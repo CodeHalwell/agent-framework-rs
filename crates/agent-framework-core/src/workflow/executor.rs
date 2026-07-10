@@ -20,6 +20,23 @@ pub trait Executor: Send + Sync {
 
     /// Handle an incoming message.
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()>;
+
+    /// Capture serializable state for checkpointing.
+    ///
+    /// Stateful executors override this to return a JSON snapshot that is stored
+    /// in the checkpoint and handed back to [`Executor::restore_state`] on
+    /// resume. Returning `None` (the default) means the executor is stateless.
+    async fn snapshot_state(&self) -> Option<Value> {
+        None
+    }
+
+    /// Restore state previously produced by [`Executor::snapshot_state`].
+    ///
+    /// The default implementation ignores the state. Only executors that
+    /// snapshot state need to implement this.
+    async fn restore_state(&self, _state: Value) -> Result<()> {
+        Ok(())
+    }
 }
 
 type ExecFn =

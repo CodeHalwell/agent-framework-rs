@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::context::WorkflowContext;
+use super::events::WorkflowEvent;
 use super::executor::Executor;
 use super::runner::{Workflow, WorkflowBuilder};
 use crate::agent::Agent;
@@ -61,6 +62,24 @@ impl Executor for AgentExecutor {
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         let mut conversation = parse_conversation(&message)?;
         let response = self.agent.run(conversation.clone(), None).await?;
+
+        // Surface agent activity as workflow events (Python's AgentRunUpdateEvent
+        // per streamed message, then AgentRunEvent for the completed run).
+        for msg in &response.messages {
+            if let Ok(update) = serde_json::to_value(msg) {
+                ctx.add_event(WorkflowEvent::AgentRunUpdate {
+                    executor_id: self.id.clone(),
+                    update,
+                });
+            }
+        }
+        if let Ok(resp_value) = serde_json::to_value(&response) {
+            ctx.add_event(WorkflowEvent::AgentRun {
+                executor_id: self.id.clone(),
+                response: resp_value,
+            });
+        }
+
         conversation.extend(response.messages);
         let payload = serde_json::to_value(&conversation)
             .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))?;
