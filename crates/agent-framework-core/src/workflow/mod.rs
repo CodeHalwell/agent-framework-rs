@@ -39,7 +39,19 @@ pub use context::{WorkflowContext, WorkflowMessage};
 pub use edge::{Case, Condition, Default, EdgeGroup, Selection};
 pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
-pub use orchestration::{AgentExecutor, ConcurrentBuilder, SequentialBuilder};
+pub use orchestration::{
+    handoff_tool_spec, AgentExecutor, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,
+    GroupChatManager, GroupChatState, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
+    HandoffUserInputRequest, MagenticBuilder, MagenticContext, MagenticManager,
+    MagenticProgressLedger, MagenticProgressLedgerItem, MagenticTaskLedger,
+    ManagerSelectionResponse, RoundRobinManager, SequentialBuilder, StandardMagenticManager,
+    WorkflowAgent, WorkflowAgentExt, DEFAULT_GROUP_CHAT_MAX_ITERATIONS,
+    DEFAULT_MANAGER_INSTRUCTIONS, DEFAULT_MANAGER_STRUCTURED_OUTPUT_PROMPT, MAGENTIC_MANAGER_NAME,
+    ORCHESTRATOR_FINAL_ANSWER_PROMPT, ORCHESTRATOR_PROGRESS_LEDGER_PROMPT,
+    ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT, ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT,
+    ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT, ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT,
+    ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
+};
 pub use request_info::{PendingRequest, RequestInfoExecutor, RequestResponse};
 pub use runner::{Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream};
 pub use shared_state::SharedState;
