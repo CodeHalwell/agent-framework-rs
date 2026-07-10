@@ -14,7 +14,7 @@ pub use content::{
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
 };
 pub use message::{prepare_messages, ChatMessage, IntoMessages, Role};
-pub use options::{ChatOptions, ToolMode};
+pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
     AgentRunResponse, AgentRunResponseUpdate, ChatResponse, ChatResponseUpdate, FinishReason,
 };

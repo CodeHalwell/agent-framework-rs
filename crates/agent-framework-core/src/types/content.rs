@@ -339,6 +339,41 @@ impl Content {
             _ => None,
         }
     }
+
+    /// The function result carried by this item, if any.
+    pub fn as_function_result(&self) -> Option<&FunctionResultContent> {
+        match self {
+            Content::FunctionResult(fr) => Some(fr),
+            _ => None,
+        }
+    }
+
+    /// The function-approval request carried by this item, if any.
+    pub fn as_function_approval_request(&self) -> Option<&FunctionApprovalRequestContent> {
+        match self {
+            Content::FunctionApprovalRequest(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The function-approval response carried by this item, if any.
+    pub fn as_function_approval_response(&self) -> Option<&FunctionApprovalResponseContent> {
+        match self {
+            Content::FunctionApprovalResponse(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+impl From<FunctionApprovalRequestContent> for Content {
+    fn from(v: FunctionApprovalRequestContent) -> Self {
+        Content::FunctionApprovalRequest(v)
+    }
+}
+impl From<FunctionApprovalResponseContent> for Content {
+    fn from(v: FunctionApprovalResponseContent) -> Self {
+        Content::FunctionApprovalResponse(v)
+    }
 }
 
 impl From<TextContent> for Content {
