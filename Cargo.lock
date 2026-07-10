@@ -15,6 +15,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-framework-anthropic"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-framework-azure"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "agent-framework-openai",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agent-framework-core"
 version = "0.1.0"
 dependencies = [
@@ -22,6 +59,24 @@ dependencies = [
  "futures",
  "pin-project-lite",
  "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-framework-mcp"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
