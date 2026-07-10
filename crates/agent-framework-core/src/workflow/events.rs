@@ -1,16 +1,28 @@
 //! Workflow events emitted during execution.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The run state of a workflow, mirroring `WorkflowRunState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The run state of a workflow, mirroring Python's `WorkflowRunState`.
+///
+/// The string forms match the Python enum values (`SCREAMING_SNAKE_CASE`) so
+/// serialized status is interchangeable with the reference implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkflowRunState {
+    /// Run has been initiated; pre-work phase.
     Started,
+    /// The workflow is actively executing.
     InProgress,
+    /// Active execution while one or more info requests are outstanding.
     InProgressPendingRequests,
+    /// Quiescent with no outstanding requests and no more work; terminal.
     Idle,
+    /// Paused awaiting external input; non-terminal (resumable).
     IdleWithPendingRequests,
+    /// Finished with an error; terminal.
     Failed,
+    /// Finished due to cancellation; terminal.
     Cancelled,
 }
 
@@ -18,36 +30,46 @@ pub enum WorkflowRunState {
 ///
 /// Corresponds to the `WorkflowEvent` hierarchy in the Python engine. Only
 /// workflow-level events are observable; inter-executor messages are internal.
-#[derive(Debug, Clone)]
+/// Variant names map onto Python types as noted (e.g. [`WorkflowEvent::Started`]
+/// is `WorkflowStartedEvent`, [`WorkflowEvent::Output`] is `WorkflowOutputEvent`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkflowEvent {
-    /// The run has begun.
+    /// The run has begun (`WorkflowStartedEvent`).
     Started,
-    /// A run-state transition.
+    /// A run-state transition (`WorkflowStatusEvent`).
     Status(WorkflowRunState),
-    /// A superstep has started (with its iteration index).
+    /// A superstep has started, with its 1-based iteration index.
     SuperStepStarted(usize),
-    /// A superstep has completed.
+    /// A superstep has completed, with its 1-based iteration index.
     SuperStepCompleted(usize),
-    /// An executor began processing a message.
+    /// An executor began processing a message (`ExecutorInvokedEvent`).
     ExecutorInvoked { executor_id: String },
-    /// An executor finished processing.
+    /// An executor finished processing (`ExecutorCompletedEvent`).
     ExecutorCompleted { executor_id: String },
-    /// An executor failed.
+    /// An executor failed (`ExecutorFailedEvent`).
     ExecutorFailed { executor_id: String, error: String },
-    /// A workflow-level output was yielded.
+    /// An agent produced an incremental streaming update (`AgentRunUpdateEvent`).
+    AgentRunUpdate { executor_id: String, update: Value },
+    /// An agent completed a run (`AgentRunEvent`).
+    AgentRun {
+        executor_id: String,
+        response: Value,
+    },
+    /// A workflow-level output was yielded (`WorkflowOutputEvent`).
     Output {
         data: Value,
         source_executor_id: String,
     },
     /// A custom event added by an executor.
     Custom(Value),
-    /// A request for external input (human-in-the-loop).
+    /// A request for external input, human-in-the-loop (`RequestInfoEvent`).
     RequestInfo {
         request_id: String,
+        /// The executor that surfaced the request (the emitter).
         source_executor_id: String,
         request_data: Value,
     },
-    /// The run failed terminally.
+    /// The run failed terminally (`WorkflowFailedEvent`).
     Failed { error: String },
 }
 
@@ -56,6 +78,26 @@ impl WorkflowEvent {
     pub fn as_output(&self) -> Option<&Value> {
         match self {
             WorkflowEvent::Output { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// If this is a [`WorkflowEvent::RequestInfo`], return `(request_id, data)`.
+    pub fn as_request_info(&self) -> Option<(&str, &Value)> {
+        match self {
+            WorkflowEvent::RequestInfo {
+                request_id,
+                request_data,
+                ..
+            } => Some((request_id, request_data)),
+            _ => None,
+        }
+    }
+
+    /// If this is a [`WorkflowEvent::Status`], return the state.
+    pub fn as_status(&self) -> Option<WorkflowRunState> {
+        match self {
+            WorkflowEvent::Status(s) => Some(*s),
             _ => None,
         }
     }
