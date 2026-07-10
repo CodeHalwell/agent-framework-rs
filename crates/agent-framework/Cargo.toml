@@ -14,7 +14,22 @@ openai = ["dep:agent-framework-openai"]
 anthropic = ["dep:agent-framework-anthropic"]
 azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
-full = ["openai", "anthropic", "azure", "mcp"]
+a2a = ["dep:agent-framework-a2a"]
+declarative = ["dep:agent-framework-declarative"]
+hosting = ["dep:agent-framework-hosting"]
+redis = ["dep:agent-framework-redis"]
+mem0 = ["dep:agent-framework-mem0"]
+full = [
+    "openai",
+    "anthropic",
+    "azure",
+    "mcp",
+    "a2a",
+    "declarative",
+    "hosting",
+    "redis",
+    "mem0",
+]
 
 [dependencies]
 agent-framework-core = { workspace = true }
@@ -22,6 +37,11 @@ agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
+agent-framework-a2a = { workspace = true, optional = true }
+agent-framework-declarative = { workspace = true, optional = true }
+agent-framework-hosting = { workspace = true, optional = true }
+agent-framework-redis = { workspace = true, optional = true }
+agent-framework-mem0 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

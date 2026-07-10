@@ -6,11 +6,16 @@ version = 3
 name = "agent-framework"
 version = "0.1.0"
 dependencies = [
+ "agent-framework-a2a",
  "agent-framework-anthropic",
  "agent-framework-azure",
  "agent-framework-core",
+ "agent-framework-declarative",
+ "agent-framework-hosting",
  "agent-framework-mcp",
+ "agent-framework-mem0",
  "agent-framework-openai",
+ "agent-framework-redis",
  "futures",
  "serde",
  "serde_json",
