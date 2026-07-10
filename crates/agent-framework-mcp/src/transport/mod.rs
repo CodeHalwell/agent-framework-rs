@@ -7,6 +7,7 @@
 
 pub mod http;
 pub mod stdio;
+pub mod websocket;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -35,3 +36,4 @@ pub trait McpTransport: Send + Sync {
 
 pub use http::McpStreamableHttpTransport;
 pub use stdio::McpStdioTransport;
+pub use websocket::McpWebsocketTransport;

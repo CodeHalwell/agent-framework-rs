@@ -19,7 +19,7 @@ use agent_framework_core::tools::{ApprovalMode, Tool, ToolDefinition};
 
 use crate::client::McpClient;
 use crate::protocol::{normalize_mcp_name, ToolDescriptor};
-use crate::transport::{McpStdioTransport, McpStreamableHttpTransport};
+use crate::transport::{McpStdioTransport, McpStreamableHttpTransport, McpWebsocketTransport};
 
 /// The `clientInfo.name` this crate sends during `initialize`.
 const CLIENT_NAME: &str = "agent-framework-rs";
@@ -436,6 +436,133 @@ impl McpStreamableHttpTool {
     }
 }
 
+/// An MCP tool backed by a WebSocket-connected server.
+///
+/// ```no_run
+/// # use agent_framework_mcp::McpWebsocketTool;
+/// # async fn demo() -> agent_framework_core::error::Result<()> {
+/// let mcp = McpWebsocketTool::new("realtime-service", "wss://service.example.com/mcp")
+///     .headers([("Authorization", "Bearer token")])
+///     .description("Real-time service operations");
+/// let tools = mcp.tool_definitions().await?;
+/// # let _ = tools;
+/// # Ok(())
+/// # }
+/// ```
+pub struct McpWebsocketTool {
+    name: String,
+    description: Option<String>,
+    url: String,
+    headers: Vec<(String, String)>,
+    allowed_tools: Option<HashSet<String>>,
+    approval_mode: McpApprovalMode,
+    session: OnceCell<Arc<McpClient>>,
+}
+
+impl McpWebsocketTool {
+    /// Create a tool that talks to the MCP server at `url` (`ws://` or
+    /// `wss://`) over a WebSocket.
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            url: url.into(),
+            headers: Vec::new(),
+            allowed_tools: None,
+            approval_mode: McpApprovalMode::default(),
+            session: OnceCell::new(),
+        }
+    }
+
+    /// Add custom headers (e.g. `Authorization`) sent on the WebSocket upgrade
+    /// request.
+    pub fn headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers
+            .extend(headers.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Set a human-readable description for this tool source.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Restrict [`Self::tool_definitions`] to these (local/normalized) tool names.
+    pub fn allowed_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Set the approval policy applied to produced [`ToolDefinition`]s.
+    pub fn approval_mode(mut self, mode: McpApprovalMode) -> Self {
+        self.approval_mode = mode;
+        self
+    }
+
+    /// Connect to the server and perform the `initialize` handshake.
+    ///
+    /// Idempotent and safe to call concurrently: the first caller performs
+    /// the handshake, later/concurrent callers await and reuse its result.
+    pub async fn connect(&self) -> Result<()> {
+        self.session
+            .get_or_try_init(|| async {
+                let transport = McpWebsocketTransport::connect(&self.url, &self.headers).await?;
+                let client = McpClient::new(Arc::new(transport));
+                client.initialize(CLIENT_NAME, CLIENT_VERSION).await?;
+                Ok::<_, Error>(Arc::new(client))
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Connect (if not already connected) and return one [`ToolDefinition`]
+    /// per server tool that passes the [`Self::allowed_tools`] filter, each
+    /// wired to call back through the shared session.
+    pub async fn tool_definitions(&self) -> Result<Vec<ToolDefinition>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        let tools = client.list_tools().await?;
+        Ok(build_tool_definitions(
+            client,
+            &tools,
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+        ))
+    }
+
+    /// The configured tool-source name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The configured description, if any.
+    pub fn description_text(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Close the underlying session, if connected (best effort, idempotent).
+    pub async fn close(&self) -> Result<()> {
+        if let Some(client) = self.session.get() {
+            client.close().await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +678,20 @@ mod tests {
             vec![("Authorization".to_string(), "Bearer x".to_string())]
         );
         assert_eq!(tool.timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn websocket_tool_builder_stores_configuration() {
+        let tool = McpWebsocketTool::new("realtime", "wss://example.com/mcp")
+            .headers([("Authorization", "Bearer x")])
+            .description("desc")
+            .allowed_tools(["echo"]);
+        assert_eq!(tool.name(), "realtime");
+        assert_eq!(tool.description_text(), Some("desc"));
+        assert_eq!(
+            tool.headers,
+            vec![("Authorization".to_string(), "Bearer x".to_string())]
+        );
+        assert!(tool.allowed_tools.as_ref().unwrap().contains("echo"));
     }
 }
