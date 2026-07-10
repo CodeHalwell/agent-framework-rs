@@ -234,3 +234,133 @@ fn chat_options_merge() {
     assert_eq!(merged.temperature, Some(0.9));
     assert_eq!(merged.instructions.as_deref(), Some("base\nmore"));
 }
+
+#[test]
+fn function_call_merge_does_not_duplicate_name() {
+    // A provider that repeats the full name in a continuation chunk must not
+    // produce "addadd".
+    let mut base =
+        FunctionCallContent::new("c1", "add", Some(FunctionArguments::Raw("{\"a\":".into())));
+    let cont = FunctionCallContent::new("", "add", Some(FunctionArguments::Raw("1}".into())));
+    base.merge(&cont).unwrap();
+    assert_eq!(base.name, "add");
+    match base.arguments {
+        Some(FunctionArguments::Raw(s)) => assert_eq!(s, "{\"a\":1}"),
+        other => panic!("unexpected args: {other:?}"),
+    }
+}
+
+/// Agent middleware that appends a suffix to every assistant message.
+struct SuffixMiddleware;
+
+#[async_trait]
+impl Middleware<AgentRunContext> for SuffixMiddleware {
+    async fn process(
+        &self,
+        ctx: AgentRunContext,
+        next: Next<AgentRunContext>,
+    ) -> Result<AgentRunContext> {
+        let mut ctx = next.run(ctx).await?;
+        if let Some(resp) = ctx.result.as_mut() {
+            for m in &mut resp.messages {
+                m.contents.push(Content::text(" [checked]"));
+            }
+        }
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn middleware_applies_on_streaming_path() {
+    let client = MockClient::new(vec![ChatResponse::from_text("answer")]);
+    let agent = ChatAgent::builder(client)
+        .middleware(Arc::new(SuffixMiddleware))
+        .build();
+
+    // Streaming must honor the middleware just like `run` does.
+    let mut stream = agent.run_stream("hi", None).await.unwrap();
+    let mut text = String::new();
+    while let Some(u) = stream.next().await {
+        text.push_str(&u.unwrap().text());
+    }
+    assert!(text.contains("answer"), "got: {text}");
+    assert!(
+        text.contains("[checked]"),
+        "middleware not applied on stream: {text}"
+    );
+}
+
+#[tokio::test]
+async fn tool_loop_reports_invalid_arguments() {
+    // The model asks to call `add` with malformed JSON arguments; the loop must
+    // report a tool error rather than invoking with null input.
+    let bad_call = FunctionCallContent::new(
+        "call_1",
+        "add",
+        Some(FunctionArguments::Raw("{ not json".into())),
+    );
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(bad_call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("done");
+
+    let invoked = Arc::new(Mutex::new(false));
+    let invoked_clone = invoked.clone();
+    let add = AiFunction::new(
+        "add",
+        "Add.",
+        json!({"type":"object","properties":{}}),
+        move |_args| {
+            let invoked = invoked_clone.clone();
+            async move {
+                *invoked.lock().unwrap() = true;
+                Ok(json!(0))
+            }
+        },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(add)
+        .build();
+    let response = agent.run_once("add please").await.unwrap();
+
+    // The tool must NOT have been invoked with bogus arguments.
+    assert!(
+        !*invoked.lock().unwrap(),
+        "tool should not run on invalid args"
+    );
+    // A tool-error result should be present in the conversation.
+    assert!(response.messages.iter().any(|m| m
+        .contents
+        .iter()
+        .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))));
+}
+
+#[tokio::test]
+async fn workflow_errors_on_max_iterations() {
+    use agent_framework_core::workflow::{FunctionExecutor, WorkflowBuilder};
+
+    // A single executor that sends to itself forever.
+    let looper = FunctionExecutor::new("loop", |_msg, ctx| async move {
+        ctx.send_message(json!(1)).await?;
+        Ok(())
+    });
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(looper))
+        .set_start("loop")
+        .add_edge("loop", "loop")
+        .set_max_iterations(5)
+        .build()
+        .unwrap();
+
+    let result = workflow.run(json!(1)).await;
+    assert!(
+        result.is_err(),
+        "expected a workflow error on iteration limit"
+    );
+}

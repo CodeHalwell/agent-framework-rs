@@ -213,7 +213,13 @@ impl FunctionCallContent {
         if self.call_id.is_empty() {
             self.call_id = other.call_id.clone();
         }
-        if !other.name.is_empty() {
+        // The function name is not fragmented by real providers: it arrives once
+        // in the first chunk. Set it if we don't have one yet; otherwise only
+        // append a genuinely different fragment so a repeated full name does not
+        // produce e.g. "get_weatherget_weather".
+        if self.name.is_empty() {
+            self.name = other.name.clone();
+        } else if !other.name.is_empty() && other.name != self.name {
             self.name.push_str(&other.name);
         }
         match (&mut self.arguments, &other.arguments) {

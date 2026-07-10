@@ -91,15 +91,37 @@ impl ChatAgent {
         let mut thread = thread.unwrap_or_else(|| self.get_new_thread());
         let (final_messages, options) = self.prepare_request(&input, &mut thread).await?;
 
+        // When agent middleware is configured, route the run through the same
+        // pipeline as `run` (so guardrails/rewrites/termination apply) and then
+        // emit the resulting messages as updates. Token-level streaming is only
+        // used when there is no agent middleware to honor.
+        if self.has_middleware() {
+            let response = self.run_core(final_messages, options, true).await?;
+            thread.on_new_messages(input).await?;
+            thread.on_new_messages(response.messages.clone()).await?;
+            let updates: Vec<Result<AgentRunResponseUpdate>> = response
+                .messages
+                .into_iter()
+                .map(|m| {
+                    Ok(AgentRunResponseUpdate {
+                        contents: m.contents,
+                        role: Some(m.role),
+                        author_name: m.author_name,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            return Ok(futures::stream::iter(updates).boxed());
+        }
+
         let inner = self
             .client
             .get_streaming_response(final_messages, options)
             .await?;
         let agent_name = self.name.clone();
-        let input_for_thread = input;
 
         // Wrap the inner stream: forward mapped updates, then update the thread.
-        let stream = async_stream_forward(inner, agent_name, thread, input_for_thread);
+        let stream = async_stream_forward(inner, agent_name, thread, input);
         Ok(stream.boxed())
     }
 
@@ -134,13 +156,64 @@ impl ChatAgent {
                 });
             }
             history.extend(ctx.messages);
-            options.tools.extend(ctx.tools);
+            // Deduplicate by name: a tool may be defined on the agent and also
+            // injected by a context provider. Providers rejecting duplicate
+            // tool names would otherwise fail the request.
+            for t in ctx.tools {
+                if !options.tools.iter().any(|existing| existing.name == t.name) {
+                    options.tools.push(t);
+                }
+            }
         }
 
         history.extend(input.iter().cloned());
         let instructions = options.instructions.take();
         let final_messages = prepare_messages(history, instructions.as_deref());
         Ok((final_messages, options))
+    }
+
+    /// Run the agent middleware pipeline with a terminal that calls the chat
+    /// client, returning the aggregated response. Shared by `run` and the
+    /// middleware path of `run_stream` (thread updates are handled by callers).
+    async fn run_core(
+        &self,
+        final_messages: Vec<ChatMessage>,
+        options: ChatOptions,
+        is_streaming: bool,
+    ) -> Result<AgentRunResponse> {
+        let client = self.client.clone();
+        let terminal: Terminal<AgentRunContext> = Box::new(move |mut ctx: AgentRunContext| {
+            let client = client.clone();
+            let options = options.clone();
+            Box::pin(async move {
+                if ctx.terminate {
+                    return Ok(ctx);
+                }
+                let response = client.get_response(ctx.messages.clone(), options).await?;
+                ctx.result = Some(AgentRunResponse::from_chat_response(response));
+                Ok(ctx)
+            }) as crate::tools::BoxFuture<Result<AgentRunContext>>
+        });
+
+        let ctx = AgentRunContext::new(final_messages, is_streaming);
+        let ctx = self.agent_middleware.execute(ctx, terminal).await?;
+        let mut response = ctx.result.ok_or_else(|| {
+            crate::error::Error::AgentExecution("agent produced no result".into())
+        })?;
+
+        if let Some(name) = &self.name {
+            for m in &mut response.messages {
+                if m.author_name.is_none() {
+                    m.author_name = Some(name.clone());
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    /// Whether this agent has any agent-level middleware configured.
+    fn has_middleware(&self) -> bool {
+        !self.agent_middleware.is_empty()
     }
 }
 
@@ -176,12 +249,16 @@ fn async_stream_forward(
                     }
                     Some(Err(e)) => Some((Err(e), (inner, collected, true, finish))),
                     None => {
-                        // Stream finished: update the thread history.
-                        if let Some((thread, input)) = finish.take() {
-                            let mut thread = thread;
+                        // Stream finished: update the thread history. Surface
+                        // any failure as the final item rather than dropping it.
+                        if let Some((mut thread, input)) = finish.take() {
+                            if let Err(e) = thread.on_new_messages(input).await {
+                                return Some((Err(e), (inner, collected, true, None)));
+                            }
                             let response = ChatResponse::from_updates(collected.clone());
-                            let _ = thread.on_new_messages(input).await;
-                            let _ = thread.on_new_messages(response.messages).await;
+                            if let Err(e) = thread.on_new_messages(response.messages).await {
+                                return Some((Err(e), (inner, collected, true, None)));
+                            }
                         }
                         None
                     }
@@ -208,36 +285,7 @@ impl Agent for ChatAgent {
         };
 
         let (final_messages, options) = self.prepare_request(&messages, thread).await?;
-
-        // Run through the agent middleware pipeline (terminal = LLM call).
-        let client = self.client.clone();
-        let terminal: Terminal<AgentRunContext> = Box::new(move |mut ctx: AgentRunContext| {
-            let client = client.clone();
-            let options = options.clone();
-            Box::pin(async move {
-                if ctx.terminate {
-                    return Ok(ctx);
-                }
-                let response = client.get_response(ctx.messages.clone(), options).await?;
-                ctx.result = Some(AgentRunResponse::from_chat_response(response));
-                Ok(ctx)
-            }) as crate::tools::BoxFuture<Result<AgentRunContext>>
-        });
-
-        let ctx = AgentRunContext::new(final_messages, false);
-        let ctx = self.agent_middleware.execute(ctx, terminal).await?;
-        let mut response = ctx.result.ok_or_else(|| {
-            crate::error::Error::AgentExecution("agent produced no result".into())
-        })?;
-
-        // Fill author names.
-        if let Some(name) = &self.name {
-            for m in &mut response.messages {
-                if m.author_name.is_none() {
-                    m.author_name = Some(name.clone());
-                }
-            }
-        }
+        let response = self.run_core(final_messages, options, false).await?;
 
         // Update thread history.
         thread.on_new_messages(messages).await?;

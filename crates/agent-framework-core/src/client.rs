@@ -161,51 +161,85 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             // Record the assistant message(s) that requested the calls.
             carried.extend(response.messages.iter().cloned());
 
-            // Execute each call and collect results.
-            let mut result_contents: Vec<Content> = Vec::new();
-            let mut had_error = false;
-            for call in &calls {
-                let tool = tools.iter().find(|t| t.name == call.name);
-                let content = match tool {
-                    None => {
-                        if self.config.terminate_on_unknown_calls {
-                            return Err(Error::tool(format!("unknown tool: {}", call.name)));
-                        }
-                        had_error = true;
-                        FunctionResultContent {
-                            call_id: call.call_id.clone(),
-                            result: None,
-                            exception: Some(format!("tool '{}' not found", call.name)),
-                        }
-                    }
-                    Some(def) => {
-                        let args = call
-                            .parse_arguments()
-                            .map(|m| serde_json::Value::Object(m.into_iter().collect()))
-                            .unwrap_or(serde_json::Value::Null);
-                        let exec = def.executor.as_ref().unwrap();
-                        match exec.invoke(args).await {
-                            Ok(result) => FunctionResultContent {
-                                call_id: call.call_id.clone(),
-                                result: Some(result),
-                                exception: None,
-                            },
-                            Err(e) => {
-                                had_error = true;
-                                let msg = if self.config.include_detailed_errors {
-                                    format!("{e}")
-                                } else {
-                                    "tool execution failed".to_string()
-                                };
+            // Execute all calls concurrently: the model may emit several
+            // parallel tool calls, and I/O-bound tools should not be serialized.
+            let invocations = calls.iter().map(|call| {
+                let tool = tools.iter().find(|t| t.name == call.name).cloned();
+                let call = call.clone();
+                let include_detailed_errors = self.config.include_detailed_errors;
+                let terminate_on_unknown = self.config.terminate_on_unknown_calls;
+                async move {
+                    match tool {
+                        None => {
+                            if terminate_on_unknown {
+                                return Err(Error::tool(format!("unknown tool: {}", call.name)));
+                            }
+                            Ok((
+                                true,
                                 FunctionResultContent {
                                     call_id: call.call_id.clone(),
                                     result: None,
-                                    exception: Some(msg),
+                                    exception: Some(format!("tool '{}' not found", call.name)),
+                                },
+                            ))
+                        }
+                        Some(def) => {
+                            // Reject unparseable arguments rather than silently
+                            // invoking the tool with null/default input.
+                            let args = match call.parse_arguments() {
+                                Ok(m) => serde_json::Value::Object(m.into_iter().collect()),
+                                Err(e) => {
+                                    let msg = if include_detailed_errors {
+                                        format!("invalid tool arguments: {e}")
+                                    } else {
+                                        "invalid tool arguments".to_string()
+                                    };
+                                    return Ok((
+                                        true,
+                                        FunctionResultContent {
+                                            call_id: call.call_id.clone(),
+                                            result: None,
+                                            exception: Some(msg),
+                                        },
+                                    ));
+                                }
+                            };
+                            let exec = def.executor.as_ref().unwrap().clone();
+                            match exec.invoke(args).await {
+                                Ok(result) => Ok((
+                                    false,
+                                    FunctionResultContent {
+                                        call_id: call.call_id.clone(),
+                                        result: Some(result),
+                                        exception: None,
+                                    },
+                                )),
+                                Err(e) => {
+                                    let msg = if include_detailed_errors {
+                                        format!("{e}")
+                                    } else {
+                                        "tool execution failed".to_string()
+                                    };
+                                    Ok((
+                                        true,
+                                        FunctionResultContent {
+                                            call_id: call.call_id.clone(),
+                                            result: None,
+                                            exception: Some(msg),
+                                        },
+                                    ))
                                 }
                             }
                         }
                     }
-                };
+                }
+            });
+
+            let outcomes = futures::future::try_join_all(invocations).await?;
+            let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
+            let mut had_error = false;
+            for (is_error, content) in outcomes {
+                had_error |= is_error;
                 result_contents.push(Content::FunctionResult(content));
             }
 

@@ -245,17 +245,20 @@ impl Workflow {
             source_id: "__start__".to_string(),
             target_id: Some(self.start.clone()),
         }];
-        // Fan-in accumulation across supersteps.
-        let mut fanin_buffer: HashMap<String, Vec<Value>> = HashMap::new();
+        // Fan-in accumulation across supersteps, keyed by target then source so
+        // the barrier only fires once every distinct source has delivered and
+        // the collected messages are ordered deterministically.
+        let mut fanin_buffer: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
         let mut iteration = 0usize;
         while !pending.is_empty() {
             if iteration >= self.max_iterations {
+                let error = format!("max_iterations ({}) exceeded", self.max_iterations);
                 events.push(WorkflowEvent::Failed {
-                    error: format!("max_iterations ({}) exceeded", self.max_iterations),
+                    error: error.clone(),
                 });
                 events.push(WorkflowEvent::Status(WorkflowRunState::Failed));
-                return Ok(WorkflowRunResult { events });
+                return Err(Error::Workflow(error));
             }
             events.push(WorkflowEvent::SuperStepStarted(iteration));
 
@@ -280,18 +283,26 @@ impl Workflow {
                 // Determine whether this target is a fan-in sink.
                 let fanin = self.fanin_group_for(&target_id);
                 if let Some(sources) = fanin {
-                    // Accumulate; only fire when all sources have delivered.
+                    // Accumulate by source; only fire when every distinct source
+                    // has delivered a message.
                     let buf = fanin_buffer.entry(target_id.clone()).or_default();
                     for m in &msgs {
-                        buf.push(m.data.clone());
+                        buf.insert(m.source_id.clone(), m.data.clone());
                     }
                     if buf.len() < sources.len() {
                         continue;
                     }
-                    let collected = Value::Array(std::mem::take(buf));
+                    // Collect in the order the sources were declared for
+                    // deterministic downstream behavior.
+                    let mut collected_vec = Vec::with_capacity(sources.len());
+                    for source in &sources {
+                        if let Some(val) = buf.remove(source) {
+                            collected_vec.push(val);
+                        }
+                    }
                     fanin_buffer.remove(&target_id);
-                    let source_ids = sources;
-                    self.run_executor(&executor, collected, source_ids, &mut events, &mut next)
+                    let collected = Value::Array(collected_vec);
+                    self.run_executor(&executor, collected, sources, &mut events, &mut next)
                         .await?;
                 } else {
                     for m in msgs {

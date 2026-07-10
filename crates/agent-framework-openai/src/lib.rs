@@ -23,6 +23,7 @@
 
 mod convert;
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
@@ -186,71 +187,89 @@ fn parse_sse_stream(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
+    // `tool_ids` maps a streamed tool-call `index` to its `call_id`, so that
+    // continuation chunks (which carry only the index) can be resolved back to
+    // the id assigned in the first chunk.
     futures::stream::unfold(
-        (
+        SseState {
             byte_stream,
-            String::new(),
-            Vec::<ChatResponseUpdate>::new(),
-            false,
-        ),
-        |(mut byte_stream, mut buffer, mut queued, done)| async move {
+            buffer: String::new(),
+            queued: VecDeque::new(),
+            tool_ids: HashMap::new(),
+            done: false,
+        },
+        |mut state| async move {
             loop {
-                if !queued.is_empty() {
-                    let update = queued.remove(0);
-                    return Some((Ok(update), (byte_stream, buffer, queued, done)));
+                if let Some(update) = state.queued.pop_front() {
+                    return Some((Ok(update), state));
                 }
-                if done {
+                if state.done {
                     return None;
                 }
-                match byte_stream.next().await {
+                match state.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].trim().to_string();
-                            buffer.drain(..=pos);
+                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = state.buffer.find('\n') {
+                            let line = state.buffer[..pos].trim().to_string();
+                            state.buffer.drain(..=pos);
                             if let Some(data) = line.strip_prefix("data:") {
                                 let data = data.trim();
                                 if data == "[DONE]" {
-                                    return drain_or_end(byte_stream, buffer, queued);
+                                    return drain_or_end(state);
                                 }
                                 if let Ok(value) = serde_json::from_str::<Value>(data) {
-                                    if let Some(update) = parse_delta(&value) {
-                                        queued.push(update);
+                                    // Providers signal mid-stream failures (rate
+                                    // limits, content filter, billing) as an
+                                    // object with an `error` field; surface it.
+                                    if let Some(err) = value.get("error") {
+                                        let msg = err
+                                            .get("message")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("unknown stream error")
+                                            .to_string();
+                                        state.done = true;
+                                        return Some((Err(Error::service(msg)), state));
+                                    }
+                                    if let Some(update) = parse_delta(&value, &mut state.tool_ids) {
+                                        state.queued.push_back(update);
                                     }
                                 }
                             }
                         }
                     }
                     Some(Err(e)) => {
-                        return Some((
-                            Err(Error::service(format!("stream error: {e}"))),
-                            (byte_stream, buffer, queued, true),
-                        ));
+                        state.done = true;
+                        return Some((Err(Error::service(format!("stream error: {e}"))), state));
                     }
-                    None => return drain_or_end(byte_stream, buffer, queued),
+                    None => return drain_or_end(state),
                 }
             }
         },
     )
 }
 
-type SseState = (ByteStream, String, Vec<ChatResponseUpdate>, bool);
-
-fn drain_or_end(
+/// State carried across `unfold` iterations while parsing the SSE stream.
+struct SseState {
     byte_stream: ByteStream,
     buffer: String,
-    mut queued: Vec<ChatResponseUpdate>,
-) -> Option<(Result<ChatResponseUpdate>, SseState)> {
-    if queued.is_empty() {
-        None
-    } else {
-        let first = queued.remove(0);
-        Some((Ok(first), (byte_stream, buffer, queued, true)))
+    queued: VecDeque<ChatResponseUpdate>,
+    tool_ids: HashMap<i64, String>,
+    done: bool,
+}
+
+fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseState)> {
+    match state.queued.pop_front() {
+        Some(update) => {
+            state.done = true;
+            Some((Ok(update), state))
+        }
+        None => None,
     }
 }
 
-/// Parse one streamed chunk (`chat.completion.chunk`) into an update.
-fn parse_delta(value: &Value) -> Option<ChatResponseUpdate> {
+/// Parse one streamed chunk (`chat.completion.chunk`) into an update, resolving
+/// tool-call ids from the index map.
+fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<ChatResponseUpdate> {
     let mut update = ChatResponseUpdate {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
         model_id: value.get("model").and_then(Value::as_str).map(String::from),
@@ -275,11 +294,16 @@ fn parse_delta(value: &Value) -> Option<ChatResponseUpdate> {
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
-                    let id = call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+                    let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    let chunk_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                    // The first chunk of a call carries its id; record it so
+                    // later index-only chunks resolve to the same call_id.
+                    let id = if chunk_id.is_empty() {
+                        tool_ids.get(&index).cloned().unwrap_or_default()
+                    } else {
+                        tool_ids.insert(index, chunk_id.to_string());
+                        chunk_id.to_string()
+                    };
                     let func = call.get("function");
                     let name = func
                         .and_then(|f| f.get("name"))
