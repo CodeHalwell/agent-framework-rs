@@ -133,10 +133,9 @@ pub fn apply_options(body: &mut Map<String, Value>, options: &ChatOptions) {
         body.insert("stop".into(), json!(stop));
     }
     if let Some(fmt) = &options.response_format {
-        body.insert(
-            "response_format".into(),
-            json!({ "type": "json_schema", "json_schema": fmt }),
-        );
+        // `ResponseFormat` serializes directly to the Chat Completions
+        // `response_format` object for all three variants.
+        body.insert("response_format".into(), json!(fmt));
     }
     for (k, v) in &options.additional_properties {
         body.entry(k.clone()).or_insert_with(|| v.clone());

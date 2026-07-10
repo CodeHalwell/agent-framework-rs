@@ -29,8 +29,8 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, Role, TextContent,
-    TextReasoningContent, ToolMode, UsageContent, UsageDetails,
+    FunctionArguments, FunctionCallContent, FunctionResultContent, ResponseFormat, Role,
+    TextContent, TextReasoningContent, ToolMode, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -345,21 +345,32 @@ fn tool_choice_to_responses(mode: &ToolMode) -> Value {
     }
 }
 
-/// Wrap a `ChatOptions::response_format` JSON-schema body (the same
-/// convention used by [`crate::convert::apply_options`] for Chat Completions)
-/// as a Responses API `text.format` object.
-fn response_format_to_text(format: &Value) -> Value {
-    let mut obj = Map::new();
-    obj.insert("type".into(), json!("json_schema"));
-    if let Value::Object(m) = format {
-        for (k, v) in m {
-            obj.insert(k.clone(), v.clone());
+/// Convert a `ChatOptions::response_format` into a Responses API
+/// `text.format` object. Unlike Chat Completions (which nests the schema
+/// under `json_schema`), the Responses API uses a flat object.
+fn response_format_to_text(format: &ResponseFormat) -> Value {
+    match format {
+        ResponseFormat::Text => json!({ "type": "text" }),
+        ResponseFormat::JsonObject => json!({ "type": "json_object" }),
+        ResponseFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            strict,
+        } => {
+            let mut obj = Map::new();
+            obj.insert("type".into(), json!("json_schema"));
+            obj.insert("name".into(), json!(name));
+            if let Some(d) = description {
+                obj.insert("description".into(), json!(d));
+            }
+            obj.insert("schema".into(), schema.clone());
+            if let Some(st) = strict {
+                obj.insert("strict".into(), json!(st));
+            }
+            Value::Object(obj)
         }
-    } else {
-        obj.insert("schema".into(), format.clone());
     }
-    obj.entry("name").or_insert_with(|| json!("response"));
-    Value::Object(obj)
 }
 
 // endregion
@@ -902,8 +913,12 @@ mod tests {
     fn build_body_response_format_becomes_text_format() {
         let c = client();
         let mut options = ChatOptions::new();
-        options.response_format =
-            Some(json!({ "name": "answer", "schema": {"type": "object"}, "strict": true }));
+        options.response_format = Some(ResponseFormat::JsonSchema {
+            name: "answer".into(),
+            description: None,
+            schema: json!({"type": "object"}),
+            strict: Some(true),
+        });
         let body = c.build_body(&[user("hi")], &options, false);
         assert_eq!(
             body["text"]["format"],
