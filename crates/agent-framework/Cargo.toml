@@ -11,10 +11,17 @@ description = "A Rust implementation of the Microsoft Agent Framework: build AI 
 [features]
 default = ["openai"]
 openai = ["dep:agent-framework-openai"]
+anthropic = ["dep:agent-framework-anthropic"]
+azure = ["dep:agent-framework-azure"]
+mcp = ["dep:agent-framework-mcp"]
+full = ["openai", "anthropic", "azure", "mcp"]
 
 [dependencies]
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
+agent-framework-anthropic = { workspace = true, optional = true }
+agent-framework-azure = { workspace = true, optional = true }
+agent-framework-mcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

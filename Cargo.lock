@@ -6,7 +6,10 @@ version = 3
 name = "agent-framework"
 version = "0.1.0"
 dependencies = [
+ "agent-framework-anthropic",
+ "agent-framework-azure",
  "agent-framework-core",
+ "agent-framework-mcp",
  "agent-framework-openai",
  "futures",
  "serde",
