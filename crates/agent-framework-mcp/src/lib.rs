@@ -16,6 +16,9 @@
 //!   JSON-RPC messages to an HTTP endpoint, accepting either a single
 //!   `application/json` response or a `text/event-stream` response scanned
 //!   for the matching reply.
+//! - [`McpWebsocketTool`] / [`McpWebsocketTransport`] — connects over a
+//!   WebSocket (`ws://` or `wss://`) using the `"mcp"` subprotocol, framing
+//!   each JSON-RPC message as one text frame.
 //!
 //! ## Protocol coverage
 //!
@@ -27,8 +30,6 @@
 //!
 //! ## Not implemented (future work)
 //!
-//! - **WebSocket transport** (`MCPWebsocketTool` in the Python reference).
-//!   Treated there as an optional extra; not ported here.
 //! - **Prompts** (`prompts/list` / `prompts/get`). Only tools are exposed as
 //!   agent functions.
 //! - **Sampling / roots callbacks.** This client does not act on
@@ -67,6 +68,23 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A [`McpWebsocketTool`] is built the same way, given a `ws://`/`wss://` URL:
+//!
+//! ```no_run
+//! use agent_framework_mcp::McpWebsocketTool;
+//!
+//! # async fn demo() -> agent_framework_core::error::Result<()> {
+//! let mcp = McpWebsocketTool::new("realtime-service", "wss://service.example.com/mcp")
+//!     .headers([("Authorization", "Bearer token")])
+//!     .description("Real-time service operations");
+//!
+//! let tools = mcp.tool_definitions().await?;
+//! # let _ = tools;
+//! mcp.close().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod client;
 mod protocol;
@@ -78,5 +96,7 @@ pub use protocol::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, ListToolsResult, RpcError,
     ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS, PROTOCOL_VERSION,
 };
-pub use tool::{McpApprovalMode, McpStdioTool, McpStreamableHttpTool};
-pub use transport::{McpStdioTransport, McpStreamableHttpTransport, McpTransport};
+pub use tool::{McpApprovalMode, McpStdioTool, McpStreamableHttpTool, McpWebsocketTool};
+pub use transport::{
+    McpStdioTransport, McpStreamableHttpTransport, McpTransport, McpWebsocketTransport,
+};

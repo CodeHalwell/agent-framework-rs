@@ -9,9 +9,45 @@
 //!
 //! Divergences from Python (documented): a single orchestrator [`Executor`]
 //! drives the loop and calls participants via [`Agent::run`] directly (Python
-//! wires a graph of agent nodes); human-in-the-loop plan review / stall
-//! intervention is **not** ported (future work); the progress-ledger retry loop
-//! has no backoff sleep.
+//! wires a graph of agent nodes); the progress-ledger retry loop has no
+//! backoff sleep.
+//!
+//! ## Human-in-the-loop plan review
+//!
+//! [`MagenticBuilder::with_plan_review`] enables a pause after the initial
+//! plan (mirrors Python's `MagenticOrchestratorExecutor(require_plan_signoff=True)`,
+//! wired from `MagenticBuilder.with_plan_review()`): the orchestrator emits a
+//! [`MagenticPlanReviewRequest`] via [`WorkflowContext::request_info`] and
+//! suspends; [`crate::workflow::WorkflowRun::send_response`] with a
+//! [`MagenticPlanReviewDecision`] resumes it. The loop semantics mirror
+//! `_handle_plan_review_response` in `_magentic.py` exactly:
+//!
+//! - `Approve { edited_plan: Some(text), .. }` adopts `text` as the plan
+//!   directly (no LLM call), re-renders the combined ledger from the
+//!   unchanged facts, and proceeds.
+//! - `Approve { comments: Some(text), .. }` (no `edited_plan`) records `text`
+//!   as human feedback and calls [`MagenticManager::replan`] (one LLM call)
+//!   before proceeding.
+//! - `Approve { edited_plan: None, comments: None }` proceeds with the
+//!   ledger unchanged.
+//! - `Revise` repeats the same edited-plan/comments handling but, instead of
+//!   proceeding, re-sends another `MagenticPlanReviewRequest` (looping until
+//!   an `Approve`) — *unless* the review round count exceeds
+//!   [`MagenticBuilder::max_plan_review_rounds`] (Python default, and this
+//!   port's default: 10 *revise* rounds), in which case it force-proceeds
+//!   with whatever plan is current, appending a notice message, exactly as
+//!   Python does.
+//! - Plan review only fires once, right after the initial plan; stall-
+//!   triggered replans later in the run never re-open it (Python doesn't
+//!   either — `_reset_and_replan` never calls `_send_plan_review_request`).
+//!
+//! **Not ported**: Python's separate stall-intervention HITL
+//! (`MagenticBuilder.with_human_input_on_stall`, `MagenticHumanInterventionKind.STALL`).
+//! It shares the same request/reply *mechanism* in Python but needs its own
+//! request/decision types, persisted round-loop state, and response
+//! dispatch — a second, independently-reviewable HITL surface rather than a
+//! small addition to plan review. Left as a documented gap; stalls always
+//! auto-replan here regardless of plan-review settings.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +59,9 @@ use super::{ensure_author, parse_conversation, run_agent_and_emit};
 use crate::agent::Agent;
 use crate::error::{Error, Result};
 use crate::types::{AgentRunResponse, ChatMessage, Role};
-use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent};
+use crate::workflow::{
+    Executor, RequestResponse, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent,
+};
 
 /// The author name used for orchestrator/manager-generated messages.
 pub const MAGENTIC_MANAGER_NAME: &str = "magentic_manager";
@@ -378,6 +416,20 @@ pub trait MagenticManager: Send + Sync {
     fn max_round_count(&self) -> Option<usize> {
         None
     }
+
+    /// The manager's current decomposed task ledger (facts + plan), if it
+    /// tracks one separately from the combined message [`Self::plan`] /
+    /// [`Self::replan`] return.
+    ///
+    /// Used only by plan review, to surface separate `facts`/`plan` text in
+    /// [`MagenticPlanReviewRequest`] and to re-render the combined ledger
+    /// after a direct human edit without an LLM call. Default `None`;
+    /// [`StandardMagenticManager`] overrides it. Rust analogue of Python's
+    /// `getattr(manager, "task_ledger", None)` escape hatch in
+    /// `_send_plan_review_request` / `_handle_plan_review_response`.
+    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
+        None
+    }
 }
 
 /// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
@@ -596,7 +648,117 @@ impl MagenticManager for StandardMagenticManager {
     fn max_round_count(&self) -> Option<usize> {
         self.max_round_count
     }
+    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
+        self.task_ledger()
+    }
 }
+
+/// The payload of the request-info event emitted when plan review is enabled
+/// and the orchestrator needs a human decision on the task ledger. Rust
+/// analogue of Python's `_MagenticHumanInterventionRequest` narrowed to its
+/// `kind=PLAN_REVIEW` fields (`task_text`, `facts_text`, `plan_text`,
+/// `round_index`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticPlanReviewRequest {
+    /// The original task text.
+    pub task: String,
+    /// The current fact sheet text.
+    pub facts: String,
+    /// The current plan text.
+    pub plan: String,
+    /// How many *revise* rounds have happened so far (0 for the first request).
+    pub round: u32,
+}
+
+/// A human's decision on a [`MagenticPlanReviewRequest`]. Rust analogue of
+/// Python's `_MagenticHumanInterventionReply` narrowed to plan review, with
+/// `MagenticHumanInterventionDecision.{APPROVE,REVISE}` as the two variants.
+///
+/// Both variants accept an optional `edited_plan` and/or `comments`, mirroring
+/// Python exactly: either decision may carry a direct plan edit (applied
+/// verbatim, no LLM call) or free-text feedback (fed to
+/// [`MagenticManager::replan`]); `edited_plan` wins if both are set. See the
+/// module-level docs for the full loop semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum MagenticPlanReviewDecision {
+    /// Accept the plan and proceed into the coordination round loop.
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edited_plan: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comments: Option<String>,
+    },
+    /// Ask for another round of planning; the orchestrator re-sends a
+    /// [`MagenticPlanReviewRequest`] (unless the round limit is exceeded, in
+    /// which case it force-proceeds instead).
+    Revise {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edited_plan: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comments: Option<String>,
+    },
+}
+
+impl MagenticPlanReviewDecision {
+    /// Approve the plan as-is.
+    pub fn approve() -> Self {
+        Self::Approve {
+            edited_plan: None,
+            comments: None,
+        }
+    }
+
+    /// Approve, replacing the plan text directly (no LLM call).
+    pub fn approve_with_edited_plan(edited_plan: impl Into<String>) -> Self {
+        Self::Approve {
+            edited_plan: Some(edited_plan.into()),
+            comments: None,
+        }
+    }
+
+    /// Approve, first asking the manager to replan with this feedback.
+    pub fn approve_with_comments(comments: impl Into<String>) -> Self {
+        Self::Approve {
+            edited_plan: None,
+            comments: Some(comments.into()),
+        }
+    }
+
+    /// Ask for a revision, replacing the plan text directly (no LLM call)
+    /// and re-requesting review.
+    pub fn revise_with_edited_plan(edited_plan: impl Into<String>) -> Self {
+        Self::Revise {
+            edited_plan: Some(edited_plan.into()),
+            comments: None,
+        }
+    }
+
+    /// Ask for a revision, having the manager replan with this feedback
+    /// before re-requesting review.
+    pub fn revise_with_comments(comments: impl Into<String>) -> Self {
+        Self::Revise {
+            edited_plan: None,
+            comments: Some(comments.into()),
+        }
+    }
+}
+
+/// Orchestrator state persisted across a plan-review pause via
+/// [`WorkflowContext::shared_state`] (the executor instance itself must stay
+/// stateless between `execute()` calls — see `HandoffCoordinator`'s
+/// save_state/load_state in `handoff.rs` for the same pattern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MagenticPlanReviewState {
+    mctx: MagenticContext,
+    combined_ledger: ChatMessage,
+    facts_text: String,
+    plan_text: String,
+    round: u32,
+}
+
+/// The shared-state key [`MagenticPlanReviewState`] is stored under.
+const PLAN_REVIEW_STATE_KEY: &str = "_magentic_plan_review_state";
 
 /// The single executor that drives the Magentic loop.
 struct MagenticOrchestrator {
@@ -607,6 +769,8 @@ struct MagenticOrchestrator {
     max_stall_count: usize,
     max_reset_count: Option<usize>,
     max_round_count: Option<usize>,
+    require_plan_signoff: bool,
+    max_plan_review_rounds: u32,
 }
 
 impl MagenticOrchestrator {
@@ -647,30 +811,147 @@ impl MagenticOrchestrator {
             .map_err(|e| Error::Workflow(format!("serialize error: {e}")))?;
         ctx.yield_output(payload).await
     }
-}
 
-#[async_trait]
-impl Executor for MagenticOrchestrator {
-    fn id(&self) -> &str {
-        &self.id
+    /// Split a manager's current ledger into separate facts/plan text for a
+    /// [`MagenticPlanReviewRequest`], falling back to the combined message's
+    /// text as `plan` (facts left empty) for managers that don't track a
+    /// decomposed ledger. Rust analogue of Python's
+    /// `getattr(manager, "task_ledger", None)` access pattern.
+    fn decompose_ledger(&self, combined: &ChatMessage) -> (String, String) {
+        match self.manager.current_task_ledger() {
+            Some(ledger) => (ledger.facts.text(), ledger.plan.text()),
+            None => (String::new(), combined.text()),
+        }
     }
 
-    async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
-        let input = parse_conversation(&message)?;
-        let task = input
-            .last()
-            .cloned()
-            .ok_or_else(|| Error::Workflow("magentic requires a task message".into()))?;
+    /// Re-render the combined ledger message from `state`'s current
+    /// facts/plan text, for applying a human-edited plan without an LLM
+    /// call. Uses the same template `StandardMagenticManager` renders with.
+    fn render_edited_ledger(&self, state: &MagenticPlanReviewState) -> ChatMessage {
+        let team_text = team_block(&state.mctx.participant_descriptions);
+        let combined = ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT
+            .replace("{task}", &state.mctx.task.text())
+            .replace("{team}", &team_text)
+            .replace("{facts}", &state.facts_text)
+            .replace("{plan}", &state.plan_text);
+        ensure_author(ChatMessage::assistant(combined), MAGENTIC_MANAGER_NAME)
+    }
 
-        let mut mctx = MagenticContext::new(task.clone(), self.descriptions.clone());
-        mctx.chat_history = input;
-        self.emit_orchestrator_message(&ctx, &task);
+    async fn save_review_state(&self, ctx: &WorkflowContext, state: &MagenticPlanReviewState) {
+        if let Ok(value) = serde_json::to_value(state) {
+            ctx.shared_state().set(PLAN_REVIEW_STATE_KEY, value).await;
+        }
+    }
 
-        // Initial planning.
-        let task_ledger = self.manager.plan(&mctx).await?;
-        mctx.chat_history.push(task_ledger.clone());
-        self.emit_orchestrator_message(&ctx, &task_ledger);
+    async fn load_review_state(&self, ctx: &WorkflowContext) -> Result<MagenticPlanReviewState> {
+        ctx.shared_state()
+            .get(PLAN_REVIEW_STATE_KEY)
+            .await
+            .and_then(|v| serde_json::from_value(v).ok())
+            .ok_or_else(|| {
+                Error::Workflow(
+                    "magentic plan-review response received with no pending review state".into(),
+                )
+            })
+    }
 
+    /// Emit a [`MagenticPlanReviewRequest`] built from `state` and pause.
+    async fn send_plan_review_request(
+        &self,
+        ctx: &WorkflowContext,
+        state: &MagenticPlanReviewState,
+    ) -> Result<()> {
+        let request = MagenticPlanReviewRequest {
+            task: state.mctx.task.text(),
+            facts: state.facts_text.clone(),
+            plan: state.plan_text.clone(),
+            round: state.round,
+        };
+        ctx.request_info(serialize(&request)?).await
+    }
+
+    /// Handle a [`MagenticPlanReviewDecision`] delivered back as a
+    /// [`RequestResponse`]. Rust analogue of `_handle_plan_review_response`
+    /// — see the module-level docs for the full semantics.
+    async fn handle_plan_review_response(
+        &self,
+        resp: RequestResponse,
+        ctx: &WorkflowContext,
+    ) -> Result<()> {
+        let decision: MagenticPlanReviewDecision = serde_json::from_value(resp.data)
+            .map_err(|e| Error::Workflow(format!("invalid plan-review decision: {e}")))?;
+        let mut state = self.load_review_state(ctx).await?;
+
+        match decision {
+            MagenticPlanReviewDecision::Approve {
+                edited_plan,
+                comments,
+            } => {
+                if let Some(edited) = edited_plan {
+                    state.plan_text = edited;
+                    state.combined_ledger = self.render_edited_ledger(&state);
+                } else if let Some(comments) = comments {
+                    state.mctx.chat_history.push(ChatMessage::user(format!(
+                        "Human plan feedback: {comments}"
+                    )));
+                    state.combined_ledger = self.manager.replan(&state.mctx).await?;
+                    let (facts_text, plan_text) = self.decompose_ledger(&state.combined_ledger);
+                    state.facts_text = facts_text;
+                    state.plan_text = plan_text;
+                }
+                state.mctx.chat_history.push(state.combined_ledger.clone());
+                self.emit_orchestrator_message(ctx, &state.combined_ledger);
+                ctx.shared_state().delete(PLAN_REVIEW_STATE_KEY).await;
+                self.run_round_loop(state.mctx, ctx).await
+            }
+            MagenticPlanReviewDecision::Revise {
+                edited_plan,
+                comments,
+            } => {
+                state.round += 1;
+                if state.round > self.max_plan_review_rounds {
+                    // Mirrors Python: the over-the-limit response's edits are
+                    // discarded and whatever plan currently stands is used.
+                    let notice = ensure_author(
+                        ChatMessage::assistant(
+                            "Plan review closed after max rounds. Proceeding with the current \
+                             plan and will no longer prompt for plan approval."
+                                .to_string(),
+                        ),
+                        MAGENTIC_MANAGER_NAME,
+                    );
+                    state.mctx.chat_history.push(notice.clone());
+                    self.emit_orchestrator_message(ctx, &notice);
+                    state.mctx.chat_history.push(state.combined_ledger.clone());
+                    self.emit_orchestrator_message(ctx, &state.combined_ledger);
+                    ctx.shared_state().delete(PLAN_REVIEW_STATE_KEY).await;
+                    return self.run_round_loop(state.mctx, ctx).await;
+                }
+
+                if let Some(edited) = edited_plan {
+                    state.plan_text = edited;
+                    state.combined_ledger = self.render_edited_ledger(&state);
+                } else {
+                    if let Some(comments) = comments {
+                        state.mctx.chat_history.push(ChatMessage::user(format!(
+                            "Human plan feedback: {comments}"
+                        )));
+                    }
+                    state.combined_ledger = self.manager.replan(&state.mctx).await?;
+                    let (facts_text, plan_text) = self.decompose_ledger(&state.combined_ledger);
+                    state.facts_text = facts_text;
+                    state.plan_text = plan_text;
+                }
+                self.save_review_state(ctx, &state).await;
+                self.send_plan_review_request(ctx, &state).await
+            }
+        }
+    }
+
+    /// Run the coordination round loop (Python's "inner loop") starting from
+    /// `mctx`. Entry point both for a fresh run (plan review disabled, or
+    /// already approved) and for resuming after a plan-review approval.
+    async fn run_round_loop(&self, mut mctx: MagenticContext, ctx: &WorkflowContext) -> Result<()> {
         loop {
             // Limit checks (before incrementing the round, mirroring Python).
             let hit_round = self.max_round_count.is_some_and(|m| mctx.round_count >= m);
@@ -685,7 +966,7 @@ impl Executor for MagenticOrchestrator {
                         MAGENTIC_MANAGER_NAME,
                     )
                 });
-                return self.yield_messages(&ctx, vec![partial]).await;
+                return self.yield_messages(ctx, vec![partial]).await;
             }
 
             mctx.round_count += 1;
@@ -693,14 +974,14 @@ impl Executor for MagenticOrchestrator {
             let ledger = match self.manager.create_progress_ledger(&mctx).await {
                 Ok(l) => l,
                 Err(_) => {
-                    self.reset_and_replan(&mut mctx, &ctx).await?;
+                    self.reset_and_replan(&mut mctx, ctx).await?;
                     continue;
                 }
             };
 
             if ledger.is_request_satisfied.answer_bool() {
                 let final_answer = self.manager.prepare_final_answer(&mctx).await?;
-                return self.yield_messages(&ctx, vec![final_answer]).await;
+                return self.yield_messages(ctx, vec![final_answer]).await;
             }
 
             if !ledger.is_progress_being_made.answer_bool() || ledger.is_in_loop.answer_bool() {
@@ -710,25 +991,25 @@ impl Executor for MagenticOrchestrator {
             }
 
             if mctx.stall_count > self.max_stall_count {
-                self.reset_and_replan(&mut mctx, &ctx).await?;
+                self.reset_and_replan(&mut mctx, ctx).await?;
                 continue;
             }
 
             let next = ledger.next_speaker.answer_str();
             if self.find(&next).is_none() {
                 let final_answer = self.manager.prepare_final_answer(&mctx).await?;
-                return self.yield_messages(&ctx, vec![final_answer]).await;
+                return self.yield_messages(ctx, vec![final_answer]).await;
             }
 
             let instruction = ledger.instruction_or_question.answer_str();
             let instr_msg =
                 ensure_author(ChatMessage::assistant(instruction), MAGENTIC_MANAGER_NAME);
             mctx.chat_history.push(instr_msg.clone());
-            self.emit_orchestrator_message(&ctx, &instr_msg);
+            self.emit_orchestrator_message(ctx, &instr_msg);
 
             let agent = self.find(&next).expect("checked above");
             let response =
-                run_agent_and_emit(agent, mctx.chat_history.clone(), &self.id, &next, &ctx).await?;
+                run_agent_and_emit(agent, mctx.chat_history.clone(), &self.id, &next, ctx).await?;
             if let Some(body) = last_message(&response) {
                 if body.role != Role::user() {
                     let author = body.author_name.clone().unwrap_or_else(|| next.clone());
@@ -741,8 +1022,60 @@ impl Executor for MagenticOrchestrator {
     }
 }
 
+#[async_trait]
+impl Executor for MagenticOrchestrator {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
+        // A response to a plan-review request resumes the paused review.
+        if let Some(resp) = RequestResponse::from_message(&message) {
+            return self.handle_plan_review_response(resp, &ctx).await;
+        }
+
+        let input = parse_conversation(&message)?;
+        let task = input
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::Workflow("magentic requires a task message".into()))?;
+
+        let mut mctx = MagenticContext::new(task.clone(), self.descriptions.clone());
+        mctx.chat_history = input;
+        self.emit_orchestrator_message(&ctx, &task);
+
+        // Initial planning.
+        let task_ledger = self.manager.plan(&mctx).await?;
+
+        if self.require_plan_signoff {
+            // Withhold the ledger from chat_history until approved, mirroring
+            // Python's `handle_start_message` (which only appends it after
+            // `_send_plan_review_request` is skipped or resolved).
+            let (facts_text, plan_text) = self.decompose_ledger(&task_ledger);
+            let state = MagenticPlanReviewState {
+                mctx,
+                combined_ledger: task_ledger,
+                facts_text,
+                plan_text,
+                round: 0,
+            };
+            self.save_review_state(&ctx, &state).await;
+            return self.send_plan_review_request(&ctx, &state).await;
+        }
+
+        mctx.chat_history.push(task_ledger.clone());
+        self.emit_orchestrator_message(&ctx, &task_ledger);
+
+        self.run_round_loop(mctx, &ctx).await
+    }
+}
+
 fn last_message(response: &AgentRunResponse) -> Option<ChatMessage> {
     response.messages.last().cloned()
+}
+
+fn serialize<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|e| Error::Workflow(format!("serialize error: {e}")))
 }
 
 /// Builder for a Magentic workflow. Rust analogue of `MagenticBuilder`.
@@ -771,7 +1104,16 @@ pub struct MagenticBuilder {
     max_stall_count: Option<usize>,
     max_reset_count: Option<usize>,
     name: Option<String>,
+    enable_plan_review: bool,
+    max_plan_review_rounds: Option<u32>,
 }
+
+/// Default cap on plan-review *revise* rounds before the orchestrator
+/// force-proceeds with the current plan (matches Python's
+/// `MagenticOrchestratorExecutor(max_plan_review_rounds=10)` default — not
+/// itself exposed on Python's `MagenticBuilder`, but the underlying value it
+/// always constructs the executor with).
+const DEFAULT_MAX_PLAN_REVIEW_ROUNDS: u32 = 10;
 
 impl MagenticBuilder {
     /// Create an empty builder.
@@ -846,6 +1188,23 @@ impl MagenticBuilder {
         self
     }
 
+    /// Require a human to review and approve (or send back for revision) the
+    /// initial plan before the coordination round loop starts. See the
+    /// module-level docs for the full request/response loop semantics. Rust
+    /// analogue of Python's `MagenticBuilder.with_plan_review(enable=True)`.
+    pub fn with_plan_review(mut self) -> Self {
+        self.enable_plan_review = true;
+        self
+    }
+
+    /// Override the maximum number of plan-review *revise* rounds before the
+    /// orchestrator force-proceeds with whatever plan is current (default 10,
+    /// matching Python). Only meaningful with [`Self::with_plan_review`].
+    pub fn max_plan_review_rounds(mut self, n: u32) -> Self {
+        self.max_plan_review_rounds = Some(n);
+        self
+    }
+
     /// Validate and build the Magentic workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -878,6 +1237,10 @@ impl MagenticBuilder {
             manager,
             participants,
             descriptions,
+            require_plan_signoff: self.enable_plan_review,
+            max_plan_review_rounds: self
+                .max_plan_review_rounds
+                .unwrap_or(DEFAULT_MAX_PLAN_REVIEW_ROUNDS),
         };
 
         let mut builder = WorkflowBuilder::new()

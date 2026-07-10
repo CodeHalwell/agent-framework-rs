@@ -70,8 +70,9 @@ pub mod prelude {
         CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,
         GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
         HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
-        MagenticManager, RequestInfoExecutor, SequentialBuilder, SharedState,
-        StandardMagenticManager, Workflow, WorkflowAgent, WorkflowAgentExt, WorkflowBuilder,
-        WorkflowContext, WorkflowEvent, WorkflowExecutor, WorkflowRun, WorkflowRunState,
+        MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
+        RequestInfoExecutor, SequentialBuilder, SharedState, StandardMagenticManager, Workflow,
+        WorkflowAgent, WorkflowAgentExt, WorkflowBuilder, WorkflowContext, WorkflowEvent,
+        WorkflowExecutor, WorkflowRun, WorkflowRunState,
     };
 }

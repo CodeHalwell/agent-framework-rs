@@ -99,7 +99,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Group chat — round-robin manager | ❌ (no built-in; requires `set_manager`/`set_select_speakers_func`) | ✅ (`RoundRobinGroupChatManager`) | ✅ done | `RoundRobinManager`, the `GroupChatBuilder` default |
 | Handoff | ✅ | ✅ | ✅ done | `orchestration::HandoffBuilder`; autonomous and human-in-loop interaction modes |
 | Magentic (plan / progress-ledger / final answer) | ✅ | not found | ✅ done | `MagenticBuilder` + `StandardMagenticManager`; prompts ported verbatim from Python |
-| Magentic human-in-the-loop plan review | ✅ (`MagenticHumanInterventionKind.PLAN_REVIEW`) | n/a (no Magentic orchestrator found) | ❌ not yet | the Rust orchestrator goes straight from planning into the round loop with no pause/approve/revise step |
+| Magentic human-in-the-loop plan review | ✅ (`MagenticHumanInterventionKind.PLAN_REVIEW`) | n/a (no Magentic orchestrator found) | ✅ done | `MagenticBuilder::with_plan_review` + `MagenticPlanReviewRequest`/`MagenticPlanReviewDecision`, over the existing `request_info`/`send_response` HITL machinery; approve/revise loop with a `max_plan_review_rounds` guard mirrors `_handle_plan_review_response`. Python's separate stall-intervention HITL (`with_human_input_on_stall`) is a distinct request/reply surface and remains 🚧 not ported — stalls still always auto-replan |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | see Agents section |
 
 ## Observability
