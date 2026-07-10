@@ -28,3 +28,17 @@ tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "anthropic"
+required-features = ["anthropic"]
+
+[[example]]
+name = "azure_openai"
+required-features = ["azure"]
+
+[[example]]
+name = "mcp_tools"
+required-features = ["mcp"]
