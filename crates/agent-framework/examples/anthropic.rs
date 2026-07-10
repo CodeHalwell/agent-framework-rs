@@ -20,9 +20,9 @@ async fn main() -> Result<()> {
     let response = agent.run_once("What is the capital of Japan?").await?;
     println!("{}", response.text());
 
-    // Note: structured output is not yet mapped for this provider (see
-    // PARITY.md) -- `ChatOptions::response_format` / `ResponseFormat::JsonSchema`
-    // is silently ignored by `AnthropicClient` today, unlike the OpenAI and
-    // Azure providers.
+    // Note: the Messages API has no native structured-output field, so
+    // `ChatOptions::response_format` is mapped by appending a strict-JSON
+    // instruction (and the schema, for `ResponseFormat::JsonSchema`) to the
+    // system prompt.
     Ok(())
 }

@@ -8,7 +8,7 @@ use agent_framework_core::prelude::*;
 use agent_framework_core::types::{Content, FunctionArguments, FunctionCallContent, Role};
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// A scripted chat client that returns queued responses in order.
 #[derive(Clone)]
@@ -813,4 +813,283 @@ async fn observable_chat_client_is_transparent() {
         .await
         .unwrap();
     assert_eq!(resp.text(), "plain");
+}
+
+// ---------------------------------------------------------------------------
+// Chat & function middleware
+// ---------------------------------------------------------------------------
+
+/// Chat middleware that rewrites every outgoing user message's text.
+struct RewriteUserMessage;
+
+#[async_trait]
+impl Middleware<ChatContext> for RewriteUserMessage {
+    async fn process(&self, mut ctx: ChatContext, next: Next<ChatContext>) -> Result<ChatContext> {
+        for m in &mut ctx.messages {
+            if m.role == Role::user() {
+                *m = ChatMessage::user("REWRITTEN");
+            }
+        }
+        next.run(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn chat_middleware_rewrites_outgoing_message() {
+    let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .chat_middleware(Arc::new(RewriteUserMessage))
+        .build();
+
+    let _ = agent.run_once("original").await.unwrap();
+
+    let seen = seen.lock().unwrap();
+    let last = seen.last().expect("the model should have been called");
+    assert!(
+        last.iter().any(|m| m.text() == "REWRITTEN"),
+        "model did not see the rewritten message: {last:?}"
+    );
+}
+
+/// Chat middleware that short-circuits with a canned response, never letting
+/// the call reach the underlying client.
+struct ShortCircuitChat;
+
+#[async_trait]
+impl Middleware<ChatContext> for ShortCircuitChat {
+    async fn process(&self, mut ctx: ChatContext, _next: Next<ChatContext>) -> Result<ChatContext> {
+        // Deliberately does not call `next.run(ctx)`: the underlying client
+        // must never be invoked.
+        ctx.result = Some(ChatResponse::from_text("canned"));
+        ctx.terminate = true;
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn chat_middleware_short_circuits_model_call() {
+    let client = MockClient::new(vec![ChatResponse::from_text("should not be used")]);
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .chat_middleware(Arc::new(ShortCircuitChat))
+        .build();
+
+    let response = agent.run_once("hi").await.unwrap();
+
+    assert_eq!(response.text(), "canned");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the underlying model must not have been called"
+    );
+}
+
+/// Function middleware that rewrites arguments before execution.
+struct RewriteArgsMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for RewriteArgsMiddleware {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        if let Some(obj) = ctx.arguments.as_object_mut() {
+            obj.insert("a".to_string(), json!(100));
+        }
+        next.run(ctx).await
+    }
+}
+
+fn add_call(a: i64, b: i64) -> ChatResponse {
+    let call = FunctionCallContent::new(
+        "call_1",
+        "add",
+        Some(FunctionArguments::Raw(json!({"a": a, "b": b}).to_string())),
+    );
+    ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_rewrites_arguments() {
+    let client = MockClient::new(vec![add_call(2, 3), ChatResponse::from_text("done")]);
+
+    let seen_args: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let seen_args_clone = seen_args.clone();
+    let add = AiFunction::new(
+        "add",
+        "Add two integers.",
+        json!({"type":"object","properties":{}}),
+        move |args: Value| {
+            let seen_args_clone = seen_args_clone.clone();
+            async move {
+                *seen_args_clone.lock().unwrap() = Some(args.clone());
+                let a = args["a"].as_i64().unwrap_or(0);
+                let b = args["b"].as_i64().unwrap_or(0);
+                Ok(json!(a + b))
+            }
+        },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(client)
+        .tool(add)
+        .function_middleware(Arc::new(RewriteArgsMiddleware))
+        .build();
+
+    let _ = agent.run_once("add 2 and 3").await.unwrap();
+
+    let seen = seen_args
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool should have run");
+    assert_eq!(
+        seen["a"],
+        json!(100),
+        "middleware did not rewrite the argument: {seen:?}"
+    );
+    assert_eq!(seen["b"], json!(3), "unrelated argument must be untouched");
+}
+
+/// Function middleware that blocks execution entirely by short-circuiting
+/// with its own result.
+struct BlockExecutionMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for BlockExecutionMiddleware {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        _next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        ctx.result = Some(json!("blocked"));
+        ctx.terminate = true;
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_blocks_execution() {
+    let client = MockClient::new(vec![add_call(2, 3), ChatResponse::from_text("done")]);
+
+    let invoked = Arc::new(Mutex::new(false));
+    let invoked_clone = invoked.clone();
+    let add = AiFunction::new(
+        "add",
+        "Add two integers.",
+        json!({"type":"object","properties":{}}),
+        move |_args| {
+            let invoked_clone = invoked_clone.clone();
+            async move {
+                *invoked_clone.lock().unwrap() = true;
+                Ok(json!(999))
+            }
+        },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(client)
+        .tool(add)
+        .function_middleware(Arc::new(BlockExecutionMiddleware))
+        .build();
+
+    let response = agent.run_once("add 2 and 3").await.unwrap();
+
+    assert!(!*invoked.lock().unwrap(), "the tool must not have executed");
+    assert!(
+        response
+            .messages
+            .iter()
+            .any(|m| m.contents.iter().any(|c| matches!(
+                c,
+                Content::FunctionResult(fr) if fr.result == Some(json!("blocked"))
+            ))),
+        "the blocked result should still flow through as the tool result: {:?}",
+        response.messages
+    );
+}
+
+/// Records `"{label}-before"`/`"{label}-after"` around `next.run(...)`, so two
+/// instances reveal the pipeline's nesting order.
+struct OrderRecorder {
+    label: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for OrderRecorder {
+    async fn process(
+        &self,
+        ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}-before", self.label));
+        let ctx = next.run(ctx).await?;
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}-after", self.label));
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_order_is_onion_nested() {
+    // Two function middlewares must nest onion-style — first registered is
+    // outermost — matching the ordering convention `MiddlewarePipeline`
+    // already establishes for agent middleware (`Next::run` walks the
+    // registered list front-to-back, invoking the terminal only once every
+    // middleware has called `next`).
+    let client = MockClient::new(vec![
+        ChatResponse {
+            messages: vec![ChatMessage::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call_1",
+                    "noop",
+                    Some(FunctionArguments::Raw("{}".into())),
+                ))],
+            )],
+            finish_reason: Some(FinishReason::tool_calls()),
+            ..Default::default()
+        },
+        ChatResponse::from_text("done"),
+    ]);
+
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let agent = ChatAgent::builder(client)
+        .tool(noop)
+        .function_middleware(Arc::new(OrderRecorder {
+            label: "A",
+            log: log.clone(),
+        }))
+        .function_middleware(Arc::new(OrderRecorder {
+            label: "B",
+            log: log.clone(),
+        }))
+        .build();
+
+    let _ = agent.run_once("go").await.unwrap();
+
+    let log = log.lock().unwrap().clone();
+    assert_eq!(log, vec!["A-before", "B-before", "B-after", "A-after"]);
 }

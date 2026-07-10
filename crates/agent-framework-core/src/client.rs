@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
+use crate::middleware::{FunctionInvocationContext, MiddlewarePipeline, Terminal};
 use crate::tools::{FunctionInvocationConfig, ToolDefinition};
 use crate::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
@@ -76,6 +77,10 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
 pub struct FunctionInvokingChatClient<C: ChatClient> {
     inner: C,
     config: FunctionInvocationConfig,
+    /// Middleware run around every individual tool call (mirrors Python's
+    /// function-middleware pipeline, driven here instead of by a
+    /// `use_function_invocation` decorator).
+    function_middleware: MiddlewarePipeline<FunctionInvocationContext>,
 }
 
 impl<C: ChatClient> FunctionInvokingChatClient<C> {
@@ -83,12 +88,28 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
         Self {
             inner,
             config: FunctionInvocationConfig::default(),
+            function_middleware: MiddlewarePipeline::default(),
         }
     }
 
     /// Override the function-invocation configuration.
     pub fn with_config(mut self, config: FunctionInvocationConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Configure the function-invocation middleware pipeline run around every
+    /// tool call: middleware may inspect/rewrite
+    /// [`FunctionInvocationContext::arguments`], short-circuit execution by
+    /// setting [`FunctionInvocationContext::result`] (and either not calling
+    /// `next`, or setting `terminate = true`), or observe a propagated
+    /// execution error by matching on the `Result` returned from their own
+    /// `next.run(...)` call. Replaces any previously configured middleware.
+    pub fn with_function_middleware(
+        mut self,
+        middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
+    ) -> Self {
+        self.function_middleware = MiddlewarePipeline::new(middleware);
         self
     }
 
@@ -119,15 +140,27 @@ fn executable_tools(options: &ChatOptions) -> Vec<ToolDefinition> {
 /// The exact rejection payload Python emits for a denied tool call.
 const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by user.";
 
-/// Execute a single requested tool call, wrapped in an `execute_tool` span.
+/// Execute a single requested tool call through the function-middleware
+/// pipeline, with the actual invocation (wrapped in an `execute_tool` span)
+/// as the pipeline's terminal handler.
 ///
 /// Returns `(is_error, result)`. `terminate_on_unknown` turns an unknown-tool
-/// call into a hard error (propagated) rather than an error result.
+/// call into a hard error (propagated) rather than an error result. Unknown
+/// tools and unparseable arguments are rejected before middleware ever sees
+/// them (there is no function to hand the pipeline in that case); once a
+/// [`FunctionInvocationContext`] is built, middleware can rewrite
+/// `arguments`, short-circuit by setting `result` (without calling `next`, or
+/// with `terminate = true`), or observe an execution error by matching on the
+/// `Result` their own `next.run(...)` call returns. A propagated error is
+/// converted to the same `(true, FunctionResultContent { exception: .. })`
+/// shape the direct-error path used before middleware existed, so
+/// `include_detailed_errors` behaves identically either way.
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
     include_detailed_errors: bool,
     terminate_on_unknown: bool,
+    function_middleware: &MiddlewarePipeline<FunctionInvocationContext>,
 ) -> Result<(bool, FunctionResultContent)> {
     match tool {
         None => {
@@ -165,25 +198,38 @@ async fn execute_tool_call(
                 }
             };
             let exec = def.executor.as_ref().unwrap().clone();
-            let span = crate::observability::tool_span(&def.name, &call.call_id);
-            let outcome = async move {
-                let result = exec.invoke(args).await;
-                if let Err(e) = &result {
-                    tracing::Span::current().record(
-                        crate::observability::attr::ERROR_TYPE,
-                        crate::observability::error_type(e).as_str(),
-                    );
-                }
-                result
-            }
-            .instrument(span)
-            .await;
-            match outcome {
-                Ok(result) => Ok((
+            let tool_name = def.name.clone();
+            let call_id = call.call_id.clone();
+            let terminal: Terminal<FunctionInvocationContext> = Box::new(move |mut ctx| {
+                Box::pin(async move {
+                    if ctx.terminate {
+                        return Ok(ctx);
+                    }
+                    let span = crate::observability::tool_span(&tool_name, &call_id);
+                    let outcome = async {
+                        let result = exec.invoke(ctx.arguments.clone()).await;
+                        if let Err(e) = &result {
+                            tracing::Span::current().record(
+                                crate::observability::attr::ERROR_TYPE,
+                                crate::observability::error_type(e).as_str(),
+                            );
+                        }
+                        result
+                    }
+                    .instrument(span)
+                    .await;
+                    ctx.result = Some(outcome?);
+                    Ok(ctx)
+                }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
+            });
+
+            let ctx = FunctionInvocationContext::new(call.name.clone(), args);
+            match function_middleware.execute(ctx, terminal).await {
+                Ok(ctx) => Ok((
                     false,
                     FunctionResultContent {
                         call_id: call.call_id.clone(),
-                        result: Some(result),
+                        result: Some(ctx.result.unwrap_or(Value::Null)),
                         exception: None,
                     },
                 )),
@@ -328,6 +374,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         call,
                         self.config.include_detailed_errors,
                         self.config.terminate_on_unknown_calls,
+                        &self.function_middleware,
                     )
                     .await?;
                     had_error |= is_error;
@@ -414,9 +461,16 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 let call = call.clone();
                 let include_detailed_errors = self.config.include_detailed_errors;
                 let terminate_on_unknown = self.config.terminate_on_unknown_calls;
+                let function_middleware = self.function_middleware.clone();
                 async move {
-                    execute_tool_call(tool, &call, include_detailed_errors, terminate_on_unknown)
-                        .await
+                    execute_tool_call(
+                        tool,
+                        &call,
+                        include_detailed_errors,
+                        terminate_on_unknown,
+                        &function_middleware,
+                    )
+                    .await
                 }
             });
 

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Role, TextContent, TextReasoningContent, ToolMode,
-    UriContent, UsageContent, UsageDetails,
+    FunctionCallContent, FunctionResultContent, ResponseFormat, Role, TextContent,
+    TextReasoningContent, ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -24,6 +24,7 @@ pub fn build_request(
     body.insert("max_tokens".into(), json!(max_tokens));
 
     let (system, rest) = extract_system(messages, options.instructions.as_deref());
+    let system = append_response_format_instructions(system, options.response_format.as_ref());
     if let Some(system) = system {
         body.insert("system".into(), json!(system));
     }
@@ -94,6 +95,55 @@ pub fn extract_system<'a>(
     } else {
         (Some(parts.join("\n\n")), rest)
     }
+}
+
+/// Fold a requested [`ResponseFormat`] into the system prompt.
+///
+/// The Anthropic Messages API has **no** native `response_format` /
+/// structured-output parameter — confirmed against the upstream Python
+/// `AnthropicClient._create_run_options` (`agent_framework_anthropic/_chat_client.py`),
+/// which builds its `run_options` dict from `temperature`, `top_p`, `stop`,
+/// `tool_choice`, tools, etc. but never reads `chat_options.response_format`
+/// at all, and against .NET's `Microsoft.Agents.AI.Anthropic` extensions,
+/// which likewise have no `ResponseFormat` handling. So this isn't a Rust
+/// port gap to close by mapping onto a wire field that doesn't exist; it's a
+/// gap in the underlying API. Rather than silently dropping the option (the
+/// previous behavior here, and the *actual* behavior of both reference
+/// implementations today), this appends an explicit natural-language
+/// instruction to the system prompt as a pragmatic, observable fallback:
+///
+/// * [`ResponseFormat::Text`] (or no format): no-op.
+/// * [`ResponseFormat::JsonObject`]: instructs the model to respond with a
+///   bare JSON object.
+/// * [`ResponseFormat::JsonSchema`]: instructs the model to respond with a
+///   JSON object conforming to the embedded schema, and includes the schema
+///   itself (pretty-printed) in the prompt.
+fn append_response_format_instructions(
+    system: Option<String>,
+    format: Option<&ResponseFormat>,
+) -> Option<String> {
+    let instruction = match format {
+        None | Some(ResponseFormat::Text) => return system,
+        Some(ResponseFormat::JsonObject) => {
+            "Respond only with a single valid JSON object. Do not include any \
+             explanation, preamble, or markdown code fences before or after the JSON."
+                .to_string()
+        }
+        Some(ResponseFormat::JsonSchema { name, schema, .. }) => {
+            let pretty =
+                serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
+            format!(
+                "Respond only with a single valid JSON object that conforms exactly to \
+                 the following JSON Schema (named \"{name}\"). Do not include any \
+                 explanation, preamble, or markdown code fences before or after the JSON.\n\n\
+                 JSON Schema:\n{pretty}"
+            )
+        }
+    };
+    Some(match system {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{instruction}"),
+        _ => instruction,
+    })
 }
 
 /// Convert framework messages into Anthropic's `messages` array.
@@ -596,6 +646,71 @@ mod tests {
     fn build_request_uses_given_max_tokens() {
         let body = build_request(&[user("hi")], &ChatOptions::new(), "claude-x", 2048, false);
         assert_eq!(body["max_tokens"], json!(2048));
+    }
+
+    // endregion
+
+    // region: response_format (structured output)
+    //
+    // Anthropic's Messages API has no native `response_format` field (see
+    // `append_response_format_instructions`'s doc comment for the upstream
+    // Python/.NET investigation), so these assert the pragmatic fallback:
+    // the request body's `system` string, rather than a silent no-op.
+
+    #[test]
+    fn build_request_response_format_none_leaves_system_untouched() {
+        let body = build_request(&[user("hi")], &ChatOptions::new(), "claude-x", 4096, false);
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn build_request_response_format_text_is_a_noop() {
+        let mut options = ChatOptions::new();
+        options.response_format = Some(ResponseFormat::Text);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn build_request_response_format_json_object_appends_system_instruction() {
+        let mut options = ChatOptions::new();
+        options.response_format = Some(ResponseFormat::JsonObject);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        let system = body["system"].as_str().expect("system must be a string");
+        assert!(
+            system.to_lowercase().contains("json"),
+            "expected a JSON instruction, got: {system}"
+        );
+    }
+
+    #[test]
+    fn build_request_response_format_json_schema_embeds_schema_in_system() {
+        let mut options = ChatOptions::new();
+        options.response_format = Some(ResponseFormat::json_schema(
+            "Person",
+            json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
+        ));
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        let system = body["system"].as_str().expect("system must be a string");
+        assert!(system.contains("Person"), "system: {system}");
+        assert!(system.contains("\"name\""), "system: {system}");
+        assert!(system.contains("\"type\": \"object\""), "system: {system}");
+    }
+
+    #[test]
+    fn build_request_response_format_json_schema_appends_after_existing_system() {
+        // A leading system message and `response_format` must combine, not
+        // clobber one another.
+        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let mut options = ChatOptions::new();
+        options.response_format = Some(ResponseFormat::JsonObject);
+        let body = build_request(&messages, &options, "claude-x", 4096, false);
+        let system = body["system"].as_str().expect("system must be a string");
+        assert!(
+            system.starts_with("Be terse."),
+            "existing system text must be preserved first: {system}"
+        );
+        assert!(system.to_lowercase().contains("json"), "system: {system}");
     }
 
     // endregion
