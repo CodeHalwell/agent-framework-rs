@@ -1,0 +1,23 @@
+[package]
+name = "agent-framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A Rust implementation of the Microsoft Agent Framework: build AI agents and multi-agent workflows. Meta-crate re-exporting core and providers."
+
+[features]
+default = ["openai"]
+openai = ["dep:agent-framework-openai"]
+
+[dependencies]
+agent-framework-core = { workspace = true }
+agent-framework-openai = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
