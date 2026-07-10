@@ -4,8 +4,10 @@
 
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
+use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
@@ -13,10 +15,10 @@ use crate::error::Result;
 use crate::memory::{AggregateContextProvider, ContextProvider};
 use crate::middleware::{AgentRunContext, MiddlewarePipeline, Terminal};
 use crate::threads::AgentThread;
-use crate::tools::ToolDefinition;
+use crate::tools::{AiFunction, ToolDefinition};
 use crate::types::{
     prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
-    IntoMessages,
+    IntoMessages, ResponseFormat,
 };
 
 /// A boxed stream of agent run updates.
@@ -55,6 +57,10 @@ pub trait Agent: Send + Sync {
 
 /// The primary concrete agent: pairs a chat client with instructions, default
 /// options, tools, context providers, and middleware.
+///
+/// Cheaply cloneable (the client, context providers, and middleware are shared
+/// via `Arc`), which is what makes [`ChatAgent::as_tool`] possible.
+#[derive(Clone)]
 pub struct ChatAgent {
     id: String,
     name: Option<String>,
@@ -63,6 +69,45 @@ pub struct ChatAgent {
     chat_options: ChatOptions,
     context_provider: Option<Arc<AggregateContextProvider>>,
     agent_middleware: MiddlewarePipeline<AgentRunContext>,
+}
+
+/// Options for [`ChatAgent::as_tool`].
+#[derive(Debug, Clone, Default)]
+pub struct AsToolOptions {
+    /// The tool name. Defaults to the agent's name (else its id).
+    pub name: Option<String>,
+    /// The tool description. Defaults to the agent's description (else empty).
+    pub description: Option<String>,
+    /// The single string argument's name. Defaults to `"task"`.
+    pub arg_name: Option<String>,
+    /// The argument's description. Defaults to `"Task for {tool_name}"`.
+    pub arg_description: Option<String>,
+}
+
+impl AsToolOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Set the tool name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    /// Set the tool description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+    /// Set the argument name (default `"task"`).
+    pub fn arg_name(mut self, arg_name: impl Into<String>) -> Self {
+        self.arg_name = Some(arg_name.into());
+        self
+    }
+    /// Set the argument description.
+    pub fn arg_description(mut self, arg_description: impl Into<String>) -> Self {
+        self.arg_description = Some(arg_description.into());
+        self
+    }
 }
 
 impl ChatAgent {
@@ -183,7 +228,50 @@ impl ChatAgent {
     /// Run the agent middleware pipeline with a terminal that calls the chat
     /// client, returning the aggregated response. Shared by `run` and the
     /// middleware path of `run_stream` (thread updates are handled by callers).
+    ///
+    /// Wrapped in an `invoke_agent` span (OTel GenAI semconv). The plain
+    /// token-streaming path does not go through here; that path is observed at
+    /// the chat-client decorator level (see [`crate::observability`]).
     async fn run_core(
+        &self,
+        final_messages: Vec<ChatMessage>,
+        options: ChatOptions,
+        is_streaming: bool,
+    ) -> Result<AgentRunResponse> {
+        let span = crate::observability::agent_span(
+            self.name.as_deref().unwrap_or(self.id.as_str()),
+            &self.id,
+        );
+        async move {
+            let result = self
+                .run_core_inner(final_messages, options, is_streaming)
+                .await;
+            let span = tracing::Span::current();
+            match &result {
+                Ok(response) => {
+                    if let Some(usage) = &response.usage_details {
+                        if let Some(input) = usage.input_token_count {
+                            span.record(crate::observability::attr::INPUT_TOKENS, input);
+                        }
+                        if let Some(output) = usage.output_token_count {
+                            span.record(crate::observability::attr::OUTPUT_TOKENS, output);
+                        }
+                    }
+                }
+                Err(err) => {
+                    span.record(
+                        crate::observability::attr::ERROR_TYPE,
+                        crate::observability::error_type(err).as_str(),
+                    );
+                }
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn run_core_inner(
         &self,
         final_messages: Vec<ChatMessage>,
         options: ChatOptions,
@@ -409,6 +497,11 @@ impl ChatAgentBuilder {
         self.chat_options.max_tokens = Some(max_tokens);
         self
     }
+    /// Request a structured-output response format (e.g. a JSON schema).
+    pub fn response_format(mut self, format: ResponseFormat) -> Self {
+        self.chat_options.response_format = Some(format);
+        self
+    }
     /// Add a tool available to the agent.
     pub fn tool(mut self, tool: ToolDefinition) -> Self {
         self.chat_options.tools.push(tool);
@@ -463,5 +556,61 @@ impl ChatAgent {
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// Wrap this agent as a [`ToolDefinition`] usable by another agent's
+    /// `.tool(...)`. Mirrors Python `BaseAgent.as_tool`.
+    ///
+    /// The tool takes a single string argument (default name `"task"`) and, on
+    /// each call, runs this agent **statelessly** (a fresh thread per call),
+    /// returning the response text.
+    ///
+    /// ```no_run
+    /// # use agent_framework_core::prelude::*;
+    /// # use agent_framework_core::agent::AsToolOptions;
+    /// # fn demo(researcher: ChatAgent, coordinator_client: impl ChatClient + 'static) {
+    /// let research_tool = researcher.as_tool(AsToolOptions::new().name("research"));
+    /// let coordinator = ChatAgent::builder(coordinator_client)
+    ///     .tool(research_tool)
+    ///     .build();
+    /// # let _ = coordinator;
+    /// # }
+    /// ```
+    pub fn as_tool(&self, options: AsToolOptions) -> ToolDefinition {
+        let agent = Arc::new(self.clone());
+        let tool_name = options
+            .name
+            .or_else(|| self.name.clone())
+            .unwrap_or_else(|| self.id.clone());
+        let description = options
+            .description
+            .or_else(|| self.description.clone())
+            .unwrap_or_default();
+        let arg_name = options.arg_name.unwrap_or_else(|| "task".to_string());
+        let arg_description = options
+            .arg_description
+            .unwrap_or_else(|| format!("Task for {tool_name}"));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                arg_name.clone(): { "type": "string", "description": arg_description }
+            },
+            "required": [arg_name.clone()],
+        });
+        let arg_key = arg_name;
+        AiFunction::new(tool_name, description, schema, move |args: Value| {
+            let agent = agent.clone();
+            let arg_key = arg_key.clone();
+            async move {
+                let task = args
+                    .get(&arg_key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let response = agent.run_once(task).await?;
+                Ok(Value::String(response.text()))
+            }
+        })
+        .into_definition()
     }
 }

@@ -83,6 +83,13 @@ impl ChatMessage {
         }
     }
 
+    /// Create a message with a single text content item, from an explicit role.
+    ///
+    /// Parity alias for the Python `ChatMessage(role=…, text=…)` constructor.
+    pub fn from_text(role: impl Into<Role>, text: impl Into<String>) -> Self {
+        Self::new(role, text)
+    }
+
     /// Create a message from a role and explicit content items.
     pub fn with_contents(role: impl Into<Role>, contents: Vec<Content>) -> Self {
         Self {
@@ -120,6 +127,30 @@ impl ChatMessage {
             .filter_map(Content::as_text)
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The function-call content items in this message.
+    pub fn function_calls(&self) -> Vec<&super::content::FunctionCallContent> {
+        self.contents
+            .iter()
+            .filter_map(Content::as_function_call)
+            .collect()
+    }
+
+    /// The function-result content items in this message.
+    pub fn function_results(&self) -> Vec<&super::content::FunctionResultContent> {
+        self.contents
+            .iter()
+            .filter_map(Content::as_function_result)
+            .collect()
+    }
+
+    /// The function-approval request content items in this message.
+    pub fn user_input_requests(&self) -> Vec<&super::content::FunctionApprovalRequestContent> {
+        self.contents
+            .iter()
+            .filter_map(Content::as_function_approval_request)
+            .collect()
     }
 }
 
