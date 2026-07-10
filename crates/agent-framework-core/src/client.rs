@@ -278,15 +278,22 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             return self.inner.get_streaming_response(messages, options).await;
         }
         // With tools, run the full loop then stream the aggregated result.
+        // Each message is replayed as its own update with a stable, distinct
+        // `message_id` so that consumers re-aggregating via
+        // `ChatResponse::from_updates` keep the messages separate rather than
+        // merging the tool-call and final assistant messages by role.
         let response = self.get_response(messages, options).await?;
         let updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(i, m)| {
+                let message_id = m.message_id.clone().or_else(|| Some(format!("replay-{i}")));
                 Ok(ChatResponseUpdate {
                     contents: m.contents,
                     role: Some(m.role),
                     author_name: m.author_name,
+                    message_id,
                     ..Default::default()
                 })
             })

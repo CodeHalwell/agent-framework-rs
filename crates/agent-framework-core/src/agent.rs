@@ -97,16 +97,23 @@ impl ChatAgent {
         // used when there is no agent middleware to honor.
         if self.has_middleware() {
             let response = self.run_core(final_messages, options, true).await?;
-            thread.on_new_messages(input).await?;
+            thread.on_new_messages(input.clone()).await?;
             thread.on_new_messages(response.messages.clone()).await?;
+            if let Some(cp) = self.resolve_provider(&thread) {
+                cp.invoked(&input, &response.messages).await?;
+            }
             let updates: Vec<Result<AgentRunResponseUpdate>> = response
                 .messages
                 .into_iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(i, m)| {
+                    // Distinct message ids keep boundaries when re-aggregated.
+                    let message_id = m.message_id.clone().or_else(|| Some(format!("msg-{i}")));
                     Ok(AgentRunResponseUpdate {
                         contents: m.contents,
                         role: Some(m.role),
                         author_name: m.author_name,
+                        message_id,
                         ..Default::default()
                     })
                 })
@@ -119,9 +126,10 @@ impl ChatAgent {
             .get_streaming_response(final_messages, options)
             .await?;
         let agent_name = self.name.clone();
+        let provider = self.resolve_provider(&thread);
 
         // Wrap the inner stream: forward mapped updates, then update the thread.
-        let stream = async_stream_forward(inner, agent_name, thread, input);
+        let stream = async_stream_forward(inner, agent_name, thread, input, provider);
         Ok(stream.boxed())
     }
 
@@ -215,7 +223,22 @@ impl ChatAgent {
     fn has_middleware(&self) -> bool {
         !self.agent_middleware.is_empty()
     }
+
+    /// The effective context provider for a run: the thread's, else the agent's.
+    fn resolve_provider(&self, thread: &AgentThread) -> Option<Arc<AggregateContextProvider>> {
+        thread
+            .context_provider
+            .clone()
+            .or_else(|| self.context_provider.clone())
+    }
 }
+
+/// State carried while forwarding a chat stream as agent updates.
+type ForwardFinish = Option<(
+    AgentThread,
+    Vec<ChatMessage>,
+    Option<Arc<AggregateContextProvider>>,
+)>;
 
 /// Forward an inner chat stream as agent updates and update the thread on end.
 fn async_stream_forward(
@@ -223,14 +246,16 @@ fn async_stream_forward(
     agent_name: Option<String>,
     thread: AgentThread,
     input: Vec<ChatMessage>,
+    provider: Option<Arc<AggregateContextProvider>>,
 ) -> impl Stream<Item = Result<AgentRunResponseUpdate>> + Send {
     use crate::types::ChatResponse;
+    let finish: ForwardFinish = Some((thread, input, provider));
     futures::stream::unfold(
         (
             inner,
             Vec::<crate::types::ChatResponseUpdate>::new(),
             false,
-            Some((thread, input)),
+            finish,
         ),
         move |(mut inner, mut collected, done, mut finish)| {
             let agent_name = agent_name.clone();
@@ -249,15 +274,22 @@ fn async_stream_forward(
                     }
                     Some(Err(e)) => Some((Err(e), (inner, collected, true, finish))),
                     None => {
-                        // Stream finished: update the thread history. Surface
-                        // any failure as the final item rather than dropping it.
-                        if let Some((mut thread, input)) = finish.take() {
-                            if let Err(e) = thread.on_new_messages(input).await {
+                        // Stream finished: update the thread history and fire the
+                        // provider hook. Surface any failure as the final item
+                        // rather than dropping it.
+                        if let Some((mut thread, input, provider)) = finish.take() {
+                            let response = ChatResponse::from_updates(collected.clone());
+                            if let Err(e) = thread.on_new_messages(input.clone()).await {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
-                            let response = ChatResponse::from_updates(collected.clone());
-                            if let Err(e) = thread.on_new_messages(response.messages).await {
+                            if let Err(e) = thread.on_new_messages(response.messages.clone()).await
+                            {
                                 return Some((Err(e), (inner, collected, true, None)));
+                            }
+                            if let Some(cp) = provider {
+                                if let Err(e) = cp.invoked(&input, &response.messages).await {
+                                    return Some((Err(e), (inner, collected, true, None)));
+                                }
                             }
                         }
                         None
@@ -288,8 +320,13 @@ impl Agent for ChatAgent {
         let response = self.run_core(final_messages, options, false).await?;
 
         // Update thread history.
-        thread.on_new_messages(messages).await?;
+        thread.on_new_messages(messages.clone()).await?;
         thread.on_new_messages(response.messages.clone()).await?;
+
+        // Fire the context provider's completion hook.
+        if let Some(cp) = self.resolve_provider(thread) {
+            cp.invoked(&messages, &response.messages).await?;
+        }
 
         Ok(response)
     }

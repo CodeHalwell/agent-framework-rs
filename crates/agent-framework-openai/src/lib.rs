@@ -30,7 +30,7 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
-    FunctionArguments, FunctionCallContent, Role, TextContent,
+    FunctionArguments, FunctionCallContent, Role, TextContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -326,6 +326,15 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             update.finish_reason = Some(FinishReason::new(fr));
         }
+    }
+
+    // The final chunk (with `stream_options.include_usage`) carries top-level
+    // `usage` and no choices; surface it so streamed runs accumulate token usage
+    // just like non-streaming responses.
+    if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
+        contents.push(Content::Usage(UsageContent {
+            details: convert::parse_usage(usage),
+        }));
     }
 
     if update.role.is_none() {

@@ -194,7 +194,7 @@ fn parse_tool_call(call: &Value) -> Option<FunctionCallContent> {
     ))
 }
 
-fn parse_usage(usage: &Value) -> UsageDetails {
+pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
     UsageDetails {
         input_token_count: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("completion_tokens").and_then(Value::as_u64),

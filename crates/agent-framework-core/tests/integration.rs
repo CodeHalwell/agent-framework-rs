@@ -341,6 +341,91 @@ async fn tool_loop_reports_invalid_arguments() {
         .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))));
 }
 
+/// A context provider that records whether `invoked` fired and injects a tool.
+struct RecordingProvider {
+    invoked: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl ContextProvider for RecordingProvider {
+    async fn invoking(&self, _messages: &[ChatMessage]) -> Result<Context> {
+        Ok(Context::new().with_instructions("remember: be brief"))
+    }
+    async fn invoked(&self, _request: &[ChatMessage], _response: &[ChatMessage]) -> Result<()> {
+        *self.invoked.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn context_provider_invoked_hook_fires() {
+    let invoked = Arc::new(Mutex::new(false));
+    let provider = RecordingProvider {
+        invoked: invoked.clone(),
+    };
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+
+    let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
+    let agent = ChatAgent::builder(client)
+        .context_provider(aggregate)
+        .build();
+
+    let _ = agent.run_once("hi").await.unwrap();
+    assert!(
+        *invoked.lock().unwrap(),
+        "invoked hook was not called after run"
+    );
+}
+
+#[tokio::test]
+async fn streaming_tool_replay_preserves_message_boundaries() {
+    // Tool call, then final answer — two assistant messages that must NOT be
+    // merged when the streamed updates are re-aggregated.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("final answer");
+
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("done")) },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(noop)
+        .build();
+
+    let mut stream = agent.run_stream("go", None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    // Re-aggregate exactly as a downstream consumer would.
+    let aggregated = AgentRunResponse::from_updates(updates);
+    // The final answer must appear as its own assistant message, not merged
+    // into the earlier tool-call message.
+    let final_msg = aggregated.messages.last().unwrap();
+    assert_eq!(final_msg.text(), "final answer");
+    assert!(
+        final_msg
+            .contents
+            .iter()
+            .all(|c| !matches!(c, Content::FunctionCall(_))),
+        "final message was merged with the tool-call message"
+    );
+}
+
 #[tokio::test]
 async fn workflow_errors_on_max_iterations() {
     use agent_framework_core::workflow::{FunctionExecutor, WorkflowBuilder};
