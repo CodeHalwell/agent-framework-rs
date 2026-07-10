@@ -36,7 +36,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Azure OpenAI (API key) | ✅ | ✅ | ✅ done | `agent-framework-azure::AzureOpenAIClient::new` |
 | Azure OpenAI (Entra ID / bearer token) | ✅ | ✅ | 🚧 partial | `TokenCredential` trait + `StaticTokenCredential` (fixed token) ship; a real Entra ID credential chain (wrapping e.g. `azure_identity`) is left to the caller |
 | Anthropic Messages API | ✅ | ✅ | ✅ done | `agent-framework-anthropic::AnthropicClient`, hand-rolled (no Anthropic SDK dependency) |
-| Anthropic structured output | ✅ | ✅ | ❌ not yet | `ChatOptions::response_format` is silently ignored by `AnthropicClient` — `convert::build_request` never reads it |
+| Anthropic structured output | 🚧 (`response_format` is accepted but `_create_run_options` never reads it — the Messages API has no native equivalent) | 🚧 (`Microsoft.Agents.AI.Anthropic` has no `ResponseFormat` handling either) | 🚧 partial | `convert::build_request` now maps `JsonObject`/`JsonSchema` onto an appended system-prompt instruction (schema included, pretty-printed, for `JsonSchema`); `Text`/unset is a no-op. A pragmatic fallback, not a silent drop — there is no native wire field to map onto in any of the three implementations |
 | `response.parse_json::<T>()` helper | ✅ (`response.value`) | ✅ | ✅ done | on both `ChatResponse` and `AgentRunResponse` |
 | Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ❌ not yet | no provider (`OpenAIClient`, `AnthropicClient`, `AzureOpenAIClient`) retries a failed request; a caller-supplied middleware or wrapper `ChatClient` would need to add one |
 
@@ -50,7 +50,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | `ChatMessageStore` / `InMemoryChatMessageStore` | ✅ | ✅ | ✅ done | |
 | `agent.as_tool()` | ✅ | ✅ | ✅ done | `ChatAgent::as_tool` + `AsToolOptions`; runs the wrapped agent statelessly |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | `orchestration::workflow_agent::WorkflowAgent`, `WorkflowAgentExt::as_agent` |
-| WorkflowAgent thread-history updates | ✅ | ✅ | ❌ not yet | `WorkflowAgent::run`'s `thread: Option<&mut AgentThread>` parameter is unused — a run never writes back to the caller's thread, unlike `ChatAgent::run` |
+| WorkflowAgent thread-history updates | ✅ | ✅ | ✅ done | `WorkflowAgent::run` now notifies `thread` of both the input and response message sets after each run (plus a `run_stream_with_thread` variant for the streaming path), matching `ChatAgent::run`'s write-back convention — a write-back only, same as Python: prior thread history is not read back into the workflow's own input |
 
 ## Tools & MCP
 
@@ -70,8 +70,8 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | Agent middleware pipeline | ✅ | ✅ | ✅ done | `middleware::{Middleware, MiddlewarePipeline, Next}`, wired into `ChatAgent::run`/`run_stream` |
-| Chat middleware pipeline | ✅ | ✅ | 🚧 partial | `ChatContext` + the `Middleware<ChatContext>` type alias exist, but nothing currently wires a chat-middleware pipeline into a `ChatClient` call path |
-| Function-invocation middleware pipeline | ✅ | ✅ | 🚧 partial | `FunctionInvocationContext` type exists; `FunctionInvokingChatClient` does not yet run calls through it |
+| Chat middleware pipeline | ✅ | ✅ | 🚧 partial | `ChatAgentBuilder::chat_middleware(..)` wires a `MiddlewarePipeline<ChatContext>` around the chat-client call in `ChatAgent::run`/`run_once` (and in `run_stream` whenever agent middleware is also configured, since that path funnels through the same non-streaming call and replays as updates) — full interception including short-circuit. The plain per-token `run_stream` path (no agent middleware) only applies chat middleware for *pre-call* mutation of `messages`/`chat_options`; a real token stream can't flow back through `ChatContext::result` (typed for a complete `ChatResponse`), so post-call middleware logic and `terminate`/`result` short-circuiting are not honored there — this mirrors upstream Python's `use_chat_middleware`, whose streaming path likewise hands middleware an unconsumed async generator rather than driving it through the pipeline |
+| Function-invocation middleware pipeline | ✅ | ✅ | ✅ done | `FunctionInvokingChatClient::with_function_middleware(..)` (plumbed automatically from `ChatAgentBuilder::function_middleware(..)`) runs every tool call through a `MiddlewarePipeline<FunctionInvocationContext>`: middleware may rewrite arguments, short-circuit with its own result, or observe a propagated execution error via the `Result` from their own `next.run(...)` call |
 | `ContextProvider` / `AggregateContextProvider` | ✅ | ✅ | ✅ done | `memory::ContextProvider`, fan-out/merge over multiple providers |
 | Mem0-backed memory provider | ✅ (`mem0` package) | ✅ (`Microsoft.Agents.AI.Mem0`) | ❌ not yet | |
 | Redis-backed memory / thread store | ✅ (`redis` package) | not found | ❌ not yet | |
@@ -128,9 +128,8 @@ These are the gaps the maintainers consider worth calling out explicitly (either
 
 - **MCP**: no WebSocket transport, no prompts capability, no sampling/roots callback handling.
 - **Magentic**: no human-in-the-loop plan-review pause (Python-only feature; not even present in .NET's Workflows package).
-- **WorkflowAgent**: does not update the caller's `AgentThread` history after a run.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only — no local emulation, provider must support them server-side.
 - **Ecosystem**: no A2A, AG-UI, DevUI, hosting integrations, declarative/YAML definitions, or CopilotStudio.
-- **Anthropic**: `ResponseFormat`/structured output is not mapped onto the Messages API.
+- **Anthropic**: `ResponseFormat`/structured output has no native Messages API field to map onto (true of Python and .NET too); the Rust client now falls back to an appended system-prompt instruction rather than silently dropping the option.
 - **Reliability**: no built-in retry/backoff policy layer for any provider.
 - **Checkpointing**: resuming from a checkpoint does not validate that the workflow graph matches the one the checkpoint was taken from.
