@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-framework-core",
+    "crates/agent-framework-openai",
+    "crates/agent-framework",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/codehalwell/agent-framework-rs"
+authors = ["agent-framework-rs contributors"]
+description = "A Rust implementation of the Microsoft Agent Framework for building AI agents and multi-agent workflows"
+keywords = ["ai", "agents", "llm", "workflow", "openai"]
+categories = ["asynchronous", "api-bindings"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+schemars = "0.8"
+bytes = "1"
+tokio-stream = "0.1"
+pin-project-lite = "0.2"
+
+agent-framework-core = { path = "crates/agent-framework-core", version = "0.1.0" }
+agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
