@@ -18,7 +18,7 @@
 //!   from its tools: the core `Agent` trait exposes no tool list. Callers can
 //!   override via [`A2ARouter::skill`].
 //! - Every `message/send` completes synchronously into a terminal `completed`
-//!   [`Task`]; there is no `working`/`input-required` lifecycle. Consequently
+//!   `Task`; there is no `working`/`input-required` lifecycle. Consequently
 //!   `tasks/cancel` on a known task returns `TaskNotCancelableError` (-32002).
 //! - `TaskStatus.timestamp` (optional in the spec) is omitted.
 

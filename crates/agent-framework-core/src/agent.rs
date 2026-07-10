@@ -616,7 +616,7 @@ impl ChatAgentBuilder {
     }
     /// Add a chat middleware, run around the underlying chat-client call on
     /// every request (repeatable, like [`ChatAgentBuilder::middleware`]).
-    /// See [`ChatAgent::call_chat_client`] for exactly what it can observe
+    /// See the chat-client call pipeline for exactly what it can observe
     /// and mutate.
     pub fn chat_middleware(mut self, mw: Arc<crate::middleware::ChatMiddleware>) -> Self {
         self.chat_middleware.push(mw);

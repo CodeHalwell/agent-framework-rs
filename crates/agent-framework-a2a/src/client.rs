@@ -198,7 +198,7 @@ impl A2AClient {
     /// Server-Sent-Events.
     ///
     /// This is lower-level than [`Self::send_message`]:
-    /// [`crate::A2AAgent::run`] does not use it (see the crate docs for why),
+    /// `A2AAgent::run` does not use it (see the crate docs for why),
     /// but it's available for callers that want incremental updates.
     pub async fn send_message_stream(&self, params: MessageSendParams) -> Result<A2AEventStream> {
         let url = self.rpc_url().await;

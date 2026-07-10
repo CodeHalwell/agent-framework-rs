@@ -29,7 +29,7 @@ use crate::error::{DeclarativeError, Result};
 
 /// A declarative workflow specification (`kind: Workflow`).
 ///
-/// Either [`WorkflowSpec::r#type`] (orchestration shorthand) or
+/// Either the `type` field (orchestration shorthand) or
 /// [`WorkflowSpec::nodes`] (explicit graph) must be provided.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
