@@ -1,0 +1,891 @@
+//! Magentic-One style orchestration: a manager gathers facts and a plan, then
+//! coordinates participants round by round via a structured progress ledger,
+//! replanning on stalls. Rust analogue of `_magentic.py`.
+//!
+//! The [`StandardMagenticManager`] drives an LLM ([`Agent`]) with the ported
+//! Magentic-One prompts to plan, produce a JSON progress ledger each round,
+//! replan on stall, and synthesize the final answer. The [`MagenticManager`]
+//! trait lets callers supply a fully custom manager.
+//!
+//! Divergences from Python (documented): a single orchestrator [`Executor`]
+//! drives the loop and calls participants via [`Agent::run`] directly (Python
+//! wires a graph of agent nodes); human-in-the-loop plan review / stall
+//! intervention is **not** ported (future work); the progress-ledger retry loop
+//! has no backoff sleep.
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{ensure_author, parse_conversation, run_agent_and_emit};
+use crate::agent::Agent;
+use crate::error::{Error, Result};
+use crate::types::{AgentRunResponse, ChatMessage, Role};
+use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent};
+
+/// The author name used for orchestrator/manager-generated messages.
+pub const MAGENTIC_MANAGER_NAME: &str = "magentic_manager";
+
+// region Magentic One prompts (ported verbatim from `_magentic.py`)
+
+/// Facts pre-survey prompt. Placeholder: `{task}`.
+pub const ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT: &str = r#"Below I will present you a request.
+
+Before we begin addressing the request, please answer the following pre-survey to the best of your ability.
+Keep in mind that you are Ken Jennings-level with trivia, and Mensa-level with puzzles, so there should be
+a deep well to draw from.
+
+Here is the request:
+
+{task}
+
+Here is the pre-survey:
+
+    1. Please list any specific facts or figures that are GIVEN in the request itself. It is possible that
+       there are none.
+    2. Please list any facts that may need to be looked up, and WHERE SPECIFICALLY they might be found.
+       In some cases, authoritative sources are mentioned in the request itself.
+    3. Please list any facts that may need to be derived (e.g., via logical deduction, simulation, or computation)
+    4. Please list any facts that are recalled from memory, hunches, well-reasoned guesses, etc.
+
+When answering this survey, keep in mind that "facts" will typically be specific names, dates, statistics, etc.
+Your answer should use headings:
+
+    1. GIVEN OR VERIFIED FACTS
+    2. FACTS TO LOOK UP
+    3. FACTS TO DERIVE
+    4. EDUCATED GUESSES
+
+DO NOT include any other headings or sections in your response. DO NOT list next steps or plans until asked to do so.
+"#;
+
+/// Plan prompt. Placeholder: `{team}`.
+pub const ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT: &str = r#"Fantastic. To address this request we have assembled the following team:
+
+{team}
+
+Based on the team composition, and known and unknown facts, please devise a short bullet-point plan for addressing the
+original request. Remember, there is no requirement to involve all team members. A team member's particular expertise
+may not be needed for this task.
+"#;
+
+/// Combined task-ledger render. Placeholders: `{task}`, `{team}`, `{facts}`, `{plan}`.
+pub const ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT: &str = r#"
+We are working to address the following user request:
+
+{task}
+
+
+To answer this request we have assembled the following team:
+
+{team}
+
+
+Here is an initial fact sheet to consider:
+
+{facts}
+
+
+Here is the plan to follow as best as possible:
+
+{plan}
+"#;
+
+/// Facts-update prompt used on replan. Placeholders: `{task}`, `{old_facts}`.
+pub const ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT: &str = r#"As a reminder, we are working to solve the following task:
+
+{task}
+
+It is clear we are not making as much progress as we would like, but we may have learned something new.
+Please rewrite the following fact sheet, updating it to include anything new we have learned that may be helpful.
+
+Example edits can include (but are not limited to) adding new guesses, moving educated guesses to verified facts
+if appropriate, etc. Updates may be made to any section of the fact sheet, and more than one section of the fact
+sheet can be edited. This is an especially good time to update educated guesses, so please at least add or update
+one educated guess or hunch, and explain your reasoning.
+
+Here is the old fact sheet:
+
+{old_facts}
+"#;
+
+/// Plan-update prompt used on replan. Placeholder: `{team}`.
+pub const ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT: &str = r#"Please briefly explain what went wrong on this last run
+(the root cause of the failure), and then come up with a new plan that takes steps and includes hints to overcome prior
+challenges and especially avoids repeating the same mistakes. As before, the new plan should be concise, expressed in
+bullet-point form, and consider the following team composition:
+
+{team}
+"#;
+
+/// Progress-ledger prompt requesting structured JSON. Placeholders: `{task}`,
+/// `{team}`, `{names}`.
+pub const ORCHESTRATOR_PROGRESS_LEDGER_PROMPT: &str = r#"
+Recall we are working on the following request:
+
+{task}
+
+And we have assembled the following team:
+
+{team}
+
+To make progress on the request, please answer the following questions, including necessary reasoning:
+
+    - Is the request fully satisfied? (True if complete, or False if the original request has yet to be
+      SUCCESSFULLY and FULLY addressed)
+    - Are we in a loop where we are repeating the same requests and or getting the same responses as before?
+      Loops can span multiple turns, and can include repeated actions like scrolling up or down more than a
+      handful of times.
+    - Are we making forward progress? (True if just starting, or recent messages are adding value. False if recent
+      messages show evidence of being stuck in a loop or if there is evidence of significant barriers to success
+      such as the inability to read from a required file)
+    - Who should speak next? (select from: {names})
+    - What instruction or question would you give this team member? (Phrase as if speaking directly to them, and
+      include any specific information they may need)
+
+Please output an answer in pure JSON format according to the following schema. The JSON object must be parsable as-is.
+DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
+
+{
+    "is_request_satisfied": {
+
+        "reason": string,
+        "answer": boolean
+    },
+    "is_in_loop": {
+        "reason": string,
+        "answer": boolean
+    },
+    "is_progress_being_made": {
+        "reason": string,
+        "answer": boolean
+    },
+    "next_speaker": {
+        "reason": string,
+        "answer": string (select from: {names})
+    },
+    "instruction_or_question": {
+        "reason": string,
+        "answer": string
+    }
+}
+"#;
+
+/// Final-answer synthesis prompt. Placeholder: `{task}`.
+pub const ORCHESTRATOR_FINAL_ANSWER_PROMPT: &str = r#"
+We are working on the following task:
+{task}
+
+We have completed the task.
+
+The above messages contain the conversation that took place to complete the task.
+
+Based on the information gathered, provide the final answer to the original request.
+The answer should be phrased as if you were speaking to the user.
+"#;
+
+// endregion
+
+/// Render a participant roster as `- name: description` lines. Rust analogue of
+/// `_team_block`.
+fn team_block(participants: &[(String, String)]) -> String {
+    participants
+        .iter()
+        .map(|(name, desc)| format!("- {name}: {desc}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Find the most recent assistant message. Rust analogue of `_first_assistant`.
+fn first_assistant(messages: &[ChatMessage]) -> Option<ChatMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::assistant())
+        .cloned()
+}
+
+/// Extract the first balanced JSON object from model output. Rust analogue of
+/// `_extract_json` (fenced blocks are handled implicitly by scanning for the
+/// first `{...}`).
+fn extract_json(text: &str) -> Result<Value> {
+    let start = text
+        .find('{')
+        .ok_or_else(|| Error::Workflow("no JSON object found in model output".into()))?;
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, ch) in text[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or_else(|| Error::Workflow("unbalanced JSON braces".into()))?;
+    let candidate = &text[start..end];
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(candidate) {
+        return Ok(v);
+    }
+    // Tolerate Python-style literals.
+    let fixed = candidate
+        .replace("True", "true")
+        .replace("False", "false")
+        .replace("None", "null");
+    match serde_json::from_str::<Value>(&fixed) {
+        Ok(v @ Value::Object(_)) => Ok(v),
+        _ => Err(Error::Workflow(
+            "unable to parse JSON from model output".into(),
+        )),
+    }
+}
+
+/// A single progress-ledger field: a reason plus a boolean or string answer.
+/// Rust analogue of `_MagenticProgressLedgerItem`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticProgressLedgerItem {
+    /// The model's reasoning for this field.
+    #[serde(default)]
+    pub reason: String,
+    /// The answer, either a boolean (for the yes/no fields) or a string.
+    #[serde(default)]
+    pub answer: Value,
+}
+
+impl MagenticProgressLedgerItem {
+    /// Interpret the answer as a boolean (defaulting to `false`).
+    pub fn answer_bool(&self) -> bool {
+        match &self.answer {
+            Value::Bool(b) => *b,
+            Value::String(s) => matches!(s.trim().to_lowercase().as_str(), "true" | "yes"),
+            _ => false,
+        }
+    }
+
+    /// Interpret the answer as a string (defaulting to empty).
+    pub fn answer_str(&self) -> String {
+        match &self.answer {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// The structured progress ledger produced each round. Rust analogue of
+/// `_MagenticProgressLedger`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticProgressLedger {
+    /// Whether the original request is fully satisfied.
+    pub is_request_satisfied: MagenticProgressLedgerItem,
+    /// Whether the team is stuck repeating itself.
+    pub is_in_loop: MagenticProgressLedgerItem,
+    /// Whether forward progress is being made.
+    pub is_progress_being_made: MagenticProgressLedgerItem,
+    /// Who should speak next.
+    pub next_speaker: MagenticProgressLedgerItem,
+    /// The instruction or question for the next speaker.
+    pub instruction_or_question: MagenticProgressLedgerItem,
+}
+
+/// Facts + plan captured for a run. Rust analogue of `_MagenticTaskLedger`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticTaskLedger {
+    /// The fact sheet message.
+    pub facts: ChatMessage,
+    /// The plan message.
+    pub plan: ChatMessage,
+}
+
+/// Mutable state threaded through the Magentic manager and orchestrator. Rust
+/// analogue of `MagenticContext`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticContext {
+    /// The task message.
+    pub task: ChatMessage,
+    /// The running conversation history.
+    pub chat_history: Vec<ChatMessage>,
+    /// Participants as `(name, description)` pairs.
+    pub participant_descriptions: Vec<(String, String)>,
+    /// The number of coordination rounds taken.
+    pub round_count: usize,
+    /// The consecutive stall count.
+    pub stall_count: usize,
+    /// The number of replans performed.
+    pub reset_count: usize,
+}
+
+impl MagenticContext {
+    /// Create a fresh context for `task` and `participants`.
+    pub fn new(task: ChatMessage, participant_descriptions: Vec<(String, String)>) -> Self {
+        Self {
+            task,
+            chat_history: Vec::new(),
+            participant_descriptions,
+            round_count: 0,
+            stall_count: 0,
+            reset_count: 0,
+        }
+    }
+
+    /// Clear the chat history and reset the stall count, incrementing the reset
+    /// count. Preserves the task, round count, and participants. Rust analogue
+    /// of `MagenticContext.reset`.
+    pub fn reset(&mut self) {
+        self.chat_history.clear();
+        self.stall_count = 0;
+        self.reset_count += 1;
+    }
+}
+
+/// The Magentic manager interface: planning, replanning, progress evaluation,
+/// and final-answer synthesis. Rust analogue of `MagenticManagerBase`.
+#[async_trait]
+pub trait MagenticManager: Send + Sync {
+    /// Gather facts and produce the initial plan (returns the combined ledger).
+    async fn plan(&self, context: &MagenticContext) -> Result<ChatMessage>;
+
+    /// Update facts and plan after a stall (returns the combined ledger).
+    async fn replan(&self, context: &MagenticContext) -> Result<ChatMessage>;
+
+    /// Produce the structured progress ledger for the current round.
+    async fn create_progress_ledger(
+        &self,
+        context: &MagenticContext,
+    ) -> Result<MagenticProgressLedger>;
+
+    /// Synthesize the final answer addressed to the user.
+    async fn prepare_final_answer(&self, context: &MagenticContext) -> Result<ChatMessage>;
+
+    /// The stall threshold that triggers a replan.
+    fn max_stall_count(&self) -> usize {
+        3
+    }
+
+    /// The maximum number of replans, if bounded.
+    fn max_reset_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// The maximum number of rounds, if bounded.
+    fn max_round_count(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
+pub struct StandardMagenticManager {
+    agent: Arc<dyn Agent>,
+    task_ledger: Mutex<Option<MagenticTaskLedger>>,
+    max_stall_count: usize,
+    max_reset_count: Option<usize>,
+    max_round_count: Option<usize>,
+    progress_ledger_retry_count: usize,
+}
+
+impl StandardMagenticManager {
+    /// Create a manager driven by `agent`.
+    pub fn new(agent: Arc<dyn Agent>) -> Self {
+        Self {
+            agent,
+            task_ledger: Mutex::new(None),
+            max_stall_count: 3,
+            max_reset_count: None,
+            max_round_count: None,
+            progress_ledger_retry_count: 3,
+        }
+    }
+
+    /// Set the stall threshold (default 3).
+    pub fn max_stall_count(mut self, n: usize) -> Self {
+        self.max_stall_count = n;
+        self
+    }
+
+    /// Set the maximum number of replans (default unbounded).
+    pub fn max_reset_count(mut self, n: usize) -> Self {
+        self.max_reset_count = Some(n);
+        self
+    }
+
+    /// Set the maximum number of rounds (default unbounded).
+    pub fn max_round_count(mut self, n: usize) -> Self {
+        self.max_round_count = Some(n);
+        self
+    }
+
+    /// Set the progress-ledger parse retry budget (default 3).
+    pub fn progress_ledger_retry_count(mut self, n: usize) -> Self {
+        self.progress_ledger_retry_count = n.max(1);
+        self
+    }
+
+    /// The current task ledger, if planning has run.
+    pub fn task_ledger(&self) -> Option<MagenticTaskLedger> {
+        self.task_ledger.lock().unwrap().clone()
+    }
+
+    /// Run the underlying agent and return the last message, tagged as the
+    /// manager. Rust analogue of `_complete`.
+    async fn complete(&self, messages: Vec<ChatMessage>) -> Result<ChatMessage> {
+        let response = self.agent.run(messages, None).await?;
+        if let Some(last) = response.messages.last() {
+            Ok(ChatMessage {
+                role: last.role.clone(),
+                contents: vec![crate::types::Content::text(last.text())],
+                author_name: last
+                    .author_name
+                    .clone()
+                    .or_else(|| Some(MAGENTIC_MANAGER_NAME.to_string())),
+                message_id: None,
+                additional_properties: Default::default(),
+            })
+        } else {
+            Ok(ensure_author(
+                ChatMessage::assistant("No output produced."),
+                MAGENTIC_MANAGER_NAME,
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl MagenticManager for StandardMagenticManager {
+    async fn plan(&self, context: &MagenticContext) -> Result<ChatMessage> {
+        let task_text = context.task.text();
+        let team_text = team_block(&context.participant_descriptions);
+
+        let facts_user =
+            ChatMessage::user(ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT.replace("{task}", &task_text));
+        let mut facts_msgs = context.chat_history.clone();
+        facts_msgs.push(facts_user.clone());
+        let facts_msg = self.complete(facts_msgs).await?;
+
+        let plan_user =
+            ChatMessage::user(ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT.replace("{team}", &team_text));
+        let mut plan_msgs = context.chat_history.clone();
+        plan_msgs.extend([facts_user, facts_msg.clone(), plan_user]);
+        let plan_msg = self.complete(plan_msgs).await?;
+
+        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+            facts: facts_msg.clone(),
+            plan: plan_msg.clone(),
+        });
+
+        let combined = ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT
+            .replace("{task}", &task_text)
+            .replace("{team}", &team_text)
+            .replace("{facts}", &facts_msg.text())
+            .replace("{plan}", &plan_msg.text());
+        Ok(ensure_author(
+            ChatMessage::assistant(combined),
+            MAGENTIC_MANAGER_NAME,
+        ))
+    }
+
+    async fn replan(&self, context: &MagenticContext) -> Result<ChatMessage> {
+        let ledger = self
+            .task_ledger
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::Workflow("replan() called before plan()".into()))?;
+        let task_text = context.task.text();
+        let team_text = team_block(&context.participant_descriptions);
+
+        let facts_update_user = ChatMessage::user(
+            ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT
+                .replace("{task}", &task_text)
+                .replace("{old_facts}", &ledger.facts.text()),
+        );
+        let mut facts_msgs = context.chat_history.clone();
+        facts_msgs.push(facts_update_user.clone());
+        let updated_facts = self.complete(facts_msgs).await?;
+
+        let plan_update_user = ChatMessage::user(
+            ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT.replace("{team}", &team_text),
+        );
+        let mut plan_msgs = context.chat_history.clone();
+        plan_msgs.extend([facts_update_user, updated_facts.clone(), plan_update_user]);
+        let updated_plan = self.complete(plan_msgs).await?;
+
+        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+            facts: updated_facts.clone(),
+            plan: updated_plan.clone(),
+        });
+
+        let combined = ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT
+            .replace("{task}", &task_text)
+            .replace("{team}", &team_text)
+            .replace("{facts}", &updated_facts.text())
+            .replace("{plan}", &updated_plan.text());
+        Ok(ensure_author(
+            ChatMessage::assistant(combined),
+            MAGENTIC_MANAGER_NAME,
+        ))
+    }
+
+    async fn create_progress_ledger(
+        &self,
+        context: &MagenticContext,
+    ) -> Result<MagenticProgressLedger> {
+        let names: Vec<String> = context
+            .participant_descriptions
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        if names.is_empty() {
+            return Err(Error::Workflow(
+                "no participants configured; cannot determine next speaker".into(),
+            ));
+        }
+        let names_csv = names.join(", ");
+        let team_text = team_block(&context.participant_descriptions);
+        let prompt = ORCHESTRATOR_PROGRESS_LEDGER_PROMPT
+            .replace("{task}", &context.task.text())
+            .replace("{team}", &team_text)
+            .replace("{names}", &names_csv);
+        let user = ChatMessage::user(prompt);
+
+        let mut last_error = None;
+        for _ in 0..self.progress_ledger_retry_count {
+            let mut msgs = context.chat_history.clone();
+            msgs.push(user.clone());
+            let raw = self.complete(msgs).await?;
+            match extract_json(&raw.text()).and_then(|v| {
+                serde_json::from_value::<MagenticProgressLedger>(v)
+                    .map_err(|e| Error::Workflow(format!("invalid progress ledger: {e}")))
+            }) {
+                Ok(ledger) => return Ok(ledger),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(Error::Workflow(format!(
+            "progress ledger parse failed after {} attempt(s): {}",
+            self.progress_ledger_retry_count,
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        )))
+    }
+
+    async fn prepare_final_answer(&self, context: &MagenticContext) -> Result<ChatMessage> {
+        let prompt = ORCHESTRATOR_FINAL_ANSWER_PROMPT.replace("{task}", &context.task.text());
+        let mut msgs = context.chat_history.clone();
+        msgs.push(ChatMessage::user(prompt));
+        let response = self.complete(msgs).await?;
+        Ok(ensure_author(
+            ChatMessage::assistant(response.text()),
+            MAGENTIC_MANAGER_NAME,
+        ))
+    }
+
+    fn max_stall_count(&self) -> usize {
+        self.max_stall_count
+    }
+    fn max_reset_count(&self) -> Option<usize> {
+        self.max_reset_count
+    }
+    fn max_round_count(&self) -> Option<usize> {
+        self.max_round_count
+    }
+}
+
+/// The single executor that drives the Magentic loop.
+struct MagenticOrchestrator {
+    id: String,
+    manager: Arc<dyn MagenticManager>,
+    participants: Vec<(String, Arc<dyn Agent>)>,
+    descriptions: Vec<(String, String)>,
+    max_stall_count: usize,
+    max_reset_count: Option<usize>,
+    max_round_count: Option<usize>,
+}
+
+impl MagenticOrchestrator {
+    fn find(&self, name: &str) -> Option<&Arc<dyn Agent>> {
+        self.participants
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, a)| a)
+    }
+
+    fn emit_orchestrator_message(&self, ctx: &WorkflowContext, message: &ChatMessage) {
+        if let Ok(update) = serde_json::to_value(message) {
+            ctx.add_event(WorkflowEvent::AgentRunUpdate {
+                executor_id: self.id.clone(),
+                update,
+            });
+        }
+    }
+
+    async fn reset_and_replan(
+        &self,
+        mctx: &mut MagenticContext,
+        ctx: &WorkflowContext,
+    ) -> Result<()> {
+        mctx.reset();
+        let task_ledger = self.manager.replan(mctx).await?;
+        mctx.chat_history.push(task_ledger.clone());
+        self.emit_orchestrator_message(ctx, &task_ledger);
+        Ok(())
+    }
+
+    async fn yield_messages(
+        &self,
+        ctx: &WorkflowContext,
+        messages: Vec<ChatMessage>,
+    ) -> Result<()> {
+        let payload = serde_json::to_value(&messages)
+            .map_err(|e| Error::Workflow(format!("serialize error: {e}")))?;
+        ctx.yield_output(payload).await
+    }
+}
+
+#[async_trait]
+impl Executor for MagenticOrchestrator {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
+        let input = parse_conversation(&message)?;
+        let task = input
+            .last()
+            .cloned()
+            .ok_or_else(|| Error::Workflow("magentic requires a task message".into()))?;
+
+        let mut mctx = MagenticContext::new(task.clone(), self.descriptions.clone());
+        mctx.chat_history = input;
+        self.emit_orchestrator_message(&ctx, &task);
+
+        // Initial planning.
+        let task_ledger = self.manager.plan(&mctx).await?;
+        mctx.chat_history.push(task_ledger.clone());
+        self.emit_orchestrator_message(&ctx, &task_ledger);
+
+        loop {
+            // Limit checks (before incrementing the round, mirroring Python).
+            let hit_round = self.max_round_count.is_some_and(|m| mctx.round_count >= m);
+            let hit_reset = self.max_reset_count.is_some_and(|m| mctx.reset_count >= m);
+            if hit_round || hit_reset {
+                let limit = if hit_round { "round" } else { "reset" };
+                let partial = first_assistant(&mctx.chat_history).unwrap_or_else(|| {
+                    ensure_author(
+                        ChatMessage::assistant(format!(
+                            "Stopped due to {limit} limit. No partial result available."
+                        )),
+                        MAGENTIC_MANAGER_NAME,
+                    )
+                });
+                return self.yield_messages(&ctx, vec![partial]).await;
+            }
+
+            mctx.round_count += 1;
+
+            let ledger = match self.manager.create_progress_ledger(&mctx).await {
+                Ok(l) => l,
+                Err(_) => {
+                    self.reset_and_replan(&mut mctx, &ctx).await?;
+                    continue;
+                }
+            };
+
+            if ledger.is_request_satisfied.answer_bool() {
+                let final_answer = self.manager.prepare_final_answer(&mctx).await?;
+                return self.yield_messages(&ctx, vec![final_answer]).await;
+            }
+
+            if !ledger.is_progress_being_made.answer_bool() || ledger.is_in_loop.answer_bool() {
+                mctx.stall_count += 1;
+            } else {
+                mctx.stall_count = mctx.stall_count.saturating_sub(1);
+            }
+
+            if mctx.stall_count > self.max_stall_count {
+                self.reset_and_replan(&mut mctx, &ctx).await?;
+                continue;
+            }
+
+            let next = ledger.next_speaker.answer_str();
+            if self.find(&next).is_none() {
+                let final_answer = self.manager.prepare_final_answer(&mctx).await?;
+                return self.yield_messages(&ctx, vec![final_answer]).await;
+            }
+
+            let instruction = ledger.instruction_or_question.answer_str();
+            let instr_msg =
+                ensure_author(ChatMessage::assistant(instruction), MAGENTIC_MANAGER_NAME);
+            mctx.chat_history.push(instr_msg.clone());
+            self.emit_orchestrator_message(&ctx, &instr_msg);
+
+            let agent = self.find(&next).expect("checked above");
+            let response =
+                run_agent_and_emit(agent, mctx.chat_history.clone(), &self.id, &next, &ctx).await?;
+            if let Some(body) = last_message(&response) {
+                if body.role != Role::user() {
+                    let author = body.author_name.clone().unwrap_or_else(|| next.clone());
+                    mctx.chat_history
+                        .push(ChatMessage::user(format!("Transferred to {author}")));
+                }
+                mctx.chat_history.push(body);
+            }
+        }
+    }
+}
+
+fn last_message(response: &AgentRunResponse) -> Option<ChatMessage> {
+    response.messages.last().cloned()
+}
+
+/// Builder for a Magentic workflow. Rust analogue of `MagenticBuilder`.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use agent_framework_core::prelude::*;
+/// # use agent_framework_core::workflow::{MagenticBuilder, StandardMagenticManager};
+/// # fn demo(coder: Arc<dyn Agent>, researcher: Arc<dyn Agent>, manager_agent: Arc<dyn Agent>) -> Result<()> {
+/// let manager = StandardMagenticManager::new(manager_agent);
+/// let workflow = MagenticBuilder::new()
+///     .participant("coder", coder)
+///     .participant("researcher", researcher)
+///     .standard_manager(manager)
+///     .max_round_count(10)
+///     .build()?;
+/// # let _ = workflow;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default)]
+pub struct MagenticBuilder {
+    participants: Vec<(String, String, Arc<dyn Agent>)>,
+    manager: Option<Arc<dyn MagenticManager>>,
+    max_round_count: Option<usize>,
+    max_stall_count: Option<usize>,
+    max_reset_count: Option<usize>,
+    name: Option<String>,
+}
+
+impl MagenticBuilder {
+    /// Create an empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a participant (its description defaults to its name).
+    pub fn participant(mut self, name: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+        let name = name.into();
+        self.participants.push((name.clone(), name, agent));
+        self
+    }
+
+    /// Register a participant with an explicit description (shown to the manager).
+    pub fn participant_described(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        agent: Arc<dyn Agent>,
+    ) -> Self {
+        self.participants
+            .push((name.into(), description.into(), agent));
+        self
+    }
+
+    /// Register several participants as `(name, agent)` pairs.
+    pub fn participants(
+        mut self,
+        participants: impl IntoIterator<Item = (String, Arc<dyn Agent>)>,
+    ) -> Self {
+        for (name, agent) in participants {
+            self.participants.push((name.clone(), name, agent));
+        }
+        self
+    }
+
+    /// Use a custom [`MagenticManager`].
+    pub fn manager(mut self, manager: Arc<dyn MagenticManager>) -> Self {
+        self.manager = Some(manager);
+        self
+    }
+
+    /// Use a [`StandardMagenticManager`] (convenience wrapper around
+    /// [`MagenticBuilder::manager`]).
+    pub fn standard_manager(mut self, manager: StandardMagenticManager) -> Self {
+        self.manager = Some(Arc::new(manager));
+        self
+    }
+
+    /// Override the maximum number of rounds.
+    pub fn max_round_count(mut self, n: usize) -> Self {
+        self.max_round_count = Some(n);
+        self
+    }
+
+    /// Override the stall threshold.
+    pub fn max_stall_count(mut self, n: usize) -> Self {
+        self.max_stall_count = Some(n);
+        self
+    }
+
+    /// Override the maximum number of replans.
+    pub fn max_reset_count(mut self, n: usize) -> Self {
+        self.max_reset_count = Some(n);
+        self
+    }
+
+    /// Set the workflow name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Validate and build the Magentic workflow.
+    pub fn build(self) -> Result<Workflow> {
+        if self.participants.is_empty() {
+            return Err(Error::Workflow(
+                "magentic workflow needs at least one participant".into(),
+            ));
+        }
+        let manager = self
+            .manager
+            .ok_or_else(|| Error::Workflow("magentic workflow requires a manager".into()))?;
+
+        let descriptions: Vec<(String, String)> = self
+            .participants
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.clone()))
+            .collect();
+        let participants: Vec<(String, Arc<dyn Agent>)> = self
+            .participants
+            .into_iter()
+            .map(|(n, _, a)| (n, a))
+            .collect();
+
+        let orchestrator = MagenticOrchestrator {
+            id: "magentic_orchestrator".to_string(),
+            max_stall_count: self
+                .max_stall_count
+                .unwrap_or_else(|| manager.max_stall_count()),
+            max_reset_count: self.max_reset_count.or_else(|| manager.max_reset_count()),
+            max_round_count: self.max_round_count.or_else(|| manager.max_round_count()),
+            manager,
+            participants,
+            descriptions,
+        };
+
+        let mut builder = WorkflowBuilder::new()
+            .add_executor(Arc::new(orchestrator))
+            .set_start("magentic_orchestrator");
+        if let Some(name) = self.name {
+            builder = builder.name(name);
+        }
+        builder.build()
+    }
+}

@@ -67,8 +67,11 @@ pub mod prelude {
         ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
-        CheckpointStorage, Executor, FileCheckpointStorage, InMemoryCheckpointStorage,
-        RequestInfoExecutor, SharedState, Workflow, WorkflowBuilder, WorkflowContext,
-        WorkflowEvent, WorkflowExecutor, WorkflowRun, WorkflowRunState,
+        CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,
+        GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
+        HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
+        MagenticManager, RequestInfoExecutor, SequentialBuilder, SharedState,
+        StandardMagenticManager, Workflow, WorkflowAgent, WorkflowAgentExt, WorkflowBuilder,
+        WorkflowContext, WorkflowEvent, WorkflowExecutor, WorkflowRun, WorkflowRunState,
     };
 }
