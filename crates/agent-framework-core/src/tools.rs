@@ -1,7 +1,7 @@
 //! Tools: executable functions and hosted-tool markers.
 //!
 //! Rust equivalent of `agent_framework._tools`. An [`AiFunction`] is a locally
-//! executable tool; [`HostedTool`] variants are markers handed to the service.
+//! executable tool; hosted [`ToolKind`] variants are markers handed to the service.
 //! Both are represented uniformly to a chat client as a [`ToolDefinition`].
 
 use std::future::Future;

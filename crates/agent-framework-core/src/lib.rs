@@ -67,6 +67,8 @@ pub mod prelude {
         ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
-        Executor, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent,
+        CheckpointStorage, Executor, FileCheckpointStorage, InMemoryCheckpointStorage,
+        RequestInfoExecutor, SharedState, Workflow, WorkflowBuilder, WorkflowContext,
+        WorkflowEvent, WorkflowExecutor, WorkflowRun, WorkflowRunState,
     };
 }
