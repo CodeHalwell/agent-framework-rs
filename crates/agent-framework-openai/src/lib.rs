@@ -21,7 +21,18 @@
 //! # }
 //! ```
 
-mod convert;
+/// Conversion between framework types and the OpenAI chat-completions wire
+/// format.
+///
+/// This module is public (but hidden from docs) so that other
+/// OpenAI-wire-compatible clients in this workspace — currently
+/// `agent-framework-azure` — can reuse request/response conversion instead of
+/// duplicating it. It is not intended as a stable external API.
+#[doc(hidden)]
+pub mod convert;
+
+pub mod responses;
+pub use responses::OpenAIResponsesClient;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -183,7 +194,11 @@ type ByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 /// Turn an SSE HTTP response into a stream of [`ChatResponseUpdate`]s.
-fn parse_sse_stream(
+///
+/// Public (but hidden) so `agent-framework-azure` can reuse the exact same
+/// chat-completions SSE parsing for Azure OpenAI's wire-compatible stream.
+#[doc(hidden)]
+pub fn parse_sse_stream(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());

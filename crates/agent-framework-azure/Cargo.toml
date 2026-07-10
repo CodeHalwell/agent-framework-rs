@@ -6,10 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Azure OpenAI chat client (Entra ID + api-key auth) for agent-framework-rs"
+description = "Azure OpenAI chat client (Entra ID + api-key auth)"
 
 [dependencies]
 agent-framework-core = { workspace = true }
+agent-framework-openai = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

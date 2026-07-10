@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Model Context Protocol (MCP) client: stdio and streamable HTTP transports for agent-framework-rs"
+description = "Model Context Protocol (MCP) client: stdio and streamable HTTP transports"
 
 [dependencies]
 agent-framework-core = { workspace = true }

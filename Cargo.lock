@@ -37,6 +37,7 @@ name = "agent-framework-azure"
 version = "0.1.0"
 dependencies = [
  "agent-framework-core",
+ "agent-framework-openai",
  "async-trait",
  "bytes",
  "futures",
