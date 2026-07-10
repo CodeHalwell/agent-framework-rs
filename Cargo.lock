@@ -16,6 +16,7 @@ dependencies = [
  "agent-framework-mem0",
  "agent-framework-openai",
  "agent-framework-redis",
+ "async-trait",
  "futures",
  "serde",
  "serde_json",
