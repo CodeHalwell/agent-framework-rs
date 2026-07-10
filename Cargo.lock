@@ -25,7 +25,9 @@ version = "0.1.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
+ "bytes",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
