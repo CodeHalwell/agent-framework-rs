@@ -50,6 +50,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
+async-trait = { workspace = true }
 
 [[example]]
 name = "anthropic"
@@ -62,3 +63,23 @@ required-features = ["azure"]
 [[example]]
 name = "mcp_tools"
 required-features = ["mcp"]
+
+[[example]]
+name = "hosting_server"
+required-features = ["hosting"]
+
+[[example]]
+name = "a2a_client"
+required-features = ["a2a"]
+
+[[example]]
+name = "declarative_agent"
+required-features = ["declarative"]
+
+[[example]]
+name = "redis_memory"
+required-features = ["redis"]
+
+[[example]]
+name = "mem0_memory"
+required-features = ["mem0"]

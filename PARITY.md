@@ -35,33 +35,35 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | OpenAI Responses API | ✅ | ✅ | ✅ done | `OpenAIResponsesClient`; `conversation_id` ↔ `previous_response_id` |
 | Azure OpenAI (API key) | ✅ | ✅ | ✅ done | `agent-framework-azure::AzureOpenAIClient::new` |
 | Azure OpenAI (Entra ID / bearer token) | ✅ | ✅ | 🚧 partial | `TokenCredential` trait + `StaticTokenCredential` (fixed token) ship; a real Entra ID credential chain (wrapping e.g. `azure_identity`) is left to the caller |
+| Azure AI (Foundry) service client | ✅ (`azure-ai`) | ✅ (`Microsoft.Agents.AI.AzureAI[.Persistent]`) | ❌ not yet | only Azure *OpenAI* is covered |
 | Anthropic Messages API | ✅ | ✅ | ✅ done | `agent-framework-anthropic::AnthropicClient`, hand-rolled (no Anthropic SDK dependency) |
-| Anthropic structured output | 🚧 (`response_format` is accepted but `_create_run_options` never reads it — the Messages API has no native equivalent) | 🚧 (`Microsoft.Agents.AI.Anthropic` has no `ResponseFormat` handling either) | 🚧 partial | `convert::build_request` now maps `JsonObject`/`JsonSchema` onto an appended system-prompt instruction (schema included, pretty-printed, for `JsonSchema`); `Text`/unset is a no-op. A pragmatic fallback, not a silent drop — there is no native wire field to map onto in any of the three implementations |
+| Anthropic structured output | ❌ (silently dropped) | ❌ (no `ResponseFormat` handling) | ✅ done | Rust *exceeds* parity here: `ResponseFormat::JsonObject`/`JsonSchema` is folded into the system prompt (the Messages API has no native `response_format`), see `convert::append_response_format_instructions` |
 | `response.parse_json::<T>()` helper | ✅ (`response.value`) | ✅ | ✅ done | on both `ChatResponse` and `AgentRunResponse` |
-| Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ❌ not yet | no provider (`OpenAIClient`, `AnthropicClient`, `AzureOpenAIClient`) retries a failed request; a caller-supplied middleware or wrapper `ChatClient` would need to add one |
+| Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ❌ not yet | no provider retries a failed request; a caller-supplied middleware or wrapper `ChatClient` would need to add one |
 
 ## Agents
 
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | `Agent` trait | ✅ | ✅ | ✅ done | `agent::Agent` |
-| `ChatAgent` (+ builder) | ✅ | ✅ | ✅ done | instructions, default options, tools, context providers, agent middleware |
+| `ChatAgent` (+ builder) | ✅ | ✅ | ✅ done | instructions, default options, tools, context providers, agent/chat/function middleware |
 | `AgentThread` (service-managed XOR local) | ✅ | ✅ | ✅ done | `threads::AgentThread` |
 | `ChatMessageStore` / `InMemoryChatMessageStore` | ✅ | ✅ | ✅ done | |
 | `agent.as_tool()` | ✅ | ✅ | ✅ done | `ChatAgent::as_tool` + `AsToolOptions`; runs the wrapped agent statelessly |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | `orchestration::workflow_agent::WorkflowAgent`, `WorkflowAgentExt::as_agent` |
-| WorkflowAgent thread-history updates | ✅ | ✅ | ✅ done | `WorkflowAgent::run` now notifies `thread` of both the input and response message sets after each run (plus a `run_stream_with_thread` variant for the streaming path), matching `ChatAgent::run`'s write-back convention — a write-back only, same as Python: prior thread history is not read back into the workflow's own input |
+| WorkflowAgent thread-history updates | ✅ | ✅ | ✅ done | `run` / `run_stream_with_thread` write input + response back to the thread (mirrors Python's `_notify_thread_of_new_messages`); like Python, write-back only — prior history is not fed into the workflow input |
+| A2A remote agent (`A2AAgent`) | ✅ (`a2a` package) | ✅ (`Microsoft.Agents.AI.A2A`) | ✅ done | `agent-framework-a2a::A2AAgent` — JSON-RPC 2.0 over HTTP + `.well-known` card discovery; thread-based `contextId`/`taskId` continuity (which the Python client actually lacks) |
 
 ## Tools & MCP
 
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | `Tool` trait / `AiFunction` | ✅ | ✅ | ✅ done | `tools::Tool`, `tools::AiFunction` (closure-backed) |
-| Hosted tool markers (code interpreter, web search, file search, MCP) | ✅ (executes server-side) | ✅ | 🚧 partial | `hosted_code_interpreter`/`hosted_web_search`/`hosted_file_search`/`hosted_mcp` are pass-through markers only (`executor: None`) — the provider must support them server-side; there is no local emulation |
+| Hosted tool markers (code interpreter, web search, file search, MCP) | ✅ (executes server-side) | ✅ | 🚧 partial | `hosted_*` constructors are pass-through markers only (`executor: None`) — the provider must support them server-side; there is no local emulation |
 | `ApprovalMode` / approval flow | ✅ | ✅ | ✅ done | enforced in `FunctionInvokingChatClient::get_response` |
 | MCP client — stdio transport | ✅ | ✅ (via `ModelContextProtocol` SDK integration) | ✅ done | `agent-framework-mcp::McpStdioTool` |
 | MCP client — streamable HTTP transport | ✅ | ✅ | ✅ done | `McpStreamableHttpTool` |
-| MCP client — WebSocket transport | ✅ | not verified | ❌ not yet | explicitly out of scope per `agent-framework-mcp`'s own doc comment |
+| MCP client — WebSocket transport | ✅ | not verified | ✅ done | `McpWebsocketTool` (`ws://`/`wss://`, `"mcp"` subprotocol, one JSON-RPC message per text frame) |
 | MCP prompts (`prompts/list` / `prompts/get`) | ✅ | not verified | ❌ not yet | only tools are exposed as agent functions |
 | MCP sampling / roots callbacks | ✅ | not verified | ❌ not yet | server-initiated requests are logged and ignored, never answered |
 
@@ -70,11 +72,12 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | Agent middleware pipeline | ✅ | ✅ | ✅ done | `middleware::{Middleware, MiddlewarePipeline, Next}`, wired into `ChatAgent::run`/`run_stream` |
-| Chat middleware pipeline | ✅ | ✅ | 🚧 partial | `ChatAgentBuilder::chat_middleware(..)` wires a `MiddlewarePipeline<ChatContext>` around the chat-client call in `ChatAgent::run`/`run_once` (and in `run_stream` whenever agent middleware is also configured, since that path funnels through the same non-streaming call and replays as updates) — full interception including short-circuit. The plain per-token `run_stream` path (no agent middleware) only applies chat middleware for *pre-call* mutation of `messages`/`chat_options`; a real token stream can't flow back through `ChatContext::result` (typed for a complete `ChatResponse`), so post-call middleware logic and `terminate`/`result` short-circuiting are not honored there — this mirrors upstream Python's `use_chat_middleware`, whose streaming path likewise hands middleware an unconsumed async generator rather than driving it through the pipeline |
-| Function-invocation middleware pipeline | ✅ | ✅ | ✅ done | `FunctionInvokingChatClient::with_function_middleware(..)` (plumbed automatically from `ChatAgentBuilder::function_middleware(..)`) runs every tool call through a `MiddlewarePipeline<FunctionInvocationContext>`: middleware may rewrite arguments, short-circuit with its own result, or observe a propagated execution error via the `Result` from their own `next.run(...)` call |
+| Chat middleware pipeline | ✅ | ✅ | ✅ done | `ChatAgentBuilder::chat_middleware` — runs around every underlying chat-client call (mirrors `use_chat_middleware`); pre-call-only on the token-streaming path, per the module docs |
+| Function-invocation middleware pipeline | ✅ | ✅ | ✅ done | `ChatAgentBuilder::function_middleware`, plumbed into `FunctionInvokingChatClient::with_function_middleware` and run around every local tool call |
 | `ContextProvider` / `AggregateContextProvider` | ✅ | ✅ | ✅ done | `memory::ContextProvider`, fan-out/merge over multiple providers |
-| Mem0-backed memory provider | ✅ (`mem0` package) | ✅ (`Microsoft.Agents.AI.Mem0`) | ❌ not yet | |
-| Redis-backed memory / thread store | ✅ (`redis` package) | not found | ❌ not yet | |
+| Mem0-backed memory provider | ✅ (`mem0` package, wraps the `mem0` SDK) | ✅ (`Microsoft.Agents.AI.Mem0`) | ✅ done | `agent-framework-mem0::Mem0Provider` — direct REST (`/v1/memories/`, `/v2/memories/search/`), scoped by application/agent/user/thread id |
+| Redis chat-message store | ✅ (`redis` package) | not found | ✅ done | `agent-framework-redis::RedisChatMessageStore` — one LIST per thread, JSON messages, optional trimming; close mirror of Python |
+| Redis context provider (long-term memory) | ✅ (RediSearch: full-text + vector/hybrid) | not found | 🚧 partial | `RedisContextProvider` ports the *scoping* semantics, but retrieval is token-match + recency over plain keys — no RediSearch index, no embeddings/vector or hybrid search (documented divergence in `context_provider.rs`) |
 
 ## Workflow engine
 
@@ -82,7 +85,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | --- | --- | --- | --- | --- |
 | Superstep (Pregel/BSP) graph engine | ✅ | ✅ | ✅ done | `workflow::{WorkflowBuilder, Workflow, WorkflowRun}`; `Single`/`FanOut`/`FanIn` edges, switch/case sugar |
 | Checkpointing (in-memory + file-backed) | ✅ | ✅ | ✅ done | `CheckpointStorage` trait, `InMemoryCheckpointStorage`, `FileCheckpointStorage` (atomic write via temp+rename); fires automatically every superstep via `with_checkpointing` |
-| Checkpoint graph-signature validation on resume | ✅ | ✅ | ❌ not yet | `Workflow::run_from_checkpoint` / `WorkflowRun::restore` trusts the caller: it never checks that the resuming graph's executor ids/edges match what the checkpoint was taken from, and silently skips restoring state for any checkpointed executor id absent from the new graph |
+| Checkpoint graph-signature validation on resume | ✅ | ✅ | ❌ not yet | `run_from_checkpoint` trusts the caller: it never checks that the resuming graph matches the checkpointed one, and silently skips state for unknown executor ids |
 | Request/response HITL (`request_info`) | ✅ | ✅ | ✅ done | `WorkflowContext::request_info`, `RequestInfoExecutor`, `WorkflowRun::send_response(s)` |
 | Shared state | ✅ | ✅ | ✅ done | `workflow::SharedState`, cloned into every `WorkflowContext`, checkpointed automatically |
 | Graph validation (structural) | ✅ | ✅ | ✅ done | start registered, unknown-executor edges, duplicate edges, start-reachability — run automatically in `WorkflowBuilder::build`. Python's additional *static type-compatibility* checks are intentionally out of scope for a `serde_json::Value`-typed engine |
@@ -99,7 +102,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Group chat — round-robin manager | ❌ (no built-in; requires `set_manager`/`set_select_speakers_func`) | ✅ (`RoundRobinGroupChatManager`) | ✅ done | `RoundRobinManager`, the `GroupChatBuilder` default |
 | Handoff | ✅ | ✅ | ✅ done | `orchestration::HandoffBuilder`; autonomous and human-in-loop interaction modes |
 | Magentic (plan / progress-ledger / final answer) | ✅ | not found | ✅ done | `MagenticBuilder` + `StandardMagenticManager`; prompts ported verbatim from Python |
-| Magentic human-in-the-loop plan review | ✅ (`MagenticHumanInterventionKind.PLAN_REVIEW`) | n/a (no Magentic orchestrator found) | ✅ done | `MagenticBuilder::with_plan_review` + `MagenticPlanReviewRequest`/`MagenticPlanReviewDecision`, over the existing `request_info`/`send_response` HITL machinery; approve/revise loop with a `max_plan_review_rounds` guard mirrors `_handle_plan_review_response`. Python's separate stall-intervention HITL (`with_human_input_on_stall`) is a distinct request/reply surface and remains 🚧 not ported — stalls still always auto-replan |
+| Magentic human-in-the-loop plan review | ✅ (`MagenticHumanInterventionKind.PLAN_REVIEW`) | n/a (no Magentic orchestrator found) | ✅ done | `MagenticBuilder::with_plan_review()` + `max_plan_review_rounds(n)`: pauses after `plan()` with a `MagenticPlanReviewRequest` (task/facts/plan/round), answered by a `MagenticPlanReviewDecision` — approve, revise-with-comments (triggers `replan` with the feedback in `chat_history`), or revise-with-edited-plan (adopted verbatim, no LLM call) |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | see Agents section |
 
 ## Observability
@@ -109,27 +112,35 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | GenAI-semantic-convention tracing spans | ✅ | ✅ | ✅ done | `observability::ObservableChatClient` (`chat` span); `invoke_agent` span in `ChatAgent::run_core`; `execute_tool` span in the function-invocation loop |
 | OpenTelemetry SDK exporter wiring | ✅ | ✅ | 🚧 partial | spans follow OTel GenAI conventions and are bridge-ready (e.g. via `tracing-opentelemetry`), but no OTel SDK/exporter is wired up or shipped |
 
-## Ecosystem
+## Serving & ecosystem
 
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
-| A2A (Agent2Agent protocol) | ✅ (`a2a`) | ✅ (`Microsoft.Agents.AI.A2A`, `.Hosting.A2A[.AspNetCore]`) | ❌ not yet | |
+| A2A client (call remote agents) | ✅ (`a2a`) | ✅ (`Microsoft.Agents.AI.A2A`) | ✅ done | `agent-framework-a2a` — see Agents section |
+| A2A serving (agent card + JSON-RPC endpoint) | ✅ | ✅ (`.Hosting.A2A[.AspNetCore]`) | ✅ done | `agent-framework-hosting::a2a::A2ARouter` — `GET /.well-known/agent-card.json` + JSON-RPC 2.0 `POST /` |
+| A2A push notifications / task resubscribe / extended card | ✅ | ✅ | ❌ not yet | `tasks/pushNotificationConfig/*`, `tasks/resubscribe`, and the authenticated extended-card flow are unimplemented on both the client and serving sides |
+| DevUI-style HTTP API (entities + responses, SSE) | ✅ (`devui`) | ✅ (`Microsoft.Agents.AI.DevUI`) | ✅ done | `agent-framework-hosting::AgentHost` — `GET /health`, `GET /v1/entities[/{id}/info]`, `POST /v1/responses` (JSON or SSE); runs are stateless (no conversation store or run-resume endpoint) |
+| DevUI web frontend | ✅ (bundled UI) | ✅ | ❌ not yet | this port ships the API surface only, no bundled browser UI |
+| OpenAI-compatible serving (`/v1/chat/completions`) | ✅ (via devui) | ✅ (`.Hosting.OpenAI`) | ✅ done | `agent-framework-hosting::openai_compat::OpenAiRouter` (JSON or SSE) |
+| Declarative agents (YAML/JSON specs) | ✅ (`declarative`) | ✅ (`Microsoft.Agents.AI.Declarative`) | ✅ done | `agent-framework-declarative::DeclarativeLoader::load_agent` — official schema vocabulary (`kind: Prompt`, `model.provider/apiType/options`, `tools`, `outputSchema`), `${VAR}` env interpolation, provider-agnostic `ChatClientFactory` / `ToolRegistry`; validated against real agent-samples specs in `tests/specs/` |
+| Declarative workflows | ✅ (Power Platform / Copilot Studio DSL) | ✅ (`.Workflows.Declarative[.AzureAI]`) | 🚧 partial | `load_workflow` drives the graph engine + orchestration builders from a documented **Rust-native** `WorkflowSpec` (orchestration shorthand or node/edge graph); the upstream imperative Copilot-Studio DSL is intentionally not mapped |
+| Hosting integrations (ASP.NET Core / Azure Functions / DurableTask) | n/a | ✅ (`Microsoft.Agents.AI.Hosting*`, `.DurableTask`) | ❌ not yet | the axum routers above are the Rust hosting story; no Azure Functions / DurableTask equivalents |
 | AG-UI protocol | ✅ (`ag-ui`) | ✅ (`Microsoft.Agents.AI.AGUI`) | ❌ not yet | |
-| DevUI | ✅ (`devui`) | ✅ (`Microsoft.Agents.AI.DevUI`) | ❌ not yet | |
-| Hosting (ASP.NET Core / Azure Functions / Durable Task) | n/a | ✅ (`Microsoft.Agents.AI.Hosting*`, `.DurableTask`) | ❌ not yet | |
-| Declarative / YAML agent & workflow definitions | ✅ (`declarative`) | ✅ (`Microsoft.Agents.AI.Declarative`, `.Workflows.Declarative[.AzureAI]`) | ❌ not yet | |
 | CopilotStudio integration | ✅ (`copilotstudio`) | ✅ (`Microsoft.Agents.AI.CopilotStudio`) | ❌ not yet | |
+| Purview / ChatKit / Azure AI Search / CosmosDB / `lab` extras | ✅ (various packages) | ✅ (various packages) | ❌ not yet | not individually tracked in this matrix |
 | Guardrails (dedicated module) | ❌ (middleware-based, no dedicated module) | ❌ (middleware-based) | ❌ not yet | none of the three implementations ship a first-class guardrails module; all three can express it via their middleware pipeline |
-| Other upstream integrations (ChatKit, Purview, Azure AI Search connector, CosmosDB thread store, ...) | ✅ (various packages) | ✅ (various packages) | ❌ not yet | not individually tracked in this matrix |
 
-## Summary of deliberate, known gaps
+## Summary of remaining gaps
 
-These are the gaps the maintainers consider worth calling out explicitly (either because they're easy to reach for and surprising when missing, or because they're natural next steps):
+Much shorter than it used to be. What genuinely remains:
 
-- **MCP**: no WebSocket transport, no prompts capability, no sampling/roots callback handling.
-- **Magentic**: no human-in-the-loop plan-review pause (Python-only feature; not even present in .NET's Workflows package).
-- **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only — no local emulation, provider must support them server-side.
-- **Ecosystem**: no A2A, AG-UI, DevUI, hosting integrations, declarative/YAML definitions, or CopilotStudio.
-- **Anthropic**: `ResponseFormat`/structured output has no native Messages API field to map onto (true of Python and .NET too); the Rust client now falls back to an appended system-prompt instruction rather than silently dropping the option.
+- **MCP**: prompts capability and sampling/roots callbacks (the WebSocket transport now ships).
+- **A2A**: push notifications, `tasks/resubscribe`, authenticated extended card.
+- **DevUI**: no bundled web frontend; hosted runs are stateless (no conversation store / run-resume endpoint).
+- **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
+- **Redis provider**: recency/token-match retrieval, no RediSearch vector or hybrid search.
+- **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
 - **Reliability**: no built-in retry/backoff policy layer for any provider.
-- **Checkpointing**: resuming from a checkpoint does not validate that the workflow graph matches the one the checkpoint was taken from.
+- **Checkpointing**: no graph-signature validation on resume.
+- **Azure**: no Azure AI (Foundry) service client, and no real Entra ID credential chain (bring your own `TokenCredential`).
+- **Ecosystem**: AG-UI, CopilotStudio, Purview, ChatKit, Azure AI Search, CosmosDB, DurableTask/Azure Functions hosting, OTel SDK exporter wiring.
