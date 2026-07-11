@@ -34,6 +34,9 @@ pub mod convert;
 pub mod responses;
 pub use responses::OpenAIResponsesClient;
 
+pub mod assistants;
+pub use assistants::OpenAIAssistantsClient;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 

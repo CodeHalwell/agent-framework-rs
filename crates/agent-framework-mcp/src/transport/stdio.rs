@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -20,7 +21,7 @@ use tokio::task::JoinHandle;
 use agent_framework_core::error::{Error, Result};
 
 use crate::protocol::{self, IdGenerator, IncomingMessage, RpcError};
-use crate::sampling::BoxedServerRequestHandler;
+use crate::sampling::{BoxedNotificationHandler, BoxedServerRequestHandler};
 use crate::transport::McpTransport;
 
 type PendingMap = StdMutex<HashMap<i64, oneshot::Sender<std::result::Result<Value, RpcError>>>>;
@@ -32,6 +33,9 @@ type PendingMap = StdMutex<HashMap<i64, oneshot::Sender<std::result::Result<Valu
 /// never outlives this transport.
 pub struct McpStdioTransport {
     inner: std::sync::Arc<StdioInner>,
+    /// Applied to every [`McpTransport::call`] while awaiting its response.
+    /// Unset (the default) waits indefinitely. See [`Self::with_request_timeout`].
+    request_timeout: Option<Duration>,
 }
 
 struct StdioInner {
@@ -44,6 +48,9 @@ struct StdioInner {
     /// Handler for server-initiated requests (`ping`, `sampling/createMessage`,
     /// `roots/list`), installed via [`McpTransport::set_server_request_handler`].
     server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
+    /// Handler for server notifications (e.g. `notifications/tools/list_changed`),
+    /// installed via [`McpTransport::set_notification_handler`].
+    notification_handler: StdMutex<Option<BoxedNotificationHandler>>,
 }
 
 impl McpStdioTransport {
@@ -103,6 +110,7 @@ impl McpStdioTransport {
             reader_task: StdMutex::new(None),
             stderr_task: StdMutex::new(None),
             server_request_handler: StdMutex::new(None),
+            notification_handler: StdMutex::new(None),
         });
 
         let reader_task = spawn_reader(stdout, inner.clone());
@@ -110,7 +118,22 @@ impl McpStdioTransport {
         *inner.reader_task.lock().unwrap() = Some(reader_task);
         *inner.stderr_task.lock().unwrap() = Some(stderr_task);
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            request_timeout: None,
+        })
+    }
+
+    /// Set a per-request timeout applied while awaiting a response to any
+    /// JSON-RPC request sent over this transport. Mirrors
+    /// [`crate::McpStreamableHttpTransport`]'s `timeout` option; unset (the
+    /// default) waits indefinitely. A request that times out is removed from
+    /// the pending-response table, so a late reply from the server is
+    /// discarded rather than mis-delivered to a later call reusing the id
+    /// space.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 }
 
@@ -148,12 +171,26 @@ impl McpTransport for McpStdioTransport {
             return Err(e);
         }
 
-        match rx.await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(rpc_err)) => Err(Error::service(rpc_err.to_string())),
-            Err(_) => Err(Error::service(
-                "MCP server closed the connection before responding",
-            )),
+        let await_response = async {
+            match rx.await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(rpc_err)) => Err(Error::service(rpc_err.to_string())),
+                Err(_) => Err(Error::service(
+                    "MCP server closed the connection before responding",
+                )),
+            }
+        };
+        match self.request_timeout {
+            None => await_response.await,
+            Some(timeout) => match tokio::time::timeout(timeout, await_response).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.inner.pending.lock().unwrap().remove(&id);
+                    Err(Error::service(format!(
+                        "MCP request '{method}' timed out after {timeout:?}"
+                    )))
+                }
+            },
         }
     }
 
@@ -171,6 +208,10 @@ impl McpTransport for McpStdioTransport {
 
     fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
         *self.inner.server_request_handler.lock().unwrap() = Some(handler);
+    }
+
+    fn set_notification_handler(&self, handler: BoxedNotificationHandler) {
+        *self.inner.notification_handler.lock().unwrap() = Some(handler);
     }
 }
 
@@ -260,6 +301,7 @@ fn route_incoming(inner: &std::sync::Arc<StdioInner>, value: Value) {
         }
         IncomingMessage::Notification { method, params } => {
             tracing::debug!(method = %method, params = %params, "MCP server notification");
+            dispatch_notification(inner.clone(), method, params);
         }
         IncomingMessage::ServerRequest { id, method, params } => {
             spawn_server_request_response(inner.clone(), id, method, params);
@@ -268,6 +310,21 @@ fn route_incoming(inner: &std::sync::Arc<StdioInner>, value: Value) {
             tracing::warn!(raw = %v, "MCP: unrecognized JSON-RPC message shape");
         }
     }
+}
+
+/// Dispatch a server notification (e.g. `notifications/tools/list_changed`)
+/// to whatever handler [`McpTransport::set_notification_handler`] installed,
+/// in its own task so a slow handler doesn't block the reader loop from
+/// noticing other incoming messages in the meantime. No response is expected
+/// or sent; a notification with no handler registered is simply dropped
+/// (already logged by the caller).
+fn dispatch_notification(inner: std::sync::Arc<StdioInner>, method: String, params: Value) {
+    tokio::spawn(async move {
+        let handler = inner.notification_handler.lock().unwrap().clone();
+        if let Some(handler) = handler {
+            handler(method, params).await;
+        }
+    });
 }
 
 /// Compute the response to a server-initiated request (via whatever handler

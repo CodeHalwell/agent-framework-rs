@@ -41,6 +41,47 @@ pub trait Tool: Send + Sync {
     async fn invoke(&self, arguments: Value) -> Result<Value>;
 }
 
+/// A dynamic source of tools, resolved fresh on every agent run instead of
+/// being frozen into the agent's tool list at build time.
+///
+/// The motivating case is an MCP server: without this trait, wiring one into
+/// a [`crate::agent::ChatAgent`] means calling `mcp.tool_definitions().await`
+/// once, up front, and handing the (now-frozen) result to
+/// [`crate::agent::ChatAgentBuilder::tools`] — the agent never notices a
+/// server-side tool-catalog change (`notifications/tools/list_changed`)
+/// afterward. Registering a `ToolSource` via
+/// [`crate::agent::ChatAgentBuilder::tool_source`] instead defers resolution
+/// to every [`crate::agent::Agent::run`] / [`crate::agent::Agent::run_with_options`]
+/// / [`crate::agent::Agent::run_stream`] call (see `ChatAgent::prepare_request`),
+/// so a source that caches internally — invalidating that cache when the
+/// server signals a change — can serve an up-to-date catalog on every run
+/// without a live round trip each time.
+///
+/// See `agent-framework-mcp`'s `McpStdioTool` / `McpStreamableHttpTool` /
+/// `McpWebsocketTool`, which all implement this trait.
+#[async_trait]
+pub trait ToolSource: Send + Sync {
+    /// Resolve this source's current tools.
+    ///
+    /// Called once per agent run. Implementations that connect to a remote
+    /// server should connect lazily (on first call) and are encouraged to
+    /// cache their result until something invalidates it, rather than
+    /// performing a live round trip on every call.
+    ///
+    /// An `Err` returned here propagates out of the whole run rather than
+    /// being swallowed — this mirrors the upstream Python reference, whose
+    /// `ChatAgent.run`/`run_stream` do not catch a failure raised while
+    /// connecting to an `MCPTool` at run time (`_agents.py:855-865,
+    /// 970-980`: `await self._async_exit_stack.enter_async_context(tool)`
+    /// is not wrapped in a `try`/`except`).
+    async fn resolve_tools(&self) -> Result<Vec<ToolDefinition>>;
+
+    /// A short, human-readable name for this source, used in diagnostics
+    /// (e.g. a `tracing::warn!` when one of its tools collides by name with
+    /// a tool that already exists).
+    fn source_name(&self) -> &str;
+}
+
 /// The category of a tool as advertised to the service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolKind {

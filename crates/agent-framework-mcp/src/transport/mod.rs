@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use agent_framework_core::error::Result;
 
-use crate::sampling::BoxedServerRequestHandler;
+use crate::sampling::{BoxedNotificationHandler, BoxedServerRequestHandler};
 
 /// A JSON-RPC 2.0 transport for MCP messages.
 ///
@@ -48,6 +48,21 @@ pub trait McpTransport: Send + Sync {
     /// The default implementation does nothing, for transports (e.g. test
     /// mocks) that never see server-initiated requests.
     fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
+        let _ = handler;
+    }
+
+    /// Register the handler invoked for every notification received from the
+    /// server (no response expected). [`crate::McpClient`] installs one
+    /// automatically at construction time to invalidate its tools/prompts
+    /// cache on `notifications/tools/list_changed` /
+    /// `notifications/prompts/list_changed` — see
+    /// [`crate::McpClient::list_tools_cached`] /
+    /// [`crate::McpClient::list_prompts_cached`]. Replaces any previously
+    /// registered handler.
+    ///
+    /// The default implementation does nothing, for transports (e.g. test
+    /// mocks) that never see server-initiated notifications.
+    fn set_notification_handler(&self, handler: BoxedNotificationHandler) {
         let _ = handler;
     }
 }

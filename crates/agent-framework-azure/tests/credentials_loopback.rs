@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_framework_azure::{
-    AzureOpenAIClient, ClientSecretCredential, ManagedIdentityCredential, TokenCredential,
-    WorkloadIdentityCredential,
+    AzureOpenAIClient, AzureOpenAIResponsesClient, ClientSecretCredential,
+    ManagedIdentityCredential, TokenCredential, WorkloadIdentityCredential,
 };
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{ChatMessage, ChatOptions};
+use futures::StreamExt;
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -323,4 +324,91 @@ async fn managed_identity_non_success_is_an_error() {
     let cred = ManagedIdentityCredential::new("https://ai.azure.com/.default")
         .with_endpoint(format!("{}/token", server.addr));
     assert!(cred.get_token().await.is_err());
+}
+
+/// End-to-end round trip for `AzureOpenAIResponsesClient::get_response`: a
+/// real `reqwest` POST against a loopback server, asserting both the outbound
+/// request (route, api-version, auth header, `model` = deployment name) and
+/// that the JSON response is parsed via the reused
+/// `agent_framework_openai::responses::parse_response`.
+#[tokio::test]
+async fn azure_openai_responses_client_loopback_round_trip() {
+    let server = FakeServer::start(
+        "200 OK",
+        vec![],
+        r#"{"id":"resp_abc123","model":"my-deployment","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from Azure Responses!"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#,
+    );
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let response = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+
+    assert_eq!(response.text(), "Hello from Azure Responses!");
+    assert_eq!(response.response_id.as_deref(), Some("resp_abc123"));
+    assert_eq!(response.usage_details.unwrap().total_token_count, Some(15));
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (line, headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /openai/v1/responses?api-version=preview"),
+        "got: {line}"
+    );
+    assert!(
+        headers.to_ascii_lowercase().contains("api-key: test-key"),
+        "headers: {headers}"
+    );
+    let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["model"], serde_json::json!("my-deployment"));
+    assert_eq!(
+        body_json["input"],
+        serde_json::json!([{ "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "hi" }
+        ]}])
+    );
+}
+
+/// SSE parse smoke test: `AzureOpenAIResponsesClient::get_streaming_response`
+/// against a loopback server emitting real Responses-API SSE events, proving
+/// the reused `agent_framework_openai::responses::parse_responses_sse_stream`
+/// is wired all the way through to a live `reqwest::Response` byte stream
+/// (not just exercised against synthetic `serde_json::Value`s, as
+/// `agent-framework-openai`'s own unit tests do).
+#[tokio::test]
+async fn azure_openai_responses_client_streams_sse_events() {
+    let sse_body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"model\":\"my-deployment\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n";
+    let server = FakeServer::start("200 OK", vec![], sse_body);
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let mut stream = client
+        .get_streaming_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+
+    let mut text = String::new();
+    let mut saw_completed = false;
+    while let Some(update) = stream.next().await {
+        let update = update.expect("stream update should parse cleanly");
+        text.push_str(&update.text_content());
+        if update.response_id.as_deref() == Some("resp_stream_1") {
+            saw_completed = true;
+            // `store != Some(false)` auto-populates `conversation_id`,
+            // identical to `OpenAIResponsesClient`'s streaming behavior.
+            assert_eq!(update.conversation_id.as_deref(), Some("resp_stream_1"));
+        }
+    }
+
+    assert_eq!(text, "Hi");
+    assert!(saw_completed, "expected a response.completed update");
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /openai/v1/responses?api-version=preview"),
+        "got: {line}"
+    );
+    let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["stream"], serde_json::json!(true));
 }

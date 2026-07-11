@@ -5,11 +5,13 @@
 //! negotiates the `"mcp"` subprotocol and that `close()` performs a real
 //! WebSocket close handshake.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_framework_core::error::Error;
+use agent_framework_core::tools::ToolSource;
 use agent_framework_mcp::{
     CreateMessageParams, CreateMessageResult, McpClient, McpTransport as _, McpWebsocketTool,
     McpWebsocketTransport, SamplingHandler,
@@ -520,5 +522,111 @@ async fn websocket_sampling_round_trip_via_server_initiated_request() {
     .await;
 
     outcome.expect("websocket_sampling_round_trip_via_server_initiated_request timed out");
+    let _ = server.await;
+}
+
+/// [`McpWebsocketTool`] as a [`ToolSource`]: `resolve_tools` must lazily
+/// connect (there's no prior `.connect()`/`.tool_definitions()` call here)
+/// and return the server's tools, same as `tool_definitions()`. A second
+/// `resolve_tools` call must also succeed — it's served from
+/// `McpClient::list_tools_cached`'s cache; the cache-hit-vs-live-refetch
+/// distinction itself, and `list_changed` invalidation, are covered
+/// deterministically (no socket, no timing) by `client.rs`'s
+/// `list_tools_cached_reuses_result_until_invalidated` test.
+#[tokio::test]
+async fn websocket_tool_source_resolve_tools_lazily_connects_and_returns_tools() {
+    let subprotocol_seen = Arc::new(AtomicBool::new(false));
+    let (url, server) = spawn_fake_server(subprotocol_seen).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let tool = McpWebsocketTool::new("fake-ws", url);
+
+        let resolved = ToolSource::resolve_tools(&tool)
+            .await
+            .expect("resolve_tools should lazily connect and list tools");
+        let names: HashSet<&str> = resolved.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains("echo"), "expected an 'echo' tool: {names:?}");
+        assert!(
+            names.contains("ask_llm"),
+            "expected an 'ask_llm' tool: {names:?}"
+        );
+
+        let resolved_again = ToolSource::resolve_tools(&tool)
+            .await
+            .expect("a second resolve_tools call should also succeed");
+        assert_eq!(resolved_again.len(), resolved.len());
+
+        tool.close().await.expect("close");
+    })
+    .await;
+
+    outcome
+        .expect("websocket_tool_source_resolve_tools_lazily_connects_and_returns_tools timed out");
+    let _ = server.await;
+}
+
+/// [`McpWebsocketTransport::with_request_timeout`] must actually cut off a
+/// call that never gets a response, not just be a stored, unused config
+/// value. The fake server here accepts the connection and then never writes
+/// anything back, so a request sent to it hangs forever without the timeout.
+///
+/// The client explicitly [`McpWebsocketTransport::close`]s at the end (as
+/// opposed to just dropping the transport) so the fake server's loop below
+/// observes a `Close` frame and exits on its own, rather than this test
+/// leaking a task that blocks forever on a connection nobody will ever
+/// close.
+#[tokio::test]
+async fn websocket_request_timeout_cuts_off_a_call_that_never_responds() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let url = format!("ws://{addr}/");
+
+    let server = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        #[allow(clippy::result_large_err)]
+        let callback = |_req: &Request, response: Response| Ok(echo_mcp_subprotocol(response));
+        let Ok(ws_stream) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
+            return;
+        };
+        // Accept the connection and the handshake, but never respond to
+        // anything sent over it -- until the client closes.
+        let (mut sink, mut source) = ws_stream.split();
+        while let Some(Ok(msg)) = source.next().await {
+            if let Message::Close(frame) = msg {
+                let _ = sink.send(Message::Close(frame)).await;
+                break;
+            }
+        }
+    });
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let transport = McpWebsocketTransport::connect(&url, &[])
+            .await
+            .expect("connect")
+            .with_request_timeout(Duration::from_millis(150));
+
+        let started = std::time::Instant::now();
+        let err = transport
+            .call("initialize", json!({}))
+            .await
+            .expect_err("a request to a server that never responds must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout should fire close to the configured 150ms, not fall back to hanging"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error message: {err}"
+        );
+
+        transport.close().await.expect("close");
+    })
+    .await;
+
+    outcome.expect("websocket_request_timeout_cuts_off_a_call_that_never_responds timed out");
     let _ = server.await;
 }

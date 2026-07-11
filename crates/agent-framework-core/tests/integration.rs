@@ -1793,3 +1793,273 @@ async fn unknown_tool_call_is_not_declaration_only() {
     );
     assert_eq!(out.text(), "done");
 }
+
+// -- ToolSource: dynamic tool resolution per agent run --------------------
+
+/// A [`ToolSource`] that returns a scripted sequence of tool lists, one per
+/// `resolve_tools` call (the last is repeated once the script is
+/// exhausted). Stands in for an MCP server whose catalog changes between
+/// runs (e.g. after a `notifications/tools/list_changed`), without any real
+/// transport.
+struct StubToolSource {
+    name: String,
+    call_count: Arc<Mutex<usize>>,
+    responses: Vec<Vec<ToolDefinition>>,
+}
+
+impl StubToolSource {
+    fn new(name: &str, responses: Vec<Vec<ToolDefinition>>) -> Self {
+        Self {
+            name: name.to_string(),
+            call_count: Arc::new(Mutex::new(0)),
+            responses,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolSource for StubToolSource {
+    async fn resolve_tools(&self) -> Result<Vec<ToolDefinition>> {
+        let mut count = self.call_count.lock().unwrap();
+        let idx = (*count).min(self.responses.len().saturating_sub(1));
+        *count += 1;
+        Ok(self.responses.get(idx).cloned().unwrap_or_default())
+    }
+
+    fn source_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A [`ToolSource`] whose `resolve_tools` always fails — stands in for an
+/// MCP server that is unreachable at run time.
+struct FailingToolSource;
+
+#[async_trait]
+impl ToolSource for FailingToolSource {
+    async fn resolve_tools(&self) -> Result<Vec<ToolDefinition>> {
+        Err(Error::service("mcp server unreachable"))
+    }
+    fn source_name(&self) -> &str {
+        "failing-source"
+    }
+}
+
+#[tokio::test]
+async fn tool_source_resolved_fresh_each_run_sees_catalog_change() {
+    // Simulates a server whose tool list grows between runs (e.g. after a
+    // notifications/tools/list_changed): the agent must re-resolve the
+    // source on every run rather than resolving it once at build time.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let source = Arc::new(StubToolSource::new(
+        "mcp",
+        vec![
+            vec![declaration_only_tool("tool_a")],
+            vec![
+                declaration_only_tool("tool_a"),
+                declaration_only_tool("tool_b"),
+            ],
+        ],
+    ));
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+    let _ = agent
+        .run(vec![ChatMessage::user("hi again")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    let names =
+        |i: usize| -> Vec<String> { recorded[i].tools.iter().map(|t| t.name.clone()).collect() };
+    assert_eq!(names(0), vec!["tool_a".to_string()]);
+    assert_eq!(
+        names(1),
+        vec!["tool_a".to_string(), "tool_b".to_string()],
+        "second run must see the source's updated catalog"
+    );
+}
+
+#[tokio::test]
+async fn tool_source_dedup_explicit_tool_wins_over_source_tool() {
+    // The agent's own build-time tool named "shared" must win over a
+    // same-named tool produced by a tool source (dedup against "explicit
+    // tools", first wins).
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let explicit = ToolDefinition {
+        description: "explicit".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source_tool = ToolDefinition {
+        description: "from-source".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![source_tool]]));
+    let agent = ChatAgent::builder(client)
+        .tool(explicit)
+        .tool_source(source)
+        .build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(
+        shared.len(),
+        1,
+        "only one 'shared' tool should survive dedup"
+    );
+    assert_eq!(
+        shared[0].description, "explicit",
+        "the explicit tool wins over the source's same-named tool"
+    );
+}
+
+#[tokio::test]
+async fn tool_source_dedup_first_registered_source_wins() {
+    // Two sources both produce a "shared" tool; the first-registered
+    // source's version must win.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let first = Arc::new(StubToolSource::new(
+        "first",
+        vec![vec![ToolDefinition {
+            description: "from-first".to_string(),
+            ..declaration_only_tool("shared")
+        }]],
+    ));
+    let second = Arc::new(StubToolSource::new(
+        "second",
+        vec![vec![ToolDefinition {
+            description: "from-second".to_string(),
+            ..declaration_only_tool("shared")
+        }]],
+    ));
+    let agent = ChatAgent::builder(client)
+        .tool_source(first)
+        .tool_source(second)
+        .build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].description, "from-first");
+}
+
+#[tokio::test]
+async fn tool_source_dedup_against_per_run_additional_tools() {
+    // A per-run `additional_tools` entry must also win over a same-named
+    // tool from a source (sources are resolved last).
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let source_tool = ToolDefinition {
+        description: "from-source".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![source_tool]]));
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+
+    let per_run_tool = ToolDefinition {
+        description: "per-run".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let options = AgentRunOptions::new().with_tool(per_run_tool);
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].description, "per-run");
+}
+
+#[tokio::test]
+async fn failing_tool_source_propagates_error_out_of_run() {
+    // Mirrors the Python reference's run()/run_stream(), which do not catch
+    // a failure raised while connecting to an MCPTool at run time -- it
+    // propagates out of the whole run rather than being swallowed.
+    let client = MockClient::new(vec![ChatResponse::from_text("should not be reached")]);
+    let agent = ChatAgent::builder(client)
+        .tool_source(Arc::new(FailingToolSource))
+        .build();
+
+    let err = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Service(_)));
+}
+
+#[tokio::test]
+async fn tool_source_tool_is_invokable_by_the_function_loop() {
+    // A tool resolved from a ToolSource must be genuinely usable, not just
+    // present in the assembled ChatOptions: the model calls it and the
+    // function-invocation loop executes it like any other tool.
+    let call = FunctionCallContent::new(
+        "call_1",
+        "double",
+        Some(FunctionArguments::Raw(json!({"n": 21}).to_string())),
+    );
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("42");
+    let client = MockClient::new(vec![ask, answer]);
+
+    let double = AiFunction::new(
+        "double",
+        "Double a number.",
+        json!({
+            "type": "object",
+            "properties": { "n": {"type": "integer"} },
+            "required": ["n"]
+        }),
+        |args: Value| async move {
+            let n = args["n"].as_i64().unwrap_or(0);
+            Ok(json!(n * 2))
+        },
+    )
+    .into_definition();
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![double]]));
+
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+    let response = agent.run_once("double 21").await.unwrap();
+    assert!(response.text().contains("42"), "got: {}", response.text());
+    assert!(response.messages.iter().any(|m| m.role == Role::tool()
+        && m.contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionResult(_)))));
+}

@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::memory::{AggregateContextProvider, ContextProvider};
 use crate::middleware::{AgentRunContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
-use crate::tools::{AiFunction, ToolDefinition};
+use crate::tools::{AiFunction, ToolDefinition, ToolSource};
 use crate::types::{
     prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
     ChatResponse, IntoMessages, ResponseFormat,
@@ -251,6 +251,10 @@ pub struct ChatAgent {
     /// Middleware run around the underlying chat-client call (mirrors
     /// Python's `use_chat_middleware`). See [`ChatAgent::call_chat_client`].
     chat_middleware: MiddlewarePipeline<ChatContext>,
+    /// Dynamic tool sources (e.g. MCP servers), resolved fresh on every run
+    /// and appended after the agent's static/context/per-run tools. See
+    /// [`ToolSource`] and [`ChatAgent::prepare_request`].
+    tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
 /// Options for [`ChatAgent::as_tool`].
@@ -461,6 +465,29 @@ impl ChatAgent {
         for t in &run_options.additional_tools {
             if !options.tools.iter().any(|existing| existing.name == t.name) {
                 options.tools.push(t.clone());
+            }
+        }
+
+        // Resolve dynamic tool sources (e.g. MCP servers) fresh for this run,
+        // appended after every tool assembled above (dedup by name against
+        // those tools plus any earlier source already appended in this same
+        // loop; first registrant wins) — mirrors the Python reference's
+        // `existing_names` skip when (re)loading MCP tools/prompts
+        // (`_mcp.py:654,696`). A source's failure propagates out of the whole
+        // run; see [`ToolSource::resolve_tools`].
+        for source in &self.tool_sources {
+            let resolved = source.resolve_tools().await?;
+            for t in resolved {
+                if options.tools.iter().any(|existing| existing.name == t.name) {
+                    tracing::warn!(
+                        source = source.source_name(),
+                        tool = %t.name,
+                        "tool source produced a tool whose name collides with an existing \
+                         tool; skipping"
+                    );
+                    continue;
+                }
+                options.tools.push(t);
             }
         }
 
@@ -907,6 +934,7 @@ pub struct ChatAgentBuilder {
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
     chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
     function_middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
+    tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
 impl ChatAgentBuilder {
@@ -923,6 +951,7 @@ impl ChatAgentBuilder {
             agent_middleware: Vec::new(),
             chat_middleware: Vec::new(),
             function_middleware: Vec::new(),
+            tool_sources: Vec::new(),
         }
     }
 
@@ -967,6 +996,16 @@ impl ChatAgentBuilder {
     /// Add multiple tools.
     pub fn tools(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
         self.chat_options.tools.extend(tools);
+        self
+    }
+    /// Register a dynamic tool source (e.g. an MCP server wrapper), resolved
+    /// fresh on every run and appended after the agent's static/context/
+    /// per-run tools (dedup by name against those and any earlier-registered
+    /// source; first registrant wins). Call repeatedly to register more than
+    /// one source. See [`ToolSource`], resolved internally by every
+    /// [`ChatAgent`] run.
+    pub fn tool_source(mut self, source: Arc<dyn ToolSource>) -> Self {
+        self.tool_sources.push(source);
         self
     }
     /// Set the context provider(s).
@@ -1039,6 +1078,7 @@ impl ChatAgentBuilder {
             chat_message_store_factory: self.chat_message_store_factory,
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
+            tool_sources: self.tool_sources,
         }
     }
 }

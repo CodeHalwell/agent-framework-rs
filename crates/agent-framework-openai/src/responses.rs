@@ -248,7 +248,12 @@ impl ChatClient for OpenAIResponsesClient {
 /// Split a leading system message (and/or `ChatOptions::instructions`) out
 /// into the Responses API's top-level `instructions` field, returning the
 /// remaining messages to convert into `input` items.
-fn extract_instructions<'a>(
+///
+/// `pub` (rather than private) so `agent-framework-azure`'s Responses client
+/// can reuse this exact instructions-extraction step ahead of
+/// [`messages_to_input`] when building the Azure OpenAI Responses request
+/// body, instead of reimplementing it.
+pub fn extract_instructions<'a>(
     messages: &'a [ChatMessage],
     options_instructions: Option<&str>,
 ) -> (Option<String>, &'a [ChatMessage]) {
@@ -276,7 +281,11 @@ fn extract_instructions<'a>(
 }
 
 /// Convert framework messages into the Responses API's `input` item array.
-fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
+///
+/// `pub` so `agent-framework-azure`'s Responses client can reuse this
+/// conversion verbatim rather than reimplementing it (Azure OpenAI's
+/// Responses API shares the exact same `input` item wire shape).
+pub fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         let role = msg.role.as_str();
@@ -398,7 +407,10 @@ fn function_result_to_item(fr: &FunctionResultContent) -> Value {
 
 /// The flat Responses-API tool spec: `{"type":"function","name":...}`, unlike
 /// Chat Completions' `{"type":"function","function":{...}}` nesting.
-fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
+///
+/// `pub` so `agent-framework-azure`'s Responses client can reuse this
+/// mapping rather than reimplementing it.
+pub fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
     use agent_framework_core::tools::ToolKind;
     match &tool.kind {
         ToolKind::HostedWebSearch => {
@@ -518,7 +530,9 @@ fn mcp_require_approval(tool: &ToolDefinition) -> Value {
     })
 }
 
-fn tool_choice_to_responses(mode: &ToolMode) -> Value {
+/// `pub` so `agent-framework-azure`'s Responses client can reuse this
+/// mapping rather than reimplementing it.
+pub fn tool_choice_to_responses(mode: &ToolMode) -> Value {
     match mode {
         ToolMode::Auto => json!("auto"),
         ToolMode::None => json!("none"),
@@ -530,7 +544,10 @@ fn tool_choice_to_responses(mode: &ToolMode) -> Value {
 /// Convert a `ChatOptions::response_format` into a Responses API
 /// `text.format` object. Unlike Chat Completions (which nests the schema
 /// under `json_schema`), the Responses API uses a flat object.
-fn response_format_to_text(format: &ResponseFormat) -> Value {
+///
+/// `pub` so `agent-framework-azure`'s Responses client can reuse this
+/// mapping rather than reimplementing it.
+pub fn response_format_to_text(format: &ResponseFormat) -> Value {
     match format {
         ResponseFormat::Text => json!({ "type": "text" }),
         ResponseFormat::JsonObject => json!({ "type": "json_object" }),
@@ -560,7 +577,12 @@ fn response_format_to_text(format: &ResponseFormat) -> Value {
 // region: response conversion
 
 /// Parse a full (non-streaming) Responses API response.
-fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
+///
+/// `pub` so `agent-framework-azure`'s Responses client (whose wire format is
+/// otherwise identical) can reuse this parser — including `parse_output_item`,
+/// `parse_annotations`, and usage/finish-reason handling — rather than
+/// reimplementing it.
+pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
         model_id: value.get("model").and_then(Value::as_str).map(String::from),
@@ -846,7 +868,11 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
 // region: streaming
 
 /// Turn a Responses API SSE HTTP response into a stream of updates.
-fn parse_responses_sse_stream(
+///
+/// `pub` so `agent-framework-azure`'s Responses client can reuse this exact
+/// SSE event parser (Azure OpenAI's Responses API streams the same event
+/// shapes) rather than reimplementing it.
+pub fn parse_responses_sse_stream(
     resp: reqwest::Response,
     store: Option<bool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {

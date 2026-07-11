@@ -68,6 +68,7 @@
 
 mod credential;
 mod credentials;
+pub mod responses;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
 pub use credentials::{
@@ -75,6 +76,7 @@ pub use credentials::{
     EnvironmentCredential, ManagedIdentityCredential, WorkloadIdentityCredential,
     DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
 };
+pub use responses::AzureOpenAIResponsesClient;
 
 use std::sync::Arc;
 

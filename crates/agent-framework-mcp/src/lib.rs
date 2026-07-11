@@ -26,7 +26,24 @@
 //! (without rejecting) an older version the server negotiates down to, such
 //! as `2025-03-26` or `2024-11-05`. Implements the `initialize` /
 //! `notifications/initialized` handshake, `ping`, `tools/list` (with cursor
-//! pagination), and `tools/call`.
+//! pagination), `tools/call`, and `notifications/tools/list_changed` /
+//! `notifications/prompts/list_changed` (see "Dynamic tools" below).
+//!
+//! ## Dynamic tools ([`ToolSource`](agent_framework_core::tools::ToolSource))
+//!
+//! [`McpStdioTool`], [`McpStreamableHttpTool`], and [`McpWebsocketTool`] all
+//! implement `ToolSource`, so `ChatAgent::builder().tool_source(Arc::new(mcp))`
+//! resolves the server's tool list fresh on every agent run instead of
+//! freezing it at build time (the alternative, `.tool_definitions().await`
+//! once up front). Resolution connects lazily on first use and thereafter
+//! serves [`McpClient::list_tools_cached`]'s cached result, which
+//! self-invalidates when the server sends
+//! `notifications/tools/list_changed` (likewise `.prompts()` and
+//! [`McpClient::list_prompts_cached`] for `notifications/prompts/list_changed`).
+//! Set `.load_tools(false)` / `.load_prompts(false)` (default `true`) to skip
+//! loading either category entirely, without a round trip. A connection or
+//! listing failure during resolution propagates out of the agent run rather
+//! than being swallowed.
 //!
 //! ## Prompts, sampling, and roots
 //!
