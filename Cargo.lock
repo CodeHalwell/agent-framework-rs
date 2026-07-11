@@ -22,6 +22,7 @@ dependencies = [
  "agent-framework-purview",
  "agent-framework-redis",
  "async-trait",
+ "axum",
  "futures",
  "serde",
  "serde_json",

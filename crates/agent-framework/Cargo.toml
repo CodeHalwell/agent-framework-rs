@@ -66,6 +66,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
 async-trait = { workspace = true }
+axum = "0.8"
 
 [[example]]
 name = "anthropic"
@@ -98,3 +99,27 @@ required-features = ["redis"]
 [[example]]
 name = "mem0_memory"
 required-features = ["mem0"]
+
+[[example]]
+name = "mcp_sampling"
+required-features = ["mcp"]
+
+[[example]]
+name = "azure_foundry_agent"
+required-features = ["azure-ai", "azure"]
+
+[[example]]
+name = "copilotstudio_agent"
+required-features = ["copilotstudio"]
+
+[[example]]
+name = "purview_middleware"
+required-features = ["purview"]
+
+[[example]]
+name = "cosmos_store"
+required-features = ["cosmos"]
+
+[[example]]
+name = "agui_server"
+required-features = ["hosting"]
