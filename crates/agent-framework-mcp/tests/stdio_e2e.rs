@@ -8,14 +8,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_framework_core::error::Error;
-use agent_framework_mcp::{McpClient, McpStdioTool, McpStdioTransport};
+use agent_framework_mcp::{
+    CreateMessageParams, CreateMessageResult, McpClient, McpStdioTool, McpStdioTransport,
+    SamplingHandler,
+};
 use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// A minimal MCP server: handles `initialize`, `notifications/initialized`,
-/// `ping`, `tools/list` (two tools: `echo`, `add`), and `tools/call`. Emits a
-/// stray `notifications/message` right before the `initialize` response, so
-/// the test proves the client's reader routes notifications away from
-/// response correlation instead of misinterpreting one as the reply.
+/// `ping`, `tools/list` (`echo`, `add`, `ask_llm`), `tools/call`,
+/// `prompts/list`, and `prompts/get`. Emits a stray `notifications/message`
+/// right before the `initialize` response, so the test proves the client's
+/// reader routes notifications away from response correlation instead of
+/// misinterpreting one as the reply.
+///
+/// `ask_llm` exercises server-initiated request routing over stdio: handling
+/// it sends the client a server-initiated `sampling/createMessage` request,
+/// then blocks reading the very next stdin line for the correlated
+/// response. That ordering is safe (not a race) because the test issues
+/// exactly one `tools/call` and awaits it before doing anything else — the
+/// only two things the client ever writes to this process's stdin in that
+/// window are the original `tools/call` request (already sent) and the
+/// client's answer to this server-initiated request, in that order.
 const FAKE_SERVER_PY: &str = r#"
 import sys, json
 
@@ -23,15 +37,23 @@ def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
+def read_message():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    line = line.strip()
+    if not line:
+        return read_message()
+    try:
+        return json.loads(line)
+    except Exception:
+        return read_message()
+
 def main():
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
+    while True:
+        msg = read_message()
+        if msg is None:
+            break
         method = msg.get("method")
         msg_id = msg.get("id")
         if method == "initialize":
@@ -42,7 +64,7 @@ def main():
                 "id": msg_id,
                 "result": {
                     "protocolVersion": "2025-06-18",
-                    "capabilities": {},
+                    "capabilities": {"tools": {}, "prompts": {}},
                     "serverInfo": {"name": "fake-mcp-server", "version": "0.0.1"},
                 },
             })
@@ -74,6 +96,15 @@ def main():
                                 "required": ["a", "b"],
                             },
                         },
+                        {
+                            "name": "ask_llm",
+                            "description": "Ask the client's LLM (via MCP sampling) a question.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"question": {"type": "string"}},
+                                "required": ["question"],
+                            },
+                        },
                     ],
                 },
             })
@@ -101,12 +132,67 @@ def main():
                         "id": msg_id,
                         "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True},
                     })
+            elif name == "ask_llm":
+                question = args.get("question", "")
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "srv-samp-1",
+                    "method": "sampling/createMessage",
+                    "params": {
+                        "messages": [{"role": "user", "content": {"type": "text", "text": question}}],
+                        "maxTokens": 50,
+                    },
+                })
+                reply = read_message() or {}
+                result = reply.get("result") or {}
+                content = result.get("content") or {}
+                answer_text = content.get("text", "")
+                send({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"content": [{"type": "text", "text": answer_text}], "isError": False},
+                })
             else:
                 send({
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "result": {"content": [{"type": "text", "text": "unknown tool: " + str(name)}], "isError": True},
                 })
+        elif method == "prompts/list":
+            send({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "prompts": [
+                        {
+                            "name": "greet",
+                            "description": "A friendly greeting prompt.",
+                            "arguments": [
+                                {"name": "name", "description": "Who to greet", "required": True},
+                            ],
+                        },
+                    ],
+                },
+            })
+        elif method == "prompts/get":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            if name == "greet":
+                who = args.get("name", "there")
+                send({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "description": "A friendly greeting prompt.",
+                        "messages": [
+                            {"role": "user", "content": {"type": "text", "text": "Say hello to " + who}},
+                        ],
+                    },
+                })
+            else:
+                send({"jsonrpc": "2.0", "id": msg_id,
+                      "error": {"code": -32602, "message": "unknown prompt: " + str(name)}})
         else:
             if msg_id is not None:
                 send({"jsonrpc": "2.0", "id": msg_id,
@@ -233,4 +319,105 @@ async fn stdio_tool_high_level_api_connects_and_filters_allowed_tools() {
 
     let _ = std::fs::remove_file(&script);
     outcome.expect("stdio_tool_high_level_api_connects_and_filters_allowed_tools timed out");
+}
+
+#[tokio::test]
+async fn stdio_tool_prompts_list_and_get() {
+    let script = write_fake_server();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let tool =
+            McpStdioTool::new("fake", "python3").args([script.to_string_lossy().to_string()]);
+        tool.connect().await.expect("connect");
+
+        let prompts = tool.prompts().await.expect("prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(
+            prompts[0].description.as_deref(),
+            Some("A friendly greeting prompt.")
+        );
+        let args = prompts[0].arguments.as_ref().expect("greet has arguments");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].name, "name");
+        assert_eq!(args[0].required, Some(true));
+
+        let messages = tool
+            .get_prompt("greet", json!({"name": "Ada"}))
+            .await
+            .expect("get_prompt");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "Say hello to Ada");
+
+        tool.close().await.expect("close");
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&script);
+    outcome.expect("stdio_tool_prompts_list_and_get timed out");
+}
+
+/// The headline test for server-request routing over stdio: the fake server
+/// answers `tools/call("ask_llm", ...)` by sending a server-initiated
+/// `sampling/createMessage` request back to the client, which must route it
+/// to the registered [`SamplingHandler`], get an answer, and write the
+/// JSON-RPC response back over stdin — all without the test ever touching
+/// the transport directly. See the `FAKE_SERVER_PY` doc comment for why the
+/// server's blocking read of "the next line" is safe here, not a race.
+#[tokio::test]
+async fn stdio_tool_sampling_round_trip_via_server_initiated_request() {
+    let script = write_fake_server();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let received_question: Arc<AsyncMutex<Option<String>>> = Arc::new(AsyncMutex::new(None));
+        let received_question_for_handler = received_question.clone();
+        let handler: SamplingHandler = Arc::new(move |params: CreateMessageParams| {
+            let received_question = received_question_for_handler.clone();
+            Box::pin(async move {
+                assert_eq!(params.max_tokens, 50);
+                let question = params
+                    .messages
+                    .first()
+                    .and_then(|m| m.content.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                *received_question.lock().await = Some(question);
+                Ok(CreateMessageResult::text("assistant", "42", "test-model"))
+            })
+        });
+
+        let tool = McpStdioTool::new("fake", "python3")
+            .args([script.to_string_lossy().to_string()])
+            .sampling_handler(handler);
+        tool.connect().await.expect("connect");
+
+        let defs = tool.tool_definitions().await.expect("tool_definitions");
+        let ask_llm = defs
+            .iter()
+            .find(|d| d.name == "ask_llm")
+            .expect("ask_llm tool present");
+        let executor = ask_llm.executor.clone().expect("executable tool");
+
+        let value = executor
+            .invoke(json!({"question": "What is 6 times 7?"}))
+            .await
+            .expect("invoke ask_llm (drives the sampling round trip)");
+        // The server echoes the client's sampling answer back as the tool
+        // result; "42" happens to parse as JSON, so `to_value()` yields the
+        // number (matching the crate's established single-text-block rule).
+        assert_eq!(value, json!(42));
+
+        assert_eq!(
+            received_question.lock().await.clone(),
+            Some("What is 6 times 7?".to_string()),
+            "the server's sampling request should have carried the tool's question through"
+        );
+
+        tool.close().await.expect("close");
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&script);
+    outcome.expect("stdio_tool_sampling_round_trip_via_server_initiated_request timed out");
 }

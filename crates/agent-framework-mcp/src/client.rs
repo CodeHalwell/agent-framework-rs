@@ -1,6 +1,6 @@
 //! [`McpClient`]: JSON-RPC/MCP methods layered over any [`McpTransport`].
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -8,17 +8,20 @@ use tokio::sync::RwLock;
 use agent_framework_core::error::{Error, Result};
 
 use crate::protocol::{
-    CallToolResult, Implementation, InitializeResult, ListToolsResult, ToolDescriptor,
-    COMPATIBLE_PROTOCOL_VERSIONS, PROTOCOL_VERSION,
+    CallToolResult, GetPromptResult, Implementation, InitializeResult, ListPromptsResult,
+    ListToolsResult, PromptDescriptor, ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS,
+    PROTOCOL_VERSION,
 };
+use crate::sampling::{dispatch_server_request, Root, SamplingHandler, ServerRequestHandlers};
 use crate::transport::McpTransport;
 
-/// Safety cap on `tools/list` pagination, so a server that never stops
-/// returning a `nextCursor` cannot spin the client forever.
+/// Safety cap on `tools/list`/`prompts/list` pagination, so a server that
+/// never stops returning a `nextCursor` cannot spin the client forever.
 const MAX_LIST_PAGES: usize = 10_000;
 
 /// A connected MCP session: `initialize`, `ping`, `tools/list`, `tools/call`,
-/// layered over any [`McpTransport`].
+/// `prompts/list`, `prompts/get`, layered over any [`McpTransport`], plus
+/// server-initiated `sampling/createMessage` / `roots/list` support.
 ///
 /// `McpClient` is transport-agnostic: construct it with an `Arc<dyn McpTransport>`
 /// (see [`crate::McpStdioTransport`] / [`crate::McpStreamableHttpTransport`]), or
@@ -27,15 +30,68 @@ const MAX_LIST_PAGES: usize = 10_000;
 pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     initialize_result: RwLock<Option<InitializeResult>>,
+    handlers: Arc<StdRwLock<ServerRequestHandlers>>,
 }
 
 impl McpClient {
     /// Wrap a transport in a fresh, uninitialized session.
+    ///
+    /// Installs the server-request dispatcher into `transport` immediately
+    /// (see [`McpTransport::set_server_request_handler`]), so
+    /// [`Self::sampling_handler`] / [`Self::roots`] take effect for any
+    /// server-initiated request the transport sees from this point on, even
+    /// ones that arrive before [`Self::initialize`] completes.
     pub fn new(transport: Arc<dyn McpTransport>) -> Self {
+        let handlers: Arc<StdRwLock<ServerRequestHandlers>> = Arc::default();
+        let dispatch_handlers = handlers.clone();
+        transport.set_server_request_handler(Arc::new(move |method: String, params: Value| {
+            let handlers = dispatch_handlers.clone();
+            Box::pin(async move { dispatch_server_request(&handlers, &method, params).await })
+        }));
         Self {
             transport,
             initialize_result: RwLock::new(None),
+            handlers,
         }
+    }
+
+    /// Register the handler for server-initiated `sampling/createMessage`
+    /// requests. Declares the `sampling` capability on the next
+    /// [`Self::initialize`] call — set this up before initializing, matching
+    /// the `mcp` Python SDK, which derives the capability from whichever
+    /// callback was passed to the session at construction time.
+    pub fn sampling_handler(self, handler: SamplingHandler) -> Self {
+        self.handlers.write().unwrap().sampling = Some(handler);
+        self
+    }
+
+    /// Register a static list of filesystem roots, answered when the server
+    /// sends `roots/list`. Declares the `roots` capability on the next
+    /// [`Self::initialize`] call, the same way [`Self::sampling_handler`] does.
+    pub fn roots(self, roots: Vec<Root>) -> Self {
+        self.handlers.write().unwrap().roots = Some(roots);
+        self
+    }
+
+    /// The `capabilities` object sent during `initialize`: `sampling`/`roots`
+    /// are included only when a handler is registered via
+    /// [`Self::sampling_handler`] / [`Self::roots`] — matching the `mcp`
+    /// Python SDK, which derives `ClientCapabilities` from whichever
+    /// callbacks were supplied. Unlike that SDK (which always sets
+    /// `roots.listChanged: true` whenever any roots callback is present,
+    /// regardless of whether it ever actually sends that notification),
+    /// this always advertises `listChanged: false`: this crate's root list
+    /// is static, so that's the honest answer.
+    fn client_capabilities(&self) -> Value {
+        let handlers = self.handlers.read().unwrap();
+        let mut capabilities = serde_json::Map::new();
+        if handlers.sampling.is_some() {
+            capabilities.insert("sampling".to_string(), json!({}));
+        }
+        if handlers.roots.is_some() {
+            capabilities.insert("roots".to_string(), json!({ "listChanged": false }));
+        }
+        Value::Object(capabilities)
     }
 
     /// Perform the MCP `initialize` request followed by the
@@ -57,7 +113,7 @@ impl McpClient {
 
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": self.client_capabilities(),
             "clientInfo": Implementation {
                 name: client_name.to_string(),
                 version: client_version.to_string(),
@@ -140,6 +196,77 @@ impl McpClient {
         Ok(result.to_value())
     }
 
+    /// List every prompt the server exposes, transparently following
+    /// `nextCursor` pagination until the server stops returning one.
+    ///
+    /// Short-circuits to an empty list, without issuing any request, if the
+    /// server didn't declare the `prompts` capability during `initialize` —
+    /// the Rust equivalent of the Python reference's try/except around
+    /// `session.list_prompts()` (which logs and treats a failure the same
+    /// way), checking the negotiated capability up front instead of
+    /// discarding an expected error.
+    pub async fn list_prompts(&self) -> Result<Vec<PromptDescriptor>> {
+        self.require_initialized().await?;
+        if !self.supports_prompts().await {
+            return Ok(Vec::new());
+        }
+        let mut prompts = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let raw = self.transport.call("prompts/list", params).await?;
+            let page: ListPromptsResult = serde_json::from_value(raw)
+                .map_err(|e| Error::service(format!("invalid MCP prompts/list response: {e}")))?;
+            prompts.extend(page.prompts);
+            match page.next_cursor {
+                Some(next) if !next.is_empty() => cursor = Some(next),
+                _ => return Ok(prompts),
+            }
+        }
+        Err(Error::service(
+            "MCP prompts/list pagination exceeded the maximum page count",
+        ))
+    }
+
+    /// `prompts/get` — fetch a rendered prompt's messages.
+    ///
+    /// `arguments` should be a JSON object of string values per the MCP
+    /// spec (`GetPromptRequest.params.arguments?: {[key: string]: string}`);
+    /// `Value::Null` is sent as `{}`, mirroring [`Self::call_tool`].
+    ///
+    /// Unlike [`Self::list_prompts`], this does not pre-check the `prompts`
+    /// capability: a caller invoking a specific prompt by name presumably
+    /// already knows it exists, and a server that doesn't support prompts at
+    /// all will simply answer with a JSON-RPC error, surfaced here as
+    /// [`Error::Service`] — mirroring how the Python reference's
+    /// `get_prompt` lets the underlying request fail naturally.
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<GetPromptResult> {
+        self.require_initialized().await?;
+        let arguments = if arguments.is_null() {
+            json!({})
+        } else {
+            arguments
+        };
+        let params = json!({ "name": name, "arguments": arguments });
+        let raw = self.transport.call("prompts/get", params).await?;
+        serde_json::from_value(raw)
+            .map_err(|e| Error::service(format!("invalid MCP prompts/get response: {e}")))
+    }
+
+    /// Whether the server declared the `prompts` capability during
+    /// [`Self::initialize`]. `false` before `initialize` has completed.
+    pub async fn supports_prompts(&self) -> bool {
+        self.initialize_result
+            .read()
+            .await
+            .as_ref()
+            .map(InitializeResult::supports_prompts)
+            .unwrap_or(false)
+    }
+
     /// The server's `serverInfo`, once [`Self::initialize`] has completed.
     pub async fn server_info(&self) -> Option<Implementation> {
         self.initialize_result
@@ -185,6 +312,7 @@ impl McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampling::CreateMessageResult;
     use async_trait::async_trait;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
@@ -192,12 +320,17 @@ mod tests {
     /// A canned, in-memory transport for exercising [`McpClient`] without any I/O.
     struct MockTransport {
         responses: Mutex<HashMap<String, VecDeque<Value>>>,
+        /// Every `(method, params)` pair passed to `call`, in order — lets
+        /// tests assert on what a higher-level `McpClient` method actually
+        /// sent (e.g. the `capabilities` object during `initialize`).
+        sent: Mutex<Vec<(String, Value)>>,
     }
 
     impl MockTransport {
         fn new() -> Self {
             Self {
                 responses: Mutex::new(HashMap::new()),
+                sent: Mutex::new(Vec::new()),
             }
         }
 
@@ -209,11 +342,23 @@ mod tests {
                 .or_default()
                 .push_back(value);
         }
+
+        /// The params of the most recent `call(method, ..)`, if any.
+        fn last_params(&self, method: &str) -> Option<Value> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(m, _)| m == method)
+                .map(|(_, p)| p.clone())
+        }
     }
 
     #[async_trait]
     impl McpTransport for MockTransport {
-        async fn call(&self, method: &str, _params: Value) -> Result<Value> {
+        async fn call(&self, method: &str, params: Value) -> Result<Value> {
+            self.sent.lock().unwrap().push((method.to_string(), params));
             let mut guard = self.responses.lock().unwrap();
             let queue = guard
                 .get_mut(method)
@@ -354,5 +499,145 @@ mod tests {
         let info = client.server_info().await.unwrap();
         assert_eq!(info.name, "mock-server");
         assert_eq!(client.protocol_version().await.unwrap(), "2025-06-18");
+    }
+
+    // -- Capability declaration ------------------------------------------
+
+    #[tokio::test]
+    async fn initialize_omits_sampling_and_roots_capabilities_by_default() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let client = McpClient::new(mock.clone());
+        client.initialize("c", "1").await.unwrap();
+        let sent = mock.last_params("initialize").unwrap();
+        assert_eq!(sent["capabilities"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn initialize_declares_sampling_capability_only_when_handler_set() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let handler: SamplingHandler =
+            Arc::new(|_| Box::pin(async { Ok(CreateMessageResult::text("assistant", "hi", "m")) }));
+        let client = McpClient::new(mock.clone()).sampling_handler(handler);
+        client.initialize("c", "1").await.unwrap();
+        let sent = mock.last_params("initialize").unwrap();
+        assert_eq!(sent["capabilities"], json!({"sampling": {}}));
+    }
+
+    #[tokio::test]
+    async fn initialize_declares_roots_capability_only_when_set() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let client = McpClient::new(mock.clone()).roots(vec![Root::new("file:///tmp")]);
+        client.initialize("c", "1").await.unwrap();
+        let sent = mock.last_params("initialize").unwrap();
+        assert_eq!(
+            sent["capabilities"],
+            json!({"roots": {"listChanged": false}})
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_declares_both_capabilities_when_both_set() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let handler: SamplingHandler =
+            Arc::new(|_| Box::pin(async { Ok(CreateMessageResult::text("assistant", "hi", "m")) }));
+        let client = McpClient::new(mock.clone())
+            .sampling_handler(handler)
+            .roots(vec![Root::new("file:///tmp")]);
+        client.initialize("c", "1").await.unwrap();
+        let sent = mock.last_params("initialize").unwrap();
+        assert_eq!(sent["capabilities"]["sampling"], json!({}));
+        assert_eq!(sent["capabilities"]["roots"]["listChanged"], json!(false));
+    }
+
+    // -- Prompts ----------------------------------------------------------
+
+    fn init_result_with_prompts() -> Value {
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"prompts": {}},
+            "serverInfo": {"name": "mock-server", "version": "0.0.1"},
+        })
+    }
+
+    #[tokio::test]
+    async fn list_prompts_short_circuits_without_prompts_capability() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let client = McpClient::new(mock.clone());
+        client.initialize("c", "1").await.unwrap();
+        assert!(!client.supports_prompts().await);
+        let prompts = client.list_prompts().await.unwrap();
+        assert!(prompts.is_empty());
+        // No `prompts/list` request should ever have been sent.
+        assert!(mock.last_params("prompts/list").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_prompts_follows_cursor_pagination_when_supported() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result_with_prompts());
+        mock.push(
+            "prompts/list",
+            json!({
+                "prompts": [{"name": "greet"}],
+                "nextCursor": "page2",
+            }),
+        );
+        mock.push(
+            "prompts/list",
+            json!({
+                "prompts": [{"name": "farewell"}],
+            }),
+        );
+        let client = McpClient::new(mock);
+        client.initialize("c", "1").await.unwrap();
+        assert!(client.supports_prompts().await);
+        let prompts = client.list_prompts().await.unwrap();
+        assert_eq!(
+            prompts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["greet", "farewell"]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_prompt_maps_messages() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result_with_prompts());
+        mock.push(
+            "prompts/get",
+            json!({
+                "description": "A greeting",
+                "messages": [
+                    {"role": "user", "content": {"type": "text", "text": "Say hi to Ada"}},
+                ],
+            }),
+        );
+        let client = McpClient::new(mock.clone());
+        client.initialize("c", "1").await.unwrap();
+        let result = client
+            .get_prompt("greet", json!({"name": "Ada"}))
+            .await
+            .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, "user");
+        let sent = mock.last_params("prompts/get").unwrap();
+        assert_eq!(sent["name"], "greet");
+        assert_eq!(sent["arguments"]["name"], "Ada");
+    }
+
+    #[tokio::test]
+    async fn get_prompt_null_arguments_sent_as_empty_object() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result_with_prompts());
+        mock.push("prompts/get", json!({"messages": []}));
+        let client = McpClient::new(mock.clone());
+        client.initialize("c", "1").await.unwrap();
+        client.get_prompt("greet", Value::Null).await.unwrap();
+        let sent = mock.last_params("prompts/get").unwrap();
+        assert_eq!(sent["arguments"], json!({}));
     }
 }

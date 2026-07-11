@@ -10,12 +10,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_framework_core::error::Error;
-use agent_framework_mcp::{McpClient, McpTransport as _, McpWebsocketTool, McpWebsocketTransport};
+use agent_framework_mcp::{
+    CreateMessageParams, CreateMessageResult, McpClient, McpTransport as _, McpWebsocketTool,
+    McpWebsocketTransport, SamplingHandler,
+};
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+type WsSink = SplitSink<WebSocketStream<TcpStream>, Message>;
+type WsSource = SplitStream<WebSocketStream<TcpStream>>;
 
 /// Handle one JSON-RPC request-shaped value the same way the stdio fake
 /// server's Python script does, returning the response (or notification+
@@ -39,7 +48,7 @@ fn handle_message(value: &Value) -> Vec<Value> {
                 "id": id,
                 "result": {
                     "protocolVersion": "2025-06-18",
-                    "capabilities": {},
+                    "capabilities": {"tools": {}, "prompts": {}},
                     "serverInfo": {"name": "fake-ws-mcp-server", "version": "0.0.1"},
                 },
             }),
@@ -58,6 +67,15 @@ fn handle_message(value: &Value) -> Vec<Value> {
                             "type": "object",
                             "properties": {"text": {"type": "string"}},
                             "required": ["text"],
+                        },
+                    },
+                    {
+                        "name": "ask_llm",
+                        "description": "Ask the client's LLM (via MCP sampling) a question.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"question": {"type": "string"}},
+                            "required": ["question"],
                         },
                     },
                 ],
@@ -82,6 +100,45 @@ fn handle_message(value: &Value) -> Vec<Value> {
                         "content": [{"type": "text", "text": format!("unknown tool: {name}")}],
                         "isError": true,
                     },
+                })]
+            }
+        }
+        "prompts/list" => vec![json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": "greet",
+                        "description": "A friendly greeting prompt.",
+                        "arguments": [
+                            {"name": "name", "description": "Who to greet", "required": true},
+                        ],
+                    },
+                ],
+            },
+        })],
+        "prompts/get" => {
+            let params = value.get("params").cloned().unwrap_or_default();
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_default();
+            if name == "greet" {
+                let who = args.get("name").and_then(Value::as_str).unwrap_or("there");
+                vec![json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "description": "A friendly greeting prompt.",
+                        "messages": [
+                            {"role": "user", "content": {"type": "text", "text": format!("Say hello to {who}")}},
+                        ],
+                    },
+                })]
+            } else {
+                vec![json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": format!("unknown prompt: {name}")},
                 })]
             }
         }
@@ -152,6 +209,23 @@ async fn spawn_fake_server(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                    let params = value.get("params").cloned().unwrap_or_default();
+                    let is_ask_llm = method == "tools/call"
+                        && params.get("name").and_then(Value::as_str) == Some("ask_llm");
+                    if is_ask_llm {
+                        // Exercises server-request routing over the websocket
+                        // transport: ask the client to sample a completion
+                        // (a server-initiated request), then block reading
+                        // the very next frame for the correlated response —
+                        // safe because the test that uses this drives exactly
+                        // one `tools/call` and awaits it, so nothing else is
+                        // ever in flight in this window.
+                        if !send_ask_llm_via_sampling(&mut sink, &mut source, &value).await {
+                            return;
+                        }
+                        continue;
+                    }
                     for reply in handle_message(&value) {
                         if sink.send(Message::text(reply.to_string())).await.is_err() {
                             return;
@@ -168,6 +242,56 @@ async fn spawn_fake_server(
     });
 
     (url, handle)
+}
+
+/// Handle one `tools/call("ask_llm", {"question": ...})` request by sending
+/// the client a server-initiated `sampling/createMessage` request and
+/// relaying its answer back as the tool result. Returns `false` if the
+/// socket closed underneath us (caller should stop the server loop).
+async fn send_ask_llm_via_sampling(
+    sink: &mut WsSink,
+    source: &mut WsSource,
+    value: &Value,
+) -> bool {
+    let id = value.get("id").cloned();
+    let params = value.get("params").cloned().unwrap_or_default();
+    let args = params.get("arguments").cloned().unwrap_or_default();
+    let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+
+    let sampling_request = json!({
+        "jsonrpc": "2.0",
+        "id": "srv-samp-1",
+        "method": "sampling/createMessage",
+        "params": {
+            "messages": [{"role": "user", "content": {"type": "text", "text": question}}],
+            "maxTokens": 50,
+        },
+    });
+    if sink
+        .send(Message::text(sampling_request.to_string()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let Some(Ok(Message::Text(reply_text))) = source.next().await else {
+        return false;
+    };
+    let reply: Value = serde_json::from_str(&reply_text).unwrap_or_default();
+    let answer_text = reply
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"content": [{"type": "text", "text": answer_text}], "isError": false},
+    });
+    sink.send(Message::text(result.to_string())).await.is_ok()
 }
 
 #[tokio::test]
@@ -300,5 +424,101 @@ async fn websocket_close_performs_close_handshake() {
     .await;
 
     outcome.expect("websocket_close_performs_close_handshake timed out");
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn websocket_client_prompts_list_and_get() {
+    let subprotocol_seen = Arc::new(AtomicBool::new(false));
+    let (url, server) = spawn_fake_server(subprotocol_seen).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let transport = McpWebsocketTransport::connect(&url, &[])
+            .await
+            .expect("connect to fake MCP websocket server");
+        let client = McpClient::new(Arc::new(transport));
+        client
+            .initialize("test-client", "0.0.1")
+            .await
+            .expect("initialize handshake");
+
+        assert!(client.supports_prompts().await);
+        let prompts = client.list_prompts().await.expect("list_prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "greet");
+
+        let result = client
+            .get_prompt("greet", json!({"name": "Grace"}))
+            .await
+            .expect("get_prompt");
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(
+            result.messages[0].content_block(),
+            agent_framework_mcp::ContentBlock::Text("Say hello to Grace".to_string())
+        );
+
+        client.close().await.expect("close");
+    })
+    .await;
+
+    outcome.expect("websocket_client_prompts_list_and_get timed out");
+    let _ = server.await;
+}
+
+/// The websocket counterpart of `stdio_e2e.rs`'s headline sampling test:
+/// the fake server answers `tools/call("ask_llm", ...)` by sending a
+/// server-initiated `sampling/createMessage` request back over the same
+/// socket, which the client must route to the registered [`SamplingHandler`]
+/// and answer — proving server-request routing works over the websocket
+/// transport too, not just stdio.
+#[tokio::test]
+async fn websocket_sampling_round_trip_via_server_initiated_request() {
+    let subprotocol_seen = Arc::new(AtomicBool::new(false));
+    let (url, server) = spawn_fake_server(subprotocol_seen).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let received_question: Arc<AsyncMutex<Option<String>>> = Arc::new(AsyncMutex::new(None));
+        let received_question_for_handler = received_question.clone();
+        let handler: SamplingHandler = Arc::new(move |params: CreateMessageParams| {
+            let received_question = received_question_for_handler.clone();
+            Box::pin(async move {
+                assert_eq!(params.max_tokens, 50);
+                let question = params
+                    .messages
+                    .first()
+                    .and_then(|m| m.content.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                *received_question.lock().await = Some(question);
+                Ok(CreateMessageResult::text("assistant", "42", "test-model"))
+            })
+        });
+
+        let tool = McpWebsocketTool::new("fake-ws", url).sampling_handler(handler);
+        tool.connect().await.expect("connect");
+
+        let defs = tool.tool_definitions().await.expect("tool_definitions");
+        let ask_llm = defs
+            .iter()
+            .find(|d| d.name == "ask_llm")
+            .expect("ask_llm tool present");
+        let executor = ask_llm.executor.clone().expect("executable tool");
+
+        let value = executor
+            .invoke(json!({"question": "What is 6 times 7?"}))
+            .await
+            .expect("invoke ask_llm (drives the sampling round trip)");
+        assert_eq!(value, json!(42));
+        assert_eq!(
+            received_question.lock().await.clone(),
+            Some("What is 6 times 7?".to_string())
+        );
+
+        tool.close().await.expect("close");
+    })
+    .await;
+
+    outcome.expect("websocket_sampling_round_trip_via_server_initiated_request timed out");
     let _ = server.await;
 }

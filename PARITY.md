@@ -64,8 +64,9 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | MCP client — stdio transport | ✅ | ✅ (via `ModelContextProtocol` SDK integration) | ✅ done | `agent-framework-mcp::McpStdioTool` |
 | MCP client — streamable HTTP transport | ✅ | ✅ | ✅ done | `McpStreamableHttpTool` |
 | MCP client — WebSocket transport | ✅ | not verified | ✅ done | `McpWebsocketTool` (`ws://`/`wss://`, `"mcp"` subprotocol, one JSON-RPC message per text frame) |
-| MCP prompts (`prompts/list` / `prompts/get`) | ✅ | not verified | ❌ not yet | only tools are exposed as agent functions |
-| MCP sampling / roots callbacks | ✅ | not verified | ❌ not yet | server-initiated requests are logged and ignored, never answered |
+| MCP prompts (`prompts/list` / `prompts/get`) | ✅ | not verified | ✅ done | `McpClient::list_prompts`/`::get_prompt`, and `.prompts()`/`.get_prompt(name, args)` on all three tool wrappers (mapping MCP `PromptMessage`s into core `ChatMessage`s, mirroring Python's `MCPTool.get_prompt`); `list_prompts`/`.prompts()` short-circuit to `[]` without a round trip when the server didn't declare the `prompts` capability |
+| MCP sampling callback (server→client `sampling/createMessage`) | ✅ | not verified | ✅ done | `SamplingHandler` + `.sampling_handler(..)` on `McpClient` and all three tool wrappers; `chat_client_sampling_handler(client)` adapts any `ChatClient`; `sampling` capability declared in `initialize` only when a handler is set (matches the `mcp` Python SDK's capability-from-callback derivation); all three transports route a server-initiated request to the handler and write the JSON-RPC response back themselves — `ping` is always answered, an unhandled/unknown method gets a JSON-RPC "method not found" response, never silence |
+| MCP roots callback (server→client `roots/list`) | 🚧 (the `mcp` Python SDK supports it; `agent_framework`'s `MCPTool` never wires up a callback, so it's unused in practice) | not verified | ✅ done | `.roots(vec![Root::new("file:///...")])` on `McpClient` and all three tool wrappers; static list only (no `list_changed` notifications, so `listChanged` is honestly advertised as `false`); the Rust port exceeds the upstream Python *package's* actual behavior here, though not the underlying protocol's |
 
 ## Middleware & memory
 
@@ -119,7 +120,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | --- | --- | --- | --- | --- |
 | A2A client (call remote agents) | ✅ (`a2a`) | ✅ (`Microsoft.Agents.AI.A2A`) | ✅ done | `agent-framework-a2a` — see Agents section |
 | A2A serving (agent card + JSON-RPC endpoint) | ✅ | ✅ (`.Hosting.A2A[.AspNetCore]`) | ✅ done | `agent-framework-hosting::a2a::A2ARouter` — `GET /.well-known/agent-card.json` + JSON-RPC 2.0 `POST /` |
-| A2A push notifications / task resubscribe / extended card | ✅ | ✅ | ❌ not yet | `tasks/pushNotificationConfig/*`, `tasks/resubscribe`, and the authenticated extended-card flow are unimplemented on both the client and serving sides |
+| A2A push notifications / task resubscribe / extended card | ✅ | ✅ | 🚧 partial | Client done: `A2AClient::set_push_notification_config`/`::get_push_notification_config` (`tasks/pushNotificationConfig/set`\|`/get` — note `get`'s params send the task id under `id`, not `taskId`, a real spec/SDK wire inconsistency faithfully preserved), `::resubscribe` (`tasks/resubscribe`, sharing its SSE parsing with `send_message_stream`), and `::get_extended_card` (`agent/getAuthenticatedExtendedCard`), auto-upgraded into `get_agent_card()` when `supportsAuthenticatedExtendedCard` is set (best-effort — falls back to the base card on failure). Serving side (`agent-framework-hosting::a2a::A2ARouter`) still exposes none of the three — out of scope for this change |
 | DevUI-style HTTP API (entities + responses, SSE) | ✅ (`devui`) | ✅ (`Microsoft.Agents.AI.DevUI`) | ✅ done | `agent-framework-hosting::AgentHost` — `GET /health`, `GET /v1/entities[/{id}/info]`, `POST /v1/responses` (JSON or SSE); runs are stateless (no conversation store or run-resume endpoint) |
 | DevUI web frontend | ✅ (bundled UI) | ✅ | 🚧 partial | not the React DevUI: `agent-framework-hosting::ui` embeds a single-file, dependency-free debug page (served at `GET /` and `GET /ui`) that lists entities and runs them against `POST /v1/responses`, rendering the SSE stream live (text deltas, collapsible executor/workflow rows, a resume-not-supported notice for pending `request_info`) |
 | OpenAI-compatible serving (`/v1/chat/completions`) | ✅ (via devui) | ✅ (`.Hosting.OpenAI`) | ✅ done | `agent-framework-hosting::openai_compat::OpenAiRouter` (JSON or SSE) |
@@ -135,8 +136,8 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 
 Much shorter than it used to be. What genuinely remains:
 
-- **MCP**: prompts capability and sampling/roots callbacks (the WebSocket transport now ships).
-- **A2A**: push notifications, `tasks/resubscribe`, authenticated extended card.
+- **MCP**: client-side protocol surface is now complete (prompts, sampling, roots, all three transports).
+- **A2A**: client-side protocol surface is now complete (push notifications, `tasks/resubscribe`, authenticated extended card); the *serving* side (`agent-framework-hosting`) still lacks all three.
 - **DevUI**: ships an embedded single-file debug page (not the React DevUI); hosted runs are stateless (no conversation store / run-resume endpoint).
 - **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
 - **Redis provider**: recency/token-match retrieval, no RediSearch vector or hybrid search.

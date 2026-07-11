@@ -402,6 +402,79 @@ pub struct MessageSendConfiguration {
     pub history_length: Option<u32>,
 }
 
+// ---------------------------------------------------------------------
+// Push notification config (`tasks/pushNotificationConfig/set` / `/get`)
+// ---------------------------------------------------------------------
+
+/// How the server should authenticate itself when it calls back a
+/// [`PushNotificationConfig::url`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushNotificationAuthenticationInfo {
+    pub schemes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
+}
+
+/// A webhook the server should call as a [`Task`] progresses, set via
+/// `tasks/pushNotificationConfig/set`
+/// ([`A2AClient::set_push_notification_config`](crate::client::A2AClient::set_push_notification_config)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushNotificationConfig {
+    /// Identifies this config among possibly several registered for the
+    /// same task (A2A 0.3.0+). Optional: a server may assign one if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<PushNotificationAuthenticationInfo>,
+}
+
+impl PushNotificationConfig {
+    /// Build a config with just a callback URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            url: url.into(),
+            token: None,
+            authentication: None,
+        }
+    }
+
+    /// Set a shared-secret token the server should include on its callback.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Set the authentication schemes/credentials the server should use.
+    pub fn with_authentication(
+        mut self,
+        authentication: PushNotificationAuthenticationInfo,
+    ) -> Self {
+        self.authentication = Some(authentication);
+        self
+    }
+}
+
+/// The `taskId` + [`PushNotificationConfig`] pair used as both the params of
+/// `tasks/pushNotificationConfig/set` and the result of both `set` and `get`.
+///
+/// Note: the `get` request's *params* use a different shape
+/// (`GetTaskPushNotificationConfigParams`, with the task id under `id` —
+/// see [`A2AClient::get_push_notification_config`](crate::client::A2AClient::get_push_notification_config)),
+/// an actual wire-level inconsistency in the A2A 0.3.0 spec/SDK, not a typo
+/// here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPushNotificationConfig {
+    pub task_id: String,
+    pub push_notification_config: PushNotificationConfig,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +719,74 @@ mod tests {
         assert!(value.get("configuration").is_none());
         assert!(value.get("metadata").is_none());
         assert_eq!(value["message"]["role"], "user");
+    }
+
+    // -- Push notification config -----------------------------------------
+
+    #[test]
+    fn push_notification_config_builder_composes() {
+        let config = PushNotificationConfig::new("https://example.com/hook")
+            .with_token("secret")
+            .with_authentication(PushNotificationAuthenticationInfo {
+                schemes: vec!["Bearer".into()],
+                credentials: Some("abc".into()),
+            });
+        assert_eq!(config.url, "https://example.com/hook");
+        assert_eq!(config.token.as_deref(), Some("secret"));
+        assert_eq!(
+            config.authentication.as_ref().unwrap().schemes,
+            vec!["Bearer".to_string()]
+        );
+    }
+
+    #[test]
+    fn push_notification_config_serializes_camel_case_and_omits_unset_fields() {
+        let config = PushNotificationConfig::new("https://example.com/hook");
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["url"], "https://example.com/hook");
+        assert!(value.get("id").is_none());
+        assert!(value.get("token").is_none());
+        assert!(value.get("authentication").is_none());
+    }
+
+    #[test]
+    fn task_push_notification_config_round_trips_with_camel_case_task_id() {
+        let json = serde_json::json!({
+            "taskId": "task-1",
+            "pushNotificationConfig": {
+                "url": "https://example.com/hook",
+                "authentication": {"schemes": ["Bearer"], "credentials": "tok"},
+            },
+        });
+        let parsed: TaskPushNotificationConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.task_id, "task-1");
+        assert_eq!(
+            parsed.push_notification_config.url,
+            "https://example.com/hook"
+        );
+        assert_eq!(
+            parsed
+                .push_notification_config
+                .authentication
+                .as_ref()
+                .unwrap()
+                .credentials
+                .as_deref(),
+            Some("tok")
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn task_push_notification_config_deserializes_with_config_id() {
+        let json = serde_json::json!({
+            "taskId": "task-1",
+            "pushNotificationConfig": {
+                "id": "cfg-1",
+                "url": "https://example.com/hook",
+            },
+        });
+        let parsed: TaskPushNotificationConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.push_notification_config.id.as_deref(), Some("cfg-1"));
     }
 }
