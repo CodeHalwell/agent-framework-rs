@@ -188,6 +188,11 @@ impl DeclarativeLoader {
             "file_search" => {
                 let mut def = hosted_file_search(spec.maximum_result_count);
                 override_meta(&mut def, spec);
+                // Providers (e.g. the OpenAI Responses client) read the
+                // required store ids from the definition's parameters.
+                if let Some(ids) = spec.vector_store_ids.as_deref().filter(|v| !v.is_empty()) {
+                    def.parameters = serde_json::json!({ "vector_store_ids": ids });
+                }
                 Ok(def)
             }
             "code_interpreter" => {
