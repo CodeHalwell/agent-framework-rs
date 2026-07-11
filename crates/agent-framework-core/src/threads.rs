@@ -117,6 +117,38 @@ impl AgentThread {
         Ok(())
     }
 
+    /// Adopt a service-managed conversation id returned by the chat service
+    /// (e.g. an OpenAI Responses `previous_response_id` or an Azure AI thread
+    /// id), so follow-up runs continue the same service conversation.
+    ///
+    /// Succeeds when the thread has no local store or its local store is
+    /// still empty (the unused store is discarded — the service owns the
+    /// history from here on). A thread that already accumulated local
+    /// history is left unchanged and `Ok(false)` is returned.
+    pub async fn try_adopt_service_thread_id(&mut self, id: &str) -> Result<bool> {
+        if self.service_thread_id.as_deref() == Some(id) {
+            return Ok(false);
+        }
+        match &self.message_store {
+            None => {
+                self.service_thread_id = Some(id.to_string());
+                Ok(true)
+            }
+            Some(store) => {
+                if store.list_messages().await?.is_empty() {
+                    self.message_store = None;
+                    self.service_thread_id = Some(id.to_string());
+                    Ok(true)
+                } else {
+                    tracing::debug!(
+                        "not adopting service thread id {id}: thread has local history"
+                    );
+                    Ok(false)
+                }
+            }
+        }
+    }
+
     /// The local message store, if any.
     pub fn message_store(&self) -> Option<&Arc<dyn ChatMessageStore>> {
         self.message_store.as_ref()

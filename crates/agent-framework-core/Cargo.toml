@@ -22,4 +22,7 @@ tokio-stream = { workspace = true }
 pin-project-lite = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` adds tokio's mock clock (`start_paused`, `pause`/`advance`) used
+# by the retry-layer tests to assert backoff timing without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = "0.3"

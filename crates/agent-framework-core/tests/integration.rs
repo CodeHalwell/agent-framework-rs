@@ -3,11 +3,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use agent_framework_core::agent::AsToolOptions;
 use agent_framework_core::prelude::*;
 use agent_framework_core::types::{Content, FunctionArguments, FunctionCallContent, Role};
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 
 /// A scripted chat client that returns queued responses in order.
 #[derive(Clone)]
@@ -448,4 +449,708 @@ async fn workflow_errors_on_max_iterations() {
         result.is_err(),
         "expected a workflow error on iteration limit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Structured output
+// ---------------------------------------------------------------------------
+
+#[test]
+fn response_format_serializes_to_openai_shape() {
+    // Text / JsonObject.
+    assert_eq!(
+        serde_json::to_value(ResponseFormat::Text).unwrap(),
+        json!({ "type": "text" })
+    );
+    assert_eq!(
+        serde_json::to_value(ResponseFormat::JsonObject).unwrap(),
+        json!({ "type": "json_object" })
+    );
+
+    // JsonSchema nests under "json_schema", matching OpenAI's request object.
+    let fmt = ResponseFormat::JsonSchema {
+        name: "Person".into(),
+        description: Some("a person".into()),
+        schema: json!({ "type": "object", "properties": { "name": { "type": "string" } } }),
+        strict: Some(true),
+    };
+    let value = serde_json::to_value(&fmt).unwrap();
+    assert_eq!(value["type"], "json_schema");
+    assert_eq!(value["json_schema"]["name"], "Person");
+    assert_eq!(value["json_schema"]["description"], "a person");
+    assert_eq!(value["json_schema"]["strict"], true);
+    assert_eq!(value["json_schema"]["schema"]["type"], "object");
+
+    // Round-trips through Deserialize.
+    let back: ResponseFormat = serde_json::from_value(value).unwrap();
+    assert_eq!(back, fmt);
+}
+
+#[test]
+fn parse_json_reads_structured_value() {
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Person {
+        name: String,
+        age: u32,
+    }
+
+    let resp = ChatResponse::from_text(r#"{"name":"Ada","age":36}"#);
+    let person: Person = resp.parse_json().unwrap();
+    assert_eq!(
+        person,
+        Person {
+            name: "Ada".into(),
+            age: 36
+        }
+    );
+
+    // The same convenience exists on AgentRunResponse.
+    let agent_resp =
+        AgentRunResponse::from_chat_response(ChatResponse::from_text(r#"{"name":"Bob","age":5}"#));
+    let person2: Person = agent_resp.parse_json().unwrap();
+    assert_eq!(person2.name, "Bob");
+
+    // Non-JSON text surfaces an error rather than panicking.
+    assert!(ChatResponse::from_text("not json")
+        .parse_json::<Person>()
+        .is_err());
+}
+
+#[test]
+fn response_format_builder_sugar_sets_option() {
+    let agent =
+        ChatAgent::builder(MockClient::new(vec![])).response_format(ResponseFormat::JsonObject);
+    // Build and confirm the option flows through (via a run that echoes options
+    // is unnecessary; just assert the builder compiles and produces an agent).
+    let _agent = agent.build();
+}
+
+// ---------------------------------------------------------------------------
+// ToolMode serde
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tool_mode_serde_round_trip() {
+    assert_eq!(serde_json::to_value(ToolMode::Auto).unwrap(), json!("auto"));
+    assert_eq!(
+        serde_json::to_value(ToolMode::required_any()).unwrap(),
+        json!("required")
+    );
+    // Like Python's serialize_model, the pinned function name is not persisted
+    // on the mode itself (the provider mapping applies it).
+    assert_eq!(
+        serde_json::to_value(ToolMode::required_function("get_weather")).unwrap(),
+        json!("required")
+    );
+    assert_eq!(serde_json::to_value(ToolMode::None).unwrap(), json!("none"));
+
+    assert_eq!(
+        serde_json::from_value::<ToolMode>(json!("auto")).unwrap(),
+        ToolMode::Auto
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolMode>(json!("required")).unwrap(),
+        ToolMode::Required(None)
+    );
+    assert_eq!(
+        serde_json::from_value::<ToolMode>(json!("none")).unwrap(),
+        ToolMode::None
+    );
+
+    assert_eq!(
+        ToolMode::required_function("f").required_function_name(),
+        Some("f")
+    );
+    assert_eq!(ToolMode::Auto.required_function_name(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Update aggregation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_update_aggregation() {
+    let updates = vec![
+        AgentRunResponseUpdate {
+            contents: vec![Content::text("Hello")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        },
+        AgentRunResponseUpdate {
+            contents: vec![Content::text(" world")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        },
+    ];
+    let resp = AgentRunResponse::from_agent_run_response_updates(updates);
+    assert_eq!(resp.text(), "Hello world");
+}
+
+// ---------------------------------------------------------------------------
+// Function-approval flow
+// ---------------------------------------------------------------------------
+
+/// A tool requiring approval that records how many times it actually executed.
+fn approval_tool(counter: Arc<Mutex<u32>>) -> ToolDefinition {
+    AiFunction::new(
+        "get_secret",
+        "Return the secret value.",
+        json!({ "type": "object", "properties": {} }),
+        move |_args| {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().unwrap() += 1;
+                Ok(json!("42"))
+            }
+        },
+    )
+    .with_approval_mode(ApprovalMode::AlwaysRequire)
+    .into_definition()
+}
+
+fn secret_call() -> ChatResponse {
+    ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                "call_1",
+                "get_secret",
+                Some(FunctionArguments::Raw("{}".into())),
+            ))],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn approval_loop_approve_executes_and_answers() {
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+    ]));
+    let options = ChatOptions::new().with_tool(tool);
+
+    // Request 1: the model asks for an approval-gated tool -> we get an approval
+    // request back, and the tool has NOT run.
+    let resp1 = client
+        .get_response(
+            vec![ChatMessage::user("what is the secret?")],
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let requests = resp1.user_input_requests();
+    assert_eq!(requests.len(), 1, "expected one approval request");
+    assert_eq!(requests[0].function_call.call_id, "call_1");
+    assert_eq!(*counter.lock().unwrap(), 0, "tool ran before approval");
+    // The assistant message still carries the original function call too.
+    assert_eq!(resp1.function_calls().len(), 1);
+
+    // Request 2: approve -> the tool runs and the model produces a final answer.
+    let approval = requests[0].create_response(true);
+    let mut conversation = vec![ChatMessage::user("what is the secret?")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(ChatMessage::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(approval)],
+    ));
+    let resp2 = client.get_response(conversation, options).await.unwrap();
+    assert!(resp2.text().contains("42"), "got: {}", resp2.text());
+    assert_eq!(*counter.lock().unwrap(), 1, "tool should run exactly once");
+}
+
+#[tokio::test]
+async fn approval_loop_reject_skips_execution() {
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("Understood, I won't retrieve it."),
+    ]));
+    let options = ChatOptions::new().with_tool(tool);
+
+    let resp1 = client
+        .get_response(
+            vec![ChatMessage::user("what is the secret?")],
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let requests = resp1.user_input_requests();
+    assert_eq!(requests.len(), 1);
+
+    // Reject the call.
+    let rejection = requests[0].create_response(false);
+    let mut conversation = vec![ChatMessage::user("what is the secret?")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(ChatMessage::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(rejection)],
+    ));
+    let resp2 = client.get_response(conversation, options).await.unwrap();
+
+    assert!(resp2.text().contains("won't"), "got: {}", resp2.text());
+    assert_eq!(*counter.lock().unwrap(), 0, "rejected tool must not run");
+}
+
+#[tokio::test]
+async fn agent_surfaces_and_resolves_approval_round_trip() {
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let agent = ChatAgent::builder(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+    ]))
+    .name("keeper")
+    .tool(tool)
+    .build();
+
+    let mut thread = agent.get_new_thread();
+
+    // First run pauses awaiting approval; the request is surfaced on the agent
+    // response and persisted to the thread.
+    let resp1 = agent
+        .run(vec![ChatMessage::user("get the secret")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert_eq!(resp1.user_input_requests().len(), 1);
+    let approval = resp1.user_input_requests()[0].create_response(true);
+
+    // Supplying the approval response as new input resolves the exchange.
+    let resp2 = agent
+        .run(
+            vec![ChatMessage::with_contents(
+                Role::user(),
+                vec![Content::FunctionApprovalResponse(approval)],
+            )],
+            Some(&mut thread),
+        )
+        .await
+        .unwrap();
+    assert!(resp2.text().contains("42"), "got: {}", resp2.text());
+    assert_eq!(*counter.lock().unwrap(), 1);
+
+    // The thread retains the full approval exchange.
+    let history = thread.list_messages().await.unwrap();
+    assert!(history.iter().any(|m| !m.user_input_requests().is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// Agent-as-tool
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn agent_as_tool_is_callable_by_another_agent() {
+    // Inner agent always answers "INNER-RESULT".
+    let inner = ChatAgent::builder(MockClient::new(vec![ChatResponse::from_text(
+        "INNER-RESULT",
+    )]))
+    .name("researcher")
+    .description("Performs research tasks.")
+    .build();
+    let research_tool = inner.as_tool(AsToolOptions::new().name("research"));
+    assert_eq!(research_tool.name, "research");
+
+    // Outer agent: the model calls `research`, then answers.
+    let call = FunctionCallContent::new(
+        "c1",
+        "research",
+        Some(FunctionArguments::Raw(
+            json!({ "task": "find X" }).to_string(),
+        )),
+    );
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let outer = ChatAgent::builder(MockClient::new(vec![ask, ChatResponse::from_text("Done.")]))
+        .tool(research_tool)
+        .build();
+
+    let response = outer.run_once("do research").await.unwrap();
+    assert!(response.text().contains("Done"), "got: {}", response.text());
+
+    // The inner agent's output flowed back as the tool result.
+    let saw_inner = response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .any(|c| {
+            matches!(c, Content::FunctionResult(fr)
+            if fr.result.as_ref().and_then(|v| v.as_str()) == Some("INNER-RESULT"))
+        });
+    assert!(
+        saw_inner,
+        "inner agent result missing: {:?}",
+        response.messages
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Observability
+//
+// The span-capture smoke test lives in its own binary (`tests/observability.rs`)
+// so the `chat` tracing callsite is first evaluated under the capturing
+// subscriber — `tracing` caches callsite interest globally, so sharing a binary
+// with tests that hit the callsite under the no-op subscriber would disable it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn observable_chat_client_is_transparent() {
+    // Decorating a client must not change its observable behavior.
+    let client = ObservableChatClient::new(
+        MockClient::new(vec![ChatResponse::from_text("plain")]),
+        "mock",
+    );
+    let resp = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(resp.text(), "plain");
+}
+
+// ---------------------------------------------------------------------------
+// Chat & function middleware
+// ---------------------------------------------------------------------------
+
+/// Chat middleware that rewrites every outgoing user message's text.
+struct RewriteUserMessage;
+
+#[async_trait]
+impl Middleware<ChatContext> for RewriteUserMessage {
+    async fn process(&self, mut ctx: ChatContext, next: Next<ChatContext>) -> Result<ChatContext> {
+        for m in &mut ctx.messages {
+            if m.role == Role::user() {
+                *m = ChatMessage::user("REWRITTEN");
+            }
+        }
+        next.run(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn chat_middleware_rewrites_outgoing_message() {
+    let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .chat_middleware(Arc::new(RewriteUserMessage))
+        .build();
+
+    let _ = agent.run_once("original").await.unwrap();
+
+    let seen = seen.lock().unwrap();
+    let last = seen.last().expect("the model should have been called");
+    assert!(
+        last.iter().any(|m| m.text() == "REWRITTEN"),
+        "model did not see the rewritten message: {last:?}"
+    );
+}
+
+/// Chat middleware that short-circuits with a canned response, never letting
+/// the call reach the underlying client.
+struct ShortCircuitChat;
+
+#[async_trait]
+impl Middleware<ChatContext> for ShortCircuitChat {
+    async fn process(&self, mut ctx: ChatContext, _next: Next<ChatContext>) -> Result<ChatContext> {
+        // Deliberately does not call `next.run(ctx)`: the underlying client
+        // must never be invoked.
+        ctx.result = Some(ChatResponse::from_text("canned"));
+        ctx.terminate = true;
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn chat_middleware_short_circuits_model_call() {
+    let client = MockClient::new(vec![ChatResponse::from_text("should not be used")]);
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .chat_middleware(Arc::new(ShortCircuitChat))
+        .build();
+
+    let response = agent.run_once("hi").await.unwrap();
+
+    assert_eq!(response.text(), "canned");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the underlying model must not have been called"
+    );
+}
+
+/// Function middleware that rewrites arguments before execution.
+struct RewriteArgsMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for RewriteArgsMiddleware {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        if let Some(obj) = ctx.arguments.as_object_mut() {
+            obj.insert("a".to_string(), json!(100));
+        }
+        next.run(ctx).await
+    }
+}
+
+fn add_call(a: i64, b: i64) -> ChatResponse {
+    let call = FunctionCallContent::new(
+        "call_1",
+        "add",
+        Some(FunctionArguments::Raw(json!({"a": a, "b": b}).to_string())),
+    );
+    ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_rewrites_arguments() {
+    let client = MockClient::new(vec![add_call(2, 3), ChatResponse::from_text("done")]);
+
+    let seen_args: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let seen_args_clone = seen_args.clone();
+    let add = AiFunction::new(
+        "add",
+        "Add two integers.",
+        json!({"type":"object","properties":{}}),
+        move |args: Value| {
+            let seen_args_clone = seen_args_clone.clone();
+            async move {
+                *seen_args_clone.lock().unwrap() = Some(args.clone());
+                let a = args["a"].as_i64().unwrap_or(0);
+                let b = args["b"].as_i64().unwrap_or(0);
+                Ok(json!(a + b))
+            }
+        },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(client)
+        .tool(add)
+        .function_middleware(Arc::new(RewriteArgsMiddleware))
+        .build();
+
+    let _ = agent.run_once("add 2 and 3").await.unwrap();
+
+    let seen = seen_args
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the tool should have run");
+    assert_eq!(
+        seen["a"],
+        json!(100),
+        "middleware did not rewrite the argument: {seen:?}"
+    );
+    assert_eq!(seen["b"], json!(3), "unrelated argument must be untouched");
+}
+
+/// Function middleware that blocks execution entirely by short-circuiting
+/// with its own result.
+struct BlockExecutionMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for BlockExecutionMiddleware {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        _next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        ctx.result = Some(json!("blocked"));
+        ctx.terminate = true;
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_blocks_execution() {
+    let client = MockClient::new(vec![add_call(2, 3), ChatResponse::from_text("done")]);
+
+    let invoked = Arc::new(Mutex::new(false));
+    let invoked_clone = invoked.clone();
+    let add = AiFunction::new(
+        "add",
+        "Add two integers.",
+        json!({"type":"object","properties":{}}),
+        move |_args| {
+            let invoked_clone = invoked_clone.clone();
+            async move {
+                *invoked_clone.lock().unwrap() = true;
+                Ok(json!(999))
+            }
+        },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(client)
+        .tool(add)
+        .function_middleware(Arc::new(BlockExecutionMiddleware))
+        .build();
+
+    let response = agent.run_once("add 2 and 3").await.unwrap();
+
+    assert!(!*invoked.lock().unwrap(), "the tool must not have executed");
+    assert!(
+        response
+            .messages
+            .iter()
+            .any(|m| m.contents.iter().any(|c| matches!(
+                c,
+                Content::FunctionResult(fr) if fr.result == Some(json!("blocked"))
+            ))),
+        "the blocked result should still flow through as the tool result: {:?}",
+        response.messages
+    );
+}
+
+/// Records `"{label}-before"`/`"{label}-after"` around `next.run(...)`, so two
+/// instances reveal the pipeline's nesting order.
+struct OrderRecorder {
+    label: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for OrderRecorder {
+    async fn process(
+        &self,
+        ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}-before", self.label));
+        let ctx = next.run(ctx).await?;
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{}-after", self.label));
+        Ok(ctx)
+    }
+}
+
+#[tokio::test]
+async fn function_middleware_order_is_onion_nested() {
+    // Two function middlewares must nest onion-style — first registered is
+    // outermost — matching the ordering convention `MiddlewarePipeline`
+    // already establishes for agent middleware (`Next::run` walks the
+    // registered list front-to-back, invoking the terminal only once every
+    // middleware has called `next`).
+    let client = MockClient::new(vec![
+        ChatResponse {
+            messages: vec![ChatMessage::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call_1",
+                    "noop",
+                    Some(FunctionArguments::Raw("{}".into())),
+                ))],
+            )],
+            finish_reason: Some(FinishReason::tool_calls()),
+            ..Default::default()
+        },
+        ChatResponse::from_text("done"),
+    ]);
+
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let agent = ChatAgent::builder(client)
+        .tool(noop)
+        .function_middleware(Arc::new(OrderRecorder {
+            label: "A",
+            log: log.clone(),
+        }))
+        .function_middleware(Arc::new(OrderRecorder {
+            label: "B",
+            log: log.clone(),
+        }))
+        .build();
+
+    let _ = agent.run_once("go").await.unwrap();
+
+    let log = log.lock().unwrap().clone();
+    assert_eq!(log, vec!["A-before", "B-before", "B-after", "A-after"]);
+}
+
+#[tokio::test]
+async fn service_conversation_id_is_adopted_by_thread() {
+    use std::sync::{Arc, Mutex};
+
+    // A client that manages conversations service-side: returns a
+    // conversation id and records the options of every request.
+    struct ServiceClient {
+        seen_options: Arc<Mutex<Vec<ChatOptions>>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatClient for ServiceClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<ChatMessage>,
+            options: ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.seen_options.lock().unwrap().push(options);
+            let mut resp = ChatResponse::from_text("ok");
+            resp.conversation_id = Some("conv-1".to_string());
+            Ok(resp)
+        }
+        async fn get_streaming_response(
+            &self,
+            messages: Vec<ChatMessage>,
+            options: ChatOptions,
+        ) -> Result<agent_framework_core::client::ChatStream> {
+            let resp = self.get_response(messages, options).await?;
+            let mut update = ChatResponseUpdate::text(resp.text());
+            update.conversation_id = Some("conv-1".to_string());
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    let seen_options = Arc::new(Mutex::new(Vec::new()));
+    let agent = ChatAgent::builder(ServiceClient {
+        seen_options: seen_options.clone(),
+    })
+    .name("svc")
+    .build();
+
+    // Fresh agent threads start with an (empty) local store; the returned
+    // service conversation id must still be adopted.
+    let mut thread = agent.get_new_thread();
+    let response = agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert_eq!(response.conversation_id.as_deref(), Some("conv-1"));
+    assert_eq!(thread.service_thread_id(), Some("conv-1"));
+
+    // Turn two must carry the id back to the service.
+    agent
+        .run(vec![ChatMessage::user("again")], Some(&mut thread))
+        .await
+        .unwrap();
+    let opts = seen_options.lock().unwrap();
+    assert_eq!(opts.len(), 2);
+    assert_eq!(opts[0].conversation_id, None);
+    assert_eq!(opts[1].conversation_id.as_deref(), Some("conv-1"));
 }

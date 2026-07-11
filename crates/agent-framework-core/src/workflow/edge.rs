@@ -22,10 +22,15 @@ pub enum EdgeGroup {
     },
     /// Broadcast from `source` to all `targets` (optionally filtered by a
     /// selection function — used for switch/case and multi-selection).
+    ///
+    /// `case_labels`, when present, is index-aligned with `targets` and carries
+    /// human-readable labels for visualization (e.g. switch-case names). It has
+    /// no effect on routing.
     FanOut {
         source: String,
         targets: Vec<String>,
         selection: Option<Selection>,
+        case_labels: Option<Vec<String>>,
     },
     /// Barrier: `target` runs once all `sources` have delivered, receiving the
     /// collected messages as a JSON array.
@@ -53,15 +58,36 @@ impl EdgeGroup {
             EdgeGroup::FanIn { target, .. } => vec![target.clone()],
         }
     }
+
+    /// Flattened directed `(source, target)` edges implied by this group. Used
+    /// by validation and visualization.
+    pub(crate) fn flat_edges(&self) -> Vec<(String, String)> {
+        match self {
+            EdgeGroup::Single { source, target, .. } => vec![(source.clone(), target.clone())],
+            EdgeGroup::FanOut {
+                source, targets, ..
+            } => targets
+                .iter()
+                .map(|t| (source.clone(), t.clone()))
+                .collect(),
+            EdgeGroup::FanIn { sources, target } => sources
+                .iter()
+                .map(|s| (s.clone(), target.clone()))
+                .collect(),
+        }
+    }
 }
 
 /// A switch/case branch: if `condition` matches, route to `target`.
 pub struct Case {
     pub condition: Condition,
     pub target: String,
+    /// Optional human-readable label used in visualization.
+    pub label: Option<String>,
 }
 
 impl Case {
+    /// A case routing to `target` when `condition` holds.
     pub fn new(
         condition: impl Fn(&Value) -> bool + Send + Sync + 'static,
         target: impl Into<String>,
@@ -69,6 +95,20 @@ impl Case {
         Self {
             condition: Arc::new(condition),
             target: target.into(),
+            label: None,
+        }
+    }
+
+    /// A case with an explicit visualization label.
+    pub fn labeled(
+        condition: impl Fn(&Value) -> bool + Send + Sync + 'static,
+        target: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            condition: Arc::new(condition),
+            target: target.into(),
+            label: Some(label.into()),
         }
     }
 }
@@ -79,6 +119,7 @@ pub struct Default {
 }
 
 impl Default {
+    /// The default branch, routing to `target` when no case matches.
     pub fn new(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),

@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<!--
+  Embedded DevUI debug page for agent-framework-hosting.
+
+  Self-contained: no external assets, no CDNs, no build step. Talks only to the
+  same-origin DevUI API (GET /v1/entities, POST /v1/responses). This is a
+  pragmatic debugging surface, NOT the upstream React DevUI.
+
+  (Local dev is typically served at localhost, e.g. run AgentHost::serve on
+  127.0.0.1:8080 and open the root path — no absolute URLs are used below.)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Framework DevUI (debug)</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #14161a;
+    --panel: #1c1f26;
+    --panel-2: #232733;
+    --border: #2e333f;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #5b9dff;
+    --ok: #4cc38a;
+    --warn: #e0b341;
+    --err: #e5678a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --border: #d9dde5;
+      --text: #1a1d23; --muted: #5a6472; --accent: #2f6fed;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .tag {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+    padding: 1px 7px; border-radius: 999px;
+  }
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 0; min-height: calc(100vh - 52px); }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  #sidebar { border-right: 1px solid var(--border); padding: 14px; overflow-y: auto; }
+  #sidebar h2, #detail h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: border-color .12s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card.active { border-color: var(--accent); background: var(--panel-2); }
+  .card .name { font-weight: 600; }
+  .card .type {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--accent); margin-left: 6px;
+  }
+  .card .desc { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  #detail { padding: 18px 22px; overflow-y: auto; }
+  #detail .placeholder { color: var(--muted); }
+  .run-box { max-width: 900px; }
+  textarea {
+    width: 100%; min-height: 74px; resize: vertical; background: var(--panel);
+    color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; font: inherit;
+  }
+  .controls { display: flex; align-items: center; gap: 14px; margin: 10px 0 4px; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+    padding: 8px 16px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+  .out { margin-top: 18px; }
+  .answer {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; white-space: pre-wrap; word-break: break-word; min-height: 22px;
+  }
+  .events { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; }
+  details.row {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  details.row > summary { cursor: pointer; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  details.row pre {
+    margin: 8px 0 2px; padding: 8px; background: var(--panel-2); border-radius: 6px;
+    overflow-x: auto; font-family: var(--mono); font-size: 12px;
+  }
+  .notice {
+    border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px;
+    color: var(--warn); background: transparent; font-size: 13px;
+  }
+  .err-line { color: var(--err, #e5678a); }
+  .status { font-size: 12px; color: var(--muted); margin-left: auto; font-family: var(--mono); }
+  footer {
+    color: var(--muted); font-size: 12px; padding: 12px 22px; border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Framework DevUI</h1>
+  <span class="tag">debug</span>
+  <span class="tag">embedded</span>
+</header>
+<main>
+  <section id="sidebar">
+    <h2>Entities</h2>
+    <div id="entities"><div class="placeholder" style="color:var(--muted)">Loading&hellip;</div></div>
+  </section>
+  <section id="detail">
+    <div class="placeholder">Select an entity to run it.</div>
+  </section>
+</main>
+<footer>
+  Pragmatic, single-file debug UI served by <code>agent-framework-hosting</code>.
+  It is <strong>not</strong> the upstream React DevUI &mdash; it renders entity
+  discovery and streamed runs with zero dependencies for quick local inspection.
+</footer>
+
+<script>
+"use strict";
+
+// Endpoints (same-origin, relative — no external hosts).
+const ENTITIES_URL = "/v1/entities";
+const RESPONSES_URL = "/v1/responses";
+
+let selectedId = null;
+
+async function loadEntities() {
+  const box = document.getElementById("entities");
+  try {
+    const res = await fetch(ENTITIES_URL);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const entities = (data && data.entities) || [];
+    if (!entities.length) {
+      box.innerHTML = '<div class="placeholder" style="color:var(--muted)">No entities registered.</div>';
+      return;
+    }
+    box.innerHTML = "";
+    for (const ent of entities) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.dataset.id = ent.id;
+      const desc = ent.description ? '<div class="desc"></div>' : "";
+      card.innerHTML =
+        '<div><span class="name"></span><span class="type"></span></div>' + desc;
+      card.querySelector(".name").textContent = ent.name || ent.id;
+      card.querySelector(".type").textContent = ent.type || "";
+      if (ent.description) card.querySelector(".desc").textContent = ent.description;
+      card.addEventListener("click", () => selectEntity(ent, card));
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="notice">Failed to load entities: ' + escapeHtml(String(e)) + "</div>";
+  }
+}
+
+function selectEntity(ent, card) {
+  selectedId = ent.id;
+  for (const c of document.querySelectorAll(".card")) c.classList.remove("active");
+  card.classList.add("active");
+
+  const detail = document.getElementById("detail");
+  detail.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "run-box";
+
+  const h = document.createElement("h2");
+  h.textContent = (ent.name || ent.id) + "  ·  " + (ent.type || "entity");
+  box.appendChild(h);
+
+  const ta = document.createElement("textarea");
+  ta.placeholder = "Message to send…";
+  ta.value = "Hello!";
+  box.appendChild(ta);
+
+  const controls = document.createElement("div");
+  controls.className = "controls";
+  const runBtn = document.createElement("button");
+  runBtn.textContent = "Run";
+  const streamLabel = document.createElement("label");
+  streamLabel.className = "toggle";
+  const streamCb = document.createElement("input");
+  streamCb.type = "checkbox";
+  streamCb.checked = true;
+  streamLabel.appendChild(streamCb);
+  streamLabel.appendChild(document.createTextNode("stream (SSE)"));
+  const status = document.createElement("span");
+  status.className = "status";
+  controls.appendChild(runBtn);
+  controls.appendChild(streamLabel);
+  controls.appendChild(status);
+  box.appendChild(controls);
+
+  const out = document.createElement("div");
+  out.className = "out";
+  const answer = document.createElement("div");
+  answer.className = "answer";
+  const events = document.createElement("div");
+  events.className = "events";
+  out.appendChild(answer);
+  out.appendChild(events);
+  box.appendChild(out);
+
+  runBtn.addEventListener("click", () =>
+    runEntity(ent.id, ta.value, streamCb.checked, { runBtn, status, answer, events })
+  );
+  detail.appendChild(box);
+}
+
+async function runEntity(entityId, input, stream, ui) {
+  ui.runBtn.disabled = true;
+  ui.answer.textContent = "";
+  ui.events.innerHTML = "";
+  ui.status.textContent = stream ? "streaming…" : "running…";
+
+  const body = JSON.stringify({ input: input, stream: stream, metadata: { entity_id: entityId } });
+  try {
+    const res = await fetch(RESPONSES_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: body,
+    });
+    if (stream) {
+      await consumeSse(res, ui);
+    } else {
+      const data = await res.json();
+      renderFinal(data, ui);
+      ui.status.textContent = "done";
+    }
+  } catch (e) {
+    addNotice(ui.events, "Request failed: " + String(e), true);
+    ui.status.textContent = "error";
+  } finally {
+    ui.runBtn.disabled = false;
+  }
+}
+
+// Parse a text/event-stream body incrementally, dispatching each JSON event.
+async function consumeSse(res, ui) {
+  if (!res.body) { ui.status.textContent = "no stream body"; return; }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line.
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      handleFrame(frame, ui);
+    }
+  }
+  if (buffer.trim()) handleFrame(buffer, ui);
+  if (ui.status.textContent === "streaming…") ui.status.textContent = "done";
+}
+
+function handleFrame(frame, ui) {
+  // A frame may have several "data:" lines; join their payloads.
+  const dataLines = frame
+    .split("\n")
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => l.slice(5).replace(/^ /, ""));
+  if (!dataLines.length) return;
+  const payload = dataLines.join("\n");
+  if (payload === "[DONE]") { ui.status.textContent = "done"; return; }
+  let ev;
+  try { ev = JSON.parse(payload); } catch { return; }
+  dispatchEvent(ev, ui);
+}
+
+function dispatchEvent(ev, ui) {
+  const t = ev.type || "";
+  switch (t) {
+    case "response.output_text.delta":
+      ui.answer.textContent += ev.delta || "";
+      break;
+    case "response.completed": {
+      const finalText = ev.response && ev.response.output_text;
+      if (typeof finalText === "string" && finalText.length) ui.answer.textContent = finalText;
+      addRow(ui.events, t, ev);
+      ui.status.textContent = "done";
+      break;
+    }
+    case "response.request_info.requested":
+      addNotice(
+        ui.events,
+        "Workflow paused on a request_info event (id " +
+          (ev.request_id || "?") +
+          "). Resuming a run over HTTP is not supported by this host.",
+        false
+      );
+      addRow(ui.events, t, ev);
+      break;
+    case "response.output_item.added":
+    case "response.output_item.done":
+    case "response.content_part.added":
+    case "response.workflow_event.completed":
+    case "response.created":
+    case "response.in_progress":
+      addRow(ui.events, t, ev);
+      break;
+    case "error":
+    case "response.error":
+      addNotice(ui.events, "Error: " + JSON.stringify(ev), true);
+      break;
+    default:
+      addRow(ui.events, t || "event", ev);
+  }
+}
+
+function renderFinal(data, ui) {
+  if (data && data.error) {
+    addNotice(ui.events, "Error: " + (data.error.message || JSON.stringify(data.error)), true);
+    return;
+  }
+  if (data && typeof data.output_text === "string") ui.answer.textContent = data.output_text;
+  if (data && Array.isArray(data.outputs)) {
+    for (const o of data.outputs) addRow(ui.events, "output", o);
+  }
+  if (data && Array.isArray(data.pending_requests) && data.pending_requests.length) {
+    addNotice(
+      ui.events,
+      "Response has " + data.pending_requests.length +
+        " pending request_info item(s). Resuming over HTTP is not supported by this host.",
+      false
+    );
+  }
+  addRow(ui.events, "response", data);
+}
+
+function addRow(container, label, obj) {
+  const d = document.createElement("details");
+  d.className = "row";
+  const s = document.createElement("summary");
+  s.textContent = label;
+  const pre = document.createElement("pre");
+  pre.textContent = safeJson(obj);
+  d.appendChild(s);
+  d.appendChild(pre);
+  container.appendChild(d);
+}
+
+function addNotice(container, text, isError) {
+  const n = document.createElement("div");
+  n.className = "notice";
+  if (isError) { n.style.borderColor = "var(--err)"; n.style.color = "var(--err)"; }
+  n.textContent = text;
+  container.appendChild(n);
+}
+
+function safeJson(obj) {
+  try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+loadEntities();
+</script>
+</body>
+</html>

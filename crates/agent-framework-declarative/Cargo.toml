@@ -1,0 +1,22 @@
+[package]
+name = "agent-framework-declarative"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Declarative agents and workflows loaded from YAML/JSON specs"
+
+[dependencies]
+agent-framework-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }

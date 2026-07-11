@@ -57,7 +57,9 @@ pub fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
     out
 }
 
-fn result_to_string(fr: &FunctionResultContent) -> String {
+/// Render a function/tool result as the plain-text/JSON string OpenAI wire
+/// formats expect for tool output. Shared by Chat Completions and Responses.
+pub(crate) fn result_to_string(fr: &FunctionResultContent) -> String {
     if let Some(exc) = &fr.exception {
         return format!("error: {exc}");
     }
@@ -69,18 +71,28 @@ fn result_to_string(fr: &FunctionResultContent) -> String {
 }
 
 fn function_call_to_openai(fc: &FunctionCallContent) -> Value {
-    let args = match &fc.arguments {
+    json!({
+        "id": fc.call_id,
+        "type": "function",
+        "function": { "name": fc.name, "arguments": function_arguments_to_string(&fc.arguments) }
+    })
+}
+
+/// Render function-call arguments as the JSON-encoded string the OpenAI wire
+/// formats (Chat Completions and Responses alike) expect.
+///
+/// Public (but hidden) so `responses.rs` in this crate, and any
+/// OpenAI-wire-compatible reuse outside it, can share the exact same
+/// stringification instead of duplicating it.
+#[doc(hidden)]
+pub fn function_arguments_to_string(args: &Option<FunctionArguments>) -> String {
+    match args {
         Some(FunctionArguments::Raw(s)) => s.clone(),
         Some(FunctionArguments::Object(m)) => {
             serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
         }
         None => "{}".into(),
-    };
-    json!({
-        "id": fc.call_id,
-        "type": "function",
-        "function": { "name": fc.name, "arguments": args }
-    })
+    }
 }
 
 /// Build the tools array and tool_choice for a request.
@@ -121,10 +133,9 @@ pub fn apply_options(body: &mut Map<String, Value>, options: &ChatOptions) {
         body.insert("stop".into(), json!(stop));
     }
     if let Some(fmt) = &options.response_format {
-        body.insert(
-            "response_format".into(),
-            json!({ "type": "json_schema", "json_schema": fmt }),
-        );
+        // `ResponseFormat` serializes directly to the Chat Completions
+        // `response_format` object for all three variants.
+        body.insert("response_format".into(), json!(fmt));
     }
     for (k, v) in &options.additional_properties {
         body.entry(k.clone()).or_insert_with(|| v.clone());
@@ -194,7 +205,11 @@ fn parse_tool_call(call: &Value) -> Option<FunctionCallContent> {
     ))
 }
 
-pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
+/// Parse an OpenAI-shaped `usage` object into [`UsageDetails`].
+///
+/// Public (but hidden) so `agent-framework-azure` can reuse it verbatim.
+#[doc(hidden)]
+pub fn parse_usage(usage: &Value) -> UsageDetails {
     UsageDetails {
         input_token_count: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("completion_tokens").and_then(Value::as_u64),

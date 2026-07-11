@@ -4,19 +4,21 @@
 
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
+use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
 use crate::error::Result;
 use crate::memory::{AggregateContextProvider, ContextProvider};
-use crate::middleware::{AgentRunContext, MiddlewarePipeline, Terminal};
+use crate::middleware::{AgentRunContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::threads::AgentThread;
-use crate::tools::ToolDefinition;
+use crate::tools::{AiFunction, ToolDefinition};
 use crate::types::{
     prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
-    IntoMessages,
+    ChatResponse, IntoMessages, ResponseFormat,
 };
 
 /// A boxed stream of agent run updates.
@@ -55,6 +57,10 @@ pub trait Agent: Send + Sync {
 
 /// The primary concrete agent: pairs a chat client with instructions, default
 /// options, tools, context providers, and middleware.
+///
+/// Cheaply cloneable (the client, context providers, and middleware are shared
+/// via `Arc`), which is what makes [`ChatAgent::as_tool`] possible.
+#[derive(Clone)]
 pub struct ChatAgent {
     id: String,
     name: Option<String>,
@@ -63,6 +69,48 @@ pub struct ChatAgent {
     chat_options: ChatOptions,
     context_provider: Option<Arc<AggregateContextProvider>>,
     agent_middleware: MiddlewarePipeline<AgentRunContext>,
+    /// Middleware run around the underlying chat-client call (mirrors
+    /// Python's `use_chat_middleware`). See [`ChatAgent::call_chat_client`].
+    chat_middleware: MiddlewarePipeline<ChatContext>,
+}
+
+/// Options for [`ChatAgent::as_tool`].
+#[derive(Debug, Clone, Default)]
+pub struct AsToolOptions {
+    /// The tool name. Defaults to the agent's name (else its id).
+    pub name: Option<String>,
+    /// The tool description. Defaults to the agent's description (else empty).
+    pub description: Option<String>,
+    /// The single string argument's name. Defaults to `"task"`.
+    pub arg_name: Option<String>,
+    /// The argument's description. Defaults to `"Task for {tool_name}"`.
+    pub arg_description: Option<String>,
+}
+
+impl AsToolOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Set the tool name.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+    /// Set the tool description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+    /// Set the argument name (default `"task"`).
+    pub fn arg_name(mut self, arg_name: impl Into<String>) -> Self {
+        self.arg_name = Some(arg_name.into());
+        self
+    }
+    /// Set the argument description.
+    pub fn arg_description(mut self, arg_description: impl Into<String>) -> Self {
+        self.arg_description = Some(arg_description.into());
+        self
+    }
 }
 
 impl ChatAgent {
@@ -97,6 +145,9 @@ impl ChatAgent {
         // used when there is no agent middleware to honor.
         if self.has_middleware() {
             let response = self.run_core(final_messages, options, true).await?;
+            if let Some(cid) = response.conversation_id.as_deref() {
+                thread.try_adopt_service_thread_id(cid).await?;
+            }
             thread.on_new_messages(input.clone()).await?;
             thread.on_new_messages(response.messages.clone()).await?;
             if let Some(cp) = self.resolve_provider(&thread) {
@@ -121,6 +172,9 @@ impl ChatAgent {
             return Ok(futures::stream::iter(updates).boxed());
         }
 
+        let (final_messages, options) = self
+            .apply_chat_middleware_pre_call(final_messages, options)
+            .await?;
         let inner = self
             .client
             .get_streaming_response(final_messages, options)
@@ -183,21 +237,73 @@ impl ChatAgent {
     /// Run the agent middleware pipeline with a terminal that calls the chat
     /// client, returning the aggregated response. Shared by `run` and the
     /// middleware path of `run_stream` (thread updates are handled by callers).
+    ///
+    /// Wrapped in an `invoke_agent` span (OTel GenAI semconv). The plain
+    /// token-streaming path does not go through here; that path is observed at
+    /// the chat-client decorator level (see [`crate::observability`]).
     async fn run_core(
         &self,
         final_messages: Vec<ChatMessage>,
         options: ChatOptions,
         is_streaming: bool,
     ) -> Result<AgentRunResponse> {
+        let span = crate::observability::agent_span(
+            self.name.as_deref().unwrap_or(self.id.as_str()),
+            &self.id,
+        );
+        async move {
+            let result = self
+                .run_core_inner(final_messages, options, is_streaming)
+                .await;
+            let span = tracing::Span::current();
+            match &result {
+                Ok(response) => {
+                    if let Some(usage) = &response.usage_details {
+                        if let Some(input) = usage.input_token_count {
+                            span.record(crate::observability::attr::INPUT_TOKENS, input);
+                        }
+                        if let Some(output) = usage.output_token_count {
+                            span.record(crate::observability::attr::OUTPUT_TOKENS, output);
+                        }
+                    }
+                }
+                Err(err) => {
+                    span.record(
+                        crate::observability::attr::ERROR_TYPE,
+                        crate::observability::error_type(err).as_str(),
+                    );
+                }
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn run_core_inner(
+        &self,
+        final_messages: Vec<ChatMessage>,
+        options: ChatOptions,
+        is_streaming: bool,
+    ) -> Result<AgentRunResponse> {
         let client = self.client.clone();
+        let chat_middleware = self.chat_middleware.clone();
         let terminal: Terminal<AgentRunContext> = Box::new(move |mut ctx: AgentRunContext| {
             let client = client.clone();
             let options = options.clone();
+            let chat_middleware = chat_middleware.clone();
             Box::pin(async move {
                 if ctx.terminate {
                     return Ok(ctx);
                 }
-                let response = client.get_response(ctx.messages.clone(), options).await?;
+                let response = Self::call_chat_client(
+                    &client,
+                    &chat_middleware,
+                    ctx.messages.clone(),
+                    options,
+                    ctx.is_streaming,
+                )
+                .await?;
                 ctx.result = Some(AgentRunResponse::from_chat_response(response));
                 Ok(ctx)
             }) as crate::tools::BoxFuture<Result<AgentRunContext>>
@@ -217,6 +323,77 @@ impl ChatAgent {
             }
         }
         Ok(response)
+    }
+
+    /// Invoke the chat client once, routed through the chat-middleware
+    /// pipeline (mirrors Python's `use_chat_middleware`).
+    ///
+    /// Middleware may mutate `messages`/`chat_options` before the call, then
+    /// observe (or override, via [`ChatContext::result`]) the response after
+    /// calling `next.run(...)`. A middleware that sets `terminate = true`
+    /// without invoking `next` short-circuits the call entirely: the
+    /// underlying client is never invoked, and [`ChatContext::result`] (if
+    /// set) becomes the returned response.
+    async fn call_chat_client(
+        client: &Arc<dyn ChatClient>,
+        chat_middleware: &MiddlewarePipeline<ChatContext>,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+        is_streaming: bool,
+    ) -> Result<ChatResponse> {
+        if chat_middleware.is_empty() {
+            return client.get_response(messages, options).await;
+        }
+        let client = client.clone();
+        let terminal: Terminal<ChatContext> = Box::new(move |mut ctx: ChatContext| {
+            let client = client.clone();
+            Box::pin(async move {
+                if ctx.terminate {
+                    return Ok(ctx);
+                }
+                let response = client
+                    .get_response(ctx.messages.clone(), ctx.chat_options.clone())
+                    .await?;
+                ctx.result = Some(response);
+                Ok(ctx)
+            }) as crate::tools::BoxFuture<Result<ChatContext>>
+        });
+        let ctx = ChatContext::new(messages, options, is_streaming);
+        let ctx = chat_middleware.execute(ctx, terminal).await?;
+        ctx.result.ok_or_else(|| {
+            crate::error::Error::AgentExecution("chat middleware produced no result".into())
+        })
+    }
+
+    /// Apply chat middleware to a *streaming* call's `messages`/`chat_options`
+    /// before the real network call.
+    ///
+    /// Unlike [`ChatAgent::call_chat_client`], this only honors *pre-call*
+    /// mutation: a real token stream can't flow back through
+    /// [`ChatContext::result`] (typed for a complete [`ChatResponse`]), so any
+    /// middleware logic placed *after* `next.run(...)` observes
+    /// `ctx.result == None` and cannot post-process individual streamed
+    /// tokens, and `terminate`/`result` short-circuiting is not honored here.
+    /// This mirrors upstream Python's `use_chat_middleware`, whose streaming
+    /// path likewise hands middleware an unconsumed async generator rather
+    /// than driving it through the pipeline. Full interception (including
+    /// short-circuiting) for chat middleware is available via
+    /// [`ChatAgent::run`]/[`ChatAgent::run_once`], and via `run_stream` too
+    /// when at least one agent middleware is also configured (that path
+    /// funnels through [`ChatAgent::run_core`] and replays the result as
+    /// updates).
+    async fn apply_chat_middleware_pre_call(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
+        if self.chat_middleware.is_empty() {
+            return Ok((messages, options));
+        }
+        let terminal: Terminal<ChatContext> = Box::new(|ctx| Box::pin(async move { Ok(ctx) }));
+        let ctx = ChatContext::new(messages, options, true);
+        let ctx = self.chat_middleware.execute(ctx, terminal).await?;
+        Ok((ctx.messages, ctx.chat_options))
     }
 
     /// Whether this agent has any agent-level middleware configured.
@@ -248,7 +425,6 @@ fn async_stream_forward(
     input: Vec<ChatMessage>,
     provider: Option<Arc<AggregateContextProvider>>,
 ) -> impl Stream<Item = Result<AgentRunResponseUpdate>> + Send {
-    use crate::types::ChatResponse;
     let finish: ForwardFinish = Some((thread, input, provider));
     futures::stream::unfold(
         (
@@ -279,6 +455,11 @@ fn async_stream_forward(
                         // rather than dropping it.
                         if let Some((mut thread, input, provider)) = finish.take() {
                             let response = ChatResponse::from_updates(collected.clone());
+                            if let Some(cid) = response.conversation_id.as_deref() {
+                                if let Err(e) = thread.try_adopt_service_thread_id(cid).await {
+                                    return Some((Err(e), (inner, collected, true, None)));
+                                }
+                            }
                             if let Err(e) = thread.on_new_messages(input.clone()).await {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
@@ -319,6 +500,11 @@ impl Agent for ChatAgent {
         let (final_messages, options) = self.prepare_request(&messages, thread).await?;
         let response = self.run_core(final_messages, options, false).await?;
 
+        // Persist a service-managed conversation id before touching local
+        // history, so service-backed threads stay service-backed.
+        if let Some(cid) = response.conversation_id.as_deref() {
+            thread.try_adopt_service_thread_id(cid).await?;
+        }
         // Update thread history.
         thread.on_new_messages(messages.clone()).await?;
         thread.on_new_messages(response.messages.clone()).await?;
@@ -361,10 +547,15 @@ pub struct ChatAgentBuilder {
     name: Option<String>,
     description: Option<String>,
     instructions: Option<String>,
+    /// The raw, caller-supplied client. Wrapping in [`FunctionInvokingChatClient`]
+    /// is deferred to [`ChatAgentBuilder::build`] so that builder-collected
+    /// function middleware can be threaded into the wrapper's constructor.
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
     context_provider: Option<Arc<AggregateContextProvider>>,
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
+    chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
+    function_middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
 }
 
 impl ChatAgentBuilder {
@@ -374,10 +565,12 @@ impl ChatAgentBuilder {
             name: None,
             description: None,
             instructions: None,
-            client: Arc::new(FunctionInvokingChatClient::new(client)),
+            client: Arc::new(client),
             chat_options: ChatOptions::new(),
             context_provider: None,
             agent_middleware: Vec::new(),
+            chat_middleware: Vec::new(),
+            function_middleware: Vec::new(),
         }
     }
 
@@ -409,6 +602,11 @@ impl ChatAgentBuilder {
         self.chat_options.max_tokens = Some(max_tokens);
         self
     }
+    /// Request a structured-output response format (e.g. a JSON schema).
+    pub fn response_format(mut self, format: ResponseFormat) -> Self {
+        self.chat_options.response_format = Some(format);
+        self
+    }
     /// Add a tool available to the agent.
     pub fn tool(mut self, tool: ToolDefinition) -> Self {
         self.chat_options.tools.push(tool);
@@ -429,6 +627,21 @@ impl ChatAgentBuilder {
         self.agent_middleware.push(mw);
         self
     }
+    /// Add a chat middleware, run around the underlying chat-client call on
+    /// every request (repeatable, like [`ChatAgentBuilder::middleware`]).
+    /// See the chat-client call pipeline for exactly what it can observe
+    /// and mutate.
+    pub fn chat_middleware(mut self, mw: Arc<crate::middleware::ChatMiddleware>) -> Self {
+        self.chat_middleware.push(mw);
+        self
+    }
+    /// Add a function-invocation middleware, run around every local tool call
+    /// (repeatable). Plumbed down into the [`FunctionInvokingChatClient`]
+    /// this builder wraps the underlying client with.
+    pub fn function_middleware(mut self, mw: Arc<crate::middleware::FunctionMiddleware>) -> Self {
+        self.function_middleware.push(mw);
+        self
+    }
     /// Override the whole chat options object (advanced).
     pub fn chat_options(mut self, options: ChatOptions) -> Self {
         // Preserve tools/instructions collected so far by merging.
@@ -447,14 +660,21 @@ impl ChatAgentBuilder {
         if self.chat_options.model_id.is_none() {
             self.chat_options.model_id = self.client.model_id().map(str::to_string);
         }
+        // Wrap the raw client in `FunctionInvokingChatClient` now that all
+        // builder-collected function middleware is known.
+        let client: Arc<dyn ChatClient> = Arc::new(
+            FunctionInvokingChatClient::new(self.client)
+                .with_function_middleware(self.function_middleware),
+        );
         ChatAgent {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: self.name,
             description: self.description,
-            client: self.client,
+            client,
             chat_options: self.chat_options,
             context_provider: self.context_provider,
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
+            chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
         }
     }
 }
@@ -463,5 +683,61 @@ impl ChatAgent {
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// Wrap this agent as a [`ToolDefinition`] usable by another agent's
+    /// `.tool(...)`. Mirrors Python `BaseAgent.as_tool`.
+    ///
+    /// The tool takes a single string argument (default name `"task"`) and, on
+    /// each call, runs this agent **statelessly** (a fresh thread per call),
+    /// returning the response text.
+    ///
+    /// ```no_run
+    /// # use agent_framework_core::prelude::*;
+    /// # use agent_framework_core::agent::AsToolOptions;
+    /// # fn demo(researcher: ChatAgent, coordinator_client: impl ChatClient + 'static) {
+    /// let research_tool = researcher.as_tool(AsToolOptions::new().name("research"));
+    /// let coordinator = ChatAgent::builder(coordinator_client)
+    ///     .tool(research_tool)
+    ///     .build();
+    /// # let _ = coordinator;
+    /// # }
+    /// ```
+    pub fn as_tool(&self, options: AsToolOptions) -> ToolDefinition {
+        let agent = Arc::new(self.clone());
+        let tool_name = options
+            .name
+            .or_else(|| self.name.clone())
+            .unwrap_or_else(|| self.id.clone());
+        let description = options
+            .description
+            .or_else(|| self.description.clone())
+            .unwrap_or_default();
+        let arg_name = options.arg_name.unwrap_or_else(|| "task".to_string());
+        let arg_description = options
+            .arg_description
+            .unwrap_or_else(|| format!("Task for {tool_name}"));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                arg_name.clone(): { "type": "string", "description": arg_description }
+            },
+            "required": [arg_name.clone()],
+        });
+        let arg_key = arg_name;
+        AiFunction::new(tool_name, description, schema, move |args: Value| {
+            let agent = agent.clone();
+            let arg_key = arg_key.clone();
+            async move {
+                let task = args
+                    .get(&arg_key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let response = agent.run_once(task).await?;
+                Ok(Value::String(response.text()))
+            }
+        })
+        .into_definition()
     }
 }

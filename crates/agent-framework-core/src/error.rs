@@ -33,8 +33,30 @@ pub enum Error {
     Tool(String),
 
     /// A chat client / service returned an error.
+    ///
+    /// Used for non-HTTP service failures (transport errors, stream-decode
+    /// errors, in-body error payloads on an otherwise-successful response). For
+    /// a non-success HTTP status, prefer [`Error::ServiceStatus`], which also
+    /// carries the status code and any `Retry-After`.
     #[error("service error: {0}")]
     Service(String),
+
+    /// A chat client / service returned a non-success HTTP status.
+    ///
+    /// Distinct from [`Error::Service`] so a retry layer can inspect the
+    /// numeric status code and any server-advised `Retry-After` delay (in
+    /// seconds). Displays like [`Error::Service`] (a `service error: ...`
+    /// message), with the status code folded into the message.
+    #[error("service error: {message}")]
+    ServiceStatus {
+        /// The HTTP status code returned by the service.
+        status: u16,
+        /// A human-readable message (typically the response body).
+        message: String,
+        /// The server-advised retry delay in seconds, parsed from the
+        /// `Retry-After` header when present.
+        retry_after: Option<f64>,
+    },
 
     /// A workflow validation or execution error.
     #[error("workflow error: {0}")]
@@ -66,6 +88,34 @@ impl Error {
     /// Create an [`Error::Service`] from anything displayable.
     pub fn service(msg: impl fmt::Display) -> Self {
         Error::Service(msg.to_string())
+    }
+
+    /// Create an [`Error::ServiceStatus`] from an HTTP status code, a message,
+    /// and an optional `Retry-After` delay (in seconds).
+    pub fn service_status(status: u16, msg: impl fmt::Display, retry_after: Option<f64>) -> Self {
+        Error::ServiceStatus {
+            status,
+            message: msg.to_string(),
+            retry_after,
+        }
+    }
+
+    /// The HTTP status code carried by this error, if it is an
+    /// [`Error::ServiceStatus`].
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Error::ServiceStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The server-advised retry delay in seconds, if this is an
+    /// [`Error::ServiceStatus`] that carried a `Retry-After` header.
+    pub fn retry_after(&self) -> Option<f64> {
+        match self {
+            Error::ServiceStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 
     /// Create an [`Error::Tool`] from anything displayable.

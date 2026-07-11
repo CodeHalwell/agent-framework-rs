@@ -21,13 +21,25 @@
 //! # }
 //! ```
 
-mod convert;
+/// Conversion between framework types and the OpenAI chat-completions wire
+/// format.
+///
+/// This module is public (but hidden from docs) so that other
+/// OpenAI-wire-compatible clients in this workspace — currently
+/// `agent-framework-azure` — can reuse request/response conversion instead of
+/// duplicating it. It is not intended as a stable external API.
+#[doc(hidden)]
+pub mod convert;
+
+pub mod responses;
+pub use responses::OpenAIResponsesClient;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
     FunctionArguments, FunctionCallContent, Role, TextContent, UsageContent,
@@ -36,6 +48,21 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Parse a `Retry-After` header into a delay in seconds.
+///
+/// HTTP allows either a delay in seconds or an HTTP-date; OpenAI (and other
+/// rate limiters) use the integer/decimal-seconds form for `429`/`503`, which
+/// is what we honor. A date-form or unparseable value is treated as absent.
+/// Shared with [`responses`](crate::responses) so both OpenAI clients attach
+/// the same retry hint to [`Error::ServiceStatus`].
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+}
 
 /// An OpenAI (or OpenAI-compatible) chat client.
 #[derive(Clone)]
@@ -136,8 +163,13 @@ impl OpenAIClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service(format!("OpenAI API error {status}: {text}")));
+            return Err(Error::service_status(
+                status.as_u16(),
+                format!("OpenAI API error {status}: {text}"),
+                retry_after,
+            ));
         }
         Ok(resp)
     }
@@ -183,7 +215,11 @@ type ByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 /// Turn an SSE HTTP response into a stream of [`ChatResponseUpdate`]s.
-fn parse_sse_stream(
+///
+/// Public (but hidden) so `agent-framework-azure` can reuse the exact same
+/// chat-completions SSE parsing for Azure OpenAI's wire-compatible stream.
+#[doc(hidden)]
+pub fn parse_sse_stream(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
@@ -194,6 +230,7 @@ fn parse_sse_stream(
         SseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_ids: HashMap::new(),
             done: false,
@@ -208,7 +245,8 @@ fn parse_sse_stream(
                 }
                 match state.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let decoded = state.utf8.push(&bytes);
+                        state.buffer.push_str(&decoded);
                         while let Some(pos) = state.buffer.find('\n') {
                             let line = state.buffer[..pos].trim().to_string();
                             state.buffer.drain(..=pos);
@@ -252,6 +290,7 @@ fn parse_sse_stream(
 struct SseState {
     byte_stream: ByteStream,
     buffer: String,
+    utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
     tool_ids: HashMap<i64, String>,
     done: bool,

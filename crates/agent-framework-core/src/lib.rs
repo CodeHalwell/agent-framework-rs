@@ -12,6 +12,7 @@
 //! - [`threads`] — conversation threads and message stores.
 //! - [`memory`] — context / memory providers.
 //! - [`middleware`] — agent, chat, and function middleware pipelines.
+//! - [`observability`] — OpenTelemetry GenAI-style `tracing` instrumentation.
 //! - [`workflow`] — graph-based multi-agent workflow orchestration.
 //!
 //! ## Example
@@ -35,6 +36,8 @@ pub mod client;
 pub mod error;
 pub mod memory;
 pub mod middleware;
+pub mod observability;
+pub mod streaming;
 pub mod threads;
 pub mod tools;
 pub mod types;
@@ -44,25 +47,37 @@ pub use error::{Error, Result};
 
 /// Commonly used imports.
 pub mod prelude {
-    pub use crate::agent::{Agent, AgentRunStream, ChatAgent, ChatAgentBuilder};
-    pub use crate::client::{ChatClient, ChatStream, FunctionInvokingChatClient};
+    pub use crate::agent::{Agent, AgentRunStream, AsToolOptions, ChatAgent, ChatAgentBuilder};
+    pub use crate::client::{
+        ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
+        RetryingChatClient,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::memory::{AggregateContextProvider, Context, ContextProvider};
     pub use crate::middleware::{
         AgentRunContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline,
         Next,
     };
+    pub use crate::observability::ObservableChatClient;
     pub use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
     pub use crate::tools::{
         hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, AiFunction,
-        FunctionInvocationConfig, Tool, ToolDefinition, ToolKind,
+        ApprovalMode, FunctionInvocationConfig, Tool, ToolDefinition, ToolKind,
     };
     pub use crate::types::{
         AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
-        ChatResponseUpdate, Content, FinishReason, FunctionCallContent, FunctionResultContent,
-        Role, TextContent, ToolMode, UsageDetails,
+        ChatResponseUpdate, Content, FinishReason, FunctionApprovalRequestContent,
+        FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent,
+        ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
-        Executor, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent,
+        CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,
+        GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
+        HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
+        MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
+        MagenticStallInterventionDecision, MagenticStallInterventionRequest, RequestInfoExecutor,
+        SequentialBuilder, SharedState, StandardMagenticManager, Workflow, WorkflowAgent,
+        WorkflowAgentExt, WorkflowBuilder, WorkflowContext, WorkflowEvent, WorkflowExecutor,
+        WorkflowRun, WorkflowRunState,
     };
 }

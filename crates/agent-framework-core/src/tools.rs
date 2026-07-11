@@ -1,7 +1,7 @@
 //! Tools: executable functions and hosted-tool markers.
 //!
 //! Rust equivalent of `agent_framework._tools`. An [`AiFunction`] is a locally
-//! executable tool; [`HostedTool`] variants are markers handed to the service.
+//! executable tool; hosted [`ToolKind`] variants are markers handed to the service.
 //! Both are represented uniformly to a chat client as a [`ToolDefinition`].
 
 use std::future::Future;
@@ -96,6 +96,27 @@ impl ToolDefinition {
         self.executor.is_some() && self.kind == ToolKind::Function
     }
 
+    /// Whether a human must approve a call to this tool before it executes.
+    pub fn requires_approval(&self) -> bool {
+        self.approval_mode == ApprovalMode::AlwaysRequire
+    }
+
+    /// Builder: set the human-in-the-loop approval mode (default
+    /// [`ApprovalMode::NeverRequire`]). When set to
+    /// [`ApprovalMode::AlwaysRequire`], the function-invocation loop returns a
+    /// [`FunctionApprovalRequestContent`] instead of executing the call.
+    ///
+    /// [`FunctionApprovalRequestContent`]: crate::types::FunctionApprovalRequestContent
+    pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
+        self.approval_mode = mode;
+        self
+    }
+
+    /// Builder: require human approval before every call to this tool.
+    pub fn require_approval(self) -> Self {
+        self.with_approval_mode(ApprovalMode::AlwaysRequire)
+    }
+
     /// The OpenAI-style function spec: `{"type":"function","function":{...}}`.
     pub fn to_openai_spec(&self) -> Value {
         serde_json::json!({
@@ -137,6 +158,7 @@ pub struct AiFunction {
     name: String,
     description: String,
     parameters: Value,
+    approval_mode: ApprovalMode,
     func: ToolClosure,
 }
 
@@ -159,13 +181,23 @@ impl AiFunction {
             name: name.into(),
             description: description.into(),
             parameters,
+            approval_mode: ApprovalMode::NeverRequire,
             func: Arc::new(move |args| Box::pin(func(args))),
         }
     }
 
+    /// Builder: set the human-in-the-loop approval mode (default
+    /// [`ApprovalMode::NeverRequire`]). Carried through to the
+    /// [`ToolDefinition`] produced by [`AiFunction::into_definition`].
+    pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
+        self.approval_mode = mode;
+        self
+    }
+
     /// Convert into a [`ToolDefinition`] for use in chat options.
     pub fn into_definition(self) -> ToolDefinition {
-        ToolDefinition::from_tool(Arc::new(self))
+        let approval_mode = self.approval_mode;
+        ToolDefinition::from_tool(Arc::new(self)).with_approval_mode(approval_mode)
     }
 }
 

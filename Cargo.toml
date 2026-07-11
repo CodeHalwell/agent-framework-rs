@@ -3,6 +3,19 @@ resolver = "2"
 members = [
     "crates/agent-framework-core",
     "crates/agent-framework-openai",
+    "crates/agent-framework-anthropic",
+    "crates/agent-framework-azure",
+    "crates/agent-framework-mcp",
+    "crates/agent-framework-a2a",
+    "crates/agent-framework-declarative",
+    "crates/agent-framework-hosting",
+    "crates/agent-framework-redis",
+    "crates/agent-framework-mem0",
+    "crates/agent-framework-azure-ai",
+    "crates/agent-framework-azure-ai-search",
+    "crates/agent-framework-cosmos",
+    "crates/agent-framework-copilotstudio",
+    "crates/agent-framework-purview",
     "crates/agent-framework",
 ]
 
@@ -34,6 +47,19 @@ pin-project-lite = "0.2"
 
 agent-framework-core = { path = "crates/agent-framework-core", version = "0.1.0" }
 agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.1.0" }
+agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.1.0" }
+agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.1.0" }
+agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.1.0" }
+agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.1.0" }
+agent-framework-declarative = { path = "crates/agent-framework-declarative", version = "0.1.0" }
+agent-framework-hosting = { path = "crates/agent-framework-hosting", version = "0.1.0" }
+agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.1.0" }
+agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.1.0" }
+agent-framework-azure-ai = { path = "crates/agent-framework-azure-ai", version = "0.1.0" }
+agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.1.0" }
+agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.1.0" }
+agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.1.0" }
+agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

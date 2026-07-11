@@ -1,11 +1,13 @@
 //! Response and streaming-update types for chat clients and agents.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::content::{Content, FunctionCallContent, UsageDetails};
+use super::content::{Content, FunctionApprovalRequestContent, FunctionCallContent, UsageDetails};
 use super::message::{ChatMessage, Role};
+use crate::error::{Error, Result};
 
 /// Reason a chat response finished. Open value wrapper, like `FinishReason`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,6 +86,26 @@ impl ChatResponse {
             .collect()
     }
 
+    /// All pending user-input (function-approval) requests across the messages.
+    ///
+    /// Mirrors Python `ChatResponse.user_input_requests`.
+    pub fn user_input_requests(&self) -> Vec<&FunctionApprovalRequestContent> {
+        self.messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_approval_request)
+            .collect()
+    }
+
+    /// Parse the response's concatenated text into a structured value.
+    ///
+    /// Mirrors Python's `response.value`: the message text is treated as JSON
+    /// and deserialized into `T`.
+    pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_str(&self.text())
+            .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
+    }
+
     /// Aggregate a stream of updates into a full response.
     pub fn from_updates(updates: Vec<ChatResponseUpdate>) -> Self {
         let mut resp = ChatResponse::default();
@@ -92,6 +114,12 @@ impl ChatResponse {
         }
         resp.finalize();
         resp
+    }
+
+    /// Alias for [`ChatResponse::from_updates`], matching Python's
+    /// `ChatResponse.from_chat_response_updates`.
+    pub fn from_chat_response_updates(updates: Vec<ChatResponseUpdate>) -> Self {
+        Self::from_updates(updates)
     }
 
     /// Merge a single streaming update into this response in place.
@@ -235,6 +263,11 @@ pub struct AgentRunResponse {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
+    /// Service-side conversation id, when the backing service manages the
+    /// conversation (e.g. Responses API `previous_response_id`, Azure AI
+    /// thread id). `ChatAgent` persists it onto the [`AgentThread`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -254,11 +287,33 @@ impl AgentRunResponse {
             .collect::<String>()
     }
 
+    /// All pending user-input (function-approval) requests across the messages.
+    ///
+    /// Mirrors Python `AgentRunResponse.user_input_requests`; use this to detect
+    /// when a run paused awaiting human approval of a tool call.
+    pub fn user_input_requests(&self) -> Vec<&FunctionApprovalRequestContent> {
+        self.messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_approval_request)
+            .collect()
+    }
+
+    /// Parse the run's concatenated text into a structured value.
+    ///
+    /// Mirrors Python's `response.value`: the message text is treated as JSON
+    /// and deserialized into `T`.
+    pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_str(&self.text())
+            .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
+    }
+
     /// Build from a chat response, mapping fields across.
     pub fn from_chat_response(resp: ChatResponse) -> Self {
         Self {
             messages: resp.messages,
             response_id: resp.response_id,
+            conversation_id: resp.conversation_id,
             created_at: resp.created_at,
             usage_details: resp.usage_details,
             value: resp.value,
@@ -273,6 +328,12 @@ impl AgentRunResponse {
             .map(AgentRunResponseUpdate::into_chat_update)
             .collect();
         Self::from_chat_response(ChatResponse::from_updates(chat_updates))
+    }
+
+    /// Alias for [`AgentRunResponse::from_updates`], matching Python's
+    /// `AgentRunResponse.from_agent_run_response_updates`.
+    pub fn from_agent_run_response_updates(updates: Vec<AgentRunResponseUpdate>) -> Self {
+        Self::from_updates(updates)
     }
 }
 
@@ -299,6 +360,16 @@ impl AgentRunResponseUpdate {
             .iter()
             .filter_map(Content::as_text)
             .collect::<String>()
+    }
+
+    /// The user-input (function-approval) requests carried by this update.
+    ///
+    /// Mirrors Python `AgentRunResponseUpdate.user_input_requests`.
+    pub fn user_input_requests(&self) -> Vec<&FunctionApprovalRequestContent> {
+        self.contents
+            .iter()
+            .filter_map(Content::as_function_approval_request)
+            .collect()
     }
 
     /// Wrap a chat update as an agent update.
