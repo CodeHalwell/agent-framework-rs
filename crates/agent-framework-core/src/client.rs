@@ -256,11 +256,31 @@ async fn execute_tool_call(
 
 /// Collect all function-approval responses present in a conversation.
 fn collect_approval_responses(messages: &[ChatMessage]) -> Vec<FunctionApprovalResponseContent> {
+    // Only approval responses newer than the last assistant message are
+    // actionable. Threads persist the raw approval exchange, and the assistant
+    // answer that follows a handled approval marks it as history — acting on
+    // it again on a later turn would repeat the tool's side effects.
+    let last_assistant = messages
+        .iter()
+        .rposition(|m| m.role == Role::assistant())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    // Belt-and-braces: skip anything whose call id already has a result.
+    let resolved: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(|c| match c {
+            Content::FunctionResult(fr) => Some(fr.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
-    for msg in messages {
+    for msg in &messages[last_assistant..] {
         for content in &msg.contents {
             if let Content::FunctionApprovalResponse(resp) = content {
-                out.push(resp.clone());
+                if !resolved.contains(resp.function_call.call_id.as_str()) {
+                    out.push(resp.clone());
+                }
             }
         }
     }

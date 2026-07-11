@@ -153,7 +153,14 @@ struct A2AState {
     card: AgentCard,
     agent: Arc<dyn Agent>,
     tasks: Mutex<HashMap<String, A2ATask>>,
+    /// Per-context conversation threads so follow-up `message/send` calls
+    /// with the same `contextId` continue the conversation. Capped: the map
+    /// is cleared once it exceeds `MAX_CONTEXTS` (this is a debug/hosting
+    /// surface, not a session store).
+    threads: Mutex<HashMap<String, agent_framework_core::threads::AgentThread>>,
 }
+
+const MAX_CONTEXTS: usize = 1024;
 
 /// Serves one agent over the A2A protocol.
 pub struct A2ARouter {
@@ -234,6 +241,7 @@ impl A2ARouter {
             card: self.card,
             agent: self.agent,
             tasks: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
         });
         Router::new()
             .route("/.well-known/agent-card.json", get(agent_card))
@@ -314,17 +322,38 @@ async fn handle_message_send(state: &A2AState, params: Value) -> Result<Value, R
         .collect::<Vec<_>>()
         .join("");
 
-    let run = state
-        .agent
-        .run(vec![ChatMessage::user(input_text)], None)
-        .await
-        .map_err(|e| RpcErr::new(-32603, format!("Agent execution failed: {e}")))?;
-    let response_text = run.text();
-
     let context_id = message
         .context_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Continue the per-context conversation across turns. The thread is
+    // checked out for the duration of the run so concurrent sends on the
+    // same context serialize on history correctness rather than interleave.
+    // std Mutex: the guard is dropped before the run's await (checkout /
+    // check-in), so a poisoned lock is the only hazard and unwraps are fine.
+    let mut thread = {
+        let mut threads = state.threads.lock().unwrap();
+        if threads.len() > MAX_CONTEXTS {
+            threads.clear();
+        }
+        threads
+            .remove(&context_id)
+            .unwrap_or_else(|| state.agent.get_new_thread())
+    };
+    let run_result = state
+        .agent
+        .run(vec![ChatMessage::user(input_text)], Some(&mut thread))
+        .await;
+    state
+        .threads
+        .lock()
+        .unwrap()
+        .insert(context_id.clone(), thread);
+    let run =
+        run_result.map_err(|e| RpcErr::new(-32603, format!("Agent execution failed: {e}")))?;
+    let response_text = run.text();
+
     let task_id = uuid::Uuid::new_v4().to_string();
 
     let response_message = A2AMessage {

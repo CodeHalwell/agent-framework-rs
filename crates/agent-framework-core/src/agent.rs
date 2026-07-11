@@ -200,7 +200,7 @@ impl ChatAgent {
         thread: &mut AgentThread,
     ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
         let mut options = self.chat_options.clone();
-        options.conversation_id = thread.service_thread_id().map(str::to_string);
+        options.conversation_id = thread.service_thread_id();
 
         let mut history = thread.list_messages().await?;
 

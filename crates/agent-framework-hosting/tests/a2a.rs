@@ -163,3 +163,79 @@ async fn message_send_missing_message_is_invalid_params() {
     let (_, resp) = post_json(router(), "/", &req).await;
     assert_eq!(resp["error"]["code"], -32602);
 }
+
+#[tokio::test]
+async fn message_send_continues_conversation_per_context() {
+    use agent_framework_core::agent::Agent;
+    use agent_framework_core::error::Result as CoreResult;
+    use agent_framework_core::threads::AgentThread;
+    use agent_framework_core::types::{AgentRunResponse, ChatMessage};
+
+    /// Replies with how many messages of history it saw on the thread.
+    struct HistoryAgent;
+    #[async_trait::async_trait]
+    impl Agent for HistoryAgent {
+        async fn run(
+            &self,
+            messages: Vec<ChatMessage>,
+            thread: Option<&mut AgentThread>,
+        ) -> CoreResult<AgentRunResponse> {
+            let thread = thread.expect("host must supply a thread");
+            let prior = thread.list_messages().await?.len();
+            let reply = ChatMessage::assistant(format!("prior:{prior}"));
+            thread.on_new_messages(messages).await?;
+            thread.on_new_messages(vec![reply.clone()]).await?;
+            Ok(AgentRunResponse {
+                messages: vec![reply],
+                ..Default::default()
+            })
+        }
+        fn id(&self) -> &str {
+            "history"
+        }
+        fn name(&self) -> Option<&str> {
+            Some("history")
+        }
+    }
+
+    let agent: std::sync::Arc<dyn Agent> = std::sync::Arc::new(HistoryAgent);
+    let router = A2ARouter::for_agent("history", agent, "http://localhost/").into_router();
+
+    // Turn one: no context id yet; the host mints one.
+    let (status, resp) = post_json(router.clone(), "/", &send_message("one")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp["result"]["artifacts"][0]["parts"][0]["text"],
+        "prior:0"
+    );
+    let ctx = resp["result"]["contextId"].as_str().unwrap().to_string();
+
+    // Turn two on the same context: the agent must see turn one's history.
+    let follow_up = json!({
+        "jsonrpc": "2.0",
+        "id": "2",
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "role": "user",
+                "messageId": "m2",
+                "contextId": ctx,
+                "parts": [{ "kind": "text", "text": "two" }],
+            }
+        }
+    });
+    let (status, resp) = post_json(router.clone(), "/", &follow_up).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp["result"]["artifacts"][0]["parts"][0]["text"],
+        "prior:2"
+    );
+
+    // A different context starts fresh.
+    let (_, resp) = post_json(router, "/", &send_message("three")).await;
+    assert_eq!(
+        resp["result"]["artifacts"][0]["parts"][0]["text"],
+        "prior:0"
+    );
+}

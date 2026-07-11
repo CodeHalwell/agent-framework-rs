@@ -175,7 +175,7 @@ impl Agent for A2AAgent {
             }
         };
 
-        let state = ThreadState::decode(thread.service_thread_id());
+        let state = ThreadState::decode(thread.service_thread_id().as_deref());
         let outgoing = chat_message_to_a2a_message(
             last,
             state.context_id.as_deref(),

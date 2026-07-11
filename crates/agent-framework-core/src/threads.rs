@@ -60,7 +60,10 @@ impl ChatMessageStore for InMemoryChatMessageStore {
 /// A conversation thread, either service-managed or backed by a local store.
 #[derive(Clone, Default)]
 pub struct AgentThread {
-    service_thread_id: Option<String>,
+    // Shared across clones (like the message store) so a service id adopted
+    // inside a cloned thread — e.g. during `run_stream` — is visible on the
+    // caller's original thread.
+    service_thread_id: Arc<std::sync::RwLock<Option<String>>>,
     message_store: Option<Arc<dyn ChatMessageStore>>,
     /// Context providers associated with this thread (memory/RAG injection).
     pub context_provider: Option<Arc<AggregateContextProvider>>,
@@ -75,7 +78,7 @@ impl AgentThread {
     /// A service-managed thread identified by a conversation id.
     pub fn service(id: impl Into<String>) -> Self {
         Self {
-            service_thread_id: Some(id.into()),
+            service_thread_id: Arc::new(std::sync::RwLock::new(Some(id.into()))),
             message_store: None,
             context_provider: None,
         }
@@ -84,7 +87,7 @@ impl AgentThread {
     /// A local thread backed by the given message store.
     pub fn local(store: Arc<dyn ChatMessageStore>) -> Self {
         Self {
-            service_thread_id: None,
+            service_thread_id: Arc::new(std::sync::RwLock::new(None)),
             message_store: Some(store),
             context_provider: None,
         }
@@ -98,12 +101,12 @@ impl AgentThread {
 
     /// Whether the thread has been initialized (has an id or a store).
     pub fn is_initialized(&self) -> bool {
-        self.service_thread_id.is_some() || self.message_store.is_some()
+        self.service_thread_id.read().unwrap().is_some() || self.message_store.is_some()
     }
 
     /// The service-side conversation id, if any.
-    pub fn service_thread_id(&self) -> Option<&str> {
-        self.service_thread_id.as_deref()
+    pub fn service_thread_id(&self) -> Option<String> {
+        self.service_thread_id.read().unwrap().clone()
     }
 
     /// Set the service-side conversation id. Fails if a local store is set.
@@ -113,7 +116,7 @@ impl AgentThread {
                 "cannot set service_thread_id on a thread with a local message store",
             ));
         }
-        self.service_thread_id = Some(id.into());
+        *self.service_thread_id.write().unwrap() = Some(id.into());
         Ok(())
     }
 
@@ -126,18 +129,18 @@ impl AgentThread {
     /// history from here on). A thread that already accumulated local
     /// history is left unchanged and `Ok(false)` is returned.
     pub async fn try_adopt_service_thread_id(&mut self, id: &str) -> Result<bool> {
-        if self.service_thread_id.as_deref() == Some(id) {
+        if self.service_thread_id.read().unwrap().as_deref() == Some(id) {
             return Ok(false);
         }
         match &self.message_store {
             None => {
-                self.service_thread_id = Some(id.to_string());
+                *self.service_thread_id.write().unwrap() = Some(id.to_string());
                 Ok(true)
             }
             Some(store) => {
                 if store.list_messages().await?.is_empty() {
                     self.message_store = None;
-                    self.service_thread_id = Some(id.to_string());
+                    *self.service_thread_id.write().unwrap() = Some(id.to_string());
                     Ok(true)
                 } else {
                     tracing::debug!(
@@ -157,7 +160,7 @@ impl AgentThread {
     /// Ensure a local message store exists (creating an in-memory one), then
     /// return it. Fails if the thread is service-managed.
     pub fn ensure_local_store(&mut self) -> Result<Arc<dyn ChatMessageStore>> {
-        if self.service_thread_id.is_some() {
+        if self.service_thread_id.read().unwrap().is_some() {
             return Err(Error::other(
                 "cannot add a local store to a service-managed thread",
             ));
@@ -172,7 +175,7 @@ impl AgentThread {
     /// no-op (the service tracks history); for local threads the messages are
     /// appended to the store.
     pub async fn on_new_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
-        if self.service_thread_id.is_some() {
+        if self.service_thread_id.read().unwrap().is_some() {
             return Ok(());
         }
         let store = self.ensure_local_store()?;

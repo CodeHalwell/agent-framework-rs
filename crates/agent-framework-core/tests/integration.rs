@@ -738,6 +738,93 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     assert!(history.iter().any(|m| !m.user_input_requests().is_empty()));
 }
 
+#[tokio::test]
+async fn run_stream_service_id_adoption_reaches_original_thread() {
+    struct StreamingServiceClient;
+    #[async_trait::async_trait]
+    impl ChatClient for StreamingServiceClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<ChatMessage>,
+            _options: ChatOptions,
+        ) -> Result<ChatResponse> {
+            let mut resp = ChatResponse::from_text("ok");
+            resp.conversation_id = Some("conv-s".to_string());
+            Ok(resp)
+        }
+        async fn get_streaming_response(
+            &self,
+            _messages: Vec<ChatMessage>,
+            _options: ChatOptions,
+        ) -> Result<agent_framework_core::client::ChatStream> {
+            let mut update = ChatResponseUpdate::text("ok");
+            update.conversation_id = Some("conv-s".to_string());
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    let agent = ChatAgent::builder(StreamingServiceClient)
+        .name("svc")
+        .build();
+    let thread = agent.get_new_thread();
+
+    // The documented streaming pattern passes a clone; the adopted service id
+    // must still be visible on the caller's original thread afterwards.
+    let mut stream = agent
+        .run_stream(vec![ChatMessage::user("hi")], Some(thread.clone()))
+        .await
+        .unwrap();
+    use futures::StreamExt as _;
+    while stream.next().await.is_some() {}
+
+    assert_eq!(thread.service_thread_id().as_deref(), Some("conv-s"));
+}
+
+#[tokio::test]
+async fn resolved_approval_is_not_re_executed_on_later_turns() {
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let agent = ChatAgent::builder(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+        ChatResponse::from_text("You are welcome."),
+    ]))
+    .name("keeper")
+    .tool(tool)
+    .build();
+
+    let mut thread = agent.get_new_thread();
+    let resp1 = agent
+        .run(vec![ChatMessage::user("get the secret")], Some(&mut thread))
+        .await
+        .unwrap();
+    let approval = resp1.user_input_requests()[0].create_response(true);
+    agent
+        .run(
+            vec![ChatMessage::with_contents(
+                Role::user(),
+                vec![Content::FunctionApprovalResponse(approval)],
+            )],
+            Some(&mut thread),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*counter.lock().unwrap(), 1);
+
+    // A later ordinary turn on the same thread (whose history still contains
+    // the raw approval response) must NOT re-execute the tool.
+    let resp3 = agent
+        .run(vec![ChatMessage::user("thanks!")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert!(resp3.text().contains("welcome"), "got: {}", resp3.text());
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "historical approval was re-executed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Agent-as-tool
 // ---------------------------------------------------------------------------
@@ -1142,7 +1229,7 @@ async fn service_conversation_id_is_adopted_by_thread() {
         .await
         .unwrap();
     assert_eq!(response.conversation_id.as_deref(), Some("conv-1"));
-    assert_eq!(thread.service_thread_id(), Some("conv-1"));
+    assert_eq!(thread.service_thread_id().as_deref(), Some("conv-1"));
 
     // Turn two must carry the id back to the service.
     agent

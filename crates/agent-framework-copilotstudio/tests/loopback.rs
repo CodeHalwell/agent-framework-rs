@@ -216,7 +216,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
         .unwrap();
     assert_eq!(first.text(), "Bonjour! The capital of France is Paris.");
     assert_eq!(first.response_id.as_deref(), Some("m1"));
-    assert_eq!(thread.service_thread_id(), Some("conv-42"));
+    assert_eq!(thread.service_thread_id().as_deref(), Some("conv-42"));
 
     let second = agent
         .run(
@@ -229,7 +229,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
     // Conversation id is unchanged: no second `start_conversation` call was
     // made (the server only programmed 3 responses total; if a fourth
     // connection had been attempted, `handle.join()` below would hang/panic).
-    assert_eq!(thread.service_thread_id(), Some("conv-42"));
+    assert_eq!(thread.service_thread_id().as_deref(), Some("conv-42"));
 
     let requests = handle.join().expect("server thread panicked");
     assert_eq!(requests.len(), 3);
