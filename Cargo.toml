@@ -17,6 +17,7 @@ members = [
     "crates/agent-framework-copilotstudio",
     "crates/agent-framework-purview",
     "crates/agent-framework",
+    "examples",
 ]
 
 [workspace.package]
