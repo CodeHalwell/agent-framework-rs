@@ -1093,3 +1093,64 @@ async fn function_middleware_order_is_onion_nested() {
     let log = log.lock().unwrap().clone();
     assert_eq!(log, vec!["A-before", "B-before", "B-after", "A-after"]);
 }
+
+#[tokio::test]
+async fn service_conversation_id_is_adopted_by_thread() {
+    use std::sync::{Arc, Mutex};
+
+    // A client that manages conversations service-side: returns a
+    // conversation id and records the options of every request.
+    struct ServiceClient {
+        seen_options: Arc<Mutex<Vec<ChatOptions>>>,
+    }
+    #[async_trait::async_trait]
+    impl ChatClient for ServiceClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<ChatMessage>,
+            options: ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.seen_options.lock().unwrap().push(options);
+            let mut resp = ChatResponse::from_text("ok");
+            resp.conversation_id = Some("conv-1".to_string());
+            Ok(resp)
+        }
+        async fn get_streaming_response(
+            &self,
+            messages: Vec<ChatMessage>,
+            options: ChatOptions,
+        ) -> Result<agent_framework_core::client::ChatStream> {
+            let resp = self.get_response(messages, options).await?;
+            let mut update = ChatResponseUpdate::text(resp.text());
+            update.conversation_id = Some("conv-1".to_string());
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    let seen_options = Arc::new(Mutex::new(Vec::new()));
+    let agent = ChatAgent::builder(ServiceClient {
+        seen_options: seen_options.clone(),
+    })
+    .name("svc")
+    .build();
+
+    // Fresh agent threads start with an (empty) local store; the returned
+    // service conversation id must still be adopted.
+    let mut thread = agent.get_new_thread();
+    let response = agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert_eq!(response.conversation_id.as_deref(), Some("conv-1"));
+    assert_eq!(thread.service_thread_id(), Some("conv-1"));
+
+    // Turn two must carry the id back to the service.
+    agent
+        .run(vec![ChatMessage::user("again")], Some(&mut thread))
+        .await
+        .unwrap();
+    let opts = seen_options.lock().unwrap();
+    assert_eq!(opts.len(), 2);
+    assert_eq!(opts[0].conversation_id, None);
+    assert_eq!(opts[1].conversation_id.as_deref(), Some("conv-1"));
+}

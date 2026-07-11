@@ -263,6 +263,11 @@ pub struct AgentRunResponse {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
+    /// Service-side conversation id, when the backing service manages the
+    /// conversation (e.g. Responses API `previous_response_id`, Azure AI
+    /// thread id). `ChatAgent` persists it onto the [`AgentThread`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -308,6 +313,7 @@ impl AgentRunResponse {
         Self {
             messages: resp.messages,
             response_id: resp.response_id,
+            conversation_id: resp.conversation_id,
             created_at: resp.created_at,
             usage_details: resp.usage_details,
             value: resp.value,

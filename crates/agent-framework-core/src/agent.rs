@@ -145,6 +145,9 @@ impl ChatAgent {
         // used when there is no agent middleware to honor.
         if self.has_middleware() {
             let response = self.run_core(final_messages, options, true).await?;
+            if let Some(cid) = response.conversation_id.as_deref() {
+                thread.try_adopt_service_thread_id(cid).await?;
+            }
             thread.on_new_messages(input.clone()).await?;
             thread.on_new_messages(response.messages.clone()).await?;
             if let Some(cp) = self.resolve_provider(&thread) {
@@ -452,6 +455,11 @@ fn async_stream_forward(
                         // rather than dropping it.
                         if let Some((mut thread, input, provider)) = finish.take() {
                             let response = ChatResponse::from_updates(collected.clone());
+                            if let Some(cid) = response.conversation_id.as_deref() {
+                                if let Err(e) = thread.try_adopt_service_thread_id(cid).await {
+                                    return Some((Err(e), (inner, collected, true, None)));
+                                }
+                            }
                             if let Err(e) = thread.on_new_messages(input.clone()).await {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
@@ -492,6 +500,11 @@ impl Agent for ChatAgent {
         let (final_messages, options) = self.prepare_request(&messages, thread).await?;
         let response = self.run_core(final_messages, options, false).await?;
 
+        // Persist a service-managed conversation id before touching local
+        // history, so service-backed threads stay service-backed.
+        if let Some(cid) = response.conversation_id.as_deref() {
+            thread.try_adopt_service_thread_id(cid).await?;
+        }
         // Update thread history.
         thread.on_new_messages(messages.clone()).await?;
         thread.on_new_messages(response.messages.clone()).await?;
