@@ -47,7 +47,10 @@ pub use error::{Error, Result};
 /// Commonly used imports.
 pub mod prelude {
     pub use crate::agent::{Agent, AgentRunStream, AsToolOptions, ChatAgent, ChatAgentBuilder};
-    pub use crate::client::{ChatClient, ChatStream, FunctionInvokingChatClient};
+    pub use crate::client::{
+        ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
+        RetryingChatClient,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::memory::{AggregateContextProvider, Context, ContextProvider};
     pub use crate::middleware::{
@@ -71,8 +74,9 @@ pub mod prelude {
         GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
         HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
         MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
-        RequestInfoExecutor, SequentialBuilder, SharedState, StandardMagenticManager, Workflow,
-        WorkflowAgent, WorkflowAgentExt, WorkflowBuilder, WorkflowContext, WorkflowEvent,
-        WorkflowExecutor, WorkflowRun, WorkflowRunState,
+        MagenticStallInterventionDecision, MagenticStallInterventionRequest, RequestInfoExecutor,
+        SequentialBuilder, SharedState, StandardMagenticManager, Workflow, WorkflowAgent,
+        WorkflowAgentExt, WorkflowBuilder, WorkflowContext, WorkflowEvent, WorkflowExecutor,
+        WorkflowRun, WorkflowRunState,
     };
 }

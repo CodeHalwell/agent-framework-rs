@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
@@ -538,6 +539,340 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             })
             .collect();
         Ok(stream::iter(updates).boxed())
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        self.inner.model_id()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry / backoff layer
+// ---------------------------------------------------------------------------
+
+/// Which errors a [`RetryPolicy`] considers retryable.
+#[derive(Clone)]
+pub enum RetryOn {
+    /// The built-in default predicate (see [`RetryPolicy`] docs for the exact
+    /// rule): retries HTTP `408`/`429`/`5xx` ([`Error::ServiceStatus`]) and
+    /// transport-ish [`Error::Service`] failures (timeouts / connection
+    /// errors).
+    Default,
+    /// A fully custom predicate deciding, per error, whether to retry.
+    Predicate(Arc<dyn Fn(&Error) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for RetryOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryOn::Default => f.write_str("RetryOn::Default"),
+            RetryOn::Predicate(_) => f.write_str("RetryOn::Predicate(..)"),
+        }
+    }
+}
+
+impl RetryOn {
+    /// A custom retry predicate.
+    pub fn predicate<F>(f: F) -> Self
+    where
+        F: Fn(&Error) -> bool + Send + Sync + 'static,
+    {
+        RetryOn::Predicate(Arc::new(f))
+    }
+
+    fn should_retry(&self, err: &Error) -> bool {
+        match self {
+            RetryOn::Default => default_should_retry(err),
+            RetryOn::Predicate(p) => p(err),
+        }
+    }
+}
+
+/// The default retryability rule used by [`RetryOn::Default`].
+///
+/// Retries when either:
+/// * the error is an [`Error::ServiceStatus`] whose status is `408`
+///   (Request Timeout), `429` (Too Many Requests), or any `5xx`; or
+/// * the error is an [`Error::Service`] whose (lowercased) message contains one
+///   of the transport-failure markers the provider clients emit — `"request
+///   failed"` (the prefix wrapping every `reqwest` send error: DNS, connect,
+///   timeout, reset), `"timed out"`, `"timeout"`, `"connection"`, or `"stream
+///   error"`.
+///
+/// Everything else (4xx other than 408/429, parse errors, tool/workflow errors,
+/// non-transport service errors) is treated as non-retryable.
+fn default_should_retry(err: &Error) -> bool {
+    if let Some(status) = err.status() {
+        return status == 408 || status == 429 || (500..600).contains(&status);
+    }
+    match err {
+        Error::Service(msg) => {
+            let m = msg.to_lowercase();
+            m.contains("request failed")
+                || m.contains("timed out")
+                || m.contains("timeout")
+                || m.contains("connection")
+                || m.contains("stream error")
+        }
+        _ => false,
+    }
+}
+
+/// Policy controlling [`RetryingChatClient`] backoff.
+///
+/// Delays grow exponentially from [`initial_delay`](Self::initial_delay) by
+/// [`backoff_multiplier`](Self::backoff_multiplier) per attempt, are capped at
+/// [`max_delay`](Self::max_delay), and are then reduced by up to
+/// [`jitter`](Self::jitter) (a fraction of the delay). When the failing error
+/// carries a server `Retry-After` (see [`Error::retry_after`]) that value is
+/// used instead of the computed backoff (still capped by `max_delay`, and not
+/// jittered — it is an explicit server instruction).
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    /// Maximum number of *retries* after the initial attempt (default `3`, so
+    /// up to four total attempts).
+    pub max_retries: usize,
+    /// Base delay before the first retry (default `500ms`).
+    pub initial_delay: Duration,
+    /// Upper bound on any single delay, also capping a server `Retry-After`
+    /// (default `30s`).
+    pub max_delay: Duration,
+    /// Exponential growth factor applied per retry (default `2.0`).
+    pub backoff_multiplier: f64,
+    /// Jitter as a fraction in `0.0..=1.0` (default `0.3`): the computed delay
+    /// is multiplied by `1 - jitter * r` for a per-attempt random `r` in
+    /// `[0, 1)`. `0.0` disables jitter (fully deterministic delays).
+    pub jitter: f64,
+    /// Which errors to retry (default [`RetryOn::Default`]).
+    pub retry_on: RetryOn,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+            jitter: 0.3,
+            retry_on: RetryOn::Default,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// A policy with the given retry count and otherwise-default backoff.
+    pub fn with_max_retries(max_retries: usize) -> Self {
+        Self {
+            max_retries,
+            ..Self::default()
+        }
+    }
+
+    /// Set the base delay before the first retry.
+    pub fn initial_delay(mut self, delay: Duration) -> Self {
+        self.initial_delay = delay;
+        self
+    }
+
+    /// Set the per-delay cap (also caps a server `Retry-After`).
+    pub fn max_delay(mut self, delay: Duration) -> Self {
+        self.max_delay = delay;
+        self
+    }
+
+    /// Set the exponential growth factor.
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.backoff_multiplier = multiplier;
+        self
+    }
+
+    /// Set the jitter fraction (clamped to `0.0..=1.0`).
+    pub fn jitter(mut self, jitter: f64) -> Self {
+        self.jitter = jitter.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the retryability rule.
+    pub fn retry_on(mut self, retry_on: RetryOn) -> Self {
+        self.retry_on = retry_on;
+        self
+    }
+
+    /// The delay to wait before a retry, given the 1-based `attempt` number
+    /// (attempt `1` is the first retry) and the error that triggered it.
+    fn delay_for(&self, attempt: usize, err: &Error) -> Duration {
+        // A server-advised `Retry-After` wins over computed backoff (capped by
+        // `max_delay`, not jittered — it is an explicit instruction).
+        if let Some(secs) = err.retry_after() {
+            let capped = secs.min(self.max_delay.as_secs_f64()).max(0.0);
+            return Duration::from_secs_f64(capped);
+        }
+        let exp = self.backoff_multiplier.powi((attempt - 1) as i32);
+        let base = self.initial_delay.as_secs_f64() * exp;
+        let capped = base.min(self.max_delay.as_secs_f64());
+        let jittered = capped * jitter_factor(self.jitter);
+        Duration::from_secs_f64(jittered.max(0.0))
+    }
+}
+
+/// A cheap jitter multiplier in `[1 - jitter, 1.0]`, without a `rand`
+/// dependency: entropy comes from the current wall-clock nanoseconds mixed
+/// with a process-lifetime counter (so repeated calls within the same
+/// nanosecond still differ). `jitter <= 0` returns `1.0` (no jitter).
+fn jitter_factor(jitter: f64) -> f64 {
+    let jitter = jitter.clamp(0.0, 1.0);
+    if jitter == 0.0 {
+        return 1.0;
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    // Map to [0, 1) via the top 53 bits (f64 mantissa width).
+    let r = (mixed >> 11) as f64 / ((1u64 << 53) as f64);
+    1.0 - jitter * r
+}
+
+/// A [`ChatClient`] decorator that retries transient failures with exponential
+/// backoff, honoring a server `Retry-After` when present.
+///
+/// Wraps any inner [`ChatClient`] and re-issues the request per its
+/// [`RetryPolicy`]. For streaming, only the *initial connection* is retried:
+/// if establishing the stream (or its very first item, before anything is
+/// yielded to the consumer) fails with a retryable error, the connection is
+/// re-attempted; once the first update flows, later stream errors propagate
+/// unchanged.
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use agent_framework_core::client::{RetryingChatClient, RetryPolicy};
+/// # use agent_framework_core::prelude::*;
+/// # fn demo(inner: impl ChatClient + 'static) {
+/// let client = RetryingChatClient::new(inner)
+///     .with_policy(RetryPolicy::with_max_retries(5).initial_delay(Duration::from_millis(200)));
+/// # let _ = client;
+/// # }
+/// ```
+pub struct RetryingChatClient<C: ChatClient> {
+    inner: C,
+    policy: RetryPolicy,
+}
+
+impl<C: ChatClient> RetryingChatClient<C> {
+    /// Wrap `inner` with the default [`RetryPolicy`].
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner,
+            policy: RetryPolicy::default(),
+        }
+    }
+
+    /// Set the retry policy (builder-style).
+    pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// A reference to the wrapped client.
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    /// A reference to the active retry policy.
+    pub fn policy(&self) -> &RetryPolicy {
+        &self.policy
+    }
+
+    /// Sleep before a retry, emitting a tracing warning describing the attempt.
+    async fn backoff(&self, attempt: usize, err: &Error) {
+        let delay = self.policy.delay_for(attempt, err);
+        tracing::warn!(
+            attempt,
+            max_retries = self.policy.max_retries,
+            delay_ms = delay.as_millis() as u64,
+            retry_after = err.retry_after(),
+            status = err.status(),
+            error = %err,
+            "retrying chat request after transient error"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+#[async_trait]
+impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
+    async fn get_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut attempt = 0usize;
+        loop {
+            match self
+                .inner
+                .get_response(messages.clone(), options.clone())
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if attempt >= self.policy.max_retries || !self.policy.retry_on.should_retry(&e)
+                    {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    self.backoff(attempt, &e).await;
+                }
+            }
+        }
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let mut attempt = 0usize;
+        loop {
+            let established = self
+                .inner
+                .get_streaming_response(messages.clone(), options.clone())
+                .await;
+            match established {
+                // The stream opened: peek its first item. An error there (with
+                // nothing yet yielded to the consumer) is still an
+                // initial-connection failure and is eligible for retry; any Ok
+                // item — or a non-retryable / retries-exhausted error — is
+                // handed back with the rest of the stream chained after it.
+                Ok(mut stream) => match stream.next().await {
+                    Some(Err(e))
+                        if attempt < self.policy.max_retries
+                            && self.policy.retry_on.should_retry(&e) =>
+                    {
+                        attempt += 1;
+                        self.backoff(attempt, &e).await;
+                        continue;
+                    }
+                    Some(first) => {
+                        let head = stream::once(async move { first });
+                        return Ok(head.chain(stream).boxed());
+                    }
+                    None => return Ok(stream::empty().boxed()),
+                },
+                // The stream never opened (e.g. a non-success HTTP status).
+                Err(e) => {
+                    if attempt >= self.policy.max_retries || !self.policy.retry_on.should_retry(&e)
+                    {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    self.backoff(attempt, &e).await;
+                }
+            }
+        }
     }
 
     fn model_id(&self) -> Option<&str> {
