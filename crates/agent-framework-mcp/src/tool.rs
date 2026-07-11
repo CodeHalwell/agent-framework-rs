@@ -16,13 +16,23 @@ use tokio::sync::OnceCell;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::{ApprovalMode, Tool, ToolDefinition};
+use agent_framework_core::types::ChatMessage;
 
 use crate::client::McpClient;
-use crate::protocol::{normalize_mcp_name, ToolDescriptor};
+use crate::protocol::{
+    normalize_mcp_name, role_and_content_to_chat_message, PromptDescriptor, ToolDescriptor,
+};
+use crate::sampling::{Root, SamplingHandler};
 use crate::transport::{McpStdioTransport, McpStreamableHttpTransport, McpWebsocketTransport};
 
 /// The `clientInfo.name` this crate sends during `initialize`.
 const CLIENT_NAME: &str = "agent-framework-rs";
+
+/// Map an MCP `prompts/get` message into a core [`ChatMessage`] — mirrors
+/// the Python reference's `_mcp_prompt_message_to_chat_message`.
+fn prompt_message_to_chat_message(msg: &crate::protocol::PromptMessage) -> ChatMessage {
+    role_and_content_to_chat_message(&msg.role, &msg.content)
+}
 /// The `clientInfo.version` this crate sends during `initialize`.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -171,6 +181,8 @@ pub struct McpStdioTool {
     cwd: Option<PathBuf>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
+    sampling_handler: Option<SamplingHandler>,
+    roots: Option<Vec<Root>>,
     session: OnceCell<Arc<McpClient>>,
 }
 
@@ -187,6 +199,8 @@ impl McpStdioTool {
             cwd: None,
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
+            sampling_handler: None,
+            roots: None,
             session: OnceCell::new(),
         }
     }
@@ -241,6 +255,24 @@ impl McpStdioTool {
         self
     }
 
+    /// Register the handler for server-initiated `sampling/createMessage`
+    /// requests, applied when the underlying session is created. See
+    /// [`McpClient::sampling_handler`].
+    pub fn sampling_handler(mut self, handler: SamplingHandler) -> Self {
+        self.sampling_handler = Some(handler);
+        self
+    }
+
+    /// Register a static list of filesystem roots, applied when the
+    /// underlying session is created. See [`McpClient::roots`].
+    pub fn roots<I>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = Root>,
+    {
+        self.roots = Some(roots.into_iter().collect());
+        self
+    }
+
     /// Connect to the server and perform the `initialize` handshake.
     ///
     /// Idempotent and safe to call concurrently: the first caller performs
@@ -255,7 +287,13 @@ impl McpStdioTool {
                     self.cwd.as_deref(),
                 )
                 .await?;
-                let client = McpClient::new(Arc::new(transport));
+                let mut client = McpClient::new(Arc::new(transport));
+                if let Some(handler) = &self.sampling_handler {
+                    client = client.sampling_handler(handler.clone());
+                }
+                if let Some(roots) = &self.roots {
+                    client = client.roots(roots.clone());
+                }
                 client.initialize(CLIENT_NAME, CLIENT_VERSION).await?;
                 Ok::<_, Error>(Arc::new(client))
             })
@@ -280,6 +318,37 @@ impl McpStdioTool {
             self.allowed_tools.as_ref(),
             &self.approval_mode,
         ))
+    }
+
+    /// Connect (if not already connected) and list the server's prompts.
+    /// Returns an empty list if the server didn't declare the `prompts`
+    /// capability — see [`McpClient::list_prompts`].
+    pub async fn prompts(&self) -> Result<Vec<PromptDescriptor>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        client.list_prompts().await
+    }
+
+    /// Connect (if not already connected) and fetch a rendered prompt's
+    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// `MCPTool.get_prompt`.
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        let result = client.get_prompt(name, arguments).await?;
+        Ok(result
+            .messages
+            .iter()
+            .map(prompt_message_to_chat_message)
+            .collect())
     }
 
     /// The configured tool-source name.
@@ -322,6 +391,8 @@ pub struct McpStreamableHttpTool {
     timeout: Option<Duration>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
+    sampling_handler: Option<SamplingHandler>,
+    roots: Option<Vec<Root>>,
     session: OnceCell<Arc<McpClient>>,
 }
 
@@ -336,6 +407,8 @@ impl McpStreamableHttpTool {
             timeout: None,
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
+            sampling_handler: None,
+            roots: None,
             session: OnceCell::new(),
         }
     }
@@ -380,6 +453,24 @@ impl McpStreamableHttpTool {
         self
     }
 
+    /// Register the handler for server-initiated `sampling/createMessage`
+    /// requests, applied when the underlying session is created. See
+    /// [`McpClient::sampling_handler`].
+    pub fn sampling_handler(mut self, handler: SamplingHandler) -> Self {
+        self.sampling_handler = Some(handler);
+        self
+    }
+
+    /// Register a static list of filesystem roots, applied when the
+    /// underlying session is created. See [`McpClient::roots`].
+    pub fn roots<I>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = Root>,
+    {
+        self.roots = Some(roots.into_iter().collect());
+        self
+    }
+
     /// Connect to the server and perform the `initialize` handshake.
     ///
     /// Idempotent and safe to call concurrently: the first caller performs
@@ -390,7 +481,13 @@ impl McpStreamableHttpTool {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
                 let transport =
                     McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout);
-                let client = McpClient::new(Arc::new(transport));
+                let mut client = McpClient::new(Arc::new(transport));
+                if let Some(handler) = &self.sampling_handler {
+                    client = client.sampling_handler(handler.clone());
+                }
+                if let Some(roots) = &self.roots {
+                    client = client.roots(roots.clone());
+                }
                 client.initialize(CLIENT_NAME, CLIENT_VERSION).await?;
                 Ok::<_, Error>(Arc::new(client))
             })
@@ -415,6 +512,37 @@ impl McpStreamableHttpTool {
             self.allowed_tools.as_ref(),
             &self.approval_mode,
         ))
+    }
+
+    /// Connect (if not already connected) and list the server's prompts.
+    /// Returns an empty list if the server didn't declare the `prompts`
+    /// capability — see [`McpClient::list_prompts`].
+    pub async fn prompts(&self) -> Result<Vec<PromptDescriptor>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        client.list_prompts().await
+    }
+
+    /// Connect (if not already connected) and fetch a rendered prompt's
+    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// `MCPTool.get_prompt`.
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        let result = client.get_prompt(name, arguments).await?;
+        Ok(result
+            .messages
+            .iter()
+            .map(prompt_message_to_chat_message)
+            .collect())
     }
 
     /// The configured tool-source name.
@@ -456,6 +584,8 @@ pub struct McpWebsocketTool {
     headers: Vec<(String, String)>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
+    sampling_handler: Option<SamplingHandler>,
+    roots: Option<Vec<Root>>,
     session: OnceCell<Arc<McpClient>>,
 }
 
@@ -470,6 +600,8 @@ impl McpWebsocketTool {
             headers: Vec::new(),
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
+            sampling_handler: None,
+            roots: None,
             session: OnceCell::new(),
         }
     }
@@ -509,6 +641,24 @@ impl McpWebsocketTool {
         self
     }
 
+    /// Register the handler for server-initiated `sampling/createMessage`
+    /// requests, applied when the underlying session is created. See
+    /// [`McpClient::sampling_handler`].
+    pub fn sampling_handler(mut self, handler: SamplingHandler) -> Self {
+        self.sampling_handler = Some(handler);
+        self
+    }
+
+    /// Register a static list of filesystem roots, applied when the
+    /// underlying session is created. See [`McpClient::roots`].
+    pub fn roots<I>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = Root>,
+    {
+        self.roots = Some(roots.into_iter().collect());
+        self
+    }
+
     /// Connect to the server and perform the `initialize` handshake.
     ///
     /// Idempotent and safe to call concurrently: the first caller performs
@@ -517,7 +667,13 @@ impl McpWebsocketTool {
         self.session
             .get_or_try_init(|| async {
                 let transport = McpWebsocketTransport::connect(&self.url, &self.headers).await?;
-                let client = McpClient::new(Arc::new(transport));
+                let mut client = McpClient::new(Arc::new(transport));
+                if let Some(handler) = &self.sampling_handler {
+                    client = client.sampling_handler(handler.clone());
+                }
+                if let Some(roots) = &self.roots {
+                    client = client.roots(roots.clone());
+                }
                 client.initialize(CLIENT_NAME, CLIENT_VERSION).await?;
                 Ok::<_, Error>(Arc::new(client))
             })
@@ -542,6 +698,37 @@ impl McpWebsocketTool {
             self.allowed_tools.as_ref(),
             &self.approval_mode,
         ))
+    }
+
+    /// Connect (if not already connected) and list the server's prompts.
+    /// Returns an empty list if the server didn't declare the `prompts`
+    /// capability — see [`McpClient::list_prompts`].
+    pub async fn prompts(&self) -> Result<Vec<PromptDescriptor>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        client.list_prompts().await
+    }
+
+    /// Connect (if not already connected) and fetch a rendered prompt's
+    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// `MCPTool.get_prompt`.
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+        self.connect().await?;
+        let client = self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone();
+        let result = client.get_prompt(name, arguments).await?;
+        Ok(result
+            .messages
+            .iter()
+            .map(prompt_message_to_chat_message)
+            .collect())
     }
 
     /// The configured tool-source name.

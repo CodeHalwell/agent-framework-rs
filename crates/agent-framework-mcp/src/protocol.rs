@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use agent_framework_core::types::{ChatMessage, Content, DataContent, Role, UriContent};
+
 /// The MCP protocol version this client requests during `initialize`.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -154,6 +156,20 @@ pub struct InitializeResult {
     pub instructions: Option<String>,
 }
 
+impl InitializeResult {
+    /// Whether the server declared the `prompts` capability, i.e.
+    /// `capabilities.prompts` is present in the `initialize` response.
+    ///
+    /// Used to short-circuit [`crate::McpClient::list_prompts`] without a
+    /// round trip — the Rust equivalent of the Python reference's
+    /// try/except around `session.list_prompts()`, which logs and treats a
+    /// failure the same way, but checks the negotiated capability up front
+    /// instead of discarding an expected error.
+    pub fn supports_prompts(&self) -> bool {
+        self.capabilities.get("prompts").is_some()
+    }
+}
+
 /// A tool descriptor as returned by `tools/list`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -288,6 +304,64 @@ impl ContentBlock {
             ContentBlock::Unknown(v) => v.clone(),
         }
     }
+
+    /// Convert this block into a core [`Content`] item.
+    ///
+    /// Mirrors the relevant arms of the Python reference's
+    /// `_mcp_type_to_ai_content`: text stays text; image/audio become
+    /// [`Content::Data`] with the base64 payload wrapped into a proper
+    /// `data:<mime>;base64,<payload>` URI (this crate's established
+    /// convention for bare-base64 wire payloads — see
+    /// `agent-framework-a2a`'s `FileWithBytes` handling); a resource link
+    /// becomes [`Content::Uri`]; an embedded resource becomes text or data
+    /// depending on whether it carries `text` or `blob`. Infallible: any
+    /// shape this crate doesn't specifically recognize degrades to its raw
+    /// JSON text rather than being dropped.
+    pub fn to_core_content(&self) -> Content {
+        match self {
+            ContentBlock::Text(text) => Content::text(text.clone()),
+            ContentBlock::Image { data, mime_type } | ContentBlock::Audio { data, mime_type } => {
+                Content::Data(DataContent {
+                    uri: format!("data:{mime_type};base64,{data}"),
+                    media_type: Some(mime_type.clone()),
+                })
+            }
+            ContentBlock::ResourceLink { uri, mime_type, .. } => Content::Uri(UriContent {
+                uri: uri.clone(),
+                media_type: mime_type
+                    .clone()
+                    .unwrap_or_else(|| "application/json".to_string()),
+            }),
+            ContentBlock::Resource(resource) => {
+                if let Some(text) = resource.get("text").and_then(Value::as_str) {
+                    Content::text(text.to_string())
+                } else if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+                    let mime = resource
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    Content::Data(DataContent {
+                        uri: format!("data:{mime};base64,{blob}"),
+                        media_type: Some(mime.to_string()),
+                    })
+                } else {
+                    Content::text(resource.to_string())
+                }
+            }
+            ContentBlock::Unknown(v) => Content::text(v.to_string()),
+        }
+    }
+}
+
+/// Build a core [`ChatMessage`] from an MCP role string plus a single raw
+/// content value. Shared by prompt-message (`prompts/get`) and
+/// sampling-message (`sampling/createMessage`) mapping: both carry a role
+/// and exactly one content block each, unlike `tools/call`'s content array.
+pub(crate) fn role_and_content_to_chat_message(role: &str, content: &Value) -> ChatMessage {
+    ChatMessage::with_contents(
+        Role::new(role.to_string()),
+        vec![ContentBlock::from_value(content).to_core_content()],
+    )
 }
 
 /// The result of a `tools/call` request.
@@ -375,6 +449,73 @@ pub fn normalize_mcp_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------
+// Prompts (`prompts/list` / `prompts/get`)
+// ---------------------------------------------------------------------
+
+/// One argument a [`PromptDescriptor`] accepts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+}
+
+/// A prompt descriptor as returned by `prompts/list`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<Vec<PromptArgument>>,
+}
+
+/// One page of `prompts/list` results.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPromptsResult {
+    #[serde(default)]
+    pub prompts: Vec<PromptDescriptor>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// One message inside a `prompts/get` result.
+///
+/// Unlike a `tools/call` result, an MCP prompt message carries exactly one
+/// content block, not an array — `content` is kept as a raw [`Value`] here
+/// (parse with [`Self::content_block`]) rather than modeled as
+/// [`ContentBlock`] directly, so this type's `Deserialize` impl can stay
+/// derived.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptMessage {
+    /// `"user"` or `"assistant"`.
+    pub role: String,
+    pub content: Value,
+}
+
+impl PromptMessage {
+    /// Parse this message's raw content into a [`ContentBlock`].
+    pub fn content_block(&self) -> ContentBlock {
+        ContentBlock::from_value(&self.content)
+    }
+}
+
+/// The result of a `prompts/get` request.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPromptResult {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<PromptMessage>,
 }
 
 #[cfg(test)]
@@ -524,5 +665,139 @@ mod tests {
             "weather-get-current"
         );
         assert_eq!(normalize_mcp_name("valid_Name-1.0"), "valid_Name-1.0");
+    }
+
+    #[test]
+    fn initialize_result_supports_prompts_checks_capabilities() {
+        let with_prompts: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"prompts": {}},
+            "serverInfo": {"name": "s", "version": "1"},
+        }))
+        .unwrap();
+        assert!(with_prompts.supports_prompts());
+
+        let without_prompts: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "s", "version": "1"},
+        }))
+        .unwrap();
+        assert!(!without_prompts.supports_prompts());
+    }
+
+    #[test]
+    fn content_block_to_core_content_maps_text() {
+        let block = ContentBlock::Text("hello".to_string());
+        assert_eq!(block.to_core_content(), Content::text("hello"));
+    }
+
+    #[test]
+    fn content_block_to_core_content_wraps_image_bytes_as_data_uri() {
+        let block = ContentBlock::Image {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "image/png".to_string(),
+        };
+        match block.to_core_content() {
+            Content::Data(d) => {
+                assert_eq!(d.uri, "data:image/png;base64,aGVsbG8=");
+                assert_eq!(d.media_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected Content::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_to_core_content_wraps_audio_bytes_as_data_uri() {
+        let block = ContentBlock::Audio {
+            data: "d2F2ZQ==".to_string(),
+            mime_type: "audio/wav".to_string(),
+        };
+        match block.to_core_content() {
+            Content::Data(d) => assert_eq!(d.uri, "data:audio/wav;base64,d2F2ZQ=="),
+            other => panic!("expected Content::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_to_core_content_maps_resource_link() {
+        let block = ContentBlock::ResourceLink {
+            uri: "file:///tmp/report.pdf".to_string(),
+            mime_type: Some("application/pdf".to_string()),
+            name: Some("report.pdf".to_string()),
+        };
+        match block.to_core_content() {
+            Content::Uri(u) => {
+                assert_eq!(u.uri, "file:///tmp/report.pdf");
+                assert_eq!(u.media_type, "application/pdf");
+            }
+            other => panic!("expected Content::Uri, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_to_core_content_maps_text_resource() {
+        let block = ContentBlock::Resource(json!({"uri": "file:///a.txt", "text": "hi"}));
+        assert_eq!(block.to_core_content(), Content::text("hi"));
+    }
+
+    #[test]
+    fn content_block_to_core_content_maps_blob_resource() {
+        let block = ContentBlock::Resource(
+            json!({"uri": "file:///a.bin", "blob": "AAAA", "mimeType": "application/octet-stream"}),
+        );
+        match block.to_core_content() {
+            Content::Data(d) => assert_eq!(d.uri, "data:application/octet-stream;base64,AAAA"),
+            other => panic!("expected Content::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_to_core_content_unknown_falls_back_to_raw_json_text() {
+        let block = ContentBlock::Unknown(json!({"type": "future_kind", "x": 1}));
+        assert_eq!(
+            block.to_core_content(),
+            Content::text(json!({"type": "future_kind", "x": 1}).to_string())
+        );
+    }
+
+    #[test]
+    fn role_and_content_to_chat_message_builds_single_content_message() {
+        let msg =
+            role_and_content_to_chat_message("assistant", &json!({"type": "text", "text": "hi"}));
+        assert_eq!(msg.role, Role::assistant());
+        assert_eq!(msg.contents, vec![Content::text("hi")]);
+    }
+
+    #[test]
+    fn list_prompts_result_parses_page_with_cursor() {
+        let page: ListPromptsResult = serde_json::from_value(json!({
+            "prompts": [{"name": "greet", "description": "Say hello", "arguments": [
+                {"name": "name", "required": true},
+            ]}],
+            "nextCursor": "page2",
+        }))
+        .unwrap();
+        assert_eq!(page.prompts.len(), 1);
+        assert_eq!(page.prompts[0].name, "greet");
+        assert_eq!(page.prompts[0].arguments.as_ref().unwrap()[0].name, "name");
+        assert_eq!(page.next_cursor.as_deref(), Some("page2"));
+    }
+
+    #[test]
+    fn get_prompt_result_parses_messages() {
+        let result: GetPromptResult = serde_json::from_value(json!({
+            "description": "A greeting prompt",
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": "Say hi to Ada"}},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, "user");
+        assert_eq!(
+            result.messages[0].content_block(),
+            ContentBlock::Text("Say hi to Ada".to_string())
+        );
     }
 }

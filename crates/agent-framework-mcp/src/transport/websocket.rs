@@ -3,8 +3,9 @@
 //!
 //! Structurally this mirrors [`super::stdio::McpStdioTransport`]: a background
 //! task reads frames off the socket and routes responses back to their
-//! waiting caller by request id, while notifications and server-initiated
-//! requests are logged and otherwise ignored (no sampling/roots support).
+//! waiting caller by request id, notifications are logged, and
+//! server-initiated requests are answered via whatever handler
+//! [`McpTransport::set_server_request_handler`] installed.
 
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
@@ -12,7 +13,7 @@ use std::sync::Mutex as StdMutex;
 use async_trait::async_trait;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -24,6 +25,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use agent_framework_core::error::{Error, Result};
 
 use crate::protocol::{self, IdGenerator, IncomingMessage, RpcError};
+use crate::sampling::BoxedServerRequestHandler;
 use crate::transport::McpTransport;
 
 /// The WebSocket subprotocol MCP servers expect during the handshake.
@@ -54,6 +56,9 @@ struct WsInner {
     pending: PendingMap,
     next_id: IdGenerator,
     reader_task: StdMutex<Option<JoinHandle<()>>>,
+    /// Handler for server-initiated requests (`ping`, `sampling/createMessage`,
+    /// `roots/list`), installed via [`McpTransport::set_server_request_handler`].
+    server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
 }
 
 impl McpWebsocketTransport {
@@ -85,6 +90,7 @@ impl McpWebsocketTransport {
             pending: StdMutex::new(HashMap::new()),
             next_id: IdGenerator::new(),
             reader_task: StdMutex::new(None),
+            server_request_handler: StdMutex::new(None),
         });
 
         let reader_task = spawn_reader(source, inner.clone());
@@ -92,15 +98,19 @@ impl McpWebsocketTransport {
 
         Ok(Self { inner })
     }
+}
 
-    async fn write_text(&self, message: &Value) -> Result<()> {
-        let text = serde_json::to_string(message)
-            .map_err(|e| Error::service(format!("failed to encode MCP message: {e}")))?;
-        let mut sink = self.inner.sink.lock().await;
-        sink.send(Message::text(text))
-            .await
-            .map_err(|e| Error::service(format!("failed to write to MCP websocket: {e}")))
-    }
+/// Encode `message` as one JSON text frame and send it. A free function
+/// (rather than an `McpWebsocketTransport` method) so the background reader
+/// task — which only holds `Arc<WsInner>`, not the outer transport handle —
+/// can use it too, to write responses to server-initiated requests.
+async fn write_text(inner: &WsInner, message: &Value) -> Result<()> {
+    let text = serde_json::to_string(message)
+        .map_err(|e| Error::service(format!("failed to encode MCP message: {e}")))?;
+    let mut sink = inner.sink.lock().await;
+    sink.send(Message::text(text))
+        .await
+        .map_err(|e| Error::service(format!("failed to write to MCP websocket: {e}")))
 }
 
 #[async_trait]
@@ -111,7 +121,7 @@ impl McpTransport for McpWebsocketTransport {
         self.inner.pending.lock().unwrap().insert(id, tx);
 
         let request = protocol::build_request(id, method, params);
-        if let Err(e) = self.write_text(&request).await {
+        if let Err(e) = write_text(&self.inner, &request).await {
             self.inner.pending.lock().unwrap().remove(&id);
             return Err(e);
         }
@@ -127,7 +137,7 @@ impl McpTransport for McpWebsocketTransport {
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let notification = protocol::build_notification(method, params);
-        self.write_text(&notification).await
+        write_text(&self.inner, &notification).await
     }
 
     async fn close(&self) -> Result<()> {
@@ -136,6 +146,10 @@ impl McpTransport for McpWebsocketTransport {
         // this fail, which is not itself an error worth surfacing.
         let _ = sink.send(Message::Close(None)).await;
         Ok(())
+    }
+
+    fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
+        *self.inner.server_request_handler.lock().unwrap() = Some(handler);
     }
 }
 
@@ -209,8 +223,9 @@ fn spawn_reader(mut source: WsSource, inner: std::sync::Arc<WsInner>) -> JoinHan
     })
 }
 
-/// Identical routing logic to the stdio transport's `route_incoming`: classify
-/// the message and either resolve a pending response or log-and-ignore.
+/// Identical routing logic to the stdio transport's `route_incoming`:
+/// classify the message and either resolve a pending response, log a
+/// notification, or answer a server-initiated request.
 fn route_incoming(inner: &std::sync::Arc<WsInner>, value: Value) {
     match protocol::parse_incoming(value) {
         IncomingMessage::Response { id, result } => {
@@ -224,15 +239,44 @@ fn route_incoming(inner: &std::sync::Arc<WsInner>, value: Value) {
             tracing::debug!(method = %method, params = %params, "MCP server notification");
         }
         IncomingMessage::ServerRequest { id, method, params } => {
-            tracing::warn!(
-                id = %id,
-                method = %method,
-                params = %params,
-                "MCP server sent a server-initiated request; sampling/roots are not supported, ignoring"
-            );
+            spawn_server_request_response(inner.clone(), id, method, params);
         }
         IncomingMessage::Malformed(v) => {
             tracing::warn!(raw = %v, "MCP: unrecognized JSON-RPC message shape");
         }
     }
+}
+
+/// Compute the response to a server-initiated request (via whatever handler
+/// is registered — see [`McpTransport::set_server_request_handler`]) and
+/// send it back over the socket, in its own task so a slow handler (e.g. a
+/// sampling handler calling out to an LLM) doesn't block the reader loop
+/// from noticing other incoming messages in the meantime.
+fn spawn_server_request_response(
+    inner: std::sync::Arc<WsInner>,
+    id: Value,
+    method: String,
+    params: Value,
+) {
+    tokio::spawn(async move {
+        let handler = inner.server_request_handler.lock().unwrap().clone();
+        let result = match handler {
+            Some(h) => h(method.clone(), params).await,
+            None => Err(RpcError {
+                code: -32601,
+                message: format!("Method not found: {method}"),
+                data: None,
+            }),
+        };
+        let envelope = match result {
+            Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
+            Err(err) => json!({ "jsonrpc": "2.0", "id": id, "error": err }),
+        };
+        if let Err(e) = write_text(&inner, &envelope).await {
+            tracing::warn!(
+                error = %e,
+                "MCP: failed to write response for a server-initiated request"
+            );
+        }
+    });
 }

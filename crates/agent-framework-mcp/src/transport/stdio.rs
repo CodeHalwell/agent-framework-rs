@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use agent_framework_core::error::{Error, Result};
 
 use crate::protocol::{self, IdGenerator, IncomingMessage, RpcError};
+use crate::sampling::BoxedServerRequestHandler;
 use crate::transport::McpTransport;
 
 type PendingMap = StdMutex<HashMap<i64, oneshot::Sender<std::result::Result<Value, RpcError>>>>;
@@ -40,6 +41,9 @@ struct StdioInner {
     next_id: IdGenerator,
     reader_task: StdMutex<Option<JoinHandle<()>>>,
     stderr_task: StdMutex<Option<JoinHandle<()>>>,
+    /// Handler for server-initiated requests (`ping`, `sampling/createMessage`,
+    /// `roots/list`), installed via [`McpTransport::set_server_request_handler`].
+    server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
 }
 
 impl McpStdioTransport {
@@ -98,6 +102,7 @@ impl McpStdioTransport {
             next_id: IdGenerator::new(),
             reader_task: StdMutex::new(None),
             stderr_task: StdMutex::new(None),
+            server_request_handler: StdMutex::new(None),
         });
 
         let reader_task = spawn_reader(stdout, inner.clone());
@@ -107,22 +112,27 @@ impl McpStdioTransport {
 
         Ok(Self { inner })
     }
+}
 
-    async fn write_line(&self, message: &Value) -> Result<()> {
-        let mut line = serde_json::to_string(message)
-            .map_err(|e| Error::service(format!("failed to encode MCP message: {e}")))?;
-        line.push('\n');
-        let mut stdin = self.inner.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| Error::service(format!("failed to write to MCP server stdin: {e}")))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| Error::service(format!("failed to flush MCP server stdin: {e}")))?;
-        Ok(())
-    }
+/// Encode `message` as one newline-terminated JSON line and write it to the
+/// child's stdin. A free function (rather than an `McpStdioTransport`
+/// method) so the background reader task — which only holds `Arc<StdioInner>`,
+/// not the outer transport handle — can use it too, to write responses to
+/// server-initiated requests.
+async fn write_line(inner: &StdioInner, message: &Value) -> Result<()> {
+    let mut line = serde_json::to_string(message)
+        .map_err(|e| Error::service(format!("failed to encode MCP message: {e}")))?;
+    line.push('\n');
+    let mut stdin = inner.stdin.lock().await;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| Error::service(format!("failed to write to MCP server stdin: {e}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|e| Error::service(format!("failed to flush MCP server stdin: {e}")))?;
+    Ok(())
 }
 
 #[async_trait]
@@ -133,7 +143,7 @@ impl McpTransport for McpStdioTransport {
         self.inner.pending.lock().unwrap().insert(id, tx);
 
         let request = protocol::build_request(id, method, params);
-        if let Err(e) = self.write_line(&request).await {
+        if let Err(e) = write_line(&self.inner, &request).await {
             self.inner.pending.lock().unwrap().remove(&id);
             return Err(e);
         }
@@ -149,7 +159,7 @@ impl McpTransport for McpStdioTransport {
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let notification = protocol::build_notification(method, params);
-        self.write_line(&notification).await
+        write_line(&self.inner, &notification).await
     }
 
     async fn close(&self) -> Result<()> {
@@ -157,6 +167,10 @@ impl McpTransport for McpStdioTransport {
             let _ = child.start_kill();
         }
         Ok(())
+    }
+
+    fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
+        *self.inner.server_request_handler.lock().unwrap() = Some(handler);
     }
 }
 
@@ -190,8 +204,9 @@ impl Drop for StdioInner {
 
 /// Spawn the background task that reads newline-delimited JSON-RPC messages
 /// from the server's stdout and routes them: responses go to their waiting
-/// caller by id, notifications and server-initiated requests are logged and
-/// otherwise ignored (no sampling/roots support).
+/// caller by id, notifications are logged, and server-initiated requests are
+/// answered via whatever handler [`McpTransport::set_server_request_handler`]
+/// installed (see [`spawn_server_request_response`]).
 fn spawn_reader(
     stdout: tokio::process::ChildStdout,
     inner: std::sync::Arc<StdioInner>,
@@ -247,17 +262,46 @@ fn route_incoming(inner: &std::sync::Arc<StdioInner>, value: Value) {
             tracing::debug!(method = %method, params = %params, "MCP server notification");
         }
         IncomingMessage::ServerRequest { id, method, params } => {
-            tracing::warn!(
-                id = %id,
-                method = %method,
-                params = %params,
-                "MCP server sent a server-initiated request; sampling/roots are not supported, ignoring"
-            );
+            spawn_server_request_response(inner.clone(), id, method, params);
         }
         IncomingMessage::Malformed(v) => {
             tracing::warn!(raw = %v, "MCP: unrecognized JSON-RPC message shape");
         }
     }
+}
+
+/// Compute the response to a server-initiated request (via whatever handler
+/// is registered — see [`McpTransport::set_server_request_handler`]) and
+/// write it back over stdin, in its own task so a slow handler (e.g. a
+/// sampling handler calling out to an LLM) doesn't block the reader loop
+/// from noticing other incoming messages in the meantime.
+fn spawn_server_request_response(
+    inner: std::sync::Arc<StdioInner>,
+    id: Value,
+    method: String,
+    params: Value,
+) {
+    tokio::spawn(async move {
+        let handler = inner.server_request_handler.lock().unwrap().clone();
+        let result = match handler {
+            Some(h) => h(method.clone(), params).await,
+            None => Err(RpcError {
+                code: -32601,
+                message: format!("Method not found: {method}"),
+                data: None,
+            }),
+        };
+        let envelope = match result {
+            Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
+            Err(err) => json!({ "jsonrpc": "2.0", "id": id, "error": err }),
+        };
+        if let Err(e) = write_line(&inner, &envelope).await {
+            tracing::warn!(
+                error = %e,
+                "MCP: failed to write response for a server-initiated request"
+            );
+        }
+    });
 }
 
 /// Spawn the background task that drains the server's stderr to `tracing`.

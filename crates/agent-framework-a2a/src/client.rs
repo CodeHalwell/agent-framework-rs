@@ -13,7 +13,10 @@ use tokio::sync::RwLock;
 use agent_framework_core::error::{Error, Result};
 
 use crate::protocol;
-use crate::types::{AgentCard, MessageSendParams, MessageStreamEvent, SendMessageResult, Task};
+use crate::types::{
+    AgentCard, MessageSendParams, MessageStreamEvent, PushNotificationConfig, SendMessageResult,
+    Task, TaskPushNotificationConfig,
+};
 
 const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const WELL_KNOWN_AGENT_JSON_PATH: &str = "/.well-known/agent.json";
@@ -119,19 +122,26 @@ impl A2AClient {
     ///
     /// GETs `{base}/.well-known/agent-card.json` first; if that fails (older
     /// servers, or ones with no discovery document at all), falls back to
-    /// `{base}/.well-known/agent.json`. On success, also updates the
-    /// JSON-RPC endpoint used by subsequent calls to the card's `url`.
+    /// `{base}/.well-known/agent.json`. If the resulting card sets
+    /// `supportsAuthenticatedExtendedCard`, this then best-effort upgrades to
+    /// the extended card via [`Self::get_extended_card`] — on failure (e.g.
+    /// missing/invalid auth headers, or the server not actually honoring the
+    /// flag), it silently keeps the base card rather than fail discovery
+    /// entirely, mirroring the `a2a-sdk` Python package's `Client.get_card`.
+    /// On success either way, also updates the JSON-RPC endpoint used by
+    /// subsequent calls to the card's `url`.
     ///
     /// Idempotent: once a card is known (from either path, or from
-    /// [`Self::from_card`]), later calls return the cached value without any
-    /// network access.
+    /// [`Self::from_card`] — which never attempts the extended-card upgrade,
+    /// matching its documented "no discovery call is ever made" contract),
+    /// later calls return the cached value without any network access.
     pub async fn get_agent_card(&self) -> Result<AgentCard> {
         if let Some(card) = self.cached_agent_card().await {
             return Ok(card);
         }
         let base = self.discovery_base.trim_end_matches('/');
         let primary = format!("{base}{WELL_KNOWN_AGENT_CARD_PATH}");
-        let card = match self.get_json::<AgentCard>(&primary).await {
+        let mut card = match self.get_json::<AgentCard>(&primary).await {
             Ok(card) => card,
             Err(primary_err) => {
                 let fallback = format!("{base}{WELL_KNOWN_AGENT_JSON_PATH}");
@@ -146,8 +156,36 @@ impl A2AClient {
             }
         };
         *self.rpc_url.write().await = card.url.clone();
+        if card.supports_authenticated_extended_card {
+            match self.get_extended_card().await {
+                Ok(extended) => card = extended,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "A2A: authenticated extended card fetch failed; using the base card"
+                    );
+                }
+            }
+        }
         *self.card.write().await = Some(card.clone());
         Ok(card)
+    }
+
+    /// `agent/getAuthenticatedExtendedCard`: fetch the agent's extended
+    /// [`AgentCard`] directly, using whatever auth headers this client is
+    /// configured with (see [`Self::with_header`] / [`Self::with_bearer_token`]).
+    ///
+    /// Low-level: does not check `supportsAuthenticatedExtendedCard`, does
+    /// not touch the cache, and propagates failure — [`Self::get_agent_card`]
+    /// wraps this with that capability check and a graceful fallback for its
+    /// own automatic upgrade. Call this directly when you want the extended
+    /// card specifically and want to know if that actually succeeded.
+    pub async fn get_extended_card(&self) -> Result<AgentCard> {
+        let raw = self
+            .call("agent/getAuthenticatedExtendedCard", json!({}))
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| Error::Serialization(format!("invalid A2A AgentCard: {e}")))
     }
 
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -191,6 +229,50 @@ impl A2AClient {
             .map_err(|e| Error::Serialization(format!("invalid A2A Task: {e}")))
     }
 
+    /// `tasks/pushNotificationConfig/set`: register a webhook the server
+    /// should call as `task_id` progresses. Returns the config the server
+    /// actually stored (it may assign a `PushNotificationConfig::id` if one
+    /// wasn't given).
+    pub async fn set_push_notification_config(
+        &self,
+        task_id: &str,
+        config: PushNotificationConfig,
+    ) -> Result<TaskPushNotificationConfig> {
+        let params = TaskPushNotificationConfig {
+            task_id: task_id.to_string(),
+            push_notification_config: config,
+        };
+        let raw = self
+            .call(
+                "tasks/pushNotificationConfig/set",
+                serde_json::to_value(&params)?,
+            )
+            .await?;
+        serde_json::from_value(raw).map_err(|e| {
+            Error::Serialization(format!("invalid A2A TaskPushNotificationConfig: {e}"))
+        })
+    }
+
+    /// `tasks/pushNotificationConfig/get`: fetch the push notification
+    /// config currently registered for `task_id`.
+    ///
+    /// Note the params shape genuinely differs from
+    /// [`Self::set_push_notification_config`]'s: the A2A 0.3.0 spec sends
+    /// the task id under `id` here (`GetTaskPushNotificationConfigParams`),
+    /// not `taskId` — a real wire-level inconsistency in the spec/SDK, not a
+    /// mistake in this port.
+    pub async fn get_push_notification_config(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskPushNotificationConfig> {
+        let raw = self
+            .call("tasks/pushNotificationConfig/get", json!({ "id": task_id }))
+            .await?;
+        serde_json::from_value(raw).map_err(|e| {
+            Error::Serialization(format!("invalid A2A TaskPushNotificationConfig: {e}"))
+        })
+    }
+
     /// `message/stream`: like [`Self::send_message`], but returns a stream of
     /// [`MessageStreamEvent`]s — an immediate
     /// [`Message`](crate::types::Message), or a sequence of `Task`
@@ -201,9 +283,30 @@ impl A2AClient {
     /// `A2AAgent::run` does not use it (see the crate docs for why),
     /// but it's available for callers that want incremental updates.
     pub async fn send_message_stream(&self, params: MessageSendParams) -> Result<A2AEventStream> {
+        self.stream_request("message/stream", serde_json::to_value(params)?)
+            .await
+    }
+
+    /// `tasks/resubscribe`: reconnect to an existing task's event stream
+    /// (e.g. after a dropped connection), yielding the exact same
+    /// [`MessageStreamEvent`] sequence shape as [`Self::send_message_stream`]
+    /// — per the A2A spec, both requests share one response type on the
+    /// wire.
+    pub async fn resubscribe(&self, task_id: &str) -> Result<A2AEventStream> {
+        self.stream_request("tasks/resubscribe", json!({ "id": task_id }))
+            .await
+    }
+
+    /// POST `method`/`params` requesting `text/event-stream` and return the
+    /// resulting SSE-framed event stream. Shared by
+    /// [`Self::send_message_stream`] and [`Self::resubscribe`], which differ
+    /// only in the method name and params shape — both respond with the same
+    /// `Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent`
+    /// union over SSE.
+    async fn stream_request(&self, method: &str, params: Value) -> Result<A2AEventStream> {
         let url = self.rpc_url().await;
         let id = uuid::Uuid::new_v4().to_string();
-        let body = protocol::build_request(&id, "message/stream", serde_json::to_value(params)?);
+        let body = protocol::build_request(&id, method, params);
         let resp = self
             .http
             .post(&url)
@@ -417,5 +520,55 @@ mod tests {
             events[0].as_ref().unwrap(),
             MessageStreamEvent::Message(_)
         ));
+    }
+
+    #[test]
+    fn resubscribe_reuses_the_same_sse_event_parsing_as_message_stream() {
+        // `tasks/resubscribe` and `message/stream` share one response shape
+        // on the wire (a `Message | Task | TaskStatusUpdateEvent |
+        // TaskArtifactUpdateEvent` union over SSE) -- `A2AClient::resubscribe`
+        // is implemented via the exact same `stream_request` helper (and
+        // thus the exact same `parse_sse_stream` / `drain_sse_events` /
+        // `protocol::parse_stream_event` path) as `send_message_stream`, so
+        // this exercises a status-update event the same way a resumed task
+        // stream would deliver one, with no special-casing anywhere.
+        let mut buf = format!(
+            "data: {}\n\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {
+                    "taskId": "task-1",
+                    "contextId": "ctx-1",
+                    "status": {"state": "working"},
+                    "final": false,
+                },
+            })
+        );
+        let events = protocol::drain_sse_events(&mut buf);
+        assert_eq!(events.len(), 1);
+        match events[0].as_ref().unwrap() {
+            MessageStreamEvent::StatusUpdate(update) => {
+                assert_eq!(update.task_id, "task-1");
+                assert!(!update.is_final);
+            }
+            other => panic!("expected StatusUpdate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_card_never_attempts_the_extended_card_upgrade() {
+        // `from_card` documents "no discovery call is ever made"; the
+        // extended-card auto-upgrade lives inside `get_agent_card`'s
+        // discovery path, so a client built from an already-known card must
+        // short-circuit before ever reaching it, even when that card claims
+        // `supportsAuthenticatedExtendedCard`. No network access happens in
+        // this test at all -- if the upgrade were mistakenly attempted, this
+        // would hang/fail trying to reach a real host.
+        let mut card = sample_card();
+        card.supports_authenticated_extended_card = true;
+        let client = A2AClient::from_card(card.clone());
+        let fetched = client.get_agent_card().await.unwrap();
+        assert_eq!(fetched, card);
     }
 }

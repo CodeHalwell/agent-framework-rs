@@ -16,8 +16,10 @@
 //!   [`Part`] (`Text` | `File` | `Data`), [`Task`], [`TaskState`], and the
 //!   JSON-RPC parameter/result shapes.
 //! - [`client`] — [`A2AClient`]: JSON-RPC 2.0 over HTTP POST
-//!   (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`), plus
-//!   [`AgentCard`] discovery via `.well-known`.
+//!   (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`,
+//!   `tasks/resubscribe`, `tasks/pushNotificationConfig/{set,get}`), plus
+//!   [`AgentCard`] discovery via `.well-known` (auto-upgrading to the
+//!   authenticated extended card when the server advertises it).
 //! - [`agent`] — [`A2AAgent`]: the [`Agent`](agent_framework_core::agent::Agent)
 //!   wrapper, converting [`ChatMessage`](agent_framework_core::types::ChatMessage)s
 //!   to/from A2A [`Message`]s and [`Task`]s.
@@ -97,11 +99,28 @@
 //!   [`agent_framework_core::agent::Agent`] has no `run_stream` requirement
 //!   (unlike Python's `BaseAgent`), so there's nothing in the trait for a
 //!   streamed run to plug into.
-//! - **Not implemented**: push notifications
-//!   (`tasks/pushNotificationConfig/*`), the authenticated extended card
-//!   flow, and `tasks/resubscribe` (reconnecting to an existing task's
-//!   stream). Future work, akin to the `agent-framework-mcp` parity notes for
-//!   its unimplemented WebSocket transport.
+//! - **Push notifications** (`tasks/pushNotificationConfig/set` / `/get`):
+//!   [`A2AClient::set_push_notification_config`] /
+//!   [`A2AClient::get_push_notification_config`]. Note the `get` request's
+//!   params shape genuinely differs from `set`'s on the wire (the task id is
+//!   sent under `id`, not `taskId`) — a real A2A 0.3.0 spec/SDK
+//!   inconsistency, faithfully preserved here rather than "fixed".
+//! - **`tasks/resubscribe`**: [`A2AClient::resubscribe`] reconnects to an
+//!   existing task's event stream, returning the exact same
+//!   [`A2AEventStream`] shape as [`A2AClient::send_message_stream`] (both
+//!   share one response type on the wire, and one implementation here).
+//! - **Authenticated extended card**: when a discovered [`AgentCard`] sets
+//!   `supportsAuthenticatedExtendedCard`, [`A2AClient::get_agent_card`]
+//!   automatically calls [`A2AClient::get_extended_card`]
+//!   (`agent/getAuthenticatedExtendedCard`) and upgrades to it, falling back
+//!   to the base card on failure. This upgrade only happens on the
+//!   `.well-known` discovery path — [`A2AClient::from_card`] never performs
+//!   it, preserving that constructor's "no discovery call is ever made"
+//!   contract.
+//! - **Not implemented**: the *serving* side of any of the above
+//!   (`agent-framework-hosting`'s A2A router doesn't expose push
+//!   notification config, resubscribe, or an extended card endpoint) — this
+//!   crate is a client only, matching its scope.
 
 pub mod agent;
 pub mod client;
@@ -113,6 +132,7 @@ pub use client::{A2AClient, A2AEventStream};
 pub use types::{
     AgentCapabilities, AgentCard, AgentProvider, AgentSkill, Artifact, DataPart, FileData,
     FilePart, FileWithBytes, FileWithUri, Message, MessageRole, MessageSendConfiguration,
-    MessageSendParams, MessageStreamEvent, Part, SendMessageResult, Task, TaskArtifactUpdateEvent,
-    TaskState, TaskStatus, TaskStatusUpdateEvent, TextPart,
+    MessageSendParams, MessageStreamEvent, Part, PushNotificationAuthenticationInfo,
+    PushNotificationConfig, SendMessageResult, Task, TaskArtifactUpdateEvent,
+    TaskPushNotificationConfig, TaskState, TaskStatus, TaskStatusUpdateEvent, TextPart,
 };

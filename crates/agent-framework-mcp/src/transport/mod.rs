@@ -14,11 +14,17 @@ use serde_json::Value;
 
 use agent_framework_core::error::Result;
 
+use crate::sampling::BoxedServerRequestHandler;
+
 /// A JSON-RPC 2.0 transport for MCP messages.
 ///
 /// Implementations own request-id bookkeeping and response correlation, and
-/// any background I/O required to notice server-initiated messages (they are
-/// logged and otherwise ignored — sampling/roots are not supported).
+/// any background I/O required to notice server-initiated messages: a
+/// server-initiated request is routed to whatever handler
+/// [`Self::set_server_request_handler`] installed (see
+/// [`crate::McpClient`], which installs one automatically), computing and
+/// writing back a JSON-RPC response; anything else (notifications) is
+/// logged and otherwise ignored.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC request and return its `result` value.
@@ -32,6 +38,18 @@ pub trait McpTransport: Send + Sync {
 
     /// Best-effort, idempotent shutdown of the transport.
     async fn close(&self) -> Result<()>;
+
+    /// Register the handler responsible for computing responses to
+    /// server-initiated requests (`ping`, `sampling/createMessage`,
+    /// `roots/list`). [`crate::McpClient`] installs one automatically at
+    /// construction, so callers normally never need to call this directly.
+    /// Replaces any previously registered handler.
+    ///
+    /// The default implementation does nothing, for transports (e.g. test
+    /// mocks) that never see server-initiated requests.
+    fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
+        let _ = handler;
+    }
 }
 
 pub use http::McpStreamableHttpTransport;

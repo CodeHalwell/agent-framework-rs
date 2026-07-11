@@ -28,16 +28,44 @@
 //! `notifications/initialized` handshake, `ping`, `tools/list` (with cursor
 //! pagination), and `tools/call`.
 //!
+//! ## Prompts, sampling, and roots
+//!
+//! - **Prompts** (`prompts/list` / `prompts/get`): [`McpClient::list_prompts`]
+//!   / [`McpClient::get_prompt`], and on each tool wrapper, `.prompts()` /
+//!   `.get_prompt(name, arguments)` (mapping MCP `PromptMessage`s into core
+//!   `ChatMessage`s, mirroring Python's `MCPTool.get_prompt`).
+//!   `list_prompts`/`.prompts()` short-circuit to an empty list — without
+//!   issuing any request — when the server didn't declare the `prompts`
+//!   capability during `initialize`.
+//! - **Sampling** (server-initiated `sampling/createMessage`): register a
+//!   [`SamplingHandler`] via `.sampling_handler(..)` on [`McpClient`] or any
+//!   tool wrapper; [`chat_client_sampling_handler`] adapts any `ChatClient`
+//!   into one. The `sampling` capability is declared during `initialize`
+//!   only when a handler is registered, matching the `mcp` Python SDK
+//!   (which derives `ClientCapabilities` from whichever callbacks were
+//!   supplied at `ClientSession` construction). All three transports route
+//!   a server-initiated request to the registered handler and write the
+//!   JSON-RPC response back themselves; `ping` is always answered with an
+//!   empty result, and an unhandled/unknown method gets a JSON-RPC "method
+//!   not found" error response rather than silence.
+//! - **Roots** (server-initiated `roots/list`): register a static list via
+//!   `.roots(vec![Root::new("file:///...")])` on [`McpClient`] or any tool
+//!   wrapper; the `roots` capability is declared during `initialize` only
+//!   when set. Static-only — there is no `notifications/roots/list_changed`
+//!   support, so `listChanged` is always advertised as `false`. Note: the
+//!   upstream Python `agent_framework` package never wires this up at all
+//!   (even though the underlying `mcp` Python SDK it depends on supports
+//!   it) — this is a case where the Rust port exceeds Python parity; see
+//!   `PARITY.md`.
+//!
 //! ## Not implemented (future work)
 //!
-//! - **Prompts** (`prompts/list` / `prompts/get`). Only tools are exposed as
-//!   agent functions.
-//! - **Sampling / roots callbacks.** This client does not act on
-//!   server-initiated requests (e.g. a server asking the client to run a
-//!   completion); such requests are logged and ignored rather than answered.
 //! - **Standalone GET-based SSE listening** for the streamable HTTP
-//!   transport (server-initiated messages outside of a request/response
-//!   cycle).
+//!   transport (a persistent stream the server opens unprompted, outside of
+//!   any request/response cycle). A server-initiated request embedded in
+//!   the SSE response to an *active* `call()` **is** routed to the
+//!   registered handler; only that separate, connection-initiated-by-the-
+//!   server stream is unsupported.
 //! - **Automatic reconnect** on a broken pipe/connection; failures are
 //!   surfaced as clear errors instead.
 //!
@@ -88,13 +116,19 @@
 
 mod client;
 mod protocol;
+mod sampling;
 mod tool;
 mod transport;
 
 pub use client::McpClient;
 pub use protocol::{
-    CallToolResult, ContentBlock, Implementation, InitializeResult, ListToolsResult, RpcError,
+    CallToolResult, ContentBlock, GetPromptResult, Implementation, InitializeResult,
+    ListPromptsResult, ListToolsResult, PromptArgument, PromptDescriptor, PromptMessage, RpcError,
     ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS, PROTOCOL_VERSION,
+};
+pub use sampling::{
+    chat_client_sampling_handler, BoxedServerRequestHandler, CreateMessageParams,
+    CreateMessageResult, Root, SamplingHandler, SamplingMessage,
 };
 pub use tool::{McpApprovalMode, McpStdioTool, McpStreamableHttpTool, McpWebsocketTool};
 pub use transport::{
