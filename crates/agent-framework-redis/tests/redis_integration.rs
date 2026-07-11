@@ -18,6 +18,24 @@
 //!
 //! Every test also uses a UUID-derived key prefix / thread id so that
 //! multiple tests sharing one `REDIS_URL` server (option 1) can't collide.
+//!
+//! # RediSearch (`FT.*`) coverage
+//!
+//! [`RedisContextProvider`]'s `FT.SEARCH`-backed retrieval path (see the
+//! crate's `context_provider` module docs) only activates against a **Redis
+//! Stack** server — plain `redis-server` (the only kind this file ever
+//! spawns itself) has no RediSearch module loaded. So:
+//!
+//! - The existing tests below exercise the SCAN-fallback path exactly as
+//!   before (this is what a self-spawned plain server gives you), proving
+//!   fallback correctness end-to-end regardless of RediSearch availability.
+//! - The `context_provider_redisearch_*` tests additionally probe the
+//!   connected server for RediSearch via [`redisearch_available`] and
+//!   `return` early (a graceful runtime skip, printed to stderr) unless it's
+//!   present — which in practice means they only actually assert anything
+//!   when `REDIS_URL` is pointed at a Redis Stack server. They are still
+//!   compiled and run (as no-ops) in any environment lacking Stack, so
+//!   nothing about this suite requires Stack to be installed.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -125,6 +143,25 @@ async fn test_server() -> Option<(String, ServerGuard)> {
 
 fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
+}
+
+/// Probe `url` directly (independent of [`RedisContextProvider`]'s own,
+/// private capability cache) for a loaded RediSearch module via `FT._LIST`.
+/// Used to gate the `context_provider_redisearch_*` tests below: they only
+/// assert anything when this returns `true`, which in practice means
+/// `REDIS_URL` was pointed at a Redis Stack server — the plain
+/// `redis-server` this file spawns itself never has RediSearch loaded.
+async fn redisearch_available(url: &str) -> bool {
+    let Ok(client) = redis::Client::open(url) else {
+        return false;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        return false;
+    };
+    redis::cmd("FT._LIST")
+        .query_async::<Vec<String>>(&mut conn)
+        .await
+        .is_ok()
 }
 
 #[tokio::test]
@@ -333,4 +370,200 @@ async fn context_provider_thread_created_conflict_is_enforced_end_to_end() {
     provider.thread_created(Some("thread-1")).await.unwrap();
     let err = provider.thread_created(Some("thread-2")).await.unwrap_err();
     assert!(err.to_string().contains("only be used with one thread"));
+}
+
+/// Forcing the SCAN fallback must behave identically no matter what the
+/// connected server actually supports — this is the "still asserting
+/// fallback correctness end-to-end" case that always runs (never gated on
+/// RediSearch availability), including when `REDIS_URL` happens to point at
+/// a Redis Stack server.
+#[tokio::test]
+async fn context_provider_force_scan_fallback_works_regardless_of_redisearch_availability() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let provider = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(unique("ctx"))
+        .with_user_id("user-force-fallback")
+        .with_force_scan_fallback(true);
+
+    provider
+        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .await
+        .unwrap();
+
+    let ctx = provider
+        .invoking(&[ChatMessage::user("Tell me about hiking")])
+        .await
+        .unwrap();
+
+    assert_eq!(ctx.messages.len(), 1);
+    assert!(ctx.messages[0]
+        .text()
+        .contains("I love hiking in the Cascades"));
+}
+
+#[tokio::test]
+async fn context_provider_redisearch_finds_and_excludes_memories_when_available() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    if !redisearch_available(&url).await {
+        eprintln!(
+            "skipping RediSearch-specific test: connected Redis server has no RediSearch \
+             module loaded (point REDIS_URL at a Redis Stack server to exercise FT.SEARCH)"
+        );
+        return;
+    }
+
+    let provider = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(unique("ftctx"))
+        .with_user_id("user-ft-1");
+
+    provider
+        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .await
+        .unwrap();
+
+    let ctx = provider
+        .invoking(&[ChatMessage::user("Tell me about hiking")])
+        .await
+        .unwrap();
+    assert_eq!(ctx.messages.len(), 1);
+    assert!(ctx.messages[0]
+        .text()
+        .contains("I love hiking in the Cascades"));
+    assert!(ctx.messages[0]
+        .text()
+        .starts_with("## Memories\nConsider the following memories"));
+
+    // No overlapping meaningful token -> FT.SEARCH finds nothing, mirroring
+    // the fallback path's equivalent assertion.
+    let ctx_empty = provider
+        .invoking(&[ChatMessage::user("What is the capital of France?")])
+        .await
+        .unwrap();
+    assert!(ctx_empty.messages.is_empty());
+}
+
+#[tokio::test]
+async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_available() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    if !redisearch_available(&url).await {
+        eprintln!("skipping RediSearch-specific test: no RediSearch module loaded");
+        return;
+    }
+
+    let key_prefix = unique("ftctx");
+    let provider_a = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(&key_prefix)
+        .with_user_id("user-ft-a");
+    let provider_b = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(&key_prefix)
+        .with_user_id("user-ft-b");
+
+    provider_a
+        .invoked(
+            &[ChatMessage::user("user-ft-a's secret hobby is pottery")],
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let ctx_b = provider_b
+        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .await
+        .unwrap();
+    assert!(
+        ctx_b.messages.is_empty(),
+        "provider scoped to user-ft-b must not see user-ft-a's memories via FT.SEARCH's TAG filter"
+    );
+
+    let ctx_a = provider_a
+        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .await
+        .unwrap();
+    assert_eq!(ctx_a.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn context_provider_redisearch_respects_limit_when_available() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    if !redisearch_available(&url).await {
+        eprintln!("skipping RediSearch-specific test: no RediSearch module loaded");
+        return;
+    }
+
+    let provider = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(unique("ftctx"))
+        .with_user_id("user-ft-limit")
+        .with_limit(2);
+
+    for i in 0..5 {
+        provider
+            .invoked(&[ChatMessage::user(format!("apple fact number {i}"))], &[])
+            .await
+            .unwrap();
+    }
+
+    let ctx = provider
+        .invoking(&[ChatMessage::user("apple")])
+        .await
+        .unwrap();
+    assert_eq!(ctx.messages.len(), 1);
+    // DEFAULT_CONTEXT_PROMPT is itself two lines; every line after that is
+    // one matched memory, so this counts how many FT.SEARCH actually
+    // returned under `LIMIT 0 2`.
+    let memory_line_count = ctx.messages[0].text().lines().skip(2).count();
+    assert_eq!(memory_line_count, 2);
+}
+
+/// Entries written by the RediSearch path (`JSON.SET`) are a different
+/// Redis value type than the SCAN fallback's plain `SET` strings — the
+/// module docs call this out explicitly. Confirm it end-to-end: a memory
+/// stored while RediSearch is in use is invisible to a *second*, otherwise
+/// identically-scoped provider that has fallback forced on.
+#[tokio::test]
+async fn context_provider_redisearch_entries_are_not_visible_to_forced_scan_fallback() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    if !redisearch_available(&url).await {
+        eprintln!("skipping RediSearch-specific test: no RediSearch module loaded");
+        return;
+    }
+
+    let key_prefix = unique("ftctx");
+    let ft_provider = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(&key_prefix)
+        .with_user_id("user-ft-cross");
+    let fallback_provider = RedisContextProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(&key_prefix)
+        .with_user_id("user-ft-cross")
+        .with_force_scan_fallback(true);
+
+    ft_provider
+        .invoked(&[ChatMessage::user("stored via JSON.SET")], &[])
+        .await
+        .unwrap();
+
+    let ctx = fallback_provider
+        .invoking(&[ChatMessage::user("Tell me about JSON.SET")])
+        .await
+        .unwrap();
+    assert!(
+        ctx.messages.is_empty(),
+        "SCAN+MGET must not see a JSON.SET-backed entry (documented storage-encoding divergence)"
+    );
 }

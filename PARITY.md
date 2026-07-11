@@ -77,7 +77,8 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | `ContextProvider` / `AggregateContextProvider` | ✅ | ✅ | ✅ done | `memory::ContextProvider`, fan-out/merge over multiple providers |
 | Mem0-backed memory provider | ✅ (`mem0` package, wraps the `mem0` SDK) | ✅ (`Microsoft.Agents.AI.Mem0`) | ✅ done | `agent-framework-mem0::Mem0Provider` — direct REST (`/v1/memories/`, `/v2/memories/search/`), scoped by application/agent/user/thread id |
 | Redis chat-message store | ✅ (`redis` package) | not found | ✅ done | `agent-framework-redis::RedisChatMessageStore` — one LIST per thread, JSON messages, optional trimming; close mirror of Python |
-| Redis context provider (long-term memory) | ✅ (RediSearch: full-text + vector/hybrid) | not found | 🚧 partial | `RedisContextProvider` ports the *scoping* semantics, but retrieval is token-match + recency over plain keys — no RediSearch index, no embeddings/vector or hybrid search (documented divergence in `context_provider.rs`) |
+| Redis context provider (long-term memory) | ✅ (RediSearch: full-text + vector/hybrid) | not found | 🚧 partial | `RedisContextProvider` ports the *scoping* semantics; when the connected server has RediSearch loaded (Redis Stack) it now manages a real `FT.CREATE ... ON JSON` index and serves `invoking()` via `FT.SEARCH` (BM25-ranked, TAG-filtered, `LIMIT`ed), falling back to the original SCAN+token-match+recency path on plain Redis or when `with_force_scan_fallback` is set; still no embeddings/vector or hybrid search (documented divergence in `context_provider.rs`) |
+| Cosmos DB chat-message store | ✅ (`azure-ai-projects`/CosmosDB-adjacent, not individually tracked) | ✅ (`Microsoft.Agents.AI.CosmosNoSql`) | 🚧 partial | `agent-framework-cosmos::CosmosChatMessageStore` — hand-rolled Cosmos DB NoSQL REST client (no `azure_data_cosmos`/`Microsoft.Azure.Cosmos` SDK dependency); one container, messages partitioned by `threadId`; `ensure_created()`, add/list/clear. **Master-key (HMAC-SHA256) auth only** — no Entra ID/AAD `TokenCredential` support, which the .NET package also offers; no `TransactionalBatch` (one `POST` per message on multi-message adds); no hierarchical partition keys; no TTL |
 
 ## Workflow engine
 
@@ -127,7 +128,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Hosting integrations (ASP.NET Core / Azure Functions / DurableTask) | n/a | ✅ (`Microsoft.Agents.AI.Hosting*`, `.DurableTask`) | ❌ not yet | the axum routers above are the Rust hosting story; no Azure Functions / DurableTask equivalents |
 | AG-UI protocol | ✅ (`ag-ui`) | ✅ (`Microsoft.Agents.AI.AGUI`) | ❌ not yet | |
 | CopilotStudio integration | ✅ (`copilotstudio`) | ✅ (`Microsoft.Agents.AI.CopilotStudio`) | ❌ not yet | |
-| Purview / ChatKit / Azure AI Search / CosmosDB / `lab` extras | ✅ (various packages) | ✅ (various packages) | ❌ not yet | not individually tracked in this matrix |
+| Purview / ChatKit / Azure AI Search / `lab` extras | ✅ (various packages) | ✅ (various packages) | ❌ not yet | not individually tracked in this matrix; CosmosDB has moved to its own row under Middleware & memory (🚧 partial, master-key auth only) |
 | Guardrails (dedicated module) | ❌ (middleware-based, no dedicated module) | ❌ (middleware-based) | ❌ not yet | none of the three implementations ship a first-class guardrails module; all three can express it via their middleware pipeline |
 
 ## Summary of remaining gaps
@@ -138,9 +139,10 @@ Much shorter than it used to be. What genuinely remains:
 - **A2A**: push notifications, `tasks/resubscribe`, authenticated extended card.
 - **DevUI**: no bundled web frontend; hosted runs are stateless (no conversation store / run-resume endpoint).
 - **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
-- **Redis provider**: recency/token-match retrieval, no RediSearch vector or hybrid search.
+- **Redis provider**: `FT.SEARCH` BM25 full-text now backs retrieval on Redis Stack (with a SCAN+token-match+recency fallback on plain Redis); vector/hybrid search is still not ported.
+- **Cosmos DB store**: master-key (HMAC) auth only, no Entra ID/AAD; one `POST` per message instead of `TransactionalBatch`; no hierarchical partition keys or TTL.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
 - **Reliability**: no built-in retry/backoff policy layer for any provider.
 - **Checkpointing**: no graph-signature validation on resume.
-- **Azure**: no Azure AI (Foundry) service client, and no real Entra ID credential chain (bring your own `TokenCredential`).
-- **Ecosystem**: AG-UI, CopilotStudio, Purview, ChatKit, Azure AI Search, CosmosDB, DurableTask/Azure Functions hosting, OTel SDK exporter wiring.
+- **Azure**: no Azure AI (Foundry) service client, and no real Entra ID credential chain (bring your own `TokenCredential`) — the same gap shows up in the new Cosmos DB store.
+- **Ecosystem**: AG-UI, CopilotStudio, Purview, ChatKit, Azure AI Search, DurableTask/Azure Functions hosting, OTel SDK exporter wiring.
