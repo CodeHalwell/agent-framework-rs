@@ -10,6 +10,7 @@ description = "Azure AI Foundry persistent-agents client"
 
 [dependencies]
 agent-framework-core = { workspace = true }
+agent-framework-azure = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -17,7 +18,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+tokio-stream = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+futures = { workspace = true }

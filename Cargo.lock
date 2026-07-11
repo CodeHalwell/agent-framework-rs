@@ -83,13 +83,17 @@ dependencies = [
 name = "agent-framework-azure-ai"
 version = "0.1.0"
 dependencies = [
+ "agent-framework-azure",
  "agent-framework-core",
  "async-trait",
+ "bytes",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]
@@ -98,15 +102,16 @@ dependencies = [
 name = "agent-framework-azure-ai-search"
 version = "0.1.0"
 dependencies = [
+ "agent-framework-azure",
  "agent-framework-core",
  "async-trait",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

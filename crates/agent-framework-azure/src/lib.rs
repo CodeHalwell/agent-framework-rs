@@ -41,10 +41,39 @@
 //!     credential,
 //! );
 //! ```
+//!
+//! A real Microsoft Entra ID credential chain — try a managed identity, then a
+//! client secret, then the Azure CLI, whichever succeeds first (each caches and
+//! refreshes tokens for the configured scope):
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use agent_framework_azure::{
+//!     AzureCliCredential, ChainedTokenCredential, ClientSecretCredential,
+//!     ManagedIdentityCredential, TokenCredential,
+//! };
+//!
+//! # async fn demo() -> agent_framework_core::error::Result<()> {
+//! let scope = "https://cognitiveservices.azure.com/.default";
+//! let chain = ChainedTokenCredential::new(vec![
+//!     Arc::new(ManagedIdentityCredential::new(scope)),
+//!     Arc::new(ClientSecretCredential::new("tenant", "client", "secret", scope)),
+//!     Arc::new(AzureCliCredential::new(scope)),
+//! ]);
+//! let token = chain.get_token().await?;
+//! # let _ = token;
+//! # Ok(())
+//! # }
+//! ```
 
 mod credential;
+mod credentials;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
+pub use credentials::{
+    AzureCliCredential, ChainedTokenCredential, ClientSecretCredential, ManagedIdentityCredential,
+    DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
+};
 
 use std::sync::Arc;
 
@@ -55,6 +84,21 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 const DEFAULT_API_VERSION: &str = "2024-10-21";
+
+/// Parse a `Retry-After` header into a delay in seconds.
+///
+/// Mirrors the OpenAI/Anthropic clients: Azure OpenAI returns the
+/// integer/decimal-seconds form on `429`/`503`, which is what we honor so a
+/// [`RetryingChatClient`](agent_framework_core::client::RetryingChatClient) can
+/// wait exactly as long as the server asks. A date-form or unparseable value is
+/// treated as absent.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+}
 
 /// How a request authenticates against Azure OpenAI.
 #[derive(Clone)]
@@ -241,10 +285,13 @@ impl AzureOpenAIClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service(format!(
-                "Azure OpenAI API error {status}: {text}"
-            )));
+            return Err(Error::service_status(
+                status.as_u16(),
+                format!("Azure OpenAI API error {status}: {text}"),
+                retry_after,
+            ));
         }
         Ok(resp)
     }
