@@ -17,6 +17,11 @@
 //! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, OpenAI-compatible) | no |
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
+//! | `azure-ai` | [`agent_framework_azure_ai`] — Azure AI Foundry persistent agents | no |
+//! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory | no |
+//! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store | no |
+//! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
+//! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
 //!
 //! `full` enables everything.
 //!
@@ -76,6 +81,26 @@ pub use agent_framework_redis as redis;
 #[cfg(feature = "mem0")]
 pub use agent_framework_mem0 as mem0;
 
+/// Azure AI Foundry persistent-agents client (enable the `azure-ai` feature).
+#[cfg(feature = "azure-ai")]
+pub use agent_framework_azure_ai as azure_ai;
+
+/// Azure AI Search context provider (enable the `azure-ai-search` feature).
+#[cfg(feature = "azure-ai-search")]
+pub use agent_framework_azure_ai_search as azure_ai_search;
+
+/// Azure Cosmos DB NoSQL chat-message store (enable the `cosmos` feature).
+#[cfg(feature = "cosmos")]
+pub use agent_framework_cosmos as cosmos;
+
+/// Microsoft Copilot Studio agent client (enable the `copilotstudio` feature).
+#[cfg(feature = "copilotstudio")]
+pub use agent_framework_copilotstudio as copilotstudio;
+
+/// Microsoft Purview compliance middleware (enable the `purview` feature).
+#[cfg(feature = "purview")]
+pub use agent_framework_purview as purview;
+
 /// Commonly used imports for building agents and workflows.
 pub mod prelude {
     pub use agent_framework_core::prelude::*;
@@ -106,4 +131,19 @@ pub mod prelude {
 
     #[cfg(feature = "mem0")]
     pub use agent_framework_mem0::Mem0Provider;
+
+    #[cfg(feature = "azure-ai")]
+    pub use agent_framework_azure_ai::AzureAIAgentClient;
+
+    #[cfg(feature = "azure-ai-search")]
+    pub use agent_framework_azure_ai_search::AzureAISearchProvider;
+
+    #[cfg(feature = "cosmos")]
+    pub use agent_framework_cosmos::CosmosChatMessageStore;
+
+    #[cfg(feature = "copilotstudio")]
+    pub use agent_framework_copilotstudio::CopilotStudioAgent;
+
+    #[cfg(feature = "purview")]
+    pub use agent_framework_purview::{PurviewAgentMiddleware, PurviewChatMiddleware};
 }

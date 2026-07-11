@@ -19,6 +19,11 @@ declarative = ["dep:agent-framework-declarative"]
 hosting = ["dep:agent-framework-hosting"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
+azure-ai = ["dep:agent-framework-azure-ai"]
+azure-ai-search = ["dep:agent-framework-azure-ai-search"]
+cosmos = ["dep:agent-framework-cosmos"]
+copilotstudio = ["dep:agent-framework-copilotstudio"]
+purview = ["dep:agent-framework-purview"]
 full = [
     "openai",
     "anthropic",
@@ -29,6 +34,11 @@ full = [
     "hosting",
     "redis",
     "mem0",
+    "azure-ai",
+    "azure-ai-search",
+    "cosmos",
+    "copilotstudio",
+    "purview",
 ]
 
 [dependencies]
@@ -42,6 +52,11 @@ agent-framework-declarative = { workspace = true, optional = true }
 agent-framework-hosting = { workspace = true, optional = true }
 agent-framework-redis = { workspace = true, optional = true }
 agent-framework-mem0 = { workspace = true, optional = true }
+agent-framework-azure-ai = { workspace = true, optional = true }
+agent-framework-azure-ai-search = { workspace = true, optional = true }
+agent-framework-cosmos = { workspace = true, optional = true }
+agent-framework-copilotstudio = { workspace = true, optional = true }
+agent-framework-purview = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
