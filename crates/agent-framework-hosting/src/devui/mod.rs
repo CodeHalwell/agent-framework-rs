@@ -2,6 +2,8 @@
 //! execution, mirroring the Python `agent_framework_devui` server.
 //!
 //! # Routes
+//! - `GET /` and `GET /ui` — the embedded single-file debug page (see
+//!   [`crate::ui`]).
 //! - `GET /health` — liveness + entity count.
 //! - `GET /v1/entities` — list entities (`DiscoveryResponse`).
 //! - `GET /v1/entities/{id}/info` — entity details (`EntityInfo`).
@@ -55,6 +57,9 @@ use models::{
 };
 
 /// Build the DevUI router for a registry.
+///
+/// The stateful API routes are merged with the stateless embedded debug page
+/// ([`crate::ui`]) served at `GET /` and `GET /ui`.
 pub(crate) fn router(state: Arc<HostState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -62,6 +67,7 @@ pub(crate) fn router(state: Arc<HostState>) -> Router {
         .route("/v1/entities/{entity_id}/info", get(entity_info))
         .route("/v1/responses", post(create_response))
         .with_state(state)
+        .merge(crate::ui::router())
 }
 
 // ---------------------------------------------------------------------------

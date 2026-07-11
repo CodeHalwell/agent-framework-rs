@@ -120,12 +120,12 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | A2A serving (agent card + JSON-RPC endpoint) | ✅ | ✅ (`.Hosting.A2A[.AspNetCore]`) | ✅ done | `agent-framework-hosting::a2a::A2ARouter` — `GET /.well-known/agent-card.json` + JSON-RPC 2.0 `POST /` |
 | A2A push notifications / task resubscribe / extended card | ✅ | ✅ | ❌ not yet | `tasks/pushNotificationConfig/*`, `tasks/resubscribe`, and the authenticated extended-card flow are unimplemented on both the client and serving sides |
 | DevUI-style HTTP API (entities + responses, SSE) | ✅ (`devui`) | ✅ (`Microsoft.Agents.AI.DevUI`) | ✅ done | `agent-framework-hosting::AgentHost` — `GET /health`, `GET /v1/entities[/{id}/info]`, `POST /v1/responses` (JSON or SSE); runs are stateless (no conversation store or run-resume endpoint) |
-| DevUI web frontend | ✅ (bundled UI) | ✅ | ❌ not yet | this port ships the API surface only, no bundled browser UI |
+| DevUI web frontend | ✅ (bundled UI) | ✅ | 🚧 partial | not the React DevUI: `agent-framework-hosting::ui` embeds a single-file, dependency-free debug page (served at `GET /` and `GET /ui`) that lists entities and runs them against `POST /v1/responses`, rendering the SSE stream live (text deltas, collapsible executor/workflow rows, a resume-not-supported notice for pending `request_info`) |
 | OpenAI-compatible serving (`/v1/chat/completions`) | ✅ (via devui) | ✅ (`.Hosting.OpenAI`) | ✅ done | `agent-framework-hosting::openai_compat::OpenAiRouter` (JSON or SSE) |
 | Declarative agents (YAML/JSON specs) | ✅ (`declarative`) | ✅ (`Microsoft.Agents.AI.Declarative`) | ✅ done | `agent-framework-declarative::DeclarativeLoader::load_agent` — official schema vocabulary (`kind: Prompt`, `model.provider/apiType/options`, `tools`, `outputSchema`), `${VAR}` env interpolation, provider-agnostic `ChatClientFactory` / `ToolRegistry`; validated against real agent-samples specs in `tests/specs/` |
 | Declarative workflows | ✅ (Power Platform / Copilot Studio DSL) | ✅ (`.Workflows.Declarative[.AzureAI]`) | 🚧 partial | `load_workflow` drives the graph engine + orchestration builders from a documented **Rust-native** `WorkflowSpec` (orchestration shorthand or node/edge graph); the upstream imperative Copilot-Studio DSL is intentionally not mapped |
 | Hosting integrations (ASP.NET Core / Azure Functions / DurableTask) | n/a | ✅ (`Microsoft.Agents.AI.Hosting*`, `.DurableTask`) | ❌ not yet | the axum routers above are the Rust hosting story; no Azure Functions / DurableTask equivalents |
-| AG-UI protocol | ✅ (`ag-ui`) | ✅ (`Microsoft.Agents.AI.AGUI`) | ❌ not yet | |
+| AG-UI protocol | ✅ (`ag-ui`) | ✅ (`Microsoft.Agents.AI.AGUI`) | ✅ done | `agent-framework-hosting::agui::AgUiRouter` — `POST {path}` streaming camelCase SSE events with the SDK's exact SCREAMING_SNAKE `type` strings (`RUN_STARTED` → `TEXT_MESSAGE_START/CONTENT/END` and `TOOL_CALL_START/ARGS/END`/`TOOL_CALL_RESULT`/`CUSTOM` → `RUN_FINISHED`, or `RUN_ERROR`); `RunAgentInput` message/tool-call mapping mirrors `agui_messages_to_agent_framework`; frontend (client-declared) tool calls surface as `TOOL_CALL_*` without a result. Divergences: run-to-completion framing (the object-safe `Agent` trait has no streaming method), client `tools` accepted but not injected, and predictive-state (`STATE_*`/`MESSAGES_SNAPSHOT`) events omitted |
 | CopilotStudio integration | ✅ (`copilotstudio`) | ✅ (`Microsoft.Agents.AI.CopilotStudio`) | ❌ not yet | |
 | Purview / ChatKit / Azure AI Search / CosmosDB / `lab` extras | ✅ (various packages) | ✅ (various packages) | ❌ not yet | not individually tracked in this matrix |
 | Guardrails (dedicated module) | ❌ (middleware-based, no dedicated module) | ❌ (middleware-based) | ❌ not yet | none of the three implementations ship a first-class guardrails module; all three can express it via their middleware pipeline |
@@ -136,11 +136,11 @@ Much shorter than it used to be. What genuinely remains:
 
 - **MCP**: prompts capability and sampling/roots callbacks (the WebSocket transport now ships).
 - **A2A**: push notifications, `tasks/resubscribe`, authenticated extended card.
-- **DevUI**: no bundled web frontend; hosted runs are stateless (no conversation store / run-resume endpoint).
+- **DevUI**: ships an embedded single-file debug page (not the React DevUI); hosted runs are stateless (no conversation store / run-resume endpoint).
 - **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
 - **Redis provider**: recency/token-match retrieval, no RediSearch vector or hybrid search.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
 - **Reliability**: no built-in retry/backoff policy layer for any provider.
 - **Checkpointing**: no graph-signature validation on resume.
 - **Azure**: no Azure AI (Foundry) service client, and no real Entra ID credential chain (bring your own `TokenCredential`).
-- **Ecosystem**: AG-UI, CopilotStudio, Purview, ChatKit, Azure AI Search, CosmosDB, DurableTask/Azure Functions hosting, OTel SDK exporter wiring.
+- **Ecosystem**: CopilotStudio, Purview, ChatKit, Azure AI Search, CosmosDB, DurableTask/Azure Functions hosting, OTel SDK exporter wiring (AG-UI now ships — see Serving).

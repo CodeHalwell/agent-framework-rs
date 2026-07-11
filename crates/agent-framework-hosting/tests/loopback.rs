@@ -36,3 +36,36 @@ async fn serve_health_over_loopback() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn serve_ui_page_over_loopback() {
+    // The embedded debug page is reachable at `/` over a real socket too.
+    let host = AgentHost::new().agent("assistant", MockAgent::new("a1").arc());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = host.into_router();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).await.unwrap();
+
+    assert!(
+        buf.contains("200 OK"),
+        "response head: {}",
+        &buf[..buf.len().min(120)]
+    );
+    assert!(buf.contains("text/html"));
+    assert!(buf.contains("/v1/entities"));
+
+    server.abort();
+}
