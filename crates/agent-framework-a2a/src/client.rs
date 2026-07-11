@@ -170,7 +170,12 @@ impl A2AClient {
         *self.rpc_url.write().await = card.url.clone();
         if card.supports_authenticated_extended_card {
             match self.get_extended_card().await {
-                Ok(extended) => card = extended,
+                Ok(extended) => {
+                    // The extended card may advertise a different RPC
+                    // endpoint for authenticated traffic — adopt it.
+                    *self.rpc_url.write().await = extended.url.clone();
+                    card = extended;
+                }
                 Err(e) => {
                     tracing::debug!(
                         error = %e,

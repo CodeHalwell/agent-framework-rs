@@ -523,6 +523,10 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         // `ChatResponse::from_updates` keep the messages separate rather than
         // merging the tool-call and final assistant messages by role.
         let response = self.get_response(messages, options).await?;
+        // Response-level metadata must survive the replay so re-aggregation
+        // (and the agent's thread adoption) sees it.
+        let conversation_id = response.conversation_id.clone();
+        let response_id = response.response_id.clone();
         let updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
@@ -534,6 +538,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     role: Some(m.role),
                     author_name: m.author_name,
                     message_id,
+                    conversation_id: conversation_id.clone(),
+                    response_id: response_id.clone(),
                     ..Default::default()
                 })
             })
