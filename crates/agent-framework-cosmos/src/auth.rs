@@ -105,12 +105,16 @@ pub(crate) fn authorization_header(
 mod tests {
     use super::*;
 
-    // Well-known, intentionally-public Cosmos DB Emulator default key (also
-    // hardcoded in Microsoft's own `Microsoft.Agents.AI.CosmosNoSql`
-    // reference test suite) — used here purely as a fixed test key, not a
-    // real secret.
-    const EMULATOR_KEY: &str =
-        "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+    // A synthetic, deterministic test key (base64 of the bytes 0..=63).
+    // Built at runtime so secret scanners never see a high-entropy literal;
+    // this was never a real credential. The signature vectors below were
+    // originally cross-checked against the well-known public Cosmos DB
+    // Emulator key and recomputed for this key with an independent Python
+    // implementation of the signing algorithm.
+    fn synthetic_key() -> String {
+        let bytes: Vec<u8> = (0u8..64).collect();
+        BASE64.encode(bytes)
+    }
 
     // region: signing_payload (pure)
 
@@ -194,7 +198,7 @@ mod tests {
 
     #[test]
     fn signature_vector_post_create_document() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let header = authorization_header(
             "post",
             "docs",
@@ -205,13 +209,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             header,
-            "type%3Dmaster%26ver%3D1.0%26sig%3DPyKtcMcAgNBOMAVmuYu6rVetvqMktcOpQvnLwOVdxSQ%3D"
+            "type%3Dmaster%26ver%3D1.0%26sig%3DffgWTDpkKP2qfe8%2BYkuOzduYtn8fcsTKUIEhoO3JsCI%3D"
         );
     }
 
     #[test]
     fn signature_vector_delete_document() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let header = authorization_header(
             "delete",
             "docs",
@@ -222,24 +226,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             header,
-            "type%3Dmaster%26ver%3D1.0%26sig%3D2sY%2Flq9w4SbHARZJW9t%2BHs4Pjm1R7cgz83DFDwox8Hc%3D"
+            "type%3Dmaster%26ver%3D1.0%26sig%3DtbE0oqk%2FYaRO7wvwCftu84rTp%2BaLIrn9lP%2ByOaSyClU%3D"
         );
     }
 
     #[test]
     fn signature_vector_post_create_database_has_empty_resource_link() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let header =
             authorization_header("post", "dbs", "", "Fri, 08 Apr 2015 03:52:31 GMT", &key).unwrap();
         assert_eq!(
             header,
-            "type%3Dmaster%26ver%3D1.0%26sig%3DSClx71uG6Jjxhn09aTkuVPB3bcrPzwB8UGUn7Mb%2B8iY%3D"
+            "type%3Dmaster%26ver%3D1.0%26sig%3DDavr6vSgXucLrHTwM%2FDw9LdFMQ5jbZIzUPLNuKc8b%2Fw%3D"
         );
     }
 
     #[test]
     fn signature_vector_post_create_container() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let header = authorization_header(
             "post",
             "colls",
@@ -250,13 +254,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             header,
-            "type%3Dmaster%26ver%3D1.0%26sig%3DL3m60OT87NOuqRD8UmMp31%2BaeYiGGoXiK6qebyUx3B4%3D"
+            "type%3Dmaster%26ver%3D1.0%26sig%3D8zppofnnQ0ts55o2TBEdySk7ZWvx%2F4mnd8iVMrXSPVY%3D"
         );
     }
 
     #[test]
     fn authorization_header_is_deterministic_for_same_inputs() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let a = authorization_header("get", "docs", "dbs/d/colls/c", "date", &key).unwrap();
         let b = authorization_header("get", "docs", "dbs/d/colls/c", "date", &key).unwrap();
         assert_eq!(a, b);
@@ -264,7 +268,7 @@ mod tests {
 
     #[test]
     fn authorization_header_changes_with_verb() {
-        let key = decode_master_key(EMULATOR_KEY).unwrap();
+        let key = decode_master_key(&synthetic_key()).unwrap();
         let get = authorization_header("get", "docs", "dbs/d/colls/c", "date", &key).unwrap();
         let post = authorization_header("post", "docs", "dbs/d/colls/c", "date", &key).unwrap();
         assert_ne!(get, post);
@@ -276,7 +280,7 @@ mod tests {
 
     #[test]
     fn decode_master_key_accepts_valid_base64() {
-        assert!(decode_master_key(EMULATOR_KEY).is_ok());
+        assert!(decode_master_key(&synthetic_key()).is_ok());
     }
 
     #[test]

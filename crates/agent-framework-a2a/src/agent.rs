@@ -279,6 +279,7 @@ fn chat_message_to_a2a_message(
     };
 
     Ok(A2AMessage {
+        kind: "message".to_string(),
         role: MessageRole::User,
         parts,
         message_id: message
@@ -681,6 +682,7 @@ mod tests {
     #[test]
     fn a2a_message_to_chat_message_maps_agent_role_and_metadata() {
         let a2a = A2AMessage {
+            kind: "message".to_string(),
             role: MessageRole::Agent,
             parts: vec![Part::Text(TextPart {
                 text: "hi".into(),
@@ -755,6 +757,7 @@ mod tests {
         let mut task = completed_task(vec![]);
         task.history = Some(vec![
             A2AMessage {
+                kind: "message".to_string(),
                 role: MessageRole::User,
                 parts: vec![Part::Text(TextPart {
                     text: "question".into(),
@@ -766,6 +769,7 @@ mod tests {
                 metadata: None,
             },
             A2AMessage {
+                kind: "message".to_string(),
                 role: MessageRole::Agent,
                 parts: vec![Part::Text(TextPart {
                     text: "answer".into(),
@@ -792,6 +796,7 @@ mod tests {
         task.status = crate::types::TaskStatus {
             state: TaskState::InputRequired,
             message: Some(A2AMessage {
+                kind: "message".to_string(),
                 role: MessageRole::Agent,
                 parts: vec![Part::Text(TextPart {
                     text: "What city?".into(),

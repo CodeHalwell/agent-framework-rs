@@ -37,6 +37,7 @@ pub mod error;
 pub mod memory;
 pub mod middleware;
 pub mod observability;
+pub mod streaming;
 pub mod threads;
 pub mod tools;
 pub mod types;

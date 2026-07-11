@@ -11,6 +11,7 @@
 use std::collections::VecDeque;
 
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatResponseUpdate, CitationAnnotation, Content, FinishReason, Role, TextContent,
     TextSpanRegion, UsageContent,
@@ -264,6 +265,7 @@ type ByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 struct StreamState {
+    utf8: Utf8StreamDecoder,
     byte_stream: ByteStream,
     decoder: SseDecoder,
     mapper: AgentEventMapper,
@@ -280,6 +282,7 @@ pub fn parse_agent_sse_stream(
     let state = StreamState {
         byte_stream: Box::pin(resp.bytes_stream()),
         decoder: SseDecoder::new(),
+        utf8: Utf8StreamDecoder::new(),
         mapper: AgentEventMapper::new(thread_id),
         queued: VecDeque::new(),
         done: false,
@@ -294,7 +297,7 @@ pub fn parse_agent_sse_stream(
             }
             match state.byte_stream.next().await {
                 Some(Ok(bytes)) => {
-                    let chunk = String::from_utf8_lossy(&bytes).to_string();
+                    let chunk = state.utf8.push(&bytes);
                     for ev in state.decoder.push(&chunk) {
                         match state.mapper.handle(&ev) {
                             EventOutcome::Updates(updates) => state.queued.extend(updates),

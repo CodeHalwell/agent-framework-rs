@@ -247,13 +247,14 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
         }
         let capture = self.capture_content;
-        // Enter the span only for the initial call; attribute recording happens
-        // as the stream drains and completes.
-        let inner = {
-            let _entered = span.enter();
-            self.inner.get_streaming_response(messages, options)
-        }
-        .await;
+        // Instrument the initiation future with the span (never hold an
+        // `enter()` guard across an await); attribute recording happens as
+        // the stream drains and completes.
+        let inner = self
+            .inner
+            .get_streaming_response(messages, options)
+            .instrument(span.clone())
+            .await;
 
         let inner = match inner {
             Ok(s) => s,

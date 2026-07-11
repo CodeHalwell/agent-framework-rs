@@ -20,8 +20,36 @@ use agent_framework_core::types::ChatMessage;
 use agent_framework_cosmos::CosmosChatMessageStore;
 use serde_json::{json, Value};
 
-const TEST_KEY: &str =
-    "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+/// A synthetic, deterministic base64 test key (bytes 0..=63), built at
+/// runtime so secret scanners never see a high-entropy literal. The
+/// loopback assertions check header *shape*, not signature values, so any
+/// well-formed key works.
+fn test_key() -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = (0u8..64).collect();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -210,7 +238,7 @@ async fn create_document_sends_signed_headers_and_expected_body() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-1".to_string()),
@@ -258,7 +286,7 @@ async fn query_documents_sends_isquery_headers_and_query_body() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-2".to_string()),
@@ -327,7 +355,7 @@ async fn add_then_list_round_trip() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-roundtrip".to_string()),
@@ -377,7 +405,7 @@ async fn add_multiple_messages_then_list_preserves_order() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-multi".to_string()),
@@ -436,7 +464,7 @@ async fn query_documents_follows_continuation_token_across_pages() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-page".to_string()),
@@ -469,7 +497,7 @@ async fn ensure_created_posts_database_then_container() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-ensure".to_string()),
@@ -506,7 +534,7 @@ async fn ensure_created_tolerates_409_conflict_on_both_calls() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-ensure-conflict".to_string()),
@@ -533,7 +561,7 @@ async fn clear_queries_ids_then_deletes_each() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-clear".to_string()),
@@ -563,7 +591,7 @@ async fn create_document_surfaces_non_2xx_status_as_service_error() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-error".to_string()),
@@ -591,7 +619,7 @@ async fn query_documents_tolerates_response_missing_documents_field() {
 
     let store = CosmosChatMessageStore::new(
         base_url,
-        TEST_KEY,
+        test_key(),
         "agent-framework",
         "chat-messages",
         Some("thread-malformed".to_string()),

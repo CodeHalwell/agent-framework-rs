@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 
 use crate::protocol;
 use crate::types::{
@@ -139,7 +140,18 @@ impl A2AClient {
         if let Some(card) = self.cached_agent_card().await {
             return Ok(card);
         }
-        let base = self.discovery_base.trim_end_matches('/');
+        // Discovery is origin-level per the A2A spec: strip any RPC path
+        // from the stored URL (e.g. `https://host/a2a/rpc` probes
+        // `https://host/.well-known/...`). Fall back to the raw value when
+        // it does not parse as an absolute HTTP(S) URL.
+        let trimmed = self.discovery_base.trim_end_matches('/').to_string();
+        let base = match reqwest::Url::parse(&trimmed) {
+            Ok(url) if url.has_host() => {
+                let origin = url.origin().ascii_serialization();
+                origin.trim_end_matches('/').to_string()
+            }
+            _ => trimmed,
+        };
         let primary = format!("{base}{WELL_KNOWN_AGENT_CARD_PATH}");
         let mut card = match self.get_json::<AgentCard>(&primary).await {
             Ok(card) => card,
@@ -358,6 +370,7 @@ type ByteStream = Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Sen
 struct SseState {
     byte_stream: ByteStream,
     buffer: String,
+    utf8: Utf8StreamDecoder,
     queued: VecDeque<Result<MessageStreamEvent>>,
     done: bool,
 }
@@ -371,6 +384,7 @@ fn parse_sse_stream(
         SseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             done: false,
         },
@@ -384,7 +398,8 @@ fn parse_sse_stream(
                 }
                 match state.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let decoded = state.utf8.push(&bytes);
+                        state.buffer.push_str(&decoded);
                         let events = protocol::drain_sse_events(&mut state.buffer);
                         state.queued.extend(events);
                     }
@@ -496,6 +511,7 @@ mod tests {
         // Exercises the same MessageStreamEvent type send_message_stream
         // yields, via the pure SSE parser (no network).
         let message = Message {
+            kind: "message".to_string(),
             role: MessageRole::Agent,
             parts: vec![Part::Text(TextPart {
                 text: "hi".into(),

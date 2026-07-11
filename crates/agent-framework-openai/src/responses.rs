@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
@@ -543,6 +544,7 @@ fn parse_responses_sse_stream(
         ResponsesSseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             call_ids: HashMap::new(),
             done: false,
@@ -558,7 +560,8 @@ fn parse_responses_sse_stream(
                 }
                 match state.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let decoded = state.utf8.push(&bytes);
+                        state.buffer.push_str(&decoded);
                         while let Some(pos) = state.buffer.find('\n') {
                             let line = state.buffer[..pos].trim().to_string();
                             state.buffer.drain(..=pos);
@@ -596,6 +599,7 @@ fn parse_responses_sse_stream(
 struct ResponsesSseState {
     byte_stream: ByteStream,
     buffer: String,
+    utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
     /// `output_index` -> `call_id`, resolved when the call is first announced
     /// via `response.output_item.added` and used to route later
@@ -1048,6 +1052,7 @@ mod tests {
         let mut state = ResponsesSseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             call_ids: HashMap::new(),
             done: false,
@@ -1056,7 +1061,8 @@ mod tests {
         let mut updates = Vec::new();
         // Drain the single chunk manually (mirrors the real unfold body).
         if let Some(Ok(bytes)) = state.byte_stream.next().await {
-            state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+            let decoded = state.utf8.push(&bytes);
+            state.buffer.push_str(&decoded);
             while let Some(pos) = state.buffer.find('\n') {
                 let line = state.buffer[..pos].trim().to_string();
                 state.buffer.drain(..=pos);
@@ -1153,13 +1159,15 @@ mod tests {
         let mut state = ResponsesSseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             call_ids: HashMap::new(),
             done: false,
             store: None,
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
-        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+        let decoded = state.utf8.push(&bytes);
+        state.buffer.push_str(&decoded);
         let mut saw_error = false;
         while let Some(pos) = state.buffer.find('\n') {
             let line = state.buffer[..pos].trim().to_string();

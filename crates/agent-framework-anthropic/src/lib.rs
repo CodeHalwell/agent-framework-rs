@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
     FunctionCallContent, Role, TextContent, TextReasoningContent, UsageContent,
@@ -225,6 +226,7 @@ fn parse_sse_stream(
         SseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
             done: false,
@@ -239,7 +241,8 @@ fn parse_sse_stream(
                 }
                 match state.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let decoded = state.utf8.push(&bytes);
+                        state.buffer.push_str(&decoded);
                         while let Some(pos) = state.buffer.find('\n') {
                             let line = state.buffer[..pos].trim().to_string();
                             state.buffer.drain(..=pos);
@@ -290,6 +293,7 @@ fn parse_sse_stream(
 struct SseState {
     byte_stream: ByteStream,
     buffer: String,
+    utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
     /// `content_block` index -> `tool_use` call id, so `input_json_delta`
     /// fragments (which carry only the index) resolve to the right call.
@@ -430,13 +434,15 @@ mod tests {
         let mut state = SseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
             done: false,
         };
         let mut updates = Vec::new();
         if let Some(Ok(bytes)) = state.byte_stream.next().await {
-            state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+            let decoded = state.utf8.push(&bytes);
+            state.buffer.push_str(&decoded);
             while let Some(pos) = state.buffer.find('\n') {
                 let line = state.buffer[..pos].trim().to_string();
                 state.buffer.drain(..=pos);
@@ -558,12 +564,14 @@ mod tests {
         let mut state = SseState {
             byte_stream,
             buffer: String::new(),
+            utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
             done: false,
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
-        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+        let decoded = state.utf8.push(&bytes);
+        state.buffer.push_str(&decoded);
         let mut saw_error = false;
         while let Some(pos) = state.buffer.find('\n') {
             let line = state.buffer[..pos].trim().to_string();

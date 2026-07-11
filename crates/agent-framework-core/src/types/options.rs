@@ -289,10 +289,23 @@ impl ChatOptions {
         take!(allow_multiple_tool_calls);
         take!(conversation_id);
         take!(frequency_penalty);
-        take!(logit_bias);
         take!(max_tokens);
-        take!(metadata);
         take!(presence_penalty);
+        // Map-valued fields merge per key (the overriding side wins on
+        // conflicts) rather than replacing the whole map, so client-level
+        // defaults survive request-level additions.
+        if let Some(other_map) = other.logit_bias {
+            match &mut self.logit_bias {
+                Some(mine) => mine.extend(other_map),
+                None => self.logit_bias = Some(other_map),
+            }
+        }
+        if let Some(other_map) = other.metadata {
+            match &mut self.metadata {
+                Some(mine) => mine.extend(other_map),
+                None => self.metadata = Some(other_map),
+            }
+        }
         take!(response_format);
         take!(seed);
         take!(stop);

@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use agent_framework_core::error::{Error, Result};
+use agent_framework_core::streaming::Utf8StreamDecoder;
 
 use crate::protocol::{self, IdGenerator, IncomingMessage, RpcError};
 use crate::sampling::BoxedServerRequestHandler;
@@ -209,10 +210,14 @@ impl McpStreamableHttpTransport {
     async fn read_sse_for_id(&self, resp: reqwest::Response, expected_id: i64) -> Result<Value> {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
+        let mut utf8 = Utf8StreamDecoder::new();
         let mut handled_server_request_ids: HashSet<String> = HashSet::new();
         loop {
             match stream.next().await {
-                Some(Ok(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                Some(Ok(bytes)) => {
+                    let decoded = utf8.push(&bytes);
+                    buf.push_str(&decoded);
+                }
                 Some(Err(e)) => return Err(Error::service(format!("MCP SSE stream error: {e}"))),
                 None => break,
             }

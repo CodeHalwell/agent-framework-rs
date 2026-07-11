@@ -127,9 +127,16 @@ pub enum MessageRole {
 
 /// One turn of an A2A conversation: a list of [`Part`]s plus routing
 /// metadata (`taskId`/`contextId`) used to continue a conversation.
+fn default_message_kind() -> String {
+    "message".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
+    /// Discriminator required by the A2A wire format (always `"message"`).
+    #[serde(default = "default_message_kind")]
+    pub kind: String,
     pub role: MessageRole,
     pub parts: Vec<Part>,
     pub message_id: String,
@@ -145,6 +152,7 @@ impl Message {
     /// Build a `user`-role message with the given parts and a fresh random id.
     pub fn user(parts: Vec<Part>) -> Self {
         Self {
+            kind: default_message_kind(),
             role: MessageRole::User,
             parts,
             message_id: uuid::Uuid::new_v4().to_string(),

@@ -210,7 +210,7 @@ impl CheckpointStorage for InMemoryCheckpointStorage {
             .filter(|cp| workflow_id.is_none_or(|w| cp.workflow_id == w))
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.timestamp_millis.cmp(&b.timestamp_millis));
+        out.sort_by_key(|a| a.timestamp_millis);
         Ok(out)
     }
 
@@ -243,8 +243,9 @@ impl FileCheckpointStorage {
         self.dir.join(format!("{checkpoint_id}.json"))
     }
 
-    fn read_file(path: &Path) -> Result<WorkflowCheckpoint> {
-        let bytes = std::fs::read(path)
+    async fn read_file(path: &Path) -> Result<WorkflowCheckpoint> {
+        let bytes = tokio::fs::read(path)
+            .await
             .map_err(|e| Error::Workflow(format!("failed to read checkpoint: {e}")))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| Error::Workflow(format!("failed to parse checkpoint: {e}")))
@@ -260,48 +261,50 @@ impl CheckpointStorage for FileCheckpointStorage {
             .map_err(|e| Error::Workflow(format!("failed to serialize checkpoint: {e}")))?;
         // Write atomically via a temp file + rename.
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
+        tokio::fs::write(&tmp, &json)
+            .await
             .map_err(|e| Error::Workflow(format!("failed to write checkpoint: {e}")))?;
-        std::fs::rename(&tmp, &path)
+        tokio::fs::rename(&tmp, &path)
+            .await
             .map_err(|e| Error::Workflow(format!("failed to finalize checkpoint: {e}")))?;
         Ok(id)
     }
 
     async fn load(&self, checkpoint_id: &str) -> Result<Option<WorkflowCheckpoint>> {
         let path = self.path_for(checkpoint_id);
-        if !path.exists() {
-            return Ok(None);
+        match Self::read_file(&path).await {
+            Ok(cp) => Ok(Some(cp)),
+            Err(_) if !path.exists() => Ok(None),
+            Err(e) => Err(e),
         }
-        Ok(Some(Self::read_file(&path)?))
     }
 
     async fn list(&self, workflow_id: Option<&str>) -> Result<Vec<WorkflowCheckpoint>> {
         let mut out = Vec::new();
-        let entries = std::fs::read_dir(&self.dir)
+        let mut entries = tokio::fs::read_dir(&self.dir)
+            .await
             .map_err(|e| Error::Workflow(format!("failed to list checkpoint dir: {e}")))?;
-        for entry in entries.flatten() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(cp) = Self::read_file(&path) {
+            if let Ok(cp) = Self::read_file(&path).await {
                 if workflow_id.is_none_or(|w| cp.workflow_id == w) {
                     out.push(cp);
                 }
             }
         }
-        out.sort_by(|a, b| a.timestamp_millis.cmp(&b.timestamp_millis));
+        out.sort_by_key(|a| a.timestamp_millis);
         Ok(out)
     }
 
     async fn delete(&self, checkpoint_id: &str) -> Result<bool> {
         let path = self.path_for(checkpoint_id);
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| Error::Workflow(format!("failed to delete checkpoint: {e}")))?;
-            Ok(true)
-        } else {
-            Ok(false)
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Workflow(format!("failed to delete checkpoint: {e}"))),
         }
     }
 }

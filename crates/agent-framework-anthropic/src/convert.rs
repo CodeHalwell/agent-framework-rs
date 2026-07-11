@@ -187,6 +187,38 @@ pub fn messages_to_anthropic(messages: &[ChatMessage]) -> Vec<Value> {
         }
         out.push(json!({ "role": role, "content": blocks }));
     }
+    normalize_role_alternation(out)
+}
+
+/// Enforce the Messages API's conversation-shape rules: messages must
+/// alternate between `user` and `assistant`, starting with `user`.
+/// Consecutive same-role messages (common in orchestration transcripts,
+/// e.g. several user turns from a group chat) are merged by concatenating
+/// their content blocks; a leading assistant message gets a minimal
+/// synthetic user turn inserted before it so the greeting is preserved.
+fn normalize_role_alternation(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match out.last_mut() {
+            Some(prev) if prev["role"] == msg["role"] => {
+                if let (Some(prev_blocks), Some(new_blocks)) =
+                    (prev["content"].as_array_mut(), msg["content"].as_array())
+                {
+                    prev_blocks.extend(new_blocks.iter().cloned());
+                }
+            }
+            _ => out.push(msg),
+        }
+    }
+    if out.first().map(|m| m["role"] == "assistant") == Some(true) {
+        out.insert(
+            0,
+            json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "(continuing the conversation)" }]
+            }),
+        );
+    }
     out
 }
 
@@ -554,10 +586,16 @@ mod tests {
         );
         assert_eq!(
             body["messages"],
-            json!([{
-                "role": "assistant",
-                "content": [{ "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } }]
-            }])
+            json!([
+                {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "(continuing the conversation)" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } }]
+                }
+            ])
         );
     }
 
@@ -806,4 +844,38 @@ mod tests {
     }
 
     // endregion
+    #[test]
+    fn consecutive_same_role_messages_are_merged() {
+        let msgs = vec![
+            ChatMessage::user("first"),
+            ChatMessage::user("second"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::assistant("more"),
+            ChatMessage::user("third"),
+        ];
+        let out = messages_to_anthropic(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(out[2]["role"], "user");
+    }
+
+    #[test]
+    fn leading_assistant_message_gets_synthetic_user_turn() {
+        let msgs = vec![
+            ChatMessage::assistant("greeting"),
+            ChatMessage::user("hello"),
+        ];
+        let out = messages_to_anthropic(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"][0]["text"],
+            "(continuing the conversation)"
+        );
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[2]["role"], "user");
+    }
 }
