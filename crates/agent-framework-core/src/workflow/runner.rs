@@ -630,6 +630,28 @@ impl WorkflowRun {
                     None => continue,
                 };
 
+                // Explicitly-targeted messages (request-info responses routed
+                // straight back to the requesting executor) bypass the fan-in
+                // barrier: their source is the responder, not one of the
+                // fan-in edges, so accumulating them would stall the resumed
+                // run forever.
+                let (direct, msgs): (Vec<_>, Vec<_>) =
+                    msgs.into_iter().partition(|m| m.target_id.is_some());
+                for m in direct {
+                    let source_ids = vec![m.source_id.clone()];
+                    self.run_executor(
+                        &executor,
+                        m.data,
+                        source_ids,
+                        &mut next,
+                        &mut emitted_pending,
+                    )
+                    .await?;
+                }
+                if msgs.is_empty() {
+                    continue;
+                }
+
                 if let Some(sources) = self.fanin_group_for(&target_id) {
                     // Barrier: accumulate by source, fire once every source has
                     // delivered, collecting in declared order.

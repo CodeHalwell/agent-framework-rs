@@ -334,12 +334,52 @@ fn function_result_to_item(fr: &FunctionResultContent) -> Value {
 /// The flat Responses-API tool spec: `{"type":"function","name":...}`, unlike
 /// Chat Completions' `{"type":"function","function":{...}}` nesting.
 fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
-    json!({
-        "type": "function",
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": tool.parameters,
-    })
+    use agent_framework_core::tools::{ApprovalMode, ToolKind};
+    match &tool.kind {
+        ToolKind::HostedWebSearch => json!({ "type": "web_search" }),
+        ToolKind::HostedCodeInterpreter => json!({
+            "type": "code_interpreter",
+            "container": { "type": "auto" },
+        }),
+        ToolKind::HostedFileSearch { max_results } => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("file_search"));
+            // The Responses API requires vector-store ids; the marker itself
+            // carries none, so honor ids supplied via the definition's
+            // parameters object when present.
+            if let Some(ids) = tool.parameters.get("vector_store_ids") {
+                spec.insert("vector_store_ids".into(), ids.clone());
+            }
+            if let Some(n) = max_results {
+                spec.insert("max_num_results".into(), json!(n));
+            }
+            Value::Object(spec)
+        }
+        ToolKind::HostedMcp { url, allowed_tools } => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("mcp"));
+            spec.insert("server_label".into(), json!(tool.name.replace(' ', "_")));
+            spec.insert("server_url".into(), json!(url));
+            if !tool.description.is_empty() {
+                spec.insert("server_description".into(), json!(tool.description));
+            }
+            if let Some(allowed) = allowed_tools {
+                spec.insert("allowed_tools".into(), json!(allowed));
+            }
+            let approval = match tool.approval_mode {
+                ApprovalMode::AlwaysRequire => "always",
+                ApprovalMode::NeverRequire => "never",
+            };
+            spec.insert("require_approval".into(), json!(approval));
+            Value::Object(spec)
+        }
+        ToolKind::Function => json!({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }),
+    }
 }
 
 fn tool_choice_to_responses(mode: &ToolMode) -> Value {
@@ -1231,5 +1271,36 @@ mod tests {
         }
         let result = OpenAIResponsesClient::from_env("gpt-4o-mini");
         assert!(result.is_err());
+    }
+    #[test]
+    fn build_body_maps_hosted_tools_to_responses_types() {
+        use agent_framework_core::tools::{
+            hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search,
+        };
+        let c = client();
+        let mut options = ChatOptions::new();
+        options.tools = vec![
+            hosted_web_search(),
+            hosted_code_interpreter(),
+            hosted_file_search(Some(7)),
+            hosted_mcp(
+                "docs",
+                "https://mcp.example/sse",
+                Some(vec!["search".into()]),
+            ),
+        ];
+        let body = c.build_body(&[user("hi")], &options, false);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0], json!({ "type": "web_search" }));
+        assert_eq!(
+            tools[1],
+            json!({ "type": "code_interpreter", "container": { "type": "auto" } })
+        );
+        assert_eq!(tools[2]["type"], "file_search");
+        assert_eq!(tools[2]["max_num_results"], json!(7));
+        assert_eq!(tools[3]["type"], "mcp");
+        assert_eq!(tools[3]["server_url"], "https://mcp.example/sse");
+        assert_eq!(tools[3]["allowed_tools"], json!(["search"]));
+        assert_eq!(tools[3]["require_approval"], "never");
     }
 }

@@ -663,3 +663,57 @@ async fn agent_executor_emits_agent_events() {
         "expected an AgentRunUpdate event"
     );
 }
+
+#[tokio::test]
+async fn fanin_sink_request_info_response_bypasses_barrier() {
+    // Two sources fan into a joiner; the joiner asks a question through
+    // ctx.request_info(). The routed response targets the joiner directly and
+    // must NOT be swallowed by the fan-in barrier (its source is the request
+    // plumbing, not one of the fan-in edges).
+    let split = FunctionExecutor::new("split", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let a = FunctionExecutor::new("a", |msg, ctx| async move {
+        ctx.send_message(json!(format!("a:{}", msg.as_str().unwrap_or(""))))
+            .await?;
+        Ok(())
+    });
+    let b = FunctionExecutor::new("b", |msg, ctx| async move {
+        ctx.send_message(json!(format!("b:{}", msg.as_str().unwrap_or(""))))
+            .await?;
+        Ok(())
+    });
+    let join = FunctionExecutor::new("join", |msg, ctx| async move {
+        if let Some(resp) = RequestResponse::from_message(&msg) {
+            ctx.yield_output(resp.data).await?;
+        } else {
+            // Barrier fired with both inputs: ask a human before finishing.
+            ctx.request_info(json!({ "joined": msg })).await?;
+        }
+        Ok(())
+    });
+
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(split))
+        .add_executor(Arc::new(a))
+        .add_executor(Arc::new(b))
+        .add_executor(Arc::new(join))
+        .set_start("split")
+        .add_fan_out("split", vec!["a".to_string(), "b".to_string()])
+        .add_fan_in(vec!["a".to_string(), "b".to_string()], "join")
+        .build()
+        .unwrap();
+
+    let mut run = workflow.run(json!("x")).await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::IdleWithPendingRequests);
+    let pending = run.pending_requests();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source_executor_id, "join");
+
+    let id = pending[0].request_id.clone();
+    run.send_response(id, json!("approved")).await.unwrap();
+
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    assert_eq!(run.last_output(), Some(json!("approved")));
+}
