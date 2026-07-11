@@ -38,6 +38,20 @@ use serde_json::Value;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Parse Anthropic's `retry-after` header into a delay in seconds.
+///
+/// Anthropic returns `retry-after` (in integer seconds) alongside `429` and
+/// overloaded `529` responses; we honor that hint on [`Error::ServiceStatus`]
+/// so a retry layer can wait exactly as long as the server asks. A date-form
+/// or unparseable value is treated as absent.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+}
 /// `max_tokens` is required by the Anthropic Messages API; this is used
 /// whenever neither `ChatOptions::max_tokens` nor a client-level override is
 /// set.
@@ -147,10 +161,13 @@ impl AnthropicClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service(format!(
-                "Anthropic API error {status}: {text}"
-            )));
+            return Err(Error::service_status(
+                status.as_u16(),
+                format!("Anthropic API error {status}: {text}"),
+                retry_after,
+            ));
         }
         Ok(resp)
     }

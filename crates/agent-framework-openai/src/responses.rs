@@ -186,8 +186,13 @@ impl OpenAIResponsesClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = crate::parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service(format!("OpenAI API error {status}: {text}")));
+            return Err(Error::service_status(
+                status.as_u16(),
+                format!("OpenAI API error {status}: {text}"),
+                retry_after,
+            ));
         }
         Ok(resp)
     }

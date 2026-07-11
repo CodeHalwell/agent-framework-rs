@@ -48,6 +48,21 @@ use serde_json::{json, Map, Value};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Parse a `Retry-After` header into a delay in seconds.
+///
+/// HTTP allows either a delay in seconds or an HTTP-date; OpenAI (and other
+/// rate limiters) use the integer/decimal-seconds form for `429`/`503`, which
+/// is what we honor. A date-form or unparseable value is treated as absent.
+/// Shared with [`responses`](crate::responses) so both OpenAI clients attach
+/// the same retry hint to [`Error::ServiceStatus`].
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+}
+
 /// An OpenAI (or OpenAI-compatible) chat client.
 #[derive(Clone)]
 pub struct OpenAIClient {
@@ -147,8 +162,13 @@ impl OpenAIClient {
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service(format!("OpenAI API error {status}: {text}")));
+            return Err(Error::service_status(
+                status.as_u16(),
+                format!("OpenAI API error {status}: {text}"),
+                retry_after,
+            ));
         }
         Ok(resp)
     }

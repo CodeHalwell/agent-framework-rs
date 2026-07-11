@@ -54,6 +54,13 @@ pub struct WorkflowCheckpoint {
     /// Additional metadata (e.g. superstep index, checkpoint type).
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
+    /// A deterministic signature of the workflow graph (executor ids + edge
+    /// topology) this checkpoint was produced from, used to detect resuming
+    /// against an incompatible graph. Empty for legacy checkpoints written
+    /// before signatures existed (serde default), which resume with a warning
+    /// rather than a hard error. See `runner::compute_graph_signature`.
+    #[serde(default)]
+    pub graph_signature: String,
     /// Checkpoint format version.
     #[serde(default = "default_version")]
     pub version: String,
@@ -71,6 +78,7 @@ impl WorkflowCheckpoint {
         shared_state: HashMap<String, Value>,
         pending_requests: Vec<PendingRequest>,
         metadata: HashMap<String, Value>,
+        graph_signature: String,
     ) -> Self {
         Self {
             checkpoint_id: uuid::Uuid::new_v4().to_string(),
@@ -83,6 +91,7 @@ impl WorkflowCheckpoint {
             shared_state,
             pending_requests,
             metadata,
+            graph_signature,
             version: default_version(),
         }
     }

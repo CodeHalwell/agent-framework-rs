@@ -39,7 +39,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Anthropic Messages API | ✅ | ✅ | ✅ done | `agent-framework-anthropic::AnthropicClient`, hand-rolled (no Anthropic SDK dependency) |
 | Anthropic structured output | ❌ (silently dropped) | ❌ (no `ResponseFormat` handling) | ✅ done | Rust *exceeds* parity here: `ResponseFormat::JsonObject`/`JsonSchema` is folded into the system prompt (the Messages API has no native `response_format`), see `convert::append_response_format_instructions` |
 | `response.parse_json::<T>()` helper | ✅ (`response.value`) | ✅ | ✅ done | on both `ChatResponse` and `AgentRunResponse` |
-| Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ❌ not yet | no provider retries a failed request; a caller-supplied middleware or wrapper `ChatClient` would need to add one |
+| Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ✅ done | `client::RetryingChatClient` wraps any `ChatClient` with a `RetryPolicy` (max_retries, exponential backoff, max_delay cap, jitter, `RetryOn` predicate). Default retries HTTP 408/429/5xx (`Error::ServiceStatus`) and transport-ish `Error::Service` failures; honors a server `Retry-After` (OpenAI + Anthropic now emit it on `ServiceStatus`) over computed backoff. Streaming retries only the initial connection |
 
 ## Agents
 
@@ -85,7 +85,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | --- | --- | --- | --- | --- |
 | Superstep (Pregel/BSP) graph engine | ✅ | ✅ | ✅ done | `workflow::{WorkflowBuilder, Workflow, WorkflowRun}`; `Single`/`FanOut`/`FanIn` edges, switch/case sugar |
 | Checkpointing (in-memory + file-backed) | ✅ | ✅ | ✅ done | `CheckpointStorage` trait, `InMemoryCheckpointStorage`, `FileCheckpointStorage` (atomic write via temp+rename); fires automatically every superstep via `with_checkpointing` |
-| Checkpoint graph-signature validation on resume | ✅ | ✅ | ❌ not yet | `run_from_checkpoint` trusts the caller: it never checks that the resuming graph matches the checkpointed one, and silently skips state for unknown executor ids |
+| Checkpoint graph-signature validation on resume | ✅ | ✅ | ✅ done | `WorkflowCheckpoint::graph_signature` records a deterministic FNV-1a fingerprint of the built graph (sorted executor ids + normalized edge-group descriptors + start; opaque conditions/selections contribute presence + declared labels only). `run_from_checkpoint` rejects a mismatch with an actionable `Error::Workflow` naming both signatures; `run_from_checkpoint_unchecked` overrides; legacy signatureless checkpoints resume with a `tracing` warn |
 | Request/response HITL (`request_info`) | ✅ | ✅ | ✅ done | `WorkflowContext::request_info`, `RequestInfoExecutor`, `WorkflowRun::send_response(s)` |
 | Shared state | ✅ | ✅ | ✅ done | `workflow::SharedState`, cloned into every `WorkflowContext`, checkpointed automatically |
 | Graph validation (structural) | ✅ | ✅ | ✅ done | start registered, unknown-executor edges, duplicate edges, start-reachability — run automatically in `WorkflowBuilder::build`. Python's additional *static type-compatibility* checks are intentionally out of scope for a `serde_json::Value`-typed engine |
@@ -103,6 +103,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Handoff | ✅ | ✅ | ✅ done | `orchestration::HandoffBuilder`; autonomous and human-in-loop interaction modes |
 | Magentic (plan / progress-ledger / final answer) | ✅ | not found | ✅ done | `MagenticBuilder` + `StandardMagenticManager`; prompts ported verbatim from Python |
 | Magentic human-in-the-loop plan review | ✅ (`MagenticHumanInterventionKind.PLAN_REVIEW`) | n/a (no Magentic orchestrator found) | ✅ done | `MagenticBuilder::with_plan_review()` + `max_plan_review_rounds(n)`: pauses after `plan()` with a `MagenticPlanReviewRequest` (task/facts/plan/round), answered by a `MagenticPlanReviewDecision` — approve, revise-with-comments (triggers `replan` with the feedback in `chat_history`), or revise-with-edited-plan (adopted verbatim, no LLM call) |
+| Magentic human-in-the-loop stall intervention | ✅ (`MagenticHumanInterventionKind.STALL`, `with_human_input_on_stall`) | n/a (no Magentic orchestrator found) | ✅ done | `MagenticBuilder::with_stall_intervention()`: when `stall_count` exceeds `max_stall_count` the round loop pauses with a `MagenticStallInterventionRequest` (task, reason, stall/max counts, round, resets-so-far, facts/plan, last agent) instead of auto-replanning. `MagenticStallInterventionDecision` mirrors Python's stall decisions: `Continue` (=`CONTINUE`), `Replan { guidance }` (folds `REPLAN`+`GUIDANCE`: existing reset path, guidance appended to history), plus an added `Abort` (final-answer path). Disabled by default → unchanged auto-replan |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | see Agents section |
 
 ## Observability
@@ -140,7 +141,5 @@ Much shorter than it used to be. What genuinely remains:
 - **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
 - **Redis provider**: recency/token-match retrieval, no RediSearch vector or hybrid search.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
-- **Reliability**: no built-in retry/backoff policy layer for any provider.
-- **Checkpointing**: no graph-signature validation on resume.
 - **Azure**: no Azure AI (Foundry) service client, and no real Entra ID credential chain (bring your own `TokenCredential`).
 - **Ecosystem**: AG-UI, CopilotStudio, Purview, ChatKit, Azure AI Search, CosmosDB, DurableTask/Azure Functions hosting, OTel SDK exporter wiring.

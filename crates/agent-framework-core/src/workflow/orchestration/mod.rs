@@ -60,11 +60,11 @@ pub use handoff::{
 pub use magentic::{
     MagenticBuilder, MagenticContext, MagenticManager, MagenticPlanReviewDecision,
     MagenticPlanReviewRequest, MagenticProgressLedger, MagenticProgressLedgerItem,
-    MagenticTaskLedger, StandardMagenticManager, MAGENTIC_MANAGER_NAME,
-    ORCHESTRATOR_FINAL_ANSWER_PROMPT, ORCHESTRATOR_PROGRESS_LEDGER_PROMPT,
-    ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT, ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT,
-    ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT, ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT,
-    ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
+    MagenticStallInterventionDecision, MagenticStallInterventionRequest, MagenticTaskLedger,
+    StandardMagenticManager, MAGENTIC_MANAGER_NAME, ORCHESTRATOR_FINAL_ANSWER_PROMPT,
+    ORCHESTRATOR_PROGRESS_LEDGER_PROMPT, ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT,
+    ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT, ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT,
+    ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT, ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 };
 pub use sequential::SequentialBuilder;
 pub use workflow_agent::{WorkflowAgent, WorkflowAgentExt};

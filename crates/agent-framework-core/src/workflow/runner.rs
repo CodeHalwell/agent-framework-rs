@@ -21,6 +21,111 @@ use crate::error::{Error, Result};
 
 const DEFAULT_MAX_ITERATIONS: usize = 100;
 
+/// FNV-1a (64-bit) hash of `bytes`. Implemented inline to avoid a hashing
+/// dependency; used only to fingerprint a workflow's topology, so collision
+/// resistance beyond "changed graphs almost always differ" is not required.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// A stable, normalized descriptor for one edge group.
+///
+/// Opaque runtime closures (a [`EdgeGroup::Single`] condition, a
+/// [`EdgeGroup::FanOut`] selection) cannot be inspected, so they contribute
+/// only their *kind* — whether a condition/selection is present, plus any
+/// declared switch-case labels — never their behavior. Target and source lists
+/// are sorted so the descriptor is independent of declaration order.
+fn edge_group_descriptor(group: &EdgeGroup) -> String {
+    match group {
+        EdgeGroup::Single {
+            source,
+            target,
+            condition,
+        } => {
+            let kind = if condition.is_some() {
+                "conditional"
+            } else {
+                "plain"
+            };
+            format!("single:{source}->{target}:{kind}")
+        }
+        EdgeGroup::FanOut {
+            source,
+            targets,
+            selection,
+            case_labels,
+        } => {
+            let mut targets = targets.clone();
+            targets.sort_unstable();
+            let kind = if selection.is_some() {
+                "selection"
+            } else {
+                "broadcast"
+            };
+            let labels = case_labels
+                .as_ref()
+                .map(|labels| {
+                    let mut labels = labels.clone();
+                    labels.sort_unstable();
+                    labels.join(",")
+                })
+                .unwrap_or_default();
+            format!(
+                "fanout:{source}->[{}]:{kind}:labels=[{labels}]",
+                targets.join(",")
+            )
+        }
+        EdgeGroup::FanIn { sources, target } => {
+            let mut sources = sources.clone();
+            sources.sort_unstable();
+            format!("fanin:[{}]->{target}", sources.join(","))
+        }
+    }
+}
+
+/// Compute a deterministic signature of a built workflow's graph.
+///
+/// The signature is the FNV-1a hash (hex) of a canonical rendering of the
+/// start executor, the sorted executor ids, and the sorted, normalized
+/// [`edge_group_descriptor`]s. It is stable across processes and independent of
+/// executor/edge insertion order, and changes whenever a node or edge is
+/// added, removed, retargeted, or has its condition/selection *presence* or
+/// switch labels change. Because conditions/selections are opaque closures,
+/// changing only a predicate's *body* (same presence, same labels) does not
+/// change the signature — documented, and acceptable for a
+/// resume-compatibility guard.
+pub(crate) fn compute_graph_signature(
+    executors: &HashMap<String, Arc<dyn Executor>>,
+    edge_groups: &[EdgeGroup],
+    start: &str,
+) -> String {
+    let mut ids: Vec<&str> = executors.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+
+    let mut edges: Vec<String> = edge_groups.iter().map(edge_group_descriptor).collect();
+    edges.sort_unstable();
+
+    let mut canonical = String::new();
+    canonical.push_str("start=");
+    canonical.push_str(start);
+    canonical.push_str("\nnodes=");
+    canonical.push_str(&ids.join(","));
+    canonical.push_str("\nedges=");
+    for edge in &edges {
+        canonical.push('\n');
+        canonical.push_str(edge);
+    }
+
+    format!("v1-{:016x}", fnv1a_64(canonical.as_bytes()))
+}
+
 /// Immutable, shared definition of a built workflow graph. Held behind an `Arc`
 /// so a [`WorkflowRun`] can be driven on its own (including in a spawned task).
 pub(crate) struct WorkflowShared {
@@ -32,6 +137,8 @@ pub(crate) struct WorkflowShared {
     pub description: Option<String>,
     pub checkpoint_storage: Option<Arc<dyn CheckpointStorage>>,
     pub id: String,
+    /// Deterministic fingerprint of the graph topology, checked on resume.
+    pub graph_signature: String,
 }
 
 /// Fluent builder for a [`Workflow`]. Rust equivalent of `WorkflowBuilder`.
@@ -211,6 +318,8 @@ impl WorkflowBuilder {
         validate_workflow_graph(&self.executors, &self.edge_groups, &start)
             .map_err(|e| Error::Workflow(e.to_string()))?;
 
+        let graph_signature = compute_graph_signature(&self.executors, &self.edge_groups, &start);
+
         Ok(Workflow {
             shared: Arc::new(WorkflowShared {
                 executors: self.executors,
@@ -221,6 +330,7 @@ impl WorkflowBuilder {
                 description: self.description,
                 checkpoint_storage: self.checkpoint_storage,
                 id: uuid::Uuid::new_v4().to_string(),
+                graph_signature,
             }),
         })
     }
@@ -248,6 +358,14 @@ impl Workflow {
     /// The start executor id.
     pub fn start_executor_id(&self) -> &str {
         &self.shared.start
+    }
+
+    /// This workflow's deterministic graph signature (see
+    /// [`WorkflowBuilder::build`]). Checkpoints record the signature of the
+    /// graph that produced them; [`Workflow::run_from_checkpoint`] refuses to
+    /// resume a checkpoint whose signature does not match this workflow's.
+    pub fn graph_signature(&self) -> &str {
+        &self.shared.graph_signature
     }
 
     /// Run the workflow to completion (or until it pauses awaiting external
@@ -287,18 +405,90 @@ impl Workflow {
     ///
     /// Restores the in-flight message queue, iteration count, shared state,
     /// executor states, and any outstanding requests.
+    ///
+    /// Before restoring, the checkpoint's recorded [graph
+    /// signature](Workflow::graph_signature) is compared against this
+    /// workflow's: a mismatch is a hard [`Error::Workflow`] (the topology
+    /// changed since the checkpoint was saved, so resuming could misroute
+    /// messages or drop executor state). A legacy checkpoint carrying no
+    /// signature is resumed with a warning. Use
+    /// [`Workflow::run_from_checkpoint_unchecked`] to bypass the check.
     pub async fn run_from_checkpoint(
         &self,
         checkpoint_id: &str,
         storage: Arc<dyn CheckpointStorage>,
     ) -> Result<WorkflowRun> {
+        self.run_from_checkpoint_inner(checkpoint_id, storage, true)
+            .await
+    }
+
+    /// Like [`Workflow::run_from_checkpoint`], but skips graph-signature
+    /// validation (a mismatch is logged, not rejected). For deliberately
+    /// resuming a checkpoint into an intentionally-evolved graph, where the
+    /// caller accepts responsibility for compatibility.
+    pub async fn run_from_checkpoint_unchecked(
+        &self,
+        checkpoint_id: &str,
+        storage: Arc<dyn CheckpointStorage>,
+    ) -> Result<WorkflowRun> {
+        self.run_from_checkpoint_inner(checkpoint_id, storage, false)
+            .await
+    }
+
+    async fn run_from_checkpoint_inner(
+        &self,
+        checkpoint_id: &str,
+        storage: Arc<dyn CheckpointStorage>,
+        validate: bool,
+    ) -> Result<WorkflowRun> {
         let cp = storage
             .load(checkpoint_id)
             .await?
             .ok_or_else(|| Error::Workflow(format!("checkpoint '{checkpoint_id}' not found")))?;
+        self.check_graph_signature(&cp, validate)?;
         let mut run = WorkflowRun::new(self.shared.clone(), None);
         run.restore(cp).await?;
         Ok(run)
+    }
+
+    /// Compare a checkpoint's graph signature against this workflow's.
+    ///
+    /// * No signature (legacy checkpoint) → warn and continue.
+    /// * Matching signature → continue.
+    /// * Mismatch with `validate` → [`Error::Workflow`] naming both signatures.
+    /// * Mismatch without `validate` → warn and continue.
+    fn check_graph_signature(&self, cp: &WorkflowCheckpoint, validate: bool) -> Result<()> {
+        let expected = &self.shared.graph_signature;
+        if cp.graph_signature.is_empty() {
+            tracing::warn!(
+                workflow_id = %self.shared.id,
+                expected = %expected,
+                "resuming a checkpoint with no graph signature (written before signature \
+                 validation existed); skipping the graph-compatibility check"
+            );
+            return Ok(());
+        }
+        if &cp.graph_signature == expected {
+            return Ok(());
+        }
+        if validate {
+            return Err(Error::Workflow(format!(
+                "checkpoint graph signature mismatch: checkpoint '{}' was saved for graph \
+                 signature '{}', but this workflow's graph signature is '{}'. The workflow's \
+                 executors or edges changed since the checkpoint was written, so resuming could \
+                 misroute messages or drop executor state. Rebuild the identical graph, or call \
+                 `run_from_checkpoint_unchecked` to override.",
+                cp.checkpoint_id, cp.graph_signature, expected
+            )));
+        }
+        tracing::warn!(
+            workflow_id = %self.shared.id,
+            checkpoint_signature = %cp.graph_signature,
+            expected = %expected,
+            "resuming a checkpoint whose graph signature does not match this workflow \
+             (unchecked); resume may misbehave if the topology is incompatible"
+        );
+        Ok(())
     }
 
     /// A visualization helper (Mermaid / Graphviz DOT) for this workflow.
@@ -585,6 +775,7 @@ impl WorkflowRun {
             shared_state,
             self.pending_requests.values().cloned().collect(),
             metadata,
+            self.shared.graph_signature.clone(),
         );
         if let Err(e) = storage.save(checkpoint).await {
             tracing::warn!("failed to save checkpoint: {e}");

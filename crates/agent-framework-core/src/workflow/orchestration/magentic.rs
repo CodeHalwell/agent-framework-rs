@@ -41,13 +41,34 @@
 //!   triggered replans later in the run never re-open it (Python doesn't
 //!   either — `_reset_and_replan` never calls `_send_plan_review_request`).
 //!
-//! **Not ported**: Python's separate stall-intervention HITL
-//! (`MagenticBuilder.with_human_input_on_stall`, `MagenticHumanInterventionKind.STALL`).
-//! It shares the same request/reply *mechanism* in Python but needs its own
-//! request/decision types, persisted round-loop state, and response
-//! dispatch — a second, independently-reviewable HITL surface rather than a
-//! small addition to plan review. Left as a documented gap; stalls always
-//! auto-replan here regardless of plan-review settings.
+//! ## Human-in-the-loop stall intervention
+//!
+//! [`MagenticBuilder::with_stall_intervention`] enables a pause when the round
+//! loop detects a stall (mirrors Python's
+//! `MagenticBuilder.with_human_input_on_stall()` /
+//! `MagenticHumanInterventionKind.STALL`): instead of silently auto-replanning
+//! once `stall_count` exceeds `max_stall_count`, the orchestrator emits a
+//! [`MagenticStallInterventionRequest`] (task, stall reason/details, counts,
+//! round, resets-so-far, current facts/plan, last agent) via
+//! [`WorkflowContext::request_info`] and suspends. A
+//! [`MagenticStallInterventionDecision`] resumes it:
+//!
+//! - `Continue` clears the stall counter and resumes the round loop as-is
+//!   (Python's `CONTINUE`).
+//! - `Replan { guidance }` takes the existing reset/replan path (Python's
+//!   `REPLAN`); when `guidance` is present it is appended to the history after
+//!   the fresh task ledger as `"Human guidance to help with stall: …"` so the
+//!   manager sees it on the next round (folding in Python's separate
+//!   `GUIDANCE` decision, whose free-text comments this port routes through
+//!   the same variant).
+//! - `Abort` stops coordinating and synthesizes the final answer from whatever
+//!   history exists (a small superset of Python's stall decisions, which offer
+//!   no explicit abort — documented divergence).
+//!
+//! With stall intervention disabled the behavior is unchanged: stalls always
+//! auto-replan. Like plan review, the paused round-loop state
+//! ([`MagenticContext`]) is persisted through [`WorkflowContext::shared_state`]
+//! so the orchestrator executor stays stateless across the pause.
 
 use std::sync::{Arc, Mutex};
 
@@ -744,6 +765,86 @@ impl MagenticPlanReviewDecision {
     }
 }
 
+/// The payload of the request-info event emitted when stall intervention is
+/// enabled and the round loop detects a stall. Rust analogue of Python's
+/// `_MagenticHumanInterventionRequest` narrowed to its `kind=STALL` fields
+/// (`stall_count`, `max_stall_count`, `task_text`, `facts_text`, `plan_text`,
+/// `last_agent`, `stall_reason`), plus `round`/`resets_so_far` for context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MagenticStallInterventionRequest {
+    /// The original task text.
+    pub task: String,
+    /// A human-readable description of why progress stalled (no forward
+    /// progress and/or looping). Python's `stall_reason`.
+    pub reason: String,
+    /// The consecutive stall count that tripped the threshold.
+    pub stall_count: usize,
+    /// The configured stall threshold (`max_stall_count`).
+    pub max_stall_count: usize,
+    /// The coordination round the stall was detected on.
+    pub round: usize,
+    /// How many replans (resets) have already happened this run.
+    pub resets_so_far: usize,
+    /// The current fact sheet text (empty when the manager tracks no ledger).
+    pub facts: String,
+    /// The current plan text (empty when the manager tracks no ledger).
+    pub plan: String,
+    /// The agent the ledger last nominated to speak. Python's `last_agent`.
+    pub last_agent: String,
+}
+
+/// A human's decision on a [`MagenticStallInterventionRequest`]. Rust analogue
+/// of Python's `_MagenticHumanInterventionReply` narrowed to the stall subset
+/// of `MagenticHumanInterventionDecision` (`CONTINUE` / `REPLAN` / `GUIDANCE`).
+///
+/// Python exposes three stall decisions; this port folds `REPLAN` and
+/// `GUIDANCE` into [`Replan { guidance }`](Self::Replan) — a forced replan
+/// that optionally carries the human's free-text guidance — and adds an
+/// explicit [`Abort`](Self::Abort) (which Python's stall decisions lack). See
+/// the module-level docs for the exact wiring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum MagenticStallInterventionDecision {
+    /// Proceed as-is: clear the stall counter and resume the round loop
+    /// (Python's `CONTINUE`).
+    Continue,
+    /// Force a replan via the existing reset path (Python's `REPLAN`);
+    /// `guidance`, if present, is appended to the history after the fresh task
+    /// ledger as `"Human guidance to help with stall: …"` (Python's
+    /// `GUIDANCE`).
+    Replan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guidance: Option<String>,
+    },
+    /// Stop coordinating and synthesize the final answer from the current
+    /// history.
+    Abort,
+}
+
+impl MagenticStallInterventionDecision {
+    /// Continue as-is (clear the stall counter and proceed).
+    pub fn continue_as_is() -> Self {
+        Self::Continue
+    }
+
+    /// Force a replan with no extra guidance.
+    pub fn replan() -> Self {
+        Self::Replan { guidance: None }
+    }
+
+    /// Force a replan, appending the given human guidance to the history.
+    pub fn replan_with_guidance(guidance: impl Into<String>) -> Self {
+        Self::Replan {
+            guidance: Some(guidance.into()),
+        }
+    }
+
+    /// Abort and produce the final answer from the current history.
+    pub fn abort() -> Self {
+        Self::Abort
+    }
+}
+
 /// Orchestrator state persisted across a plan-review pause via
 /// [`WorkflowContext::shared_state`] (the executor instance itself must stay
 /// stateless between `execute()` calls — see `HandoffCoordinator`'s
@@ -760,6 +861,10 @@ struct MagenticPlanReviewState {
 /// The shared-state key [`MagenticPlanReviewState`] is stored under.
 const PLAN_REVIEW_STATE_KEY: &str = "_magentic_plan_review_state";
 
+/// The shared-state key the paused round-loop [`MagenticContext`] is stored
+/// under while a stall-intervention request is outstanding.
+const STALL_STATE_KEY: &str = "_magentic_stall_state";
+
 /// The single executor that drives the Magentic loop.
 struct MagenticOrchestrator {
     id: String,
@@ -771,6 +876,7 @@ struct MagenticOrchestrator {
     max_round_count: Option<usize>,
     require_plan_signoff: bool,
     max_plan_review_rounds: u32,
+    enable_stall_intervention: bool,
 }
 
 impl MagenticOrchestrator {
@@ -948,6 +1054,101 @@ impl MagenticOrchestrator {
         }
     }
 
+    /// Whether a stall-intervention request is currently outstanding (its
+    /// paused round-loop state is persisted in shared state).
+    async fn has_stall_state(&self, ctx: &WorkflowContext) -> bool {
+        ctx.shared_state().has(STALL_STATE_KEY).await
+    }
+
+    async fn save_stall_state(&self, ctx: &WorkflowContext, mctx: &MagenticContext) {
+        if let Ok(value) = serde_json::to_value(mctx) {
+            ctx.shared_state().set(STALL_STATE_KEY, value).await;
+        }
+    }
+
+    async fn load_stall_state(&self, ctx: &WorkflowContext) -> Result<MagenticContext> {
+        ctx.shared_state()
+            .get(STALL_STATE_KEY)
+            .await
+            .and_then(|v| serde_json::from_value(v).ok())
+            .ok_or_else(|| {
+                Error::Workflow(
+                    "magentic stall-intervention response received with no pending stall state"
+                        .into(),
+                )
+            })
+    }
+
+    /// Persist the round-loop state and emit a [`MagenticStallInterventionRequest`],
+    /// suspending the run. Rust analogue of the `_enable_stall_intervention`
+    /// branch in Python's `_run_inner_loop_exclusive`.
+    async fn pause_for_stall(
+        &self,
+        mctx: MagenticContext,
+        ledger: &MagenticProgressLedger,
+        ctx: &WorkflowContext,
+    ) -> Result<()> {
+        // Python reads facts/plan straight off the manager's task ledger,
+        // leaving them empty when the manager tracks none (unlike plan review,
+        // which falls back to the combined ledger text).
+        let (facts, plan) = match self.manager.current_task_ledger() {
+            Some(ledger) => (ledger.facts.text(), ledger.plan.text()),
+            None => (String::new(), String::new()),
+        };
+        let request = MagenticStallInterventionRequest {
+            task: mctx.task.text(),
+            reason: stall_reason(ledger),
+            stall_count: mctx.stall_count,
+            max_stall_count: self.max_stall_count,
+            round: mctx.round_count,
+            resets_so_far: mctx.reset_count,
+            facts,
+            plan,
+            last_agent: ledger.next_speaker.answer_str(),
+        };
+        self.save_stall_state(ctx, &mctx).await;
+        ctx.request_info(serialize(&request)?).await
+    }
+
+    /// Handle a [`MagenticStallInterventionDecision`] delivered back as a
+    /// [`RequestResponse`]. Rust analogue of
+    /// `_handle_stall_intervention_response` — see the module-level docs.
+    async fn handle_stall_intervention_response(
+        &self,
+        resp: RequestResponse,
+        ctx: &WorkflowContext,
+    ) -> Result<()> {
+        let decision: MagenticStallInterventionDecision = serde_json::from_value(resp.data)
+            .map_err(|e| Error::Workflow(format!("invalid stall-intervention decision: {e}")))?;
+        let mut mctx = self.load_stall_state(ctx).await?;
+        ctx.shared_state().delete(STALL_STATE_KEY).await;
+
+        match decision {
+            MagenticStallInterventionDecision::Continue => {
+                // Clear the stall counter and resume coordinating as-is.
+                mctx.stall_count = 0;
+                self.run_round_loop(mctx, ctx).await
+            }
+            MagenticStallInterventionDecision::Replan { guidance } => {
+                // The existing reset path clears history + stall count and
+                // replans; guidance is appended afterward so it survives the
+                // reset and reaches the manager on the next round.
+                self.reset_and_replan(&mut mctx, ctx).await?;
+                if let Some(guidance) = guidance {
+                    let msg =
+                        ChatMessage::user(format!("Human guidance to help with stall: {guidance}"));
+                    mctx.chat_history.push(msg.clone());
+                    self.emit_orchestrator_message(ctx, &msg);
+                }
+                self.run_round_loop(mctx, ctx).await
+            }
+            MagenticStallInterventionDecision::Abort => {
+                let final_answer = self.manager.prepare_final_answer(&mctx).await?;
+                self.yield_messages(ctx, vec![final_answer]).await
+            }
+        }
+    }
+
     /// Run the coordination round loop (Python's "inner loop") starting from
     /// `mctx`. Entry point both for a fresh run (plan review disabled, or
     /// already approved) and for resuming after a plan-review approval.
@@ -991,6 +1192,10 @@ impl MagenticOrchestrator {
             }
 
             if mctx.stall_count > self.max_stall_count {
+                if self.enable_stall_intervention {
+                    // Pause for a human decision instead of auto-replanning.
+                    return self.pause_for_stall(mctx, &ledger, ctx).await;
+                }
                 self.reset_and_replan(&mut mctx, ctx).await?;
                 continue;
             }
@@ -1029,8 +1234,15 @@ impl Executor for MagenticOrchestrator {
     }
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
-        // A response to a plan-review request resumes the paused review.
+        // A response to an outstanding request resumes the paused orchestrator.
+        // A pending stall intervention (persisted round-loop state) takes
+        // precedence; otherwise it is a plan-review response. The two never
+        // overlap: plan-review state is cleared before the round loop starts,
+        // and stall pauses only happen inside the round loop.
         if let Some(resp) = RequestResponse::from_message(&message) {
+            if self.has_stall_state(&ctx).await {
+                return self.handle_stall_intervention_response(resp, &ctx).await;
+            }
             return self.handle_plan_review_response(resp, &ctx).await;
         }
 
@@ -1074,6 +1286,27 @@ fn last_message(response: &AgentRunResponse) -> Option<ChatMessage> {
     response.messages.last().cloned()
 }
 
+/// Build the human-readable stall reason from a progress ledger, mirroring
+/// Python's `_run_inner_loop_exclusive`: "No progress being made" when progress
+/// stalled and/or "Agents appear to be in a loop" when looping, joined by
+/// "; " when both hold.
+fn stall_reason(ledger: &MagenticProgressLedger) -> String {
+    let mut reason = if ledger.is_progress_being_made.answer_bool() {
+        String::new()
+    } else {
+        "No progress being made".to_string()
+    };
+    if ledger.is_in_loop.answer_bool() {
+        let loop_msg = "Agents appear to be in a loop";
+        reason = if reason.is_empty() {
+            loop_msg.to_string()
+        } else {
+            format!("{reason}; {loop_msg}")
+        };
+    }
+    reason
+}
+
 fn serialize<T: Serialize>(value: &T) -> Result<Value> {
     serde_json::to_value(value).map_err(|e| Error::Workflow(format!("serialize error: {e}")))
 }
@@ -1106,6 +1339,7 @@ pub struct MagenticBuilder {
     name: Option<String>,
     enable_plan_review: bool,
     max_plan_review_rounds: Option<u32>,
+    enable_stall_intervention: bool,
 }
 
 /// Default cap on plan-review *revise* rounds before the orchestrator
@@ -1205,6 +1439,19 @@ impl MagenticBuilder {
         self
     }
 
+    /// Pause for a human decision when the round loop detects a stall, instead
+    /// of silently auto-replanning. When `stall_count` exceeds
+    /// `max_stall_count` the orchestrator emits a
+    /// [`MagenticStallInterventionRequest`] via
+    /// [`WorkflowContext::request_info`] and suspends until a
+    /// [`MagenticStallInterventionDecision`] is supplied. See the module-level
+    /// docs for the full loop semantics. Rust analogue of Python's
+    /// `MagenticBuilder.with_human_input_on_stall(enable=True)`.
+    pub fn with_stall_intervention(mut self) -> Self {
+        self.enable_stall_intervention = true;
+        self
+    }
+
     /// Validate and build the Magentic workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -1241,6 +1488,7 @@ impl MagenticBuilder {
             max_plan_review_rounds: self
                 .max_plan_review_rounds
                 .unwrap_or(DEFAULT_MAX_PLAN_REVIEW_ROUNDS),
+            enable_stall_intervention: self.enable_stall_intervention,
         };
 
         let mut builder = WorkflowBuilder::new()

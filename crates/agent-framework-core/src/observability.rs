@@ -71,6 +71,7 @@ pub fn error_type(err: &Error) -> String {
         Error::Content(_) => "content",
         Error::Tool(_) => "tool",
         Error::Service(_) => "service",
+        Error::ServiceStatus { .. } => "service",
         Error::Workflow(_) => "workflow",
         Error::AdditionItemMismatch(_) => "addition_item_mismatch",
         Error::Configuration(_) => "configuration",
