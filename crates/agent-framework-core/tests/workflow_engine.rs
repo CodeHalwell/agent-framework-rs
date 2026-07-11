@@ -665,6 +665,59 @@ async fn agent_executor_emits_agent_events() {
     );
 }
 
+/// An agent that returns several messages, to exercise incremental per-update
+/// `AgentRunUpdate` emission by `run_agent_and_emit`.
+struct MultiMessageAgent;
+
+#[async_trait]
+impl Agent for MultiMessageAgent {
+    async fn run(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _thread: Option<&mut AgentThread>,
+    ) -> Result<AgentRunResponse> {
+        Ok(AgentRunResponse {
+            messages: vec![
+                ChatMessage::assistant("one"),
+                ChatMessage::assistant("two"),
+                ChatMessage::assistant("three"),
+            ],
+            ..Default::default()
+        })
+    }
+    fn id(&self) -> &str {
+        "multi"
+    }
+}
+
+#[tokio::test]
+async fn agent_executor_emits_incremental_agent_run_updates() {
+    // The orchestration layer now drives `run_stream` and emits one
+    // `AgentRunUpdate` per streamed update, then a single terminal `AgentRun`.
+    let agent = Arc::new(MultiMessageAgent) as Arc<dyn Agent>;
+    let exec = AgentExecutor::new("a1", agent).with_output(true);
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(exec))
+        .set_start("a1")
+        .build()
+        .unwrap();
+
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    let update_count = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::AgentRunUpdate { .. }))
+        .count();
+    assert_eq!(update_count, 3, "one AgentRunUpdate per streamed update");
+    let run_count = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::AgentRun { .. }))
+        .count();
+    assert_eq!(run_count, 1, "exactly one terminal AgentRun");
+}
+
 #[tokio::test]
 async fn fanin_sink_request_info_response_bypasses_barrier() {
     // Two sources fan into a joiner; the joiner asks a question through

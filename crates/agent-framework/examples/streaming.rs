@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
         .instructions("You are a helpful assistant.")
         .build();
 
-    let mut stream = agent.run_stream("Write a haiku about Rust.", None).await?;
+    let mut stream = agent.run_stream_once("Write a haiku about Rust.").await?;
     while let Some(update) = stream.next().await {
         let update = update?;
         print!("{}", update.text());

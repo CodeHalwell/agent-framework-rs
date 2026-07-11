@@ -44,6 +44,12 @@ schemars = "0.8"
 bytes = "1"
 tokio-stream = "0.1"
 pin-project-lite = "0.2"
+# OTel API only (no SDK/exporter) — see agent-framework-core's `otel-metrics`
+# feature. `opentelemetry_sdk` is a test-only dependency there (in-memory
+# metric reader), pinned here for version consistency should another crate
+# need it later.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
 agent-framework-core = { path = "crates/agent-framework-core", version = "0.1.0" }
 agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.1.0" }

@@ -47,7 +47,9 @@ pub use error::{Error, Result};
 
 /// Commonly used imports.
 pub mod prelude {
-    pub use crate::agent::{Agent, AgentRunStream, AsToolOptions, ChatAgent, ChatAgentBuilder};
+    pub use crate::agent::{
+        Agent, AgentRunOptions, AgentRunStream, AsToolOptions, ChatAgent, ChatAgentBuilder,
+    };
     pub use crate::client::{
         ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
         RetryingChatClient,
@@ -58,11 +60,11 @@ pub mod prelude {
         AgentRunContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline,
         Next,
     };
-    pub use crate::observability::ObservableChatClient;
+    pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
     pub use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
     pub use crate::tools::{
         hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, AiFunction,
-        ApprovalMode, FunctionInvocationConfig, Tool, ToolDefinition, ToolKind,
+        ApprovalMode, FunctionInvocationConfig, McpApprovalMode, Tool, ToolDefinition, ToolKind,
     };
     pub use crate::types::{
         AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions, ChatResponse,

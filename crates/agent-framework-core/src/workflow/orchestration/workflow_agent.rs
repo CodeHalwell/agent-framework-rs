@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentRunStream};
+use crate::agent::{Agent, AgentRunOptions, AgentRunStream};
 use crate::error::Result;
 use crate::threads::AgentThread;
 use crate::tools::{AiFunction, ToolDefinition};
@@ -81,13 +81,16 @@ impl WorkflowAgent {
         self.description.as_deref()
     }
 
-    /// Stream the workflow's agent activity as [`AgentRunResponseUpdate`]s.
+    /// Stream the workflow's agent activity as [`AgentRunResponseUpdate`]s
+    /// (without thread write-back).
     ///
     /// Maps the engine's `run_stream` events: each
-    /// [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate) carries an agent message
-    /// (emitted as a delta) and each [`RequestInfo`](WorkflowEvent::RequestInfo)
-    /// becomes a user-input request update. Other events are ignored.
-    pub fn run_stream(&self, messages: Vec<ChatMessage>) -> AgentRunStream {
+    /// [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate) forwards a streamed
+    /// agent update and each [`RequestInfo`](WorkflowEvent::RequestInfo) becomes
+    /// a user-input request update. Other events are ignored. Private helper
+    /// behind [`WorkflowAgent::run_stream_with_thread`] and the object-safe
+    /// [`Agent::run_stream`] trait method.
+    fn stream_events(&self, messages: Vec<ChatMessage>) -> AgentRunStream {
         let input = serde_json::to_value(&messages).unwrap_or_else(|_| Value::Array(Vec::new()));
         let name = self.name.clone();
         let stream = self.workflow.run_stream(input);
@@ -98,12 +101,13 @@ impl WorkflowAgent {
         Box::pin(mapped)
     }
 
-    /// Like [`WorkflowAgent::run_stream`], but also writes back to `thread`
-    /// the way [`ChatAgent::run_stream`](crate::agent::ChatAgent::run_stream)
-    /// does: once the stream completes, `messages` and the response messages
-    /// reconstructed from the emitted updates are both persisted via
-    /// [`AgentThread::on_new_messages`]. A new method rather than a change to
-    /// `run_stream`'s signature, so existing callers keep compiling.
+    /// Stream the workflow's agent activity and, once the stream completes,
+    /// write back to `thread` the way
+    /// [`ChatAgent::run_stream`](crate::agent::ChatAgent::run_stream) does:
+    /// `messages` and the response messages reconstructed from the emitted
+    /// updates are both persisted via [`AgentThread::on_new_messages`]. An
+    /// infallible inherent convenience; the object-safe [`Agent::run_stream`]
+    /// trait method wraps this in `Ok(..)`.
     ///
     /// Mirrors Python's `WorkflowAgent.run_stream`, which likewise only
     /// notifies the thread of new messages after the stream is exhausted — it
@@ -120,7 +124,7 @@ impl WorkflowAgent {
         thread: Option<AgentThread>,
     ) -> AgentRunStream {
         let thread = thread.unwrap_or_else(|| self.get_new_thread());
-        let inner = self.run_stream(messages.clone());
+        let inner = self.stream_events(messages.clone());
         Box::pin(forward_and_persist(inner, thread, messages))
     }
 
@@ -204,14 +208,14 @@ fn request_message(request_id: &str, data: &Value, name: Option<&str>) -> ChatMe
 fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRunResponseUpdate> {
     match event {
         WorkflowEvent::AgentRunUpdate { update, .. } => {
-            let msg: ChatMessage = serde_json::from_value(update.clone()).ok()?;
-            Some(AgentRunResponseUpdate {
-                contents: msg.contents,
-                role: Some(msg.role),
-                author_name: msg.author_name.or_else(|| name.map(str::to_string)),
-                message_id: msg.message_id,
-                ..Default::default()
-            })
+            // The orchestration layer emits a serialized `AgentRunResponseUpdate`
+            // per streamed update (see `run_agent_and_emit`); forward it,
+            // attributing the workflow-agent's name when the update carries none.
+            let mut u: AgentRunResponseUpdate = serde_json::from_value(update.clone()).ok()?;
+            if u.author_name.is_none() {
+                u.author_name = name.map(str::to_string);
+            }
+            Some(u)
         }
         WorkflowEvent::RequestInfo {
             request_id,
@@ -314,6 +318,27 @@ impl Agent for WorkflowAgent {
             messages: response_messages,
             ..Default::default()
         })
+    }
+
+    /// Real streaming override: maps the workflow's live events to agent
+    /// updates as they happen, with thread write-back on completion. Per-run
+    /// [`AgentRunOptions`] are not supported (the wrapped workflow's executors
+    /// carry their own options); non-empty options are ignored with a warning.
+    async fn run_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<AgentThread>,
+        options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        if let Some(opts) = &options {
+            if !opts.is_empty() {
+                tracing::warn!(
+                    agent = %self.id,
+                    "WorkflowAgent does not support per-run options; ignoring them"
+                );
+            }
+        }
+        Ok(self.run_stream_with_thread(messages, thread))
     }
 
     fn id(&self) -> &str {

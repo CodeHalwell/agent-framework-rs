@@ -44,18 +44,25 @@
 //! closed with a `TOOL_CALL_END` at finalize and never gets a `TOOL_CALL_RESULT`.
 //!
 //! # Divergences from the Python reference
-//! - **Run-to-completion framing.** The object-safe [`Agent`] trait exposes only
-//!   `run` (not a streaming method), so — exactly like the [`crate::devui`] and
-//!   [`crate::openai_compat`] surfaces — we run the agent to completion and then
-//!   frame the final `AgentRunResponse` as the event sequence above. `type`
-//!   ordering and payloads still match the bridge; only true token-level
-//!   streaming is lost (each text message arrives as one `TEXT_MESSAGE_CONTENT`).
-//! - **Client `tools` are accepted but not injected.** `Agent::run` takes no
-//!   per-run tool list, so client-declared tools cannot be registered on an
-//!   opaque `Arc<dyn Agent>` the way Python registers declaration-only
-//!   `AIFunction`s. They are still parsed (and tolerated) on input; frontend
-//!   tool calls are surfaced whenever the agent itself emits an unexecuted
-//!   `FunctionCallContent` (see above).
+//! - **Live streaming.** The object-safe [`Agent`] trait exposes `run_stream`,
+//!   so this router drives it and frames each [`AgentRunResponseUpdate`] into
+//!   AG-UI events as it arrives — one `TEXT_MESSAGE_CONTENT` per text delta,
+//!   `TOOL_CALL_*` per call fragment. `type` ordering and payloads match the
+//!   bridge. (Agents whose `run_stream` falls back to the buffered default —
+//!   e.g. a plain `Arc<dyn Agent>` that only implements `run` — still emit one
+//!   `TEXT_MESSAGE_CONTENT` per message, as before.)
+//!
+//!   [`AgentRunResponseUpdate`]: agent_framework_core::types::AgentRunResponseUpdate
+//! - **Client `tools` are injected as declaration-only tools.** Client-declared
+//!   `tools` in the `RunAgentInput` are mapped to declaration-only
+//!   [`ToolDefinition`](agent_framework_core::tools::ToolDefinition)s (no
+//!   executor) and passed to the agent via per-run
+//!   [`AgentRunOptions`](agent_framework_core::agent::AgentRunOptions). When the
+//!   model calls one, the function-invocation loop returns the call unexecuted
+//!   (see [`crate::agui`]'s frontend-tool note), and it is framed as
+//!   `TOOL_CALL_*` **without** a `TOOL_CALL_RESULT` — the browser runs it. An
+//!   agent that does not support per-run options (anything other than a
+//!   `ChatAgent`) logs a warning and ignores the injected tools.
 //! - **State events are not emitted.** `STATE_SNAPSHOT` / `STATE_DELTA` /
 //!   `MESSAGES_SNAPSHOT` are driven by Python's `predict_state_config` /
 //!   `state_schema` (agentic generative-UI / predictive-state features) which
@@ -69,17 +76,19 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::{Agent, AgentRunOptions};
+use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     ChatMessage, Content, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
     FunctionResultContent, Role, TextContent,
 };
 
 use crate::registry::IntoAgentRegistration;
-use crate::sse::sse_events;
+use crate::sse::sse_events_stream;
 use crate::util;
 
 // ---------------------------------------------------------------------------
@@ -205,17 +214,101 @@ async fn run_agent(State(state): State<Arc<AgUiState>>, body: String) -> Respons
 
     let messages = input_to_messages(&input.messages);
 
-    let events = match state.agent.run(messages, None).await {
-        Ok(response) => run_events(&response, &thread_id, &run_id),
-        // Agent failure → RUN_ERROR in place of RUN_FINISHED (still a 200 SSE
-        // stream, per the AG-UI protocol; the error travels in-band).
-        Err(e) => vec![
-            run_started(&thread_id, &run_id),
-            json!({ "type": "RUN_ERROR", "message": e.to_string() }),
-        ],
+    // Client-declared tools become declaration-only per-run tools; when the
+    // model calls one it is returned unexecuted so the browser runs it.
+    let additional_tools = parse_client_tools(&input.tools);
+    let run_options = if additional_tools.is_empty() {
+        None
+    } else {
+        Some(AgentRunOptions {
+            additional_tools,
+            ..Default::default()
+        })
     };
 
-    sse_events(events)
+    // Live streaming: drive `run_stream` and frame each update into AG-UI
+    // events as it arrives (one `TEXT_MESSAGE_CONTENT` per text delta, etc.).
+    let agent = state.agent.clone();
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+    tokio::spawn(async move {
+        let _ = tx.unbounded_send(run_started(&thread_id, &run_id));
+        match agent.run_stream(messages, None, run_options).await {
+            Ok(mut stream) => {
+                let mut framing = AgUiFraming::new();
+                let mut errored = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(update) => {
+                            let mut events = Vec::new();
+                            framing.push_contents(&update.contents, &mut events);
+                            for ev in events {
+                                let _ = tx.unbounded_send(ev);
+                            }
+                        }
+                        // Agent failure mid-stream → RUN_ERROR in place of
+                        // RUN_FINISHED (still a 200 SSE stream; error in-band).
+                        Err(e) => {
+                            let _ = tx.unbounded_send(
+                                json!({ "type": "RUN_ERROR", "message": e.to_string() }),
+                            );
+                            errored = true;
+                            break;
+                        }
+                    }
+                }
+                if !errored {
+                    let mut events = Vec::new();
+                    framing.finalize(&mut events);
+                    events.push(run_finished(&thread_id, &run_id));
+                    for ev in events {
+                        let _ = tx.unbounded_send(ev);
+                    }
+                }
+            }
+            // Failure before the stream even opens.
+            Err(e) => {
+                let _ = tx.unbounded_send(json!({ "type": "RUN_ERROR", "message": e.to_string() }));
+            }
+        }
+    });
+
+    sse_events_stream(rx)
+}
+
+/// Map AG-UI client-declared tools (`{name, description, parameters}`) into
+/// **declaration-only** [`ToolDefinition`]s (no executor). Passed to the agent
+/// as per-run `additional_tools`: when the model calls one, the
+/// function-invocation loop returns the call to the caller unexecuted, and the
+/// AG-UI framing surfaces it as `TOOL_CALL_*` without a `TOOL_CALL_RESULT` —
+/// the browser executes it (the frontend-tool pattern).
+fn parse_client_tools(tools: &[Value]) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let obj = t.as_object()?;
+            let name = obj.get("name").and_then(Value::as_str)?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let description = obj
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let parameters = obj
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            Some(ToolDefinition {
+                name,
+                description,
+                parameters,
+                kind: ToolKind::Function,
+                approval_mode: ApprovalMode::NeverRequire,
+                executor: None,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -230,46 +323,55 @@ fn run_finished(thread_id: &str, run_id: &str) -> Value {
     json!({ "type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id })
 }
 
-/// Frame a completed agent run as the ordered AG-UI event sequence.
-fn run_events(
-    resp: &agent_framework_core::types::AgentRunResponse,
-    thread_id: &str,
-    run_id: &str,
-) -> Vec<Value> {
-    let mut events = vec![run_started(thread_id, run_id)];
+/// Incremental AG-UI event framing, driven one streamed update's contents at a
+/// time (via [`AgUiFraming::push_contents`]) and closed with
+/// [`AgUiFraming::finalize`]. This reproduces the bridge's stateful framing
+/// across the whole run: a single text message spans the run (lazily opened on
+/// the first text delta, never reset), and tool calls are tracked so unresulted
+/// ones (frontend tools) are closed at the end.
+struct AgUiFraming {
+    /// The run's single text message id, opened on the first text delta.
+    message_id: Option<String>,
+    /// Tool calls opened (in order) and those already closed via a result.
+    started_tools: Vec<String>,
+    ended_tools: HashSet<String>,
+}
 
-    // A single text message spans the whole run (the bridge lazily opens it on
-    // the first text delta and never resets it), closed once at finalize.
-    let mut message_id: Option<String> = None;
-    // Tool calls we opened (in order) and those already closed via a result.
-    let mut started_tools: Vec<String> = Vec::new();
-    let mut ended_tools: HashSet<String> = HashSet::new();
+impl AgUiFraming {
+    fn new() -> Self {
+        Self {
+            message_id: None,
+            started_tools: Vec::new(),
+            ended_tools: HashSet::new(),
+        }
+    }
 
-    for message in &resp.messages {
-        for content in &message.contents {
+    /// Frame one streamed update's `contents`, pushing AG-UI events onto `out`.
+    fn push_contents(&mut self, contents: &[Content], out: &mut Vec<Value>) {
+        for content in contents {
             match content {
                 Content::Text(TextContent { text, .. }) if !text.is_empty() => {
-                    let mid = match &message_id {
+                    let mid = match &self.message_id {
                         Some(mid) => mid.clone(),
                         None => {
                             let mid = util::msg_id();
-                            events.push(json!({
+                            out.push(json!({
                                 "type": "TEXT_MESSAGE_START",
                                 "messageId": mid,
                                 "role": "assistant",
                             }));
-                            message_id = Some(mid.clone());
+                            self.message_id = Some(mid.clone());
                             mid
                         }
                     };
-                    events.push(json!({
+                    out.push(json!({
                         "type": "TEXT_MESSAGE_CONTENT",
                         "messageId": mid,
                         "delta": text,
                     }));
                 }
                 Content::FunctionCall(fc) => {
-                    let tool_call_id = coalesce_call_id(fc, started_tools.last());
+                    let tool_call_id = coalesce_call_id(fc, self.started_tools.last());
                     if !fc.name.is_empty() {
                         let mut start = json!({
                             "type": "TOOL_CALL_START",
@@ -278,15 +380,15 @@ fn run_events(
                         });
                         // parentMessageId is included only when a text message
                         // is open (omitted-when-None, per the SDK).
-                        if let Some(mid) = &message_id {
+                        if let Some(mid) = &self.message_id {
                             start["parentMessageId"] = json!(mid);
                         }
-                        events.push(start);
-                        started_tools.push(tool_call_id.clone());
+                        out.push(start);
+                        self.started_tools.push(tool_call_id.clone());
                     }
                     if let Some(delta) = arguments_delta(fc) {
                         if !delta.is_empty() {
-                            events.push(json!({
+                            out.push(json!({
                                 "type": "TOOL_CALL_ARGS",
                                 "toolCallId": tool_call_id,
                                 "delta": delta,
@@ -296,10 +398,10 @@ fn run_events(
                 }
                 Content::FunctionResult(fr) => {
                     if !fr.call_id.is_empty() {
-                        events.push(json!({ "type": "TOOL_CALL_END", "toolCallId": fr.call_id }));
-                        ended_tools.insert(fr.call_id.clone());
+                        out.push(json!({ "type": "TOOL_CALL_END", "toolCallId": fr.call_id }));
+                        self.ended_tools.insert(fr.call_id.clone());
                     }
-                    events.push(json!({
+                    out.push(json!({
                         "type": "TOOL_CALL_RESULT",
                         "messageId": util::msg_id(),
                         "toolCallId": fr.call_id,
@@ -309,13 +411,13 @@ fn run_events(
                 }
                 Content::FunctionApprovalRequest(ar) => {
                     if !ar.function_call.call_id.is_empty() {
-                        events.push(json!({
+                        out.push(json!({
                             "type": "TOOL_CALL_END",
                             "toolCallId": ar.function_call.call_id,
                         }));
-                        ended_tools.insert(ar.function_call.call_id.clone());
+                        self.ended_tools.insert(ar.function_call.call_id.clone());
                     }
-                    events.push(approval_custom_event(ar));
+                    out.push(approval_custom_event(ar));
                 }
                 // Reasoning, data, uri, error, usage, hosted-file/-vector-store,
                 // approval *responses* → no AG-UI event (documented subset).
@@ -324,22 +426,20 @@ fn run_events(
         }
     }
 
-    // Close any tool call that never received a result (frontend-tool pattern),
-    // in the order they were opened — mirrors the orchestrator's
-    // `pending_without_end` sweep.
-    for tool_call_id in &started_tools {
-        if !ended_tools.contains(tool_call_id) {
-            events.push(json!({ "type": "TOOL_CALL_END", "toolCallId": tool_call_id }));
+    /// Emit the run's closing events: close any tool call that never received a
+    /// result (frontend-tool pattern), in open order, then close the run's text
+    /// message if one was opened. Mirrors the orchestrator's
+    /// `pending_without_end` sweep.
+    fn finalize(&mut self, out: &mut Vec<Value>) {
+        for tool_call_id in &self.started_tools {
+            if !self.ended_tools.contains(tool_call_id) {
+                out.push(json!({ "type": "TOOL_CALL_END", "toolCallId": tool_call_id }));
+            }
+        }
+        if let Some(mid) = &self.message_id {
+            out.push(json!({ "type": "TEXT_MESSAGE_END", "messageId": mid }));
         }
     }
-
-    // Close the run's text message, if one was opened.
-    if let Some(mid) = &message_id {
-        events.push(json!({ "type": "TEXT_MESSAGE_END", "messageId": mid }));
-    }
-
-    events.push(run_finished(thread_id, run_id));
-    events
 }
 
 /// The AG-UI `CUSTOM` event carrying a function-approval request (mirrors the
@@ -419,7 +519,8 @@ pub struct RunAgentInput {
     pub run_id: Option<String>,
     /// Conversation history (AG-UI `Message` objects).
     pub messages: Vec<Value>,
-    /// Client-declared tools (accepted but not injected — see module docs).
+    /// Client-declared tools, injected as declaration-only per-run tools so
+    /// their calls round-trip back to the browser (see module docs).
     pub tools: Vec<Value>,
     /// Shared state (accepted and ignored — see module docs).
     pub state: Option<Value>,

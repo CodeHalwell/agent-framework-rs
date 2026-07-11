@@ -24,6 +24,83 @@ use crate::types::{
 /// A boxed stream of agent run updates.
 pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentRunResponseUpdate>> + Send>>;
 
+/// Per-run option overrides for a single [`Agent::run_with_options`] /
+/// [`Agent::run_stream`] call, merged over the agent's build-time defaults.
+///
+/// Mirrors upstream `run`/`run_stream` per-call keyword arguments and .NET
+/// `AgentRunOptions`: the per-run [`ChatOptions`] take precedence over the
+/// agent's defaults (via [`ChatOptions::merge`], matching Python's
+/// `run_chat_options & ChatOptions(...)`), and
+/// [`additional_tools`](Self::additional_tools) are appended to the tool list
+/// for that call only.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunOptions {
+    /// Chat-option overrides merged over the agent's defaults (per-run wins).
+    pub chat_options: Option<ChatOptions>,
+    /// Extra tools available only for this run, appended to the agent's tools.
+    ///
+    /// Declaration-only tools (no executor) surface their calls back to the
+    /// caller instead of being executed locally — this is how a hosting
+    /// frontend injects client-side tools (see the AG-UI router).
+    pub additional_tools: Vec<ToolDefinition>,
+}
+
+impl AgentRunOptions {
+    /// Empty options (no overrides).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the per-run chat-option overrides (merged over the agent defaults,
+    /// per-run winning).
+    pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
+        self.chat_options = Some(options);
+        self
+    }
+
+    /// Append a tool available only for this run.
+    pub fn with_tool(mut self, tool: ToolDefinition) -> Self {
+        self.additional_tools.push(tool);
+        self
+    }
+
+    /// Append multiple tools available only for this run.
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
+        self.additional_tools.extend(tools);
+        self
+    }
+
+    /// Whether these options carry no overrides at all. Used by the default
+    /// [`Agent::run_with_options`] to decide whether to warn about ignoring
+    /// options it cannot honor.
+    pub fn is_empty(&self) -> bool {
+        self.chat_options.is_none() && self.additional_tools.is_empty()
+    }
+}
+
+/// Map a completed run's messages into buffered agent updates — one update per
+/// message, each with a distinct `message_id` so that re-aggregation via
+/// [`AgentRunResponse::from_updates`] keeps the message boundaries. Shared by
+/// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path replay.
+pub(crate) fn messages_to_updates(
+    messages: Vec<ChatMessage>,
+) -> Vec<Result<AgentRunResponseUpdate>> {
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let message_id = m.message_id.clone().or_else(|| Some(format!("msg-{i}")));
+            Ok(AgentRunResponseUpdate {
+                contents: m.contents,
+                role: Some(m.role),
+                author_name: m.author_name,
+                message_id,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
 /// A factory that builds a fresh [`ChatMessageStore`] for each new local
 /// thread, mirroring Python's `chat_message_store_factory`
 /// (`_agents.py:1088-1092`). Configured via
@@ -84,6 +161,54 @@ pub trait Agent: Send + Sync {
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentRunResponse>;
+
+    /// Run the agent to completion, applying per-run [`AgentRunOptions`] over
+    /// the agent's build-time defaults.
+    ///
+    /// The default implementation ignores `options` and delegates to
+    /// [`Agent::run`], emitting a `tracing::warn!` when non-empty options are
+    /// supplied — mirroring upstream agents that silently drop kwargs they do
+    /// not understand. Agents that support per-run overrides (notably
+    /// [`ChatAgent`]) override this.
+    async fn run_with_options(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<&mut AgentThread>,
+        options: AgentRunOptions,
+    ) -> Result<AgentRunResponse> {
+        if !options.is_empty() {
+            tracing::warn!(
+                agent = %self.id(),
+                "agent does not support per-run options; ignoring them"
+            );
+        }
+        self.run(messages, thread).await
+    }
+
+    /// Run the agent and stream incremental [`AgentRunResponseUpdate`]s.
+    ///
+    /// The default implementation is a **buffered fallback**: it runs to
+    /// completion via [`Agent::run_with_options`] and yields the response's
+    /// messages as updates. Agents with a real streaming backend (notably
+    /// [`ChatAgent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
+    /// A2A client agent) override this to stream incrementally.
+    ///
+    /// `thread` is taken **by value**: the returned stream owns it and writes
+    /// the conversation back once the stream is fully consumed. When the
+    /// thread's message store is shared (as [`ChatAgent`]'s is, via `Arc`), the
+    /// write-back is observable through a clone taken before streaming.
+    async fn run_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<AgentThread>,
+        options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        let mut owned = thread;
+        let response = self
+            .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
+            .await?;
+        Ok(futures::stream::iter(messages_to_updates(response.messages)).boxed())
+    }
 
     /// A stable identifier for this agent.
     fn id(&self) -> &str;
@@ -179,19 +304,47 @@ impl ChatAgent {
         self.chat_options.instructions.as_deref()
     }
 
-    /// Run and stream incremental updates.
+    /// Run and stream incremental updates — an ergonomic wrapper over the
+    /// object-safe [`Agent::run_stream`] trait method (the real streaming
+    /// implementation), accepting `impl IntoMessages`.
     ///
     /// The thread's history is updated when the stream completes; because
     /// message stores are shared via `Arc`, updates are visible on the original
-    /// thread once the returned stream is fully consumed.
+    /// thread once the returned stream is fully consumed. Pass per-run
+    /// [`AgentRunOptions`] to override the agent's defaults for this call only.
     pub async fn run_stream(
         &self,
         messages: impl IntoMessages,
         thread: Option<AgentThread>,
+        options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        let input = messages.into_messages();
+        Agent::run_stream(self, messages.into_messages(), thread, options).await
+    }
+
+    /// Ergonomic streaming run with a fresh thread and no per-run options
+    /// (mirrors [`ChatAgent::run_once`]).
+    pub async fn run_stream_once(&self, messages: impl IntoMessages) -> Result<AgentRunStream> {
+        Agent::run_stream(self, messages.into_messages(), None, None).await
+    }
+
+    /// Ergonomic run without an explicit thread.
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+        self.run(messages.into_messages(), None).await
+    }
+
+    /// The real streaming implementation, shared by the [`Agent::run_stream`]
+    /// trait impl. Kept as an inherent helper so the trait method stays a thin
+    /// forwarder.
+    async fn run_stream_impl(
+        &self,
+        input: Vec<ChatMessage>,
+        thread: Option<AgentThread>,
+        run_options: AgentRunOptions,
+    ) -> Result<AgentRunStream> {
         let mut thread = thread.unwrap_or_else(|| self.get_new_thread());
-        let (final_messages, options) = self.prepare_request(&input, &mut thread).await?;
+        let (final_messages, options) = self
+            .prepare_request(&input, &mut thread, &run_options)
+            .await?;
 
         // When agent middleware is configured, route the run through the same
         // pipeline as `run` (so guardrails/rewrites/termination apply) and then
@@ -214,23 +367,8 @@ impl ChatAgent {
             if let Some(cp) = self.resolve_provider(&thread) {
                 cp.invoked(&input, &response.messages, None).await?;
             }
-            let updates: Vec<Result<AgentRunResponseUpdate>> = response
-                .messages
-                .into_iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    // Distinct message ids keep boundaries when re-aggregated.
-                    let message_id = m.message_id.clone().or_else(|| Some(format!("msg-{i}")));
-                    Ok(AgentRunResponseUpdate {
-                        contents: m.contents,
-                        role: Some(m.role),
-                        author_name: m.author_name,
-                        message_id,
-                        ..Default::default()
-                    })
-                })
-                .collect();
-            return Ok(futures::stream::iter(updates).boxed());
+            // Distinct message ids keep boundaries when re-aggregated.
+            return Ok(futures::stream::iter(messages_to_updates(response.messages)).boxed());
         }
 
         let (final_messages, options) = self
@@ -262,17 +400,13 @@ impl ChatAgent {
         Ok(stream.boxed())
     }
 
-    /// Ergonomic run without an explicit thread.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
-        self.run(messages.into_messages(), None).await
-    }
-
     /// Assemble the final message list and options for a request, applying
     /// thread history and context providers.
     async fn prepare_request(
         &self,
         input: &[ChatMessage],
         thread: &mut AgentThread,
+        run_options: &AgentRunOptions,
     ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
         // Fire the context-provider `thread_created` hook when a run uses a
         // service-managed thread (mirrors `_agents.py:1264-1265`). The id
@@ -284,7 +418,14 @@ impl ChatAgent {
             }
         }
 
-        let mut options = self.chat_options.clone();
+        // Merge per-run chat-option overrides over the agent's defaults, with
+        // the per-run side winning (mirrors Python's `run_chat_options &
+        // ChatOptions(...)`, whose right-hand side takes precedence — see
+        // `ChatOptions::merge`).
+        let mut options = match &run_options.chat_options {
+            Some(overrides) => self.chat_options.clone().merge(overrides.clone()),
+            None => self.chat_options.clone(),
+        };
         options.conversation_id = service_thread_id;
 
         let mut history = thread.list_messages().await?;
@@ -310,6 +451,16 @@ impl ChatAgent {
                 if !options.tools.iter().any(|existing| existing.name == t.name) {
                     options.tools.push(t);
                 }
+            }
+        }
+
+        // Append per-run additional tools (deduplicated by name), available for
+        // this call only. Declaration-only tools (no executor) surface their
+        // calls back to the caller (frontend-tool pattern) via the
+        // function-invocation loop's declaration-only handling in `client.rs`.
+        for t in &run_options.additional_tools {
+            if !options.tools.iter().any(|existing| existing.name == t.name) {
+                options.tools.push(t.clone());
             }
         }
 
@@ -353,10 +504,7 @@ impl ChatAgent {
                     }
                 }
                 Err(err) => {
-                    span.record(
-                        crate::observability::attr::ERROR_TYPE,
-                        crate::observability::error_type(err).as_str(),
-                    );
+                    crate::observability::record_error(&span, err);
                 }
             }
             result
@@ -659,6 +807,16 @@ impl Agent for ChatAgent {
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentRunResponse> {
+        self.run_with_options(messages, thread, AgentRunOptions::default())
+            .await
+    }
+
+    async fn run_with_options(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<&mut AgentThread>,
+        options: AgentRunOptions,
+    ) -> Result<AgentRunResponse> {
         let mut owned_thread;
         let thread: &mut AgentThread = match thread {
             Some(t) => t,
@@ -668,8 +826,9 @@ impl Agent for ChatAgent {
             }
         };
 
-        let (final_messages, options) = self.prepare_request(&messages, thread).await?;
-        let response = match self.run_core(final_messages, options, false).await {
+        let (final_messages, chat_options) =
+            self.prepare_request(&messages, thread, &options).await?;
+        let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
                 // Failure path: let context providers observe the error
@@ -697,6 +856,16 @@ impl Agent for ChatAgent {
         }
 
         Ok(response)
+    }
+
+    async fn run_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<AgentThread>,
+        options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        self.run_stream_impl(messages, thread, options.unwrap_or_default())
+            .await
     }
 
     fn id(&self) -> &str {

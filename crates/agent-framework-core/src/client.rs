@@ -14,7 +14,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::middleware::{FunctionInvocationContext, MiddlewarePipeline, Terminal};
-use crate::tools::{FunctionInvocationConfig, ToolDefinition};
+use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
@@ -138,6 +138,17 @@ fn executable_tools(options: &ChatOptions) -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Whether `tool` is a *declaration-only* function tool: a known function with
+/// no local executor. Mirrors Python's `AIFunction.declaration_only`. A call to
+/// such a tool is returned to the caller unexecuted (the frontend-tool pattern
+/// that makes AG-UI client-side tools work). Hosted tools (web search, MCP, …)
+/// are deliberately excluded — they are not function tools and a call whose
+/// name matches none of the local function tools is treated as unknown, not
+/// declaration-only, exactly as Python's `_get_tool_map` omits them.
+fn is_declaration_only(tool: &ToolDefinition) -> bool {
+    tool.kind == ToolKind::Function && tool.executor.is_none()
+}
+
 /// The exact rejection payload Python emits for a denied tool call.
 const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by user.";
 
@@ -200,25 +211,45 @@ async fn execute_tool_call(
             };
             let exec = def.executor.as_ref().unwrap().clone();
             let tool_name = def.name.clone();
+            let description = def.description.clone();
             let call_id = call.call_id.clone();
             let terminal: Terminal<FunctionInvocationContext> = Box::new(move |mut ctx| {
                 Box::pin(async move {
                     if ctx.terminate {
                         return Ok(ctx);
                     }
-                    let span = crate::observability::tool_span(&tool_name, &call_id);
+                    let span = crate::observability::tool_span_ex(
+                        &tool_name,
+                        &call_id,
+                        Some(&description),
+                    );
+                    let capture =
+                        crate::observability::ObservabilityConfig::from_env().enable_sensitive_data;
+                    crate::observability::record_tool_arguments(&span, &ctx.arguments, capture);
+                    #[cfg(feature = "otel-metrics")]
+                    let started = std::time::Instant::now();
                     let outcome = async {
                         let result = exec.invoke(ctx.arguments.clone()).await;
                         if let Err(e) = &result {
-                            tracing::Span::current().record(
-                                crate::observability::attr::ERROR_TYPE,
-                                crate::observability::error_type(e).as_str(),
-                            );
+                            crate::observability::record_error(&tracing::Span::current(), e);
                         }
                         result
                     }
-                    .instrument(span)
+                    .instrument(span.clone())
                     .await;
+                    #[cfg(feature = "otel-metrics")]
+                    crate::observability::metrics::record_function_invocation_duration(
+                        &tool_name,
+                        started.elapsed(),
+                        outcome
+                            .as_ref()
+                            .err()
+                            .map(crate::observability::error_type)
+                            .as_deref(),
+                    );
+                    if let Ok(value) = &outcome {
+                        crate::observability::record_tool_result(&span, value, capture);
+                    }
                     ctx.result = Some(outcome?);
                     Ok(ctx)
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
@@ -456,6 +487,30 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             approval_contents,
                         ));
                     }
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut resp.messages);
+                    resp.messages = msgs;
+                    return Ok(resp);
+                }
+
+                // Declaration-only calls: a call targeting a KNOWN tool that has
+                // no local executor (declaration-only — e.g. an AG-UI frontend
+                // tool, or a per-run `additional_tools` entry) terminates the
+                // loop and returns the response with the `FunctionCallContent`
+                // intact, so the caller can execute it. Mirrors Python's
+                // `_try_execute_function_calls` `declaration_only` branch
+                // (`_tools.py:1396-1420`): if *any* requested call is
+                // declaration-only, the whole response is returned unexecuted.
+                // A genuinely unknown tool name is NOT declaration-only and
+                // keeps today's not-found handling in `execute_tool_call`.
+                let has_declaration_only = calls.iter().any(|c| {
+                    options
+                        .tools
+                        .iter()
+                        .any(|t| t.name == c.name && is_declaration_only(t))
+                });
+                if has_declaration_only {
+                    let mut resp = response;
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
                     resp.messages = msgs;

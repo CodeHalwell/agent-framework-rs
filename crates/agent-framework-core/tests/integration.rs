@@ -86,7 +86,7 @@ async fn agent_streaming_updates_thread() {
 
     let mut thread = agent.get_new_thread();
     let mut stream = agent
-        .run_stream("hello", Some(thread.clone()))
+        .run_stream("hello", Some(thread.clone()), None)
         .await
         .unwrap();
     let mut text = String::new();
@@ -279,7 +279,7 @@ async fn middleware_applies_on_streaming_path() {
         .build();
 
     // Streaming must honor the middleware just like `run` does.
-    let mut stream = agent.run_stream("hi", None).await.unwrap();
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
     let mut text = String::new();
     while let Some(u) = stream.next().await {
         text.push_str(&u.unwrap().text());
@@ -423,7 +423,7 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
         .tool(noop)
         .build();
 
-    let mut stream = agent.run_stream("go", None).await.unwrap();
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
     let mut updates = Vec::new();
     while let Some(u) = stream.next().await {
         updates.push(u.unwrap());
@@ -1331,7 +1331,7 @@ async fn thread_created_fires_on_adoption_when_streaming() {
         .context_provider(aggregate)
         .build();
 
-    let mut stream = agent.run_stream("hi", None).await.unwrap();
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
     while let Some(u) = stream.next().await {
         u.unwrap();
     }
@@ -1400,7 +1400,7 @@ async fn invoked_hook_observes_streaming_failure() {
         .context_provider(aggregate)
         .build();
 
-    let err = agent.run_stream("hi", None).await.err().unwrap();
+    let err = agent.run_stream("hi", None, None).await.err().unwrap();
     assert!(err.to_string().contains("boom"));
     assert!(
         invoked_error
@@ -1492,4 +1492,304 @@ async fn agent_get_new_thread_with_service_id() {
     let thread = agent.get_new_thread_with_service_id("svc-9").unwrap();
     assert_eq!(thread.service_thread_id(), Some("svc-9"));
     assert!(thread.message_store().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// GAP 1.4 — trait-level streaming; GAP 1.5 — per-run options; Task 3 — declaration-only
+// ---------------------------------------------------------------------------
+
+/// A client that streams a fixed list of text deltas (real incremental
+/// streaming, distinct from `MockClient`'s per-message replay).
+#[derive(Clone)]
+struct DeltaClient {
+    deltas: Vec<String>,
+}
+
+#[async_trait]
+impl ChatClient for DeltaClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Ok(ChatResponse::from_text(self.deltas.concat()))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let updates: Vec<Result<ChatResponseUpdate>> = self
+            .deltas
+            .iter()
+            .map(|d| Ok(ChatResponseUpdate::text(d.clone())))
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+/// A client that records every `ChatOptions` it is handed (to assert per-run
+/// option precedence and per-run tool visibility).
+#[derive(Clone)]
+struct RecordingClient {
+    seen: Arc<Mutex<Vec<ChatOptions>>>,
+}
+
+impl RecordingClient {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatClient for RecordingClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        self.seen.lock().unwrap().push(options);
+        Ok(ChatResponse::from_text("ok"))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let updates: Vec<Result<ChatResponseUpdate>> = resp
+            .messages
+            .into_iter()
+            .map(|m| {
+                Ok(ChatResponseUpdate {
+                    contents: m.contents,
+                    role: Some(m.role),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+fn declaration_only_tool(name: &str) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: String::new(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        kind: ToolKind::Function,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
+#[tokio::test]
+async fn trait_default_run_stream_buffers_for_minimal_agent() {
+    // A minimal custom agent implementing only `run` + `id` gets the trait's
+    // default buffered `run_stream` for free.
+    struct EchoAgent;
+    #[async_trait]
+    impl Agent for EchoAgent {
+        async fn run(
+            &self,
+            messages: Vec<ChatMessage>,
+            _thread: Option<&mut AgentThread>,
+        ) -> Result<AgentRunResponse> {
+            let text = messages.last().map(ChatMessage::text).unwrap_or_default();
+            Ok(AgentRunResponse {
+                messages: vec![ChatMessage::assistant(format!("echo: {text}"))],
+                ..Default::default()
+            })
+        }
+        fn id(&self) -> &str {
+            "echo"
+        }
+    }
+
+    let agent = EchoAgent;
+    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut count = 0;
+    while let Some(update) = stream.next().await {
+        text.push_str(&update.unwrap().text());
+        count += 1;
+    }
+    assert_eq!(text, "echo: hi");
+    assert_eq!(count, 1, "one buffered update per response message");
+}
+
+#[tokio::test]
+async fn chat_agent_trait_stream_yields_real_deltas() {
+    // ChatAgent's real streaming override forwards one update per model delta.
+    let client = DeltaClient {
+        deltas: vec!["Hel".into(), "lo ".into(), "world".into()],
+    };
+    let agent = ChatAgent::builder(client).build();
+    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    while let Some(update) = stream.next().await {
+        deltas.push(update.unwrap().text());
+    }
+    assert_eq!(deltas.len(), 3, "one update per streamed delta");
+    assert_eq!(deltas.concat(), "Hello world");
+}
+
+#[tokio::test]
+async fn per_run_chat_options_override_agent_defaults() {
+    // Agent default temperature 0.2; a per-run override of 0.9 must win, matching
+    // Python's `run_chat_options & ChatOptions(...)`.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client).temperature(0.2).build();
+
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        temperature: Some(0.9),
+        ..Default::default()
+    });
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].temperature,
+        Some(0.9),
+        "per-run temperature wins over the agent default"
+    );
+}
+
+#[tokio::test]
+async fn per_run_tools_are_visible_only_for_that_call() {
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .tool(declaration_only_tool("base_tool"))
+        .build();
+
+    // Run 1: inject an extra per-run tool.
+    let options = AgentRunOptions::new().with_tool(declaration_only_tool("run_tool"));
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+    // Run 2: no per-run tools.
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let names =
+        |i: usize| -> Vec<String> { recorded[i].tools.iter().map(|t| t.name.clone()).collect() };
+    assert!(names(0).contains(&"base_tool".to_string()));
+    assert!(
+        names(0).contains(&"run_tool".to_string()),
+        "per-run tool visible for that call"
+    );
+    assert!(
+        !names(1).contains(&"run_tool".to_string()),
+        "per-run tool must NOT leak into the next call"
+    );
+    assert!(names(1).contains(&"base_tool".to_string()));
+}
+
+#[tokio::test]
+async fn declaration_only_tool_call_is_returned_to_caller() {
+    // The model calls a known-but-declaration-only tool; the loop must return
+    // the response with the FunctionCallContent intact (frontend-tool pattern).
+    let call = FunctionCallContent::new(
+        "c1",
+        "frontend_tool",
+        Some(FunctionArguments::Raw(json!({"x": 1}).to_string())),
+    );
+    let resp = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![resp]));
+    // A real executable tool is present so the invocation loop actually engages;
+    // the model instead calls the declaration-only tool, which the loop must
+    // return unexecuted rather than error on.
+    let real_tool = AiFunction::new(
+        "real",
+        "",
+        json!({ "type": "object", "properties": {} }),
+        |_args: Value| async { Ok(Value::Null) },
+    )
+    .into_definition();
+    let options = ChatOptions {
+        tools: vec![real_tool, declaration_only_tool("frontend_tool")],
+        ..Default::default()
+    };
+    let out = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+
+    let calls = out.function_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "frontend_tool");
+    let has_result = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .any(|c| matches!(c, Content::FunctionResult(_)));
+    assert!(!has_result, "declaration-only call must not be executed");
+}
+
+#[tokio::test]
+async fn unknown_tool_call_is_not_declaration_only() {
+    // A genuinely unknown tool name keeps the not-found error behavior (an
+    // error result, loop continues), NOT the declaration-only early return.
+    let call = FunctionCallContent::new("c1", "ghost_tool", None);
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("done");
+    // A real executable tool is present so the loop engages, but the model calls
+    // a different, unknown tool.
+    let real_tool = AiFunction::new(
+        "real",
+        "",
+        json!({ "type": "object", "properties": {} }),
+        |_args: Value| async { Ok(Value::Null) },
+    )
+    .into_definition();
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ask, answer]));
+    let options = ChatOptions {
+        tools: vec![real_tool],
+        ..Default::default()
+    };
+    let out = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+
+    let has_error_result = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()));
+    assert!(
+        has_error_result,
+        "unknown tool yields an error result, not a declaration-only return"
+    );
+    assert_eq!(out.text(), "done");
 }

@@ -24,6 +24,10 @@ azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
+# GenAI metrics (token-usage / operation-duration / function-invocation
+# histograms) via the opentelemetry API crate — see agent-framework-core's
+# observability module docs.
+otel-metrics = ["agent-framework-core/otel-metrics"]
 full = [
     "openai",
     "anthropic",

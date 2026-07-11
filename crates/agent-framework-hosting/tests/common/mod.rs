@@ -8,14 +8,76 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
+use futures::StreamExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::Result;
 use agent_framework_core::threads::AgentThread;
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, UsageDetails};
+use agent_framework_core::types::{
+    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, Role, UsageDetails,
+};
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
+
+/// A scripted agent that streams multiple text deltas, to exercise the live SSE
+/// paths: `run` returns the concatenation as one message; `run_stream` yields
+/// one [`AgentRunResponseUpdate`] per delta (real incremental streaming).
+pub struct StreamingAgent {
+    id: String,
+    deltas: Vec<String>,
+}
+
+impl StreamingAgent {
+    pub fn new(id: impl Into<String>, deltas: Vec<&str>) -> Self {
+        Self {
+            id: id.into(),
+            deltas: deltas.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    pub fn arc(self) -> Arc<dyn Agent> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl Agent for StreamingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _thread: Option<&mut AgentThread>,
+    ) -> Result<AgentRunResponse> {
+        Ok(AgentRunResponse {
+            messages: vec![ChatMessage::assistant(self.deltas.concat())],
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _thread: Option<AgentThread>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        let updates: Vec<Result<AgentRunResponseUpdate>> = self
+            .deltas
+            .iter()
+            .map(|d| {
+                Ok(AgentRunResponseUpdate {
+                    contents: vec![Content::text(d)],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
 
 /// A scripted agent: echoes the concatenated input text behind a fixed prefix,
 /// so tests can verify both routing and input parsing. Optionally reports usage.

@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::Value;
 
 use super::context::WorkflowContext;
@@ -38,7 +39,7 @@ use super::events::WorkflowEvent;
 use super::executor::Executor;
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::{AgentRunResponse, ChatMessage};
+use crate::types::{AgentRunResponse, AgentRunResponseUpdate, ChatMessage};
 
 mod concurrent;
 mod group_chat;
@@ -99,9 +100,15 @@ pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage
 }
 
 /// Run an agent over a conversation and surface its activity on the event
-/// stream (an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate) per message and a
-/// final [`AgentRun`](WorkflowEvent::AgentRun)), returning the response with
+/// stream incrementally: an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate)
+/// per streamed [`AgentRunResponseUpdate`] as it arrives, then a final
+/// aggregated [`AgentRun`](WorkflowEvent::AgentRun). Returns the response with
 /// every message attributed to `author`.
+///
+/// Mirrors upstream `AgentExecutor`'s streaming (`_agent_executor.py:268-360`),
+/// which drives the agent via `run_stream` and emits an `AgentRunUpdateEvent`
+/// per update before the terminal `AgentRunEvent`. The updates are aggregated
+/// back into an [`AgentRunResponse`] via [`AgentRunResponse::from_updates`].
 pub(crate) async fn run_agent_and_emit(
     agent: &Arc<dyn Agent>,
     conversation: Vec<ChatMessage>,
@@ -109,18 +116,26 @@ pub(crate) async fn run_agent_and_emit(
     author: &str,
     ctx: &WorkflowContext,
 ) -> Result<AgentRunResponse> {
-    let mut response = agent.run(conversation, None).await?;
+    let mut stream = agent.run_stream(conversation, None, None).await?;
+    let mut updates: Vec<AgentRunResponseUpdate> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let mut update = item?;
+        if update.author_name.is_none() {
+            update.author_name = Some(author.to_string());
+        }
+        if let Ok(update_value) = serde_json::to_value(&update) {
+            ctx.add_event(WorkflowEvent::AgentRunUpdate {
+                executor_id: executor_id.to_string(),
+                update: update_value,
+            });
+        }
+        updates.push(update);
+    }
+
+    let mut response = AgentRunResponse::from_updates(updates);
     for msg in &mut response.messages {
         if msg.author_name.is_none() {
             msg.author_name = Some(author.to_string());
-        }
-    }
-    for msg in &response.messages {
-        if let Ok(update) = serde_json::to_value(msg) {
-            ctx.add_event(WorkflowEvent::AgentRunUpdate {
-                executor_id: executor_id.to_string(),
-                update,
-            });
         }
     }
     if let Ok(resp_value) = serde_json::to_value(&response) {

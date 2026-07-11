@@ -144,7 +144,7 @@ async fn workflow_agent_streams_agent_updates() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "streamer");
 
-    let mut stream = wf_agent.run_stream(vec![ChatMessage::user("go")]);
+    let mut stream = wf_agent.run_stream_with_thread(vec![ChatMessage::user("go")], None);
     let mut text = String::new();
     while let Some(update) = stream.next().await {
         text.push_str(&update.unwrap().text());
@@ -267,4 +267,23 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
         history.iter().any(|m| m.text() == "streamed-reply"),
         "response missing from thread: {history:?}"
     );
+}
+
+#[tokio::test]
+async fn workflow_agent_trait_run_stream_yields_updates() {
+    // The object-safe `Agent::run_stream` override streams the workflow's agent
+    // activity (exercised through a `dyn Agent`, as hosting/orchestration do).
+    let a = agent("A", vec!["hello-from-A"]);
+    let workflow = SequentialBuilder::new().add(a).build().unwrap();
+    let wf_agent: Arc<dyn Agent> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
+
+    let mut stream = wf_agent
+        .run_stream(vec![ChatMessage::user("go")], None, None)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(update) = stream.next().await {
+        text.push_str(&update.unwrap().text());
+    }
+    assert!(text.contains("hello-from-A"), "streamed via trait: {text}");
 }

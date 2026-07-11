@@ -8,7 +8,10 @@ use agent_framework_hosting::AgentHost;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{echo_workflow, get_json, parse_sse, parse_sse_json, post_json, post_raw, MockAgent};
+use common::{
+    echo_workflow, get_json, parse_sse, parse_sse_json, post_json, post_raw, MockAgent,
+    StreamingAgent,
+};
 
 fn host() -> AgentHost {
     AgentHost::new()
@@ -250,4 +253,34 @@ async fn responses_unknown_entity_is_404() {
     let (status, resp) = post_json(host().into_router(), "/v1/responses", &body).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(resp["error"]["message"].as_str().unwrap().contains("ghost"));
+}
+
+#[tokio::test]
+async fn responses_agent_stream_emits_incremental_deltas() {
+    // A multi-delta streaming agent yields one `response.output_text.delta` per
+    // update, and the terminal `response.completed` aggregates them.
+    let host = AgentHost::new().agent(
+        "streamer",
+        StreamingAgent::new("s1", vec!["Hel", "lo ", "world"]).arc(),
+    );
+
+    let body = json!({
+        "input": "go",
+        "stream": true,
+        "metadata": { "entity_id": "streamer" },
+    });
+    let (status, text) = post_raw(host.into_router(), "/v1/responses", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = parse_sse_json(&text);
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, vec!["Hel", "lo ", "world"], "one delta per update");
+
+    let completed = events.last().unwrap();
+    assert_eq!(completed["type"], "response.completed");
+    assert_eq!(completed["response"]["output_text"], "Hello world");
 }

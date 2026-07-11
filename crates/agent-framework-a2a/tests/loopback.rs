@@ -397,3 +397,76 @@ async fn resubscribe_streams_task_status_updates_over_a_real_loopback_socket() {
     outcome.expect("resubscribe_streams_task_status_updates_over_a_real_loopback_socket timed out");
     server.join().expect("loopback server thread panicked");
 }
+
+#[tokio::test]
+async fn a2a_agent_run_stream_maps_sse_events_to_updates() {
+    use agent_framework_a2a::{
+        A2AAgent, AgentCard, Message, MessageRole, Part, SendMessageResult, TextPart,
+    };
+    use agent_framework_core::agent::Agent;
+    use agent_framework_core::types::ChatMessage;
+    use futures::StreamExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener local addr");
+
+    let server = std::thread::spawn(move || {
+        let mut stream = accept_with_timeout(&listener);
+        let (_line, body) = read_http_request(&mut stream);
+        let request: Value = serde_json::from_slice(&body).expect("parse JSON-RPC request body");
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("message/stream"),
+            "A2AAgent::run_stream must use the streaming endpoint"
+        );
+        let id = extract_jsonrpc_id(&body);
+        let answer = Message {
+            kind: "message".to_string(),
+            role: MessageRole::Agent,
+            parts: vec![Part::Text(TextPart {
+                text: "The weather is sunny.".into(),
+                metadata: None,
+            })],
+            message_id: "m1".into(),
+            task_id: None,
+            context_id: Some("ctx-1".into()),
+            metadata: None,
+        };
+        write_sse_response(
+            &mut stream,
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": serde_json::to_value(SendMessageResult::Message(answer)).unwrap(),
+            })],
+        );
+    });
+
+    // `from_card` caches the card, so run_stream performs no discovery GET —
+    // the fake server only needs to serve the single `message/stream` POST.
+    let card = AgentCard {
+        name: "weather".into(),
+        url: format!("http://{addr}/rpc"),
+        ..Default::default()
+    };
+    let agent = A2AAgent::from_card("weather", card);
+
+    let updates = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("weather?")], None, None)
+            .await
+            .expect("run_stream opens");
+        let mut collected = Vec::new();
+        while let Some(update) = stream.next().await {
+            collected.push(update.expect("update ok"));
+        }
+        collected
+    })
+    .await
+    .expect("run_stream timed out");
+
+    server.join().expect("loopback server thread panicked");
+
+    let text: String = updates.iter().map(|u| u.text()).collect();
+    assert_eq!(text, "The weather is sunny.");
+    assert_eq!(updates[0].author_name.as_deref(), Some("weather"));
+}

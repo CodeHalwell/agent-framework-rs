@@ -128,16 +128,19 @@
 //!   into one question string (relevant when a caller passes several
 //!   messages in one call, e.g. `agent.run(["Hello", "How are you?"])`);
 //!   that per-call flattening is not reproduced here.
-//! - **`run_stream` is not implemented.** [`agent_framework_core::agent::Agent`]
-//!   has no streaming method (unlike Python's `BaseAgent.run_stream`), so
-//!   there is nothing to plug a token stream into. This also sidesteps a
-//!   genuine oddity in the Python reference: `run_stream`'s
-//!   `_process_activities(activities, streaming=True)` call only ever
-//!   surfaces `type == "typing"` activity text as updates and *never*
-//!   yields the final `type == "message"` activity — this port's `run`
-//!   instead mirrors Python's **non**-streaming path
-//!   (`streaming=False`), which correctly surfaces `message` activities and
-//!   skips `typing`/other types.
+//! - **`run_stream` uses the trait's buffered default.**
+//!   [`agent_framework_core::agent::Agent`] now has an object-safe `run_stream`
+//!   (with a default that runs to completion and replays the messages as
+//!   updates), but [`CopilotStudioAgent`] deliberately does **not** override it
+//!   with real streaming. This sidesteps a genuine oddity in the Python
+//!   reference: `run_stream`'s `_process_activities(activities,
+//!   streaming=True)` call only ever surfaces `type == "typing"` activity text
+//!   as updates and *never* yields the final `type == "message"` activity — so
+//!   real Copilot Studio streaming would emit only interim typing indicators.
+//!   This port's [`Agent::run`](agent_framework_core::agent::Agent::run)
+//!   mirrors Python's **non**-streaming path (`streaming=False`), which
+//!   correctly surfaces `message` activities and skips `typing`/other types;
+//!   the buffered `run_stream` default then replays that complete answer.
 //! - **Response parsing accepts a bare JSON array**, not just SSE `event:
 //!   activity` / `data:` frames — see [`activity::parse_activities`] for
 //!   why.
