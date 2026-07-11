@@ -1,5 +1,11 @@
 # Feature parity: Rust vs. Python vs. .NET
 
+> **Note:** an independent audit of this matrix found a number of rows that
+> overstate parity, several silent-data-loss bugs, and whole surfaces the
+> matrix does not track (Assistants clients, AG-UI client, per-run options,
+> thread persistence, metrics, …). See [GAP_ANALYSIS.md](GAP_ANALYSIS.md)
+> for the verified findings and the corrections this file needs.
+
 A snapshot of `agent-framework-rs` against the upstream [Microsoft Agent
 Framework](https://github.com/microsoft/agent-framework) (Python and .NET), as
 of this port's current state. The **Rust** column is ground-truthed against
