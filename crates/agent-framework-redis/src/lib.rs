@@ -10,9 +10,12 @@
 //!   of the Python `RedisChatMessageStore`.
 //! - [`RedisContextProvider`] — scoped long-term memory storage/retrieval.
 //!   Ports the Python `RedisProvider`'s *scoping* semantics
-//!   (application/agent/user/thread id) but **not** its RediSearch-backed
-//!   vector/full-text search — see the [`context_provider`] module docs for
-//!   the simplification this crate implements instead, and why.
+//!   (application/agent/user/thread id). When the connected server has
+//!   RediSearch loaded (Redis Stack), retrieval is backed by a real
+//!   `FT.SEARCH` BM25 full-text index; otherwise it falls back to a
+//!   `SCAN`+token-match path over plain Redis. Vector/hybrid search is
+//!   **not** ported — see the [`context_provider`] module docs for the full
+//!   picture.
 //!
 //! Both types connect lazily: constructing them only parses the Redis URL
 //! (via [`redis::Client::open`]); the actual

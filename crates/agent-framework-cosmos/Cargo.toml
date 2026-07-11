@@ -18,6 +18,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
+# Master-key request signing (HMAC-SHA256 over a canonical string, per
+# https://learn.microsoft.com/en-us/rest/api/cosmos-db/access-control-on-cosmosdb-resources).
+# All three are small, pure-Rust, and already resolve cleanly alongside this
+# workspace's existing `reqwest`/TLS dependency graph (`base64` and `digest`,
+# the shared base of `hmac`/`sha2`, are already present in Cargo.lock).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
