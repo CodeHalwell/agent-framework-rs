@@ -251,7 +251,7 @@ fn select_recent(
         }
     }
 
-    entries.sort_by(|a, b| b.rank.cmp(&a.rank));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.rank));
     entries.truncate(limit);
     entries
 }

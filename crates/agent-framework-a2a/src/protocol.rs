@@ -113,10 +113,7 @@ pub fn parse_stream_event(value: &Value) -> Result<MessageStreamEvent> {
 /// legitimately might.
 pub fn drain_sse_events(buf: &mut String) -> Vec<Result<MessageStreamEvent>> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = buf.find("\n\n") else {
-            break;
-        };
+    while let Some(pos) = buf.find("\n\n") {
         let event_text = buf[..pos].to_string();
         buf.drain(..pos + 2);
         if let Some(parsed) = parse_sse_event_text(&event_text) {
