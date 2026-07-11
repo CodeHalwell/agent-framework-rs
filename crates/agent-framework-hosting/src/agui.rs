@@ -47,7 +47,7 @@
 //! - **Run-to-completion framing.** The object-safe [`Agent`] trait exposes only
 //!   `run` (not a streaming method), so — exactly like the [`crate::devui`] and
 //!   [`crate::openai_compat`] surfaces — we run the agent to completion and then
-//!   frame the final [`AgentRunResponse`] as the event sequence above. `type`
+//!   frame the final `AgentRunResponse` as the event sequence above. `type`
 //!   ordering and payloads still match the bridge; only true token-level
 //!   streaming is lost (each text message arrives as one `TEXT_MESSAGE_CONTENT`).
 //! - **Client `tools` are accepted but not injected.** `Agent::run` takes no

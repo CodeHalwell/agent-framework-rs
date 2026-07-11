@@ -71,7 +71,7 @@ use crate::client::CosmosRestClient;
 
 /// Default Cosmos DB container partition key path — every container this
 /// store creates is partitioned by `threadId`. Re-exported from
-/// [`crate::client::PARTITION_KEY_PATH`] for visibility at the public API
+/// the internal `client::PARTITION_KEY_PATH` for visibility at the public API
 /// surface.
 pub const DEFAULT_PARTITION_KEY_PATH: &str = crate::client::PARTITION_KEY_PATH;
 
@@ -121,7 +121,7 @@ fn seq_base() -> i64 {
 
 /// Cosmos DB (NoSQL API)-backed [`ChatMessageStore`]: every thread's
 /// messages are documents in one container, partitioned by `threadId`. See
-/// the [module docs](self) for the wire shape and this port's divergences
+/// the module docs for the wire shape and this port's divergences
 /// from .NET's `CosmosChatMessageStore`.
 ///
 /// ```no_run

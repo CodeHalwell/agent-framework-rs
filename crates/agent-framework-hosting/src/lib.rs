@@ -8,7 +8,7 @@
 //!   `agent_framework_devui` server:
 //!   `GET /health`, `GET /v1/entities`, `GET /v1/entities/{id}/info`,
 //!   `POST /v1/responses` (JSON or SSE), plus an embedded single-file debug
-//!   page at `GET /` and `GET /ui` (see [`ui`]). See [`devui`].
+//!   page at `GET /` and `GET /ui`. See [`devui`].
 //! - **A2A hosting** ([`a2a::A2ARouter`]) — the Agent-to-Agent protocol:
 //!   `GET /.well-known/agent-card.json` and a JSON-RPC 2.0 `POST /`.
 //! - **OpenAI Chat Completions** ([`openai_compat::OpenAiRouter`]) —

@@ -5,7 +5,7 @@
 //! [`crate::client`]'s module docs for exactly what's cut (the protection-
 //! scopes precheck, caching, and background content-activity logging) and
 //! why. What *is* ported faithfully: per-message request construction
-//! ([`build_request`]) and the GUID-based user-id resolution algorithm
+//! (the internal `build_request`) and the GUID-based user-id resolution algorithm
 //! (mirrors `ScopedContentProcessor._map_messages`'s
 //! `additional_properties["user_id"]` / `author_name` scan, minus the
 //! bearer-token-JWT fallback — see the crate docs).

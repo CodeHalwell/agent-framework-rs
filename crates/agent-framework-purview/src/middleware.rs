@@ -172,7 +172,7 @@ impl Middleware<AgentRunContext> for PurviewAgentMiddleware {
 /// attaching Purview enforcement directly to a [`ChatClient`](agent_framework_core::client::ChatClient)
 /// rather than an agent's middleware pipeline. Mirrors Python's
 /// `PurviewChatPolicyMiddleware`; the policy logic is identical (see
-/// [`PurviewPolicyCore`]) — only the hook point (and result/message types)
+/// the internal `PurviewPolicyCore`) — only the hook point (and result/message types)
 /// differ.
 pub struct PurviewChatMiddleware(PurviewPolicyCore);
 

@@ -3,7 +3,7 @@
 //!
 //! # Routes
 //! - `GET /` and `GET /ui` — the embedded single-file debug page (see
-//!   [`crate::ui`]).
+//!   the crate's `ui` module).
 //! - `GET /health` — liveness + entity count.
 //! - `GET /v1/entities` — list entities (`DiscoveryResponse`).
 //! - `GET /v1/entities/{id}/info` — entity details (`EntityInfo`).

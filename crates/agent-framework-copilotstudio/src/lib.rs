@@ -36,8 +36,8 @@
 //! ## Layout
 //!
 //! - [`settings`] — [`CopilotStudioSettings`] (`COPILOTSTUDIOAGENT__*` env
-//!   vars), [`PowerPlatformCloud`](settings::PowerPlatformCloud),
-//!   [`AgentType`](settings::AgentType), and
+//!   vars), [`settings::PowerPlatformCloud`],
+//!   [`settings::AgentType`], and
 //!   [`CopilotStudioConnectionSettings`] (Direct-to-Engine conversation URL
 //!   construction).
 //! - [`auth`] — [`TokenProvider`]: bring-your-own bearer token (see "Auth
@@ -105,7 +105,7 @@
 //! flow performed elsewhere, or use [`StaticTokenProvider`] for a
 //! pre-fetched/test token. The required scope is
 //! `https://api.powerplatform.com/.default` (or the equivalent for a
-//! non-Prod [`PowerPlatformCloud`](settings::PowerPlatformCloud)).
+//! non-Prod [`settings::PowerPlatformCloud`]).
 //!
 //! ## Divergences from the Python reference
 //!

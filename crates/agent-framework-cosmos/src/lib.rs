@@ -9,7 +9,7 @@
 //!   messages as individual documents, partitioned by `threadId`. Talks
 //!   directly to the [Cosmos DB REST
 //!   API](https://learn.microsoft.com/en-us/rest/api/cosmos-db/) with
-//!   master-key (HMAC-SHA256) request signing — see the [`auth`] module —
+//!   master-key (HMAC-SHA256) request signing — see the internal `auth` module —
 //!   rather than depending on the `azure_data_cosmos`/`Microsoft.Azure.Cosmos`
 //!   SDK. **Only master-key authentication is implemented**; Entra ID/AAD
 //!   (`TokenCredential`) auth, which the .NET package also supports, is not
