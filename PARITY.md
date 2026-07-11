@@ -67,6 +67,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | MCP prompts (`prompts/list` / `prompts/get`) | ✅ | not verified | ✅ done | `McpClient::list_prompts`/`::get_prompt`, and `.prompts()`/`.get_prompt(name, args)` on all three tool wrappers (mapping MCP `PromptMessage`s into core `ChatMessage`s, mirroring Python's `MCPTool.get_prompt`); `list_prompts`/`.prompts()` short-circuit to `[]` without a round trip when the server didn't declare the `prompts` capability |
 | MCP sampling callback (server→client `sampling/createMessage`) | ✅ | not verified | ✅ done | `SamplingHandler` + `.sampling_handler(..)` on `McpClient` and all three tool wrappers; `chat_client_sampling_handler(client)` adapts any `ChatClient`; `sampling` capability declared in `initialize` only when a handler is set (matches the `mcp` Python SDK's capability-from-callback derivation); all three transports route a server-initiated request to the handler and write the JSON-RPC response back themselves — `ping` is always answered, an unhandled/unknown method gets a JSON-RPC "method not found" response, never silence |
 | MCP roots callback (server→client `roots/list`) | 🚧 (the `mcp` Python SDK supports it; `agent_framework`'s `MCPTool` never wires up a callback, so it's unused in practice) | not verified | ✅ done | `.roots(vec![Root::new("file:///...")])` on `McpClient` and all three tool wrappers; static list only (no `list_changed` notifications, so `listChanged` is honestly advertised as `false`); the Rust port exceeds the upstream Python *package's* actual behavior here, though not the underlying protocol's |
+| MCP remaining client surface (standalone GET-SSE listening, auto-reconnect, elicitation) | 🚧 (SDK-level) | not verified | ❌ not yet | the streamable-HTTP transport doesn't open the server-initiated GET `text/event-stream`; broken connections surface as errors instead of reconnecting; `elicitation/create` is answered with a JSON-RPC "method not found" (never silence) rather than implemented |
 
 ## Middleware & memory
 
@@ -79,7 +80,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Mem0-backed memory provider | ✅ (`mem0` package, wraps the `mem0` SDK) | ✅ (`Microsoft.Agents.AI.Mem0`) | ✅ done | `agent-framework-mem0::Mem0Provider` — direct REST (`/v1/memories/`, `/v2/memories/search/`), scoped by application/agent/user/thread id |
 | Redis chat-message store | ✅ (`redis` package) | not found | ✅ done | `agent-framework-redis::RedisChatMessageStore` — one LIST per thread, JSON messages, optional trimming; close mirror of Python |
 | Redis context provider (long-term memory) | ✅ (RediSearch: full-text + vector/hybrid) | not found | 🚧 partial | `RedisContextProvider` ports the *scoping* semantics; when the connected server has RediSearch loaded (Redis Stack) it now manages a real `FT.CREATE ... ON JSON` index and serves `invoking()` via `FT.SEARCH` (BM25-ranked, TAG-filtered, `LIMIT`ed), falling back to the original SCAN+token-match+recency path on plain Redis or when `with_force_scan_fallback` is set; still no embeddings/vector or hybrid search (documented divergence in `context_provider.rs`) |
-| Cosmos DB chat-message store | ✅ (`azure-ai-projects`/CosmosDB-adjacent, not individually tracked) | ✅ (`Microsoft.Agents.AI.CosmosNoSql`) | 🚧 partial | `agent-framework-cosmos::CosmosChatMessageStore` — hand-rolled Cosmos DB NoSQL REST client (no `azure_data_cosmos`/`Microsoft.Azure.Cosmos` SDK dependency); one container, messages partitioned by `threadId`; `ensure_created()`, add/list/clear. **Master-key (HMAC-SHA256) auth only** — no Entra ID/AAD `TokenCredential` support, which the .NET package also offers; no `TransactionalBatch` (one `POST` per message on multi-message adds); no hierarchical partition keys; no TTL |
+| Cosmos DB chat-message store | ❌ (no Python package) | ✅ (`Microsoft.Agents.AI.CosmosNoSql`) | 🚧 partial | `agent-framework-cosmos::CosmosChatMessageStore` — hand-rolled Cosmos DB NoSQL REST client (no `azure_data_cosmos`/`Microsoft.Azure.Cosmos` SDK dependency); one container, messages partitioned by `threadId`; `ensure_created()`, add/list/clear. **Master-key (HMAC-SHA256) auth only** — no Entra ID/AAD `TokenCredential` support, which the .NET package also offers; no `TransactionalBatch` (one `POST` per message on multi-message adds); no hierarchical partition keys; no TTL |
 
 ## Workflow engine
 
@@ -137,15 +138,16 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 
 ## Summary of remaining gaps
 
-Much shorter than it used to be. What genuinely remains:
+Everything not listed here ships (see the tables above). What genuinely remains:
 
-- **MCP**: client-side protocol surface is now complete (prompts, sampling, roots, all three transports).
-- **A2A**: client-side protocol surface is now complete (push notifications, `tasks/resubscribe`, authenticated extended card); the *serving* side (`agent-framework-hosting`) still lacks all three.
-- **DevUI**: ships an embedded single-file debug page (not the React DevUI); hosted runs are stateless (no conversation store / run-resume endpoint).
+- **MCP client**: no standalone GET-based SSE listening on the streamable-HTTP transport, no automatic reconnect, and no elicitation support (`elicitation/create` gets a JSON-RPC "method not found").
+- **A2A serving**: the hosting router exposes no push-notification config, `tasks/resubscribe`, or authenticated extended card — those three ship on the *client* only.
+- **DevUI frontend**: the embedded page is a single-file debug UI, not the React DevUI; hosted runs are stateless (no conversation store / run-resume endpoint).
 - **Declarative workflows**: Rust-native spec, not the upstream Copilot-Studio imperative DSL (declarative *agents* follow the official schema).
-- **Redis provider**: `FT.SEARCH` BM25 full-text now backs retrieval on Redis Stack (with a SCAN+token-match+recency fallback on plain Redis); vector/hybrid search is still not ported.
+- **Redis provider**: no embeddings/vector-KNN or hybrid search — retrieval is BM25 full-text on Redis Stack, SCAN+token-match+recency on plain Redis.
 - **Cosmos DB store**: master-key (HMAC) auth only, no Entra ID/AAD; one `POST` per message instead of `TransactionalBatch`; no hierarchical partition keys or TTL.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
-- **Azure**: the Azure AI Foundry (persistent agents) client, the Entra ID credential chain, and the Azure AI Search context provider now ship; Foundry route/`api-version` fidelity follows the documented Assistants convention (not locally verifiable against a vendored SDK). Cosmos DB remains master-key auth only.
-- **Purview**: covers only `processContent` — no protection-scopes precheck/caching, background content-activity logging, or JWT-derived identity fallback (see the Serving table row).
-- **Ecosystem**: ChatKit, DurableTask/Azure Functions hosting, OTel SDK exporter wiring (AG-UI, Cosmos DB, CopilotStudio, Purview, Azure AI Foundry, and Azure AI Search now ship).
+- **Azure AI Foundry fidelity**: routes/`api-version` follow the documented Assistants convention rather than a locally verifiable SDK (the upstream wraps `azure-ai-agents`, which has no Rust equivalent).
+- **Purview**: covers only `processContent` — no protection-scopes precheck/caching, background content-activity logging, or JWT-derived identity fallback.
+- **Observability**: spans are OTel-GenAI-shaped and bridge-ready, but no OTel SDK exporter is wired up or shipped.
+- **Ecosystem**: ChatKit, the `lab` experimental packages, DurableTask/Azure Functions hosting, and a dedicated guardrails module (which no implementation ships) remain unported.
