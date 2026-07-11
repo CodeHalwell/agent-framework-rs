@@ -2,7 +2,7 @@
 //!
 //! Run with:
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example quickstart
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example quickstart
 //! ```
 
 use agent_framework::prelude::*;

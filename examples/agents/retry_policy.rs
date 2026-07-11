@@ -4,7 +4,7 @@
 //! client -- no API key or network needed.
 //!
 //! ```bash
-//! cargo run -p agent-framework --example retry_policy
+//! cargo run -p agent-framework-examples --example retry_policy
 //! ```
 
 use std::sync::atomic::{AtomicUsize, Ordering};

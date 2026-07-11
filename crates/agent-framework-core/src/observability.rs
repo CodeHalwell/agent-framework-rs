@@ -173,6 +173,9 @@ pub fn error_type(err: &Error) -> String {
         Error::Tool(_) => "tool",
         Error::Service(_) => "service",
         Error::ServiceStatus { .. } => "service",
+        Error::ServiceInvalidAuth { .. } => "service_invalid_auth",
+        Error::ServiceInvalidRequest { .. } => "service_invalid_request",
+        Error::ServiceContentFilter { .. } => "service_content_filter",
         Error::Workflow(_) => "workflow",
         Error::AdditionItemMismatch(_) => "addition_item_mismatch",
         Error::Configuration(_) => "configuration",
@@ -944,5 +947,32 @@ mod tests {
         let name = config.otel_service_name();
         clear_env();
         assert_eq!(name, "my-service");
+    }
+
+    // -- error_type --------------------------------------------------------
+
+    #[test]
+    fn error_type_gives_the_granular_service_errors_distinct_tags() {
+        // The three newer variants get their own `error.type` tags, distinct
+        // from both each other and the generic "service"/"service" tags that
+        // `Error::Service`/`Error::ServiceStatus` share — that granularity is
+        // the whole point of adding them.
+        assert_eq!(
+            error_type(&Error::service_invalid_auth("x")),
+            "service_invalid_auth"
+        );
+        assert_eq!(
+            error_type(&Error::service_invalid_request("x")),
+            "service_invalid_request"
+        );
+        assert_eq!(
+            error_type(&Error::service_content_filter("x")),
+            "service_content_filter"
+        );
+        assert_eq!(error_type(&Error::service("x")), "service");
+        assert_eq!(
+            error_type(&Error::service_status(500, "x", None)),
+            "service"
+        );
     }
 }

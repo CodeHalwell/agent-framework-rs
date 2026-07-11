@@ -5,7 +5,7 @@
 //! to export these same spans to an OTel collector.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example observability
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example observability
 //! ```
 
 use agent_framework::prelude::*;

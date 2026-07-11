@@ -1,7 +1,7 @@
 //! Streaming responses token-by-token.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example streaming
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example streaming
 //! ```
 
 use agent_framework::prelude::*;

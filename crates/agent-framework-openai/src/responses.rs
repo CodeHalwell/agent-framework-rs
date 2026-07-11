@@ -193,8 +193,9 @@ impl OpenAIResponsesClient {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            return Err(crate::classify_service_error(
                 status.as_u16(),
+                &text,
                 format!("OpenAI API error {status}: {text}"),
                 retry_after,
             ));

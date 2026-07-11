@@ -3,7 +3,7 @@
 //! service remembers the prior turn without resending history.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example openai_responses
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example openai_responses
 //! ```
 
 use agent_framework::prelude::*;

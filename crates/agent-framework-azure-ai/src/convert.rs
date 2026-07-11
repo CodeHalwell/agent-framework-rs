@@ -779,6 +779,35 @@ pub fn last_error_message(run: &Value) -> String {
         .to_string()
 }
 
+/// The `code` field of a failed run's `last_error`, if present (e.g.
+/// `"content_filter"`, `"rate_limit_exceeded"`, `"server_error"`).
+pub fn last_error_code(run: &Value) -> Option<&str> {
+    run.get("last_error")?.get("code")?.as_str()
+}
+
+/// Classify a failed run's `last_error` into an [`Error`], distinguishing a
+/// content-filter refusal from every other failure reason.
+///
+/// Upstream (`agent_framework_azure_ai/_chat_client.py`, `case
+/// AgentStreamEvent.THREAD_RUN_FAILED: raise
+/// ServiceResponseException(event_data.last_error.message)`) does not
+/// classify `last_error.code` at all — every run failure becomes the same
+/// generic exception. This extends that with the one distinction Azure AI
+/// Foundry's wire format carries that upstream's exception hierarchy already
+/// has a dedicated class for: `last_error.code == "content_filter"` ->
+/// [`Error::ServiceContentFilter`] (mirroring `ServiceContentFilterException`);
+/// every other code (or none at all) stays the same plain [`Error::Service`]
+/// Python constructs. Shared by both the polling
+/// (`AzureAIAgentClient::response_from_run`'s `"failed"` arm) and streaming
+/// (`crate::sse`'s `"thread.run.failed"` handling) run-failure paths.
+pub fn classify_last_error(run: &Value) -> Error {
+    let message = last_error_message(run);
+    match last_error_code(run) {
+        Some("content_filter") => Error::service_content_filter(message),
+        _ => Error::service(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,5 +1261,47 @@ mod tests {
             json!({"tool_call_id": "call_2", "approve": true})
         );
         assert_eq!(body["stream"], json!(true));
+    }
+
+    // -- last_error / classify_last_error -----------------------------------
+
+    #[test]
+    fn last_error_code_reads_the_code_field() {
+        let run = json!({"status": "failed", "last_error": {"code": "content_filter", "message": "flagged"}});
+        assert_eq!(last_error_code(&run), Some("content_filter"));
+
+        let no_code = json!({"status": "failed", "last_error": {"message": "oops"}});
+        assert_eq!(last_error_code(&no_code), None);
+
+        let no_last_error = json!({"status": "failed"});
+        assert_eq!(last_error_code(&no_last_error), None);
+    }
+
+    #[test]
+    fn classify_last_error_maps_content_filter_code_to_content_filter_error() {
+        let run = json!({
+            "status": "failed",
+            "last_error": {"code": "content_filter", "message": "The response was filtered"},
+        });
+        let err = classify_last_error(&run);
+        assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+        assert!(err.to_string().contains("The response was filtered"));
+    }
+
+    #[test]
+    fn classify_last_error_leaves_other_codes_as_generic_service_error() {
+        // Matches upstream exactly: any non-content-filter `last_error`
+        // (or one with no `code` at all) is just the plain exception Python
+        // raises, not a more specific variant.
+        for run in [
+            json!({"status": "failed", "last_error": {"code": "rate_limit_exceeded", "message": "too many"}}),
+            json!({"status": "failed", "last_error": {"code": "server_error", "message": "oops"}}),
+            json!({"status": "failed", "last_error": {"message": "no code at all"}}),
+            json!({"status": "failed"}),
+        ] {
+            let err = classify_last_error(&run);
+            assert!(matches!(err, Error::Service(_)), "run {run:?}: got {err:?}");
+            assert!(!matches!(err, Error::ServiceContentFilter { .. }));
+        }
     }
 }

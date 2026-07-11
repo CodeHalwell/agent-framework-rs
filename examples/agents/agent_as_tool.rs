@@ -2,7 +2,7 @@
 //! orchestrator agent via `ChatAgent::as_tool`.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example agent_as_tool
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example agent_as_tool
 //! ```
 
 use agent_framework::prelude::*;

@@ -2,7 +2,7 @@
 //!
 //! Requires the `anthropic` feature:
 //! ```bash
-//! ANTHROPIC_API_KEY=sk-ant-... cargo run -p agent-framework --example anthropic --features anthropic
+//! ANTHROPIC_API_KEY=sk-ant-... cargo run -p agent-framework-examples --example anthropic
 //! ```
 
 use agent_framework::prelude::*;

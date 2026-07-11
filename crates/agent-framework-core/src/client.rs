@@ -631,7 +631,11 @@ pub enum RetryOn {
     /// The built-in default predicate (see [`RetryPolicy`] docs for the exact
     /// rule): retries HTTP `408`/`429`/`5xx` ([`Error::ServiceStatus`]) and
     /// transport-ish [`Error::Service`] failures (timeouts / connection
-    /// errors).
+    /// errors). Never retries [`Error::ServiceInvalidAuth`],
+    /// [`Error::ServiceInvalidRequest`], or [`Error::ServiceContentFilter`] —
+    /// authentication/authorization failures, malformed requests, and
+    /// content-filter refusals are non-transient, so retrying would just
+    /// repeat the same rejection.
     Default,
     /// A fully custom predicate deciding, per error, whether to retry.
     Predicate(Arc<dyn Fn(&Error) -> bool + Send + Sync>),
@@ -675,7 +679,15 @@ impl RetryOn {
 ///   error"`.
 ///
 /// Everything else (4xx other than 408/429, parse errors, tool/workflow errors,
-/// non-transport service errors) is treated as non-retryable.
+/// non-transport service errors) is treated as non-retryable. This explicitly
+/// includes [`Error::ServiceInvalidAuth`], [`Error::ServiceInvalidRequest`],
+/// and [`Error::ServiceContentFilter`] — authentication/authorization
+/// failures, malformed requests, and content-filter refusals are
+/// non-transient, so retrying would just repeat the same rejection. None of
+/// the three carry a status via [`Error::status`], so they fall through to
+/// the final `_ => false` below (there's no dedicated match arm for them:
+/// merging one in would just duplicate that `false`, which `clippy` flags as
+/// `match_same_arms`).
 fn default_should_retry(err: &Error) -> bool {
     if let Some(status) = err.status() {
         return status == 408 || status == 429 || (500..600).contains(&status);

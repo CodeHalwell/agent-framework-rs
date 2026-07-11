@@ -6,7 +6,7 @@
 //! AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com \
 //! AZURE_OPENAI_API_KEY=... \
 //! AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=my-gpt4o-deployment \
-//! cargo run -p agent-framework --example azure_openai --features azure
+//! cargo run -p agent-framework-examples --example azure_openai
 //! ```
 
 use std::sync::Arc;

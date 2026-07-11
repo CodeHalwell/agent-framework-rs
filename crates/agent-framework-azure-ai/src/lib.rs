@@ -93,6 +93,28 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
         .filter(|s| s.is_finite() && *s >= 0.0)
 }
 
+/// Classify a non-success Azure AI Agents API HTTP response by status.
+///
+/// `401`/`403` -> [`Error::ServiceInvalidAuth`]; `400` ->
+/// [`Error::ServiceInvalidRequest`]; anything else — notably `408`/`429`/
+/// `5xx`, which the retry layer depends on — -> [`Error::ServiceStatus`],
+/// unchanged.
+///
+/// Content-filter refusals are *not* classified here: Foundry reports those
+/// asynchronously via a failed run's `last_error.code` (see
+/// [`convert::classify_last_error`]), not as a synchronous HTTP error on
+/// these agent/thread/message/run CRUD calls, so there's no body signal to
+/// check at this layer — mirrors the Python client, which does not classify
+/// these HTTP errors at all beyond `ServiceInitializationError` for local
+/// config problems.
+fn classify_status_error(status: u16, message: String, retry_after: Option<f64>) -> Error {
+    match status {
+        401 | 403 => Error::service_invalid_auth(message),
+        400 => Error::service_invalid_request(message),
+        _ => Error::service_status(status, message, retry_after),
+    }
+}
+
 /// A chat client backed by an Azure AI Foundry persistent agent.
 pub struct AzureAIAgentClient {
     inner: Arc<Inner>,
@@ -271,11 +293,8 @@ impl AzureAIAgentClient {
         let status = resp.status();
         let retry_after = parse_retry_after(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        Err(Error::service_status(
-            status.as_u16(),
-            format!("Azure AI API error {status}: {text}"),
-            retry_after,
-        ))
+        let message = format!("Azure AI API error {status}: {text}");
+        Err(classify_status_error(status.as_u16(), message, retry_after))
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
@@ -533,7 +552,7 @@ impl AzureAIAgentClient {
                 m.message_id = Some(run_id);
                 resp.messages.push(m);
             }
-            "failed" => return Err(Error::service(convert::last_error_message(&run))),
+            "failed" => return Err(convert::classify_last_error(&run)),
             other => {
                 return Err(Error::service(format!(
                     "Azure AI run ended in status '{other}'"
@@ -717,5 +736,36 @@ mod tests {
             combined_instructions(&options, &prepared).as_deref(),
             Some("from options\nfrom message")
         );
+    }
+
+    // -- classify_status_error ----------------------------------------------
+
+    #[test]
+    fn classify_status_error_maps_401_and_403_to_invalid_auth() {
+        for status in [401, 403] {
+            let err = classify_status_error(status, format!("err {status}"), None);
+            assert!(
+                matches!(err, Error::ServiceInvalidAuth { .. }),
+                "status {status}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_status_error_maps_400_to_invalid_request() {
+        let err = classify_status_error(400, "bad request".into(), None);
+        assert!(
+            matches!(err, Error::ServiceInvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_status_error_leaves_retryable_statuses_as_service_status() {
+        for status in [408, 429, 500, 503] {
+            let err = classify_status_error(status, format!("err {status}"), Some(3.0));
+            assert_eq!(err.status(), Some(status), "{err:?}");
+            assert_eq!(err.retry_after(), Some(3.0), "{err:?}");
+        }
     }
 }

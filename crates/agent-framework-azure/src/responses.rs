@@ -387,8 +387,11 @@ impl AzureOpenAIResponsesClient {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            // Shared with `agent-framework-openai`'s Responses client — see
+            // `AzureOpenAIClient::post`.
+            return Err(agent_framework_openai::classify_service_error(
                 status.as_u16(),
+                &text,
                 format!("Azure OpenAI API error {status}: {text}"),
                 retry_after,
             ));

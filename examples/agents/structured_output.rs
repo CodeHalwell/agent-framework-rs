@@ -2,7 +2,7 @@
 //! Schema, then parse it straight into a typed Rust struct.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example structured_output
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example structured_output
 //! ```
 
 use agent_framework::prelude::*;

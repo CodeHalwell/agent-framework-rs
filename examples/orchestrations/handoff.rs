@@ -8,7 +8,7 @@
 //! comment near the bottom for how that loop is driven.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example handoff
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example handoff
 //! ```
 
 use std::sync::Arc;

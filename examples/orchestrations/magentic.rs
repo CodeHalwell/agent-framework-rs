@@ -3,7 +3,7 @@
 //! final answer once the ledger says the request is satisfied.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example magentic
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example magentic
 //! ```
 
 use std::sync::Arc;

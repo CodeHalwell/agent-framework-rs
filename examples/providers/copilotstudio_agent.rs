@@ -13,7 +13,7 @@
 //! ```bash
 //! COPILOTSTUDIOAGENT__ENVIRONMENTID=... COPILOTSTUDIOAGENT__SCHEMANAME=... \
 //! COPILOTSTUDIO_TOKEN=eyJ... \
-//! cargo run -p agent-framework --example copilotstudio_agent --features copilotstudio
+//! cargo run -p agent-framework-examples --example copilotstudio_agent
 //! ```
 
 use agent_framework::copilotstudio::{

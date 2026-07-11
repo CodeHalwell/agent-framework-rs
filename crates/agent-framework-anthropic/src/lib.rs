@@ -54,6 +54,62 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
         .filter(|s| s.is_finite() && *s >= 0.0)
 }
 
+/// Classify a non-success Anthropic Messages API HTTP response into a
+/// granular [`Error`].
+///
+/// Upstream's Anthropic connector (`agent_framework_anthropic/_chat_client.py`)
+/// does not wrap `messages.create`/`beta.messages.create` in any
+/// status-specific exception handling at all — SDK errors propagate
+/// unchanged, so there is no Python call-site behavior to mirror status by
+/// status here. This instead applies upstream's exception *hierarchy*
+/// (`agent_framework.exceptions.ServiceInvalidAuthError` /
+/// `ServiceInvalidRequestError`) using Anthropic's own documented
+/// status <-> `error.type` convention
+/// (<https://docs.anthropic.com/en/api/errors>):
+///
+/// * `401` / `403` -> [`Error::ServiceInvalidAuth`] (Anthropic's
+///   `authentication_error` / `permission_error`)
+/// * `400` -> [`Error::ServiceInvalidRequest`], but only once the body
+///   confirms `error.type == "invalid_request_error"` (Anthropic's
+///   documented sole `400` type); an unparseable or unexpected body
+///   conservatively falls back to the generic [`Error::ServiceStatus`]
+///   rather than guessing
+/// * anything else — notably `408` / `429` / `5xx`, which the retry layer
+///   depends on — -> [`Error::ServiceStatus`], unchanged
+///
+/// Anthropic has no content-filter-specific HTTP error to classify: a
+/// content-policy refusal is a `200 OK` response with `stop_reason:
+/// "refusal"`, mapped to `FinishReason::CONTENT_FILTER` by
+/// [`convert::map_stop_reason`] (mirroring upstream's `FINISH_REASON_MAP`)
+/// rather than raised as an error, so [`Error::ServiceContentFilter`] is
+/// never constructed on this path — don't invent one.
+fn classify_anthropic_error(
+    status: u16,
+    body: &str,
+    message: impl Into<String>,
+    retry_after: Option<f64>,
+) -> Error {
+    let message = message.into();
+    match status {
+        401 | 403 => Error::service_invalid_auth(message),
+        400 if anthropic_error_type(body).as_deref() == Some("invalid_request_error") => {
+            Error::service_invalid_request(message)
+        }
+        _ => Error::service_status(status, message, retry_after),
+    }
+}
+
+/// The Anthropic error body's `error.type`, if the body parses as JSON and
+/// carries one (e.g. `"invalid_request_error"`, `"authentication_error"`).
+fn anthropic_error_type(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")?
+        .get("type")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Build the base `POST /v1/messages` request, including the `anthropic-beta`
 /// header when `betas` is non-empty. Split out from [`AnthropicClient::post`]
 /// so the header-attachment logic is unit-testable without an HTTP round
@@ -227,8 +283,9 @@ impl AnthropicClient {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            return Err(classify_anthropic_error(
                 status.as_u16(),
+                &text,
                 format!("Anthropic API error {status}: {text}"),
                 retry_after,
             ));
@@ -932,6 +989,86 @@ mod tests {
         .build()
         .unwrap();
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    // endregion
+
+    // region: classify_anthropic_error
+
+    #[test]
+    fn classifies_401_and_403_as_invalid_auth() {
+        for status in [401, 403] {
+            let body = format!(
+                r#"{{"type":"error","error":{{"type":"authentication_error","message":"nope {status}"}}}}"#
+            );
+            let err = classify_anthropic_error(status, &body, format!("err {status}"), None);
+            assert!(
+                matches!(err, Error::ServiceInvalidAuth { .. }),
+                "status {status}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_400_invalid_request_error_as_invalid_request() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#;
+        let err = classify_anthropic_error(400, body, "err", None);
+        assert!(
+            matches!(err, Error::ServiceInvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_400_without_confirming_body_stays_service_status() {
+        // Conservative: only reclassify once the body actually confirms
+        // Anthropic's documented `invalid_request_error` type; an
+        // unparseable or differently-typed body falls back to the generic
+        // status-carrying variant rather than guessing.
+        let err = classify_anthropic_error(400, "not json", "err", None);
+        assert_eq!(err.status(), Some(400), "{err:?}");
+
+        let err = classify_anthropic_error(
+            400,
+            r#"{"type":"error","error":{"type":"something_else"}}"#,
+            "err",
+            None,
+        );
+        assert_eq!(err.status(), Some(400), "{err:?}");
+    }
+
+    #[test]
+    fn leaves_retryable_statuses_as_service_status() {
+        // 408/429/5xx (and Anthropic's overloaded 529) must stay
+        // `ServiceStatus` exactly as before — the retry layer depends on it.
+        for status in [408, 429, 500, 529] {
+            let err = classify_anthropic_error(status, "", format!("err {status}"), Some(1.5));
+            assert_eq!(err.status(), Some(status), "{err:?}");
+            assert_eq!(err.retry_after(), Some(1.5), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn never_produces_content_filter() {
+        // Anthropic has no content-filter-specific HTTP error: content-policy
+        // refusals surface as `stop_reason: "refusal"` on a 200 (see
+        // `map_stop_reason_covers_documented_mapping`), never as a non-success
+        // status, so this path must never invent a `ServiceContentFilter`.
+        let bodies = [
+            "",
+            "not json",
+            r#"{"type":"error","error":{"type":"invalid_request_error"}}"#,
+            r#"{"type":"error","error":{"type":"authentication_error"}}"#,
+        ];
+        for status in [400, 401, 403, 404, 422, 429, 500] {
+            for body in bodies {
+                let err = classify_anthropic_error(status, body, "err", None);
+                assert!(
+                    !matches!(err, Error::ServiceContentFilter { .. }),
+                    "status {status}, body {body:?}: {err:?}"
+                );
+            }
+        }
     }
 
     // endregion

@@ -8,7 +8,7 @@
 //! -> repeat until a final answer comes back.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example approvals
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example approvals
 //! ```
 
 use agent_framework::prelude::*;

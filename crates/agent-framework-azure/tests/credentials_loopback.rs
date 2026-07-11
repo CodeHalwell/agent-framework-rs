@@ -15,6 +15,7 @@ use agent_framework_azure::{
     ManagedIdentityCredential, TokenCredential, WorkloadIdentityCredential,
 };
 use agent_framework_core::client::ChatClient;
+use agent_framework_core::error::Error;
 use agent_framework_core::types::{ChatMessage, ChatOptions};
 use futures::StreamExt;
 
@@ -314,6 +315,101 @@ async fn azure_openai_maps_429_to_service_status_with_retry_after() {
 
     assert_eq!(err.status(), Some(429), "error: {err}");
     assert_eq!(err.retry_after(), Some(2.0), "error: {err}");
+}
+
+/// Real end-to-end proof (actual `reqwest` round trip, not just a unit test of
+/// the classification function) that `AzureOpenAIClient` reuses
+/// `agent_framework_openai::classify_service_error` and gets the same
+/// granular variants OpenAI's own client would.
+#[tokio::test]
+async fn azure_openai_maps_401_to_invalid_auth() {
+    let server = FakeServer::start(
+        "401 Unauthorized",
+        vec![],
+        r#"{"error":{"message":"Access denied","code":"invalid_api_key"}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidAuth { .. }),
+        "error: {err:?}"
+    );
+    // Not a ServiceStatus, so the retry layer never sees a status/retry_after
+    // for it — it just treats it as non-retryable directly.
+    assert_eq!(err.status(), None, "error: {err}");
+}
+
+#[tokio::test]
+async fn azure_openai_maps_plain_400_to_invalid_request() {
+    let server = FakeServer::start(
+        "400 Bad Request",
+        vec![],
+        r#"{"error":{"message":"Unrecognized field","type":"invalid_request_error"}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidRequest { .. }),
+        "error: {err:?}"
+    );
+}
+
+/// Azure OpenAI's content-filter shape: a `400` whose `error.code` is
+/// `"content_filter"` (with a nested `innererror.code` giving the
+/// `ResponsibleAIPolicyViolation` detail) must classify as
+/// `ServiceContentFilter`, not the generic `ServiceInvalidRequest` a plain
+/// `400` gets.
+#[tokio::test]
+async fn azure_openai_maps_content_filter_400_to_content_filter() {
+    let server = FakeServer::start(
+        "400 Bad Request",
+        vec![],
+        r#"{"error":{"message":"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.","code":"content_filter","status":400,"innererror":{"code":"ResponsibleAIPolicyViolation","content_filter_result":{"violence":{"filtered":true,"severity":"medium"}}}}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceContentFilter { .. }),
+        "error: {err:?}"
+    );
+}
+
+/// Same classification, proven through `AzureOpenAIResponsesClient` too (a
+/// separate `post` in `responses.rs` that also delegates to
+/// `agent_framework_openai::classify_service_error`).
+#[tokio::test]
+async fn azure_openai_responses_client_maps_403_to_invalid_auth() {
+    let server = FakeServer::start(
+        "403 Forbidden",
+        vec![],
+        r#"{"error":{"message":"Forbidden"}}"#,
+    );
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidAuth { .. }),
+        "error: {err:?}"
+    );
 }
 
 /// A managed-identity credential that fails (non-success status) should surface

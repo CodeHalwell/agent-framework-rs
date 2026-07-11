@@ -10,7 +10,7 @@
 //! pause/approve flow is identical.
 //!
 //! ```bash
-//! cargo run -p agent-framework --example magentic_plan_review
+//! cargo run -p agent-framework-examples --example magentic_plan_review
 //! ```
 
 use std::sync::{Arc, Mutex};

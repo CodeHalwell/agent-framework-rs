@@ -1,7 +1,7 @@
 //! A sequential multi-agent workflow: a writer drafts, then an editor revises.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example workflow_sequential
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example sequential
 //! ```
 
 use std::sync::Arc;

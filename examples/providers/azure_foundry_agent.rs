@@ -11,7 +11,7 @@
 //!
 //! ```bash
 //! az login && AZURE_AI_PROJECT_ENDPOINT=https://... \
-//! cargo run -p agent-framework --example azure_foundry_agent --features azure-ai,azure
+//! cargo run -p agent-framework-examples --example azure_foundry_agent
 //! ```
 
 use std::sync::Arc;

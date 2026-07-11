@@ -231,8 +231,9 @@ impl OpenAIAssistantsClient {
         req
     }
 
-    /// Send a request, mapping a non-success status to [`Error::ServiceStatus`]
-    /// (carrying any `Retry-After`), matching [`crate::OpenAIClient`].
+    /// Send a request, classifying a non-success status via
+    /// [`crate::classify_service_error`] (carrying any `Retry-After` on the
+    /// [`Error::ServiceStatus`] fallback), matching [`crate::OpenAIClient`].
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let resp = req
             .send()
@@ -242,8 +243,9 @@ impl OpenAIAssistantsClient {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            return Err(crate::classify_service_error(
                 status.as_u16(),
+                &text,
                 format!("OpenAI API error {status}: {text}"),
                 retry_after,
             ));

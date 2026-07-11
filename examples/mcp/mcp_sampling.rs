@@ -6,10 +6,13 @@
 //!
 //! Prerequisites: OPENAI_API_KEY (skips gracefully when unset) and a working
 //! `npx` -- this spawns `@modelcontextprotocol/server-everything`, whose
-//! `sampleLLM` demo tool exercises exactly this callback.
+//! sampling demo tool exercises exactly this callback. The tool's name has
+//! changed across server releases (`sampleLLM` in older versions,
+//! `simulate-research-query` in newer ones), so the prompt below asks the
+//! model to pick whichever sampling-demo tool the server advertises.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example mcp_sampling --features mcp
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example mcp_sampling
 //! ```
 
 use std::sync::Arc;
@@ -41,11 +44,15 @@ async fn main() -> Result<()> {
         .tools(tools)
         .build();
 
-    // Asking for the sampleLLM tool makes the server issue a
+    // Invoking the server's sampling-demo tool makes it issue a
     // sampling/createMessage back to us mid-tool-call; our handler answers
     // it with a real OpenAI completion, and the tool result flows back.
     let response = agent
-        .run_once("Use the sampleLLM tool to ask: what color is the sky?")
+        .run_once(
+            "Call the tool that demonstrates LLM sampling (it is named \
+             `sampleLLM` or `simulate-research-query` depending on the server \
+             version) and ask it: what color is the sky?",
+        )
         .await?;
     println!("{}", response.text());
 

@@ -8,7 +8,7 @@
 //! public sample server:
 //! ```bash
 //! A2A_AGENT_URL=http://127.0.0.1:8080/a2a \
-//! cargo run -p agent-framework --example a2a_client --features a2a
+//! cargo run -p agent-framework-examples --example a2a_client
 //! ```
 
 use agent_framework::prelude::*;

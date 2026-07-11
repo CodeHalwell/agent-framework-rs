@@ -11,7 +11,7 @@
 //!
 //! ```bash
 //! COSMOS_ENDPOINT=https://... COSMOS_KEY=... \
-//! cargo run -p agent-framework --example cosmos_store --features cosmos
+//! cargo run -p agent-framework-examples --example cosmos_store
 //! ```
 
 use std::sync::Arc;

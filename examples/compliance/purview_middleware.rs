@@ -10,7 +10,7 @@
 //!
 //! ```bash
 //! PURVIEW_TOKEN=eyJ... OPENAI_API_KEY=sk-... \
-//! cargo run -p agent-framework --example purview_middleware --features purview
+//! cargo run -p agent-framework-examples --example purview_middleware
 //! ```
 
 use std::sync::Arc;

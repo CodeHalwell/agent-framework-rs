@@ -32,6 +32,61 @@ Legend: 🐛 bug in shipped code · 🧱 architectural gap · ❌ missing surfac
 
 ---
 
+## Status update (post-audit implementation waves)
+
+Four implementation waves landed after this audit; the workspace went from
+771 to ~1,100 tests, all green, clippy/rustfmt clean throughout.
+
+**Addressed:**
+
+- **Every item in §1 and §2** except the two called out below: multimodal
+  input mapping (1.1), Anthropic betas + hosted tools (1.2), Azure AI tool
+  configs + existing-agent merge (1.3), trait-level `run_stream` with real
+  SSE through hosting/AG-UI/orchestrations (1.4), per-run `AgentRunOptions`
+  + declaration-only tool round-trips (1.5), `AiFunction::typed` schema
+  derivation via schemars (1.6), thread serialize/deserialize + store
+  factory (1.7 — container keys match Python; message payloads still
+  serialize in Rust's shape), fan-in checkpoint capture (1.8), concurrent
+  within-superstep execution (1.9), and all fifteen §2 items (citations,
+  reasoning/hosted outputs, usage breakdowns, `thread_created`,
+  `.value` auto-fill, `#[serde(other)]`, name sanitization, …).
+- From §1.10: the **OpenAI Assistants client** and the **Azure OpenAI
+  Responses client** now exist. Still open from that item: an
+  `AzureOpenAIAssistantsClient` convenience wrapper and the new Foundry
+  Prompt-Agent client.
+- From §3: granular errors (`ServiceInvalidAuth` / `ServiceInvalidRequest` /
+  `ServiceContentFilter` + provider classification, retry-excluded),
+  observability request/tool span attributes + `gen_ai.provider.name`, and
+  GenAI **metrics** (token-usage / operation-duration / function-invocation
+  histograms) behind an `otel-metrics` feature; `invoked(error)` context-
+  provider observability; per-function invocation limits; hosted-tool config
+  setters; `DefaultAzureCredential` / `EnvironmentCredential` /
+  `WorkloadIdentityCredential`.
+- From §4: MCP servers as **first-class agent tools** (`ToolSource`,
+  resolved per run) with `list_changed` invalidation, load flags,
+  stdio/websocket request timeouts, and name dedup.
+- A top-level `examples/` gallery crate: 69 categorized examples (the 32
+  originals moved + 37 new, including showcases for each new capability),
+  indexed in `examples/README.md`.
+
+**Still open** (the honest remainder): typed executor routing /
+`AgentExecutorRequest`-style envelopes / sub-workflow request interception
+and the other §4 workflow-depth items; orchestration builder HITL/
+checkpointing options; cross-language wire `type` tags (and
+`raw_representation` / `additional_properties` on content types); richer
+middleware contexts; `as_mcp_server`; AG-UI client + predictive-state
+events; the DevUI conversations/cancel/discovery/auth surface; A2A serving
+streaming + task lifecycle; the Foundry Prompt-Agent client; OTel exporter
+wiring (by design — the app installs the SDK); and the big tracked
+ecosystem items (DurableTask/Azure Functions hosting, ChatKit, Copilot
+Studio workflow DSL, Redis vector/hybrid retrieval, Cosmos hardening +
+checkpoint store, Purview protection scopes, `lab`).
+
+The sections below are preserved as the audit's original findings; read
+them together with this status block.
+
+---
+
 ## 1. The headline items
 
 Ranked by impact on someone trying to use this port for real work today.

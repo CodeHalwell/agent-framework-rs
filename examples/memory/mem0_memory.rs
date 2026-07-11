@@ -8,7 +8,7 @@
 //!
 //! ```bash
 //! MEM0_API_KEY=m0-... OPENAI_API_KEY=sk-... \
-//! cargo run -p agent-framework --example mem0_memory --features mem0
+//! cargo run -p agent-framework-examples --example mem0_memory
 //! ```
 
 use std::sync::Arc;

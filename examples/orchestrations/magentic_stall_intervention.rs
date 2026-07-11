@@ -10,7 +10,7 @@
 //! Runs fully offline: the manager is scripted (no LLM).
 //!
 //! ```bash
-//! cargo run -p agent-framework --example magentic_stall_intervention
+//! cargo run -p agent-framework-examples --example magentic_stall_intervention
 //! ```
 
 use std::collections::VecDeque;

@@ -14,6 +14,7 @@ use std::time::Duration;
 use agent_framework_azure::StaticTokenCredential;
 use agent_framework_azure_ai::AzureAIAgentClient;
 use agent_framework_core::client::ChatClient;
+use agent_framework_core::error::Error;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, Content, FinishReason, FunctionResultContent, Role,
 };
@@ -236,6 +237,79 @@ async fn non_streaming_run_creates_thread_and_returns_text() {
         .find(|r| r.method == "POST" && r.route().ends_with("/runs"))
         .unwrap();
     assert_eq!(runs.body_json()["assistant_id"], json!("asst_1"));
+}
+
+/// A non-success status on a plain CRUD call (agent creation, here) is
+/// classified by `check_status`, end to end through the real `reqwest` path —
+/// not just the extracted `classify_status_error` unit tests in `lib.rs`.
+#[tokio::test]
+async fn unauthorized_agent_creation_becomes_invalid_auth() {
+    let server = MockServer::start(|req| match (req.method.as_str(), req.route()) {
+        ("POST", p) if p.ends_with("/assistants") => Response {
+            status: "401 Unauthorized".into(),
+            event_stream: false,
+            body: r#"{"error":{"message":"Access denied"}}"#.into(),
+        },
+        _ => Response::json("{}"),
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ServiceInvalidAuth { .. }), "{err:?}");
+}
+
+/// A run that ends `"failed"` with `last_error.code == "content_filter"`
+/// becomes `Error::ServiceContentFilter` end to end through the non-streaming
+/// (poll) path — `response_from_run`'s `"failed"` arm now delegates to
+/// `convert::classify_last_error` instead of always building a generic
+/// `Error::Service`.
+#[tokio::test]
+async fn content_filtered_run_becomes_content_filter_error() {
+    let server = MockServer::start(|req| {
+        route_default(req).unwrap_or_else(|| match (req.method.as_str(), req.route()) {
+            ("POST", p) if p.ends_with("/runs") => Response::json(
+                r#"{"id":"run_1","status":"failed","last_error":{"code":"content_filter","message":"The response was filtered due to the prompt triggering content management policy."}}"#,
+            ),
+            _ => Response::json("{}"),
+        })
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+    assert!(err.to_string().contains("content management policy"));
+}
+
+/// The same failed-run scenario, but for a non-content-filter code: stays the
+/// generic `Error::Service` (matching upstream, which does not classify
+/// `last_error.code` at all beyond this crate's content-filter addition).
+#[tokio::test]
+async fn non_content_filter_run_failure_stays_generic_service_error() {
+    let server = MockServer::start(|req| {
+        route_default(req).unwrap_or_else(|| match (req.method.as_str(), req.route()) {
+            ("POST", p) if p.ends_with("/runs") => Response::json(
+                r#"{"id":"run_1","status":"failed","last_error":{"code":"server_error","message":"internal error"}}"#,
+            ),
+            _ => Response::json("{}"),
+        })
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::Service(_)), "{err:?}");
+    assert!(err.to_string().contains("internal error"));
 }
 
 #[tokio::test]

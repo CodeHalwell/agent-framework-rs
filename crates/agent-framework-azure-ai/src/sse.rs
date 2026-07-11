@@ -90,8 +90,9 @@ fn parse_event_block(block: &str) -> Option<SseEvent> {
 pub enum EventOutcome {
     /// Zero or more updates to yield to the consumer.
     Updates(Vec<ChatResponseUpdate>),
-    /// The run failed; the stream should end with this error message.
-    Failed(String),
+    /// The run failed; the stream should end with this (already-classified —
+    /// see [`convert::classify_last_error`]) error.
+    Failed(Error),
     /// End of stream (`event: done` / `data: [DONE]`).
     Done,
 }
@@ -155,7 +156,7 @@ impl AgentEventMapper {
                 u.finish_reason = Some(FinishReason::tool_calls());
                 EventOutcome::Updates(vec![u])
             }
-            "thread.run.failed" => EventOutcome::Failed(convert::last_error_message(&data)),
+            "thread.run.failed" => EventOutcome::Failed(convert::classify_last_error(&data)),
             "thread.run.completed" => {
                 let mut u = self.base_update();
                 u.finish_reason = Some(FinishReason::stop());
@@ -301,9 +302,9 @@ pub fn parse_agent_sse_stream(
                     for ev in state.decoder.push(&chunk) {
                         match state.mapper.handle(&ev) {
                             EventOutcome::Updates(updates) => state.queued.extend(updates),
-                            EventOutcome::Failed(msg) => {
+                            EventOutcome::Failed(err) => {
                                 state.done = true;
-                                return Some((Err(Error::service(msg)), state));
+                                return Some((Err(err), state));
                             }
                             EventOutcome::Done => {
                                 state.done = true;
@@ -339,7 +340,7 @@ pub fn updates_from_sse(sse: &str, thread_id: &str) -> Result<Vec<ChatResponseUp
     for ev in decoder.push(sse) {
         match mapper.handle(&ev) {
             EventOutcome::Updates(u) => updates.extend(u),
-            EventOutcome::Failed(msg) => return Err(Error::service(msg)),
+            EventOutcome::Failed(err) => return Err(err),
             EventOutcome::Done => break,
         }
     }
@@ -421,6 +422,20 @@ mod tests {
         );
         let err = updates_from_sse(sse, "thread_1").unwrap_err();
         assert!(err.to_string().contains("too many"));
+        // A non-content-filter code (or none at all) stays the generic
+        // variant, matching upstream's undifferentiated `ServiceResponseException`.
+        assert!(matches!(err, Error::Service(_)));
+    }
+
+    #[test]
+    fn content_filter_run_failure_becomes_content_filter_error() {
+        let sse = concat!(
+            "event: thread.run.created\ndata: {\"id\":\"run_3\"}\n\n",
+            "event: thread.run.failed\ndata: {\"id\":\"run_3\",\"status\":\"failed\",\"last_error\":{\"code\":\"content_filter\",\"message\":\"The response was filtered\"}}\n\n",
+        );
+        let err = updates_from_sse(sse, "thread_1").unwrap_err();
+        assert!(err.to_string().contains("The response was filtered"));
+        assert!(matches!(err, Error::ServiceContentFilter { .. }));
     }
 
     #[test]

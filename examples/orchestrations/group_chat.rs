@@ -4,7 +4,7 @@
 //! stop).
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example group_chat
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example group_chat
 //! ```
 
 use std::sync::Arc;

@@ -6,7 +6,7 @@
 //! LLM calls, API key, or network access.
 //!
 //! ```bash
-//! cargo run -p agent-framework --example workflow_viz
+//! cargo run -p agent-framework-examples --example workflow_viz
 //! ```
 
 use std::sync::Arc;

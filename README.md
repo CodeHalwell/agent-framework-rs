@@ -191,7 +191,8 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
-| `full` | all of the above | no |
+| `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
+| `full` | all of the above except `otel-metrics` | no |
 
 ```toml
 # Everything:
@@ -202,53 +203,28 @@ agent-framework = { version = "0.1", features = ["anthropic"] }
 
 ## Examples
 
-See [`crates/agent-framework/examples`](crates/agent-framework/examples) for
-runnable examples. The offline ones need no API key or network access; the
-rest read their provider's credentials from environment variables (and skip
-gracefully when unset).
+69 runnable examples live in [`examples/`](examples), organized by topic
+(agents, providers, workflows, orchestrations, mcp, hosting, memory,
+observability, a2a, declarative, compliance). See
+[`examples/README.md`](examples/README.md) for the full gallery — every
+example with a one-line description and what it needs to run. The offline
+ones need no API key or network access; the rest read their provider's
+credentials from environment variables, and skip gracefully when unset.
 
-| Example | Shows | Requires |
-| --- | --- | --- |
-| `quickstart` | Minimal `ChatAgent` + OpenAI | `OPENAI_API_KEY` |
-| `streaming` | Token-by-token agent streaming | `OPENAI_API_KEY` |
-| `tools` | Local tool calling via the function-invocation loop | `OPENAI_API_KEY` |
-| `structured_output` | `ResponseFormat::json_schema` + `response.parse_json::<T>()` | `OPENAI_API_KEY` |
-| `approvals` | Human-in-the-loop tool approval loop | `OPENAI_API_KEY` |
-| `agent_as_tool` | A specialist agent exposed via `.as_tool()` to an orchestrator | `OPENAI_API_KEY` |
-| `observability` | `ObservableChatClient` + `tracing_subscriber` span output | `OPENAI_API_KEY` |
-| `openai_responses` | OpenAI Responses API + `conversation_id` reuse | `OPENAI_API_KEY` |
-| `workflow_sequential` | Two-agent sequential pipeline (`SequentialBuilder`) | `OPENAI_API_KEY` |
-| `group_chat` | Multi-agent group chat: round-robin and LLM-managed variants | `OPENAI_API_KEY` |
-| `handoff` | Triage agent handing off to specialists | `OPENAI_API_KEY` |
-| `magentic` | `MagenticBuilder` + `StandardMagenticManager` over two participants | `OPENAI_API_KEY` |
-| `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY`, `--features anthropic` |
-| `azure_openai` | Azure OpenAI, API-key and Entra ID auth | `AZURE_OPENAI_*` vars, `--features azure` |
-| `azure_foundry_agent` | Azure AI Foundry persistent agents + `AzureCliCredential` | `AZURE_AI_PROJECT_ENDPOINT` + `az login`, `--features azure-ai,azure` |
-| `copilotstudio_agent` | Copilot Studio agent over Direct-to-Engine | `COPILOTSTUDIOAGENT__*` vars + token, `--features copilotstudio` |
-| `mcp_tools` | Connect an MCP stdio server, wire its tools into an agent | `OPENAI_API_KEY`, Node/`npx`, `--features mcp` |
-| `mcp_sampling` | Answer MCP server-initiated sampling with your model | `OPENAI_API_KEY`, Node/`npx`, `--features mcp` |
-| `hosting_server` | `AgentHost`: DevUI-style HTTP API + embedded debug page | `--features hosting` (offline with a canned agent) |
-| `agui_server` | AG-UI protocol serving (`AgUiRouter` SSE events) | `--features hosting` (offline with a canned agent) |
-| `a2a_client` | `A2AAgent` against any A2A server, incl. multi-turn continuity | `A2A_AGENT_URL`, `--features a2a` |
-| `declarative_agent` | Load a `ChatAgent` from an inline YAML spec via `DeclarativeLoader` | `--features declarative` (offline with a canned client) |
-| `redis_memory` | Redis-backed thread history + long-term memory provider | a Redis server, `--features redis` (skips gracefully) |
-| `mem0_memory` | Mem0 long-term memory provider | `MEM0_API_KEY` + `OPENAI_API_KEY`, `--features mem0` |
-| `cosmos_store` | Cosmos DB NoSQL conversation store (works on the emulator) | `COSMOS_ENDPOINT`/`COSMOS_KEY`, `--features cosmos` (skips gracefully) |
-| `purview_middleware` | Purview `processContent` DLP checks around an agent | `PURVIEW_TOKEN` + `OPENAI_API_KEY`, `--features purview` |
-| `retry_policy` | `RetryingChatClient` + `RetryPolicy` over a flaky client | offline — no key needed |
-| `magentic_plan_review` | Magentic plan-review HITL: pause, revise, approve | offline — no key needed |
-| `magentic_stall_intervention` | Magentic stall HITL: pause, replan with guidance | offline — no key needed |
-| `workflow_checkpoint` | `FileCheckpointStorage`: save, list, resume mid-pipeline | offline — no key needed |
-| `workflow_hitl` | `RequestInfoExecutor` pause / `send_response` resume | offline — no key needed |
-| `workflow_viz` | Render a branching workflow as Mermaid and Graphviz DOT | offline — no key needed |
+All of them run the same way, no `--features` flag needed:
 
 ```bash
-OPENAI_API_KEY=sk-... cargo run -p agent-framework --example quickstart
-cargo run -p agent-framework --example retry_policy                  # offline
-cargo run -p agent-framework --example magentic_stall_intervention   # offline
-cargo run -p agent-framework --example hosting_server --features hosting
-cargo run -p agent-framework --example agui_server --features hosting
-ANTHROPIC_API_KEY=sk-ant-... cargo run -p agent-framework --example anthropic --features anthropic
+cargo run -p agent-framework-examples --example <name>
+```
+
+A few highlights:
+
+```bash
+OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example quickstart
+cargo run -p agent-framework-examples --example streaming_sse              # offline -- real SSE token streaming end to end
+cargo run -p agent-framework-examples --example typed_tools                # offline -- JSON Schema derived from a Rust struct
+cargo run -p agent-framework-examples --example checkpoint_resume_fanin    # offline -- checkpoint mid-fan-in, then resume
+OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example magentic
 ```
 
 ## Design
@@ -284,47 +260,75 @@ types (`FunctionInvokingChatClient`, `RetryingChatClient`,
 
 ## Roadmap
 
-See [PARITY.md](PARITY.md) for the full, grounded feature matrix. The
-remaining gaps:
+See [PARITY.md](PARITY.md) for the feature matrix and
+[GAP_ANALYSIS.md](GAP_ANALYSIS.md) for the audited gap list and its status
+section (the current source of truth). The remaining gaps:
 
+- [ ] Workflow depth: typed executor routing / multiple handlers,
+      `AgentExecutorRequest`-style envelopes, sub-workflow request
+      interception, orchestration `with_request_info`/`with_checkpointing`
+      options, event origin/warning events, viz file export
+- [ ] Cross-language wire compatibility: `type`-tagged message payloads,
+      `raw_representation`/`additional_properties` on content types
+- [ ] AG-UI: the client (`AGUIChatClient`) and predictive-state events
+      (`STATE_SNAPSHOT`/`STATE_DELTA`, `confirm_changes`)
+- [ ] DevUI parity: conversations API, run cancellation, `/meta`,
+      directory-based entity discovery, auth; the React frontend
+- [ ] A2A serving: streaming, non-terminal task lifecycle, file/data parts,
+      push-notification config, `tasks/resubscribe`, extended card
+- [ ] Providers: `AzureOpenAIAssistantsClient` wrapper, the new Foundry
+      Prompt-Agent client; `as_mcp_server`
 - [ ] MCP client: standalone GET-based SSE listening, automatic reconnect,
       elicitation
-- [ ] A2A serving: push-notification config, `tasks/resubscribe`, and the
-      authenticated extended card on the hosting side (the client has all
-      three)
-- [ ] The React DevUI frontend (an embedded single-file debug page ships
-      today) and stateful hosted runs (conversation store, run-resume)
 - [ ] Redis provider: embeddings/vector-KNN and hybrid search (BM25
       full-text ships on Redis Stack)
 - [ ] Cosmos DB: Entra ID/AAD auth, `TransactionalBatch`, hierarchical
-      partition keys, TTL
+      partition keys, TTL, and a Cosmos-backed workflow-checkpoint store
 - [ ] The upstream Copilot-Studio declarative *workflow* DSL (declarative
       agents already follow the official schema)
 - [ ] Purview: protection-scopes precheck/caching, background
       content-activity logging, JWT-derived identity fallback
-- [ ] OTel SDK exporter wiring (spans are emitted and bridge-ready today)
+- [ ] OTel SDK exporter wiring stays the application's job by design
+      (spans and `otel-metrics` histograms are emitted and bridge-ready)
 - [ ] Remaining ecosystem: ChatKit, the `lab` experimental packages,
       DurableTask/Azure Functions hosting
 
 Done — everything else, including:
 
 - [x] Core data model, function-invocation loop, approval flow, structured
-      output on every provider, and `RetryingChatClient` retries with
-      `Retry-After` support
-- [x] `ChatAgent` with threads, memory, `as_tool`, and agent / chat /
+      output on every provider (auto-parsed into `response.value`), and
+      `RetryingChatClient` retries with `Retry-After` support
+- [x] `ChatAgent` with threads (serialize/deserialize + store factory),
+      memory, `as_tool`, per-run `AgentRunOptions`, and agent / chat /
       function middleware
-- [x] Providers: OpenAI (chat + Responses), Azure OpenAI, Azure AI Foundry,
-      Anthropic, Copilot Studio; Entra ID credential chain
-- [x] MCP client: stdio + HTTP + WebSocket, tools, prompts, sampling, roots
-- [x] Workflow engine incl. signature-validated checkpointing, HITL, shared
-      state, validation, viz, sub-workflows
+- [x] Trait-level `run_stream`: real token SSE through hosting (DevUI-style,
+      AG-UI, OpenAI-compatible), incremental agent updates inside
+      orchestrations, streaming A2A
+- [x] `AiFunction::typed` — parameter schemas derived from Rust types
+      (schemars), plus invocation limits and hosted-tool config setters
+- [x] Providers: OpenAI (chat + Responses + **Assistants**), Azure OpenAI
+      (chat + **Responses**), Azure AI Foundry (incl. Bing grounding /
+      file-search configs), Anthropic (betas + hosted tools + citations),
+      Copilot Studio; Entra ID credential chain incl.
+      `DefaultAzureCredential`
+- [x] Multimodal input (images/audio/files) and citation annotations on
+      OpenAI + Anthropic; granular service errors (auth / invalid-request /
+      content-filter)
+- [x] MCP: stdio + HTTP + WebSocket, tools, prompts, sampling, roots, and
+      first-class `ToolSource` integration with `list_changed` reloads
+- [x] Workflow engine incl. signature-validated checkpointing (fan-in state
+      included), concurrent supersteps, HITL, shared state, validation,
+      viz, sub-workflows
 - [x] All orchestrations incl. Magentic plan-review and stall-intervention
       HITL
 - [x] A2A client (full task surface) and A2A serving (card + JSON-RPC)
 - [x] Declarative YAML agents; Rust-native workflow specs
-- [x] Hosting: DevUI-style API + embedded debug page, AG-UI, OpenAI-compatible
+- [x] Hosting: DevUI-style API + embedded debug page, AG-UI (with client
+      tools injected per-run), OpenAI-compatible
 - [x] Redis (BM25), Mem0, Cosmos DB, Azure AI Search; Purview middleware
-- [x] `tracing`-based observability with OTel GenAI semantic conventions
+- [x] Observability: OTel GenAI spans (request + tool attributes) and
+      optional GenAI metrics histograms (`otel-metrics`)
+- [x] 69 runnable examples in [`examples/`](examples)
 
 ## Development
 

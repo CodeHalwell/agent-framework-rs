@@ -9,7 +9,7 @@
 //!
 //! Requires the `mcp` feature:
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example mcp_tools --features mcp
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example mcp_tools
 //! ```
 
 use agent_framework::prelude::*;

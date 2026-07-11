@@ -8,7 +8,7 @@
 //! needs no API key or network access.
 //!
 //! ```bash
-//! cargo run -p agent-framework --example workflow_checkpoint
+//! cargo run -p agent-framework-examples --example workflow_checkpoint
 //! ```
 
 use std::sync::Arc;

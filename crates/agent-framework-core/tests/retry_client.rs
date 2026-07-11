@@ -192,6 +192,71 @@ async fn does_not_retry_non_retryable_status() {
     );
 }
 
+/// Auth failures, invalid-request rejections, and content-filter refusals are
+/// all definitively non-transient (retrying repeats the exact same
+/// rejection), so none of the three new granular variants are retried by
+/// [`RetryOn::Default`] — while a `429`/`5xx` [`Error::ServiceStatus`] (the
+/// same status family upstream would previously have collapsed these into)
+/// is still retried. This is the one behavioral guarantee the whole
+/// error-granularity change depends on: adding the variants must not make
+/// auth/content-filter errors *more* retryable than the `ServiceStatus` they
+/// used to be reported as.
+#[tokio::test(start_paused = true)]
+async fn does_not_retry_auth_invalid_request_or_content_filter_but_still_retries_429_and_5xx() {
+    for (err, label) in [
+        (Error::service_invalid_auth("unauthorized"), "auth"),
+        (
+            Error::service_invalid_request("bad request"),
+            "invalid_request",
+        ),
+        (
+            Error::service_content_filter("flagged by content filter"),
+            "content_filter",
+        ),
+    ] {
+        let client = FlakyClient::new();
+        client.push_response(Err(err));
+        client.push_response(Ok(ChatResponse::from_text("unreached")));
+        let calls = client.resp_calls.clone();
+
+        let retrying = RetryingChatClient::new(client).with_policy(deterministic_policy());
+        let err = retrying
+            .get_response(user(), ChatOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status(), None, "{label}: not a ServiceStatus");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "{label}: non-transient error must not be retried"
+        );
+    }
+
+    // Control: the status family these used to be reported under is still
+    // retried, so the exclusion above is specific to the new variants rather
+    // than a change to the general retry behavior.
+    for status in [429, 500, 503] {
+        let client = FlakyClient::new();
+        client.push_response(Err(Error::service_status(status, "transient", None)));
+        client.push_response(Ok(ChatResponse::from_text("ok")));
+        let calls = client.resp_calls.clone();
+
+        let retrying = RetryingChatClient::new(client).with_policy(deterministic_policy());
+        let resp = retrying
+            .get_response(user(), ChatOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.text(), "ok", "status {status}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "status {status}: still retried once then succeeds"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn retries_transport_service_errors() {
     let client = FlakyClient::new();

@@ -8,7 +8,7 @@
 //!
 //! Requires the `hosting` feature:
 //! ```bash
-//! cargo run -p agent-framework --example agui_server --features hosting
+//! cargo run -p agent-framework-examples --example agui_server
 //! ```
 //!
 //! Then, from another terminal:

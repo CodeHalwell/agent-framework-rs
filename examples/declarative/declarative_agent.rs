@@ -8,7 +8,7 @@
 //! Runs offline (a canned client is registered when OPENAI_API_KEY is unset).
 //!
 //! ```bash
-//! cargo run -p agent-framework --example declarative_agent --features declarative
+//! cargo run -p agent-framework-examples --example declarative_agent
 //! ```
 
 use std::sync::Arc;

@@ -8,7 +8,7 @@
 //! provider's retrieval is recency-based, not vector search (see PARITY.md).
 //!
 //! ```bash
-//! cargo run -p agent-framework --example redis_memory --features redis
+//! cargo run -p agent-framework-examples --example redis_memory
 //! ```
 
 use std::sync::Arc;

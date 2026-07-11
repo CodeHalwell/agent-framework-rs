@@ -3,7 +3,7 @@
 //! the model produces a final answer.
 //!
 //! ```bash
-//! OPENAI_API_KEY=sk-... cargo run -p agent-framework --example tools
+//! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example tools
 //! ```
 
 use agent_framework::prelude::*;

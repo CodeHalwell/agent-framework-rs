@@ -6,7 +6,7 @@
 //!
 //! Requires the `hosting` feature:
 //! ```bash
-//! cargo run -p agent-framework --example hosting_server --features hosting
+//! cargo run -p agent-framework-examples --example hosting_server
 //! ```
 //!
 //! Then, from another terminal:

@@ -6,7 +6,7 @@
 //! needs no API key or network access.
 //!
 //! ```bash
-//! cargo run -p agent-framework --example workflow_hitl
+//! cargo run -p agent-framework-examples --example workflow_hitl
 //! ```
 
 use std::sync::Arc;
