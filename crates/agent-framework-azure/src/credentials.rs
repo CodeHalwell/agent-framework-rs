@@ -6,9 +6,15 @@
 //!
 //! * [`AzureCliCredential`] — shells out to `az account get-access-token`.
 //! * [`ClientSecretCredential`] — OAuth2 client-credentials flow against Entra.
+//! * [`EnvironmentCredential`] — the same flow, configured from
+//!   `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`.
 //! * [`ManagedIdentityCredential`] — the IMDS token endpoint.
+//! * [`WorkloadIdentityCredential`] — exchanges a Kubernetes federated
+//!   service-account token (AKS workload identity) for an Entra token.
 //! * [`ChainedTokenCredential`] — tries each in order; the first to succeed is
 //!   remembered and preferred thereafter.
+//! * [`DefaultAzureCredential`] — a prebuilt chain of the above four, in
+//!   `azure_identity`'s documented `DefaultAzureCredential` order.
 //!
 //! Every credential is bound to a default scope (audience) supplied at
 //! construction and used by [`TokenCredential::get_token`]; a different scope
@@ -145,6 +151,17 @@ fn parse_cli_output(stdout: &[u8]) -> Result<(String, SystemTime)> {
 /// IMDS expects (`resource=<resource>`).
 fn resource_from_scope(scope: &str) -> &str {
     scope.strip_suffix("/.default").unwrap_or(scope)
+}
+
+/// Names of `vars` whose resolved value is `None`, in the given order — used
+/// by [`EnvironmentCredential::new`] and [`WorkloadIdentityCredential`] to
+/// build a single "missing: X, Y" error message instead of failing on just
+/// the first missing variable.
+fn missing_env_vars<'a>(vars: &[(&'a str, &Option<String>)]) -> Vec<&'a str> {
+    vars.iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +347,79 @@ impl TokenCredential for ClientSecretCredential {
 }
 
 // ---------------------------------------------------------------------------
+// EnvironmentCredential
+// ---------------------------------------------------------------------------
+
+/// Authenticates a service principal configured entirely by environment
+/// variables, via the client-secret flow: `AZURE_TENANT_ID`,
+/// `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
+///
+/// A restricted port of `azure_identity`'s `EnvironmentCredential`: upstream
+/// also supports a certificate flow and a (deprecated) username/password
+/// flow, neither of which this crate implements, so only the client-secret
+/// configuration is recognized. Unlike upstream — which defers the
+/// "not configured" failure to the first
+/// [`get_token`](TokenCredential::get_token) call — [`new`](Self::new) fails
+/// immediately, listing every missing variable, so misconfiguration is caught
+/// at startup rather than on first use.
+pub struct EnvironmentCredential {
+    inner: ClientSecretCredential,
+}
+
+impl EnvironmentCredential {
+    /// Read `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`
+    /// from the environment and build a client-secret credential acquiring
+    /// tokens for `scope`.
+    ///
+    /// # Errors
+    /// [`Error::Configuration`] naming every missing variable, when one or
+    /// more of the three are unset.
+    pub fn new(scope: impl Into<String>) -> Result<Self> {
+        let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
+        let client_id = std::env::var("AZURE_CLIENT_ID").ok();
+        let client_secret = std::env::var("AZURE_CLIENT_SECRET").ok();
+
+        let missing = missing_env_vars(&[
+            ("AZURE_TENANT_ID", &tenant_id),
+            ("AZURE_CLIENT_ID", &client_id),
+            ("AZURE_CLIENT_SECRET", &client_secret),
+        ]);
+        if !missing.is_empty() {
+            return Err(Error::Configuration(format!(
+                "EnvironmentCredential: missing required environment variable(s): {}",
+                missing.join(", ")
+            )));
+        }
+
+        Ok(Self {
+            inner: ClientSecretCredential::new(
+                tenant_id.unwrap(),
+                client_id.unwrap(),
+                client_secret.unwrap(),
+                scope,
+            ),
+        })
+    }
+
+    /// Override the Entra authority used by the inner client-secret
+    /// credential (default [`DEFAULT_AUTHORITY`]).
+    pub fn with_authority(mut self, authority: impl Into<String>) -> Self {
+        self.inner = self.inner.with_authority(authority);
+        self
+    }
+}
+
+#[async_trait]
+impl TokenCredential for EnvironmentCredential {
+    async fn get_token(&self) -> Result<String> {
+        self.inner.get_token().await
+    }
+    async fn get_token_for_scope(&self, scope: &str) -> Result<String> {
+        self.inner.get_token_for_scope(scope).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ManagedIdentityCredential
 // ---------------------------------------------------------------------------
 
@@ -444,6 +534,175 @@ impl TokenCredential for ManagedIdentityCredential {
 }
 
 // ---------------------------------------------------------------------------
+// WorkloadIdentityCredential
+// ---------------------------------------------------------------------------
+
+/// Authenticates via Microsoft Entra Workload ID (Azure Kubernetes Service
+/// workload identity federation): exchanges a Kubernetes projected
+/// service-account token for an Entra access token using the OAuth2
+/// client-credentials grant with a JWT client assertion
+/// (`POST {authority}/{tenant}/oauth2/v2.0/token`,
+/// `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`).
+///
+/// By default `tenant_id`, `client_id`, and the federated token file path are
+/// read from `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+/// `AZURE_FEDERATED_TOKEN_FILE` — the variables the AKS workload identity
+/// webhook injects into a pod — mirroring `azure_identity`'s
+/// `WorkloadIdentityCredential`. The token file is re-read on every token
+/// *request* (not cached once at startup), since the kubelet periodically
+/// rotates the projected token.
+pub struct WorkloadIdentityCredential {
+    http: reqwest::Client,
+    authority: String,
+    tenant_id: String,
+    client_id: String,
+    token_file_path: String,
+    default_scope: String,
+    cache: TokenCache,
+}
+
+impl WorkloadIdentityCredential {
+    /// Read `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and
+    /// `AZURE_FEDERATED_TOKEN_FILE` from the environment, acquiring tokens for
+    /// `scope`.
+    ///
+    /// # Errors
+    /// [`Error::Configuration`] naming every missing variable, when one or
+    /// more of the three are unset.
+    pub fn new(scope: impl Into<String>) -> Result<Self> {
+        Self::with_overrides(scope, None, None, None)
+    }
+
+    /// Same as [`new`](Self::new), but the tenant id, client id, and/or
+    /// federated-token-file path can be supplied directly instead of read
+    /// from the environment. Pass `None` for a field to keep reading it from
+    /// the usual environment variable.
+    ///
+    /// # Errors
+    /// [`Error::Configuration`] naming every value that is neither passed
+    /// here nor found in the environment.
+    pub fn with_overrides(
+        scope: impl Into<String>,
+        tenant_id: Option<String>,
+        client_id: Option<String>,
+        token_file_path: Option<String>,
+    ) -> Result<Self> {
+        let tenant_id = tenant_id.or_else(|| std::env::var("AZURE_TENANT_ID").ok());
+        let client_id = client_id.or_else(|| std::env::var("AZURE_CLIENT_ID").ok());
+        let token_file_path =
+            token_file_path.or_else(|| std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok());
+
+        let missing = missing_env_vars(&[
+            ("AZURE_TENANT_ID", &tenant_id),
+            ("AZURE_CLIENT_ID", &client_id),
+            ("AZURE_FEDERATED_TOKEN_FILE", &token_file_path),
+        ]);
+        if !missing.is_empty() {
+            return Err(Error::Configuration(format!(
+                "WorkloadIdentityCredential: missing required configuration: {}",
+                missing.join(", ")
+            )));
+        }
+
+        Ok(Self {
+            http: reqwest::Client::new(),
+            authority: DEFAULT_AUTHORITY.to_string(),
+            tenant_id: tenant_id.unwrap(),
+            client_id: client_id.unwrap(),
+            token_file_path: token_file_path.unwrap(),
+            default_scope: scope.into(),
+            cache: TokenCache::default(),
+        })
+    }
+
+    /// Same as [`new`](Self::new), overriding only the client id (default:
+    /// `AZURE_CLIENT_ID`) — e.g. to authenticate as an app registration whose
+    /// federated credential trusts this pod's service account token, distinct
+    /// from the identity the AKS webhook injects by default.
+    pub fn with_client_id(scope: impl Into<String>, client_id: Option<String>) -> Result<Self> {
+        Self::with_overrides(scope, None, client_id, None)
+    }
+
+    /// Override the Entra authority (default [`DEFAULT_AUTHORITY`]) — e.g. a
+    /// sovereign cloud, or a loopback in tests.
+    pub fn with_authority(mut self, authority: impl Into<String>) -> Self {
+        self.authority = authority.into();
+        self
+    }
+
+    fn token_url(&self) -> String {
+        format!(
+            "{}/{}/oauth2/v2.0/token",
+            self.authority.trim_end_matches('/'),
+            self.tenant_id
+        )
+    }
+
+    async fn token(&self, scope: &str) -> Result<String> {
+        if let Some(t) = self.cache.get(scope) {
+            return Ok(t);
+        }
+        let (token, expires_at) = self.fetch(scope).await?;
+        self.cache.put(scope, token.clone(), expires_at);
+        Ok(token)
+    }
+
+    /// Build the token-request form body, re-reading the federated token file
+    /// fresh every time so a rotated projected token is always picked up.
+    /// Factored out from [`fetch`](Self::fetch) so the exact request shape is
+    /// unit-testable without a network.
+    fn request_params(&self, scope: &str) -> Result<Vec<(String, String)>> {
+        let assertion = std::fs::read_to_string(&self.token_file_path).map_err(|e| {
+            Error::Configuration(format!(
+                "WorkloadIdentityCredential: failed to read federated token file '{}': {e}",
+                self.token_file_path
+            ))
+        })?;
+        Ok(vec![
+            ("grant_type".to_string(), "client_credentials".to_string()),
+            ("client_id".to_string(), self.client_id.clone()),
+            ("client_assertion".to_string(), assertion.trim().to_string()),
+            (
+                "client_assertion_type".to_string(),
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+            ),
+            ("scope".to_string(), scope.to_string()),
+        ])
+    }
+
+    async fn fetch(&self, scope: &str) -> Result<(String, SystemTime)> {
+        let params = self.request_params(scope)?;
+        let resp = self
+            .http
+            .post(self.token_url())
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| Error::service(format!("workload-identity token request failed: {e}")))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::other(format!(
+                "workload-identity token request rejected ({}): {}",
+                status,
+                body.trim()
+            )));
+        }
+        parse_oauth_token(&body)
+    }
+}
+
+#[async_trait]
+impl TokenCredential for WorkloadIdentityCredential {
+    async fn get_token(&self) -> Result<String> {
+        self.token(&self.default_scope).await
+    }
+    async fn get_token_for_scope(&self, scope: &str) -> Result<String> {
+        self.token(scope).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChainedTokenCredential
 // ---------------------------------------------------------------------------
 
@@ -518,6 +777,80 @@ impl TokenCredential for ChainedTokenCredential {
     }
     async fn get_token_for_scope(&self, scope: &str) -> Result<String> {
         self.acquire(Some(scope)).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DefaultAzureCredential
+// ---------------------------------------------------------------------------
+
+/// A prebuilt [`ChainedTokenCredential`], in (a subset of) `azure_identity`'s
+/// documented `DefaultAzureCredential` order.
+///
+/// Upstream (Python/.NET) `DefaultAzureCredential` tries, in order:
+/// `EnvironmentCredential`, `WorkloadIdentityCredential`,
+/// `ManagedIdentityCredential`, `SharedTokenCacheCredential` (Windows only),
+/// `VisualStudioCodeCredential`, `AzureCliCredential`,
+/// `AzurePowerShellCredential`, `AzureDeveloperCliCredential`, and
+/// (Windows/WSL only, off by default) `InteractiveBrowserCredential`/broker
+/// authentication.
+///
+/// This crate implements four of those credential types, so this chain is
+/// **`EnvironmentCredential` → `WorkloadIdentityCredential` →
+/// `ManagedIdentityCredential` → `AzureCliCredential`** — the same relative
+/// order upstream uses among the credentials that exist here. Every other
+/// link in upstream's list (the shared token cache, IDE-signed-in
+/// credentials, PowerShell, the Azure Developer CLI, interactive/broker auth)
+/// is simply absent rather than approximated by something else; callers that
+/// need one of those should build their own [`ChainedTokenCredential`].
+///
+/// `EnvironmentCredential` and `WorkloadIdentityCredential` are included only
+/// when their required environment variables are present — construction
+/// failure just excludes them from the chain, mirroring upstream's
+/// "unavailable credentials are skipped, not fatal" behavior (there, via a
+/// placeholder that defers the error to `get_token`; here, by omission, since
+/// [`ChainedTokenCredential`] already only holds constructed credentials).
+/// `ManagedIdentityCredential` and `AzureCliCredential` need no such
+/// configuration and are always present, so the chain is never empty. As with
+/// any [`ChainedTokenCredential`], whichever credential first returns a token
+/// is remembered and tried first on subsequent calls.
+pub struct DefaultAzureCredential {
+    chain: ChainedTokenCredential,
+}
+
+impl DefaultAzureCredential {
+    /// Build the chain, acquiring tokens for `scope` by default.
+    pub fn new(scope: impl Into<String>) -> Self {
+        let scope = scope.into();
+        Self {
+            chain: ChainedTokenCredential::new(default_chain(&scope)),
+        }
+    }
+}
+
+/// The ordered, environment-filtered credential list backing
+/// [`DefaultAzureCredential`]. A free function so the inclusion logic is
+/// independently unit-testable without a network.
+fn default_chain(scope: &str) -> Vec<Arc<dyn TokenCredential>> {
+    let mut chain: Vec<Arc<dyn TokenCredential>> = Vec::new();
+    if let Ok(cred) = EnvironmentCredential::new(scope) {
+        chain.push(Arc::new(cred));
+    }
+    if let Ok(cred) = WorkloadIdentityCredential::new(scope) {
+        chain.push(Arc::new(cred));
+    }
+    chain.push(Arc::new(ManagedIdentityCredential::new(scope)));
+    chain.push(Arc::new(AzureCliCredential::new(scope)));
+    chain
+}
+
+#[async_trait]
+impl TokenCredential for DefaultAzureCredential {
+    async fn get_token(&self) -> Result<String> {
+        self.chain.get_token().await
+    }
+    async fn get_token_for_scope(&self, scope: &str) -> Result<String> {
+        self.chain.get_token_for_scope(scope).await
     }
 }
 
@@ -693,6 +1026,266 @@ mod tests {
     async fn empty_chain_errors() {
         let chain = ChainedTokenCredential::new(vec![]);
         assert!(chain.get_token().await.is_err());
+    }
+
+    // endregion
+
+    // region: env-var-backed credentials (Environment / WorkloadIdentity / Default)
+
+    /// Guards mutation of the Entra env vars consumed by
+    /// `EnvironmentCredential`/`WorkloadIdentityCredential`/
+    /// `DefaultAzureCredential`: tests in this module run on multiple
+    /// threads, and env vars are process-global (same pattern as
+    /// `agent-framework-mem0`'s `ENV_MUTEX`).
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const ENTRA_ENV_VARS: &[&str] = &[
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_FEDERATED_TOKEN_FILE",
+    ];
+
+    fn clear_entra_env() {
+        for key in ENTRA_ENV_VARS {
+            // SAFETY: serialized by ENV_MUTEX; no other test in this crate
+            // touches these variables.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    const TEST_SCOPE: &str = "https://ai.azure.com/.default";
+
+    #[test]
+    fn environment_credential_errors_listing_all_missing_vars() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        // `.err().unwrap()` rather than `.unwrap_err()`: the credential types
+        // deliberately don't derive `Debug` (they can hold secrets), and only
+        // `unwrap_err()` requires the `Ok` side to be `Debug`.
+        let err = EnvironmentCredential::new(TEST_SCOPE).err().unwrap();
+        clear_entra_env();
+        let msg = err.to_string();
+        assert!(msg.contains("AZURE_TENANT_ID"), "{msg}");
+        assert!(msg.contains("AZURE_CLIENT_ID"), "{msg}");
+        assert!(msg.contains("AZURE_CLIENT_SECRET"), "{msg}");
+    }
+
+    #[test]
+    fn environment_credential_lists_only_the_vars_still_missing() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_CLIENT_ID", "client");
+        }
+        let err = EnvironmentCredential::new(TEST_SCOPE).err().unwrap();
+        clear_entra_env();
+        let msg = err.to_string();
+        assert!(msg.contains("AZURE_CLIENT_SECRET"), "{msg}");
+        assert!(!msg.contains("AZURE_TENANT_ID"), "{msg}");
+        assert!(!msg.contains("AZURE_CLIENT_ID"), "{msg}");
+    }
+
+    #[test]
+    fn environment_credential_succeeds_with_all_three_vars() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_CLIENT_ID", "client");
+            std::env::set_var("AZURE_CLIENT_SECRET", "secret");
+        }
+        let cred = EnvironmentCredential::new(TEST_SCOPE);
+        clear_entra_env();
+        assert!(cred.is_ok());
+    }
+
+    #[test]
+    fn workload_identity_errors_listing_all_missing_vars() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        let err = WorkloadIdentityCredential::new(TEST_SCOPE).err().unwrap();
+        clear_entra_env();
+        let msg = err.to_string();
+        assert!(msg.contains("AZURE_TENANT_ID"), "{msg}");
+        assert!(msg.contains("AZURE_CLIENT_ID"), "{msg}");
+        assert!(msg.contains("AZURE_FEDERATED_TOKEN_FILE"), "{msg}");
+    }
+
+    #[test]
+    fn workload_identity_client_id_override_fills_in_for_missing_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_FEDERATED_TOKEN_FILE", "placeholder-token-file");
+        }
+        let cred = WorkloadIdentityCredential::with_client_id(
+            TEST_SCOPE,
+            Some("explicit-client".to_string()),
+        );
+        clear_entra_env();
+        assert!(cred.is_ok());
+    }
+
+    #[test]
+    fn workload_identity_request_params_build_client_assertion_shape() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // A real scratch file: `request_params` reads it fresh every call.
+        let path = std::env::temp_dir().join(format!(
+            "af-workload-identity-test-{}-{:?}.jwt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "fake.jwt.token").unwrap();
+
+        let cred = WorkloadIdentityCredential::with_overrides(
+            TEST_SCOPE,
+            Some("tenant-1".to_string()),
+            Some("client-1".to_string()),
+            Some(path.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        let params = cred.request_params(TEST_SCOPE).unwrap();
+        let get = |key: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("grant_type").as_deref(), Some("client_credentials"));
+        assert_eq!(get("client_id").as_deref(), Some("client-1"));
+        assert_eq!(get("client_assertion").as_deref(), Some("fake.jwt.token"));
+        assert_eq!(
+            get("client_assertion_type").as_deref(),
+            Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+        );
+        assert_eq!(get("scope").as_deref(), Some(TEST_SCOPE));
+        assert_eq!(
+            cred.token_url(),
+            "https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn workload_identity_rereads_token_file_on_each_request() {
+        let path = std::env::temp_dir().join(format!(
+            "af-workload-identity-rotate-{}-{:?}.jwt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "first-token").unwrap();
+
+        let cred = WorkloadIdentityCredential::with_overrides(
+            TEST_SCOPE,
+            Some("tenant-1".to_string()),
+            Some("client-1".to_string()),
+            Some(path.to_str().unwrap().to_string()),
+        )
+        .unwrap();
+
+        let first = cred.request_params("scope").unwrap();
+        let assertion_of = |params: &[(String, String)]| {
+            params
+                .iter()
+                .find(|(k, _)| k == "client_assertion")
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(assertion_of(&first).as_deref(), Some("first-token"));
+
+        std::fs::write(&path, "rotated-token").unwrap();
+        let second = cred.request_params("scope").unwrap();
+        assert_eq!(assertion_of(&second).as_deref(), Some("rotated-token"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn workload_identity_missing_token_file_is_a_clear_error() {
+        let cred = WorkloadIdentityCredential::with_overrides(
+            TEST_SCOPE,
+            Some("tenant-1".to_string()),
+            Some("client-1".to_string()),
+            Some("/definitely/not/a/real/path/af-test.jwt".to_string()),
+        )
+        .unwrap();
+        let err = cred.request_params(TEST_SCOPE).unwrap_err();
+        assert!(err.to_string().contains("federated token file"), "{err}");
+    }
+
+    // endregion
+
+    // region: DefaultAzureCredential chain composition/order
+
+    #[test]
+    fn default_chain_includes_only_always_on_credentials_without_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        let chain = default_chain(TEST_SCOPE);
+        clear_entra_env();
+        // Only ManagedIdentityCredential + AzureCliCredential need no
+        // configuration, so they're the only two present.
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn default_chain_adds_environment_credential_when_configured() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_CLIENT_ID", "client");
+            std::env::set_var("AZURE_CLIENT_SECRET", "secret");
+        }
+        let chain = default_chain(TEST_SCOPE);
+        clear_entra_env();
+        assert_eq!(chain.len(), 3, "Environment + ManagedIdentity + AzureCli");
+    }
+
+    #[test]
+    fn default_chain_adds_workload_identity_when_configured() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_CLIENT_ID", "client");
+            std::env::set_var("AZURE_FEDERATED_TOKEN_FILE", "placeholder-token-file");
+        }
+        let chain = default_chain(TEST_SCOPE);
+        clear_entra_env();
+        assert_eq!(
+            chain.len(),
+            3,
+            "WorkloadIdentity + ManagedIdentity + AzureCli"
+        );
+    }
+
+    #[test]
+    fn default_chain_adds_both_environment_and_workload_identity_in_order() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        unsafe {
+            std::env::set_var("AZURE_TENANT_ID", "tenant");
+            std::env::set_var("AZURE_CLIENT_ID", "client");
+            std::env::set_var("AZURE_CLIENT_SECRET", "secret");
+            std::env::set_var("AZURE_FEDERATED_TOKEN_FILE", "placeholder-token-file");
+        }
+        let chain = default_chain(TEST_SCOPE);
+        clear_entra_env();
+        assert_eq!(chain.len(), 4, "all four credentials configured");
+    }
+
+    #[test]
+    fn default_azure_credential_wraps_a_never_empty_chain() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_entra_env();
+        let cred = DefaultAzureCredential::new(TEST_SCOPE);
+        clear_entra_env();
+        assert_eq!(cred.chain.credentials.len(), 2);
     }
 
     // endregion

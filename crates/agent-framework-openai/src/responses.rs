@@ -29,14 +29,18 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, ResponseFormat, Role,
-    TextContent, TextReasoningContent, ToolMode, UsageContent, UsageDetails,
+    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, CitationAnnotation, Content,
+    DataContent, FinishReason, FunctionApprovalRequestContent, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, ResponseFormat, Role, TextContent,
+    TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use crate::convert::{function_arguments_to_string, result_to_string};
+use crate::convert::{
+    audio_format, data_content_media_type, function_arguments_to_string, result_to_string,
+    top_level_media_type, DEFAULT_FILENAME,
+};
 use crate::{ByteStream, DEFAULT_BASE_URL};
 
 /// An OpenAI Responses API chat client (`POST /v1/responses`).
@@ -285,7 +289,7 @@ fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
             continue;
         }
 
-        let mut buffered_text: Vec<Value> = Vec::new();
+        let mut buffered: Vec<Value> = Vec::new();
         for content in &msg.contents {
             match content {
                 Content::Text(t) => {
@@ -294,10 +298,25 @@ fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
                     } else {
                         "input_text"
                     };
-                    buffered_text.push(json!({ "type": text_type, "text": t.text }));
+                    buffered.push(json!({ "type": text_type, "text": t.text }));
+                }
+                Content::Uri(u) => {
+                    if let Some(part) = content_to_input_part(&u.uri, Some(&u.media_type)) {
+                        buffered.push(part);
+                    }
+                }
+                Content::Data(d) => {
+                    if let Some(part) =
+                        content_to_input_part(&d.uri, data_content_media_type(d).as_deref())
+                    {
+                        buffered.push(part);
+                    }
+                }
+                Content::HostedFile(h) => {
+                    buffered.push(json!({ "type": "input_file", "file_id": h.file_id }));
                 }
                 Content::FunctionCall(fc) => {
-                    flush_text(&mut out, &mut buffered_text, role);
+                    flush_text(&mut out, &mut buffered, role);
                     out.push(json!({
                         "type": "function_call",
                         "call_id": fc.call_id,
@@ -306,15 +325,61 @@ fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
                     }));
                 }
                 Content::FunctionResult(fr) => {
-                    flush_text(&mut out, &mut buffered_text, role);
+                    flush_text(&mut out, &mut buffered, role);
                     out.push(function_result_to_item(fr));
+                }
+                Content::FunctionApprovalResponse(r) => {
+                    flush_text(&mut out, &mut buffered, role);
+                    out.push(json!({
+                        "type": "mcp_approval_response",
+                        "approval_request_id": r.id,
+                        "approve": r.approved,
+                    }));
+                }
+                Content::FunctionApprovalRequest(r) => {
+                    flush_text(&mut out, &mut buffered, role);
+                    out.push(json!({
+                        "type": "mcp_approval_request",
+                        "id": r.id,
+                        "name": r.function_call.name,
+                        "arguments": function_arguments_to_string(&r.function_call.arguments),
+                    }));
                 }
                 _ => {}
             }
         }
-        flush_text(&mut out, &mut buffered_text, role);
+        flush_text(&mut out, &mut buffered, role);
     }
     out
+}
+
+/// Map a URI/data content item to a Responses API input content part, or `None`
+/// when it has no wire mapping (mirrors upstream `_openai_content_parser`).
+/// Handles images (`input_image`), audio (`input_audio`), and `application/*`
+/// data (`input_file`).
+fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
+    let media_type = media_type?;
+    match top_level_media_type(media_type).as_str() {
+        // `detail` defaults to "auto"; the Rust content types carry no override.
+        "image" => Some(json!({
+            "type": "input_image",
+            "image_url": uri,
+            "detail": "auto",
+        })),
+        "audio" => {
+            let format = audio_format(media_type)?;
+            Some(json!({
+                "type": "input_audio",
+                "input_audio": { "data": uri, "format": format },
+            }))
+        }
+        "application" => Some(json!({
+            "type": "input_file",
+            "file_data": uri,
+            "filename": DEFAULT_FILENAME,
+        })),
+        _ => None,
+    }
 }
 
 fn flush_text(out: &mut Vec<Value>, buffered: &mut Vec<Value>, role: &str) {
@@ -334,13 +399,33 @@ fn function_result_to_item(fr: &FunctionResultContent) -> Value {
 /// The flat Responses-API tool spec: `{"type":"function","name":...}`, unlike
 /// Chat Completions' `{"type":"function","function":{...}}` nesting.
 fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
-    use agent_framework_core::tools::{ApprovalMode, ToolKind};
+    use agent_framework_core::tools::ToolKind;
     match &tool.kind {
-        ToolKind::HostedWebSearch => json!({ "type": "web_search" }),
-        ToolKind::HostedCodeInterpreter => json!({
-            "type": "code_interpreter",
-            "container": { "type": "auto" },
-        }),
+        ToolKind::HostedWebSearch => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("web_search"));
+            if let Some(loc) = tool.parameters.get("user_location") {
+                spec.insert("user_location".into(), user_location_to_responses(loc));
+            }
+            Value::Object(spec)
+        }
+        ToolKind::HostedCodeInterpreter => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("code_interpreter"));
+            // A caller-supplied `container` wins; otherwise default to `auto`
+            // and attach any `file_ids` (`_responses_client.py:264-278`).
+            if let Some(container) = tool.parameters.get("container") {
+                spec.insert("container".into(), container.clone());
+            } else {
+                let mut container = Map::new();
+                container.insert("type".into(), json!("auto"));
+                if let Some(file_ids) = tool.parameters.get("file_ids") {
+                    container.insert("file_ids".into(), file_ids.clone());
+                }
+                spec.insert("container".into(), Value::Object(container));
+            }
+            Value::Object(spec)
+        }
         ToolKind::HostedFileSearch { max_results } => {
             let mut spec = Map::new();
             spec.insert("type".into(), json!("file_search"));
@@ -350,8 +435,12 @@ fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             if let Some(ids) = tool.parameters.get("vector_store_ids") {
                 spec.insert("vector_store_ids".into(), ids.clone());
             }
-            if let Some(n) = max_results {
-                spec.insert("max_num_results".into(), json!(n));
+            // Prefer the marker's `max_results`; fall back to a parameters key.
+            let max = (*max_results)
+                .map(|n| json!(n))
+                .or_else(|| tool.parameters.get("max_results").cloned());
+            if let Some(n) = max {
+                spec.insert("max_num_results".into(), n);
             }
             Value::Object(spec)
         }
@@ -363,14 +452,13 @@ fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             if !tool.description.is_empty() {
                 spec.insert("server_description".into(), json!(tool.description));
             }
+            if let Some(headers) = tool.parameters.get("headers") {
+                spec.insert("headers".into(), headers.clone());
+            }
             if let Some(allowed) = allowed_tools {
                 spec.insert("allowed_tools".into(), json!(allowed));
             }
-            let approval = match tool.approval_mode {
-                ApprovalMode::AlwaysRequire => "always",
-                ApprovalMode::NeverRequire => "never",
-            };
-            spec.insert("require_approval".into(), json!(approval));
+            spec.insert("require_approval".into(), mcp_require_approval(tool));
             Value::Object(spec)
         }
         ToolKind::Function => json!({
@@ -380,6 +468,54 @@ fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             "parameters": tool.parameters,
         }),
     }
+}
+
+/// Build the Responses `web_search.user_location` object from a hosted-tool
+/// `user_location` parameter (`_responses_client.py:310-329`).
+fn user_location_to_responses(location: &Value) -> Value {
+    let mut loc = Map::new();
+    loc.insert("type".into(), json!("approximate"));
+    for key in ["city", "country", "region", "timezone"] {
+        if let Some(v) = location.get(key) {
+            loc.insert(key.into(), v.clone());
+        }
+    }
+    Value::Object(loc)
+}
+
+/// Build the Responses MCP `require_approval` value. A `parameters.approval_mode`
+/// override — either the string `"always_require"`/`"never_require"` or an
+/// object `{"always": [...], "never": [...]}` — takes precedence over the
+/// definition's [`ApprovalMode`]; mirrors `get_mcp_tool`
+/// (`_responses_client.py:365-386`).
+fn mcp_require_approval(tool: &ToolDefinition) -> Value {
+    use agent_framework_core::tools::ApprovalMode;
+    match tool.parameters.get("approval_mode") {
+        Some(Value::String(s)) => {
+            return json!(if s == "always_require" {
+                "always"
+            } else {
+                "never"
+            });
+        }
+        Some(Value::Object(modes)) => {
+            let mut req = Map::new();
+            if let Some(always) = modes.get("always") {
+                req.insert("always".into(), json!({ "tool_names": always }));
+            }
+            if let Some(never) = modes.get("never") {
+                req.insert("never".into(), json!({ "tool_names": never }));
+            }
+            if !req.is_empty() {
+                return Value::Object(req);
+            }
+        }
+        _ => {}
+    }
+    json!(match tool.approval_mode {
+        ApprovalMode::AlwaysRequire => "always",
+        ApprovalMode::NeverRequire => "never",
+    })
 }
 
 fn tool_choice_to_responses(mode: &ToolMode) -> Value {
@@ -461,7 +597,9 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                     match part.get("type").and_then(Value::as_str) {
                         Some("output_text") => {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                contents.push(Content::Text(TextContent::new(text)));
+                                let mut tc = TextContent::new(text);
+                                tc.annotations = parse_annotations(part);
+                                contents.push(Content::Text(tc));
                             }
                         }
                         Some("refusal") => {
@@ -508,7 +646,140 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                 }
             }
         }
+        // Code-interpreter runs surface `logs` as text and `image` outputs as
+        // URIs; a bare `code` (no outputs) is a text fallback
+        // (`_create_response_content:748-764`).
+        Some("code_interpreter_call") => {
+            let outputs = item
+                .get("outputs")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty());
+            if let Some(outputs) = outputs {
+                for output in outputs {
+                    match output.get("type").and_then(Value::as_str) {
+                        Some("logs") => {
+                            if let Some(logs) = output.get("logs").and_then(Value::as_str) {
+                                contents.push(Content::Text(TextContent::new(logs)));
+                            }
+                        }
+                        Some("image") => {
+                            if let Some(url) = output.get("url").and_then(Value::as_str) {
+                                contents.push(Content::Uri(UriContent {
+                                    uri: url.to_string(),
+                                    media_type: "image".to_string(),
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Some(code) = item.get("code").and_then(Value::as_str) {
+                contents.push(Content::Text(TextContent::new(code)));
+            }
+        }
+        // A generated image is returned as base64; default to image/png unless
+        // the result is a data URI that states its own type
+        // (`_create_response_content:788-811`).
+        Some("image_generation_call") => {
+            if let Some(result) = item.get("result").and_then(Value::as_str) {
+                let (uri, media_type) = if result.starts_with("data:") {
+                    let media_type = if result.contains(';') {
+                        result
+                            .strip_prefix("data:")
+                            .and_then(|r| r.split(';').next())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    } else {
+                        None
+                    };
+                    (result.to_string(), media_type)
+                } else {
+                    (
+                        format!("data:image/png;base64,{result}"),
+                        Some("image/png".to_string()),
+                    )
+                };
+                contents.push(Content::Data(DataContent { uri, media_type }));
+            }
+        }
+        // An MCP approval request round-trips its `id` as the call id so a
+        // later `FunctionApprovalResponse` refers back to it
+        // (`_create_response_content:775-787`).
+        Some("mcp_approval_request") => {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let args = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string();
+            contents.push(Content::FunctionApprovalRequest(
+                FunctionApprovalRequestContent {
+                    id: id.clone(),
+                    function_call: FunctionCallContent::new(
+                        id,
+                        name,
+                        Some(FunctionArguments::Raw(args)),
+                    ),
+                },
+            ));
+        }
         _ => {}
+    }
+}
+
+/// Parse the `annotations` on an `output_text` part into [`CitationAnnotation`]s
+/// (`_create_response_content:667-724`). The core annotation type has no free
+/// `additional_properties`, so upstream's `index`/`container_id` extras are
+/// dropped.
+fn parse_annotations(part: &Value) -> Option<Vec<CitationAnnotation>> {
+    let arr = part.get("annotations").and_then(Value::as_array)?;
+    let mut out = Vec::new();
+    for ann in arr {
+        let str_field = |k: &str| ann.get(k).and_then(Value::as_str).map(String::from);
+        let regions = || {
+            Some(vec![TextSpanRegion {
+                start_index: ann.get("start_index").and_then(Value::as_i64),
+                end_index: ann.get("end_index").and_then(Value::as_i64),
+            }])
+        };
+        match ann.get("type").and_then(Value::as_str) {
+            Some("file_path") => out.push(CitationAnnotation {
+                file_id: str_field("file_id"),
+                ..Default::default()
+            }),
+            Some("file_citation") => out.push(CitationAnnotation {
+                url: str_field("filename"),
+                file_id: str_field("file_id"),
+                ..Default::default()
+            }),
+            Some("url_citation") => out.push(CitationAnnotation {
+                title: str_field("title"),
+                url: str_field("url"),
+                annotated_regions: regions(),
+                ..Default::default()
+            }),
+            Some("container_file_citation") => out.push(CitationAnnotation {
+                file_id: str_field("file_id"),
+                url: str_field("filename"),
+                annotated_regions: regions(),
+                ..Default::default()
+            }),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -649,10 +920,31 @@ struct ResponsesSseState {
     store: Option<bool>,
 }
 
+// A transient control-flow value: produced per SSE event and immediately
+// destructured in the stream loop, never stored in bulk. Boxing the `Update`
+// variant to equalize sizes would add a heap allocation on every streamed
+// token, so the size skew is accepted here.
+#[allow(clippy::large_enum_variant)]
 enum EventOutcome {
     Update(ChatResponseUpdate),
     Error(Error),
     None,
+}
+
+/// Wrap streamed reasoning text as a [`TextReasoningContent`] update, or
+/// [`EventOutcome::None`] when empty.
+fn reasoning_update(text: &str) -> EventOutcome {
+    if text.is_empty() {
+        return EventOutcome::None;
+    }
+    EventOutcome::Update(ChatResponseUpdate {
+        contents: vec![Content::TextReasoning(TextReasoningContent {
+            text: text.to_string(),
+            annotations: None,
+        })],
+        role: Some(Role::assistant()),
+        ..Default::default()
+    })
 }
 
 /// Parse one Responses API SSE event (already-decoded JSON `data:` payload).
@@ -693,6 +985,16 @@ fn parse_responses_event(
                 role: Some(Role::assistant()),
                 ..Default::default()
             })
+        }
+        // Reasoning (chain-of-thought / summary) streams as its own text
+        // channel. Both the incremental `.delta` and the terminal `.done`
+        // (full text) map to `TextReasoningContent`, mirroring upstream
+        // `_create_streaming_response_content` (`_responses_client.py:917-928`).
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+            reasoning_update(value.get("delta").and_then(Value::as_str).unwrap_or(""))
+        }
+        "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
+            reasoning_update(value.get("text").and_then(Value::as_str).unwrap_or(""))
         }
         "response.output_item.added" => {
             let item = value.get("item");
@@ -802,11 +1104,24 @@ fn parse_responses_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_framework_core::tools::{ApprovalMode, ToolKind};
-    use agent_framework_core::types::FunctionResultContent;
+    use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
+    use agent_framework_core::types::{
+        FunctionApprovalResponseContent, FunctionResultContent, HostedFileContent,
+    };
 
     fn user(text: &str) -> ChatMessage {
         ChatMessage::user(text)
+    }
+
+    fn user_with(contents: Vec<Content>) -> ChatMessage {
+        ChatMessage::with_contents(Role::user(), contents)
+    }
+
+    /// Parse a single Responses output item into its content list.
+    fn parse_item(item: Value) -> Vec<Content> {
+        let mut contents = Vec::new();
+        parse_output_item(&item, &mut contents);
+        contents
     }
 
     fn client() -> OpenAIResponsesClient {
@@ -1303,4 +1618,363 @@ mod tests {
         assert_eq!(tools[3]["allowed_tools"], json!(["search"]));
         assert_eq!(tools[3]["require_approval"], "never");
     }
+
+    // endregion
+
+    // region: multimodal input (Responses)
+
+    #[test]
+    fn input_image_uri_becomes_input_image_part() {
+        let msg = user_with(vec![Content::Uri(UriContent {
+            uri: "https://example.com/cat.png".into(),
+            media_type: "image/png".into(),
+        })]);
+        let input = messages_to_input(&[msg]);
+        assert_eq!(
+            input[0],
+            json!({ "type": "message", "role": "user", "content": [
+                { "type": "input_image", "image_url": "https://example.com/cat.png", "detail": "auto" }
+            ]})
+        );
+    }
+
+    #[test]
+    fn input_audio_file_and_hosted_file_parts() {
+        let msg = user_with(vec![
+            Content::Data(DataContent {
+                uri: "data:audio/wav;base64,QQ".into(),
+                media_type: Some("audio/wav".into()),
+            }),
+            Content::Data(DataContent {
+                uri: "data:application/pdf;base64,JV".into(),
+                media_type: Some("application/pdf".into()),
+            }),
+            Content::HostedFile(HostedFileContent {
+                file_id: "file-123".into(),
+            }),
+        ]);
+        let input = messages_to_input(&[msg]);
+        // The Responses API keeps the full data URI for audio (unlike Chat
+        // Completions, which strips the prefix).
+        assert_eq!(
+            input[0]["content"],
+            json!([
+                { "type": "input_audio", "input_audio": { "data": "data:audio/wav;base64,QQ", "format": "wav" } },
+                { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" },
+                { "type": "input_file", "file_id": "file-123" },
+            ])
+        );
+    }
+
+    #[test]
+    fn approval_response_becomes_mcp_approval_response_item() {
+        let resp = FunctionApprovalResponseContent {
+            approved: true,
+            id: "appr_1".into(),
+            function_call: FunctionCallContent::new("appr_1", "search", None),
+        };
+        let msg = user_with(vec![Content::FunctionApprovalResponse(resp)]);
+        let input = messages_to_input(&[msg]);
+        assert_eq!(
+            input[0],
+            json!({
+                "type": "mcp_approval_response",
+                "approval_request_id": "appr_1",
+                "approve": true,
+            })
+        );
+    }
+
+    #[test]
+    fn approval_request_becomes_mcp_approval_request_item() {
+        let req = FunctionApprovalRequestContent {
+            id: "appr_1".into(),
+            function_call: FunctionCallContent::new(
+                "appr_1",
+                "search",
+                Some(FunctionArguments::Raw(r#"{"q":"x"}"#.into())),
+            ),
+        };
+        let msg = ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionApprovalRequest(req)],
+        );
+        let input = messages_to_input(&[msg]);
+        assert_eq!(
+            input[0],
+            json!({
+                "type": "mcp_approval_request",
+                "id": "appr_1",
+                "name": "search",
+                "arguments": r#"{"q":"x"}"#,
+            })
+        );
+    }
+
+    // endregion
+
+    // region: output parsing (annotations, code interpreter, images, approvals)
+
+    #[test]
+    fn output_text_url_citation_annotation() {
+        let contents = parse_item(json!({
+            "type": "message", "role": "assistant", "content": [{
+                "type": "output_text", "text": "See source.",
+                "annotations": [{
+                    "type": "url_citation", "title": "Src", "url": "https://ex.com",
+                    "start_index": 0, "end_index": 3,
+                }],
+            }],
+        }));
+        let Content::Text(t) = &contents[0] else {
+            panic!("expected text content");
+        };
+        let ann = t.annotations.as_ref().unwrap();
+        assert_eq!(ann[0].title.as_deref(), Some("Src"));
+        assert_eq!(ann[0].url.as_deref(), Some("https://ex.com"));
+        let region = &ann[0].annotated_regions.as_ref().unwrap()[0];
+        assert_eq!(region.start_index, Some(0));
+        assert_eq!(region.end_index, Some(3));
+    }
+
+    #[test]
+    fn output_text_file_and_container_citations() {
+        let contents = parse_item(json!({
+            "type": "message", "role": "assistant", "content": [{
+                "type": "output_text", "text": "x",
+                "annotations": [
+                    { "type": "file_citation", "filename": "doc.pdf", "file_id": "file-1", "index": 2 },
+                    { "type": "file_path", "file_id": "file-2", "index": 0 },
+                    { "type": "container_file_citation", "filename": "c.txt", "file_id": "file-3",
+                      "container_id": "cont-1", "start_index": 1, "end_index": 4 },
+                ],
+            }],
+        }));
+        let Content::Text(t) = &contents[0] else {
+            panic!("expected text content");
+        };
+        let ann = t.annotations.as_ref().unwrap();
+        assert_eq!(ann[0].url.as_deref(), Some("doc.pdf"));
+        assert_eq!(ann[0].file_id.as_deref(), Some("file-1"));
+        assert_eq!(ann[1].file_id.as_deref(), Some("file-2"));
+        assert_eq!(ann[2].file_id.as_deref(), Some("file-3"));
+        assert_eq!(ann[2].url.as_deref(), Some("c.txt"));
+        assert_eq!(
+            ann[2].annotated_regions.as_ref().unwrap()[0].end_index,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn code_interpreter_outputs_become_text_and_uri() {
+        let contents = parse_item(json!({
+            "type": "code_interpreter_call",
+            "outputs": [
+                { "type": "logs", "logs": "hello stdout" },
+                { "type": "image", "url": "https://ex.com/plot.png" },
+            ],
+        }));
+        assert!(matches!(&contents[0], Content::Text(t) if t.text == "hello stdout"));
+        assert!(
+            matches!(&contents[1], Content::Uri(u) if u.uri == "https://ex.com/plot.png" && u.media_type == "image")
+        );
+    }
+
+    #[test]
+    fn code_interpreter_without_outputs_falls_back_to_code() {
+        let contents = parse_item(json!({
+            "type": "code_interpreter_call", "code": "print(1)",
+        }));
+        assert!(matches!(&contents[0], Content::Text(t) if t.text == "print(1)"));
+    }
+
+    #[test]
+    fn image_generation_raw_base64_becomes_png_data() {
+        let contents = parse_item(json!({
+            "type": "image_generation_call", "result": "AAAABBBB",
+        }));
+        let Content::Data(d) = &contents[0] else {
+            panic!("expected data content");
+        };
+        assert_eq!(d.uri, "data:image/png;base64,AAAABBBB");
+        assert_eq!(d.media_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn image_generation_data_uri_keeps_stated_media_type() {
+        let contents = parse_item(json!({
+            "type": "image_generation_call", "result": "data:image/webp;base64,ZZZ",
+        }));
+        let Content::Data(d) = &contents[0] else {
+            panic!("expected data content");
+        };
+        assert_eq!(d.uri, "data:image/webp;base64,ZZZ");
+        assert_eq!(d.media_type.as_deref(), Some("image/webp"));
+    }
+
+    #[test]
+    fn mcp_approval_request_output_round_trips_into_response() {
+        let contents = parse_item(json!({
+            "type": "mcp_approval_request",
+            "id": "appr_9", "name": "search", "arguments": r#"{"q":"rust"}"#,
+            "server_label": "docs",
+        }));
+        let Content::FunctionApprovalRequest(req) = &contents[0] else {
+            panic!("expected approval request");
+        };
+        assert_eq!(req.id, "appr_9");
+        assert_eq!(req.function_call.call_id, "appr_9");
+        assert_eq!(req.function_call.name, "search");
+
+        // The id round-trips into the request's response item (item 5).
+        let msg = user_with(vec![Content::FunctionApprovalResponse(
+            req.create_response(true),
+        )]);
+        let input = messages_to_input(&[msg]);
+        assert_eq!(input[0]["type"], json!("mcp_approval_response"));
+        assert_eq!(input[0]["approval_request_id"], json!("appr_9"));
+        assert_eq!(input[0]["approve"], json!(true));
+    }
+
+    // endregion
+
+    // region: streaming reasoning
+
+    fn reasoning_event(value: Value) -> EventOutcome {
+        let mut ids = HashMap::new();
+        parse_responses_event(&value, &mut ids, None)
+    }
+
+    #[test]
+    fn reasoning_text_delta_and_done_map_to_reasoning_content() {
+        let EventOutcome::Update(delta) =
+            reasoning_event(json!({ "type": "response.reasoning_text.delta", "delta": "Th" }))
+        else {
+            panic!("expected update");
+        };
+        assert!(matches!(&delta.contents[0], Content::TextReasoning(t) if t.text == "Th"));
+
+        let EventOutcome::Update(done) =
+            reasoning_event(json!({ "type": "response.reasoning_text.done", "text": "Think" }))
+        else {
+            panic!("expected update");
+        };
+        assert!(matches!(&done.contents[0], Content::TextReasoning(t) if t.text == "Think"));
+    }
+
+    #[test]
+    fn reasoning_summary_text_events_map_to_reasoning_content() {
+        let EventOutcome::Update(delta) = reasoning_event(
+            json!({ "type": "response.reasoning_summary_text.delta", "delta": "sum" }),
+        ) else {
+            panic!("expected update");
+        };
+        assert!(matches!(&delta.contents[0], Content::TextReasoning(t) if t.text == "sum"));
+
+        let EventOutcome::Update(done) = reasoning_event(
+            json!({ "type": "response.reasoning_summary_text.done", "text": "summary" }),
+        ) else {
+            panic!("expected update");
+        };
+        assert!(matches!(&done.contents[0], Content::TextReasoning(t) if t.text == "summary"));
+    }
+
+    // endregion
+
+    // region: hosted-tool config passthrough
+
+    fn hosted(kind: ToolKind, name: &str, params: Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            parameters: params,
+            kind,
+            approval_mode: ApprovalMode::NeverRequire,
+            executor: None,
+        }
+    }
+
+    #[test]
+    fn web_search_passes_through_user_location() {
+        let tool = hosted(
+            ToolKind::HostedWebSearch,
+            "web_search",
+            json!({ "user_location": { "city": "Paris", "country": "FR" } }),
+        );
+        assert_eq!(
+            tool_to_responses_spec(&tool),
+            json!({
+                "type": "web_search",
+                "user_location": { "type": "approximate", "city": "Paris", "country": "FR" },
+            })
+        );
+    }
+
+    #[test]
+    fn file_search_passes_vector_store_ids_and_max_results_param() {
+        let tool = hosted(
+            ToolKind::HostedFileSearch { max_results: None },
+            "file_search",
+            json!({ "vector_store_ids": ["vs_1"], "max_results": 12 }),
+        );
+        let spec = tool_to_responses_spec(&tool);
+        assert_eq!(spec["vector_store_ids"], json!(["vs_1"]));
+        assert_eq!(spec["max_num_results"], json!(12));
+    }
+
+    #[test]
+    fn code_interpreter_passes_file_ids_and_container_override() {
+        let with_files = hosted(
+            ToolKind::HostedCodeInterpreter,
+            "ci",
+            json!({ "file_ids": ["file-1", "file-2"] }),
+        );
+        assert_eq!(
+            tool_to_responses_spec(&with_files)["container"],
+            json!({ "type": "auto", "file_ids": ["file-1", "file-2"] })
+        );
+        let with_container = hosted(
+            ToolKind::HostedCodeInterpreter,
+            "ci",
+            json!({ "container": { "type": "secure", "id": "c1" } }),
+        );
+        assert_eq!(
+            tool_to_responses_spec(&with_container)["container"],
+            json!({ "type": "secure", "id": "c1" })
+        );
+    }
+
+    #[test]
+    fn mcp_passes_headers_and_string_approval_mode_override() {
+        let tool = hosted(
+            ToolKind::HostedMcp {
+                url: "https://mcp/sse".into(),
+                allowed_tools: None,
+            },
+            "docs",
+            json!({ "headers": { "Authorization": "Bearer x" }, "approval_mode": "always_require" }),
+        );
+        // The enum default is NeverRequire; the parameter overrides it.
+        let spec = tool_to_responses_spec(&tool);
+        assert_eq!(spec["headers"], json!({ "Authorization": "Bearer x" }));
+        assert_eq!(spec["require_approval"], json!("always"));
+    }
+
+    #[test]
+    fn mcp_object_approval_mode_maps_to_tool_name_lists() {
+        let tool = hosted(
+            ToolKind::HostedMcp {
+                url: "https://mcp/sse".into(),
+                allowed_tools: None,
+            },
+            "docs",
+            json!({ "approval_mode": { "always": ["delete"], "never": ["read"] } }),
+        );
+        assert_eq!(
+            tool_to_responses_spec(&tool)["require_approval"],
+            json!({ "always": { "tool_names": ["delete"] }, "never": { "tool_names": ["read"] } })
+        );
+    }
+
+    // endregion
 }

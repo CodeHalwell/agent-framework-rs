@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -401,4 +401,82 @@ async fn streaming_run_yields_text_and_usage() {
     assert_eq!(text, "Hi there");
     assert_eq!(conversation_id.as_deref(), Some("thread_1"));
     assert_eq!(total_tokens, Some(7));
+}
+
+#[tokio::test]
+async fn existing_agent_definition_is_fetched_once_and_merged_into_every_run() {
+    let get_agent_calls = Arc::new(AtomicUsize::new(0));
+    let calls = get_agent_calls.clone();
+    let server = MockServer::start(move |req| match (req.method.as_str(), req.route()) {
+        ("GET", p) if p.ends_with("/assistants/asst_existing") => {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Response::json(
+                r#"{"id":"asst_existing","instructions":"Be terse.","tools":[{"type":"code_interpreter"},{"type":"function","function":{"name":"ignored"}}],"tool_resources":{"code_interpreter":{"file_ids":["file_1"]}}}"#,
+            )
+        }
+        ("POST", p) if p.ends_with("/threads") => Response::json(r#"{"id":"thread_1"}"#),
+        ("POST", p) if p.ends_with("/messages") => Response::json(r#"{"id":"msg_1"}"#),
+        ("POST", p) if p.ends_with("/runs") => {
+            Response::json(r#"{"id":"run_1","status":"completed"}"#)
+        }
+        ("GET", p) if p.ends_with("/messages") => Response::json(
+            r#"{"data":[{"role":"assistant","content":[{"type":"text","text":{"value":"hi"}}]}]}"#,
+        ),
+        _ => Response::json("{}"),
+    });
+
+    let c = AzureAIAgentClient::with_existing_agent(
+        &server.addr,
+        "asst_existing",
+        Arc::new(StaticTokenCredential::new("test-token")),
+    );
+
+    // Turn 1: no local tools/instructions at all — everything comes from the
+    // persistent agent's own definition.
+    let first = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(first.conversation_id.as_deref(), Some("thread_1"));
+
+    // Turn 2: same conversation.
+    let mut options = ChatOptions::new();
+    options.conversation_id = Some("thread_1".to_string());
+    let _ = c
+        .get_response(vec![ChatMessage::user("again")], options)
+        .await
+        .unwrap();
+
+    // Fetched exactly once despite two turns — cached after the first.
+    assert_eq!(
+        get_agent_calls.load(Ordering::SeqCst),
+        1,
+        "agent definition should be fetched once and cached"
+    );
+    // No agent creation: this client targets an existing agent.
+    let creates = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.route().ends_with("/assistants"))
+        .count();
+    assert_eq!(creates, 0);
+
+    let runs: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.route().ends_with("/runs"))
+        .collect();
+    assert_eq!(runs.len(), 2, "one run per turn");
+    for run in &runs {
+        let body = run.body_json();
+        assert_eq!(body["assistant_id"], json!("asst_existing"));
+        // Only the non-function tool is replayed; the function tool is
+        // dropped (chat_options.tools carries functions instead).
+        assert_eq!(body["tools"], json!([{"type": "code_interpreter"}]));
+        assert_eq!(body["instructions"], json!("Be terse."));
+        assert_eq!(
+            body["tool_resources"],
+            json!({"code_interpreter": {"file_ids": ["file_1"]}})
+        );
+    }
 }

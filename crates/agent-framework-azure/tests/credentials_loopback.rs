@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use agent_framework_azure::{
     AzureOpenAIClient, ClientSecretCredential, ManagedIdentityCredential, TokenCredential,
+    WorkloadIdentityCredential,
 };
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{ChatMessage, ChatOptions};
@@ -232,6 +233,68 @@ async fn managed_identity_credential_fetches_and_caches() {
         !line.contains(".default"),
         "resource must strip /.default: {line}"
     );
+}
+
+#[tokio::test]
+async fn workload_identity_credential_sends_client_assertion_and_caches() {
+    let server = FakeServer::start(
+        "200 OK",
+        vec![],
+        r#"{"token_type":"Bearer","expires_in":3600,"access_token":"workload-token"}"#,
+    );
+
+    // A real scratch file: the credential re-reads it on every token request.
+    let token_path = std::env::temp_dir().join(format!(
+        "af-workload-identity-loopback-{}.jwt",
+        std::process::id()
+    ));
+    std::fs::write(&token_path, "federated-jwt-contents").expect("write fake token file");
+
+    // `with_overrides` supplies everything explicitly so this test never
+    // touches real process env vars (consistent with the rest of this file).
+    let cred = WorkloadIdentityCredential::with_overrides(
+        "https://ai.azure.com/.default",
+        Some("my-tenant".to_string()),
+        Some("my-client".to_string()),
+        Some(token_path.to_str().unwrap().to_string()),
+    )
+    .expect("all required fields supplied")
+    .with_authority(&server.addr);
+
+    // First call hits the network.
+    assert_eq!(cred.get_token().await.unwrap(), "workload-token");
+    // Second call is served from cache (expires_in=3600 keeps it fresh).
+    assert_eq!(cred.get_token().await.unwrap(), "workload-token");
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        server.request_count(),
+        1,
+        "cached token should not re-request"
+    );
+
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /my-tenant/oauth2/v2.0/token"),
+        "got: {line}"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("grant_type=client_credentials"),
+        "body: {body}"
+    );
+    assert!(body.contains("client_id=my-client"), "body: {body}");
+    assert!(
+        body.contains("client_assertion=federated-jwt-contents"),
+        "body: {body}"
+    );
+    // `:` is percent-escaped in form encoding.
+    assert!(
+        body.contains("client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer"),
+        "body: {body}"
+    );
+
+    std::fs::remove_file(&token_path).ok();
 }
 
 #[tokio::test]

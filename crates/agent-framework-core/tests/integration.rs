@@ -342,9 +342,14 @@ async fn tool_loop_reports_invalid_arguments() {
         .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))));
 }
 
-/// A context provider that records whether `invoked` fired and injects a tool.
+/// A context provider that records lifecycle-hook activity: whether `invoked`
+/// fired, the error (if any) the last `invoked` carried, and every id passed to
+/// `thread_created`. Also injects an instruction so `invoking` has an effect.
+#[derive(Default, Clone)]
 struct RecordingProvider {
     invoked: Arc<Mutex<bool>>,
+    invoked_error: Arc<Mutex<Option<String>>>,
+    thread_created_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -352,18 +357,29 @@ impl ContextProvider for RecordingProvider {
     async fn invoking(&self, _messages: &[ChatMessage]) -> Result<Context> {
         Ok(Context::new().with_instructions("remember: be brief"))
     }
-    async fn invoked(&self, _request: &[ChatMessage], _response: &[ChatMessage]) -> Result<()> {
+    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
+        self.thread_created_ids
+            .lock()
+            .unwrap()
+            .push(thread_id.map(str::to_string));
+        Ok(())
+    }
+    async fn invoked(
+        &self,
+        _request: &[ChatMessage],
+        _response: &[ChatMessage],
+        error: Option<&Error>,
+    ) -> Result<()> {
         *self.invoked.lock().unwrap() = true;
+        *self.invoked_error.lock().unwrap() = error.map(|e| e.to_string());
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn context_provider_invoked_hook_fires() {
-    let invoked = Arc::new(Mutex::new(false));
-    let provider = RecordingProvider {
-        invoked: invoked.clone(),
-    };
+    let provider = RecordingProvider::default();
+    let invoked = provider.invoked.clone();
     let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
         provider,
     )]));
@@ -1153,4 +1169,327 @@ async fn service_conversation_id_is_adopted_by_thread() {
     assert_eq!(opts.len(), 2);
     assert_eq!(opts[0].conversation_id, None);
     assert_eq!(opts[1].conversation_id.as_deref(), Some("conv-1"));
+}
+
+// ===========================================================================
+// Task 5: as_tool name sanitization
+// ===========================================================================
+
+#[tokio::test]
+async fn as_tool_sanitizes_agent_name() {
+    let agent = ChatAgent::builder(MockClient::new(vec![]))
+        .name("My Weather Agent!! v2")
+        .build();
+    // Spaces/punctuation -> underscores, collapsed, trimmed.
+    let tool = agent.as_tool(AsToolOptions::new());
+    assert_eq!(tool.name, "My_Weather_Agent_v2");
+
+    // An explicit name is used verbatim (mirrors Python `name or sanitize`).
+    let tool2 = agent.as_tool(AsToolOptions::new().name("explicit name"));
+    assert_eq!(tool2.name, "explicit name");
+
+    // Leading digit gets an underscore prefix; all-invalid -> "agent".
+    let numeric = ChatAgent::builder(MockClient::new(vec![]))
+        .name("9lives")
+        .build();
+    assert_eq!(numeric.as_tool(AsToolOptions::new()).name, "_9lives");
+    let junk = ChatAgent::builder(MockClient::new(vec![]))
+        .name("@@@")
+        .build();
+    assert_eq!(junk.as_tool(AsToolOptions::new()).name, "agent");
+}
+
+// ===========================================================================
+// Task 6: service-managed thread with no returned conversation id errors
+// ===========================================================================
+
+#[tokio::test]
+async fn service_thread_without_conversation_id_errors() {
+    // The client succeeds but returns no conversation id.
+    let client = MockClient::new(vec![ChatResponse::from_text("hi")]);
+    let agent = ChatAgent::builder(client).name("svc").build();
+    let mut thread = agent.get_new_thread_with_service_id("svc-thread").unwrap();
+    let err = agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AgentExecution(_)));
+    assert!(err
+        .to_string()
+        .contains("did not return a valid conversation id"));
+}
+
+// ===========================================================================
+// Task 1: ContextProvider::thread_created is fired by ChatAgent
+// ===========================================================================
+
+/// Echoes the request's conversation id back (keeps a service thread valid).
+struct EchoServiceClient;
+#[async_trait]
+impl ChatClient for EchoServiceClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut resp = ChatResponse::from_text("ok");
+        resp.conversation_id = options.conversation_id.clone();
+        Ok(resp)
+    }
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let mut u = ChatResponseUpdate::text(resp.text());
+        u.conversation_id = resp.conversation_id.clone();
+        Ok(Box::pin(futures::stream::iter(vec![Ok(u)])))
+    }
+}
+
+/// Returns a fresh conversation id for a previously-local thread to adopt.
+struct AdoptServiceClient;
+#[async_trait]
+impl ChatClient for AdoptServiceClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut resp = ChatResponse::from_text("ok");
+        resp.conversation_id = Some("adopted-1".to_string());
+        Ok(resp)
+    }
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let mut u = ChatResponseUpdate::text(resp.text());
+        u.conversation_id = Some("adopted-1".to_string());
+        Ok(Box::pin(futures::stream::iter(vec![Ok(u)])))
+    }
+}
+
+#[tokio::test]
+async fn thread_created_fires_for_service_thread() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(EchoServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    let mut thread = agent.get_new_thread_with_service_id("svc-1").unwrap();
+    agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+
+    // Fired once at run start with the service thread id (no re-fire on the
+    // echoed-back same id).
+    assert_eq!(ids.lock().unwrap().clone(), vec![Some("svc-1".to_string())]);
+}
+
+#[tokio::test]
+async fn thread_created_fires_on_service_id_adoption() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(AdoptServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    // A local thread that adopts the id returned by the service.
+    let mut thread = agent.get_new_thread();
+    agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids.lock().unwrap().clone(),
+        vec![Some("adopted-1".to_string())]
+    );
+    assert_eq!(thread.service_thread_id(), Some("adopted-1"));
+}
+
+#[tokio::test]
+async fn thread_created_fires_on_adoption_when_streaming() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(AdoptServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    let mut stream = agent.run_stream("hi", None).await.unwrap();
+    while let Some(u) = stream.next().await {
+        u.unwrap();
+    }
+    assert_eq!(
+        ids.lock().unwrap().clone(),
+        vec![Some("adopted-1".to_string())]
+    );
+}
+
+// ===========================================================================
+// Task 2: ContextProvider::invoked observes failures
+// ===========================================================================
+
+struct FailingClient;
+#[async_trait]
+impl ChatClient for FailingClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Err(Error::service("boom"))
+    }
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Err(Error::service("boom"))
+    }
+}
+
+#[tokio::test]
+async fn invoked_hook_observes_failure() {
+    let provider = RecordingProvider::default();
+    let invoked = provider.invoked.clone();
+    let invoked_error = provider.invoked_error.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(FailingClient)
+        .context_provider(aggregate)
+        .build();
+
+    let err = agent.run_once("hi").await.unwrap_err();
+    assert!(err.to_string().contains("boom"));
+    assert!(
+        *invoked.lock().unwrap(),
+        "invoked fired on the failure path"
+    );
+    let recorded = invoked_error.lock().unwrap().clone();
+    assert!(
+        recorded.is_some_and(|m| m.contains("boom")),
+        "provider observed the run error"
+    );
+}
+
+#[tokio::test]
+async fn invoked_hook_observes_streaming_failure() {
+    let provider = RecordingProvider::default();
+    let invoked_error = provider.invoked_error.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(FailingClient)
+        .context_provider(aggregate)
+        .build();
+
+    let err = agent.run_stream("hi", None).await.err().unwrap();
+    assert!(err.to_string().contains("boom"));
+    assert!(
+        invoked_error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.contains("boom")),
+        "provider observed the streaming failure"
+    );
+}
+
+// ===========================================================================
+// Task 3: structured-output value auto-population
+// ===========================================================================
+
+#[tokio::test]
+async fn structured_output_value_autofilled_on_agent_run() {
+    let client = MockClient::new(vec![ChatResponse::from_text("{\"city\": \"Paris\"}")]);
+    let agent = ChatAgent::builder(client)
+        .response_format(ResponseFormat::JsonObject)
+        .build();
+    let resp = agent.run_once("where?").await.unwrap();
+    assert_eq!(resp.value, Some(json!({"city": "Paris"})));
+}
+
+#[tokio::test]
+async fn structured_output_value_tolerates_non_json() {
+    let client = MockClient::new(vec![ChatResponse::from_text("sorry, no idea")]);
+    let agent = ChatAgent::builder(client)
+        .response_format(ResponseFormat::JsonObject)
+        .build();
+    let resp = agent.run_once("where?").await.unwrap();
+    assert_eq!(resp.value, None);
+}
+
+#[tokio::test]
+async fn structured_output_value_autofilled_on_bare_client() {
+    use agent_framework_core::client::FunctionInvokingChatClient;
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ChatResponse::from_text(
+        "{\"n\": 5}",
+    )]));
+    let mut opts = ChatOptions::new();
+    opts.response_format = Some(ResponseFormat::JsonObject);
+    let resp = client
+        .get_response(vec![ChatMessage::user("x")], opts)
+        .await
+        .unwrap();
+    assert_eq!(resp.value, Some(json!({"n": 5})));
+}
+
+// ===========================================================================
+// Task 7: thread persistence (agent-level: factory, deserialize, service id)
+// ===========================================================================
+
+#[tokio::test]
+async fn chat_message_store_factory_used_by_get_new_thread() {
+    // The factory seeds a marker so we can observe it was used.
+    let agent = ChatAgent::builder(MockClient::new(vec![]))
+        .chat_message_store_factory(|| {
+            Arc::new(InMemoryChatMessageStore::with_messages(vec![
+                ChatMessage::system("MARKER"),
+            ]))
+        })
+        .build();
+    let thread = agent.get_new_thread();
+    let msgs = thread.list_messages().await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].text(), "MARKER");
+}
+
+#[tokio::test]
+async fn agent_deserialize_thread_roundtrips_history() {
+    let agent = ChatAgent::builder(MockClient::new(vec![])).build();
+    let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
+        ChatMessage::user("hi"),
+        ChatMessage::assistant("hello"),
+    ]));
+    let state = AgentThread::local(store).serialize().await.unwrap();
+
+    let restored = agent.deserialize_thread(&state).await.unwrap();
+    let msgs = restored.list_messages().await.unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[1].text(), "hello");
+}
+
+#[tokio::test]
+async fn agent_get_new_thread_with_service_id() {
+    let agent = ChatAgent::builder(MockClient::new(vec![])).build();
+    let thread = agent.get_new_thread_with_service_id("svc-9").unwrap();
+    assert_eq!(thread.service_thread_id(), Some("svc-9"));
+    assert!(thread.message_store().is_none());
 }

@@ -71,7 +71,8 @@ mod credentials;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
 pub use credentials::{
-    AzureCliCredential, ChainedTokenCredential, ClientSecretCredential, ManagedIdentityCredential,
+    AzureCliCredential, ChainedTokenCredential, ClientSecretCredential, DefaultAzureCredential,
+    EnvironmentCredential, ManagedIdentityCredential, WorkloadIdentityCredential,
     DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
 };
 

@@ -353,6 +353,7 @@ fn content_type_name(content: &Content) -> &'static str {
         Content::HostedVectorStore(_) => "hosted_vector_store",
         Content::FunctionApprovalRequest(_) => "function_approval_request",
         Content::FunctionApprovalResponse(_) => "function_approval_response",
+        Content::Unknown => "unknown",
     }
 }
 

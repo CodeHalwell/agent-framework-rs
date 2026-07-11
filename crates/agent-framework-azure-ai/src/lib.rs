@@ -114,6 +114,11 @@ struct Inner {
     agent_id: Mutex<Option<String>>,
     /// Whether this client created the agent (and so should delete it).
     agent_created: AtomicBool,
+    /// Cached agent definition (`GET .../assistants/{id}`, or the body
+    /// returned when auto-creating), used to replay an agent's own
+    /// tools/instructions/tool_resources onto every run — see
+    /// [`load_agent_definition_if_needed`](AzureAIAgentClient::load_agent_definition_if_needed).
+    agent_definition: Mutex<Option<Value>>,
 }
 
 impl Clone for AzureAIAgentClient {
@@ -176,6 +181,7 @@ impl AzureAIAgentClient {
                 should_cleanup_agent: true,
                 agent_id: Mutex::new(agent_id),
                 agent_created: AtomicBool::new(false),
+                agent_definition: Mutex::new(None),
             }),
         }
     }
@@ -376,7 +382,7 @@ impl AzureAIAgentClient {
             self.inner.agent_description.as_deref(),
             instructions,
             options,
-        );
+        )?;
         let created = self.create_agent(&body).await?;
         let id = created
             .get("id")
@@ -385,7 +391,34 @@ impl AzureAIAgentClient {
             .to_string();
         *self.inner.agent_id.lock().unwrap() = Some(id.clone());
         self.inner.agent_created.store(true, Ordering::SeqCst);
+        // Cache the just-created agent's own definition so it gets replayed
+        // on later turns the same way an existing (persistent) agent's does
+        // (see `load_agent_definition_if_needed`), instead of an extra GET.
+        *self.inner.agent_definition.lock().unwrap() = Some(created);
         Ok(id)
+    }
+
+    /// Fetch (and cache) the active agent's own definition, mirroring the
+    /// Python client's `_load_agent_definition_if_needed`
+    /// (`_chat_client.py:751-755`): a no-op until an agent id is known (i.e.
+    /// before an auto-created agent exists yet), fetched at most once per
+    /// agent id and reused after that. [`ensure_agent`](Self::ensure_agent)
+    /// seeds this cache directly from its create response, so a freshly
+    /// auto-created agent never needs an extra `GET` either.
+    async fn load_agent_definition_if_needed(&self) -> Result<Option<Value>> {
+        let id = { self.inner.agent_id.lock().unwrap().clone() };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        {
+            let cached = self.inner.agent_definition.lock().unwrap();
+            if let Some(def) = cached.as_ref() {
+                return Ok(Some(def.clone()));
+            }
+        }
+        let def = self.get_agent(&id).await?;
+        *self.inner.agent_definition.lock().unwrap() = Some(def.clone());
+        Ok(Some(def))
     }
 
     async fn create_thread(&self, options: &ChatOptions) -> Result<String> {
@@ -447,6 +480,7 @@ impl AzureAIAgentClient {
                 self.delete_agent(&id).await?;
                 *self.inner.agent_id.lock().unwrap() = None;
                 self.inner.agent_created.store(false, Ordering::SeqCst);
+                *self.inner.agent_definition.lock().unwrap() = None;
             }
         }
         Ok(())
@@ -547,6 +581,7 @@ impl ChatClient for AzureAIAgentClient {
         }
 
         // Fresh-run path.
+        let agent_definition = self.load_agent_definition_if_needed().await?;
         let agent_id = self.ensure_agent(&options, instructions.as_deref()).await?;
         let thread_id = match thread_id {
             Some(t) => t,
@@ -558,8 +593,9 @@ impl ChatClient for AzureAIAgentClient {
             self.model_for(&options),
             instructions.as_deref(),
             &options,
+            agent_definition.as_ref(),
             false,
-        );
+        )?;
         let run = self
             .post_json(&format!("threads/{thread_id}/runs"), &body)
             .await?;
@@ -598,6 +634,7 @@ impl ChatClient for AzureAIAgentClient {
         }
 
         // Fresh-run path (streamed).
+        let agent_definition = self.load_agent_definition_if_needed().await?;
         let agent_id = self.ensure_agent(&options, instructions.as_deref()).await?;
         let thread_id = match thread_id {
             Some(t) => t,
@@ -609,8 +646,9 @@ impl ChatClient for AzureAIAgentClient {
             self.model_for(&options),
             instructions.as_deref(),
             &options,
+            agent_definition.as_ref(),
             true,
-        );
+        )?;
         let resp = self
             .post_stream(&format!("threads/{thread_id}/runs"), &body)
             .await?;

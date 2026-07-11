@@ -162,7 +162,11 @@ async fn invoked_posts_to_v1_memories_with_body_and_auth_header() {
         .with_application_id("app-1");
 
     provider
-        .invoked(&[ChatMessage::user("I moved to Austin last month")], &[])
+        .invoked(
+            &[ChatMessage::user("I moved to Austin last month")],
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -200,6 +204,7 @@ async fn invoked_combines_request_and_response_messages() {
         .invoked(
             &[ChatMessage::user("What's the weather?")],
             &[ChatMessage::assistant("It's sunny today.")],
+            None,
         )
         .await
         .unwrap();
@@ -330,7 +335,7 @@ async fn invoked_surfaces_non_2xx_status_as_service_error() {
         .with_api_base(base_url)
         .with_user_id("u1");
     let err = provider
-        .invoked(&[ChatMessage::user("hi")], &[])
+        .invoked(&[ChatMessage::user("hi")], &[], None)
         .await
         .unwrap_err();
     let msg = err.to_string();

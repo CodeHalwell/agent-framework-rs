@@ -51,6 +51,17 @@ pub struct WorkflowCheckpoint {
     pub shared_state: HashMap<String, Value>,
     /// Requests outstanding at snapshot time.
     pub pending_requests: Vec<PendingRequest>,
+    /// Partially-satisfied fan-in barriers: `target -> (source -> value)`.
+    ///
+    /// When a fan-in target has received some but not all of its sources'
+    /// messages, the already-delivered messages are buffered on the runner
+    /// (`WorkflowRun::fanin`) until the barrier fires. If a checkpoint is taken
+    /// between source deliveries (they can arrive in different supersteps),
+    /// this buffer must be captured or the barrier can never complete on
+    /// resume. Empty for legacy checkpoints written before this field existed
+    /// (serde default), and for checkpoints with no in-flight fan-in.
+    #[serde(default)]
+    pub fanin_state: HashMap<String, HashMap<String, Value>>,
     /// Additional metadata (e.g. superstep index, checkpoint type).
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
@@ -77,6 +88,7 @@ impl WorkflowCheckpoint {
         executor_states: HashMap<String, Value>,
         shared_state: HashMap<String, Value>,
         pending_requests: Vec<PendingRequest>,
+        fanin_state: HashMap<String, HashMap<String, Value>>,
         metadata: HashMap<String, Value>,
         graph_signature: String,
     ) -> Self {
@@ -90,6 +102,7 @@ impl WorkflowCheckpoint {
             executor_states,
             shared_state,
             pending_requests,
+            fanin_state,
             metadata,
             graph_signature,
             version: default_version(),

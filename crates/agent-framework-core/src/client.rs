@@ -339,173 +339,187 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         messages: Vec<ChatMessage>,
         mut options: ChatOptions,
     ) -> Result<ChatResponse> {
-        self.config.validate()?;
-        let tools = executable_tools(&options);
+        // After the tool loop settles, auto-populate `ChatResponse.value` from
+        // the final text when a structured `response_format` was requested
+        // (mirrors Python `try_parse_value`). This is the central non-streaming
+        // fill point: it covers a bare `FunctionInvokingChatClient` and every
+        // `ChatAgent` run (whose client is always wrapped in one). The tool
+        // loop is run inside an `async move` block so its interior `return`s
+        // funnel through this single fill/return path.
+        let response_format = options.response_format.clone();
+        let mut response: ChatResponse = async move {
+            self.config.validate()?;
+            let tools = executable_tools(&options);
 
-        // Default tool choice to auto when tools are present and unset.
-        if !options.tools.is_empty() && options.tool_choice.is_none() {
-            options.tool_choice = Some(ToolMode::Auto);
-        }
+            // Default tool choice to auto when tools are present and unset.
+            if !options.tools.is_empty() && options.tool_choice.is_none() {
+                options.tool_choice = Some(ToolMode::Auto);
+            }
 
-        if tools.is_empty() || !self.config.enabled {
-            return self.inner_get_response(messages, options).await;
-        }
+            if tools.is_empty() || !self.config.enabled {
+                return self.inner_get_response(messages, options).await;
+            }
 
-        let mut conversation = messages;
-        let mut carried: Vec<ChatMessage> = Vec::new();
-        let mut consecutive_errors = 0usize;
+            let mut conversation = messages;
+            let mut carried: Vec<ChatMessage> = Vec::new();
+            let mut consecutive_errors = 0usize;
 
-        for _ in 0..self.config.max_iterations {
-            // Process any function-approval responses supplied in the input:
-            // execute the approved calls and splice their results into the
-            // conversation (mirrors Python's `_collect_approval_responses` +
-            // `_replace_approval_contents_with_results`).
-            let approval_responses = collect_approval_responses(&conversation);
-            if !approval_responses.is_empty() {
-                let mut approved_results: HashMap<String, FunctionResultContent> = HashMap::new();
-                let mut had_error = false;
-                for resp in &approval_responses {
-                    if !resp.approved {
-                        continue;
+            for _ in 0..self.config.max_iterations {
+                // Process any function-approval responses supplied in the input:
+                // execute the approved calls and splice their results into the
+                // conversation (mirrors Python's `_collect_approval_responses` +
+                // `_replace_approval_contents_with_results`).
+                let approval_responses = collect_approval_responses(&conversation);
+                if !approval_responses.is_empty() {
+                    let mut approved_results: HashMap<String, FunctionResultContent> =
+                        HashMap::new();
+                    let mut had_error = false;
+                    for resp in &approval_responses {
+                        if !resp.approved {
+                            continue;
+                        }
+                        let call = &resp.function_call;
+                        let tool = tools.iter().find(|t| t.name == call.name).cloned();
+                        let (is_error, content) = execute_tool_call(
+                            tool,
+                            call,
+                            self.config.include_detailed_errors,
+                            self.config.terminate_on_unknown_calls,
+                            &self.function_middleware,
+                        )
+                        .await?;
+                        had_error |= is_error;
+                        approved_results.insert(content.call_id.clone(), content);
                     }
-                    let call = &resp.function_call;
-                    let tool = tools.iter().find(|t| t.name == call.name).cloned();
-                    let (is_error, content) = execute_tool_call(
-                        tool,
-                        call,
-                        self.config.include_detailed_errors,
-                        self.config.terminate_on_unknown_calls,
-                        &self.function_middleware,
-                    )
-                    .await?;
-                    had_error |= is_error;
-                    approved_results.insert(content.call_id.clone(), content);
+                    replace_approval_contents_with_results(&mut conversation, &approved_results);
+                    if had_error {
+                        consecutive_errors += 1;
+                        if consecutive_errors > self.config.max_consecutive_errors_per_request {
+                            options.tool_choice = Some(ToolMode::None);
+                        }
+                    }
                 }
-                replace_approval_contents_with_results(&mut conversation, &approved_results);
+
+                let response = self
+                    .inner_get_response(conversation.clone(), options.clone())
+                    .await?;
+
+                let calls: Vec<_> = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .filter_map(Content::as_function_call)
+                    .cloned()
+                    .collect();
+
+                if calls.is_empty() {
+                    // Prepend the accumulated tool-interaction messages so the final
+                    // assistant message stays last.
+                    let mut final_resp = response;
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut final_resp.messages);
+                    final_resp.messages = msgs;
+                    return Ok(final_resp);
+                }
+
+                // Human-in-the-loop gate: if *any* requested tool requires approval,
+                // defer *all* calls (matching Python) and return an assistant message
+                // that carries the original calls plus one approval request each.
+                let needs_approval = calls.iter().any(|c| {
+                    tools
+                        .iter()
+                        .find(|t| t.name == c.name)
+                        .map(ToolDefinition::requires_approval)
+                        .unwrap_or(false)
+                });
+                if needs_approval {
+                    let mut resp = response;
+                    let approval_contents: Vec<Content> = calls
+                        .iter()
+                        .map(|c| {
+                            Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                                id: c.call_id.clone(),
+                                function_call: c.clone(),
+                            })
+                        })
+                        .collect();
+                    if let Some(m) = resp
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == Role::assistant())
+                    {
+                        m.contents.extend(approval_contents);
+                    } else {
+                        resp.messages.push(ChatMessage::with_contents(
+                            Role::assistant(),
+                            approval_contents,
+                        ));
+                    }
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut resp.messages);
+                    resp.messages = msgs;
+                    return Ok(resp);
+                }
+
+                // Record the assistant message(s) that requested the calls.
+                carried.extend(response.messages.iter().cloned());
+
+                // Execute all calls concurrently: the model may emit several
+                // parallel tool calls, and I/O-bound tools should not be serialized.
+                let invocations = calls.iter().map(|call| {
+                    let tool = tools.iter().find(|t| t.name == call.name).cloned();
+                    let call = call.clone();
+                    let include_detailed_errors = self.config.include_detailed_errors;
+                    let terminate_on_unknown = self.config.terminate_on_unknown_calls;
+                    let function_middleware = self.function_middleware.clone();
+                    async move {
+                        execute_tool_call(
+                            tool,
+                            &call,
+                            include_detailed_errors,
+                            terminate_on_unknown,
+                            &function_middleware,
+                        )
+                        .await
+                    }
+                });
+
+                let outcomes = futures::future::try_join_all(invocations).await?;
+                let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
+                let mut had_error = false;
+                for (is_error, content) in outcomes {
+                    had_error |= is_error;
+                    result_contents.push(Content::FunctionResult(content));
+                }
+
                 if had_error {
                     consecutive_errors += 1;
                     if consecutive_errors > self.config.max_consecutive_errors_per_request {
+                        // Give up on tools and let the model answer directly.
                         options.tool_choice = Some(ToolMode::None);
                     }
-                }
-            }
-
-            let response = self
-                .inner_get_response(conversation.clone(), options.clone())
-                .await?;
-
-            let calls: Vec<_> = response
-                .messages
-                .iter()
-                .flat_map(|m| m.contents.iter())
-                .filter_map(Content::as_function_call)
-                .cloned()
-                .collect();
-
-            if calls.is_empty() {
-                // Prepend the accumulated tool-interaction messages so the final
-                // assistant message stays last.
-                let mut final_resp = response;
-                let mut msgs = std::mem::take(&mut carried);
-                msgs.append(&mut final_resp.messages);
-                final_resp.messages = msgs;
-                return Ok(final_resp);
-            }
-
-            // Human-in-the-loop gate: if *any* requested tool requires approval,
-            // defer *all* calls (matching Python) and return an assistant message
-            // that carries the original calls plus one approval request each.
-            let needs_approval = calls.iter().any(|c| {
-                tools
-                    .iter()
-                    .find(|t| t.name == c.name)
-                    .map(ToolDefinition::requires_approval)
-                    .unwrap_or(false)
-            });
-            if needs_approval {
-                let mut resp = response;
-                let approval_contents: Vec<Content> = calls
-                    .iter()
-                    .map(|c| {
-                        Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
-                            id: c.call_id.clone(),
-                            function_call: c.clone(),
-                        })
-                    })
-                    .collect();
-                if let Some(m) = resp
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.role == Role::assistant())
-                {
-                    m.contents.extend(approval_contents);
                 } else {
-                    resp.messages.push(ChatMessage::with_contents(
-                        Role::assistant(),
-                        approval_contents,
-                    ));
+                    consecutive_errors = 0;
                 }
-                let mut msgs = std::mem::take(&mut carried);
-                msgs.append(&mut resp.messages);
-                resp.messages = msgs;
-                return Ok(resp);
+
+                let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
+                carried.push(tool_message.clone());
+                conversation.extend(response.messages);
+                conversation.push(tool_message);
             }
 
-            // Record the assistant message(s) that requested the calls.
-            carried.extend(response.messages.iter().cloned());
-
-            // Execute all calls concurrently: the model may emit several
-            // parallel tool calls, and I/O-bound tools should not be serialized.
-            let invocations = calls.iter().map(|call| {
-                let tool = tools.iter().find(|t| t.name == call.name).cloned();
-                let call = call.clone();
-                let include_detailed_errors = self.config.include_detailed_errors;
-                let terminate_on_unknown = self.config.terminate_on_unknown_calls;
-                let function_middleware = self.function_middleware.clone();
-                async move {
-                    execute_tool_call(
-                        tool,
-                        &call,
-                        include_detailed_errors,
-                        terminate_on_unknown,
-                        &function_middleware,
-                    )
-                    .await
-                }
-            });
-
-            let outcomes = futures::future::try_join_all(invocations).await?;
-            let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
-            let mut had_error = false;
-            for (is_error, content) in outcomes {
-                had_error |= is_error;
-                result_contents.push(Content::FunctionResult(content));
-            }
-
-            if had_error {
-                consecutive_errors += 1;
-                if consecutive_errors > self.config.max_consecutive_errors_per_request {
-                    // Give up on tools and let the model answer directly.
-                    options.tool_choice = Some(ToolMode::None);
-                }
-            } else {
-                consecutive_errors = 0;
-            }
-
-            let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
-            carried.push(tool_message.clone());
-            conversation.extend(response.messages);
-            conversation.push(tool_message);
+            // Failsafe: one final call with tools disabled.
+            options.tool_choice = Some(ToolMode::None);
+            let mut final_resp = self.inner_get_response(conversation, options).await?;
+            let mut msgs = std::mem::take(&mut carried);
+            msgs.append(&mut final_resp.messages);
+            final_resp.messages = msgs;
+            Ok(final_resp)
         }
-
-        // Failsafe: one final call with tools disabled.
-        options.tool_choice = Some(ToolMode::None);
-        let mut final_resp = self.inner_get_response(conversation, options).await?;
-        let mut msgs = std::mem::take(&mut carried);
-        msgs.append(&mut final_resp.messages);
-        final_resp.messages = msgs;
-        Ok(final_resp)
+        .await?;
+        response.try_parse_value(response_format.as_ref());
+        Ok(response)
     }
 
     async fn get_streaming_response(

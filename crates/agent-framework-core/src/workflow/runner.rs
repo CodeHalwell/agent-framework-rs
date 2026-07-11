@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::checkpoint::{CheckpointStorage, WorkflowCheckpoint};
-use super::context::{WorkflowContext, WorkflowMessage};
+use super::context::{DrainedEffects, WorkflowContext, WorkflowMessage};
 use super::edge::{Case, Default as SwitchDefault, EdgeGroup};
 use super::events::{WorkflowEvent, WorkflowRunState};
 use super::executor::Executor;
@@ -497,6 +497,18 @@ impl Workflow {
     }
 }
 
+/// One planned executor invocation within a superstep: the target executor, the
+/// payload to hand it, and the source executor id(s) that produced the payload.
+///
+/// A superstep's invocations are planned up front (draining the delivery queue
+/// and resolving fan-in barriers, which mutate `WorkflowRun::fanin`) and then
+/// run concurrently, so nothing here borrows the runner.
+struct Invocation {
+    executor: Arc<dyn Executor>,
+    data: Value,
+    source_ids: Vec<String>,
+}
+
 /// A live workflow run: owns the pending message queue, fan-in buffers,
 /// iteration count, shared state, and outstanding requests, so a run can pause
 /// (awaiting external input) and later resume.
@@ -551,6 +563,9 @@ impl WorkflowRun {
         self.shared_state.import(cp.shared_state).await;
         self.iteration = cp.iteration_count;
         self.queue = cp.messages;
+        // Restore partially-satisfied fan-in barriers so a checkpoint taken
+        // between source deliveries can still fire the barrier on resume.
+        self.fanin = cp.fanin_state;
         self.pending_requests = cp
             .pending_requests
             .into_iter()
@@ -622,10 +637,17 @@ impl WorkflowRun {
             let mut targets: Vec<String> = by_target.keys().cloned().collect();
             targets.sort();
 
-            let mut next: Vec<WorkflowMessage> = Vec::new();
-            for target_id in targets {
-                let msgs = by_target.remove(&target_id).unwrap_or_default();
-                let executor = match self.shared.executors.get(&target_id) {
+            // Plan this superstep's executor invocations. Fan-in barriers are
+            // resolved here, synchronously, because they mutate `self.fanin`;
+            // once planned, each invocation owns everything it needs so the
+            // executes below touch no `&mut self` state. Iterating `targets` in
+            // sorted order (and, within a target, direct messages before the
+            // fan-in/regular messages) fixes the invocation order, which in turn
+            // fixes event and next-queue order after the join.
+            let mut invocations: Vec<Invocation> = Vec::new();
+            for target_id in &targets {
+                let msgs = by_target.remove(target_id).unwrap_or_default();
+                let executor = match self.shared.executors.get(target_id) {
                     Some(e) => e.clone(),
                     None => continue,
                 };
@@ -638,21 +660,17 @@ impl WorkflowRun {
                 let (direct, msgs): (Vec<_>, Vec<_>) =
                     msgs.into_iter().partition(|m| m.target_id.is_some());
                 for m in direct {
-                    let source_ids = vec![m.source_id.clone()];
-                    self.run_executor(
-                        &executor,
-                        m.data,
-                        source_ids,
-                        &mut next,
-                        &mut emitted_pending,
-                    )
-                    .await?;
+                    invocations.push(Invocation {
+                        executor: executor.clone(),
+                        data: m.data,
+                        source_ids: vec![m.source_id],
+                    });
                 }
                 if msgs.is_empty() {
                     continue;
                 }
 
-                if let Some(sources) = self.fanin_group_for(&target_id) {
+                if let Some(sources) = self.fanin_group_for(target_id) {
                     // Barrier: accumulate by source, fire once every source has
                     // delivered, collecting in declared order.
                     let buf = self.fanin.entry(target_id.clone()).or_default();
@@ -668,26 +686,93 @@ impl WorkflowRun {
                             collected.push(v);
                         }
                     }
-                    self.fanin.remove(&target_id);
-                    self.run_executor(
-                        &executor,
-                        Value::Array(collected),
-                        sources,
-                        &mut next,
-                        &mut emitted_pending,
-                    )
-                    .await?;
+                    self.fanin.remove(target_id);
+                    invocations.push(Invocation {
+                        executor,
+                        data: Value::Array(collected),
+                        source_ids: sources,
+                    });
                 } else {
                     for m in msgs {
-                        let source_ids = vec![m.source_id.clone()];
-                        self.run_executor(
-                            &executor,
-                            m.data,
-                            source_ids,
-                            &mut next,
-                            &mut emitted_pending,
-                        )
-                        .await?;
+                        invocations.push(Invocation {
+                            executor: executor.clone(),
+                            data: m.data,
+                            source_ids: vec![m.source_id],
+                        });
+                    }
+                }
+            }
+
+            // Run the planned invocations concurrently — upstream parity with
+            // `asyncio.gather` over a superstep's deliveries (`_runner.py`).
+            // Each future builds its own context and drains its own effects, so
+            // the executes (typically LLM calls) genuinely overlap instead of
+            // running one after another. `join_all` preserves input order, so
+            // `results` is still in the planned (sorted-target) order.
+            let shared_state = self.shared_state.clone();
+            let results = futures::future::join_all(invocations.into_iter().map(|inv| {
+                Self::run_executor_isolated(
+                    inv.executor,
+                    inv.data,
+                    inv.source_ids,
+                    shared_state.clone(),
+                )
+            }))
+            .await;
+
+            // Apply results in planned order so the emitted event sequence and
+            // the next superstep's queue are identical to sequential execution.
+            // Events are buffered per invocation (not emitted live during the
+            // executes), which keeps per-executor event pairs coherent and the
+            // overall order deterministic. The first error in planned order
+            // fails the superstep, exactly as the sequential `?` did — later
+            // invocations' effects are simply not applied.
+            let mut next: Vec<WorkflowMessage> = Vec::new();
+            for (id, result) in results {
+                self.emit(WorkflowEvent::ExecutorInvoked {
+                    executor_id: id.clone(),
+                });
+                match result {
+                    Ok((sent, outputs, custom, requests)) => {
+                        for out in outputs {
+                            self.emit(WorkflowEvent::Output {
+                                data: out,
+                                source_executor_id: id.clone(),
+                            });
+                        }
+                        for ev in custom {
+                            self.emit(ev);
+                        }
+                        for draft in requests {
+                            let pending = PendingRequest {
+                                request_id: draft.request_id.clone(),
+                                source_executor_id: id.clone(),
+                                reply_to_executor_id: draft.reply_to,
+                                request_data: draft.data.clone(),
+                            };
+                            self.pending_requests
+                                .insert(draft.request_id.clone(), pending);
+                            self.emit(WorkflowEvent::RequestInfo {
+                                request_id: draft.request_id,
+                                source_executor_id: id.clone(),
+                                request_data: draft.data,
+                            });
+                            if !emitted_pending {
+                                emitted_pending = true;
+                                self.emit(WorkflowEvent::Status(
+                                    WorkflowRunState::InProgressPendingRequests,
+                                ));
+                            }
+                        }
+                        next.extend(sent);
+                        self.emit(WorkflowEvent::ExecutorCompleted { executor_id: id });
+                    }
+                    Err(e) => {
+                        self.emit(WorkflowEvent::ExecutorFailed {
+                            executor_id: id,
+                            error: e.to_string(),
+                        });
+                        return Err(e);
                     }
                 }
             }
@@ -711,64 +796,27 @@ impl WorkflowRun {
         Ok(())
     }
 
-    async fn run_executor(
-        &mut self,
-        executor: &Arc<dyn Executor>,
+    /// Run one executor in isolation: build its context, execute it, and drain
+    /// the effects it produced (messages, outputs, custom events, requests).
+    ///
+    /// Deliberately takes no `&self` — only owned inputs and the `Arc`-shared
+    /// [`SharedState`] — so a superstep's invocations can run concurrently
+    /// without contending on the runner. Returns the executor id alongside
+    /// either its drained effects or its execution error; the caller emits the
+    /// corresponding events (in a deterministic order) after the join.
+    async fn run_executor_isolated(
+        executor: Arc<dyn Executor>,
         data: Value,
         source_ids: Vec<String>,
-        next: &mut Vec<WorkflowMessage>,
-        emitted_pending: &mut bool,
-    ) -> Result<()> {
+        shared_state: SharedState,
+    ) -> (String, Result<DrainedEffects>) {
         let id = executor.id().to_string();
-        self.emit(WorkflowEvent::ExecutorInvoked {
-            executor_id: id.clone(),
-        });
-        let ctx = WorkflowContext::new(id.clone(), source_ids, self.shared_state.clone());
-        match executor.execute(data, ctx.clone()).await {
-            Ok(()) => {
-                let (sent, outputs, custom, requests) = ctx.take();
-                for out in outputs {
-                    self.emit(WorkflowEvent::Output {
-                        data: out,
-                        source_executor_id: id.clone(),
-                    });
-                }
-                for ev in custom {
-                    self.emit(ev);
-                }
-                for draft in requests {
-                    let pending = PendingRequest {
-                        request_id: draft.request_id.clone(),
-                        source_executor_id: id.clone(),
-                        reply_to_executor_id: draft.reply_to,
-                        request_data: draft.data.clone(),
-                    };
-                    self.pending_requests
-                        .insert(draft.request_id.clone(), pending);
-                    self.emit(WorkflowEvent::RequestInfo {
-                        request_id: draft.request_id,
-                        source_executor_id: id.clone(),
-                        request_data: draft.data,
-                    });
-                    if !*emitted_pending {
-                        *emitted_pending = true;
-                        self.emit(WorkflowEvent::Status(
-                            WorkflowRunState::InProgressPendingRequests,
-                        ));
-                    }
-                }
-                next.extend(sent);
-                self.emit(WorkflowEvent::ExecutorCompleted { executor_id: id });
-                Ok(())
-            }
-            Err(e) => {
-                self.emit(WorkflowEvent::ExecutorFailed {
-                    executor_id: id,
-                    error: e.to_string(),
-                });
-                Err(e)
-            }
-        }
+        let ctx = WorkflowContext::new(id.clone(), source_ids, shared_state);
+        let result = match executor.execute(data, ctx.clone()).await {
+            Ok(()) => Ok(ctx.take()),
+            Err(e) => Err(e),
+        };
+        (id, result)
     }
 
     async fn maybe_checkpoint(&self, step: usize) {
@@ -796,6 +844,7 @@ impl WorkflowRun {
             executor_states,
             shared_state,
             self.pending_requests.values().cloned().collect(),
+            self.fanin.clone(),
             metadata,
             self.shared.graph_signature.clone(),
         );
