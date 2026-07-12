@@ -86,9 +86,22 @@ pub struct TextSpanRegion {
     pub end_index: Option<i64>,
 }
 
+/// The discriminator for an [`Annotation`]. Upstream tags every annotation
+/// with `type: "citation"`; this is the sole kind today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnnotationKind {
+    #[default]
+    #[serde(rename = "citation")]
+    Citation,
+}
+
 /// A citation annotation attached to content.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
+    /// The annotation kind discriminator (`"citation"`), matching upstream's
+    /// `Annotation.type`.
+    #[serde(rename = "type", default)]
+    pub kind: AnnotationKind,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -779,6 +792,21 @@ mod tests {
         assert_eq!(sum.cache_creation_input_token_count, Some(6));
         assert_eq!(sum.cache_read_input_token_count, Some(8));
         assert_eq!(sum.reasoning_output_token_count, Some(10));
+    }
+
+    #[test]
+    fn annotation_carries_citation_type_discriminator() {
+        let ann = Annotation {
+            url: Some("https://example/src".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&ann).unwrap();
+        assert_eq!(v.get("type"), Some(&serde_json::json!("citation")));
+        // Round-trips, and older payloads without `type` still deserialize.
+        let back: Annotation = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ann);
+        let legacy: Annotation = serde_json::from_value(serde_json::json!({"url": "u"})).unwrap();
+        assert_eq!(legacy.kind, AnnotationKind::Citation);
     }
 
     #[test]
