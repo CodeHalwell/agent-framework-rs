@@ -255,3 +255,80 @@ async fn round_limit_yields_partial_not_final() {
     );
     assert!(!conv.is_empty(), "a partial result is yielded");
 }
+
+/// `intermediate_output_from` demotes the orchestrator's single final yield
+/// (the synthesized final answer) from the workflow's terminal output to a
+/// non-terminal `Intermediate` event — useful when Magentic is composed as
+/// one stage of a larger pipeline. See [`MagenticBuilder::output_from`] docs
+/// for why this is whole-orchestrator-granular rather than per-participant
+/// (Magentic compiles to a single executor).
+#[tokio::test]
+async fn intermediate_output_from_demotes_final_yield() {
+    let manager = ScriptedManager {
+        ledgers: Mutex::new(Vec::new()), // immediately satisfied
+        fixed_ledger: None,
+        plan_calls: Arc::new(AtomicUsize::new(0)),
+        replan_calls: Arc::new(AtomicUsize::new(0)),
+        final_calls: Arc::new(AtomicUsize::new(0)),
+        max_stall: 5,
+        max_rounds: Some(5),
+        max_resets: Some(5),
+    };
+
+    let coder = agent("coder", vec!["turn-1"]);
+    let workflow = MagenticBuilder::new()
+        .participant("coder", coder)
+        .manager(Arc::new(manager))
+        .intermediate_output_from(["coder"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("do something").await.unwrap();
+
+    assert!(
+        run.last_output().is_none(),
+        "no terminal output should be recorded once demoted to Intermediate"
+    );
+    let intermediate = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Intermediate { .. }))
+        .count();
+    assert_eq!(
+        intermediate, 1,
+        "the sole yield became a non-terminal event"
+    );
+    let output_events = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Output { .. }))
+        .count();
+    assert_eq!(output_events, 0);
+}
+
+/// Unknown participant names are rejected at build time.
+#[tokio::test]
+async fn output_from_rejects_unknown_participant() {
+    let coder = agent("coder", vec!["turn-1"]);
+    let manager = ScriptedManager {
+        ledgers: Mutex::new(Vec::new()),
+        fixed_ledger: None,
+        plan_calls: Arc::new(AtomicUsize::new(0)),
+        replan_calls: Arc::new(AtomicUsize::new(0)),
+        final_calls: Arc::new(AtomicUsize::new(0)),
+        max_stall: 5,
+        max_rounds: Some(5),
+        max_resets: Some(5),
+    };
+
+    let err = match MagenticBuilder::new()
+        .participant("coder", coder)
+        .manager(Arc::new(manager))
+        .output_from(["nobody"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("nobody"));
+}

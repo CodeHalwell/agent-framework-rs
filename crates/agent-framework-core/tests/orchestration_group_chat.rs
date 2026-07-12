@@ -218,3 +218,98 @@ async fn termination_condition_halts_conversation() {
     );
     assert_eq!(run.state(), WorkflowRunState::Idle);
 }
+
+/// `intermediate_output_from` demotes the group chat's single final yield
+/// (the finished conversation) from the workflow's terminal output to a
+/// non-terminal `Intermediate` event — useful when a group chat is composed
+/// as one stage of a larger pipeline. See [`GroupChatBuilder::output_from`]
+/// docs for why this is whole-orchestrator-granular rather than
+/// per-participant (a group chat compiles to a single executor).
+#[tokio::test]
+async fn intermediate_output_from_demotes_final_yield() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .round_robin()
+        .max_rounds(1)
+        .intermediate_output_from(["A"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("kick off").await.unwrap();
+
+    assert!(
+        run.last_output().is_none(),
+        "no terminal output should be recorded once demoted to Intermediate"
+    );
+    let intermediate = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Intermediate { .. }))
+        .count();
+    assert_eq!(
+        intermediate, 1,
+        "the sole yield became a non-terminal event"
+    );
+    let output_events = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Output { .. }))
+        .count();
+    assert_eq!(output_events, 0);
+}
+
+/// `output_from` naming a known participant preserves the default: the
+/// finished conversation remains the workflow's terminal output.
+#[tokio::test]
+async fn output_from_preserves_terminal_output() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .round_robin()
+        .max_rounds(1)
+        .output_from(["A"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("kick off").await.unwrap();
+    assert!(run.last_output().is_some());
+}
+
+/// Unknown participant names are rejected at build time.
+#[tokio::test]
+async fn output_from_rejects_unknown_participant() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let err = match GroupChatBuilder::new()
+        .participant("A", a)
+        .output_from(["nobody"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("nobody"));
+}
+
+/// Naming participants in both lists is rejected: on this single-executor
+/// builder both resolve to the same underlying executor id.
+#[tokio::test]
+async fn output_from_and_intermediate_output_from_conflict() {
+    let a = agent("A", vec!["a-speaks"]);
+    let b = agent("B", vec!["b-speaks"]);
+
+    let err = match GroupChatBuilder::new()
+        .participant("A", a)
+        .participant("B", b)
+        .output_from(["A"])
+        .intermediate_output_from(["B"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("group_chat_orchestrator"));
+}

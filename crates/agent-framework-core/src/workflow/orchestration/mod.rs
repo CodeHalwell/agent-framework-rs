@@ -152,8 +152,15 @@ pub(crate) async fn run_agent_and_emit(
 pub struct AgentExecutor {
     id: String,
     agent: Arc<dyn SupportsAgentRun>,
-    /// When true, yield the conversation as workflow output instead of sending.
+    /// When true, yield the conversation as a workflow output (in addition to
+    /// sending it downstream when [`Self::also_send`] is set).
     emit_output: bool,
+    /// When true, forward the conversation downstream even though
+    /// `emit_output` is also set. Lets a builder designate an interior
+    /// participant (not just the terminal one) as an output/intermediate
+    /// source — see [`SequentialBuilder::output_from`](super::SequentialBuilder::output_from)
+    /// and [`ConcurrentBuilder::output_from`](super::ConcurrentBuilder::output_from).
+    also_send: bool,
 }
 
 impl AgentExecutor {
@@ -163,13 +170,28 @@ impl AgentExecutor {
             id: id.into(),
             agent,
             emit_output: false,
+            also_send: false,
         }
     }
 
     /// When set, the executor yields the running conversation as a workflow
-    /// output instead of forwarding it downstream.
+    /// output. Unless [`Self::with_also_send`] is also set, this replaces
+    /// forwarding the conversation downstream (the pre-designation default:
+    /// a pipeline's terminal executor only yields, it has nothing downstream
+    /// to send to).
     pub fn with_output(mut self, emit_output: bool) -> Self {
         self.emit_output = emit_output;
+        self
+    }
+
+    /// When set, the executor forwards the conversation downstream via
+    /// [`WorkflowContext::send_message`] even if [`Self::with_output`] is
+    /// also set (rather than the exclusive-or default). Needed whenever an
+    /// interior (non-terminal) participant is designated as an output or
+    /// intermediate-output source and must still hand the conversation to
+    /// the next stage / the fan-in barrier.
+    pub fn with_also_send(mut self, also_send: bool) -> Self {
+        self.also_send = also_send;
         self
     }
 }
@@ -189,8 +211,9 @@ impl Executor for AgentExecutor {
         let payload = serde_json::to_value(&conversation)
             .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))?;
         if self.emit_output {
-            ctx.yield_output(payload).await?;
-        } else {
+            ctx.yield_output(payload.clone()).await?;
+        }
+        if !self.emit_output || self.also_send {
             ctx.send_message(payload).await?;
         }
         Ok(())

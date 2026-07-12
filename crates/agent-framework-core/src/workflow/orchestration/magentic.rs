@@ -1337,6 +1337,8 @@ pub struct MagenticBuilder {
     enable_plan_review: bool,
     max_plan_review_rounds: Option<u32>,
     enable_stall_intervention: bool,
+    output_from: Vec<String>,
+    intermediate_output_from: Vec<String>,
 }
 
 /// Default cap on plan-review *revise* rounds before the orchestrator
@@ -1453,6 +1455,45 @@ impl MagenticBuilder {
         self
     }
 
+    /// Designate participants (by the name passed to
+    /// [`Self::participant`]/[`Self::participant_described`]) as a workflow
+    /// output source, forwarded to [`WorkflowBuilder::output_from`].
+    ///
+    /// **Divergence from Sequential/Concurrent:** like [`GroupChatBuilder`],
+    /// Magentic compiles to a *single* orchestrator [`Executor`] that drives
+    /// the whole plan/round loop internally (see the module-level design
+    /// note) rather than one executor per participant, so there is no
+    /// per-participant executor id to route to individually. Naming any
+    /// participant here keeps the orchestrator's single final yield — the
+    /// synthesized final answer — as the terminal
+    /// [`WorkflowEvent::Output`](crate::workflow::WorkflowEvent::Output)
+    /// (already the default). Call [`Self::intermediate_output_from`]
+    /// instead to demote it to a non-terminal
+    /// [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event when composing Magentic into a larger workflow.
+    ///
+    /// Rejected at `build()` if a name does not match any registered
+    /// participant, or if this and [`Self::intermediate_output_from`] are
+    /// both non-empty (both resolve to the same underlying executor id).
+    pub fn output_from(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.output_from.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Designate participants (by name) as an intermediate-output source,
+    /// demoting the orchestrator's single final yield to a non-terminal
+    /// [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event instead of the workflow's terminal output. See
+    /// [`Self::output_from`] for the single-executor caveat.
+    pub fn intermediate_output_from(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.intermediate_output_from
+            .extend(names.into_iter().map(Into::into));
+        self
+    }
+
     /// Validate and build the Magentic workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -1463,6 +1504,25 @@ impl MagenticBuilder {
         let manager = self
             .manager
             .ok_or_else(|| Error::Workflow("magentic workflow requires a manager".into()))?;
+
+        let known_names: std::collections::HashSet<&str> = self
+            .participants
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        for n in self
+            .output_from
+            .iter()
+            .chain(self.intermediate_output_from.iter())
+        {
+            if !known_names.contains(n.as_str()) {
+                return Err(Error::Workflow(format!(
+                    "output designation references unknown participant '{n}'"
+                )));
+            }
+        }
+        let designate_output = !self.output_from.is_empty();
+        let designate_intermediate = !self.intermediate_output_from.is_empty();
 
         let descriptions: Vec<(String, String)> = self
             .participants
@@ -1495,6 +1555,12 @@ impl MagenticBuilder {
         let mut builder = WorkflowBuilder::new()
             .add_executor(Arc::new(orchestrator))
             .set_start("magentic_orchestrator");
+        if designate_output {
+            builder = builder.output_from(["magentic_orchestrator"]);
+        }
+        if designate_intermediate {
+            builder = builder.intermediate_output_from(["magentic_orchestrator"]);
+        }
         if let Some(name) = self.name {
             builder = builder.name(name);
         }

@@ -451,6 +451,8 @@ pub struct GroupChatBuilder {
     max_rounds: Option<usize>,
     termination: Option<TerminationCondition>,
     name: Option<String>,
+    output_from: Vec<String>,
+    intermediate_output_from: Vec<String>,
 }
 
 impl Default for GroupChatBuilder {
@@ -462,6 +464,8 @@ impl Default for GroupChatBuilder {
             max_rounds: None,
             termination: None,
             name: None,
+            output_from: Vec::new(),
+            intermediate_output_from: Vec::new(),
         }
     }
 }
@@ -568,6 +572,48 @@ impl GroupChatBuilder {
         self
     }
 
+    /// Designate participants (by the name passed to
+    /// [`Self::participant`]/[`Self::participant_described`]) as a workflow
+    /// output source, forwarded to [`WorkflowBuilder::output_from`].
+    ///
+    /// **Divergence from Sequential/Concurrent:** unlike those builders, a
+    /// group chat compiles to a *single* orchestrator [`Executor`] that runs
+    /// the whole manager/participant loop internally (see the module-level
+    /// design note) rather than one executor per participant, so there is no
+    /// per-participant executor id to route to individually. Naming any
+    /// participant here is therefore equivalent to naming every participant:
+    /// it simply keeps the orchestrator's single final yield — the finished
+    /// conversation — as the terminal [`WorkflowEvent::Output`](crate::workflow::WorkflowEvent::Output)
+    /// (already the default when no designation is set at all). Its
+    /// practical purpose is composing a group chat into a larger workflow:
+    /// call [`Self::intermediate_output_from`] instead to demote the group
+    /// chat's result to a non-terminal
+    /// [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event, e.g. when this workflow feeds a downstream stage.
+    ///
+    /// Rejected at `build()` if a name does not match any registered
+    /// participant, or if this and [`Self::intermediate_output_from`] are
+    /// both non-empty (both resolve to the same underlying executor id, so
+    /// the id would be designated as both terminal and non-terminal).
+    pub fn output_from(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.output_from.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Designate participants (by name) as an intermediate-output source,
+    /// demoting the group chat orchestrator's single final yield to a
+    /// non-terminal [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event instead of the workflow's terminal output. See
+    /// [`Self::output_from`] for the single-executor caveat.
+    pub fn intermediate_output_from(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.intermediate_output_from
+            .extend(names.into_iter().map(Into::into));
+        self
+    }
+
     /// Validate and build the group chat workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -575,6 +621,25 @@ impl GroupChatBuilder {
                 "group chat needs at least one participant".into(),
             ));
         }
+
+        let known_names: std::collections::HashSet<&str> = self
+            .participants
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        for n in self
+            .output_from
+            .iter()
+            .chain(self.intermediate_output_from.iter())
+        {
+            if !known_names.contains(n.as_str()) {
+                return Err(Error::Workflow(format!(
+                    "output designation references unknown participant '{n}'"
+                )));
+            }
+        }
+        let designate_output = !self.output_from.is_empty();
+        let designate_intermediate = !self.intermediate_output_from.is_empty();
 
         let manager: Arc<dyn GroupChatManager> = match self.manager {
             ManagerChoice::RoundRobin => Arc::new(RoundRobinManager::new()),
@@ -612,6 +677,12 @@ impl GroupChatBuilder {
         let mut builder = WorkflowBuilder::new()
             .add_executor(Arc::new(orchestrator))
             .set_start("group_chat_orchestrator");
+        if designate_output {
+            builder = builder.output_from(["group_chat_orchestrator"]);
+        }
+        if designate_intermediate {
+            builder = builder.intermediate_output_from(["group_chat_orchestrator"]);
+        }
         if let Some(name) = self.name {
             builder = builder.name(name);
         }
