@@ -404,6 +404,13 @@ impl OpenAIAssistantsClient {
                 self.create_thread(messages, tool_resources, metadata).await
             }
             Some(tid) => {
+                if strip_reused_thread_fields(run_options) {
+                    tracing::debug!(
+                        thread_id = %tid,
+                        "ignoring tool_resources on a reused Assistants thread; \
+                         configure vector stores / file ids when the thread is created"
+                    );
+                }
                 if let Some(active) = active_run {
                     self.send(self.request(
                         reqwest::Method::POST,
@@ -783,6 +790,18 @@ fn take_thread_fields(
     let tool_resources = run_options.remove("tool_resources");
     let metadata = run_options.get("metadata").cloned();
     (messages, tool_resources, metadata)
+}
+
+/// Strip thread-creation-only fields from a run body when reusing an existing
+/// thread. `tool_resources` is a thread field the Create Run endpoint rejects
+/// (an existing thread already carries its own, set at creation), so it is
+/// removed; `additional_messages` is a valid run field and stays. Returns
+/// whether anything was removed. Diverges from upstream Python, which only
+/// pops `tool_resources` on the new-thread branch and would thus send an
+/// invalid run body for a reused thread carrying hosted file-search /
+/// code-interpreter resources.
+fn strip_reused_thread_fields(run_options: &mut Map<String, Value>) -> bool {
+    run_options.remove("tool_resources").is_some()
 }
 
 /// Assemble a thread-creation body, omitting an empty `messages` list.
@@ -1228,6 +1247,27 @@ mod tests {
     // endregion
 
     // region: prepare_options -> run body
+
+    #[test]
+    fn reused_thread_strips_tool_resources_but_keeps_messages() {
+        // A run reusing an existing thread must not carry `tool_resources`
+        // (the Create Run endpoint rejects it), but keeps `additional_messages`.
+        let options = ChatOptions::new()
+            .with_tool_choice(ToolMode::Auto)
+            .with_tool(hosted_file_search(None).vector_store_ids(vec!["vs_1".into()]));
+        let (mut run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        assert!(run.contains_key("tool_resources"));
+        assert!(run.contains_key("additional_messages"));
+
+        let removed = strip_reused_thread_fields(&mut run);
+        assert!(removed);
+        assert!(!run.contains_key("tool_resources"));
+        // The user message still rides along on the reused-thread run.
+        assert!(run.contains_key("additional_messages"));
+
+        // Idempotent / no-op when there was nothing to strip.
+        assert!(!strip_reused_thread_fields(&mut run));
+    }
 
     #[test]
     fn incomplete_run_status_is_terminal() {
