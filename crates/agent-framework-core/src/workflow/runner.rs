@@ -2,7 +2,7 @@
 //! the superstep runner.
 
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -139,6 +139,15 @@ pub(crate) struct WorkflowShared {
     pub id: String,
     /// Deterministic fingerprint of the graph topology, checked on resume.
     pub graph_signature: String,
+    /// Executor ids whose yields are workflow-level [`Output`](WorkflowEvent::Output)
+    /// events (see [`WorkflowBuilder::output_from`]). Empty means "no
+    /// restriction" — see [`WorkflowRun::classify_yield`] for the full
+    /// precedence rule.
+    pub output_executors: HashSet<String>,
+    /// Executor ids whose yields are non-terminal
+    /// [`Intermediate`](WorkflowEvent::Intermediate) events (see
+    /// [`WorkflowBuilder::intermediate_output_from`]).
+    pub intermediate_executors: HashSet<String>,
 }
 
 /// Fluent builder for a [`Workflow`]. Rust equivalent of `WorkflowBuilder`.
@@ -150,6 +159,8 @@ pub struct WorkflowBuilder {
     name: Option<String>,
     description: Option<String>,
     checkpoint_storage: Option<Arc<dyn CheckpointStorage>>,
+    output_executors: Vec<String>,
+    intermediate_executors: Vec<String>,
 }
 
 impl std::default::Default for WorkflowBuilder {
@@ -162,6 +173,8 @@ impl std::default::Default for WorkflowBuilder {
             name: None,
             description: None,
             checkpoint_storage: None,
+            output_executors: Vec::new(),
+            intermediate_executors: Vec::new(),
         }
     }
 }
@@ -308,15 +321,56 @@ impl WorkflowBuilder {
         self
     }
 
+    /// Designate `ids` as workflow-level output sources: their `yield_output`
+    /// calls become terminal [`WorkflowEvent::Output`] events and are recorded
+    /// in [`WorkflowRun::last_output`]/[`WorkflowRun::outputs`].
+    ///
+    /// Once any executor is designated with `output_from`, executors *not*
+    /// named here (and not named via [`WorkflowBuilder::intermediate_output_from`])
+    /// have their yields demoted to non-terminal [`WorkflowEvent::Intermediate`]
+    /// events rather than dropped — see [`WorkflowEvent::Intermediate`] for the
+    /// full precedence rule. Leaving both designation lists empty preserves the
+    /// default behavior: every yield is a terminal `Output`.
+    ///
+    /// Rejected at [`WorkflowBuilder::build`] if any id is unknown or overlaps
+    /// [`WorkflowBuilder::intermediate_output_from`].
+    pub fn output_from(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.output_executors
+            .extend(ids.into_iter().map(Into::into));
+        self
+    }
+
+    /// Designate `ids` as intermediate-output sources: their `yield_output`
+    /// calls become non-terminal [`WorkflowEvent::Intermediate`] events and are
+    /// never recorded as the run's final output.
+    ///
+    /// Rejected at [`WorkflowBuilder::build`] if any id is unknown or overlaps
+    /// [`WorkflowBuilder::output_from`].
+    pub fn intermediate_output_from(
+        mut self,
+        ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.intermediate_executors
+            .extend(ids.into_iter().map(Into::into));
+        self
+    }
+
     /// Validate and build the workflow.
     pub fn build(self) -> Result<Workflow> {
         let start = self
             .start
             .ok_or_else(|| Error::Workflow("no start executor set".into()))?;
 
-        // Full graph validation (start presence, duplicate edges, connectivity).
-        validate_workflow_graph(&self.executors, &self.edge_groups, &start)
-            .map_err(|e| Error::Workflow(e.to_string()))?;
+        // Full graph validation (start presence, duplicate edges, connectivity,
+        // output designation).
+        validate_workflow_graph(
+            &self.executors,
+            &self.edge_groups,
+            &start,
+            &self.output_executors,
+            &self.intermediate_executors,
+        )
+        .map_err(|e| Error::Workflow(e.to_string()))?;
 
         let graph_signature = compute_graph_signature(&self.executors, &self.edge_groups, &start);
 
@@ -331,6 +385,8 @@ impl WorkflowBuilder {
                 checkpoint_storage: self.checkpoint_storage,
                 id: uuid::Uuid::new_v4().to_string(),
                 graph_signature,
+                output_executors: self.output_executors.into_iter().collect(),
+                intermediate_executors: self.intermediate_executors.into_iter().collect(),
             }),
         })
     }
@@ -548,6 +604,41 @@ impl WorkflowRun {
             let _ = tx.send(event.clone());
         }
         self.events.push(event);
+    }
+
+    /// Classify a value yielded by executor `id` into the right
+    /// [`WorkflowEvent`], per the workflow's output designation
+    /// (`output_from`/`intermediate_output_from`).
+    ///
+    /// Precedence:
+    /// 1. `id` is in `intermediate_executors` -> [`WorkflowEvent::Intermediate`]
+    ///    (never counted as the run's output, regardless of `output_executors`).
+    /// 2. Otherwise, if `output_executors` is empty (no designation configured
+    ///    at all) -> [`WorkflowEvent::Output`], preserving the pre-designation
+    ///    default where every yield is terminal output.
+    /// 3. Otherwise (`output_executors` is non-empty), `id` in it ->
+    ///    [`WorkflowEvent::Output`]; `id` not in it -> demoted to
+    ///    [`WorkflowEvent::Intermediate`] as a safe non-terminal signal, rather
+    ///    than silently dropped.
+    fn classify_yield(&self, id: &str, data: Value) -> WorkflowEvent {
+        let source_executor_id = id.to_string();
+        if self.shared.intermediate_executors.contains(id) {
+            return WorkflowEvent::Intermediate {
+                data,
+                source_executor_id,
+            };
+        }
+        if self.shared.output_executors.is_empty() || self.shared.output_executors.contains(id) {
+            WorkflowEvent::Output {
+                data,
+                source_executor_id,
+            }
+        } else {
+            WorkflowEvent::Intermediate {
+                data,
+                source_executor_id,
+            }
+        }
     }
 
     async fn start(&mut self, input: Value) -> Result<()> {
@@ -787,10 +878,7 @@ impl WorkflowRun {
                 match result {
                     Ok((sent, outputs, custom, requests)) => {
                         for out in outputs {
-                            self.emit(WorkflowEvent::Output {
-                                data: out,
-                                source_executor_id: id.clone(),
-                            });
+                            self.emit(self.classify_yield(&id, out));
                         }
                         for ev in custom {
                             self.emit(ev);

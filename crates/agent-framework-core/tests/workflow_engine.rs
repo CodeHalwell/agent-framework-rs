@@ -186,7 +186,7 @@ fn validate_workflow_graph_returns_typed_error() {
         target: "b".into(),
         condition: None,
     }];
-    let err = validate_workflow_graph(&execs, &groups, "a").unwrap_err();
+    let err = validate_workflow_graph(&execs, &groups, "a", &[], &[]).unwrap_err();
     assert_eq!(err.validation_type, ValidationType::GraphConnectivity);
 
     // Duplicate edge is also surfaced with the right category.
@@ -205,7 +205,7 @@ fn validate_workflow_graph_returns_typed_error() {
     let mut ab: HashMap<String, Arc<dyn Executor>> = HashMap::new();
     ab.insert("a".into(), noop("a"));
     ab.insert("b".into(), noop("b"));
-    let err = validate_workflow_graph(&ab, &dup_groups, "a").unwrap_err();
+    let err = validate_workflow_graph(&ab, &dup_groups, "a", &[], &[]).unwrap_err();
     assert_eq!(err.validation_type, ValidationType::EdgeDuplication);
 }
 
@@ -290,6 +290,7 @@ fn tag(event: &WorkflowEvent) -> String {
         WorkflowEvent::AgentRunUpdate { .. } => "AgentRunUpdate".into(),
         WorkflowEvent::AgentRun { .. } => "AgentRun".into(),
         WorkflowEvent::Output { .. } => "Output".into(),
+        WorkflowEvent::Intermediate { .. } => "Intermediate".into(),
         WorkflowEvent::Custom(_) => "Custom".into(),
         WorkflowEvent::RequestInfo { .. } => "RequestInfo".into(),
         WorkflowEvent::Failed { .. } => "Failed".into(),
@@ -1060,4 +1061,171 @@ async fn fan_out_event_and_output_order_is_deterministic() {
         "outputs follow sorted-target order"
     );
     assert_eq!(run2.outputs(), run1.outputs());
+}
+
+// ----------------------------------------------------------------------------
+// Workflow output designation: output_from / intermediate_output_from
+// ----------------------------------------------------------------------------
+
+/// Two-stage pipeline, `first -> second`, both yielding a value. Used to probe
+/// the interaction between `output_from`/`intermediate_output_from` and
+/// `last_output`/`outputs`/`events`.
+fn two_stage_yield_workflow(
+    output_from: Option<Vec<&'static str>>,
+    intermediate_from: Option<Vec<&'static str>>,
+) -> Result<Workflow> {
+    let first = FunctionExecutor::new("first", |_msg, ctx| async move {
+        ctx.yield_output(json!("from-first")).await?;
+        ctx.send_message(json!("go")).await?;
+        Ok(())
+    });
+    let second = FunctionExecutor::new("second", |_msg, ctx| async move {
+        ctx.yield_output(json!("from-second")).await?;
+        Ok(())
+    });
+
+    let mut builder = WorkflowBuilder::new()
+        .add_executor(Arc::new(first))
+        .add_executor(Arc::new(second))
+        .set_start("first")
+        .add_edge("first", "second");
+    if let Some(ids) = output_from {
+        builder = builder.output_from(ids);
+    }
+    if let Some(ids) = intermediate_from {
+        builder = builder.intermediate_output_from(ids);
+    }
+    builder.build()
+}
+
+#[tokio::test]
+async fn default_output_designation_is_unchanged() {
+    // With neither `output_from` nor `intermediate_output_from` configured,
+    // every yield is a terminal `Output` and `last_output` is the last one
+    // produced, exactly as before this feature existed.
+    let workflow = two_stage_yield_workflow(None, None).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(
+        run.outputs(),
+        vec![json!("from-first"), json!("from-second")]
+    );
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+    assert!(
+        !run.events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::Intermediate { .. })),
+        "no Intermediate events without a designation"
+    );
+}
+
+#[tokio::test]
+async fn intermediate_output_from_is_non_terminal_output_from_wins() {
+    // `first` is marked intermediate-only; `second` is the designated output.
+    // `first`'s yield must surface as `Intermediate` (never as the run's final
+    // output), while `second`'s yield is the `Output` / `last_output`.
+    let workflow = two_stage_yield_workflow(Some(vec!["second"]), Some(vec!["first"])).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(
+        run.outputs(),
+        vec![json!("from-second")],
+        "only the output_from executor's yield counts as Output"
+    );
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+
+    let intermediates: Vec<Value> = run
+        .events()
+        .iter()
+        .filter_map(|e| e.as_intermediate().cloned())
+        .collect();
+    assert_eq!(
+        intermediates,
+        vec![json!("from-first")],
+        "the intermediate_output_from executor's yield is Intermediate, not Output"
+    );
+
+    // Sanity: the intermediate value never leaks into last_output/outputs.
+    assert_ne!(run.last_output(), Some(json!("from-first")));
+    assert!(!run.outputs().contains(&json!("from-first")));
+}
+
+#[tokio::test]
+async fn output_from_demotes_undesignated_executors_to_intermediate() {
+    // Only `second` is designated as an output source; `first` is not listed
+    // in either set. Per the documented precedence, its yield is demoted to a
+    // non-terminal Intermediate rather than silently dropped.
+    let workflow = two_stage_yield_workflow(Some(vec!["second"]), None).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(run.outputs(), vec![json!("from-second")]);
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+    assert!(run.events().iter().any(
+        |e| matches!(e, WorkflowEvent::Intermediate { data, source_executor_id }
+            if data == &json!("from-first") && source_executor_id == "first")
+    ));
+}
+
+#[test]
+fn output_designation_validation_rejects_overlap_and_unknown_ids() {
+    let mut execs: HashMap<String, Arc<dyn Executor>> = HashMap::new();
+    execs.insert("a".into(), noop("a"));
+    execs.insert("b".into(), noop("b"));
+    let groups = vec![EdgeGroup::Single {
+        source: "a".into(),
+        target: "b".into(),
+        condition: None,
+    }];
+
+    // Overlapping designation.
+    let overlap = vec!["a".to_string()];
+    let err = validate_workflow_graph(&execs, &groups, "a", &overlap, &overlap).unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Unknown id in output_from.
+    let err = validate_workflow_graph(
+        &execs,
+        &groups,
+        "a",
+        &["not-a-real-executor".to_string()],
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Unknown id in intermediate_output_from.
+    let err = validate_workflow_graph(
+        &execs,
+        &groups,
+        "a",
+        &[],
+        &["not-a-real-executor".to_string()],
+    )
+    .unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Disjoint, known ids: valid.
+    assert!(
+        validate_workflow_graph(&execs, &groups, "a", &["a".to_string()], &["b".to_string()],)
+            .is_ok()
+    );
+}
+
+#[test]
+fn workflow_builder_rejects_overlapping_output_designation_at_build() {
+    let first = FunctionExecutor::new("first", |_msg, ctx| async move {
+        ctx.yield_output(json!("x")).await?;
+        Ok(())
+    });
+    let result = WorkflowBuilder::new()
+        .add_executor(Arc::new(first))
+        .set_start("first")
+        .output_from(["first"])
+        .intermediate_output_from(["first"])
+        .build();
+    let err = match result {
+        Ok(_) => panic!("expected build() to reject an overlapping output designation"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("OUTPUT_VALIDATION"));
 }

@@ -602,6 +602,25 @@ fn map_workflow_event(ev: &WorkflowEvent, ctx: &mut WfCtx, out: &mut Vec<Value>)
                 }
             }));
         }
+        WorkflowEvent::Intermediate {
+            data,
+            source_executor_id,
+        } => {
+            // Non-terminal progress signal, analogous to `Output` but never
+            // recorded as the run's final output: surfaced as a workflow
+            // debug event rather than an output message item.
+            out.push(json!({
+                "type": "response.workflow_event.completed",
+                "item_id": ctx.item_id,
+                "output_index": ctx.output_index.max(0),
+                "sequence_number": ctx.next(),
+                "data": {
+                    "event_type": "WorkflowIntermediateEvent",
+                    "source_executor_id": source_executor_id,
+                    "data": data,
+                },
+            }));
+        }
         WorkflowEvent::RequestInfo {
             request_id,
             source_executor_id,
@@ -693,6 +712,14 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
             "request_id": request_id,
             "source_executor_id": source_executor_id,
             "request_data": request_data,
+        }),
+        WorkflowEvent::Intermediate {
+            data,
+            source_executor_id,
+        } => json!({
+            "event_type": "WorkflowIntermediateEvent",
+            "source_executor_id": source_executor_id,
+            "data": data,
         }),
     }
 }

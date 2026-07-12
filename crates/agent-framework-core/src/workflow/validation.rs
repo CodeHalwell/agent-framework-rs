@@ -23,6 +23,10 @@ pub enum ValidationType {
     UnknownExecutor,
     /// One or more executors are unreachable from the start node.
     GraphConnectivity,
+    /// The workflow-output designation (`output_from`/`intermediate_output_from`)
+    /// is invalid: the two sets overlap, or a designated id is not a known
+    /// executor.
+    OutputValidation,
 }
 
 impl fmt::Display for ValidationType {
@@ -32,6 +36,7 @@ impl fmt::Display for ValidationType {
             ValidationType::EdgeDuplication => "EDGE_DUPLICATION",
             ValidationType::UnknownExecutor => "UNKNOWN_EXECUTOR",
             ValidationType::GraphConnectivity => "GRAPH_CONNECTIVITY",
+            ValidationType::OutputValidation => "OUTPUT_VALIDATION",
         };
         f.write_str(s)
     }
@@ -72,11 +77,16 @@ impl std::error::Error for WorkflowValidationError {}
 /// 1. the start executor is registered;
 /// 2. every edge references a registered executor;
 /// 3. no directed `(source, target)` edge is duplicated;
-/// 4. every executor is reachable from the start node.
+/// 4. every executor is reachable from the start node;
+/// 5. the workflow-output designation (`output_executors`/
+///    `intermediate_executors`) does not overlap and only names known
+///    executors.
 pub fn validate_workflow_graph(
     executors: &HashMap<String, Arc<dyn Executor>>,
     edge_groups: &[EdgeGroup],
     start: &str,
+    output_executors: &[String],
+    intermediate_executors: &[String],
 ) -> Result<(), WorkflowValidationError> {
     // 1. Start must be registered.
     if !executors.contains_key(start) {
@@ -143,6 +153,51 @@ pub fn validate_workflow_graph(
                  This may indicate a disconnected workflow graph."
             ),
         ));
+    }
+
+    // 5. Workflow-output designation: the two sets must be disjoint, and every
+    //    designated id must name a known executor.
+    validate_output_designation(executors, output_executors, intermediate_executors)?;
+
+    Ok(())
+}
+
+/// Validate the `output_from`/`intermediate_output_from` designation: the two
+/// lists must not overlap (an executor's yields cannot be both terminal and
+/// non-terminal), and every listed id must be a registered executor.
+fn validate_output_designation(
+    executors: &HashMap<String, Arc<dyn Executor>>,
+    output_executors: &[String],
+    intermediate_executors: &[String],
+) -> Result<(), WorkflowValidationError> {
+    let output_set: HashSet<&str> = output_executors.iter().map(String::as_str).collect();
+    let intermediate_set: HashSet<&str> =
+        intermediate_executors.iter().map(String::as_str).collect();
+
+    let mut overlap: Vec<&str> = output_set
+        .intersection(&intermediate_set)
+        .copied()
+        .collect();
+    if !overlap.is_empty() {
+        overlap.sort_unstable();
+        return Err(WorkflowValidationError::new(
+            ValidationType::OutputValidation,
+            format!(
+                "executor id(s) {overlap:?} are designated as both an output source \
+                 (`output_from`) and an intermediate-output source \
+                 (`intermediate_output_from`); an executor's yields cannot be both \
+                 terminal and non-terminal."
+            ),
+        ));
+    }
+
+    for id in output_executors.iter().chain(intermediate_executors.iter()) {
+        if !executors.contains_key(id) {
+            return Err(WorkflowValidationError::new(
+                ValidationType::OutputValidation,
+                format!("workflow-output designation references unknown executor '{id}'"),
+            ));
+        }
     }
 
     Ok(())
