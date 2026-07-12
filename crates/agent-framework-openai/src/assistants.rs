@@ -685,12 +685,28 @@ fn prepare_options(
     let mut additional_messages: Vec<Value> = Vec::new();
     let mut tool_results: Option<Vec<FunctionResultContent>> = None;
 
+    // Join instruction fragments (the `ChatOptions::instructions` seed plus each
+    // system/developer message) with a newline, matching this port's own
+    // instruction convention (`ChatAgent` and `ChatOptions::merge` both
+    // newline-concatenate). Deliberate divergence from Python's separator-less
+    // `"".join`, which would run distinct prompts together
+    // ("Be terse."+"Return JSON." → "Be terse.Return JSON.").
+    let mut append_instruction = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        if !instructions.is_empty() {
+            instructions.push('\n');
+        }
+        instructions.push_str(text);
+    };
+
     for msg in messages {
         let role = msg.role.as_str();
         if role == Role::SYSTEM || role == "developer" {
             for content in &msg.contents {
                 if let Content::Text(t) = content {
-                    instructions.push_str(&t.text);
+                    append_instruction(&t.text);
                 }
             }
             continue;
@@ -1334,7 +1350,9 @@ mod tests {
             &[ChatMessage::system("Be terse."), ChatMessage::user("hi")],
             &options,
         );
-        assert_eq!(run["instructions"], json!("You are helpful.Be terse."));
+        // Fragments are newline-joined (matching the port's instruction
+        // convention), not run together.
+        assert_eq!(run["instructions"], json!("You are helpful.\nBe terse."));
     }
 
     #[test]
@@ -1396,8 +1414,12 @@ mod tests {
             ChatMessage::user("hi"),
         ];
         let (run, _) = prepare_options(&messages, &ChatOptions::new());
-        // Concatenated with no separator, matching Python's `"".join`.
-        assert_eq!(run["instructions"], json!("Be terse.Prefer bullet points."));
+        // Newline-joined (the port's instruction convention), so distinct
+        // system/developer prompts don't run together.
+        assert_eq!(
+            run["instructions"],
+            json!("Be terse.\nPrefer bullet points.")
+        );
         // Only the user message becomes an additional message.
         let add = run["additional_messages"].as_array().unwrap();
         assert_eq!(add.len(), 1);
