@@ -655,6 +655,55 @@ async fn service_created_conversation_id_propagates_into_tool_followup() {
 }
 
 #[tokio::test]
+async fn duplicate_provider_message_ids_do_not_merge_on_replay() {
+    // A service (e.g. Assistants) can reuse one run id for the tool-call turn
+    // and the final answer. If the replay preserved that duplicate id,
+    // aggregation would merge the final text into the tool-call message and
+    // reorder it ahead of the tool result. The replay must keep the two
+    // assistant messages distinct.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let mut tool_call_msg =
+        ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+    tool_call_msg.message_id = Some("run_dup".into());
+    let ask = ChatResponse {
+        messages: vec![tool_call_msg],
+        ..Default::default()
+    };
+    let mut final_msg = ChatMessage::with_contents(Role::assistant(), vec![Content::text("final")]);
+    final_msg.message_id = Some("run_dup".into()); // same id as the tool-call turn
+    let answer = ChatResponse {
+        messages: vec![final_msg],
+        ..Default::default()
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(noop)
+        .build();
+
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    // Final answer stays its own message, after the tool result — not merged
+    // into the tool-call message.
+    let last = aggregated.messages.last().unwrap();
+    assert_eq!(last.text(), "final");
+    assert!(last
+        .contents
+        .iter()
+        .all(|c| !matches!(c, Content::FunctionCall(_))));
+}
+
+#[tokio::test]
 async fn provider_resolved_tool_calls_are_not_executed_locally() {
     // A response carrying a function call WITH its matching result in the
     // same response (e.g. Anthropic server-side web-search/MCP tool use) was

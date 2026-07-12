@@ -636,12 +636,30 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         let finish_reason = response.finish_reason.clone();
         let usage_details = response.usage_details.clone();
         let last = response.messages.len().saturating_sub(1);
+        // Keep the provider message ids only when they're all present and
+        // distinct; otherwise use positional ids for every message. A service
+        // (e.g. Assistants) can reuse one run id for both the tool-call turn
+        // and the final assistant turn, and `ChatResponse::from_updates` keys
+        // messages by id — a duplicate would merge the final answer into the
+        // tool-call message, ahead of the tool result.
+        let keep_provider_ids = {
+            let mut seen = std::collections::HashSet::new();
+            response.messages.iter().all(|m| {
+                m.message_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty() && seen.insert(id.as_str()))
+            })
+        };
         let mut updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
             .enumerate()
             .map(|(i, m)| {
-                let message_id = m.message_id.clone().or_else(|| Some(format!("replay-{i}")));
+                let message_id = if keep_provider_ids {
+                    m.message_id.clone()
+                } else {
+                    Some(format!("replay-{i}"))
+                };
                 let mut contents = m.contents;
                 let is_last = i == last;
                 if is_last {

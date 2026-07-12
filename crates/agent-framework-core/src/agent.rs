@@ -100,11 +100,29 @@ pub(crate) fn response_to_updates(
         ..
     } = response;
     let last = messages.len().saturating_sub(1);
+    // Keep provider message ids only when all present and distinct; otherwise
+    // positional ids for every message. A service (e.g. Assistants) can reuse
+    // one run id across the tool-call and final assistant messages, and
+    // `AgentRunResponse::from_updates` keys by id — a duplicate would merge
+    // the final answer into the tool-call message, so streamed and
+    // non-streamed responses would differ.
+    let keep_provider_ids = {
+        let mut seen = std::collections::HashSet::new();
+        messages.iter().all(|m| {
+            m.message_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty() && seen.insert(id.as_str()))
+        })
+    };
     let mut updates: Vec<Result<AgentRunResponseUpdate>> = messages
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
-            let message_id = m.message_id.clone().or_else(|| Some(format!("msg-{i}")));
+            let message_id = if keep_provider_ids {
+                m.message_id.clone()
+            } else {
+                Some(format!("msg-{i}"))
+            };
             let mut contents = m.contents;
             if i == last {
                 if let Some(usage) = usage_details.clone() {
