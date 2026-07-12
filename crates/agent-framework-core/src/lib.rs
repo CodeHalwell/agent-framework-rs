@@ -18,6 +18,11 @@
 //! - [`memory`] — context / memory providers.
 //! - [`middleware`] — agent, chat, and function middleware pipelines.
 //! - [`observability`] — OpenTelemetry GenAI-style `tracing` instrumentation.
+//! - [`skills`] — [`Skill`](skills::Skill) capability packages, surfaced via
+//!   [`SkillsProvider`](skills::SkillsProvider), a
+//!   [`ContextProvider`](memory::ContextProvider) that progressively
+//!   discloses skill instructions and resources through
+//!   framework-generated tools.
 //! - [`settings`] — secret-masking [`SecretString`](settings::SecretString)
 //!   and precedence-based setting resolution.
 //! - [`workflow`] — graph-based multi-agent workflow orchestration.
@@ -48,6 +53,7 @@ pub mod middleware;
 pub mod observability;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod streaming;
 pub mod tools;
 pub mod types;
@@ -77,6 +83,7 @@ pub mod prelude {
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
     pub use crate::session::AgentSession;
     pub use crate::settings::{load_setting, SecretString};
+    pub use crate::skills::{Skill, SkillsProvider};
     pub use crate::tools::{
         hosted_code_interpreter, hosted_file_search, hosted_image_generation, hosted_mcp,
         hosted_web_search, ApprovalMode, FunctionInvocationConfig, FunctionTool, McpApprovalMode,
