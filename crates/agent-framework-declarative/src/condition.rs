@@ -67,11 +67,11 @@ pub fn parse(expr: &str) -> Result<Condition> {
     let expected = parse_literal(literal_str);
 
     Ok(Arc::new(move |msg: &Value| {
-        let actual = lookup(msg, &path);
-        match actual {
+        let result = match lookup(msg, &path) {
             Some(actual) => compare(actual, op, &expected),
             None => false,
-        }
+        };
+        Box::pin(async move { result }) as agent_framework_core::tools::BoxFuture<bool>
     }))
 }
 

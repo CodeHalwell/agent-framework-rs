@@ -433,7 +433,7 @@ impl DeclarativeLoader {
         for edge in &spec.edges {
             match self.build_condition(edge.condition.as_deref(), edge.predicate.as_deref())? {
                 Some(condition) => {
-                    builder = builder.add_conditional_edge(
+                    builder = builder.add_conditional_edge_async(
                         edge.from.clone(),
                         edge.to.clone(),
                         move |value: &Value| condition(value),
@@ -459,12 +459,12 @@ impl DeclarativeLoader {
                         )
                     })?;
                 let built = match &case.label {
-                    Some(label) => Case::labeled(
+                    Some(label) => Case::labeled_async(
                         move |v: &Value| condition(v),
                         case.to.clone(),
                         label.clone(),
                     ),
-                    None => Case::new(move |v: &Value| condition(v), case.to.clone()),
+                    None => Case::new_async(move |v: &Value| condition(v), case.to.clone()),
                 };
                 cases.push(built);
             }

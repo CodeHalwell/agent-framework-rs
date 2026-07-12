@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -10,7 +11,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::checkpoint::{CheckpointStorage, WorkflowCheckpoint};
 use super::context::{DrainedEffects, WorkflowContext, WorkflowMessage};
-use super::edge::{Case, Default as SwitchDefault, EdgeGroup};
+use super::edge::{
+    wrap_async_condition, wrap_sync_condition, Case, Default as SwitchDefault, EdgeGroup, Selection,
+};
 use super::events::{WorkflowEvent, WorkflowRunState};
 use super::executor::Executor;
 use super::request_info::{PendingRequest, RequestResponse};
@@ -18,6 +21,7 @@ use super::shared_state::SharedState;
 use super::validation::validate_workflow_graph;
 use super::viz::WorkflowViz;
 use crate::error::{Error, Result};
+use crate::tools::BoxFuture;
 
 const DEFAULT_MAX_ITERATIONS: usize = 100;
 
@@ -208,7 +212,7 @@ impl WorkflowBuilder {
         self
     }
 
-    /// Add a single directed edge guarded by a condition.
+    /// Add a single directed edge guarded by a synchronous condition.
     pub fn add_conditional_edge(
         mut self,
         source: impl Into<String>,
@@ -218,7 +222,31 @@ impl WorkflowBuilder {
         self.edge_groups.push(EdgeGroup::Single {
             source: source.into(),
             target: target.into(),
-            condition: Some(Arc::new(condition)),
+            condition: Some(wrap_sync_condition(condition)),
+        });
+        self
+    }
+
+    /// Add a single directed edge guarded by an async condition.
+    ///
+    /// Equivalent to [`WorkflowBuilder::add_conditional_edge`] but for a
+    /// predicate that itself needs to `.await` (e.g. an I/O check); the
+    /// condition is awaited at routing time (see `UPSTREAM_DRIFT.md` §10,
+    /// `Edge.should_route` becoming async upstream).
+    pub fn add_conditional_edge_async<F, Fut>(
+        mut self,
+        source: impl Into<String>,
+        target: impl Into<String>,
+        condition: F,
+    ) -> Self
+    where
+        F: Fn(&Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.edge_groups.push(EdgeGroup::Single {
+            source: source.into(),
+            target: target.into(),
+            condition: Some(wrap_async_condition(condition)),
         });
         self
     }
@@ -269,15 +297,26 @@ impl WorkflowBuilder {
         targets.push(default.target.clone());
         labels.push("default".to_string());
 
-        let conds: Vec<Case> = cases;
+        // Extract owned `(condition, target)` pairs so the selection closure
+        // below doesn't need to borrow `cases` from its own captured
+        // environment (the returned future must own everything it touches).
+        let case_targets: Vec<(super::edge::Condition, String)> = cases
+            .iter()
+            .map(|case| (case.condition.clone(), case.target.clone()))
+            .collect();
         let default_target = default.target.clone();
-        let selection = Arc::new(move |msg: &Value, _candidates: &[String]| {
-            for case in &conds {
-                if (case.condition)(msg) {
-                    return vec![case.target.clone()];
+        let selection: Selection = Arc::new(move |msg: &Value, _candidates: &[String]| {
+            let case_targets = case_targets.clone();
+            let default_target = default_target.clone();
+            let msg = msg.clone();
+            Box::pin(async move {
+                for (condition, target) in &case_targets {
+                    if condition(&msg).await {
+                        return vec![target.clone()];
+                    }
                 }
-            }
-            vec![default_target.clone()]
+                vec![default_target.clone()]
+            }) as BoxFuture<Vec<String>>
         });
         self.edge_groups.push(EdgeGroup::FanOut {
             source,
@@ -722,7 +761,7 @@ impl WorkflowRun {
             let deliveries = std::mem::take(&mut self.queue);
             let mut by_target: HashMap<String, Vec<WorkflowMessage>> = HashMap::new();
             for msg in deliveries {
-                for target in self.resolve_targets(&msg) {
+                for target in self.resolve_targets(&msg).await {
                     by_target.entry(target).or_default().push(msg.clone());
                 }
             }
@@ -1058,7 +1097,10 @@ impl WorkflowRun {
     }
 
     /// Resolve which executors a message should be delivered to.
-    fn resolve_targets(&self, msg: &WorkflowMessage) -> Vec<String> {
+    ///
+    /// Awaits each matching group's condition/selection (see
+    /// `UPSTREAM_DRIFT.md` §10 — upstream's `Edge.should_route` is async).
+    async fn resolve_targets(&self, msg: &WorkflowMessage) -> Vec<String> {
         // Explicit target wins (direct sends and routed responses).
         if let Some(t) = &msg.target_id {
             return vec![t.clone()];
@@ -1071,7 +1113,11 @@ impl WorkflowRun {
                     target,
                     condition,
                 } if *source == msg.source_id => {
-                    if condition.as_ref().map(|c| c(&msg.data)).unwrap_or(true) {
+                    let route = match condition {
+                        Some(c) => c(&msg.data).await,
+                        None => true,
+                    };
+                    if route {
                         targets.push(target.clone());
                     }
                 }
@@ -1081,7 +1127,7 @@ impl WorkflowRun {
                     selection,
                     ..
                 } if *source == msg.source_id => match selection {
-                    Some(sel) => targets.extend(sel(&msg.data, outs)),
+                    Some(sel) => targets.extend(sel(&msg.data, outs).await),
                     None => targets.extend(outs.clone()),
                 },
                 EdgeGroup::FanIn { sources, target } if sources.contains(&msg.source_id) => {
@@ -1169,5 +1215,109 @@ impl futures::Stream for WorkflowRunStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod async_condition_tests {
+    //! Regression + new-behavior coverage for `UPSTREAM_DRIFT.md` §10: edge
+    //! routing conditions became async upstream (`Edge.should_route`); these
+    //! confirm the sync builder API still routes correctly (regression) and
+    //! that the new `*_async` builder API also routes correctly.
+
+    use super::*;
+    use crate::workflow::executor::FunctionExecutor;
+    use serde_json::json;
+
+    /// An executor that immediately yields whatever message it receives as a
+    /// workflow output, so a run's `outputs()` directly reveal which branch(es)
+    /// were taken.
+    fn echo(id: &str) -> Arc<dyn Executor> {
+        Arc::new(FunctionExecutor::new(id, |msg, ctx| async move {
+            ctx.yield_output(msg).await
+        }))
+    }
+
+    #[tokio::test]
+    async fn sync_condition_still_routes() {
+        // Regression: the pre-existing sync `add_conditional_edge` builder
+        // must keep routing correctly now that `Condition` is async
+        // internally.
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hit"))
+            .add_executor(echo("miss"))
+            .set_start("start")
+            .add_conditional_edge("start", "hit", |v| v == &json!("go"))
+            .add_conditional_edge("start", "miss", |v| v != &json!("go"))
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+    }
+
+    #[tokio::test]
+    async fn async_condition_routes() {
+        // New: `add_conditional_edge_async` accepts a condition that actually
+        // awaits (yields to the scheduler) before resolving.
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hit"))
+            .add_executor(echo("miss"))
+            .set_start("start")
+            .add_conditional_edge_async("start", "hit", |v| {
+                let matched = v == &json!("go");
+                async move {
+                    tokio::task::yield_now().await;
+                    matched
+                }
+            })
+            .add_conditional_edge_async("start", "miss", |v| {
+                let matched = v != &json!("go");
+                async move {
+                    tokio::task::yield_now().await;
+                    matched
+                }
+            })
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+    }
+
+    #[tokio::test]
+    async fn async_switch_case_routes() {
+        // New: `Case::new_async`/`labeled_async` let a switch/case group's
+        // branches await too, exercised through the existing `add_switch`
+        // builder (which now awaits each case's condition in order).
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hot"))
+            .add_executor(echo("cold"))
+            .set_start("start")
+            .add_switch(
+                "start",
+                vec![Case::new_async(
+                    |v| {
+                        let matched = v == &json!("go");
+                        async move {
+                            tokio::task::yield_now().await;
+                            matched
+                        }
+                    },
+                    "hot",
+                )],
+                SwitchDefault::new("cold"),
+            )
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+
+        let run = workflow.run(json!("stop")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("stop")]);
     }
 }
