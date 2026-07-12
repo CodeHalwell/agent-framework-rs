@@ -76,6 +76,18 @@ green) before commit.
   examples, and docs; the distinct `agent-framework-azure-ai-search` crate is
   untouched. (Binding to a server-hosted agent on the Foundry Agents
   control-plane is a documented extension point, not yet wired.)
+- **Anthropic multi-cloud** (rework in place, no new crates): the `anthropic`
+  crate is now a superset with `AnthropicBedrockClient` (AWS Bedrock
+  `InvokeModel`, `anthropic_version: bedrock-2023-05-31`, reusing the verified
+  `agent_framework_bedrock::sigv4` signer), `AnthropicVertexClient` (Vertex
+  `:rawPredict`, `vertex-2023-10-16`, pluggable `VertexTokenProvider` for the
+  Google OAuth token), and `AnthropicFoundryClient` (Entra via
+  `agent_framework_azure::TokenCredential`; route/version overridable as a
+  documented extension point). A shared `convert::build_cloud_request` omits the
+  top-level `model` (it's URL-encoded) and stamps the per-cloud
+  `anthropic_version`. Cloud-transport streaming is a documented single-update
+  adaptation (the AWS event-stream / `:streamRawPredict` framing is a marked
+  extension point). No dependency cycle (bedrock/azure don't depend back).
 - `CosmosCheckpointStorage`; DevUI security middleware (Host-header
   anti-DNS-rebinding guard + optional bearer auth, opt-in).
 
@@ -96,11 +108,10 @@ Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
    `to_dict`/`from_dict`) and history out of the thread into a
    `HistoryProvider` (`InMemory`/`File`), rewiring the agent run loop. Broad
    ripple (a2a/copilotstudio/hosting/redis/examples).
-2. **Provider reworks** — Anthropic multi-cloud (Bedrock/Vertex/Foundry
-   transports in the same crate); Azure "routing mode" realignment; the
+2. **Provider reworks** — Azure "routing mode" realignment; the
    `agent-framework-claude` agent crate (Claude Agent SDK subprocess, distinct
-   from the `anthropic` chat client). (`azure-ai`→`foundry` and github-copilot
-   are done.)
+   from the `anthropic` chat client). (`azure-ai`→`foundry`, github-copilot, and
+   Anthropic multi-cloud are done.)
 4. **Orchestration depth (§12)** — terminal output shape (`AgentResponse` vs
    transcript). (`AgentApprovalExecutor` HITL and Handoff mesh-topology are
    done.)

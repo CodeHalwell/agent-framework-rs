@@ -1,11 +1,11 @@
 //! # agent-framework-anthropic
 //!
-//! An Anthropic (Claude) [`ChatClient`] for `agent-framework-rs`.
+//! Anthropic (Claude) [`ChatClient`]s for `agent-framework-rs`.
 //!
-//! Talks directly to the Anthropic Messages API (`POST /v1/messages`), the
-//! same way `agent-framework-openai` talks to Chat Completions: hand-rolled
-//! request/response JSON conversion plus a hand-rolled SSE parser, with no
-//! dependency on Anthropic's own SDK.
+//! [`AnthropicClient`] talks directly to the Anthropic Messages API
+//! (`POST /v1/messages`), the same way `agent-framework-openai` talks to Chat
+//! Completions: hand-rolled request/response JSON conversion plus a
+//! hand-rolled SSE parser, with no dependency on Anthropic's own SDK.
 //!
 //! ```no_run
 //! use agent_framework_anthropic::AnthropicClient;
@@ -21,8 +21,39 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Multi-cloud transports
+//!
+//! Claude models are also available through three managed-cloud offerings,
+//! each of which speaks the *same* Anthropic Messages API wire format
+//! [`AnthropicClient`] does — only the URL shape, model-selection mechanism,
+//! and authentication scheme differ. Each is a thin transport built on
+//! [`convert::build_cloud_request`] (the direct API's `convert::build_request`
+//! minus the top-level `model` field, plus a cloud-specific
+//! `anthropic_version` tag) rather than a reimplementation of the wire
+//! format:
+//!
+//! * [`bedrock::AnthropicBedrockClient`] — AWS Bedrock's `InvokeModel` API,
+//!   [SigV4](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)-signed
+//!   via [`agent_framework_bedrock::sigv4`] (reused, not reimplemented).
+//! * [`vertex::AnthropicVertexClient`] — Google Vertex AI's
+//!   `rawPredict`/`streamRawPredict` publisher-model routes, authenticated
+//!   via a caller-supplied [`vertex::VertexTokenProvider`] (no Google Cloud
+//!   SDK dependency in this workspace; see that module's docs).
+//! * [`foundry::AnthropicFoundryClient`] — Azure AI Foundry Anthropic
+//!   deployments, authenticated via
+//!   [`agent_framework_azure::TokenCredential`] (Microsoft Entra ID); see
+//!   that module's docs for the caveats around its non-stably-documented
+//!   route/version defaults.
 
-mod convert;
+pub mod bedrock;
+pub mod convert;
+pub mod foundry;
+pub mod vertex;
+
+pub use bedrock::AnthropicBedrockClient;
+pub use foundry::AnthropicFoundryClient;
+pub use vertex::{AnthropicVertexClient, StaticVertexToken, VertexTokenProvider};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

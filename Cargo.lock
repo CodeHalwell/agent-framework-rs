@@ -58,6 +58,8 @@ dependencies = [
 name = "agent-framework-anthropic"
 version = "0.1.0"
 dependencies = [
+ "agent-framework-azure",
+ "agent-framework-bedrock",
  "agent-framework-core",
  "async-trait",
  "bytes",

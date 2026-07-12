@@ -64,7 +64,44 @@ pub fn build_request(
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
+    fill_request_body(body, messages, options, stream)
+}
 
+/// Build an Anthropic Messages-API-shaped request body for the multi-cloud
+/// transports ([`crate::bedrock`], [`crate::vertex`], [`crate::foundry`]).
+///
+/// AWS Bedrock, Google Vertex AI, and Azure AI Foundry all select the model
+/// through the request *URL* (a path segment or deployment), not the JSON
+/// body, and all three require an explicit `anthropic_version` string in the
+/// body in place of the direct API's top-level `model` field. Everything
+/// else — system prompt extraction, message conversion, sampling options,
+/// tools/tool_choice, and `additional_properties` passthrough — is identical
+/// to [`build_request`], via the same [`fill_request_body`] helper, so the
+/// two stay in lockstep by construction rather than by convention.
+pub fn build_cloud_request(
+    messages: &[Message],
+    options: &ChatOptions,
+    max_tokens: u32,
+    stream: bool,
+    anthropic_version: &str,
+) -> Value {
+    let mut body = Map::new();
+    body.insert("anthropic_version".into(), json!(anthropic_version));
+    body.insert("max_tokens".into(), json!(max_tokens));
+    fill_request_body(body, messages, options, stream)
+}
+
+/// Fill in the fields shared by [`build_request`] and [`build_cloud_request`]
+/// onto an already-started body map (which differs only in whether it leads
+/// with `model` or `anthropic_version`): `system`, `messages`, sampling
+/// parameters, `tools`/`mcp_servers`/`tool_choice`, `additional_properties`
+/// passthrough, and the `stream` flag.
+fn fill_request_body(
+    mut body: Map<String, Value>,
+    messages: &[Message],
+    options: &ChatOptions,
+    stream: bool,
+) -> Value {
     let (system, rest) = extract_system(messages, options.instructions.as_deref());
     let system = append_response_format_instructions(system, options.response_format.as_ref());
     if let Some(system) = system {
@@ -1048,6 +1085,71 @@ mod tests {
     fn build_request_uses_given_max_tokens() {
         let body = build_request(&[user("hi")], &ChatOptions::new(), "claude-x", 2048, false);
         assert_eq!(body["max_tokens"], json!(2048));
+    }
+
+    // endregion
+
+    // region: build_cloud_request (multi-cloud transports)
+
+    #[test]
+    fn build_cloud_request_omits_model_and_sets_anthropic_version() {
+        let body = build_cloud_request(
+            &[user("hi")],
+            &ChatOptions::new(),
+            4096,
+            false,
+            "bedrock-2023-05-31",
+        );
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], json!("bedrock-2023-05-31"));
+        assert_eq!(body["max_tokens"], json!(4096));
+    }
+
+    #[test]
+    fn build_cloud_request_uses_given_anthropic_version() {
+        let body = build_cloud_request(
+            &[user("hi")],
+            &ChatOptions::new(),
+            4096,
+            false,
+            "vertex-2023-10-16",
+        );
+        assert_eq!(body["anthropic_version"], json!("vertex-2023-10-16"));
+    }
+
+    #[test]
+    fn build_cloud_request_messages_system_and_tools_match_build_request() {
+        let tool = ToolDefinition {
+            name: "get_weather".into(),
+            description: "Get the weather".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            kind: ToolKind::Function,
+            approval_mode: ApprovalMode::NeverRequire,
+            executor: None,
+        };
+        let messages = vec![Message::system("Be terse."), user("Hi")];
+        let options = ChatOptions::new()
+            .with_tool(tool)
+            .with_tool_choice(ToolMode::Required(Some("get_weather".into())));
+
+        let direct = build_request(&messages, &options, "claude-x", 4096, false);
+        let cloud = build_cloud_request(&messages, &options, 4096, false, "bedrock-2023-05-31");
+
+        assert_eq!(cloud["messages"], direct["messages"]);
+        assert_eq!(cloud["system"], direct["system"]);
+        assert_eq!(cloud["tools"], direct["tools"]);
+        assert_eq!(cloud["tool_choice"], direct["tool_choice"]);
+    }
+
+    #[test]
+    fn build_cloud_request_stream_flag_and_additional_properties() {
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("top_k".into(), json!(5));
+        let body = build_cloud_request(&[user("hi")], &options, 4096, true, "foundry-2025-01-01");
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["top_k"], json!(5));
     }
 
     // endregion
