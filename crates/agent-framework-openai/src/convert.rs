@@ -269,20 +269,27 @@ pub fn apply_options(body: &mut Map<String, Value>, options: &ChatOptions) {
     }
     // A hosted web-search tool is expressed as the top-level
     // `web_search_options` request field rather than an entry in `tools`
-    // (`_chat_client._process_web_search_tool`).
-    if let Some(tool) = options
-        .tools
-        .iter()
-        .find(|t| t.kind == ToolKind::HostedWebSearch)
-    {
-        let mut ws = Map::new();
-        if let Some(loc) = tool.parameters.get("user_location") {
-            ws.insert(
-                "user_location".into(),
-                json!({ "type": "approximate", "approximate": loc }),
-            );
+    // (`_chat_client._process_web_search_tool`). An explicit
+    // `ToolMode::None` disables it like every other tool — that field is
+    // what *enables* hosted browsing on Chat Completions, and upstream
+    // clears the tool list before conversion in that mode
+    // (`_clients._prepare_tool_choice`), so nothing would be emitted there
+    // either.
+    if options.tool_choice != Some(ToolMode::None) {
+        if let Some(tool) = options
+            .tools
+            .iter()
+            .find(|t| t.kind == ToolKind::HostedWebSearch)
+        {
+            let mut ws = Map::new();
+            if let Some(loc) = tool.parameters.get("user_location") {
+                ws.insert(
+                    "user_location".into(),
+                    json!({ "type": "approximate", "approximate": loc }),
+                );
+            }
+            body.insert("web_search_options".into(), Value::Object(ws));
         }
-        body.insert("web_search_options".into(), Value::Object(ws));
     }
     for (k, v) in &options.additional_properties {
         body.entry(k.clone()).or_insert_with(|| v.clone());
@@ -633,6 +640,17 @@ mod tests {
         let mut body = Map::new();
         apply_options(&mut body, &options);
         assert_eq!(body["web_search_options"], json!({}));
+    }
+
+    #[test]
+    fn web_search_options_suppressed_when_tool_choice_is_none() {
+        // `web_search_options` is what ENABLES hosted browsing on Chat
+        // Completions — an explicit "no tools" run must not emit it.
+        let mut options = ChatOptions::new().with_tool_choice(ToolMode::None);
+        options.tools = vec![hosted_web_search()];
+        let mut body = Map::new();
+        apply_options(&mut body, &options);
+        assert!(body.get("web_search_options").is_none());
     }
 
     // endregion

@@ -324,9 +324,13 @@ fn stream_event_to_updates(
             if m.context_id.is_some() {
                 state.context_id = m.context_id.clone();
             }
-            if m.task_id.is_some() {
-                state.task_id = m.task_id.clone();
-            }
+            // Replace unconditionally, exactly like the non-streaming
+            // `SendMessageResult::Message` mapping: a standalone message
+            // with no task id means there is no active task, and keeping a
+            // previous (completed) task's id would make the next outgoing
+            // message continue the wrong task. (`context_id` above keeps the
+            // old value when absent — also matching run().)
+            state.task_id = m.task_id.clone();
             (
                 wrap_message(a2a_message_to_chat_message(m), name),
                 Some(m.message_id.clone()),
@@ -1074,6 +1078,34 @@ mod tests {
         // Continuity tracked from the event.
         assert_eq!(state.context_id.as_deref(), Some("c1"));
         assert_eq!(state.task_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn stream_event_bare_message_clears_a_stale_task_id() {
+        // Matches run()'s SendMessageResult::Message mapping: a standalone
+        // message without a task id means no active task — a previous
+        // (completed) task's id must not leak into the next outgoing message.
+        let mut state = ThreadState {
+            context_id: Some("c1".into()),
+            task_id: Some("finished-task".into()),
+        };
+        let ev = MessageStreamEvent::Message(A2AMessage {
+            kind: "message".into(),
+            role: MessageRole::Agent,
+            parts: vec![Part::Text(TextPart {
+                text: "standalone".into(),
+                metadata: None,
+            })],
+            message_id: "m2".into(),
+            task_id: None,
+            context_id: None,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        assert_eq!(updates.len(), 1);
+        assert!(state.task_id.is_none());
+        // Context continuity keeps the previous id when absent (run() parity).
+        assert_eq!(state.context_id.as_deref(), Some("c1"));
     }
 
     #[test]
