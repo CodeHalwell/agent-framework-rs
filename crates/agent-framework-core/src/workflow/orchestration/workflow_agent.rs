@@ -28,7 +28,7 @@ use crate::error::Result;
 use crate::threads::AgentThread;
 use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, FunctionApprovalRequestContent,
+    AgentResponse, AgentResponseUpdate, ChatMessage, Content, FunctionApprovalRequestContent,
     FunctionArguments, FunctionCallContent, Role,
 };
 use crate::workflow::{Workflow, WorkflowEvent};
@@ -81,7 +81,7 @@ impl WorkflowAgent {
         self.description.as_deref()
     }
 
-    /// Stream the workflow's agent activity as [`AgentRunResponseUpdate`]s
+    /// Stream the workflow's agent activity as [`AgentResponseUpdate`]s
     /// (without thread write-back).
     ///
     /// Maps the engine's `run_stream` events: each
@@ -205,13 +205,13 @@ fn request_message(request_id: &str, data: &Value, name: Option<&str>) -> ChatMe
 }
 
 /// Convert a live workflow event into an agent update (used by `run_stream`).
-fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRunResponseUpdate> {
+fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentResponseUpdate> {
     match event {
         WorkflowEvent::AgentRunUpdate { update, .. } => {
-            // The orchestration layer emits a serialized `AgentRunResponseUpdate`
+            // The orchestration layer emits a serialized `AgentResponseUpdate`
             // per streamed update (see `run_agent_and_emit`); forward it,
             // attributing the workflow-agent's name when the update carries none.
-            let mut u: AgentRunResponseUpdate = serde_json::from_value(update.clone()).ok()?;
+            let mut u: AgentResponseUpdate = serde_json::from_value(update.clone()).ok()?;
             if u.author_name.is_none() {
                 u.author_name = name.map(str::to_string);
             }
@@ -223,7 +223,7 @@ fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRunRe
             ..
         } => {
             let msg = request_message(request_id, request_data, name);
-            Some(AgentRunResponseUpdate {
+            Some(AgentResponseUpdate {
                 contents: msg.contents,
                 role: Some(msg.role),
                 author_name: msg.author_name,
@@ -243,10 +243,10 @@ fn forward_and_persist(
     inner: AgentRunStream,
     thread: AgentThread,
     input: Vec<ChatMessage>,
-) -> impl futures::Stream<Item = Result<AgentRunResponseUpdate>> + Send {
+) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
     let finish: Option<(AgentThread, Vec<ChatMessage>)> = Some((thread, input));
     futures::stream::unfold(
-        (inner, Vec::<AgentRunResponseUpdate>::new(), false, finish),
+        (inner, Vec::<AgentResponseUpdate>::new(), false, finish),
         move |(mut inner, mut collected, done, mut finish)| async move {
             if done {
                 return None;
@@ -259,7 +259,7 @@ fn forward_and_persist(
                 Some(Err(e)) => Some((Err(e), (inner, collected, true, finish))),
                 None => {
                     if let Some((mut thread, input)) = finish.take() {
-                        let response = AgentRunResponse::from_updates(collected.clone());
+                        let response = AgentResponse::from_updates(collected.clone());
                         if let Err(e) = thread.on_new_messages(input.clone()).await {
                             return Some((Err(e), (inner, collected, true, None)));
                         }
@@ -280,7 +280,7 @@ impl Agent for WorkflowAgent {
         &self,
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let mut owned_thread;
         let thread: &mut AgentThread = match thread {
             Some(t) => t,
@@ -314,7 +314,7 @@ impl Agent for WorkflowAgent {
         thread.on_new_messages(messages.clone()).await?;
         thread.on_new_messages(response_messages.clone()).await?;
 
-        Ok(AgentRunResponse {
+        Ok(AgentResponse {
             messages: response_messages,
             ..Default::default()
         })

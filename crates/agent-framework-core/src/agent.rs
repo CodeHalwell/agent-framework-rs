@@ -17,12 +17,12 @@ use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal}
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
 use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
 use crate::types::{
-    prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
-    ChatResponse, IntoMessages, ResponseFormat,
+    prepare_messages, AgentResponse, AgentResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
+    IntoMessages, ResponseFormat,
 };
 
 /// A boxed stream of agent run updates.
-pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentRunResponseUpdate>> + Send>>;
+pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentResponseUpdate>> + Send>>;
 
 /// Per-run option overrides for a single [`Agent::run_with_options`] /
 /// [`Agent::run_stream`] call, merged over the agent's build-time defaults.
@@ -80,19 +80,17 @@ impl AgentRunOptions {
 
 /// Map a completed run into buffered agent updates — one update per message,
 /// each with a distinct `message_id` so that re-aggregation via
-/// [`AgentRunResponse::from_updates`] keeps the message boundaries. Shared by
+/// [`AgentResponse::from_updates`] keeps the message boundaries. Shared by
 /// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path
 /// replay.
 ///
 /// Response-level metadata survives the replay: `response_id` and
 /// `conversation_id` ride on every update, and `usage_details` rides the
 /// final update as a [`Content::Usage`] item (aggregation folds it back into
-/// [`AgentRunResponse::usage_details`], never into message contents) — the
+/// [`AgentResponse::usage_details`], never into message contents) — the
 /// same contract as the tool-loop replay in `FunctionInvokingChatClient`.
-pub(crate) fn response_to_updates(
-    response: AgentRunResponse,
-) -> Vec<Result<AgentRunResponseUpdate>> {
-    let AgentRunResponse {
+pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentResponseUpdate>> {
+    let AgentResponse {
         messages,
         response_id,
         conversation_id,
@@ -103,7 +101,7 @@ pub(crate) fn response_to_updates(
     // Keep provider message ids only when all present and distinct; otherwise
     // positional ids for every message. A service (e.g. Assistants) can reuse
     // one run id across the tool-call and final assistant messages, and
-    // `AgentRunResponse::from_updates` keys by id — a duplicate would merge
+    // `AgentResponse::from_updates` keys by id — a duplicate would merge
     // the final answer into the tool-call message, so streamed and
     // non-streamed responses would differ.
     let keep_provider_ids = {
@@ -114,7 +112,7 @@ pub(crate) fn response_to_updates(
                 .is_some_and(|id| !id.is_empty() && seen.insert(id.as_str()))
         })
     };
-    let mut updates: Vec<Result<AgentRunResponseUpdate>> = messages
+    let mut updates: Vec<Result<AgentResponseUpdate>> = messages
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
@@ -131,7 +129,7 @@ pub(crate) fn response_to_updates(
                     }));
                 }
             }
-            Ok(AgentRunResponseUpdate {
+            Ok(AgentResponseUpdate {
                 contents,
                 role: Some(m.role),
                 author_name: m.author_name,
@@ -150,7 +148,7 @@ pub(crate) fn response_to_updates(
                 })]
             })
             .unwrap_or_default();
-        updates.push(Ok(AgentRunResponseUpdate {
+        updates.push(Ok(AgentResponseUpdate {
             contents,
             role: Some(crate::types::Role::assistant()),
             response_id,
@@ -220,7 +218,7 @@ pub trait Agent: Send + Sync {
         &self,
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse>;
+    ) -> Result<AgentResponse>;
 
     /// Run the agent to completion, applying per-run [`AgentRunOptions`] over
     /// the agent's build-time defaults.
@@ -235,7 +233,7 @@ pub trait Agent: Send + Sync {
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
         options: AgentRunOptions,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         if !options.is_empty() {
             tracing::warn!(
                 agent = %self.id(),
@@ -245,7 +243,7 @@ pub trait Agent: Send + Sync {
         self.run(messages, thread).await
     }
 
-    /// Run the agent and stream incremental [`AgentRunResponseUpdate`]s.
+    /// Run the agent and stream incremental [`AgentResponseUpdate`]s.
     ///
     /// The default implementation is a **buffered fallback**: it runs to
     /// completion via [`Agent::run_with_options`] and yields the response's
@@ -392,7 +390,7 @@ impl ChatAgent {
     }
 
     /// Ergonomic run without an explicit thread.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
 
@@ -576,7 +574,7 @@ impl ChatAgent {
         final_messages: Vec<ChatMessage>,
         options: ChatOptions,
         is_streaming: bool,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let span = crate::observability::agent_span(
             self.name.as_deref().unwrap_or(self.id.as_str()),
             &self.id,
@@ -612,7 +610,7 @@ impl ChatAgent {
         final_messages: Vec<ChatMessage>,
         options: ChatOptions,
         is_streaming: bool,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let client = self.client.clone();
         let chat_middleware = self.chat_middleware.clone();
         let terminal: Terminal<AgentContext> = Box::new(move |mut ctx: AgentContext| {
@@ -631,7 +629,7 @@ impl ChatAgent {
                     ctx.is_streaming,
                 )
                 .await?;
-                ctx.result = Some(AgentRunResponse::from_chat_response(response));
+                ctx.result = Some(AgentResponse::from_chat_response(response));
                 Ok(ctx)
             }) as crate::tools::BoxFuture<Result<AgentContext>>
         });
@@ -799,7 +797,7 @@ fn async_stream_forward(
     input: Vec<ChatMessage>,
     provider: Option<Arc<AggregateContextProvider>>,
     response_format: Option<ResponseFormat>,
-) -> impl Stream<Item = Result<AgentRunResponseUpdate>> + Send {
+) -> impl Stream<Item = Result<AgentResponseUpdate>> + Send {
     let finish: ForwardFinish = Some((thread, input, provider, response_format));
     futures::stream::unfold(
         (
@@ -817,7 +815,7 @@ fn async_stream_forward(
                 match inner.next().await {
                     Some(Ok(update)) => {
                         collected.push(update.clone());
-                        let mut au = AgentRunResponseUpdate::from_chat_update(&update);
+                        let mut au = AgentResponseUpdate::from_chat_update(&update);
                         if au.author_name.is_none() {
                             au.author_name = agent_name.clone();
                         }
@@ -900,7 +898,7 @@ impl Agent for ChatAgent {
         &self,
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         self.run_with_options(messages, thread, AgentRunOptions::default())
             .await
     }
@@ -910,7 +908,7 @@ impl Agent for ChatAgent {
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
         options: AgentRunOptions,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let mut owned_thread;
         let thread: &mut AgentThread = match thread {
             Some(t) => t,

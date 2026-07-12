@@ -16,7 +16,7 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentRunResponse, ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
+    AgentResponse, ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
     FunctionArguments, FunctionCallContent, FunctionResultContent, Role,
 };
 use agent_framework_hosting::agui::AgUiRouter;
@@ -118,13 +118,13 @@ impl Agent for FrontendToolAgent {
         &self,
         _messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_1",
             "get_weather",
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
-        Ok(AgentRunResponse {
+        Ok(AgentResponse {
             messages: vec![ChatMessage::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call)],
@@ -186,14 +186,14 @@ impl Agent for ExecutedToolAgent {
         &self,
         _messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_9",
             "lookup",
             Some(FunctionArguments::Raw(r#"{"q":"x"}"#.to_string())),
         );
         let result = FunctionResultContent::new("call_9", Some(json!({ "answer": 42 })));
-        Ok(AgentRunResponse {
+        Ok(AgentResponse {
             messages: vec![ChatMessage::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call), Content::FunctionResult(result)],
@@ -251,7 +251,7 @@ impl Agent for FailingAgent {
         &self,
         _messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         Err(Error::AgentExecution("kaboom".to_string()))
     }
     fn id(&self) -> &str {
@@ -299,7 +299,7 @@ impl Agent for InspectAgent {
         &self,
         messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let mut parts: Vec<String> = Vec::new();
         for m in &messages {
             for c in &m.contents {
@@ -317,7 +317,7 @@ impl Agent for InspectAgent {
                 }
             }
         }
-        Ok(AgentRunResponse {
+        Ok(AgentResponse {
             messages: vec![ChatMessage::assistant(parts.join("|"))],
             ..Default::default()
         })

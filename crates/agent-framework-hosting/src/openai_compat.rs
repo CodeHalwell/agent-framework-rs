@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use agent_framework_core::agent::Agent;
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, Role, UsageDetails};
+use agent_framework_core::types::{AgentResponse, ChatMessage, Role, UsageDetails};
 
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_response_stream;
@@ -168,7 +168,7 @@ async fn chat_completions(
 
 /// Build the non-streaming `chat.completion` response object.
 fn completion_object(
-    resp: &AgentRunResponse,
+    resp: &AgentResponse,
     id: &str,
     created: u64,
     model: &str,

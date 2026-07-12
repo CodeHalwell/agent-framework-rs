@@ -281,7 +281,7 @@ IMPORTANT: Choose only from these exact participant names (case-sensitive).\n\n{
     /// Parse the manager agent's response into a [`ManagerSelectionResponse`],
     /// mirroring Python's `_parse_manager_selection`: prefer the structured
     /// `value`, then fall back to parsing the message text as JSON.
-    fn parse(response: &crate::types::AgentRunResponse) -> Result<ManagerSelectionResponse> {
+    fn parse(response: &crate::types::AgentResponse) -> Result<ManagerSelectionResponse> {
         if let Some(value) = &response.value {
             if let Ok(sel) = serde_json::from_value::<ManagerSelectionResponse>(value.clone()) {
                 return Ok(sel);

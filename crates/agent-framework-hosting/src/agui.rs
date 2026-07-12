@@ -45,14 +45,14 @@
 //!
 //! # Divergences from the Python reference
 //! - **Live streaming.** The object-safe [`Agent`] trait exposes `run_stream`,
-//!   so this router drives it and frames each [`AgentRunResponseUpdate`] into
+//!   so this router drives it and frames each [`AgentResponseUpdate`] into
 //!   AG-UI events as it arrives — one `TEXT_MESSAGE_CONTENT` per text delta,
 //!   `TOOL_CALL_*` per call fragment. `type` ordering and payloads match the
 //!   bridge. (Agents whose `run_stream` falls back to the buffered default —
 //!   e.g. a plain `Arc<dyn Agent>` that only implements `run` — still emit one
 //!   `TEXT_MESSAGE_CONTENT` per message, as before.)
 //!
-//!   [`AgentRunResponseUpdate`]: agent_framework_core::types::AgentRunResponseUpdate
+//!   [`AgentResponseUpdate`]: agent_framework_core::types::AgentResponseUpdate
 //! - **Client `tools` are injected as declaration-only tools.** Client-declared
 //!   `tools` in the `RunAgentInput` are mapped to declaration-only
 //!   [`ToolDefinition`](agent_framework_core::tools::ToolDefinition)s (no

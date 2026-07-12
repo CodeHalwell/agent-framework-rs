@@ -39,7 +39,7 @@ use super::events::WorkflowEvent;
 use super::executor::Executor;
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::{AgentRunResponse, AgentRunResponseUpdate, ChatMessage};
+use crate::types::{AgentResponse, AgentResponseUpdate, ChatMessage};
 
 mod concurrent;
 mod group_chat;
@@ -101,23 +101,23 @@ pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage
 
 /// Run an agent over a conversation and surface its activity on the event
 /// stream incrementally: an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate)
-/// per streamed [`AgentRunResponseUpdate`] as it arrives, then a final
+/// per streamed [`AgentResponseUpdate`] as it arrives, then a final
 /// aggregated [`AgentRun`](WorkflowEvent::AgentRun). Returns the response with
 /// every message attributed to `author`.
 ///
 /// Mirrors upstream `AgentExecutor`'s streaming (`_agent_executor.py:268-360`),
 /// which drives the agent via `run_stream` and emits an `AgentRunUpdateEvent`
 /// per update before the terminal `AgentRunEvent`. The updates are aggregated
-/// back into an [`AgentRunResponse`] via [`AgentRunResponse::from_updates`].
+/// back into an [`AgentResponse`] via [`AgentResponse::from_updates`].
 pub(crate) async fn run_agent_and_emit(
     agent: &Arc<dyn Agent>,
     conversation: Vec<ChatMessage>,
     executor_id: &str,
     author: &str,
     ctx: &WorkflowContext,
-) -> Result<AgentRunResponse> {
+) -> Result<AgentResponse> {
     let mut stream = agent.run_stream(conversation, None, None).await?;
-    let mut updates: Vec<AgentRunResponseUpdate> = Vec::new();
+    let mut updates: Vec<AgentResponseUpdate> = Vec::new();
     while let Some(item) = stream.next().await {
         let mut update = item?;
         if update.author_name.is_none() {
@@ -132,7 +132,7 @@ pub(crate) async fn run_agent_and_emit(
         updates.push(update);
     }
 
-    let mut response = AgentRunResponse::from_updates(updates);
+    let mut response = AgentResponse::from_updates(updates);
     for msg in &mut response.messages {
         if msg.author_name.is_none() {
             msg.author_name = Some(author.to_string());

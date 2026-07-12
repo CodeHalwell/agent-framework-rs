@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use agent_framework_core::middleware::{AgentContext, MiddlewarePipeline, Terminal};
 use agent_framework_core::tools::BoxFuture;
-use agent_framework_core::types::{AgentRunResponse, ChatMessage};
+use agent_framework_core::types::{AgentResponse, ChatMessage};
 use agent_framework_purview::{
     PurviewAgentMiddleware, PurviewAppLocation, PurviewLocationType, PurviewSettings,
     StaticTokenProvider,
@@ -171,7 +171,7 @@ fn terminal_returning(called: Arc<AtomicBool>, text: &'static str) -> Terminal<A
     Box::new(move |mut ctx: AgentContext| {
         called.store(true, Ordering::SeqCst);
         Box::pin(async move {
-            ctx.result = Some(AgentRunResponse {
+            ctx.result = Some(AgentResponse {
                 messages: vec![ChatMessage::assistant(text)],
                 ..Default::default()
             });

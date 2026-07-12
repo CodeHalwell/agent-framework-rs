@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use agent_framework_core::agent::Agent;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, IntoMessages, Role};
+use agent_framework_core::types::{AgentResponse, ChatMessage, IntoMessages, Role};
 
 use crate::activity::{
     build_message_activity_body, build_start_conversation_body, parse_activities, WireActivity,
@@ -94,7 +94,7 @@ impl CopilotStudioAgent {
     /// `ChatAgent::run_once`): the conversation starts fresh every call,
     /// since no [`AgentThread`] is carried across calls to persist the
     /// Direct-to-Engine conversation id.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
 
@@ -159,7 +159,7 @@ impl Agent for CopilotStudioAgent {
         &self,
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         // Mirrors agent-framework-a2a's A2AAgent: only the newest message is
         // sent — with real conversation-id continuity (see below and the
         // crate docs), the server already has everything earlier. Python's
@@ -223,7 +223,7 @@ impl Agent for CopilotStudioAgent {
 
         let response_id = response_messages.first().and_then(|m| m.message_id.clone());
 
-        let mut response = AgentRunResponse {
+        let mut response = AgentResponse {
             messages: response_messages,
             response_id,
             ..Default::default()

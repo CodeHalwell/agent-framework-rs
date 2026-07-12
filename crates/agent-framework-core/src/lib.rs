@@ -71,7 +71,7 @@ pub mod prelude {
         ToolSource,
     };
     pub use crate::types::{
-        AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
+        AgentResponse, AgentResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
         ChatResponseUpdate, Content, FinishReason, FunctionApprovalRequestContent,
         FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent,
         ResponseFormat, Role, TextContent, ToolMode, UsageDetails,

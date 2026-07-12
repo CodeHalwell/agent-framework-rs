@@ -443,7 +443,7 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
         updates.push(u.unwrap());
     }
     // Re-aggregate exactly as a downstream consumer would.
-    let aggregated = AgentRunResponse::from_updates(updates);
+    let aggregated = AgentResponse::from_updates(updates);
     // The final answer must appear as its own assistant message, not merged
     // into the earlier tool-call message.
     let final_msg = aggregated.messages.last().unwrap();
@@ -498,7 +498,7 @@ async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id
     while let Some(u) = stream.next().await {
         updates.push(u.unwrap());
     }
-    let aggregated = AgentRunResponse::from_updates(updates);
+    let aggregated = AgentResponse::from_updates(updates);
     assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-9"));
     let usage = aggregated
         .usage_details
@@ -585,7 +585,7 @@ async fn middleware_stream_replay_preserves_conversation_id_and_usage() {
     while let Some(u) = stream.next().await {
         updates.push(u.unwrap());
     }
-    let aggregated = AgentRunResponse::from_updates(updates);
+    let aggregated = AgentResponse::from_updates(updates);
     assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-7"));
     assert_eq!(
         aggregated
@@ -688,7 +688,7 @@ async fn duplicate_provider_message_ids_do_not_merge_on_replay() {
     while let Some(u) = stream.next().await {
         updates.push(u.unwrap());
     }
-    let aggregated = AgentRunResponse::from_updates(updates);
+    let aggregated = AgentResponse::from_updates(updates);
     // Final answer stays its own message, after the tool result — not merged
     // into the tool-call message.
     let last = aggregated.messages.last().unwrap();
@@ -751,7 +751,7 @@ async fn provider_resolved_tool_calls_are_not_executed_locally() {
 
 #[tokio::test]
 async fn chat_level_tool_stream_replay_carries_finish_reason() {
-    // AgentRunResponse has no finish_reason (matching upstream), so the
+    // AgentResponse has no finish_reason (matching upstream), so the
     // finish-reason half of the replay metadata is asserted at the
     // chat-client level, where ChatResponse::from_updates surfaces it.
     let call =
@@ -870,9 +870,9 @@ fn parse_json_reads_structured_value() {
         }
     );
 
-    // The same convenience exists on AgentRunResponse.
+    // The same convenience exists on AgentResponse.
     let agent_resp =
-        AgentRunResponse::from_chat_response(ChatResponse::from_text(r#"{"name":"Bob","age":5}"#));
+        AgentResponse::from_chat_response(ChatResponse::from_text(r#"{"name":"Bob","age":5}"#));
     let person2: Person = agent_resp.parse_json().unwrap();
     assert_eq!(person2.name, "Bob");
 
@@ -937,18 +937,18 @@ fn tool_mode_serde_round_trip() {
 #[test]
 fn agent_update_aggregation() {
     let updates = vec![
-        AgentRunResponseUpdate {
+        AgentResponseUpdate {
             contents: vec![Content::text("Hello")],
             role: Some(Role::assistant()),
             ..Default::default()
         },
-        AgentRunResponseUpdate {
+        AgentResponseUpdate {
             contents: vec![Content::text(" world")],
             role: Some(Role::assistant()),
             ..Default::default()
         },
     ];
-    let resp = AgentRunResponse::from_agent_run_response_updates(updates);
+    let resp = AgentResponse::from_agent_run_response_updates(updates);
     assert_eq!(resp.text(), "Hello world");
 }
 
@@ -1948,9 +1948,9 @@ async fn trait_default_run_stream_buffers_for_minimal_agent() {
             &self,
             messages: Vec<ChatMessage>,
             _thread: Option<&mut AgentThread>,
-        ) -> Result<AgentRunResponse> {
+        ) -> Result<AgentResponse> {
             let text = messages.last().map(ChatMessage::text).unwrap_or_default();
-            Ok(AgentRunResponse {
+            Ok(AgentResponse {
                 messages: vec![ChatMessage::assistant(format!("echo: {text}"))],
                 ..Default::default()
             })

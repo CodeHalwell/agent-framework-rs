@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::tools::BoxFuture;
-use crate::types::{AgentRunResponse, ChatMessage, ChatOptions, ChatResponse};
+use crate::types::{AgentResponse, ChatMessage, ChatOptions, ChatResponse};
 
 /// The terminal handler invoked at the end of a middleware chain.
 pub type Terminal<C> = Box<dyn FnOnce(C) -> BoxFuture<Result<C>> + Send>;
@@ -98,7 +98,7 @@ pub struct AgentContext {
     pub is_streaming: bool,
     pub metadata: HashMap<String, serde_json::Value>,
     /// The run result; populated by the terminal handler or overridden here.
-    pub result: Option<AgentRunResponse>,
+    pub result: Option<AgentResponse>,
     /// If set to true, the pipeline stops without running further middleware.
     pub terminate: bool,
 }

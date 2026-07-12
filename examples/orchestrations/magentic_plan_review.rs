@@ -85,8 +85,8 @@ fn placeholder_participant() -> Arc<dyn Agent> {
             &self,
             _messages: Vec<ChatMessage>,
             _thread: Option<&mut AgentThread>,
-        ) -> Result<AgentRunResponse> {
-            Ok(AgentRunResponse::default())
+        ) -> Result<AgentResponse> {
+            Ok(AgentResponse::default())
         }
         fn id(&self) -> &str {
             "writer"

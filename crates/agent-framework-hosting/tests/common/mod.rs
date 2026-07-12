@@ -16,13 +16,13 @@ use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::Result;
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, ChatMessage, Content, Role, UsageDetails,
 };
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
 
 /// A scripted agent that streams multiple text deltas, to exercise the live SSE
 /// paths: `run` returns the concatenation as one message; `run_stream` yields
-/// one [`AgentRunResponseUpdate`] per delta (real incremental streaming).
+/// one [`AgentResponseUpdate`] per delta (real incremental streaming).
 pub struct StreamingAgent {
     id: String,
     deltas: Vec<String>,
@@ -47,8 +47,8 @@ impl Agent for StreamingAgent {
         &self,
         _messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
-        Ok(AgentRunResponse {
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
             messages: vec![ChatMessage::assistant(self.deltas.concat())],
             ..Default::default()
         })
@@ -60,11 +60,11 @@ impl Agent for StreamingAgent {
         _thread: Option<AgentThread>,
         _options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        let updates: Vec<Result<AgentRunResponseUpdate>> = self
+        let updates: Vec<Result<AgentResponseUpdate>> = self
             .deltas
             .iter()
             .map(|d| {
-                Ok(AgentRunResponseUpdate {
+                Ok(AgentResponseUpdate {
                     contents: vec![Content::text(d)],
                     role: Some(Role::assistant()),
                     ..Default::default()
@@ -129,14 +129,14 @@ impl Agent for MockAgent {
         &self,
         messages: Vec<ChatMessage>,
         _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let input = messages
             .iter()
             .map(ChatMessage::text)
             .collect::<Vec<_>>()
             .join(" ");
         let reply = format!("{}{}", self.prefix, input.trim());
-        Ok(AgentRunResponse {
+        Ok(AgentResponse {
             messages: vec![ChatMessage::assistant(reply)],
             usage_details: self.usage.clone(),
             ..Default::default()

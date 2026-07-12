@@ -79,7 +79,7 @@ use serde_json::Value;
 use super::{ensure_author, parse_conversation, run_agent_and_emit};
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::{AgentRunResponse, ChatMessage, Role};
+use crate::types::{AgentResponse, ChatMessage, Role};
 use crate::workflow::{
     Executor, RequestResponse, Workflow, WorkflowBuilder, WorkflowContext, WorkflowEvent,
 };
@@ -1282,7 +1282,7 @@ impl Executor for MagenticOrchestrator {
     }
 }
 
-fn last_message(response: &AgentRunResponse) -> Option<ChatMessage> {
+fn last_message(response: &AgentResponse) -> Option<ChatMessage> {
     response.messages.last().cloned()
 }
 

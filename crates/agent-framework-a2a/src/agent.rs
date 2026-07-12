@@ -13,8 +13,8 @@ use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, DataContent, IntoMessages,
-    Role, UriContent,
+    AgentResponse, AgentResponseUpdate, ChatMessage, Content, DataContent, IntoMessages, Role,
+    UriContent,
 };
 
 use crate::client::{A2AClient, A2AEventStream};
@@ -28,7 +28,7 @@ use crate::types::{
 ///
 /// Wraps an [`A2AClient`] so a remote, A2A-compliant agent can be used
 /// anywhere the framework expects a local [`Agent`]: [`ChatMessage`]s in,
-/// [`AgentRunResponse`] out, with `contextId`/`taskId` continuity tracked per
+/// [`AgentResponse`] out, with `contextId`/`taskId` continuity tracked per
 /// [`AgentThread`]. See the crate docs for the exact mapping and how this
 /// diverges from the Python reference implementation.
 #[derive(Debug, Clone)]
@@ -93,7 +93,7 @@ impl A2AAgent {
     /// `ChatAgent::run_once`): the conversation starts fresh every call,
     /// since no [`AgentThread`] is carried across calls to persist
     /// `contextId`/`taskId`.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
 
@@ -160,7 +160,7 @@ impl Agent for A2AAgent {
         &self,
         messages: Vec<ChatMessage>,
         thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         // Mirrors the Python reference: only the newest message is sent —
         // earlier turns are already known to the remote agent via its
         // `contextId`/`taskId`, which this port tracks below.
@@ -223,7 +223,7 @@ impl Agent for A2AAgent {
             let _ = thread.set_service_thread_id(encoded);
         }
 
-        let mut response = AgentRunResponse {
+        let mut response = AgentResponse {
             messages: out_messages,
             response_id: Some(response_id),
             ..Default::default()
@@ -240,7 +240,7 @@ impl Agent for A2AAgent {
 
     /// Real streaming override: sends the newest message via the client's
     /// `message/stream` SSE endpoint and maps each
-    /// [`MessageStreamEvent`] to an [`AgentRunResponseUpdate`] as it arrives,
+    /// [`MessageStreamEvent`] to an [`AgentResponseUpdate`] as it arrives,
     /// accumulating `contextId`/`taskId` and writing the resulting
     /// continuity state back onto the (owned) thread once the stream ends —
     /// mirroring [`Agent::run`]'s bookkeeping on this type. Per-run
@@ -313,11 +313,11 @@ fn stream_event_to_updates(
     event: &MessageStreamEvent,
     state: &mut ThreadState,
     name: Option<&str>,
-) -> Vec<Result<AgentRunResponseUpdate>> {
+) -> Vec<Result<AgentResponseUpdate>> {
     // `response_id` follows the same rule as the non-streaming `run()`
     // (`SendMessageResult` mapping above): a bare message exposes its
     // message id, task-bearing events expose the task id — so aggregating
-    // the stream yields the same `AgentRunResponse.response_id` and
+    // the stream yields the same `AgentResponse.response_id` and
     // streaming clients can cancel/poll the A2A task.
     let (updates, response_id) = match event {
         MessageStreamEvent::Message(m) => {
@@ -366,7 +366,7 @@ fn stream_event_to_updates(
             )
         }
     };
-    let mut updates: Vec<Result<AgentRunResponseUpdate>> = updates
+    let mut updates: Vec<Result<AgentResponseUpdate>> = updates
         .into_iter()
         .map(|u| {
             u.map(|mut update| {
@@ -390,7 +390,7 @@ fn stream_event_to_updates(
     );
     if updates.is_empty() && is_task_bearing {
         if let Some(id) = response_id {
-            updates.push(Ok(AgentRunResponseUpdate {
+            updates.push(Ok(AgentResponseUpdate {
                 response_id: Some(id),
                 ..Default::default()
             }));
@@ -402,15 +402,15 @@ fn stream_event_to_updates(
 fn wrap_message(
     result: Result<ChatMessage>,
     name: Option<&str>,
-) -> Vec<Result<AgentRunResponseUpdate>> {
+) -> Vec<Result<AgentResponseUpdate>> {
     match result {
         Ok(cm) => vec![Ok(message_to_update(cm, name))],
         Err(e) => vec![Err(e)],
     }
 }
 
-fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentRunResponseUpdate {
-    AgentRunResponseUpdate {
+fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentResponseUpdate {
+    AgentResponseUpdate {
         contents: cm.contents,
         role: Some(cm.role),
         author_name: cm.author_name.or_else(|| name.map(str::to_string)),
@@ -422,7 +422,7 @@ fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentRunResponseUpd
 /// State carried while forwarding an A2A event stream as agent updates.
 struct A2AForward {
     inner: A2AEventStream,
-    queue: VecDeque<Result<AgentRunResponseUpdate>>,
+    queue: VecDeque<Result<AgentResponseUpdate>>,
     state: ThreadState,
     thread: Option<AgentThread>,
     name: Option<String>,
@@ -437,7 +437,7 @@ fn a2a_forward_stream(
     thread: AgentThread,
     state: ThreadState,
     name: Option<String>,
-) -> impl futures::Stream<Item = Result<AgentRunResponseUpdate>> + Send {
+) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
     futures::stream::unfold(
         A2AForward {
             inner,

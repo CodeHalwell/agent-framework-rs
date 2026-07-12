@@ -37,7 +37,7 @@ impl Middleware<AgentContext> for LoggingMiddleware {
         let ctx = next.run(ctx).await?;
         println!(
             "  [logging] <- run finished: {:?}",
-            ctx.result.as_ref().map(AgentRunResponse::text)
+            ctx.result.as_ref().map(AgentResponse::text)
         );
         Ok(ctx)
     }
@@ -69,7 +69,7 @@ impl Middleware<AgentContext> for BlockedWordsMiddleware {
 
         if let Some(word) = hit {
             println!("  [blocked-words] refusing request containing '{word}' -- model not called");
-            ctx.result = Some(AgentRunResponse {
+            ctx.result = Some(AgentResponse {
                 messages: vec![ChatMessage::assistant(format!(
                     "Sorry, I can't help with requests containing '{word}'."
                 ))],

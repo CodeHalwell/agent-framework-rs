@@ -49,7 +49,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, ChatMessage, Role, UsageDetails,
 };
 use agent_framework_core::workflow::WorkflowEvent;
 
@@ -245,7 +245,7 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
 }
 
 /// Build the aggregated (non-streaming) response for an agent run.
-fn agent_response_object(resp: &AgentRunResponse, model: &str, input_len: usize) -> ResponseObject {
+fn agent_response_object(resp: &AgentResponse, model: &str, input_len: usize) -> ResponseObject {
     let text = resp.text();
     let mid = util::msg_id();
     let usage = build_usage(&resp.usage_details, input_len, text.len());
@@ -267,7 +267,7 @@ fn agent_response_object(resp: &AgentRunResponse, model: &str, input_len: usize)
 }
 
 /// Incremental OpenAI-Responses SSE framing for a streamed agent run, driven
-/// one [`AgentRunResponseUpdate`] at a time. Emits the fixed preamble, one
+/// one [`AgentResponseUpdate`] at a time. Emits the fixed preamble, one
 /// `response.output_text.delta` per non-empty update, and a final
 /// `response.completed` aggregating the run (text + usage).
 struct AgentStreamFraming {
@@ -277,8 +277,8 @@ struct AgentStreamFraming {
     mid: String,
     seq: u64,
     /// Updates collected so the terminal `response.completed` can aggregate the
-    /// full text and usage via [`AgentRunResponse::from_updates`].
-    collected: Vec<AgentRunResponseUpdate>,
+    /// full text and usage via [`AgentResponse::from_updates`].
+    collected: Vec<AgentResponseUpdate>,
 }
 
 impl AgentStreamFraming {
@@ -325,7 +325,7 @@ impl AgentStreamFraming {
 
     /// Frame one streamed update: a `response.output_text.delta` when it carries
     /// text (otherwise nothing). The update is retained for final aggregation.
-    fn push_update(&mut self, update: &AgentRunResponseUpdate) -> Vec<Value> {
+    fn push_update(&mut self, update: &AgentResponseUpdate) -> Vec<Value> {
         self.collected.push(update.clone());
         let delta = update.text();
         if delta.is_empty() {
@@ -346,7 +346,7 @@ impl AgentStreamFraming {
 
     /// The terminal `response.completed`, aggregating all collected updates.
     fn completed(&mut self) -> Value {
-        let response = AgentRunResponse::from_updates(std::mem::take(&mut self.collected));
+        let response = AgentResponse::from_updates(std::mem::take(&mut self.collected));
         let text = response.text();
         let usage = build_usage(&response.usage_details, self.input_len, text.len());
         let completed = ResponseObject {

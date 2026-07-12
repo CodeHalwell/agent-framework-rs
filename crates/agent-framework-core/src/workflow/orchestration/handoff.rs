@@ -171,7 +171,7 @@ impl HandoffResolution {
     /// Detect a handoff from an agent response. The first handoff-shaped call
     /// wins; additional ones are warned about (Python: "first wins, warn").
     fn detect(
-        response: &crate::types::AgentRunResponse,
+        response: &crate::types::AgentResponse,
         tool_targets: &HashMap<String, String>,
     ) -> HandoffResolution {
         let mut calls: Vec<FunctionCallContent> = Vec::new();

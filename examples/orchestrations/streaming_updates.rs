@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
                 update,
             } => {
                 update_count += 1;
-                let u: AgentRunResponseUpdate =
+                let u: AgentResponseUpdate =
                     serde_json::from_value(update.clone()).unwrap_or_default();
                 println!(
                     "{event_count:>3}  [{executor_id}] update chunk: {:?}",
@@ -102,8 +102,7 @@ async fn main() -> Result<()> {
                 executor_id,
                 response,
             } => {
-                let r: AgentRunResponse =
-                    serde_json::from_value(response.clone()).unwrap_or_default();
+                let r: AgentResponse = serde_json::from_value(response.clone()).unwrap_or_default();
                 println!(
                     "{event_count:>3}  [{executor_id}] run complete: {:?}",
                     r.text()

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use agent_framework_core::error::Result;
 use agent_framework_core::middleware::{AgentContext, ChatContext, Middleware, Next};
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, ChatResponse, Role};
+use agent_framework_core::types::{AgentResponse, ChatMessage, ChatResponse, Role};
 
 use crate::auth::TokenProvider;
 use crate::client::PurviewClient;
@@ -139,7 +139,7 @@ impl Middleware<AgentContext> for PurviewAgentMiddleware {
     ) -> Result<AgentContext> {
         let (should_block, resolved_user_id) = self.0.check(&ctx.messages, None, "prompt").await?;
         if should_block {
-            ctx.result = Some(AgentRunResponse {
+            ctx.result = Some(AgentResponse {
                 messages: vec![self.0.blocked_prompt_message()],
                 ..Default::default()
             });
@@ -157,7 +157,7 @@ impl Middleware<AgentContext> for PurviewAgentMiddleware {
                     .check(&messages, resolved_user_id.as_deref(), "response")
                     .await?;
                 if should_block {
-                    ctx.result = Some(AgentRunResponse {
+                    ctx.result = Some(AgentResponse {
                         messages: vec![self.0.blocked_response_message()],
                         ..Default::default()
                     });
@@ -259,7 +259,7 @@ mod tests {
         Box::new(move |mut ctx: AgentContext| {
             called.store(true, Ordering::SeqCst);
             Box::pin(async move {
-                ctx.result = Some(AgentRunResponse {
+                ctx.result = Some(AgentResponse {
                     messages: vec![ChatMessage::assistant(text)],
                     ..Default::default()
                 });
