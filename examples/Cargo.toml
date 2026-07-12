@@ -114,10 +114,6 @@ name = "copilotstudio_agent"
 path = "providers/copilotstudio_agent.rs"
 
 [[example]]
-name = "openai_assistants"
-path = "providers/openai_assistants.rs"
-
-[[example]]
 name = "anthropic_hosted_tools"
 path = "providers/anthropic_hosted_tools.rs"
 

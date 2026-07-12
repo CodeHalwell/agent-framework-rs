@@ -34,9 +34,6 @@ pub mod convert;
 pub mod responses;
 pub use responses::OpenAIResponsesClient;
 
-pub mod assistants;
-pub use assistants::OpenAIAssistantsClient;
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -67,12 +64,12 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         .filter(|s| s.is_finite() && *s >= 0.0)
 }
 
-/// Classify a non-success OpenAI-wire (Chat Completions / Responses /
-/// Assistants) HTTP response into a granular [`Error`].
+/// Classify a non-success OpenAI-wire (Chat Completions / Responses) HTTP
+/// response into a granular [`Error`].
 ///
 /// The single point of truth for status/body interpretation, used by every
-/// endpoint in this crate ([`OpenAIClient::post`], [`responses`], and
-/// [`assistants`]) and reused by `agent-framework-azure` (Azure OpenAI is
+/// endpoint in this crate ([`OpenAIClient::post`] and [`responses`]) and reused
+/// by `agent-framework-azure` (Azure OpenAI is
 /// wire-compatible for Chat Completions and Responses), so the two stay
 /// identical rather than drifting.
 ///
@@ -479,8 +476,8 @@ mod tests {
     // -- classify_service_error --------------------------------------------
     //
     // Canned status+body combinations run through the exact classification
-    // `OpenAIClient::post`, `responses::OpenAIResponsesClient::post`, and
-    // `assistants::OpenAIAssistantsClient::send` all delegate to.
+    // `OpenAIClient::post` and `responses::OpenAIResponsesClient::post`
+    // both delegate to.
 
     #[test]
     fn classifies_401_and_403_as_invalid_auth() {

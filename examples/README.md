@@ -71,13 +71,12 @@ middleware.
 
 ## Providers (`providers/`)
 
-Every `ChatClient` backend: OpenAI (Chat + Responses + Assistants), Azure
+Every `ChatClient` backend: OpenAI (Chat + Responses), Azure
 OpenAI, Azure AI Foundry, Anthropic, and Copilot Studio.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `openai_responses` | OpenAI Responses API + `conversation_id` (`previous_response_id`) reuse | `OPENAI_API_KEY` |
-| `openai_assistants` | OpenAI Assistants (beta) API: lazy assistant creation, thread-based replies | `OPENAI_API_KEY` (skips gracefully) |
 | `openai_compatible_endpoint` | `OpenAIClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
 | `anthropic` | The Anthropic (Claude) Messages API client | `ANTHROPIC_API_KEY` |
 | `anthropic_hosted_tools` | Anthropic hosted web-search / code-execution tools (server-side, no local wiring) | `ANTHROPIC_API_KEY` (skips gracefully) |
