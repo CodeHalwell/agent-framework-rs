@@ -10,6 +10,9 @@
 //! | --- | --- | --- |
 //! | `openai` | [`agent_framework_openai`] — OpenAI Chat Completions + Responses API | yes |
 //! | `anthropic` | [`agent_framework_anthropic`] — Anthropic (Claude) Messages API | no |
+//! | `ollama` | [`agent_framework_ollama`] — Ollama (local/remote, OpenAI-compatible) | no |
+//! | `gemini` | [`agent_framework_gemini`] — Google Gemini `generateContent` API | no |
+//! | `mistral` | [`agent_framework_mistral`] — Mistral AI Chat Completions API | no |
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
@@ -52,6 +55,18 @@ pub use agent_framework_openai as openai;
 /// The Anthropic (Claude) provider (enable the `anthropic` feature).
 #[cfg(feature = "anthropic")]
 pub use agent_framework_anthropic as anthropic;
+
+/// The Ollama provider (enable the `ollama` feature).
+#[cfg(feature = "ollama")]
+pub use agent_framework_ollama as ollama;
+
+/// The Google Gemini provider (enable the `gemini` feature).
+#[cfg(feature = "gemini")]
+pub use agent_framework_gemini as gemini;
+
+/// The Mistral AI provider (enable the `mistral` feature).
+#[cfg(feature = "mistral")]
+pub use agent_framework_mistral as mistral;
 
 /// The Azure OpenAI provider (enable the `azure` feature).
 #[cfg(feature = "azure")]
@@ -110,6 +125,15 @@ pub mod prelude {
 
     #[cfg(feature = "anthropic")]
     pub use agent_framework_anthropic::AnthropicClient;
+
+    #[cfg(feature = "ollama")]
+    pub use agent_framework_ollama::OllamaChatClient;
+
+    #[cfg(feature = "gemini")]
+    pub use agent_framework_gemini::GeminiChatClient;
+
+    #[cfg(feature = "mistral")]
+    pub use agent_framework_mistral::MistralChatClient;
 
     #[cfg(feature = "azure")]
     pub use agent_framework_azure::{AzureOpenAIClient, StaticTokenCredential, TokenCredential};

@@ -72,7 +72,8 @@ middleware.
 ## Providers (`providers/`)
 
 Every `ChatClient` backend: OpenAI (Chat + Responses), Azure
-OpenAI, Azure AI Foundry, Anthropic, and Copilot Studio.
+OpenAI, Azure AI Foundry, Anthropic, Ollama, Gemini, Mistral, and Copilot
+Studio.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
@@ -80,6 +81,9 @@ OpenAI, Azure AI Foundry, Anthropic, and Copilot Studio.
 | `openai_compatible_endpoint` | `OpenAIChatCompletionClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
 | `anthropic` | The Anthropic (Claude) Messages API client | `ANTHROPIC_API_KEY` |
 | `anthropic_hosted_tools` | Anthropic hosted web-search / code-execution tools (server-side, no local wiring) | `ANTHROPIC_API_KEY` (skips gracefully) |
+| `ollama` | `OllamaChatClient` against a local/remote Ollama server's OpenAI-compatible endpoint | `OLLAMA_HOST` (skips gracefully) |
+| `gemini` | `GeminiChatClient`: Google Gemini's `generateContent` REST API | `GEMINI_API_KEY` or `GOOGLE_API_KEY` (skips gracefully) |
+| `mistral` | `MistralChatClient`: Mistral AI's Chat Completions API | `MISTRAL_API_KEY` (skips gracefully) |
 | `azure_openai` | Azure OpenAI with both api-key and Entra ID (`TokenCredential`) auth | `AZURE_OPENAI_*` |
 | `azure_openai_responses` | `AzureOpenAIResponsesClient`: the Responses API on Azure OpenAI | `AZURE_OPENAI_*` (skips gracefully) |
 | `azure_default_credential` | `DefaultAzureCredential`'s four-link Entra ID credential chain | `AZURE_OPENAI_ENDPOINT` (+ `az login`; skips gracefully) |

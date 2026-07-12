@@ -12,6 +12,9 @@ description = "A Rust implementation of the Microsoft Agent Framework: build AI 
 default = ["openai"]
 openai = ["dep:agent-framework-openai"]
 anthropic = ["dep:agent-framework-anthropic"]
+ollama = ["dep:agent-framework-ollama"]
+gemini = ["dep:agent-framework-gemini"]
+mistral = ["dep:agent-framework-mistral"]
 azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
@@ -31,6 +34,9 @@ otel-metrics = ["agent-framework-core/otel-metrics"]
 full = [
     "openai",
     "anthropic",
+    "ollama",
+    "gemini",
+    "mistral",
     "azure",
     "mcp",
     "a2a",
@@ -49,6 +55,9 @@ full = [
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
+agent-framework-ollama = { workspace = true, optional = true }
+agent-framework-gemini = { workspace = true, optional = true }
+agent-framework-mistral = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
 agent-framework-a2a = { workspace = true, optional = true }

@@ -15,9 +15,12 @@ dependencies = [
  "agent-framework-core",
  "agent-framework-cosmos",
  "agent-framework-declarative",
+ "agent-framework-gemini",
  "agent-framework-hosting",
  "agent-framework-mcp",
  "agent-framework-mem0",
+ "agent-framework-mistral",
+ "agent-framework-ollama",
  "agent-framework-openai",
  "agent-framework-purview",
  "agent-framework-redis",
@@ -209,6 +212,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-framework-gemini"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agent-framework-hosting"
 version = "0.1.0"
 dependencies = [
@@ -257,6 +278,44 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-framework-mistral"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "agent-framework-openai",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-framework-ollama"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-core",
+ "agent-framework-openai",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]

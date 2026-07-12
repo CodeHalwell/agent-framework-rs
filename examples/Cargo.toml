@@ -102,6 +102,18 @@ name = "anthropic"
 path = "providers/anthropic.rs"
 
 [[example]]
+name = "ollama"
+path = "providers/ollama.rs"
+
+[[example]]
+name = "gemini"
+path = "providers/gemini.rs"
+
+[[example]]
+name = "mistral"
+path = "providers/mistral.rs"
+
+[[example]]
 name = "azure_openai"
 path = "providers/azure_openai.rs"
 
