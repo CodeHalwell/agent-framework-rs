@@ -314,7 +314,12 @@ fn stream_event_to_updates(
     state: &mut ThreadState,
     name: Option<&str>,
 ) -> Vec<Result<AgentRunResponseUpdate>> {
-    match event {
+    // `response_id` follows the same rule as the non-streaming `run()`
+    // (`SendMessageResult` mapping above): a bare message exposes its
+    // message id, task-bearing events expose the task id — so aggregating
+    // the stream yields the same `AgentRunResponse.response_id` and
+    // streaming clients can cancel/poll the A2A task.
+    let (updates, response_id) = match event {
         MessageStreamEvent::Message(m) => {
             if m.context_id.is_some() {
                 state.context_id = m.context_id.clone();
@@ -322,33 +327,50 @@ fn stream_event_to_updates(
             if m.task_id.is_some() {
                 state.task_id = m.task_id.clone();
             }
-            wrap_message(a2a_message_to_chat_message(m), name)
+            (
+                wrap_message(a2a_message_to_chat_message(m), name),
+                Some(m.message_id.clone()),
+            )
         }
         MessageStreamEvent::Task(t) => {
             state.context_id = Some(t.context_id.clone());
             state.task_id = Some(t.id.clone());
-            match task_to_chat_messages(t) {
+            let updates = match task_to_chat_messages(t) {
                 Ok(msgs) => msgs
                     .into_iter()
                     .map(|cm| Ok(message_to_update(cm, name)))
                     .collect(),
                 Err(e) => vec![Err(e)],
-            }
+            };
+            (updates, Some(t.id.clone()))
         }
         MessageStreamEvent::StatusUpdate(e) => {
             state.context_id = Some(e.context_id.clone());
             state.task_id = Some(e.task_id.clone());
-            match &e.status.message {
+            let updates = match &e.status.message {
                 Some(msg) => wrap_message(a2a_message_to_chat_message(msg), name),
                 None => Vec::new(),
-            }
+            };
+            (updates, Some(e.task_id.clone()))
         }
         MessageStreamEvent::ArtifactUpdate(e) => {
             state.context_id = Some(e.context_id.clone());
             state.task_id = Some(e.task_id.clone());
-            wrap_message(artifact_to_chat_message(&e.artifact), name)
+            (
+                wrap_message(artifact_to_chat_message(&e.artifact), name),
+                Some(e.task_id.clone()),
+            )
         }
-    }
+    };
+    updates
+        .into_iter()
+        .map(|u| {
+            u.map(|mut update| {
+                update.response_id = response_id.clone();
+                update
+            })
+        })
+        .collect()
 }
 
 fn wrap_message(
@@ -1046,6 +1068,9 @@ mod tests {
         let u = updates.into_iter().next().unwrap().unwrap();
         assert_eq!(u.text(), "hi");
         assert_eq!(u.author_name.as_deref(), Some("weather"));
+        // Same rule as non-streaming run(): a bare message exposes its
+        // message id as the response id.
+        assert_eq!(u.response_id.as_deref(), Some("m1"));
         // Continuity tracked from the event.
         assert_eq!(state.context_id.as_deref(), Some("c1"));
         assert_eq!(state.task_id.as_deref(), Some("t1"));
@@ -1078,10 +1103,11 @@ mod tests {
         });
         let updates = stream_event_to_updates(&ev, &mut state, None);
         assert_eq!(updates.len(), 1);
-        assert_eq!(
-            updates.into_iter().next().unwrap().unwrap().text(),
-            "What city?"
-        );
+        let u = updates.into_iter().next().unwrap().unwrap();
+        assert_eq!(u.text(), "What city?");
+        // Task-bearing events expose the task id as the response id, so a
+        // streaming client can cancel/poll the task after aggregation.
+        assert_eq!(u.response_id.as_deref(), Some("t2"));
         assert_eq!(state.context_id.as_deref(), Some("c2"));
         assert_eq!(state.task_id.as_deref(), Some("t2"));
     }
@@ -1103,7 +1129,43 @@ mod tests {
         let updates = stream_event_to_updates(&ev, &mut state, None);
         assert!(updates.is_empty(), "no status message → no update");
         assert_eq!(state.task_id.as_deref(), Some("t3"));
-        assert_eq!(state.context_id.as_deref(), Some("c3"));
+    }
+
+    #[test]
+    fn stream_event_task_updates_carry_the_task_id_as_response_id() {
+        let mut state = ThreadState::default();
+        let ev = MessageStreamEvent::Task(crate::types::Task {
+            id: "task-42".into(),
+            context_id: "c9".into(),
+            status: crate::types::TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            history: Some(vec![A2AMessage {
+                kind: "message".into(),
+                role: MessageRole::Agent,
+                parts: vec![Part::Text(TextPart {
+                    text: "done".into(),
+                    metadata: None,
+                })],
+                message_id: "m9".into(),
+                task_id: Some("task-42".into()),
+                context_id: Some("c9".into()),
+                metadata: None,
+            }]),
+            artifacts: None,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        assert!(!updates.is_empty());
+        for u in updates {
+            let u = u.unwrap();
+            // Mirrors run(): a Task result's response_id is the task id.
+            assert_eq!(u.response_id.as_deref(), Some("task-42"));
+        }
+        assert_eq!(state.task_id.as_deref(), Some("task-42"));
+        assert_eq!(state.context_id.as_deref(), Some("c9"));
     }
 
     #[test]

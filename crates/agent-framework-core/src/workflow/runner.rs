@@ -726,7 +726,24 @@ impl WorkflowRun {
             // executes), which keeps per-executor event pairs coherent and the
             // overall order deterministic. The first error in planned order
             // fails the superstep, exactly as the sequential `?` did — later
-            // invocations' effects are simply not applied.
+            // invocations' *drained* effects (messages, events, outputs,
+            // requests) are simply not applied.
+            //
+            // Live side effects are a different matter, by design: sibling
+            // invocations that already ran (or were mid-flight) when another
+            // failed have still performed their external work and any
+            // `SharedState` writes — shared state is live within a superstep,
+            // not transactional, and there is no rollback. This matches
+            // upstream exactly: Python's `_run_iteration` drives a
+            // superstep's deliveries with plain `asyncio.gather`
+            // (`_runner.py:147-183`), which neither cancels sibling tasks on
+            // the first exception nor stages `SharedState` mutations.
+            // Cancelling siblings here could not retract writes already made
+            // (it would only shrink the window while imposing
+            // cancellation-safety on user executors), and staging would break
+            // the live cross-executor visibility both engines document — so
+            // a failed run may retain state from branches whose messages
+            // never took effect, and a resume replays the whole superstep.
             let mut next: Vec<WorkflowMessage> = Vec::new();
             for (id, result) in results {
                 self.emit(WorkflowEvent::ExecutorInvoked {
