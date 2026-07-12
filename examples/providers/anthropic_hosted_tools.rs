@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
 
     let web_search = hosted_web_search().max_uses(3);
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("research-assistant")
         .instructions("Use web search for anything time-sensitive; cite your sources briefly.")
         .tool(web_search)

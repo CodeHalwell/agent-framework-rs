@@ -69,14 +69,14 @@ impl ChatClient for MockClient {
 /// A participant that is never expected to run: the round loop either stalls
 /// (before selecting a speaker) or reaches a satisfied ledger straight to the
 /// final answer. Still required — `MagenticBuilder::build()` needs one.
-fn unused_participant(name: &str) -> Arc<dyn Agent> {
+fn unused_participant(name: &str) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(MockClient::new(vec![ChatResponse::from_text(
+        Agent::builder(MockClient::new(vec![ChatResponse::from_text(
             "should not be called",
         )]))
         .name(name)
         .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 fn ledger(satisfied: bool, progress: bool, in_loop: bool, next: &str) -> MagenticProgressLedger {

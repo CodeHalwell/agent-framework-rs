@@ -35,7 +35,7 @@
 //! let mut providers = AggregateContextProvider::new();
 //! providers.add(Arc::new(memory));
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
 //!     .context_provider(Arc::new(providers))
 //!     .build();

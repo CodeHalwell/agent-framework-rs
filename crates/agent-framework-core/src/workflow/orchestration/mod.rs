@@ -1,6 +1,6 @@
 //! Prebuilt orchestration patterns built on the workflow engine.
 //!
-//! Each pattern wraps [`Agent`]s as workflow [`Executor`] nodes that pass a
+//! Each pattern wraps [`SupportsAgentRun`]s as workflow [`Executor`] nodes that pass a
 //! shared conversation (`Vec<Message>`, carried as JSON) between
 //! participants:
 //!
@@ -11,7 +11,7 @@
 //!   calls, optionally requesting fresh user input between turns.
 //! - [`MagenticBuilder`] — Magentic-One style planning + progress-ledger
 //!   orchestration driven by a [`MagenticManager`].
-//! - [`WorkflowAgent`] — expose a built [`Workflow`] as an [`Agent`].
+//! - [`WorkflowAgent`] — expose a built [`Workflow`] as an [`SupportsAgentRun`].
 //!
 //! Rust equivalents of `agent_framework._workflows` (`_sequential`,
 //! `_concurrent`, `_group_chat`, `_handoff`, `_magentic`, `_agent`).
@@ -21,7 +21,7 @@
 //! The Python orchestrators build a multi-node graph in which the orchestrator
 //! and every participant are separate executors that exchange envelope messages.
 //! This Rust port keeps each orchestrator as a **single** [`Executor`] that
-//! drives its participants by calling [`Agent::run`] directly (the same approach
+//! drives its participants by calling [`SupportsAgentRun::run`] directly (the same approach
 //! the built-in [`AgentExecutor`] already uses), looping internally within one
 //! superstep. Human-in-the-loop patterns (handoff interactive mode) still pause
 //! and resume across supersteps via the engine's
@@ -37,7 +37,7 @@ use serde_json::Value;
 use super::context::WorkflowContext;
 use super::events::WorkflowEvent;
 use super::executor::Executor;
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::{AgentResponse, AgentResponseUpdate, Message};
 
@@ -110,7 +110,7 @@ pub(crate) fn ensure_author(mut message: Message, name: &str) -> Message {
 /// per update before the terminal `AgentRunEvent`. The updates are aggregated
 /// back into an [`AgentResponse`] via [`AgentResponse::from_updates`].
 pub(crate) async fn run_agent_and_emit(
-    agent: &Arc<dyn Agent>,
+    agent: &Arc<dyn SupportsAgentRun>,
     conversation: Vec<Message>,
     executor_id: &str,
     author: &str,
@@ -147,18 +147,18 @@ pub(crate) async fn run_agent_and_emit(
     Ok(response)
 }
 
-/// An [`Executor`] that runs an [`Agent`] over the incoming conversation and
+/// An [`Executor`] that runs an [`SupportsAgentRun`] over the incoming conversation and
 /// appends the agent's reply. Rust analogue of `AgentExecutor`.
 pub struct AgentExecutor {
     id: String,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
     /// When true, yield the conversation as workflow output instead of sending.
     emit_output: bool,
 }
 
 impl AgentExecutor {
     /// Wrap `agent` as an executor with the given `id`.
-    pub fn new(id: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn new(id: impl Into<String>, agent: Arc<dyn SupportsAgentRun>) -> Self {
         Self {
             id: id.into(),
             agent,

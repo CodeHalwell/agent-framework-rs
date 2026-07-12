@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{parse_conversation, AgentExecutor};
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::Message;
 use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext};
@@ -74,7 +74,7 @@ impl Executor for AggregateExecutor {
 /// `ConcurrentBuilder`.
 #[derive(Default)]
 pub struct ConcurrentBuilder {
-    participants: Vec<Arc<dyn Agent>>,
+    participants: Vec<Arc<dyn SupportsAgentRun>>,
     name: Option<String>,
 }
 
@@ -85,14 +85,17 @@ impl ConcurrentBuilder {
     }
 
     /// Set the participants that run concurrently.
-    pub fn participants(mut self, agents: impl IntoIterator<Item = Arc<dyn Agent>>) -> Self {
+    pub fn participants(
+        mut self,
+        agents: impl IntoIterator<Item = Arc<dyn SupportsAgentRun>>,
+    ) -> Self {
         self.participants = agents.into_iter().collect();
         self
     }
 
     /// Add a participant.
     #[allow(clippy::should_implement_trait)]
-    pub fn add(mut self, agent: Arc<dyn Agent>) -> Self {
+    pub fn add(mut self, agent: Arc<dyn SupportsAgentRun>) -> Self {
         self.participants.push(agent);
         self
     }

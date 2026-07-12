@@ -12,7 +12,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
+use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::Result;
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
@@ -36,13 +36,13 @@ impl StreamingAgent {
         }
     }
 
-    pub fn arc(self) -> Arc<dyn Agent> {
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
         Arc::new(self)
     }
 }
 
 #[async_trait]
-impl Agent for StreamingAgent {
+impl SupportsAgentRun for StreamingAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -118,13 +118,13 @@ impl MockAgent {
         self
     }
 
-    pub fn arc(self) -> Arc<dyn Agent> {
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
         Arc::new(self)
     }
 }
 
 #[async_trait]
-impl Agent for MockAgent {
+impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
         messages: Vec<Message>,

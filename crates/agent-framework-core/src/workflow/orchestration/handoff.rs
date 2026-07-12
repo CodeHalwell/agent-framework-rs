@@ -12,7 +12,7 @@
 //!   next user message, then resumes when the response arrives.
 //!
 //! Divergences from Python (documented): (1) because a built
-//! [`ChatAgent`](crate::agent::ChatAgent)'s tool list is fixed and the [`Agent`]
+//! [`Agent`](crate::agent::Agent)'s tool list is fixed and the [`SupportsAgentRun`]
 //! trait exposes no tool mutation, the coordinator detects handoffs by
 //! **inspecting** the agent's response for a handoff-shaped function call
 //! (matching Python's `_resolve_handoff_target`) rather than injecting an
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{parse_conversation, run_agent_and_emit};
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::tools::{ApprovalMode, ToolDefinition, ToolKind};
 use crate::types::{Content, FunctionCallContent, FunctionResultContent, Message, Role};
@@ -300,7 +300,7 @@ const HANDOFF_STATE_KEY: &str = "_handoff_state";
 /// The single executor that coordinates agent-to-agent handoffs.
 struct HandoffCoordinator {
     id: String,
-    agents: Vec<(String, Arc<dyn Agent>)>,
+    agents: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     initial_agent: String,
     tool_targets: HashMap<String, String>,
     interaction_mode: HandoffInteractionMode,
@@ -310,7 +310,7 @@ struct HandoffCoordinator {
 }
 
 impl HandoffCoordinator {
-    fn find(&self, name: &str) -> Option<&Arc<dyn Agent>> {
+    fn find(&self, name: &str) -> Option<&Arc<dyn SupportsAgentRun>> {
         self.agents.iter().find(|(n, _)| n == name).map(|(_, a)| a)
     }
 
@@ -486,7 +486,7 @@ impl HandoffEdgeBuilder {
 /// # use std::sync::Arc;
 /// # use agent_framework_core::prelude::*;
 /// # use agent_framework_core::workflow::HandoffBuilder;
-/// # fn demo(triage: Arc<dyn Agent>, billing: Arc<dyn Agent>) -> Result<()> {
+/// # fn demo(triage: Arc<dyn SupportsAgentRun>, billing: Arc<dyn SupportsAgentRun>) -> Result<()> {
 /// let workflow = HandoffBuilder::new()
 ///     .participant("triage", triage)
 ///     .participant("billing", billing)
@@ -499,7 +499,7 @@ impl HandoffEdgeBuilder {
 /// # }
 /// ```
 pub struct HandoffBuilder {
-    participants: Vec<(String, Arc<dyn Agent>)>,
+    participants: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     initial_agent: Option<String>,
     handoff_map: HashMap<String, Vec<String>>,
     interaction_mode: HandoffInteractionMode,
@@ -531,7 +531,11 @@ impl HandoffBuilder {
     }
 
     /// Register a participant by name.
-    pub fn participant(mut self, name: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn participant(
+        mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn SupportsAgentRun>,
+    ) -> Self {
         self.participants.push((name.into(), agent));
         self
     }
@@ -539,7 +543,7 @@ impl HandoffBuilder {
     /// Register several participants as `(name, agent)` pairs.
     pub fn participants(
         mut self,
-        participants: impl IntoIterator<Item = (String, Arc<dyn Agent>)>,
+        participants: impl IntoIterator<Item = (String, Arc<dyn SupportsAgentRun>)>,
     ) -> Self {
         self.participants.extend(participants);
         self

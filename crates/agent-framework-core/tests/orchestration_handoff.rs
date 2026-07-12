@@ -78,12 +78,12 @@ fn handoff_response(call_id: &str, target: &str) -> ChatResponse {
     }
 }
 
-fn agent_with(name: &str, responses: Vec<ChatResponse>) -> Arc<dyn Agent> {
+fn agent_with(name: &str, responses: Vec<ChatResponse>) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 fn conversation(value: serde_json::Value) -> Vec<Message> {

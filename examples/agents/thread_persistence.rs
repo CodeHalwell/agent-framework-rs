@@ -1,6 +1,6 @@
 //! Thread persistence: `thread.serialize()` produces a JSON blob you can hand
 //! to any storage layer (a file, a database row, a session cache, ...);
-//! `ChatAgent::deserialize_thread` rebuilds a thread from that blob, ready to
+//! `Agent::deserialize_thread` rebuilds a thread from that blob, ready to
 //! continue the conversation.
 //!
 //! Runs fully offline against a canned client that reports how many messages
@@ -43,7 +43,7 @@ impl ChatClient for CannedClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(CannedClient).name("assistant").build();
+    let agent = Agent::builder(CannedClient).name("assistant").build();
     let mut thread = agent.get_new_thread();
 
     println!("-- turn 1 --");
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     println!("-- serialized thread state --");
     println!("{}\n", serde_json::to_string_pretty(&serialized)?);
 
-    // Reconstruct a thread from that blob. `ChatAgent::deserialize_thread`
+    // Reconstruct a thread from that blob. `Agent::deserialize_thread`
     // populates a fresh message store (built the same way `get_new_thread`
     // would) from the serialized messages.
     let mut restored = agent.deserialize_thread(&serialized).await?;

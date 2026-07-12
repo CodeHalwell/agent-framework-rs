@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     )
     .into_definition();
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("calculator")
         .tool(add)
         .function_middleware(Arc::new(ArgRewriteMiddleware))

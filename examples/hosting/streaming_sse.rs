@@ -78,7 +78,7 @@ fn reply_to(messages: &[Message]) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(StreamingCannedClient)
+    let agent = Agent::builder(StreamingCannedClient)
         .name("assistant")
         .instructions("You are a streaming demo assistant.")
         .build();

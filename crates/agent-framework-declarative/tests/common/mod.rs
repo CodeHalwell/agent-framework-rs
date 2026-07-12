@@ -80,8 +80,6 @@ impl ChatClient for MockClient {
 }
 
 /// Build an agent registry entry backed by a mock that always replies `text`.
-pub fn mock_agent(name: &str, text: &str) -> ChatAgent {
-    ChatAgent::builder(MockClient::always(text))
-        .name(name)
-        .build()
+pub fn mock_agent(name: &str, text: &str) -> Agent {
+    Agent::builder(MockClient::always(text)).name(name).build()
 }

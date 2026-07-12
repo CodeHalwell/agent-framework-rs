@@ -2,7 +2,7 @@
 //!
 //! An [Agent2Agent (A2A)](https://a2a-protocol.org/) protocol **client** for
 //! `agent-framework-rs`: talk to any A2A-compliant remote agent as if it were
-//! a local [`Agent`](agent_framework_core::agent::Agent).
+//! a local [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun).
 //!
 //! This is the Rust equivalent of `agent_framework_a2a` (`A2AAgent`) in the
 //! Python reference implementation, built directly against the A2A JSON-RPC
@@ -20,7 +20,7 @@
 //!   `tasks/resubscribe`, `tasks/pushNotificationConfig/{set,get}`), plus
 //!   [`AgentCard`] discovery via `.well-known` (auto-upgrading to the
 //!   authenticated extended card when the server advertises it).
-//! - [`agent`] — [`A2AAgent`]: the [`Agent`](agent_framework_core::agent::Agent)
+//! - [`agent`] — [`A2AAgent`]: the [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun)
 //!   wrapper, converting [`Message`](agent_framework_core::types::Message)s
 //!   to/from A2A [`Message`]s and [`Task`]s.
 //!
@@ -73,18 +73,18 @@
 //!   `contextId`/`taskId` in
 //!   [`AgentThread::service_thread_id`](agent_framework_core::threads::AgentThread)
 //!   (JSON-encoded, since that field is a single string) and replays them on
-//!   the same thread's next [`A2AAgent::run`](agent_framework_core::agent::Agent::run)
+//!   the same thread's next [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   call, so a real multi-turn conversation works as long as the same
 //!   thread is reused (see the second example above) and doesn't already
 //!   have a local message store attached (e.g. one borrowed from a
-//!   `ChatAgent`) — continuity is skipped, not an error, in that case.
+//!   `Agent`) — continuity is skipped, not an error, in that case.
 //! - **`input-required` surfaces the agent's question.** If a [`Task`] comes
 //!   back in [`TaskState::InputRequired`], this crate returns
 //!   `task.status.message` as the response text, so the caller has
 //!   something to show/act on. The Python reference has no special case for
 //!   this state and would silently produce no messages unless the server
 //!   happens to also put that message in `history`.
-//! - **No polling loop.** [`A2AAgent::run`](agent_framework_core::agent::Agent::run)
+//! - **No polling loop.** [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   performs exactly one `message/send` call and maps whatever comes back,
 //!   including a still-`working`/`submitted` [`Task`] (which maps to zero
 //!   messages, with the task id as `response_id`). It does not poll
@@ -96,7 +96,7 @@
 //!   `Message` / `Task` / status-update / artifact-update events over SSE.
 //!   It is not wired into [`A2AAgent`] — `run` always uses the non-streaming
 //!   `message/send` — because
-//!   [`agent_framework_core::agent::Agent`] has no `run_stream` requirement
+//!   [`agent_framework_core::agent::SupportsAgentRun`] has no `run_stream` requirement
 //!   (unlike Python's `BaseAgent`), so there's nothing in the trait for a
 //!   streamed run to plug into.
 //! - **Push notifications** (`tasks/pushNotificationConfig/set` / `/get`):

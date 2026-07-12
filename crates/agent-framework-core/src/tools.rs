@@ -45,14 +45,14 @@ pub trait Tool: Send + Sync {
 /// being frozen into the agent's tool list at build time.
 ///
 /// The motivating case is an MCP server: without this trait, wiring one into
-/// a [`crate::agent::ChatAgent`] means calling `mcp.tool_definitions().await`
+/// a [`crate::agent::Agent`] means calling `mcp.tool_definitions().await`
 /// once, up front, and handing the (now-frozen) result to
-/// [`crate::agent::ChatAgentBuilder::tools`] — the agent never notices a
+/// [`crate::agent::AgentBuilder::tools`] — the agent never notices a
 /// server-side tool-catalog change (`notifications/tools/list_changed`)
 /// afterward. Registering a `ToolSource` via
-/// [`crate::agent::ChatAgentBuilder::tool_source`] instead defers resolution
-/// to every [`crate::agent::Agent::run`] / [`crate::agent::Agent::run_with_options`]
-/// / [`crate::agent::Agent::run_stream`] call (see `ChatAgent::prepare_request`),
+/// [`crate::agent::AgentBuilder::tool_source`] instead defers resolution
+/// to every [`crate::agent::SupportsAgentRun::run`] / [`crate::agent::SupportsAgentRun::run_with_options`]
+/// / [`crate::agent::SupportsAgentRun::run_stream`] call (see `Agent::prepare_request`),
 /// so a source that caches internally — invalidating that cache when the
 /// server signals a change — can serve an up-to-date catalog on every run
 /// without a live round trip each time.
@@ -70,7 +70,7 @@ pub trait ToolSource: Send + Sync {
     ///
     /// An `Err` returned here propagates out of the whole run rather than
     /// being swallowed — this mirrors the upstream Python reference, whose
-    /// `ChatAgent.run`/`run_stream` do not catch a failure raised while
+    /// `Agent.run`/`run_stream` do not catch a failure raised while
     /// connecting to an `MCPTool` at run time (`_agents.py:855-865,
     /// 970-980`: `await self._async_exit_stack.enter_async_context(tool)`
     /// is not wrapped in a `try`/`except`).

@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         println!("  - {}", tool.name);
     }
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("Use the available tools when they help answer the question.")
         .tools(tools)

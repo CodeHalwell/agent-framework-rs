@@ -1,5 +1,5 @@
 //! Model Context Protocol (MCP) tools: connect to an MCP server over stdio,
-//! list its tools, and wire them straight into a `ChatAgent`.
+//! list its tools, and wire them straight into a `Agent`.
 //!
 //! Prerequisite: a working `npx` (Node.js) on PATH, and network access the
 //! first time (npm downloads and caches the server package). This spawns
@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
 
     // Spawns the server subprocess (if not already connected), performs the
     // MCP `initialize` handshake, and lists its tools as `ToolDefinition`s --
-    // ready to hand to a `ChatAgent` exactly like a local `FunctionTool`.
+    // ready to hand to a `Agent` exactly like a local `FunctionTool`.
     let tools = mcp.tool_definitions().await?;
     println!("discovered {} MCP tool(s):", tools.len());
     for tool in &tools {
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     }
 
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You can use the available tools when they help answer the question.")
         .tools(tools)

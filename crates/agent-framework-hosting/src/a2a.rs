@@ -1,4 +1,4 @@
-//! A2A (Agent-to-Agent) protocol hosting.
+//! A2A (SupportsAgentRun-to-SupportsAgentRun) protocol hosting.
 //!
 //! Serves a single agent over the A2A protocol (v0.3.x):
 //! - `GET /.well-known/agent-card.json` — the [`AgentCard`] (camelCase per spec).
@@ -15,7 +15,7 @@
 //!
 //! # Divergences
 //! - `skills` are derived from the agent's name/description (one skill), not
-//!   from its tools: the core `Agent` trait exposes no tool list. Callers can
+//!   from its tools: the core `SupportsAgentRun` trait exposes no tool list. Callers can
 //!   override via [`A2ARouter::skill`].
 //! - Every `message/send` completes synchronously into a terminal `completed`
 //!   `Task`; there is no `working`/`input-required` lifecycle. Consequently
@@ -32,7 +32,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::SupportsAgentRun;
 use agent_framework_core::types::Message;
 
 use crate::registry::IntoAgentRegistration;
@@ -151,23 +151,23 @@ struct A2AArtifact {
 
 struct A2AState {
     card: AgentCard,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
     tasks: Mutex<HashMap<String, A2ATask>>,
 }
 
 /// Serves one agent over the A2A protocol.
 pub struct A2ARouter {
     card: AgentCard,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
 }
 
 impl A2ARouter {
     /// Build an A2A host for `agent`, advertised at `base_url` (the JSON-RPC
     /// endpoint URL that clients POST to).
     ///
-    /// Accepts a [`ChatAgent`](agent_framework_core::agent::ChatAgent), a
+    /// Accepts a [`Agent`](agent_framework_core::agent::Agent), a
     /// [`WorkflowAgent`](agent_framework_core::workflow::WorkflowAgent), or an
-    /// `Arc<dyn Agent>`.
+    /// `Arc<dyn SupportsAgentRun>`.
     pub fn for_agent(
         name: impl Into<String>,
         agent: impl IntoAgentRegistration,

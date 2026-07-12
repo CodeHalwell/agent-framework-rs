@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     // you opt in with `.with_content_capture(true)`.
     let client = ObservableChatClient::new(OpenAIClient::from_env("gpt-4o-mini")?, "openai");
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You are concise.")
         .build();

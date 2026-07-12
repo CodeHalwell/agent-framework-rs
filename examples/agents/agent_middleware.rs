@@ -1,4 +1,4 @@
-//! Agent middleware: wraps a whole `agent.run(...)` call. A middleware
+//! SupportsAgentRun middleware: wraps a whole `agent.run(...)` call. A middleware
 //! receives an owned `AgentContext` and a `Next` continuation -- call
 //! `next.run(ctx)` to continue the chain and observe/rewrite the result, or
 //! return without calling it (optionally setting `ctx.terminate = true`) to
@@ -108,7 +108,7 @@ impl ChatClient for CannedClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(CannedClient)
+    let agent = Agent::builder(CannedClient)
         .name("assistant")
         .middleware(Arc::new(LoggingMiddleware))
         .middleware(Arc::new(BlockedWordsMiddleware {

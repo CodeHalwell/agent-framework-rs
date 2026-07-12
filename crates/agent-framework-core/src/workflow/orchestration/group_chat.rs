@@ -7,13 +7,13 @@
 //! - a **custom** manager — any [`GroupChatManager`] implementation or a sync
 //!   closure via [`GroupChatBuilder::manager_fn`] — decides the next speaker or
 //!   finishes;
-//! - an **LLM manager** — a [`ChatAgent`](crate::agent::ChatAgent) (any
-//!   [`Agent`]) prompted with [`DEFAULT_MANAGER_INSTRUCTIONS`] that returns a
+//! - an **LLM manager** — a [`Agent`](crate::agent::Agent) (any
+//!   [`SupportsAgentRun`]) prompted with [`DEFAULT_MANAGER_INSTRUCTIONS`] that returns a
 //!   [`ManagerSelectionResponse`] as JSON.
 //!
 //! Divergence from Python: the reference builds a graph of orchestrator +
 //! participant nodes. Here a single orchestrator [`Executor`] drives the loop,
-//! calling participants via [`Agent::run`] directly. Python's group chat has no
+//! calling participants via [`SupportsAgentRun::run`] directly. Python's group chat has no
 //! built-in round-robin manager (it requires `set_manager` or
 //! `set_select_speakers_func`); round-robin is a Rust convenience. Python's
 //! manager rounds default to unlimited (bounded only by the workflow's
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ensure_author, parse_conversation, run_agent_and_emit};
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::Message;
 use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext};
@@ -251,12 +251,12 @@ impl ManagerSelectionResponse {
     }
 }
 
-/// An LLM-driven manager: a [`ChatAgent`](crate::agent::ChatAgent) is prompted
+/// An LLM-driven manager: a [`Agent`](crate::agent::Agent) is prompted
 /// with the participant roster and running conversation and returns a
 /// [`ManagerSelectionResponse`] as JSON. Created by
 /// [`GroupChatBuilder::manager_agent`].
 struct LlmGroupChatManager {
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
     name: String,
 }
 
@@ -318,7 +318,7 @@ type TerminationCondition = Arc<dyn Fn(&[Message]) -> bool + Send + Sync>;
 struct GroupChatOrchestrator {
     id: String,
     manager: Arc<dyn GroupChatManager>,
-    participants: Vec<(String, Arc<dyn Agent>)>,
+    participants: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     descriptions: Vec<(String, String)>,
     manager_name: String,
     max_rounds: Option<usize>,
@@ -326,7 +326,7 @@ struct GroupChatOrchestrator {
 }
 
 impl GroupChatOrchestrator {
-    fn find(&self, name: &str) -> Option<&Arc<dyn Agent>> {
+    fn find(&self, name: &str) -> Option<&Arc<dyn SupportsAgentRun>> {
         self.participants
             .iter()
             .find(|(n, _)| n == name)
@@ -424,7 +424,7 @@ impl Executor for GroupChatOrchestrator {
 enum ManagerChoice {
     RoundRobin,
     Custom(Arc<dyn GroupChatManager>),
-    Agent(Arc<dyn Agent>),
+    Agent(Arc<dyn SupportsAgentRun>),
 }
 
 /// Builder for a group chat workflow. Rust analogue of `GroupChatBuilder`.
@@ -433,7 +433,7 @@ enum ManagerChoice {
 /// # use std::sync::Arc;
 /// # use agent_framework_core::prelude::*;
 /// # use agent_framework_core::workflow::GroupChatBuilder;
-/// # fn demo(writer: Arc<dyn Agent>, reviewer: Arc<dyn Agent>) -> Result<()> {
+/// # fn demo(writer: Arc<dyn SupportsAgentRun>, reviewer: Arc<dyn SupportsAgentRun>) -> Result<()> {
 /// let workflow = GroupChatBuilder::new()
 ///     .participant("writer", writer)
 ///     .participant("reviewer", reviewer)
@@ -445,7 +445,7 @@ enum ManagerChoice {
 /// # }
 /// ```
 pub struct GroupChatBuilder {
-    participants: Vec<(String, String, Arc<dyn Agent>)>,
+    participants: Vec<(String, String, Arc<dyn SupportsAgentRun>)>,
     manager: ManagerChoice,
     manager_name: Option<String>,
     max_rounds: Option<usize>,
@@ -473,7 +473,11 @@ impl GroupChatBuilder {
     }
 
     /// Register a participant (its description defaults to its name).
-    pub fn participant(mut self, name: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn participant(
+        mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn SupportsAgentRun>,
+    ) -> Self {
         let name = name.into();
         self.participants.push((name.clone(), name, agent));
         self
@@ -485,7 +489,7 @@ impl GroupChatBuilder {
         mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        agent: Arc<dyn Agent>,
+        agent: Arc<dyn SupportsAgentRun>,
     ) -> Self {
         self.participants
             .push((name.into(), description.into(), agent));
@@ -495,7 +499,7 @@ impl GroupChatBuilder {
     /// Register several participants as `(name, agent)` pairs.
     pub fn participants(
         mut self,
-        participants: impl IntoIterator<Item = (String, Arc<dyn Agent>)>,
+        participants: impl IntoIterator<Item = (String, Arc<dyn SupportsAgentRun>)>,
     ) -> Self {
         for (name, agent) in participants {
             self.participants.push((name.clone(), name, agent));
@@ -530,7 +534,7 @@ impl GroupChatBuilder {
     /// Use an LLM agent as the manager (prompted with
     /// [`DEFAULT_MANAGER_INSTRUCTIONS`] and asked for a
     /// [`ManagerSelectionResponse`] as JSON).
-    pub fn manager_agent(mut self, agent: Arc<dyn Agent>) -> Self {
+    pub fn manager_agent(mut self, agent: Arc<dyn SupportsAgentRun>) -> Self {
         self.manager = ManagerChoice::Agent(agent);
         self
     }
@@ -589,7 +593,7 @@ impl GroupChatBuilder {
             .iter()
             .map(|(n, d, _)| (n.clone(), d.clone()))
             .collect();
-        let participants: Vec<(String, Arc<dyn Agent>)> = self
+        let participants: Vec<(String, Arc<dyn SupportsAgentRun>)> = self
             .participants
             .into_iter()
             .map(|(n, _, a)| (n, a))

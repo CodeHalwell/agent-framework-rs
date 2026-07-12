@@ -61,15 +61,15 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn build_agent() -> ChatAgent {
+fn build_agent() -> Agent {
     let instructions = "You are a helpful, concise assistant.";
     match OpenAIClient::from_env("gpt-4o-mini") {
-        Ok(client) => ChatAgent::builder(client)
+        Ok(client) => Agent::builder(client)
             .name("assistant")
             .description("General-purpose assistant served over the OpenAI-compatible API.")
             .instructions(instructions)
             .build(),
-        Err(_) => ChatAgent::builder(CannedClient)
+        Err(_) => Agent::builder(CannedClient)
             .name("assistant")
             .description("Offline canned assistant (no OPENAI_API_KEY).")
             .instructions(instructions)

@@ -23,7 +23,7 @@ pub(crate) fn sse_response(events: Vec<Value>) -> Response {
 
 /// Live variant of [`sse_response`]: frame a **stream** of JSON event objects as
 /// an SSE response, appending a final `data: [DONE]` once the stream ends. Used
-/// by the streaming devui / OpenAI-compat paths that consume `Agent::run_stream`
+/// by the streaming devui / OpenAI-compat paths that consume `SupportsAgentRun::run_stream`
 /// incrementally.
 pub(crate) fn sse_response_stream<S>(events: S) -> Response
 where
@@ -43,7 +43,7 @@ where
 
 /// Live variant of [`sse_events`]: frame a **stream** of JSON event objects as
 /// an SSE response with no terminal sentinel (AG-UI). Used by the AG-UI router
-/// to emit events as `Agent::run_stream` produces them.
+/// to emit events as `SupportsAgentRun::run_stream` produces them.
 pub(crate) fn sse_events_stream<S>(events: S) -> Response
 where
     S: Stream<Item = Value> + Send + 'static,

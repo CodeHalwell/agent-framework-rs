@@ -1,9 +1,9 @@
 //! The [`DeclarativeLoader`]: parse specs, interpolate environment variables,
-//! and build [`ChatAgent`]s and [`Workflow`]s using the core builders.
+//! and build [`Agent`]s and [`Workflow`]s using the core builders.
 
 use std::sync::Arc;
 
-use agent_framework_core::agent::ChatAgent;
+use agent_framework_core::agent::Agent;
 use agent_framework_core::tools::{
     empty_schema, hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search,
     ApprovalMode, ToolDefinition, ToolKind,
@@ -122,14 +122,14 @@ impl DeclarativeLoader {
 
     // --- agents ----------------------------------------------------------
 
-    /// Parse and build a [`ChatAgent`] from a YAML agent spec.
-    pub fn load_agent(&self, yaml: &str) -> Result<ChatAgent> {
+    /// Parse and build a [`Agent`] from a YAML agent spec.
+    pub fn load_agent(&self, yaml: &str) -> Result<Agent> {
         let spec = self.load_agent_spec(yaml)?;
         self.build_agent(&spec)
     }
 
-    /// Build a [`ChatAgent`] from an already-parsed [`AgentSpec`].
-    pub fn build_agent(&self, spec: &AgentSpec) -> Result<ChatAgent> {
+    /// Build a [`Agent`] from an already-parsed [`AgentSpec`].
+    pub fn build_agent(&self, spec: &AgentSpec) -> Result<Agent> {
         spec.validate_kind()?;
         let client = self.clients.resolve(spec.model.as_ref())?;
 
@@ -157,7 +157,7 @@ impl DeclarativeLoader {
             tool_defs.push(self.build_tool(tool)?);
         }
 
-        let mut builder = ChatAgent::builder(client);
+        let mut builder = Agent::builder(client);
         if let Some(name) = spec.effective_name() {
             builder = builder.name(name.to_string());
         }
@@ -337,7 +337,10 @@ impl DeclarativeLoader {
                 "orchestration workflow requires a non-empty 'participants' list".into(),
             ));
         }
-        let resolved: Vec<(String, Arc<dyn agent_framework_core::agent::Agent>)> = spec
+        let resolved: Vec<(
+            String,
+            Arc<dyn agent_framework_core::agent::SupportsAgentRun>,
+        )> = spec
             .participants
             .iter()
             .map(|id| Ok((id.clone(), agents.get(id)?)))

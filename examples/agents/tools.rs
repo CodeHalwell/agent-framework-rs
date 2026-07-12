@@ -1,4 +1,4 @@
-//! Agent with a local tool. The framework runs the function-invocation loop
+//! SupportsAgentRun with a local tool. The framework runs the function-invocation loop
 //! automatically: the model calls `get_weather`, the result is fed back, and
 //! the model produces a final answer.
 //!
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     )
     .into_definition();
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .instructions("You are a weather assistant. Use tools when needed.")
         .tool(get_weather)
         .build();

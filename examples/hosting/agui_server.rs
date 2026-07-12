@@ -1,4 +1,4 @@
-//! Serve an agent over the AG-UI protocol (CopilotKit's Agent-User
+//! Serve an agent over the AG-UI protocol (CopilotKit's SupportsAgentRun-User
 //! Interaction protocol): `POST /` takes a RunAgentInput body and streams
 //! camelCase SSE events (RUN_STARTED, TEXT_MESSAGE_*, TOOL_CALL_*,
 //! RUN_FINISHED) that AG-UI frontends consume directly.
@@ -57,14 +57,14 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn build_agent() -> ChatAgent {
+fn build_agent() -> Agent {
     let instructions = "You are a helpful, concise assistant.";
     match OpenAIClient::from_env("gpt-4o-mini") {
-        Ok(client) => ChatAgent::builder(client)
+        Ok(client) => Agent::builder(client)
             .name("assistant")
             .instructions(instructions)
             .build(),
-        Err(_) => ChatAgent::builder(CannedClient)
+        Err(_) => Agent::builder(CannedClient)
             .name("assistant")
             .instructions(instructions)
             .build(),

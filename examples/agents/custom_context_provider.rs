@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     )]));
 
     println!("-- scenario 1: thread_created fires for an already service-managed thread --");
-    let agent1 = ChatAgent::builder(EchoingClient)
+    let agent1 = Agent::builder(EchoingClient)
         .context_provider(provider.clone())
         .build();
     let mut thread1 = agent1.get_new_thread_with_service_id("demo-thread")?;
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     println!("agent: {}\n", r1.text());
 
     println!("-- scenario 2: thread_created fires when a local thread adopts a service id --");
-    let agent2 = ChatAgent::builder(AdoptingClient)
+    let agent2 = Agent::builder(AdoptingClient)
         .context_provider(provider.clone())
         .build();
     let mut thread2 = agent2.get_new_thread();
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
     );
 
     println!("-- scenario 3: invoked observes a failed run --");
-    let agent3 = ChatAgent::builder(FailingClient)
+    let agent3 = Agent::builder(FailingClient)
         .context_provider(provider)
         .build();
     match agent3.run_once("hi").await {

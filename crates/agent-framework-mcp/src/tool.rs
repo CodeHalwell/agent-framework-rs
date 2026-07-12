@@ -5,14 +5,14 @@
 //! tool catalog into ready-to-use [`ToolDefinition`]s whose executors call
 //! back into that shared session.
 //!
-//! Two ways to wire one into a [`agent_framework_core::agent::ChatAgent`]:
+//! Two ways to wire one into a [`agent_framework_core::agent::Agent`]:
 //!
 //! - **Static** (frozen at build time): `mcp.tool_definitions().await` once,
-//!   up front, and hand the result to `ChatAgent::builder().tools(..)`. The
+//!   up front, and hand the result to `Agent::builder().tools(..)`. The
 //!   agent never notices a later server-side tool-catalog change.
 //! - **Dynamic** (resolved on every run): all three types implement
 //!   [`agent_framework_core::tools::ToolSource`], so
-//!   `ChatAgent::builder().tool_source(Arc::new(mcp))` connects lazily on
+//!   `Agent::builder().tool_source(Arc::new(mcp))` connects lazily on
 //!   the agent's first run and re-resolves the tool list on every
 //!   subsequent run from a cache that self-invalidates on the server's
 //!   `notifications/tools/list_changed` (see [`McpClient::list_tools_cached`]).

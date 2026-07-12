@@ -1,5 +1,5 @@
 //! Talk to a published Microsoft Copilot Studio agent via the Direct-to-
-//! Engine (D2E) protocol. `CopilotStudioAgent` implements the `Agent` trait;
+//! Engine (D2E) protocol. `CopilotStudioAgent` implements the `SupportsAgentRun` trait;
 //! reusing one `AgentThread` keeps the Copilot Studio conversation id across
 //! turns.
 //!

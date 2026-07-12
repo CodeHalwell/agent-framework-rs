@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     let mut providers = AggregateContextProvider::new();
     providers.add(Arc::new(memory));
 
-    let agent = ChatAgent::builder(CannedClient)
+    let agent = Agent::builder(CannedClient)
         .instructions("You are a helpful assistant.")
         .context_provider(Arc::new(providers))
         .build();

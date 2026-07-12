@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     };
 
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("vision-assistant")
         .instructions("Describe images concisely.")
         .build();

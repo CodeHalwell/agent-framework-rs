@@ -1,4 +1,4 @@
-//! Agents: the [`Agent`] trait and the concrete [`ChatAgent`].
+//! Agents: the [`SupportsAgentRun`] trait and the concrete [`Agent`].
 //!
 //! Rust equivalent of `agent_framework._agents`.
 
@@ -24,8 +24,8 @@ use crate::types::{
 /// A boxed stream of agent run updates.
 pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentResponseUpdate>> + Send>>;
 
-/// Per-run option overrides for a single [`Agent::run_with_options`] /
-/// [`Agent::run_stream`] call, merged over the agent's build-time defaults.
+/// Per-run option overrides for a single [`SupportsAgentRun::run_with_options`] /
+/// [`SupportsAgentRun::run_stream`] call, merged over the agent's build-time defaults.
 ///
 /// Mirrors upstream `run`/`run_stream` per-call keyword arguments and .NET
 /// `AgentRunOptions`: the per-run [`ChatOptions`] take precedence over the
@@ -71,7 +71,7 @@ impl AgentRunOptions {
     }
 
     /// Whether these options carry no overrides at all. Used by the default
-    /// [`Agent::run_with_options`] to decide whether to warn about ignoring
+    /// [`SupportsAgentRun::run_with_options`] to decide whether to warn about ignoring
     /// options it cannot honor.
     pub fn is_empty(&self) -> bool {
         self.chat_options.is_none() && self.additional_tools.is_empty()
@@ -81,7 +81,7 @@ impl AgentRunOptions {
 /// Map a completed run into buffered agent updates — one update per message,
 /// each with a distinct `message_id` so that re-aggregation via
 /// [`AgentResponse::from_updates`] keeps the message boundaries. Shared by
-/// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path
+/// the default [`SupportsAgentRun::run_stream`] and [`Agent`]'s middleware-path
 /// replay.
 ///
 /// Response-level metadata survives the replay: `response_id` and
@@ -162,8 +162,8 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
 /// A factory that builds a fresh [`ChatMessageStore`] for each new local
 /// thread, mirroring Python's `chat_message_store_factory`
 /// (`_agents.py:1088-1092`). Configured via
-/// [`ChatAgentBuilder::chat_message_store_factory`] and used by
-/// [`ChatAgent::get_new_thread`] / [`ChatAgent::deserialize_thread`].
+/// [`AgentBuilder::chat_message_store_factory`] and used by
+/// [`Agent::get_new_thread`] / [`Agent::deserialize_thread`].
 pub type ChatMessageStoreFactory = Arc<dyn Fn() -> Arc<dyn ChatMessageStore> + Send + Sync>;
 
 /// Sanitize an agent name into a valid tool/function identifier, mirroring
@@ -212,7 +212,7 @@ fn sanitize_agent_name(agent_name: Option<&str>) -> Option<String> {
 
 /// The common interface implemented by all agents.
 #[async_trait]
-pub trait Agent: Send + Sync {
+pub trait SupportsAgentRun: Send + Sync {
     /// Run the agent to completion.
     async fn run(
         &self,
@@ -224,10 +224,10 @@ pub trait Agent: Send + Sync {
     /// the agent's build-time defaults.
     ///
     /// The default implementation ignores `options` and delegates to
-    /// [`Agent::run`], emitting a `tracing::warn!` when non-empty options are
+    /// [`SupportsAgentRun::run`], emitting a `tracing::warn!` when non-empty options are
     /// supplied — mirroring upstream agents that silently drop kwargs they do
     /// not understand. Agents that support per-run overrides (notably
-    /// [`ChatAgent`]) override this.
+    /// [`Agent`]) override this.
     async fn run_with_options(
         &self,
         messages: Vec<Message>,
@@ -246,14 +246,14 @@ pub trait Agent: Send + Sync {
     /// Run the agent and stream incremental [`AgentResponseUpdate`]s.
     ///
     /// The default implementation is a **buffered fallback**: it runs to
-    /// completion via [`Agent::run_with_options`] and yields the response's
+    /// completion via [`SupportsAgentRun::run_with_options`] and yields the response's
     /// messages as updates. Agents with a real streaming backend (notably
-    /// [`ChatAgent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
+    /// [`Agent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
     /// A2A client agent) override this to stream incrementally.
     ///
     /// `thread` is taken **by value**: the returned stream owns it and writes
     /// the conversation back once the stream is fully consumed. When the
-    /// thread's message store is shared (as [`ChatAgent`]'s is, via `Arc`), the
+    /// thread's message store is shared (as [`Agent`]'s is, via `Arc`), the
     /// write-back is observable through a clone taken before streaming.
     async fn run_stream(
         &self,
@@ -293,9 +293,9 @@ pub trait Agent: Send + Sync {
 /// options, tools, context providers, and middleware.
 ///
 /// Cheaply cloneable (the client, context providers, and middleware are shared
-/// via `Arc`), which is what makes [`ChatAgent::as_tool`] possible.
+/// via `Arc`), which is what makes [`Agent::as_tool`] possible.
 #[derive(Clone)]
-pub struct ChatAgent {
+pub struct Agent {
     id: String,
     name: Option<String>,
     description: Option<String>,
@@ -307,15 +307,15 @@ pub struct ChatAgent {
     chat_message_store_factory: Option<ChatMessageStoreFactory>,
     agent_middleware: MiddlewarePipeline<AgentContext>,
     /// Middleware run around the underlying chat-client call (mirrors
-    /// Python's `use_chat_middleware`). See [`ChatAgent::call_chat_client`].
+    /// Python's `use_chat_middleware`). See [`Agent::call_chat_client`].
     chat_middleware: MiddlewarePipeline<ChatContext>,
     /// Dynamic tool sources (e.g. MCP servers), resolved fresh on every run
     /// and appended after the agent's static/context/per-run tools. See
-    /// [`ToolSource`] and [`ChatAgent::prepare_request`].
+    /// [`ToolSource`] and [`Agent::prepare_request`].
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
-/// Options for [`ChatAgent::as_tool`].
+/// Options for [`Agent::as_tool`].
 #[derive(Debug, Clone, Default)]
 pub struct AsToolOptions {
     /// The tool name. Defaults to the agent's name (else its id).
@@ -354,11 +354,11 @@ impl AsToolOptions {
     }
 }
 
-impl ChatAgent {
+impl Agent {
     /// Start building an agent from a chat client. The client is automatically
     /// wrapped with [`FunctionInvokingChatClient`] so local tools are executed.
-    pub fn builder(client: impl ChatClient + 'static) -> ChatAgentBuilder {
-        ChatAgentBuilder::new(client)
+    pub fn builder(client: impl ChatClient + 'static) -> AgentBuilder {
+        AgentBuilder::new(client)
     }
 
     /// The agent's default instructions.
@@ -367,7 +367,7 @@ impl ChatAgent {
     }
 
     /// Run and stream incremental updates — an ergonomic wrapper over the
-    /// object-safe [`Agent::run_stream`] trait method (the real streaming
+    /// object-safe [`SupportsAgentRun::run_stream`] trait method (the real streaming
     /// implementation), accepting `impl IntoMessages`.
     ///
     /// The thread's history is updated when the stream completes; because
@@ -380,13 +380,13 @@ impl ChatAgent {
         thread: Option<AgentThread>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        Agent::run_stream(self, messages.into_messages(), thread, options).await
+        SupportsAgentRun::run_stream(self, messages.into_messages(), thread, options).await
     }
 
     /// Ergonomic streaming run with a fresh thread and no per-run options
-    /// (mirrors [`ChatAgent::run_once`]).
+    /// (mirrors [`Agent::run_once`]).
     pub async fn run_stream_once(&self, messages: impl IntoMessages) -> Result<AgentRunStream> {
-        Agent::run_stream(self, messages.into_messages(), None, None).await
+        SupportsAgentRun::run_stream(self, messages.into_messages(), None, None).await
     }
 
     /// Ergonomic run without an explicit thread.
@@ -394,7 +394,7 @@ impl ChatAgent {
         self.run(messages.into_messages(), None).await
     }
 
-    /// The real streaming implementation, shared by the [`Agent::run_stream`]
+    /// The real streaming implementation, shared by the [`SupportsAgentRun::run_stream`]
     /// trait impl. Kept as an inherent helper so the trait method stays a thin
     /// forwarder.
     async fn run_stream_impl(
@@ -693,7 +693,7 @@ impl ChatAgent {
     /// Apply chat middleware to a *streaming* call's `messages`/`chat_options`
     /// before the real network call.
     ///
-    /// Unlike [`ChatAgent::call_chat_client`], this only honors *pre-call*
+    /// Unlike [`Agent::call_chat_client`], this only honors *pre-call*
     /// mutation: a real token stream can't flow back through
     /// [`ChatContext::result`] (typed for a complete [`ChatResponse`]), so any
     /// middleware logic placed *after* `next.run(...)` observes
@@ -703,9 +703,9 @@ impl ChatAgent {
     /// path likewise hands middleware an unconsumed async generator rather
     /// than driving it through the pipeline. Full interception (including
     /// short-circuiting) for chat middleware is available via
-    /// [`ChatAgent::run`]/[`ChatAgent::run_once`], and via `run_stream` too
+    /// [`Agent::run`]/[`Agent::run_once`], and via `run_stream` too
     /// when at least one agent middleware is also configured (that path
-    /// funnels through [`ChatAgent::run_core`] and replays the result as
+    /// funnels through [`Agent::run_core`] and replays the result as
     /// updates).
     async fn apply_chat_middleware_pre_call(
         &self,
@@ -893,7 +893,7 @@ fn async_stream_forward(
 }
 
 #[async_trait]
-impl Agent for ChatAgent {
+impl SupportsAgentRun for Agent {
     async fn run(
         &self,
         messages: Vec<Message>,
@@ -983,14 +983,14 @@ impl Agent for ChatAgent {
     }
 }
 
-/// Builder for [`ChatAgent`].
-pub struct ChatAgentBuilder {
+/// Builder for [`Agent`].
+pub struct AgentBuilder {
     id: Option<String>,
     name: Option<String>,
     description: Option<String>,
     instructions: Option<String>,
     /// The raw, caller-supplied client. Wrapping in [`FunctionInvokingChatClient`]
-    /// is deferred to [`ChatAgentBuilder::build`] so that builder-collected
+    /// is deferred to [`AgentBuilder::build`] so that builder-collected
     /// function middleware can be threaded into the wrapper's constructor.
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
@@ -1002,7 +1002,7 @@ pub struct ChatAgentBuilder {
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
-impl ChatAgentBuilder {
+impl AgentBuilder {
     fn new(client: impl ChatClient + 'static) -> Self {
         Self {
             id: None,
@@ -1068,7 +1068,7 @@ impl ChatAgentBuilder {
     /// per-run tools (dedup by name against those and any earlier-registered
     /// source; first registrant wins). Call repeatedly to register more than
     /// one source. See [`ToolSource`], resolved internally by every
-    /// [`ChatAgent`] run.
+    /// [`Agent`] run.
     pub fn tool_source(mut self, source: Arc<dyn ToolSource>) -> Self {
         self.tool_sources.push(source);
         self
@@ -1080,7 +1080,7 @@ impl ChatAgentBuilder {
     }
     /// Set a factory for the message store of each new local thread, mirroring
     /// Python's `chat_message_store_factory`. Used by
-    /// [`ChatAgent::get_new_thread`] and [`ChatAgent::deserialize_thread`]
+    /// [`Agent::get_new_thread`] and [`Agent::deserialize_thread`]
     /// instead of hardcoding [`InMemoryChatMessageStore`].
     pub fn chat_message_store_factory<F>(mut self, factory: F) -> Self
     where
@@ -1095,7 +1095,7 @@ impl ChatAgentBuilder {
         self
     }
     /// Add a chat middleware, run around the underlying chat-client call on
-    /// every request (repeatable, like [`ChatAgentBuilder::middleware`]).
+    /// every request (repeatable, like [`AgentBuilder::middleware`]).
     /// See the chat-client call pipeline for exactly what it can observe
     /// and mutate.
     pub fn chat_middleware(mut self, mw: Arc<crate::middleware::ChatMiddleware>) -> Self {
@@ -1117,7 +1117,7 @@ impl ChatAgentBuilder {
     }
 
     /// Build the agent.
-    pub fn build(mut self) -> ChatAgent {
+    pub fn build(mut self) -> Agent {
         if let Some(instr) = self.instructions.take() {
             self.chat_options.instructions = Some(match self.chat_options.instructions.take() {
                 Some(existing) => format!("{instr}\n{existing}"),
@@ -1133,7 +1133,7 @@ impl ChatAgentBuilder {
             FunctionInvokingChatClient::new(self.client)
                 .with_function_middleware(self.function_middleware),
         );
-        ChatAgent {
+        Agent {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: self.name,
             description: self.description,
@@ -1148,7 +1148,7 @@ impl ChatAgentBuilder {
     }
 }
 
-impl ChatAgent {
+impl Agent {
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
@@ -1200,9 +1200,9 @@ impl ChatAgent {
     /// ```no_run
     /// # use agent_framework_core::prelude::*;
     /// # use agent_framework_core::agent::AsToolOptions;
-    /// # fn demo(researcher: ChatAgent, coordinator_client: impl ChatClient + 'static) {
+    /// # fn demo(researcher: Agent, coordinator_client: impl ChatClient + 'static) {
     /// let research_tool = researcher.as_tool(AsToolOptions::new().name("research"));
-    /// let coordinator = ChatAgent::builder(coordinator_client)
+    /// let coordinator = Agent::builder(coordinator_client)
     ///     .tool(research_tool)
     ///     .build();
     /// # let _ = coordinator;

@@ -75,10 +75,10 @@ impl MagenticManager for ScriptedManager {
 
 /// Never actually invoked here (the ledger reports "satisfied" immediately),
 /// but the builder requires at least one participant.
-fn placeholder_participant() -> Arc<dyn Agent> {
+fn placeholder_participant() -> Arc<dyn SupportsAgentRun> {
     struct Silent;
     #[async_trait]
-    impl Agent for Silent {
+    impl SupportsAgentRun for Silent {
         async fn run(
             &self,
             _messages: Vec<Message>,

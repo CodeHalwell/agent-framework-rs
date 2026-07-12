@@ -1,5 +1,5 @@
 //! Talk to a remote Agent2Agent (A2A) server as if it were a local agent:
-//! `A2AAgent` implements the `Agent` trait over the A2A JSON-RPC protocol,
+//! `A2AAgent` implements the `SupportsAgentRun` trait over the A2A JSON-RPC protocol,
 //! and reusing one `AgentThread` carries the remote `contextId`/`taskId`
 //! across turns for a real multi-turn conversation.
 //!

@@ -28,7 +28,7 @@
 //!
 //! The main entry point is [`ObservableChatClient`], a [`ChatClient`] decorator.
 //! Tool execution inside [`FunctionInvokingChatClient`] and the
-//! [`ChatAgent`](crate::agent::ChatAgent) run paths are instrumented directly by
+//! [`Agent`](crate::agent::Agent) run paths are instrumented directly by
 //! those types using the span constructors here.
 //!
 //! ## Metrics (`otel-metrics` feature)

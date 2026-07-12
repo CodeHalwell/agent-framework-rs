@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_framework_core::agent::{Agent, ChatAgent};
+use agent_framework_core::agent::{Agent, SupportsAgentRun};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::workflow::Condition;
@@ -163,7 +163,7 @@ impl ToolRegistry {
 /// [`WorkflowSpec`](crate::WorkflowSpec).
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
-    agents: HashMap<String, Arc<dyn Agent>>,
+    agents: HashMap<String, Arc<dyn SupportsAgentRun>>,
 }
 
 impl AgentRegistry {
@@ -173,23 +173,23 @@ impl AgentRegistry {
     }
 
     /// Register an agent under `id`.
-    pub fn register(&mut self, id: impl Into<String>, agent: Arc<dyn Agent>) {
+    pub fn register(&mut self, id: impl Into<String>, agent: Arc<dyn SupportsAgentRun>) {
         self.agents.insert(id.into(), agent);
     }
 
-    /// Register a concrete [`ChatAgent`] under `id`.
-    pub fn register_chat_agent(&mut self, id: impl Into<String>, agent: ChatAgent) {
+    /// Register a concrete [`Agent`] under `id`.
+    pub fn register_chat_agent(&mut self, id: impl Into<String>, agent: Agent) {
         self.agents.insert(id.into(), Arc::new(agent));
     }
 
     /// Builder form of [`AgentRegistry::register`].
-    pub fn with(mut self, id: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn with(mut self, id: impl Into<String>, agent: Arc<dyn SupportsAgentRun>) -> Self {
         self.register(id, agent);
         self
     }
 
     /// Look up an agent by id.
-    pub(crate) fn get(&self, id: &str) -> Result<Arc<dyn Agent>> {
+    pub(crate) fn get(&self, id: &str) -> Result<Arc<dyn SupportsAgentRun>> {
         self.agents
             .get(id)
             .cloned()

@@ -1,6 +1,6 @@
 //! MCP prompts: list a server's reusable prompt templates (`prompts/list`),
 //! render one into messages (`prompts/get`), and feed the result straight
-//! into a `ChatAgent` run as ordinary `Message`s.
+//! into a `Agent` run as ordinary `Message`s.
 //!
 //! Same prerequisites as `mcp_tools.rs`: a working `npx` (Node.js) on PATH,
 //! plus OPENAI_API_KEY to run the rendered prompt through a real model. This
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
 
     // The rendered messages are ordinary `Message`s -- hand them straight
     // to an agent run, exactly like a hand-written prompt would be.
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("Respond helpfully to the rendered prompt.")
         .build();

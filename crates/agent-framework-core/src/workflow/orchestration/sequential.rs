@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use super::AgentExecutor;
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::workflow::{Workflow, WorkflowBuilder};
 
@@ -13,7 +13,7 @@ use crate::workflow::{Workflow, WorkflowBuilder};
 /// appends its reply; the final conversation is yielded as output.
 #[derive(Default)]
 pub struct SequentialBuilder {
-    participants: Vec<Arc<dyn Agent>>,
+    participants: Vec<Arc<dyn SupportsAgentRun>>,
     name: Option<String>,
 }
 
@@ -24,14 +24,17 @@ impl SequentialBuilder {
     }
 
     /// Set the ordered list of participants.
-    pub fn participants(mut self, agents: impl IntoIterator<Item = Arc<dyn Agent>>) -> Self {
+    pub fn participants(
+        mut self,
+        agents: impl IntoIterator<Item = Arc<dyn SupportsAgentRun>>,
+    ) -> Self {
         self.participants = agents.into_iter().collect();
         self
     }
 
     /// Append a participant to the pipeline.
     #[allow(clippy::should_implement_trait)]
-    pub fn add(mut self, agent: Arc<dyn Agent>) -> Self {
+    pub fn add(mut self, agent: Arc<dyn SupportsAgentRun>) -> Self {
         self.participants.push(agent);
         self
     }

@@ -82,9 +82,9 @@ async fn main() -> Result<()> {
 
     let client = RetryingChatClient::new(flaky).with_policy(policy);
 
-    // Works standalone or as the client behind a ChatAgent -- retries happen
+    // Works standalone or as the client behind a Agent -- retries happen
     // beneath the function-invocation loop either way.
-    let agent = ChatAgent::builder(client).name("resilient").build();
+    let agent = Agent::builder(client).name("resilient").build();
 
     println!("running (watch the attempts):");
     let response = agent.run_once("Hi!").await?;

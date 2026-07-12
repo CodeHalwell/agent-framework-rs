@@ -60,13 +60,13 @@ impl ChatClient for MockClient {
     }
 }
 
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 fn ledger_json(
@@ -100,7 +100,7 @@ async fn standard_manager_drives_agents_to_completion() {
         ChatResponse::from_text("FINAL ANSWER: the sum is 42"),
     ]);
     let manager_agent =
-        Arc::new(ChatAgent::builder(manager_client).name("mgr").build()) as Arc<dyn Agent>;
+        Arc::new(Agent::builder(manager_client).name("mgr").build()) as Arc<dyn SupportsAgentRun>;
     let manager = StandardMagenticManager::new(manager_agent).max_round_count(10);
 
     let coder = agent("coder", vec!["def solve(): return 42"]);

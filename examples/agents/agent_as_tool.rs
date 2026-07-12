@@ -1,5 +1,5 @@
 //! Compose agents: a specialist agent is exposed as a callable tool to an
-//! orchestrator agent via `ChatAgent::as_tool`.
+//! orchestrator agent via `Agent::as_tool`.
 //!
 //! ```bash
 //! OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example agent_as_tool
@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
 
     // The specialist: answers geography questions. `as_tool` runs it
     // statelessly (a fresh thread per call) and returns its reply text.
-    let geographer = ChatAgent::builder(client.clone())
+    let geographer = Agent::builder(client.clone())
         .name("geographer")
         .description("Answers questions about world geography.")
         .instructions("Answer geography questions in one short sentence.")
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
 
     // The orchestrator can now call the specialist exactly like any other
     // tool -- the function-invocation loop handles the call/result round trip.
-    let orchestrator = ChatAgent::builder(client)
+    let orchestrator = Agent::builder(client)
         .name("orchestrator")
         .instructions(
             "You answer user questions. For geography questions, delegate to \

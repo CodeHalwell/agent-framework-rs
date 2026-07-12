@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::error::{DeclarativeError, Result};
 
-/// A declarative agent specification (`kind: Prompt` / `kind: Agent`).
+/// A declarative agent specification (`kind: Prompt` / `kind: SupportsAgentRun`).
 ///
 /// Round-trips losslessly through [`AgentSpec::from_yaml`] / [`AgentSpec::to_yaml`].
 /// Environment-variable interpolation is applied by the
@@ -20,7 +20,7 @@ use crate::error::{DeclarativeError, Result};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentSpec {
-    /// The agent kind. Supported: `Prompt`, `Agent` (case-insensitive).
+    /// The agent kind. Supported: `Prompt`, `SupportsAgentRun` (case-insensitive).
     pub kind: String,
     /// The agent name (exposed to callers and used as the tool name in `as_tool`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

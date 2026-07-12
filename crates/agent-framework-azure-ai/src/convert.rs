@@ -1165,7 +1165,7 @@ mod tests {
         .unwrap();
         // Only the non-function tool is replayed.
         assert_eq!(body["tools"], json!([{"type": "code_interpreter"}]));
-        // Agent instructions are prepended ahead of the per-request ones.
+        // SupportsAgentRun instructions are prepended ahead of the per-request ones.
         assert_eq!(
             body["instructions"],
             json!("Be terse.\nper-request instructions")

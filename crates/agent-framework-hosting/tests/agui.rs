@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use agent_framework_core::agent::{Agent, ChatAgent};
+use agent_framework_core::agent::{Agent, SupportsAgentRun};
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
@@ -113,7 +113,7 @@ async fn missing_ids_are_generated_and_echoed() {
 struct FrontendToolAgent;
 
 #[async_trait]
-impl Agent for FrontendToolAgent {
+impl SupportsAgentRun for FrontendToolAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -139,8 +139,11 @@ impl Agent for FrontendToolAgent {
 
 #[tokio::test]
 async fn frontend_tool_call_framing_without_result() {
-    let app =
-        AgUiRouter::for_agent("tools", Arc::new(FrontendToolAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "tools",
+        Arc::new(FrontendToolAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({
         "threadId": "t", "runId": "r",
@@ -181,7 +184,7 @@ async fn frontend_tool_call_framing_without_result() {
 struct ExecutedToolAgent;
 
 #[async_trait]
-impl Agent for ExecutedToolAgent {
+impl SupportsAgentRun for ExecutedToolAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -208,8 +211,11 @@ impl Agent for ExecutedToolAgent {
 
 #[tokio::test]
 async fn executed_tool_call_emits_end_then_result() {
-    let app =
-        AgUiRouter::for_agent("tools", Arc::new(ExecutedToolAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "tools",
+        Arc::new(ExecutedToolAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({ "threadId": "t", "runId": "r", "messages": [] });
     let (status, text) = post_raw(app, "/", body.to_string()).await;
@@ -246,7 +252,7 @@ async fn executed_tool_call_emits_end_then_result() {
 struct FailingAgent;
 
 #[async_trait]
-impl Agent for FailingAgent {
+impl SupportsAgentRun for FailingAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -261,7 +267,8 @@ impl Agent for FailingAgent {
 
 #[tokio::test]
 async fn agent_failure_emits_run_error() {
-    let app = AgUiRouter::for_agent("boom", Arc::new(FailingAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent("boom", Arc::new(FailingAgent) as Arc<dyn SupportsAgentRun>)
+        .into_router();
 
     let body = json!({ "threadId": "t", "runId": "r", "messages": [] });
     // The stream itself is a normal 200 text/event-stream; the failure is in-band.
@@ -294,7 +301,7 @@ async fn malformed_input_is_400() {
 struct InspectAgent;
 
 #[async_trait]
-impl Agent for InspectAgent {
+impl SupportsAgentRun for InspectAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
@@ -331,8 +338,11 @@ impl Agent for InspectAgent {
 async fn assistant_tool_call_and_tool_result_messages_are_mapped() {
     // A prior assistant tool call + a tool result in the history should map to
     // FunctionCall / FunctionResult content and reach the agent intact.
-    let app =
-        AgUiRouter::for_agent("inspect", Arc::new(InspectAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "inspect",
+        Arc::new(InspectAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({
         "threadId": "t", "runId": "r",
@@ -501,7 +511,7 @@ impl ChatClient for WeatherClient {
 
 #[tokio::test]
 async fn client_declared_tools_are_injected_and_round_trip_as_frontend_tools() {
-    let agent = ChatAgent::builder(WeatherClient).name("assistant").build();
+    let agent = Agent::builder(WeatherClient).name("assistant").build();
     let app = AgUiRouter::for_agent("assistant", agent).into_router();
 
     let body = json!({

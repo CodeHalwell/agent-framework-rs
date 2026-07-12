@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
         "additionalProperties": false
     });
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("chef")
         .instructions("You suggest simple recipes.")
         .response_format(ResponseFormat::json_schema("Recipe", schema))

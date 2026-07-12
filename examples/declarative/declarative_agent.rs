@@ -1,4 +1,4 @@
-//! Load a `ChatAgent` from a declarative YAML spec. The loader is
+//! Load a `Agent` from a declarative YAML spec. The loader is
 //! provider-agnostic: you register a `ChatClientFactory` closure per provider
 //! key ("OpenAI.Chat" here, i.e. `model.provider` + `model.apiType`), and the
 //! spec's model options (temperature, ...), instructions, and tools are wired

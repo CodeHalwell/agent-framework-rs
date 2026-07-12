@@ -4,7 +4,7 @@
 //! schema by hand).
 //!
 //! Runs offline: the schema-derivation and direct-invocation steps need no
-//! network. Only the final step -- wiring the tool into a live `ChatAgent` --
+//! network. Only the final step -- wiring the tool into a live `Agent` --
 //! is env-gated on `OPENAI_API_KEY` and skips gracefully without it.
 //!
 //! ```bash
@@ -65,12 +65,12 @@ async fn main() -> Result<()> {
 
     // Wiring it into a live agent is the only part that needs a real model.
     let Ok(_) = std::env::var("OPENAI_API_KEY") else {
-        println!("set OPENAI_API_KEY to also run this tool through a live ChatAgent");
+        println!("set OPENAI_API_KEY to also run this tool through a live Agent");
         return Ok(());
     };
 
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("weather-assistant")
         .instructions("You are a weather assistant. Use tools when needed.")
         .tool(get_weather.into_definition())

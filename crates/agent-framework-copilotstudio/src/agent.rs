@@ -1,12 +1,12 @@
 //! [`CopilotStudioAgent`]: wraps the Copilot Studio Direct-to-Engine API as a
-//! local [`Agent`].
+//! local [`SupportsAgentRun`].
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::SupportsAgentRun;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{AgentResponse, IntoMessages, Message, Role};
@@ -26,7 +26,7 @@ const D2E_USER_AGENT: &str = concat!(
 /// A Microsoft Copilot Studio agent, reached via the Direct-to-Engine (D2E)
 /// API. Wraps a [`CopilotStudioConnectionSettings`] + [`TokenProvider`] so a
 /// published (or prebuilt) Copilot Studio agent can be used anywhere the
-/// framework expects a local [`Agent`].
+/// framework expects a local [`SupportsAgentRun`].
 ///
 /// See the crate docs for the exact wire protocol, the auth burden this port
 /// pushes onto callers, and how conversation continuity here diverges
@@ -91,7 +91,7 @@ impl CopilotStudioAgent {
     }
 
     /// Ergonomic run without an explicit thread (mirrors
-    /// `ChatAgent::run_once`): the conversation starts fresh every call,
+    /// `Agent::run_once`): the conversation starts fresh every call,
     /// since no [`AgentThread`] is carried across calls to persist the
     /// Direct-to-Engine conversation id.
     pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
@@ -154,7 +154,7 @@ impl CopilotStudioAgent {
 }
 
 #[async_trait]
-impl Agent for CopilotStudioAgent {
+impl SupportsAgentRun for CopilotStudioAgent {
     async fn run(
         &self,
         messages: Vec<Message>,

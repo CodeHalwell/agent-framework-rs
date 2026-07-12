@@ -29,10 +29,10 @@
 //!   `/v1/entities/{id}/runs/{run_id}/responses` endpoint, so per the work
 //!   package we surface pending requests (in-stream and in the final response)
 //!   but do not persist runs or support resume.
-//! - Agent streaming drives the core `Agent::run_stream` and frames each update
+//! - SupportsAgentRun streaming drives the core `SupportsAgentRun::run_stream` and frames each update
 //!   as SSE live (one `response.output_text.delta` per update); the terminal
 //!   `response.completed` aggregates the run. Event ordering and payloads match
-//!   DevUI's names. Non-streaming requests stay on `Agent::run`. (Workflow
+//!   DevUI's names. Non-streaming requests stay on `SupportsAgentRun::run`. (Workflow
 //!   streaming still frames the workflow's own event stream after the run.)
 
 pub mod models;
@@ -158,12 +158,12 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
             name: a.name.clone(),
             description: a.description.clone(),
             framework: "agent_framework",
-            // The core `Agent` trait exposes no tool list, so this is absent.
+            // The core `SupportsAgentRun` trait exposes no tool list, so this is absent.
             tools: None,
             metadata: Map::new(),
             source: "in_memory",
             instructions: a.instructions.clone(),
-            // `model_id` is not accessible through the `Agent` trait.
+            // `model_id` is not accessible through the `SupportsAgentRun` trait.
             model_id: None,
             executors: None,
             input_schema: None,
@@ -190,7 +190,7 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Agent execution
+// SupportsAgentRun execution
 // ---------------------------------------------------------------------------
 
 async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: String) -> Response {

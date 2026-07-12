@@ -111,7 +111,7 @@
 //! let token_provider = StaticTokenProvider::new("<graph-bearer-token>");
 //! let middleware = PurviewAgentMiddleware::new(token_provider, settings);
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
 //!     .middleware(Arc::new(middleware))
 //!     .build();

@@ -1,4 +1,4 @@
-//! Agent-spec parsing, field mapping, agent building, and error tests.
+//! SupportsAgentRun-spec parsing, field mapping, agent building, and error tests.
 //!
 //! The `specs/*.yaml` fixtures are verbatim copies of upstream reference
 //! samples, cited at each test:
@@ -23,7 +23,7 @@ const GET_WEATHER: &str = include_str!("specs/GetWeather.yaml");
 const OPENAI_CHAT: &str = include_str!("specs/OpenAIChat.yaml");
 const MS_LEARN: &str = include_str!("specs/MicrosoftLearnAgent.yaml");
 
-/// `ChatAgent` does not implement `Debug`, so `Result::unwrap_err` is
+/// `Agent` does not implement `Debug`, so `Result::unwrap_err` is
 /// unavailable; extract the error explicitly.
 fn expect_load_err(loader: &DeclarativeLoader, yaml: &str) -> DeclarativeError {
     match loader.load_agent(yaml) {

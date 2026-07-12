@@ -13,13 +13,13 @@ use agent_framework::prelude::*;
 use agent_framework::workflow::GroupChatBuilder;
 use agent_framework_core::types::Message;
 
-fn participant(client: &OpenAIClient, name: &str, instructions: &str) -> Arc<dyn Agent> {
+fn participant(client: &OpenAIClient, name: &str, instructions: &str) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name(name)
             .instructions(instructions)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]

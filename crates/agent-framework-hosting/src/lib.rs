@@ -9,11 +9,11 @@
 //!   `GET /health`, `GET /v1/entities`, `GET /v1/entities/{id}/info`,
 //!   `POST /v1/responses` (JSON or SSE), plus an embedded single-file debug
 //!   page at `GET /` and `GET /ui`. See [`devui`].
-//! - **A2A hosting** ([`a2a::A2ARouter`]) — the Agent-to-Agent protocol:
+//! - **A2A hosting** ([`a2a::A2ARouter`]) — the SupportsAgentRun-to-SupportsAgentRun protocol:
 //!   `GET /.well-known/agent-card.json` and a JSON-RPC 2.0 `POST /`.
 //! - **OpenAI Chat Completions** ([`openai_compat::OpenAiRouter`]) —
 //!   `POST /v1/chat/completions` (JSON or SSE), for OpenAI-Chat clients.
-//! - **AG-UI protocol** ([`agui::AgUiRouter`]) — CopilotKit's Agent-User
+//! - **AG-UI protocol** ([`agui::AgUiRouter`]) — CopilotKit's SupportsAgentRun-User
 //!   Interaction protocol: `POST {path}` streaming camelCase SSE events
 //!   (`RUN_STARTED` → `TEXT_MESSAGE_*` / `TOOL_CALL_*` → `RUN_FINISHED`),
 //!   mirroring the Python `agent_framework_ag_ui` package.
@@ -22,10 +22,10 @@
 //! or run directly with [`AgentHost::serve`].
 //!
 //! ```no_run
-//! use agent_framework_core::agent::ChatAgent;
+//! use agent_framework_core::agent::Agent;
 //! use agent_framework_hosting::{AgentHost, a2a::A2ARouter, openai_compat::OpenAiRouter};
 //!
-//! # async fn demo(assistant: ChatAgent) -> std::io::Result<()> {
+//! # async fn demo(assistant: Agent) -> std::io::Result<()> {
 //! // DevUI host with one agent.
 //! let host = AgentHost::new().agent("assistant", assistant.clone());
 //!

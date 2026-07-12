@@ -12,7 +12,7 @@
 //!
 //! # async fn demo() -> Result<()> {
 //! let client = OpenAIClient::new("sk-...", "gpt-4o-mini");
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;

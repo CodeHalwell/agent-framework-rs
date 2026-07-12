@@ -1,6 +1,6 @@
 //! Azure AI Foundry persistent agents: `AzureAIAgentClient` speaks the
 //! Foundry Agents REST routes (Assistants conventions -- agents, threads,
-//! runs) and plugs into `ChatAgent` like any other `ChatClient`. Entra ID
+//! runs) and plugs into `Agent` like any other `ChatClient`. Entra ID
 //! auth comes from the `azure` crate's credential chain -- here the Azure CLI
 //! credential (`az login`), but `ClientSecretCredential`,
 //! `ManagedIdentityCredential`, or a `ChainedTokenCredential` work the same.
@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     let client = AzureAIAgentClient::new(&endpoint, &model, credential)
         .with_agent_name("rust-example-agent");
 
-    let agent = ChatAgent::builder(client.clone())
+    let agent = Agent::builder(client.clone())
         .name("foundry-assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();

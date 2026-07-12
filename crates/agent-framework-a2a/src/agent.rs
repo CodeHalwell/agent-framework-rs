@@ -1,4 +1,4 @@
-//! [`A2AAgent`]: wraps an [`A2AClient`] as a local [`Agent`].
+//! [`A2AAgent`]: wraps an [`A2AClient`] as a local [`SupportsAgentRun`].
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -9,7 +9,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
+use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
@@ -27,7 +27,7 @@ use crate::types::{
 /// Agent2Agent (A2A) protocol client agent.
 ///
 /// Wraps an [`A2AClient`] so a remote, A2A-compliant agent can be used
-/// anywhere the framework expects a local [`Agent`]: [`Message`]s in,
+/// anywhere the framework expects a local [`SupportsAgentRun`]: [`Message`]s in,
 /// [`AgentResponse`] out, with `contextId`/`taskId` continuity tracked per
 /// [`AgentThread`]. See the crate docs for the exact mapping and how this
 /// diverges from the Python reference implementation.
@@ -41,7 +41,7 @@ pub struct A2AAgent {
 
 impl A2AAgent {
     /// Point at a remote agent's JSON-RPC endpoint directly. The real
-    /// [`AgentCard`] is discovered lazily — on the first [`Agent::run`] call,
+    /// [`AgentCard`] is discovered lazily — on the first [`SupportsAgentRun::run`] call,
     /// or explicitly via [`Self::initialize`] — falling back to using `url`
     /// itself as the JSON-RPC endpoint if discovery isn't available (many
     /// minimal A2A servers don't expose a `.well-known` document).
@@ -90,7 +90,7 @@ impl A2AAgent {
     }
 
     /// Ergonomic run without an explicit thread (mirrors
-    /// `ChatAgent::run_once`): the conversation starts fresh every call,
+    /// `Agent::run_once`): the conversation starts fresh every call,
     /// since no [`AgentThread`] is carried across calls to persist
     /// `contextId`/`taskId`.
     pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
@@ -99,7 +99,7 @@ impl A2AAgent {
 
     /// Resolve the remote [`AgentCard`], propagating discovery failures.
     ///
-    /// [`Agent::run`] performs the best-effort equivalent of this
+    /// [`SupportsAgentRun::run`] performs the best-effort equivalent of this
     /// automatically on first use; call this explicitly when you want to
     /// know discovery actually succeeded (e.g. to read `capabilities` /
     /// `skills` before the first run) rather than have it silently fall back
@@ -108,7 +108,7 @@ impl A2AAgent {
         self.client.get_agent_card().await
     }
 
-    /// Best-effort card discovery used internally by [`Agent::run`]: unlike
+    /// Best-effort card discovery used internally by [`SupportsAgentRun::run`]: unlike
     /// [`Self::initialize`], never fails the run just because `.well-known`
     /// discovery isn't available.
     async fn ensure_initialized(&self) {
@@ -155,7 +155,7 @@ impl ThreadState {
 }
 
 #[async_trait]
-impl Agent for A2AAgent {
+impl SupportsAgentRun for A2AAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
@@ -216,7 +216,7 @@ impl Agent for A2AAgent {
 
         // Best effort: this only fails if `thread` already owns a local
         // message store (mutually exclusive with a service thread id on
-        // `AgentThread`) — e.g. a thread borrowed from a `ChatAgent`. In that
+        // `AgentThread`) — e.g. a thread borrowed from a `Agent`. In that
         // case the run still succeeds; it just won't get contextId/taskId
         // continuity on that particular thread.
         if let Some(encoded) = new_state.encode() {
@@ -243,15 +243,15 @@ impl Agent for A2AAgent {
     /// [`MessageStreamEvent`] to an [`AgentResponseUpdate`] as it arrives,
     /// accumulating `contextId`/`taskId` and writing the resulting
     /// continuity state back onto the (owned) thread once the stream ends —
-    /// mirroring [`Agent::run`]'s bookkeeping on this type. Per-run
+    /// mirroring [`SupportsAgentRun::run`]'s bookkeeping on this type. Per-run
     /// [`AgentRunOptions`] have no A2A representation; non-empty options are
     /// ignored with a warning.
     ///
-    /// Note: unlike [`ChatAgent`](agent_framework_core::agent::ChatAgent),
+    /// Note: unlike [`Agent`](agent_framework_core::agent::Agent),
     /// A2A continuity state lives in a plain (non-shared) thread field, so the
     /// end-of-stream write-back is not observable through a thread clone taken
     /// before streaming — carry the returned continuity forward via
-    /// [`Agent::run`] when you need multi-turn A2A conversations.
+    /// [`SupportsAgentRun::run`] when you need multi-turn A2A conversations.
     async fn run_stream(
         &self,
         messages: Vec<Message>,
@@ -1081,7 +1081,7 @@ mod tests {
 
     // -- ThreadState --------------------------------------------------
 
-    // -- Streaming event -> update mapping (Agent::run_stream override) -----
+    // -- Streaming event -> update mapping (SupportsAgentRun::run_stream override) -----
 
     #[test]
     fn stream_event_message_maps_to_update_and_tracks_ids() {
@@ -1265,7 +1265,7 @@ mod tests {
         );
     }
 
-    // -- Agent trait plumbing -------------------------------------------
+    // -- SupportsAgentRun trait plumbing -------------------------------------------
 
     #[test]
     fn from_url_sets_name_and_random_id() {

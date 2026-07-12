@@ -15,18 +15,18 @@ async fn main() -> Result<()> {
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
 
     let writer = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("writer")
             .instructions("You write a short first draft paragraph on the given topic.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let editor = Arc::new(
-        ChatAgent::builder(client)
+        Agent::builder(client)
             .name("editor")
             .instructions("You improve the previous draft for clarity and concision.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let workflow = SequentialBuilder::new()
         .participants(vec![writer, editor])

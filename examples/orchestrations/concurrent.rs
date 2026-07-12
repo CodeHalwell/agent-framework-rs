@@ -51,8 +51,8 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn expert(name: &str, reply: &'static str) -> Arc<dyn Agent> {
-    Arc::new(ChatAgent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn Agent>
+fn expert(name: &str, reply: &'static str) -> Arc<dyn SupportsAgentRun> {
+    Arc::new(Agent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]

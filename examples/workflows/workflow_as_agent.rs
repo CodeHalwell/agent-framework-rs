@@ -1,4 +1,4 @@
-//! workflow_as_agent: expose a built `Workflow` as an `Agent` via
+//! workflow_as_agent: expose a built `Workflow` as an `SupportsAgentRun` via
 //! `WorkflowAgentExt::as_agent`, then drive it exactly like any other agent
 //! -- `run` with a caller-supplied `AgentThread` that accumulates history
 //! across calls.
@@ -69,12 +69,12 @@ impl ChatClient for ScriptedClient {
     }
 }
 
-fn scripted_agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn scripted_agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(ScriptedClient::new(replies))
+        Agent::builder(ScriptedClient::new(replies))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]

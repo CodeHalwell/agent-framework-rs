@@ -17,25 +17,25 @@ async fn main() -> Result<()> {
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
 
     let researcher = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("researcher")
             .instructions("You find and summarize relevant facts.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let writer = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("writer")
             .instructions("You turn facts into a polished, short answer.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     // The manager is itself an LLM agent: it plans the task, picks the next
     // speaker each round, and eventually prepares the final answer. It needs
     // no special instructions -- `StandardMagenticManager` supplies its own
     // ported-from-Python planning/progress-ledger prompts.
-    let manager_agent =
-        Arc::new(ChatAgent::builder(client).name("magentic_manager").build()) as Arc<dyn Agent>;
+    let manager_agent = Arc::new(Agent::builder(client).name("magentic_manager").build())
+        as Arc<dyn SupportsAgentRun>;
     let manager = StandardMagenticManager::new(manager_agent)
         .max_round_count(10)
         .max_stall_count(3);

@@ -19,7 +19,7 @@ pub struct HealthResponse {
 ///
 /// Divergences from DevUI: `null`-valued optional fields are omitted rather than
 /// serialized as `null`; `tools`/`model_id` are populated only when cheaply
-/// available from the concrete agent type (the core `Agent` trait exposes
+/// available from the concrete agent type (the core `SupportsAgentRun` trait exposes
 /// neither, so both are usually absent — see crate docs).
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityInfo {
@@ -34,7 +34,7 @@ pub struct EntityInfo {
     pub tools: Option<Vec<String>>,
     pub metadata: Map<String, Value>,
     pub source: &'static str,
-    // Agent-specific.
+    // SupportsAgentRun-specific.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

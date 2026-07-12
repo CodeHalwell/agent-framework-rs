@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     // The middleware runs around the whole agent turn: the user prompt is
     // checked before the model is called, and the model's response before it
     // is returned. Blocked content never reaches the other side.
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("compliant-assistant")
         .instructions("You are a helpful assistant.")
         .middleware(Arc::new(middleware))

@@ -3,7 +3,7 @@
 //! A [Microsoft Copilot Studio](https://copilotstudio.microsoft.com/) agent
 //! **client** for `agent-framework-rs`: talk to a published (or prebuilt)
 //! Copilot Studio agent over its Direct-to-Engine (D2E) API as if it were a
-//! local [`Agent`](agent_framework_core::agent::Agent).
+//! local [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun).
 //!
 //! This is the Rust equivalent of `agent_framework_copilotstudio`
 //! (`CopilotStudioAgent`) in the Python reference implementation. Python
@@ -45,7 +45,7 @@
 //! - [`activity`] — the Direct-to-Engine `Activity` wire shape and
 //!   SSE/JSON-array response parsing.
 //! - [`agent`] — [`CopilotStudioAgent`]: the
-//!   [`Agent`](agent_framework_core::agent::Agent) wrapper.
+//!   [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun) wrapper.
 //!
 //! ## Example
 //!
@@ -129,7 +129,7 @@
 //!   messages in one call, e.g. `agent.run(["Hello", "How are you?"])`);
 //!   that per-call flattening is not reproduced here.
 //! - **`run_stream` uses the trait's buffered default.**
-//!   [`agent_framework_core::agent::Agent`] now has an object-safe `run_stream`
+//!   [`agent_framework_core::agent::SupportsAgentRun`] now has an object-safe `run_stream`
 //!   (with a default that runs to completion and replays the messages as
 //!   updates), but [`CopilotStudioAgent`] deliberately does **not** override it
 //!   with real streaming. This sidesteps a genuine oddity in the Python
@@ -137,7 +137,7 @@
 //!   streaming=True)` call only ever surfaces `type == "typing"` activity text
 //!   as updates and *never* yields the final `type == "message"` activity — so
 //!   real Copilot Studio streaming would emit only interim typing indicators.
-//!   This port's [`Agent::run`](agent_framework_core::agent::Agent::run)
+//!   This port's [`SupportsAgentRun::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   mirrors Python's **non**-streaming path (`streaming=False`), which
 //!   correctly surfaces `message` activities and skips `typing`/other types;
 //!   the buffered `run_stream` default then replays that complete answer.

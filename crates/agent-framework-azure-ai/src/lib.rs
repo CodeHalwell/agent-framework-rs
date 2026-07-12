@@ -28,7 +28,7 @@
 //!     "gpt-4o",
 //!     credential,
 //! );
-//! let agent = ChatAgent::builder(client).instructions("You are concise.").build();
+//! let agent = Agent::builder(client).instructions("You are concise.").build();
 //! let reply = agent.run_once("Say hi").await?;
 //! println!("{}", reply.text());
 //! # Ok(())

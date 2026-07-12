@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     .with_approval_mode(ApprovalMode::AlwaysRequire)
     .into_definition();
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("file-assistant")
         .instructions("You help manage files. Use tools when the user asks for a file action.")
         .tool(delete_file)

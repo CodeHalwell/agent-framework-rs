@@ -3,7 +3,7 @@
 //! A Model Context Protocol (MCP) client for `agent-framework-rs`. Connects to
 //! MCP servers, lists their tools, and turns them into
 //! [`ToolDefinition`](agent_framework_core::tools::ToolDefinition)s that plug
-//! straight into a `ChatAgent`.
+//! straight into a `Agent`.
 //!
 //! This is the Rust equivalent of `agent_framework._mcp` (`MCPStdioTool`,
 //! `MCPStreamableHTTPTool`) in the Python reference implementation.
@@ -32,7 +32,7 @@
 //! ## Dynamic tools ([`ToolSource`](agent_framework_core::tools::ToolSource))
 //!
 //! [`McpStdioTool`], [`McpStreamableHttpTool`], and [`McpWebsocketTool`] all
-//! implement `ToolSource`, so `ChatAgent::builder().tool_source(Arc::new(mcp))`
+//! implement `ToolSource`, so `Agent::builder().tool_source(Arc::new(mcp))`
 //! resolves the server's tool list fresh on every agent run instead of
 //! freezing it at build time (the alternative, `.tool_definitions().await`
 //! once up front). Resolution connects lazily on first use and thereafter
@@ -100,7 +100,7 @@
 //! // Connects (if needed) and lists the server's tools as ToolDefinitions.
 //! let tools = mcp.tool_definitions().await?;
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .name("assistant")
 //!     .instructions("You can read files when needed.")
 //!     .tools(tools)

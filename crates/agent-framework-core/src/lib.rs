@@ -6,8 +6,8 @@
 //! - [`types`] — the data model: messages, content, responses, options.
 //! - [`client`] — the [`ChatClient`](client::ChatClient) trait and the
 //!   automatic function-invocation loop.
-//! - [`agent`] — the [`Agent`](agent::Agent) trait and
-//!   [`ChatAgent`](agent::ChatAgent).
+//! - [`agent`] — the [`SupportsAgentRun`](agent::SupportsAgentRun) trait and
+//!   [`Agent`](agent::Agent).
 //! - [`tools`] — executable tools and hosted-tool markers.
 //! - [`threads`] — conversation threads and message stores.
 //! - [`memory`] — context / memory providers.
@@ -22,7 +22,7 @@
 //! ```no_run
 //! use agent_framework_core::prelude::*;
 //! # async fn demo(client: impl ChatClient + 'static) -> Result<()> {
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .name("assistant")
 //!     .instructions("You are a helpful assistant.")
 //!     .build();
@@ -51,7 +51,7 @@ pub use error::{Error, Result};
 /// Commonly used imports.
 pub mod prelude {
     pub use crate::agent::{
-        Agent, AgentRunOptions, AgentRunStream, AsToolOptions, ChatAgent, ChatAgentBuilder,
+        Agent, AgentBuilder, AgentRunOptions, AgentRunStream, AsToolOptions, SupportsAgentRun,
     };
     pub use crate::client::{
         ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,

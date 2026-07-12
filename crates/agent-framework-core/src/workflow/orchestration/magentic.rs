@@ -2,13 +2,13 @@
 //! coordinates participants round by round via a structured progress ledger,
 //! replanning on stalls. Rust analogue of `_magentic.py`.
 //!
-//! The [`StandardMagenticManager`] drives an LLM ([`Agent`]) with the ported
+//! The [`StandardMagenticManager`] drives an LLM ([`SupportsAgentRun`]) with the ported
 //! Magentic-One prompts to plan, produce a JSON progress ledger each round,
 //! replan on stall, and synthesize the final answer. The [`MagenticManager`]
 //! trait lets callers supply a fully custom manager.
 //!
 //! Divergences from Python (documented): a single orchestrator [`Executor`]
-//! drives the loop and calls participants via [`Agent::run`] directly (Python
+//! drives the loop and calls participants via [`SupportsAgentRun::run`] directly (Python
 //! wires a graph of agent nodes); the progress-ledger retry loop has no
 //! backoff sleep.
 //!
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ensure_author, parse_conversation, run_agent_and_emit};
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::{AgentResponse, Message, Role};
 use crate::workflow::{
@@ -455,7 +455,7 @@ pub trait MagenticManager: Send + Sync {
 
 /// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
 pub struct StandardMagenticManager {
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
     task_ledger: Mutex<Option<MagenticTaskLedger>>,
     max_stall_count: usize,
     max_reset_count: Option<usize>,
@@ -465,7 +465,7 @@ pub struct StandardMagenticManager {
 
 impl StandardMagenticManager {
     /// Create a manager driven by `agent`.
-    pub fn new(agent: Arc<dyn Agent>) -> Self {
+    pub fn new(agent: Arc<dyn SupportsAgentRun>) -> Self {
         Self {
             agent,
             task_ledger: Mutex::new(None),
@@ -869,7 +869,7 @@ const STALL_STATE_KEY: &str = "_magentic_stall_state";
 struct MagenticOrchestrator {
     id: String,
     manager: Arc<dyn MagenticManager>,
-    participants: Vec<(String, Arc<dyn Agent>)>,
+    participants: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     descriptions: Vec<(String, String)>,
     max_stall_count: usize,
     max_reset_count: Option<usize>,
@@ -880,7 +880,7 @@ struct MagenticOrchestrator {
 }
 
 impl MagenticOrchestrator {
-    fn find(&self, name: &str) -> Option<&Arc<dyn Agent>> {
+    fn find(&self, name: &str) -> Option<&Arc<dyn SupportsAgentRun>> {
         self.participants
             .iter()
             .find(|(n, _)| n == name)
@@ -1314,7 +1314,7 @@ fn serialize<T: Serialize>(value: &T) -> Result<Value> {
 /// # use std::sync::Arc;
 /// # use agent_framework_core::prelude::*;
 /// # use agent_framework_core::workflow::{MagenticBuilder, StandardMagenticManager};
-/// # fn demo(coder: Arc<dyn Agent>, researcher: Arc<dyn Agent>, manager_agent: Arc<dyn Agent>) -> Result<()> {
+/// # fn demo(coder: Arc<dyn SupportsAgentRun>, researcher: Arc<dyn SupportsAgentRun>, manager_agent: Arc<dyn SupportsAgentRun>) -> Result<()> {
 /// let manager = StandardMagenticManager::new(manager_agent);
 /// let workflow = MagenticBuilder::new()
 ///     .participant("coder", coder)
@@ -1328,7 +1328,7 @@ fn serialize<T: Serialize>(value: &T) -> Result<Value> {
 /// ```
 #[derive(Default)]
 pub struct MagenticBuilder {
-    participants: Vec<(String, String, Arc<dyn Agent>)>,
+    participants: Vec<(String, String, Arc<dyn SupportsAgentRun>)>,
     manager: Option<Arc<dyn MagenticManager>>,
     max_round_count: Option<usize>,
     max_stall_count: Option<usize>,
@@ -1353,7 +1353,11 @@ impl MagenticBuilder {
     }
 
     /// Register a participant (its description defaults to its name).
-    pub fn participant(mut self, name: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn participant(
+        mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn SupportsAgentRun>,
+    ) -> Self {
         let name = name.into();
         self.participants.push((name.clone(), name, agent));
         self
@@ -1364,7 +1368,7 @@ impl MagenticBuilder {
         mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        agent: Arc<dyn Agent>,
+        agent: Arc<dyn SupportsAgentRun>,
     ) -> Self {
         self.participants
             .push((name.into(), description.into(), agent));
@@ -1374,7 +1378,7 @@ impl MagenticBuilder {
     /// Register several participants as `(name, agent)` pairs.
     pub fn participants(
         mut self,
-        participants: impl IntoIterator<Item = (String, Arc<dyn Agent>)>,
+        participants: impl IntoIterator<Item = (String, Arc<dyn SupportsAgentRun>)>,
     ) -> Self {
         for (name, agent) in participants {
             self.participants.push((name.clone(), name, agent));
@@ -1465,7 +1469,7 @@ impl MagenticBuilder {
             .iter()
             .map(|(n, d, _)| (n.clone(), d.clone()))
             .collect();
-        let participants: Vec<(String, Arc<dyn Agent>)> = self
+        let participants: Vec<(String, Arc<dyn SupportsAgentRun>)> = self
             .participants
             .into_iter()
             .map(|(n, _, a)| (n, a))

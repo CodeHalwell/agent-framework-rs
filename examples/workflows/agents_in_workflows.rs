@@ -1,4 +1,4 @@
-//! agents_in_workflows: wrap `Agent`s as graph nodes via `AgentExecutor`, and
+//! agents_in_workflows: wrap `SupportsAgentRun`s as graph nodes via `AgentExecutor`, and
 //! mix them with a plain `FunctionExecutor` in the same graph -- something
 //! the `SequentialBuilder`/`ConcurrentBuilder` sugar doesn't expose. Each
 //! `AgentExecutor` appends its agent's reply to the running conversation and
@@ -56,8 +56,8 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn canned_agent(name: &str, reply: &'static str) -> Arc<dyn Agent> {
-    Arc::new(ChatAgent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn Agent>
+fn canned_agent(name: &str, reply: &'static str) -> Arc<dyn SupportsAgentRun> {
+    Arc::new(Agent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]

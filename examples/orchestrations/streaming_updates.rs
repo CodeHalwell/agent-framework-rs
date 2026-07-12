@@ -54,12 +54,12 @@ impl ChatClient for WordStreamingClient {
     }
 }
 
-fn streaming_agent(name: &str, reply: &'static str) -> Arc<dyn Agent> {
+fn streaming_agent(name: &str, reply: &'static str) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(WordStreamingClient(reply))
+        Agent::builder(WordStreamingClient(reply))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]

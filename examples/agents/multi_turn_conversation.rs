@@ -47,7 +47,7 @@ impl ChatClient for CannedClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(CannedClient).name("assistant").build();
+    let agent = Agent::builder(CannedClient).name("assistant").build();
     let mut thread = agent.get_new_thread();
 
     let turns = [

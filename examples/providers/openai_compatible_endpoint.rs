@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     println!("connecting to {base_url} (model \"{model}\")");
     let client = OpenAIClient::new(api_key, model).with_base_url(base_url);
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();

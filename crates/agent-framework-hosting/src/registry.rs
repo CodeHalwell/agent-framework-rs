@@ -9,23 +9,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_framework_core::agent::{Agent, ChatAgent};
+use agent_framework_core::agent::{Agent, SupportsAgentRun};
 use agent_framework_core::workflow::{Workflow, WorkflowAgent};
 
 /// An agent plus the display metadata captured from its concrete type.
 ///
 /// Produced by [`IntoAgentRegistration`]. `description` and `instructions` are
-/// best-effort: they are populated for [`ChatAgent`]/[`WorkflowAgent`] (whose
-/// accessors are public) and left `None` for an opaque `Arc<dyn Agent>`.
+/// best-effort: they are populated for [`Agent`]/[`WorkflowAgent`] (whose
+/// accessors are public) and left `None` for an opaque `Arc<dyn SupportsAgentRun>`.
 pub struct AgentRegistration {
-    pub(crate) agent: Arc<dyn Agent>,
+    pub(crate) agent: Arc<dyn SupportsAgentRun>,
     pub(crate) description: Option<String>,
     pub(crate) instructions: Option<String>,
 }
 
 impl AgentRegistration {
     /// Build a registration from a bare agent handle with no extra metadata.
-    pub fn new(agent: Arc<dyn Agent>) -> Self {
+    pub fn new(agent: Arc<dyn SupportsAgentRun>) -> Self {
         Self {
             agent,
             description: None,
@@ -47,7 +47,7 @@ impl AgentRegistration {
 }
 
 /// Conversion into an [`AgentRegistration`], letting [`AgentHost::agent`] accept
-/// a [`ChatAgent`], a [`WorkflowAgent`], or a bare `Arc<dyn Agent>` naturally
+/// a [`Agent`], a [`WorkflowAgent`], or a bare `Arc<dyn SupportsAgentRun>` naturally
 /// while still capturing description/instructions from the concrete types.
 pub trait IntoAgentRegistration {
     fn into_agent_registration(self) -> AgentRegistration;
@@ -59,7 +59,7 @@ impl IntoAgentRegistration for AgentRegistration {
     }
 }
 
-impl IntoAgentRegistration for ChatAgent {
+impl IntoAgentRegistration for Agent {
     fn into_agent_registration(self) -> AgentRegistration {
         let description = self.description().map(str::to_string);
         let instructions = self.instructions().map(str::to_string);
@@ -71,7 +71,7 @@ impl IntoAgentRegistration for ChatAgent {
     }
 }
 
-impl IntoAgentRegistration for Arc<ChatAgent> {
+impl IntoAgentRegistration for Arc<Agent> {
     fn into_agent_registration(self) -> AgentRegistration {
         let description = self.description().map(str::to_string);
         let instructions = self.instructions().map(str::to_string);
@@ -105,7 +105,7 @@ impl IntoAgentRegistration for Arc<WorkflowAgent> {
     }
 }
 
-impl IntoAgentRegistration for Arc<dyn Agent> {
+impl IntoAgentRegistration for Arc<dyn SupportsAgentRun> {
     fn into_agent_registration(self) -> AgentRegistration {
         AgentRegistration::new(self)
     }
@@ -117,7 +117,7 @@ pub(crate) struct AgentRecord {
     pub(crate) name: String,
     pub(crate) description: Option<String>,
     pub(crate) instructions: Option<String>,
-    pub(crate) agent: Arc<dyn Agent>,
+    pub(crate) agent: Arc<dyn SupportsAgentRun>,
 }
 
 /// A registered workflow and its cached metadata.
@@ -156,9 +156,9 @@ impl HostState {
 ///
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use agent_framework_core::agent::ChatAgent;
+/// # use agent_framework_core::agent::Agent;
 /// # use agent_framework_hosting::AgentHost;
-/// # async fn demo(weather: ChatAgent) -> std::io::Result<()> {
+/// # async fn demo(weather: Agent) -> std::io::Result<()> {
 /// let host = AgentHost::new().agent("weather", weather);
 /// host.serve(([127, 0, 0, 1], 8080)).await
 /// # }
@@ -187,7 +187,7 @@ impl AgentHost {
 
     /// Register an agent under `name`, which becomes its entity id.
     ///
-    /// Accepts a [`ChatAgent`], a [`WorkflowAgent`], or an `Arc<dyn Agent>`
+    /// Accepts a [`Agent`], a [`WorkflowAgent`], or an `Arc<dyn SupportsAgentRun>`
     /// (see [`IntoAgentRegistration`]).
     pub fn agent(mut self, name: impl Into<String>, agent: impl IntoAgentRegistration) -> Self {
         let id = name.into();

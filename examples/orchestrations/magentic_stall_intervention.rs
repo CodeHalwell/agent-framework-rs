@@ -91,10 +91,10 @@ impl MagenticManager for ScriptedManager {
 
 /// Never invoked (the demo stalls before any speaker turn, then finishes),
 /// but the builder requires a participant.
-fn placeholder() -> Arc<dyn Agent> {
+fn placeholder() -> Arc<dyn SupportsAgentRun> {
     struct Silent;
     #[async_trait]
-    impl Agent for Silent {
+    impl SupportsAgentRun for Silent {
         async fn run(
             &self,
             _messages: Vec<Message>,

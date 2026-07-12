@@ -1,4 +1,4 @@
-//! MCP tools as a first-class `ToolSource`: `ChatAgentBuilder::tool_source`
+//! MCP tools as a first-class `ToolSource`: `AgentBuilder::tool_source`
 //! registers an `Arc<McpStdioTool>` directly, instead of snapshotting a
 //! `Vec<ToolDefinition>` once at build time.
 //!
@@ -39,11 +39,11 @@ async fn main() -> Result<()> {
 
     // The manual approach (`mcp_tools.rs`) would be:
     //   let tools = mcp.tool_definitions().await?;
-    //   ChatAgent::builder(client).tools(tools).build()
+    //   Agent::builder(client).tools(tools).build()
     // -- a one-time snapshot taken before the agent exists. `.tool_source`
     // instead keeps the live `McpStdioTool` around and asks it, fresh, on
     // every run (see `ToolSource::resolve_tools`).
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("Use the available tools when they help answer the question.")
         .tool_source(mcp.clone())

@@ -1,7 +1,7 @@
 //! [`Mem0Provider`]: a [`ContextProvider`] backed by the hosted
 //! [Mem0](https://mem0.ai) memory API.
 //!
-//! Mirrors `agent_framework_mem0.Mem0Provider` from the Python Agent
+//! Mirrors `agent_framework_mem0.Mem0Provider` from the Python SupportsAgentRun
 //! Framework: `invoked()` adds the request/response exchange to Mem0,
 //! scoped by `user_id`/`agent_id`/`run_id`/`application_id`; `invoking()`
 //! searches Mem0 with the latest input text (plus the same scope) and

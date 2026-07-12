@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     let mut providers = AggregateContextProvider::new();
     providers.add(Arc::new(search));
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("Answer using the retrieved context when it's relevant.")
         .context_provider(Arc::new(providers))

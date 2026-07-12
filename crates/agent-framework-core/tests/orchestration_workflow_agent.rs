@@ -1,4 +1,4 @@
-//! WorkflowAgent tests: expose a built workflow as an `Agent`, aggregate its
+//! WorkflowAgent tests: expose a built workflow as an `SupportsAgentRun`, aggregate its
 //! output as the response, surface pending request-info as user-input requests,
 //! and act as an `.as_tool()` target.
 
@@ -58,13 +58,13 @@ impl ChatClient for MockClient {
     }
 }
 
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::test]
@@ -216,7 +216,7 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
         "the second run must append to, not replace, the thread history \
          (before: {after_first:?}, after: {after_second:?})"
     );
-    // Matching `ChatAgent`'s exact convention (see `agent_surfaces_and_resolves_approval_round_trip`
+    // Matching `Agent`'s exact convention (see `agent_surfaces_and_resolves_approval_round_trip`
     // in `tests/integration.rs`): both runs' input and response message sets
     // are all present in the thread store after two runs.
     assert!(after_second.iter().any(|m| m.text() == "first"));
@@ -228,7 +228,7 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
 #[tokio::test]
 async fn workflow_agent_run_without_explicit_thread_does_not_panic() {
     // No thread supplied: `run` must create and use an ephemeral one
-    // internally (mirroring `ChatAgent::run`) rather than erroring.
+    // internally (mirroring `Agent::run`) rather than erroring.
     let a = agent("A", vec!["only-reply"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "solo");
@@ -254,7 +254,7 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
 
     // Because message stores are shared via `Arc`, the write-back that
     // happened on the internal thread clone is visible through this clone
-    // too (same pattern as `ChatAgent::run_stream`).
+    // too (same pattern as `Agent::run_stream`).
     let history = thread.list_messages().await.unwrap();
     assert!(
         history.iter().any(|m| m.text() == "go"),
@@ -268,11 +268,11 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
 
 #[tokio::test]
 async fn workflow_agent_trait_run_stream_yields_updates() {
-    // The object-safe `Agent::run_stream` override streams the workflow's agent
-    // activity (exercised through a `dyn Agent`, as hosting/orchestration do).
+    // The object-safe `SupportsAgentRun::run_stream` override streams the workflow's agent
+    // activity (exercised through a `dyn SupportsAgentRun`, as hosting/orchestration do).
     let a = agent("A", vec!["hello-from-A"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
-    let wf_agent: Arc<dyn Agent> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
+    let wf_agent: Arc<dyn SupportsAgentRun> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
 
     let mut stream = wf_agent
         .run_stream(vec![Message::user("go")], None, None)

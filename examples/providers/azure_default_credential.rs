@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     let credential = Arc::new(DefaultAzureCredential::new(COGNITIVE_SERVICES_SCOPE));
     let client = AzureOpenAIClient::with_token_credential(endpoint, deployment, credential);
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();

@@ -361,7 +361,7 @@ pub struct AgentResponse {
     pub response_id: Option<String>,
     /// Service-side conversation id, when the backing service manages the
     /// conversation (e.g. Responses API `previous_response_id`, Azure AI
-    /// thread id). `ChatAgent` persists it onto the [`AgentThread`].
+    /// thread id). `Agent` persists it onto the [`AgentThread`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

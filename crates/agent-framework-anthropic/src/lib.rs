@@ -13,7 +13,7 @@
 //!
 //! # async fn demo() -> Result<()> {
 //! let client = AnthropicClient::new("sk-ant-...", "claude-sonnet-4-5-20250929");
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;

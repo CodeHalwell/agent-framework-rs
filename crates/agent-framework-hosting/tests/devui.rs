@@ -3,7 +3,7 @@
 
 mod common;
 
-use agent_framework_core::agent::ChatAgent;
+use agent_framework_core::agent::Agent;
 use agent_framework_hosting::AgentHost;
 use axum::http::StatusCode;
 use serde_json::json;
@@ -140,7 +140,7 @@ async fn responses_agent_stream_event_sequence() {
 
 #[tokio::test]
 async fn responses_uses_real_chat_agent() {
-    // A real ChatAgent (not just the mock) flows end-to-end via a mock client.
+    // A real Agent (not just the mock) flows end-to-end via a mock client.
     use agent_framework_core::client::{ChatClient, ChatStream};
     use agent_framework_core::types::{ChatOptions, ChatResponse};
     use async_trait::async_trait;
@@ -164,7 +164,7 @@ async fn responses_uses_real_chat_agent() {
         }
     }
 
-    let agent = ChatAgent::builder(FixedClient)
+    let agent = Agent::builder(FixedClient)
         .name("real")
         .description("a real chat agent")
         .build();

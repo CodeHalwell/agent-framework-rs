@@ -1,4 +1,4 @@
-//! AG-UI protocol hosting (CopilotKit's Agent-User Interaction protocol).
+//! AG-UI protocol hosting (CopilotKit's SupportsAgentRun-User Interaction protocol).
 //!
 //! Serves one or more agents over the AG-UI protocol, mirroring the Python
 //! `agent_framework_ag_ui` package. AG-UI is Server-Sent Events with camelCase
@@ -44,12 +44,12 @@
 //! closed with a `TOOL_CALL_END` at finalize and never gets a `TOOL_CALL_RESULT`.
 //!
 //! # Divergences from the Python reference
-//! - **Live streaming.** The object-safe [`Agent`] trait exposes `run_stream`,
+//! - **Live streaming.** The object-safe [`SupportsAgentRun`] trait exposes `run_stream`,
 //!   so this router drives it and frames each [`AgentResponseUpdate`] into
 //!   AG-UI events as it arrives — one `TEXT_MESSAGE_CONTENT` per text delta,
 //!   `TOOL_CALL_*` per call fragment. `type` ordering and payloads match the
 //!   bridge. (Agents whose `run_stream` falls back to the buffered default —
-//!   e.g. a plain `Arc<dyn Agent>` that only implements `run` — still emit one
+//!   e.g. a plain `Arc<dyn SupportsAgentRun>` that only implements `run` — still emit one
 //!   `TEXT_MESSAGE_CONTENT` per message, as before.)
 //!
 //!   [`AgentResponseUpdate`]: agent_framework_core::types::AgentResponseUpdate
@@ -62,11 +62,11 @@
 //!   (see [`crate::agui`]'s frontend-tool note), and it is framed as
 //!   `TOOL_CALL_*` **without** a `TOOL_CALL_RESULT` — the browser runs it. An
 //!   agent that does not support per-run options (anything other than a
-//!   `ChatAgent`) logs a warning and ignores the injected tools.
+//!   `Agent`) logs a warning and ignores the injected tools.
 //! - **State events are not emitted.** `STATE_SNAPSHOT` / `STATE_DELTA` /
 //!   `MESSAGES_SNAPSHOT` are driven by Python's `predict_state_config` /
 //!   `state_schema` (agentic generative-UI / predictive-state features) which
-//!   have no equivalent on the core `Agent` trait. Inbound `state` is accepted
+//!   have no equivalent on the core `SupportsAgentRun` trait. Inbound `state` is accepted
 //!   and ignored. `CUSTOM` is emitted only for approval requests.
 
 use std::collections::HashSet;
@@ -80,7 +80,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use agent_framework_core::agent::{Agent, AgentRunOptions};
+use agent_framework_core::agent::{AgentRunOptions, SupportsAgentRun};
 use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     Content, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
@@ -99,13 +99,13 @@ use crate::util;
 struct AgUiRoute {
     path: String,
     name: String,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
 }
 
 /// Per-route handler state.
 struct AgUiState {
     name: String,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
 }
 
 /// Serves agents over the AG-UI protocol.
@@ -116,9 +116,9 @@ struct AgUiState {
 ///
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use agent_framework_core::agent::ChatAgent;
+/// # use agent_framework_core::agent::Agent;
 /// # use agent_framework_hosting::agui::AgUiRouter;
-/// # fn demo(chat: ChatAgent, planner: ChatAgent) -> axum::Router {
+/// # fn demo(chat: Agent, planner: Agent) -> axum::Router {
 /// AgUiRouter::for_agent("chat", chat)
 ///     .path("/agent")
 ///     .agent("planner", planner, "/planner")
@@ -132,9 +132,9 @@ pub struct AgUiRouter {
 impl AgUiRouter {
     /// Serve `agent` at the default path `/`, identified by `name`.
     ///
-    /// Accepts a [`ChatAgent`](agent_framework_core::agent::ChatAgent), a
+    /// Accepts a [`Agent`](agent_framework_core::agent::Agent), a
     /// [`WorkflowAgent`](agent_framework_core::workflow::WorkflowAgent), or an
-    /// `Arc<dyn Agent>` (see [`IntoAgentRegistration`]).
+    /// `Arc<dyn SupportsAgentRun>` (see [`IntoAgentRegistration`]).
     pub fn for_agent(name: impl Into<String>, agent: impl IntoAgentRegistration) -> Self {
         Self {
             routes: vec![AgUiRoute {
@@ -245,7 +245,7 @@ async fn run_agent(State(state): State<Arc<AgUiState>>, body: String) -> Respons
                                 let _ = tx.unbounded_send(ev);
                             }
                         }
-                        // Agent failure mid-stream → RUN_ERROR in place of
+                        // SupportsAgentRun failure mid-stream → RUN_ERROR in place of
                         // RUN_FINISHED (still a 200 SSE stream; error in-band).
                         Err(e) => {
                             let _ = tx.unbounded_send(

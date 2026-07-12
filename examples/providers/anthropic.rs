@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     // Reads ANTHROPIC_API_KEY (and optional ANTHROPIC_BASE_URL).
     let client = AnthropicClient::from_env("claude-sonnet-4-5-20250929")?;
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();

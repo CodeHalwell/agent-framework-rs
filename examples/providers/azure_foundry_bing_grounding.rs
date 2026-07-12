@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     // erroring for lack of a connection.
     let bing_search = hosted_web_search().connection_id(connection_id);
 
-    let agent = ChatAgent::builder(client.clone())
+    let agent = Agent::builder(client.clone())
         .name("bing-grounded-assistant")
         .instructions("Use web search for anything time-sensitive; cite your sources briefly.")
         .tool(bing_search)

@@ -1,4 +1,4 @@
-//! Expose a built [`Workflow`] as an [`Agent`]. Rust analogue of
+//! Expose a built [`Workflow`] as an [`SupportsAgentRun`]. Rust analogue of
 //! `_workflows/_agent.py` (`WorkflowAgent`).
 //!
 //! [`WorkflowAgent::run`] feeds the input messages to the workflow (as the
@@ -11,7 +11,7 @@
 //!
 //! Both `run` and `run_stream_with_thread` write the input and response
 //! messages back to the caller's [`AgentThread`] (mirroring
-//! [`ChatAgent`](crate::agent::ChatAgent) and, upstream, Python's
+//! [`Agent`](crate::agent::Agent) and, upstream, Python's
 //! `WorkflowAgent._notify_thread_of_new_messages` calls) — a write-back only,
 //! not a read-back: prior thread history is not fed into the workflow's
 //! input, matching Python's behavior exactly.
@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentRunOptions, AgentRunStream};
+use crate::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use crate::error::Result;
 use crate::threads::AgentThread;
 use crate::tools::{FunctionTool, ToolDefinition};
@@ -37,7 +37,7 @@ use crate::workflow::{Workflow, WorkflowEvent};
 /// user-input request (matches Python's `REQUEST_INFO_FUNCTION_NAME`).
 const REQUEST_INFO_FUNCTION_NAME: &str = "request_info";
 
-/// An [`Agent`] that wraps a [`Workflow`] and exposes it through the agent
+/// An [`SupportsAgentRun`] that wraps a [`Workflow`] and exposes it through the agent
 /// interface. Rust analogue of `WorkflowAgent`.
 #[derive(Clone)]
 pub struct WorkflowAgent {
@@ -89,7 +89,7 @@ impl WorkflowAgent {
     /// agent update and each [`RequestInfo`](WorkflowEvent::RequestInfo) becomes
     /// a user-input request update. Other events are ignored. Private helper
     /// behind [`WorkflowAgent::run_stream_with_thread`] and the object-safe
-    /// [`Agent::run_stream`] trait method.
+    /// [`SupportsAgentRun::run_stream`] trait method.
     fn stream_events(&self, messages: Vec<Message>) -> AgentRunStream {
         let input = serde_json::to_value(&messages).unwrap_or_else(|_| Value::Array(Vec::new()));
         let name = self.name.clone();
@@ -103,21 +103,21 @@ impl WorkflowAgent {
 
     /// Stream the workflow's agent activity and, once the stream completes,
     /// write back to `thread` the way
-    /// [`ChatAgent::run_stream`](crate::agent::ChatAgent::run_stream) does:
+    /// [`Agent::run_stream`](crate::agent::Agent::run_stream) does:
     /// `messages` and the response messages reconstructed from the emitted
     /// updates are both persisted via [`AgentThread::on_new_messages`]. An
-    /// infallible inherent convenience; the object-safe [`Agent::run_stream`]
+    /// infallible inherent convenience; the object-safe [`SupportsAgentRun::run_stream`]
     /// trait method wraps this in `Ok(..)`.
     ///
     /// Mirrors Python's `WorkflowAgent.run_stream`, which likewise only
     /// notifies the thread of new messages after the stream is exhausted — it
     /// does not feed the thread's prior history back into the workflow's own
-    /// input (see [`Agent::run`] on this type for the same convention on the
+    /// input (see [`SupportsAgentRun::run`] on this type for the same convention on the
     /// non-streaming path).
     ///
     /// Because message stores are shared via `Arc`, the write-back is
     /// observable on the original thread through any clone of it once the
-    /// returned stream is fully consumed (same pattern as `ChatAgent`'s).
+    /// returned stream is fully consumed (same pattern as `Agent`'s).
     pub fn run_stream_with_thread(
         &self,
         messages: Vec<Message>,
@@ -129,7 +129,7 @@ impl WorkflowAgent {
     }
 
     /// Wrap this workflow-agent as a [`ToolDefinition`] callable by another
-    /// agent (mirrors [`ChatAgent::as_tool`](crate::agent::ChatAgent::as_tool)).
+    /// agent (mirrors [`Agent::as_tool`](crate::agent::Agent::as_tool)).
     /// The tool takes a single `task` string and returns the response text.
     pub fn as_tool(&self) -> ToolDefinition {
         let agent = Arc::new(self.clone());
@@ -237,7 +237,7 @@ fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRespo
 /// Forward `inner`'s updates unchanged, and once it completes, write both
 /// `input` and the reconstructed response messages back to `thread`. Used by
 /// [`WorkflowAgent::run_stream_with_thread`]; mirrors
-/// [`ChatAgent`](crate::agent::ChatAgent)'s analogous internal stream
+/// [`Agent`](crate::agent::Agent)'s analogous internal stream
 /// forwarder.
 fn forward_and_persist(
     inner: AgentRunStream,
@@ -275,7 +275,7 @@ fn forward_and_persist(
 }
 
 #[async_trait]
-impl Agent for WorkflowAgent {
+impl SupportsAgentRun for WorkflowAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
@@ -305,7 +305,7 @@ impl Agent for WorkflowAgent {
         }
 
         // Notify the thread of the new messages (both the input and the
-        // response), exactly like `ChatAgent::run`. Mirrors Python's
+        // response), exactly like `Agent::run`. Mirrors Python's
         // `WorkflowAgent.run`, which calls `_notify_thread_of_new_messages`
         // with the same two message sets after collecting the run's updates;
         // like Python, this does not feed the thread's prior history back
@@ -353,17 +353,17 @@ impl Agent for WorkflowAgent {
         // Eagerly create a local in-memory store, rather than relying on the
         // trait default `AgentThread::new()` (which defers store creation
         // until the first `on_new_messages` call). `run_stream_with_thread`
-        // takes `Option<AgentThread>` *by value*, like `ChatAgent::run_stream`
+        // takes `Option<AgentThread>` *by value*, like `Agent::run_stream`
         // does, so the only way a caller observes the post-stream write-back
         // through a clone taken beforehand is if the store (and therefore its
         // `Arc`) already exists at clone time. Mirrors
-        // `ChatAgent::get_new_thread`.
+        // `Agent::get_new_thread`.
         AgentThread::local(Arc::new(crate::threads::InMemoryChatMessageStore::new()))
     }
 }
 
 /// Extension trait adding [`Workflow::as_agent`](WorkflowAgentExt::as_agent) so
-/// a built workflow can be exposed as an [`Agent`] fluently.
+/// a built workflow can be exposed as an [`SupportsAgentRun`] fluently.
 pub trait WorkflowAgentExt {
     /// Wrap this workflow as a [`WorkflowAgent`] named `name`.
     fn as_agent(&self, name: impl Into<String>) -> WorkflowAgent;

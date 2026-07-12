@@ -47,21 +47,21 @@ and exits on its own — no second terminal needed).
 
 ## Agents (`agents/`)
 
-Core `ChatAgent` mechanics: building, running, streaming, tools, threads, and
+Core `Agent` mechanics: building, running, streaming, tools, threads, and
 middleware.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `quickstart` | Minimal `ChatAgent` + OpenAI in a few lines | `OPENAI_API_KEY` |
+| `quickstart` | Minimal `Agent` + OpenAI in a few lines | `OPENAI_API_KEY` |
 | `streaming` | Token-by-token agent streaming | `OPENAI_API_KEY` |
 | `tools` | Local tool calling via the automatic function-invocation loop | `OPENAI_API_KEY` |
 | `typed_tools` | `FunctionTool::typed` derives a JSON Schema from a `#[derive(JsonSchema)]` struct | offline (live model optional, `OPENAI_API_KEY`) |
 | `structured_output` | `ResponseFormat::json_schema` + `response.parse_json::<T>()` | `OPENAI_API_KEY` |
 | `approvals` | Human-in-the-loop tool approval: pause, inspect, approve, resume | `OPENAI_API_KEY` |
-| `agent_as_tool` | Compose agents: a specialist exposed as a tool via `ChatAgent::as_tool` | `OPENAI_API_KEY` |
+| `agent_as_tool` | Compose agents: a specialist exposed as a tool via `Agent::as_tool` | `OPENAI_API_KEY` |
 | `retry_policy` | `RetryingChatClient` + `RetryPolicy` over a scripted flaky client | offline |
 | `per_run_options` | `AgentRunOptions` merges per-run `ChatOptions` overrides over the agent's defaults | offline |
-| `thread_persistence` | `thread.serialize()` / `ChatAgent::deserialize_thread` round-trip a conversation | offline |
+| `thread_persistence` | `thread.serialize()` / `Agent::deserialize_thread` round-trip a conversation | offline |
 | `multi_turn_conversation` | One `AgentThread` reused across calls accumulates history automatically | offline |
 | `image_input` | Attach an image via `Content::Uri` (URL) or `Content::Data` (inline bytes) | `OPENAI_API_KEY` (vision model; skips gracefully) |
 | `agent_middleware` | Wrap a whole agent run: logging plus early-termination middleware | offline |
@@ -135,8 +135,8 @@ sampling, and roots. All five connect to
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `mcp_tools` | Connect an MCP stdio server, list its tools, wire them into a `ChatAgent` | `OPENAI_API_KEY`, `npx` |
-| `mcp_first_class_tools` | `ChatAgentBuilder::tool_source`: resolve an MCP server's tools fresh on every run | `OPENAI_API_KEY` (skips gracefully), `npx` |
+| `mcp_tools` | Connect an MCP stdio server, list its tools, wire them into a `Agent` | `OPENAI_API_KEY`, `npx` |
+| `mcp_first_class_tools` | `AgentBuilder::tool_source`: resolve an MCP server's tools fresh on every run | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_prompts` | List an MCP server's prompts, render one, and run it through a real agent | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_roots` | Advertise filesystem roots via `.roots(...)`; explains the server-side `roots/list` flow | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_sampling` | Answer MCP server-initiated `sampling/createMessage` with your own model | `OPENAI_API_KEY` (skips gracefully), `npx` |
@@ -190,7 +190,7 @@ calls.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `declarative_agent` | Load a `ChatAgent` from an official-schema YAML spec via `DeclarativeLoader` | offline (canned fallback; `OPENAI_API_KEY` optional) |
+| `declarative_agent` | Load a `Agent` from an official-schema YAML spec via `DeclarativeLoader` | offline (canned fallback; `OPENAI_API_KEY` optional) |
 | `declarative_workflow` | Load a `Workflow` from a Rust-native spec: orchestration shorthand and an explicit graph | offline |
 
 ## Compliance (`compliance/`)

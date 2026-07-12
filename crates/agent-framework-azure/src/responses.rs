@@ -55,7 +55,7 @@
 //!     "my-gpt4o-deployment",
 //!     "my-api-key",
 //! );
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;

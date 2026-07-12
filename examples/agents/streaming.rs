@@ -11,7 +11,7 @@ use std::io::Write;
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .instructions("You are a helpful assistant.")
         .build();
 

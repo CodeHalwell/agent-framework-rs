@@ -12,7 +12,7 @@
 //!   Assistants `thread_id`. With no id, a fresh thread is created per call
 //!   (seeded with the request's new messages as `additional_messages`), and the
 //!   returned [`ChatResponse::conversation_id`] carries the new thread id so a
-//!   caller (or [`ChatAgent`]) can continue the conversation.
+//!   caller (or [`Agent`]) can continue the conversation.
 //! * **Assistants lifecycle.** A client either targets an existing assistant
 //!   ([`OpenAIAssistantsClient::with_assistant_id`], never deleted) or lazily
 //!   creates a *transient* assistant on first use (from the client `model` plus
@@ -44,7 +44,7 @@
 //!
 //! # async fn demo() -> Result<()> {
 //! let client = OpenAIAssistantsClient::new("sk-...", "gpt-4o-mini");
-//! let agent = ChatAgent::builder(client.clone())
+//! let agent = Agent::builder(client.clone())
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;
@@ -57,7 +57,7 @@
 //!
 //! [`ChatOptions::conversation_id`]: agent_framework_core::types::ChatOptions::conversation_id
 //! [`ChatResponse::conversation_id`]: agent_framework_core::types::ChatResponse::conversation_id
-//! [`ChatAgent`]: agent_framework_core::agent::ChatAgent
+//! [`Agent`]: agent_framework_core::agent::Agent
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -592,7 +592,7 @@ fn prepare_options(
     // from Python's gate (`_assistants_client.py:404-435`), which drops ALL
     // tool definitions whenever `tool_choice` is unset: in this port a request
     // can legitimately arrive with tools but no explicit choice — a direct
-    // client call, or `ChatAgent::run_stream` with only hosted /
+    // client call, or `Agent::run_stream` with only hosted /
     // declaration-only tools, which bypasses the tool loop's default-to-auto
     // (that default only applies when executable local tools exist) — and
     // those runs must not silently lose their code-interpreter / file-search /
@@ -685,16 +685,16 @@ fn prepare_options(
     // any system/developer message text after it (upstream's `BaseChatClient`
     // prepends `chat_options.instructions` as the first system message before
     // the Assistants client splits system text into `instructions`; this port
-    // injects that system message in `ChatAgent`, so a *direct* client call
+    // injects that system message in `Agent`, so a *direct* client call
     // would otherwise drop it — seeding here honors it either way, and cannot
-    // double-inject because `ChatAgent` takes the option out before dispatch).
+    // double-inject because `Agent` takes the option out before dispatch).
     let mut instructions = options.instructions.clone().unwrap_or_default();
     let mut additional_messages: Vec<Value> = Vec::new();
     let mut tool_results: Option<Vec<FunctionResultContent>> = None;
 
     // Join instruction fragments (the `ChatOptions::instructions` seed plus each
     // system/developer message) with a newline, matching this port's own
-    // instruction convention (`ChatAgent` and `ChatOptions::merge` both
+    // instruction convention (`Agent` and `ChatOptions::merge` both
     // newline-concatenate). Deliberate divergence from Python's separator-less
     // `"".join`, which would run distinct prompts together
     // ("Be terse."+"Return JSON." → "Be terse.Return JSON.").

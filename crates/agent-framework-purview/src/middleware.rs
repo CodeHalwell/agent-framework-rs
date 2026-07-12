@@ -84,7 +84,7 @@ impl PurviewPolicyCore {
     }
 }
 
-/// Agent middleware enforcing Purview policy on both the outgoing prompt and
+/// SupportsAgentRun middleware enforcing Purview policy on both the outgoing prompt and
 /// the agent's response. Mirrors Python's `PurviewPolicyMiddleware`.
 ///
 /// - **Prompt (pre) check**: evaluates `ctx.messages`. If blocked,
@@ -115,7 +115,7 @@ impl PurviewPolicyCore {
 ///     ));
 /// let middleware = PurviewAgentMiddleware::new(StaticTokenProvider::new("<graph-bearer-token>"), settings);
 ///
-/// let agent = ChatAgent::builder(client)
+/// let agent = Agent::builder(client)
 ///     .instructions("You are a helpful assistant.")
 ///     .middleware(Arc::new(middleware))
 ///     .build();
@@ -242,7 +242,7 @@ mod tests {
     // `PurviewAgentMiddleware`/`PurviewChatMiddleware::process`'s
     // short-circuit and error-propagation logic hermetically, using a "mock
     // next" continuation built from `agent-framework-core`'s own
-    // `MiddlewarePipeline`/`Terminal` — the same machinery `ChatAgent` uses
+    // `MiddlewarePipeline`/`Terminal` — the same machinery `Agent` uses
     // internally — per this work package's "core test patterns" note. The
     // happy-path HTTP call itself (an actual `processContent` round trip) is
     // covered by `tests/loopback.rs`.

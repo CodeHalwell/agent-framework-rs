@@ -6,7 +6,7 @@
 //! canned offline mock -- so the server itself runs without any credentials
 //! (same pattern as `hosting/devui_server.rs`). Point `a2a/a2a_client.rs`
 //! (`A2A_AGENT_URL=http://127.0.0.1:8083/`) at this server to talk to it as a
-//! local `Agent`.
+//! local `SupportsAgentRun`.
 //!
 //! ```bash
 //! cargo run -p agent-framework-examples --example a2a_server
@@ -62,15 +62,15 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn build_agent() -> ChatAgent {
+fn build_agent() -> Agent {
     let instructions = "You are a helpful, concise assistant.";
     match OpenAIClient::from_env("gpt-4o-mini") {
-        Ok(client) => ChatAgent::builder(client)
+        Ok(client) => Agent::builder(client)
             .name("assistant")
             .description("General-purpose assistant served over A2A.")
             .instructions(instructions)
             .build(),
-        Err(_) => ChatAgent::builder(CannedClient)
+        Err(_) => Agent::builder(CannedClient)
             .name("assistant")
             .description("Offline canned assistant (no OPENAI_API_KEY).")
             .instructions(instructions)

@@ -374,7 +374,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         // the final text when a structured `response_format` was requested
         // (mirrors Python `try_parse_value`). This is the central non-streaming
         // fill point: it covers a bare `FunctionInvokingChatClient` and every
-        // `ChatAgent` run (whose client is always wrapped in one). The tool
+        // `Agent` run (whose client is always wrapped in one). The tool
         // loop is run inside an `async move` block so its interior `return`s
         // funnel through this single fill/return path.
         let response_format = options.response_format.clone();

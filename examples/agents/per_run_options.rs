@@ -19,7 +19,7 @@ use serde_json::json;
 /// names it was actually called with, so the merge is observable. Note that
 /// by the time a request reaches the client, `ChatOptions::instructions` has
 /// already been consumed and turned into a leading system `Message` (see
-/// `ChatAgent::prepare_request`) -- so we read it off `messages`, not
+/// `Agent::prepare_request`) -- so we read it off `messages`, not
 /// `options`.
 #[derive(Clone)]
 struct ReportingClient;
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     )
     .into_definition();
 
-    let agent = ChatAgent::builder(ReportingClient)
+    let agent = Agent::builder(ReportingClient)
         .name("assistant")
         .instructions("Be terse.")
         .temperature(0.2)

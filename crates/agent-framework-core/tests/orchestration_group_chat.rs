@@ -60,13 +60,13 @@ impl ChatClient for MockClient {
 }
 
 /// Build a named agent that returns the given scripted text replies.
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 fn conversation(run: &WorkflowRun) -> Vec<Message> {
@@ -133,16 +133,16 @@ async fn custom_manager_can_finish() {
 }
 
 /// Build an LLM manager agent scripted to emit JSON `ManagerSelectionResponse`s.
-fn manager_agent(json_responses: Vec<&str>) -> Arc<dyn Agent> {
+fn manager_agent(json_responses: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = json_responses
         .into_iter()
         .map(ChatResponse::from_text)
         .collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name("manager")
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::test]

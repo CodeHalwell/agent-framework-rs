@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_framework_core::error::Result;
-use agent_framework_core::prelude::{Agent, AgentResponse, ChatResponse, Message};
+use agent_framework_core::prelude::{AgentResponse, ChatResponse, Message, SupportsAgentRun};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::workflow::{
     get_checkpoint_summary, validate_workflow_graph, AgentExecutor, Case, CheckpointStorage,
@@ -690,7 +690,7 @@ struct MockAgent {
 }
 
 #[async_trait]
-impl Agent for MockAgent {
+impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -710,7 +710,7 @@ async fn agent_executor_emits_agent_events() {
     let agent = Arc::new(MockAgent {
         id: "m".into(),
         reply: "hello".into(),
-    }) as Arc<dyn Agent>;
+    }) as Arc<dyn SupportsAgentRun>;
     let exec = AgentExecutor::new("a1", agent).with_output(true);
 
     let workflow = WorkflowBuilder::new()
@@ -740,7 +740,7 @@ async fn agent_executor_emits_agent_events() {
 struct MultiMessageAgent;
 
 #[async_trait]
-impl Agent for MultiMessageAgent {
+impl SupportsAgentRun for MultiMessageAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
@@ -764,7 +764,7 @@ impl Agent for MultiMessageAgent {
 async fn agent_executor_emits_incremental_agent_run_updates() {
     // The orchestration layer now drives `run_stream` and emits one
     // `AgentRunUpdate` per streamed update, then a single terminal `AgentRun`.
-    let agent = Arc::new(MultiMessageAgent) as Arc<dyn Agent>;
+    let agent = Arc::new(MultiMessageAgent) as Arc<dyn SupportsAgentRun>;
     let exec = AgentExecutor::new("a1", agent).with_output(true);
     let workflow = WorkflowBuilder::new()
         .add_executor(Arc::new(exec))
