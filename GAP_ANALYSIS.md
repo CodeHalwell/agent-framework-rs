@@ -1,6 +1,25 @@
 # Gap analysis: agent-framework-rs vs. the official Agent Framework
 
-A fresh, full-repo audit of this port against the upstream
+> ## ⚠️ Baseline notice — read first
+>
+> **This audit was conducted against upstream `638fbb5f` (2025-12-10)**, the
+> checkout `PARITY.md` was pinned to. Upstream `main` has since advanced ~7
+> months to **`68136ee`** (2026-07) and landed the largest breaking-change
+> window in the framework's history — most notably `ChatAgent` was **renamed to
+> `Agent`** (the port's `ChatAgent` naming no longer matches upstream), threads
+> became sessions, providers and orchestrations were extracted out of core into
+> standalone packages, and the **OpenAI/Azure Assistants API was removed
+> entirely.**
+>
+> As a result, some findings below are **stale or inverted** — a few "gaps" no
+> longer exist, and some work the port shipped now targets removed surfaces.
+> Each such claim carries an inline **`Re-baseline (68136ee):`** note. The
+> complete, current re-derivation lives in **[`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md)**;
+> treat that document as the authority on what upstream looks like today and
+> this one as the historical `638fbb5f` audit plus the implementation waves that
+> answered it.
+
+A full-repo audit of this port against the upstream
 [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) at
 revision `638fbb5f` (2025-12-10) — the same checkout `PARITY.md` was written
 against. Unlike `PARITY.md` (the port's own tracking matrix), this document is
@@ -54,6 +73,15 @@ Four implementation waves landed after this audit; the workspace went from
   Responses client** now exist. Still open from that item: an
   `AzureOpenAIAssistantsClient` convenience wrapper and the new Foundry
   Prompt-Agent client.
+  > **Re-baseline (68136ee):** upstream **removed the Assistants API entirely**
+  > — `OpenAIAssistantsClient`/`AzureOpenAIAssistantsClient` no longer exist in
+  > Python. The `OpenAIAssistantsClient` this port built (Wave 3, then four
+  > PR-review rounds) now targets a **dead surface** and should be removed, not
+  > extended. Separately, the "new Foundry Prompt-Agent client" is no longer
+  > *missing*: it ships upstream as the **`foundry`** package (`FoundryAgent` +
+  > `to_prompt_agent`), which replaced the deleted `azure-ai` package — so the
+  > action is to **rename+rewrite** the existing `agent-framework-azure-ai`
+  > crate, not to add something new. See `UPSTREAM_DRIFT.md` §13.
 - From §3: granular errors (`ServiceInvalidAuth` / `ServiceInvalidRequest` /
   `ServiceContentFilter` + provider classification, retry-excluded),
   observability request/tool span attributes + `gen_ai.provider.name`, and
@@ -84,6 +112,16 @@ checkpoint store, Purview protection scopes, `lab`).
 
 The sections below are preserved as the audit's original findings; read
 them together with this status block.
+
+> **Re-baseline (68136ee):** most of the "Still open" list above remains real
+> work, but several items shifted shape upstream — the workflow HITL/checkpoint
+> options, orchestration builders, DevUI surface, A2A serving, and the Foundry
+> client all changed in the 7-month window, and threads/memory were replaced by
+> sessions/history-providers. `UPSTREAM_DRIFT.md` supersedes this list with the
+> current, correctly-baselined action plan (including new-since-audit surfaces
+> this document could not have seen: seven new provider packages,
+> sessions/skills/compaction/harness/security, `durabletask`, `azure-cosmos`,
+> the declarative-workflow engine, and the `hosting`/`hosting-responses` split).
 
 ---
 
@@ -179,6 +217,14 @@ core types diverges from upstream (no `type` discriminators; `Role`/
 `FinishReason` as bare strings), so even hand-rolled persistence is not
 cross-language compatible with Python/.NET stores.
 
+> **Re-baseline (68136ee):** the whole thread model was replaced. `AgentThread`
+> → **`AgentSession`** (a `{session_id, service_session_id, state}` container
+> with **no** message store), and `AgentThread.serialize()`/`deserialize()`
+> (async) → `AgentSession.to_dict()`/`from_dict()` (**sync**). Message storage
+> moved out of the thread into **`HistoryProvider`** context providers
+> (`InMemoryHistoryProvider`, new `FileHistoryProvider`). So the persistence gap
+> is real but its target changed entirely — see `UPSTREAM_DRIFT.md` §2/§3.
+
 ### 1.8 🐛 Workflow checkpoints lose partial fan-in state
 
 The runner's fan-in buffer (`workflow/runner.rs:507`, filled at :658,
@@ -211,6 +257,17 @@ new Foundry "Prompt Agent" client (versioned server-side agents) — the Rust
 `agent-framework-azure-ai` crate corresponds only to the older
 Persistent/Assistants flavor.
 
+> **Re-baseline (68136ee):** this finding is now **mostly void**. Upstream
+> **deleted the Assistants API** (`OpenAIAssistantsClient`/`AzureOpenAIAssistantsClient`
+> are gone), so those are no longer gaps — and the port's own Wave-3
+> `OpenAIAssistantsClient` is now dead surface to remove. The `azure-ai` package
+> was **deleted** and replaced by **`foundry`** (`FoundryChatClient` over the
+> Responses API + `FoundryAgent`/`to_prompt_agent` — this *is* the "Prompt
+> Agent" client), so the Rust `agent-framework-azure-ai` crate should be
+> **renamed to `agent-framework-foundry` and rewritten**. The one still-live
+> item here is the OpenAI/Azure **Responses** client (now the canonical
+> `OpenAIChatClient` upstream). See `UPSTREAM_DRIFT.md` §13.
+
 ---
 
 ## 2. Silent data-loss & correctness list (all verified against source)
@@ -233,6 +290,15 @@ Persistent/Assistants flavor.
 | 14 | Service thread returning no conversation id is silently ignored | `core/src/threads.rs:128-150` | raises `AgentExecutionException` |
 | 15 | `as_tool` uses the raw agent name as the function name (no sanitization → can emit invalid tool names) | `core/src/agent.rs:706-742` | `_sanitize_agent_name` (`_agents.py:53-87`) |
 
+> **Re-baseline (68136ee):** row 9 is now **inverted** — upstream **removed
+> `thread_created`** (the `ContextProvider` hooks became `before_run`/`after_run`
+> and `Context`→`SessionContext`), so the `thread_created` hook the port added
+> to answer this row is now itself drift to migrate. Row 11's `#[serde(other)]`
+> fallback (added by a wave) is exactly right and becomes more valuable: upstream
+> added twelve new `Content` variants (shell/MCP/image-gen/oauth tool call+result),
+> which the fallback deserializes inertly but silently drops until the variants
+> are added. See `UPSTREAM_DRIFT.md` §3/§5.
+
 ## 3. Cross-cutting architectural gaps
 
 | Gap | Rust today | Upstream | Impact |
@@ -247,6 +313,19 @@ Persistent/Assistants flavor.
 | Middleware contexts | no `agent`/`thread`/function-object/`chat_client`/kwargs exposure; no unified list/decorators | rich contexts, unified registration | limits real middleware (guardrails, routing) |
 | Observability | spans only, older `gen_ai.system` attr, small attribute set | + token-usage & duration **histograms**, `setup_observability()`, OTLP/App-Insights env wiring, richer span attrs | no metrics at all today; PARITY's 🚧 row undersells this |
 | `Content` field parity | no `additional_properties`/`raw_representation` on any content/message/response/update | on everything (`BaseContent`) | provider metadata lost, esp. across streaming aggregation |
+
+> **Re-baseline (68136ee):** the upstream targets in this table shifted.
+> **Typed executor routing** — the "biggest conceptual divergence" — is now
+> *bigger*: `@handler` gained an explicit-typing mode (`input=`/`output=`/
+> `workflow_output=`) on top of introspection. **Cross-language wire format** —
+> upstream renamed `ChatMessage`→`Message`, `AgentRunResponse`→`AgentResponse`,
+> `model_id`→`model`, and rebuilt `Content` around a single `type`-discriminated
+> class, so the divergence details changed even though the gap is unchanged in
+> spirit (and Python's own checkpoint format is now internally
+> version-incompatible with no discriminator). **Observability** — the wave
+> added metrics; upstream separately renamed `setup_observability`→
+> `enable_instrumentation` and added cache/reasoning-token attributes and an
+> `embeddings` operation. See `UPSTREAM_DRIFT.md` §5/§8/§10.
 
 ## 4. Missing surfaces not tracked by PARITY.md
 
@@ -300,6 +379,17 @@ Persistent/Assistants flavor.
   OpenAI **Responses + Conversations** serving (get/cancel/input_items,
   conversation CRUD), `WorkflowCatalog`.
 
+> **Re-baseline (68136ee):** several entries here changed. In **Providers**, the
+> `*AssistantsClient`s are no longer missing surfaces — upstream deleted the API
+> (see §1.10). In **Hosting**, the ".NET-only" server story partly landed in
+> **Python** as the new `hosting` + `hosting-responses` libraries (plus
+> per-protocol serving in `a2a`/`ag-ui`), and DevUI flipped Bearer auth **on by
+> default** with a new anti-DNS-rebinding Host-header check. **AG-UI** grew a
+> workflow-hosting + snapshot-store layer; **A2A** gained a first-party server
+> (`A2AExecutor`). And whole new surfaces appeared that no row here could track
+> (seven provider packages, `durabletask`, `azure-cosmos`, sessions/skills/
+> compaction/harness/security). `UPSTREAM_DRIFT.md` §13/§14 is the current map.
+
 ## 5. Tracked-and-confirmed gaps (PARITY.md roadmap is accurate here)
 
 Durable execution (DurableTask / `azurefunctions` durable entities,
@@ -317,6 +407,20 @@ Copilot Studio conversation continuity (exceeds Python), Anthropic
 structured-output folding (exceeds both), Magentic plan-review /
 stall-intervention HITL, checkpoint graph-signature validation,
 `WorkflowRunState` (all 7 states), and the retry layer.
+
+> **Re-baseline (68136ee):** two "exceeds/accurate" notes moved.
+> **Copilot Studio conversation continuity** — upstream *matched* the port
+> (it now reuses the session's conversation id and starts a new one only on
+> first use), so the port no longer "exceeds" here; the in-code comment claiming
+> Python starts a new conversation unconditionally is now false and should be
+> corrected. **Magentic plan-review / stall-intervention HITL** — upstream
+> **merged** the two flows into one `MagenticPlanReviewRequest` (approve/revise,
+> `is_stalled` flag) and dropped the separate CONTINUE/GUIDANCE stall path; the
+> port's two-track model (with an extra `edited_plan` capability neither Python
+> version has) is now a deliberate divergence rather than a match. On the tracked
+> list itself, **DurableTask** and **Cosmos checkpoint store** are no longer
+> ".NET-only"/roadmap — Python shipped `agent-framework-durabletask` and
+> `azure-cosmos`. See `UPSTREAM_DRIFT.md` §12/§14.
 
 ## 6. PARITY.md rows needing a status correction
 
@@ -369,6 +473,14 @@ stall-intervention HITL, checkpoint graph-signature validation,
    conversations/cancel/discovery, AG-UI client + state events, A2A serving
    streaming/lifecycle, metrics + `setup_observability`, then the big tracked
    items (durable hosting, ChatKit, declarative DSL, Redis vectors).
+
+> **Re-baseline (68136ee):** this ordering predates the catch-up now required.
+> Drop the Assistants half of item 5 (API removed) and re-cast it as the
+> `foundry` rename+rewrite. The current, correctly-baselined priority order —
+> which leads with the `Agent` rename, the unified `run(stream=)`, and the
+> sessions/memory keystone before providers/orchestrations, and adds
+> independent correctness fixes (per-executor serialization, superstep state
+> commit) — is in `UPSTREAM_DRIFT.md` Part III.
 
 ---
 
