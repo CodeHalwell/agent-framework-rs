@@ -8,6 +8,8 @@
 //!   automatic function-invocation loop.
 //! - [`agent`] — the [`SupportsAgentRun`](agent::SupportsAgentRun) trait and
 //!   [`Agent`](agent::Agent).
+//! - [`compaction`] — conversation-history compaction strategies and the
+//!   [`Tokenizer`](compaction::Tokenizer) abstraction.
 //! - [`tools`] — executable tools and hosted-tool markers.
 //! - [`threads`] — conversation threads and message stores.
 //! - [`memory`] — context / memory providers.
@@ -35,6 +37,7 @@
 
 pub mod agent;
 pub mod client;
+pub mod compaction;
 pub mod error;
 pub mod memory;
 pub mod middleware;
@@ -56,6 +59,10 @@ pub mod prelude {
     pub use crate::client::{
         ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
         RetryingChatClient,
+    };
+    pub use crate::compaction::{
+        compact, ApproxTokenizer, CompactionStrategy, SelectiveToolResult, SlidingWindow,
+        TokenBudget, Tokenizer, Truncation,
     };
     pub use crate::error::{Error, Result};
     pub use crate::memory::{ContextProvider, SessionContext};
