@@ -766,21 +766,19 @@ impl WorkflowRun {
             // invocations' *drained* effects (messages, events, outputs,
             // requests) are simply not applied.
             //
-            // Live side effects are a different matter, by design: sibling
+            // External side effects are a different matter, by design: sibling
             // invocations that already ran (or were mid-flight) when another
-            // failed have still performed their external work and any
-            // `SharedState` writes — shared state is live within a superstep,
-            // not transactional, and there is no rollback. This matches
-            // upstream exactly: Python's `_run_iteration` drives a
-            // superstep's deliveries with plain `asyncio.gather`
-            // (`_runner.py:147-183`), which neither cancels sibling tasks on
-            // the first exception nor stages `SharedState` mutations.
-            // Cancelling siblings here could not retract writes already made
-            // (it would only shrink the window while imposing
-            // cancellation-safety on user executors), and staging would break
-            // the live cross-executor visibility both engines document — so
-            // a failed run may retain state from branches whose messages
-            // never took effect, and a resume replays the whole superstep.
+            // failed have still performed their external work (network calls,
+            // etc.), and there is no rollback for those. `SharedState` writes,
+            // however, are staged: they land in the pending buffer during a
+            // superstep and are folded into committed state only by the
+            // `commit()` below, which a failed superstep never reaches. So a
+            // failed superstep discards its shared-state writes rather than
+            // persisting a partial, branch-dependent state — matching upstream's
+            // Pregel-style commit-at-boundary model (`_state.py` / `_runner.py`),
+            // where `commit()` runs only after a superstep's executors all
+            // complete. A resume then replays the whole superstep from the last
+            // committed boundary.
             let mut next: Vec<WorkflowMessage> = Vec::new();
             for (id, result) in results {
                 self.emit(WorkflowEvent::ExecutorInvoked {
@@ -830,6 +828,13 @@ impl WorkflowRun {
                     }
                 }
             }
+
+            // Superstep barrier: fold this superstep's staged shared-state
+            // writes into committed state before emitting completion or
+            // checkpointing, so a checkpoint captures exactly the committed
+            // boundary. Only reached when every executor succeeded (an error
+            // returns above, leaving the writes discarded).
+            self.shared_state.commit().await;
 
             self.emit(WorkflowEvent::SuperStepCompleted(step));
             self.queue = next;
