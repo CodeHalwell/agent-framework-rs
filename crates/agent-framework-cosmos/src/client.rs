@@ -209,17 +209,23 @@ impl CosmosRestClient {
     }
 
     /// `POST /dbs/{database_id}/colls` with `{"id": container_id,
-    /// "partitionKey": {"paths": ["/threadId"], "kind": "Hash"}}`.
-    /// Tolerates `409 Conflict` as success.
+    /// "partitionKey": {"paths": [partition_key_path], "kind": "Hash"}}`.
+    /// Tolerates `409 Conflict` as success. `partition_key_path` lets each
+    /// store pick its own partitioning scheme (e.g.
+    /// [`crate::CosmosChatMessageStore`]'s `/threadId` vs.
+    /// [`crate::checkpoint_storage::CosmosCheckpointStorage`]'s `/id`)
+    /// rather than hard-coding one path for every container this crate
+    /// creates.
     pub(crate) async fn create_container_if_not_exists(
         &self,
         database_id: &str,
         container_id: &str,
+        partition_key_path: &str,
     ) -> Result<()> {
         let body = serde_json::json!({
             "id": container_id,
             "partitionKey": {
-                "paths": [PARTITION_KEY_PATH],
+                "paths": [partition_key_path],
                 "kind": "Hash",
             },
         });
@@ -298,18 +304,71 @@ impl CosmosRestClient {
         query: &str,
         parameters: &[(&str, Value)],
     ) -> Result<Vec<Value>> {
+        let pk_header = partition_key_header_value(partition_key)?;
+        self.query_documents_with_headers(
+            database_id,
+            container_id,
+            query,
+            parameters,
+            vec![
+                ("x-ms-documentdb-isquery", "True".to_string()),
+                ("x-ms-documentdb-partitionkey", pk_header),
+            ],
+        )
+        .await
+    }
+
+    /// Run a parameterized SQL query against `dbs/{db}/colls/{coll}/docs`
+    /// fanned out across *every* partition (`x-ms-documentdb-
+    /// query-enablecrosspartition: True`, no partition-key header) — for
+    /// stores like [`crate::checkpoint_storage::CosmosCheckpointStorage`]
+    /// whose partition key (`/id`) isn't a useful query-time filter.
+    /// Transparently follows `x-ms-continuation` pagination until
+    /// exhausted, same as [`Self::query_documents`].
+    pub(crate) async fn query_documents_cross_partition(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        query: &str,
+        parameters: &[(&str, Value)],
+    ) -> Result<Vec<Value>> {
+        self.query_documents_with_headers(
+            database_id,
+            container_id,
+            query,
+            parameters,
+            vec![
+                ("x-ms-documentdb-isquery", "True".to_string()),
+                (
+                    "x-ms-documentdb-query-enablecrosspartition",
+                    "True".to_string(),
+                ),
+            ],
+        )
+        .await
+    }
+
+    /// Shared pagination loop for [`Self::query_documents`] and
+    /// [`Self::query_documents_cross_partition`]; `base_headers` supplies
+    /// whichever of the two mutually-exclusive scoping headers (partition
+    /// key vs. cross-partition) the caller wants, plus `x-ms-documentdb-
+    /// isquery`. `x-ms-continuation` is appended per-iteration.
+    async fn query_documents_with_headers(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        query: &str,
+        parameters: &[(&str, Value)],
+        base_headers: Vec<(&str, String)>,
+    ) -> Result<Vec<Value>> {
         let resource_link = coll_link(database_id, container_id);
         let url_path = docs_link(database_id, container_id);
-        let pk_header = partition_key_header_value(partition_key)?;
         let body = build_query_body(query, parameters);
 
         let mut out = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
-            let mut headers = vec![
-                ("x-ms-documentdb-isquery", "True".to_string()),
-                ("x-ms-documentdb-partitionkey", pk_header.clone()),
-            ];
+            let mut headers = base_headers.clone();
             if let Some(token) = &continuation {
                 headers.push(("x-ms-continuation", token.clone()));
             }
@@ -349,6 +408,93 @@ impl CosmosRestClient {
             }
         }
         Ok(out)
+    }
+
+    /// `GET /dbs/{db}/colls/{coll}/docs/{doc_id}`, scoped to partition
+    /// `partition_key` — a point read. Returns `Ok(None)` on `404 Not
+    /// Found` rather than erroring (mirrors [`Self::delete_document`]'s
+    /// "not found is not a failure" treatment), `Ok(Some(document))` on
+    /// success.
+    pub(crate) async fn get_document(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        partition_key: &str,
+        doc_id: &str,
+    ) -> Result<Option<Value>> {
+        let resource_link = doc_link(database_id, container_id, doc_id);
+        let pk_header = partition_key_header_value(partition_key)?;
+        let resp = self
+            .send(RequestSpec {
+                method: reqwest::Method::GET,
+                resource_type: "docs",
+                resource_link: &resource_link,
+                url_path: &resource_link,
+                body: None,
+                content_type: None,
+                extra_headers: &[("x-ms-documentdb-partitionkey", pk_header)],
+            })
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::service(format!("failed reading Cosmos DB response body: {e}")))?;
+        if !status.is_success() {
+            return Err(map_error_response(status, &text));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|e| {
+            Error::service(format!(
+                "invalid Cosmos DB response JSON: {e} (body: {text})"
+            ))
+        })?;
+        Ok(Some(value))
+    }
+
+    /// `POST /dbs/{db}/colls/{coll}/docs` with `x-ms-documentdb-is-upsert:
+    /// True`, scoped to partition `partition_key` — creates `document` if
+    /// its `id` doesn't yet exist in this partition, else replaces it in
+    /// place. Returns the resulting document as returned by Cosmos DB.
+    pub(crate) async fn upsert_document(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        partition_key: &str,
+        document: &Value,
+    ) -> Result<Value> {
+        let resource_link = coll_link(database_id, container_id);
+        let url_path = docs_link(database_id, container_id);
+        let pk_header = partition_key_header_value(partition_key)?;
+        let resp = self
+            .send(RequestSpec {
+                method: reqwest::Method::POST,
+                resource_type: "docs",
+                resource_link: &resource_link,
+                url_path: &url_path,
+                body: Some(document),
+                content_type: None,
+                extra_headers: &[
+                    ("x-ms-documentdb-partitionkey", pk_header),
+                    ("x-ms-documentdb-is-upsert", "True".to_string()),
+                ],
+            })
+            .await?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::service(format!("failed reading Cosmos DB response body: {e}")))?;
+        if !status.is_success() {
+            return Err(map_error_response(status, &text));
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            Error::service(format!(
+                "invalid Cosmos DB response JSON: {e} (body: {text})"
+            ))
+        })
     }
 
     /// `DELETE /dbs/{db}/colls/{coll}/docs/{doc_id}`, scoped to partition

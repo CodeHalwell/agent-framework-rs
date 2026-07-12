@@ -167,12 +167,32 @@ impl HostState {
 pub struct AgentHost {
     entities: Vec<EntityRecord>,
     index: HashMap<String, usize>,
+    bearer_token: Option<String>,
+    allowed_hosts: Option<Vec<String>>,
 }
 
 impl AgentHost {
     /// A new, empty host.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Require `Authorization: Bearer <token>` on every request (401 without
+    /// it, or with the wrong token). Opt-in: unset by default, so
+    /// [`AgentHost::into_router`] is unaffected unless this is called. See
+    /// [`crate::security::bearer_auth`].
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Reject (403) requests whose `Host` header isn't one of `hosts`
+    /// (anti-DNS-rebinding; ports are ignored). Opt-in: unset by default, so
+    /// [`AgentHost::into_router`] is unaffected unless this is called. See
+    /// [`crate::security::host_guard`].
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = Some(hosts);
+        self
     }
 
     fn insert(&mut self, id: String, record: EntityRecord) {
@@ -248,13 +268,62 @@ impl AgentHost {
     /// Routes: `GET /health`, `GET /v1/entities`, `GET /v1/entities/{id}/info`,
     /// `POST /v1/responses`. The router carries no state of its own beyond the
     /// registry and is freely nestable into a larger application.
+    ///
+    /// Security middleware is **opt-in**: with no [`AgentHost::with_bearer_token`]
+    /// or [`AgentHost::with_allowed_hosts`] call, this returns exactly the
+    /// unauthenticated, unguarded router it always has (existing callers and
+    /// tests are unaffected). Call those builders first — or use
+    /// [`AgentHost::into_secure_router`] for a secure-by-default router — to
+    /// have the corresponding middleware applied here.
     pub fn into_router(self) -> axum::Router {
-        crate::devui::router(self.into_state())
+        let bearer_token = self.bearer_token.clone();
+        let allowed_hosts = self.allowed_hosts.clone();
+        let mut router = crate::devui::router(self.into_state());
+
+        // Layers apply outermost-last-added-first; auth after the host guard
+        // so a rebinding attempt is rejected before token comparison.
+        if let Some(token) = bearer_token {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                crate::security::BearerToken::new(token),
+                crate::security::bearer_auth,
+            ));
+        }
+        if let Some(hosts) = allowed_hosts {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                crate::security::AllowedHosts::new(hosts),
+                crate::security::host_guard,
+            ));
+        }
+        router
+    }
+
+    /// [`AgentHost::into_router`], but secure by default: if
+    /// [`AgentHost::with_allowed_hosts`] was never called, the anti-DNS-
+    /// rebinding `Host` guard is still applied with the default loopback
+    /// allowlist (`localhost`, `127.0.0.1`, `[::1]`, any port). Bearer auth
+    /// stays opt-in — call [`AgentHost::with_bearer_token`] to require it.
+    ///
+    /// This does not change [`AgentHost::into_router`] itself; use this method
+    /// when you want a safer default entry point (e.g. for `serve`-style
+    /// binding to a real socket) without touching existing `into_router()`
+    /// callers.
+    pub fn into_secure_router(mut self) -> axum::Router {
+        if self.allowed_hosts.is_none() {
+            self.allowed_hosts = Some(crate::security::default_hosts());
+        }
+        self.into_router()
     }
 
     /// Bind `addr` and serve the DevUI router until the process exits.
     pub async fn serve(self, addr: impl Into<std::net::SocketAddr>) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr.into()).await?;
         axum::serve(listener, self.into_router()).await
+    }
+
+    /// [`AgentHost::serve`], but binding [`AgentHost::into_secure_router`]
+    /// instead — secure by default (see there for what that adds).
+    pub async fn serve_secure(self, addr: impl Into<std::net::SocketAddr>) -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::bind(addr.into()).await?;
+        axum::serve(listener, self.into_secure_router()).await
     }
 }

@@ -55,6 +55,7 @@ pub mod agui;
 pub mod devui;
 pub mod openai_compat;
 pub mod registry;
+pub mod security;
 
 mod sse;
 mod ui;

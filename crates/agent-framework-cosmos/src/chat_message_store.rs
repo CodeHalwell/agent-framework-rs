@@ -209,7 +209,11 @@ impl CosmosChatMessageStore {
             .create_database_if_not_exists(&self.database_id)
             .await?;
         self.client
-            .create_container_if_not_exists(&self.database_id, &self.container_id)
+            .create_container_if_not_exists(
+                &self.database_id,
+                &self.container_id,
+                DEFAULT_PARTITION_KEY_PATH,
+            )
             .await?;
         Ok(())
     }

@@ -17,8 +17,31 @@ use std::time::Duration;
 
 use agent_framework_core::threads::ChatMessageStore;
 use agent_framework_core::types::Message;
-use agent_framework_cosmos::CosmosChatMessageStore;
+use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
+use agent_framework_cosmos::{CosmosChatMessageStore, CosmosCheckpointStorage};
 use serde_json::{json, Value};
+
+/// A minimal but non-trivial [`WorkflowCheckpoint`] for the checkpoint-storage
+/// loopback tests below.
+fn sample_checkpoint(checkpoint_id: &str, workflow_id: &str) -> WorkflowCheckpoint {
+    let mut executor_states = std::collections::HashMap::new();
+    executor_states.insert("executor-a".to_string(), json!({"count": 2}));
+    WorkflowCheckpoint {
+        checkpoint_id: checkpoint_id.to_string(),
+        workflow_id: workflow_id.to_string(),
+        workflow_name: Some("my-workflow".to_string()),
+        timestamp_millis: 1_700_000_000_000,
+        iteration_count: 3,
+        messages: Vec::new(),
+        executor_states,
+        shared_state: std::collections::HashMap::new(),
+        pending_requests: Vec::new(),
+        fanin_state: std::collections::HashMap::new(),
+        metadata: std::collections::HashMap::new(),
+        graph_signature: "sig-123".to_string(),
+        version: "1.0".to_string(),
+    }
+}
 
 /// A synthetic, deterministic base64 test key (bytes 0..=63), built at
 /// runtime so secret scanners never see a high-entropy literal. The
@@ -628,3 +651,288 @@ async fn query_documents_tolerates_response_missing_documents_field() {
     let messages = store.list_messages().await.unwrap();
     assert!(messages.is_empty());
 }
+
+// region: CosmosCheckpointStorage
+
+#[tokio::test]
+async fn checkpoint_save_sends_upsert_header_and_document_shape() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        let mut created = request.body_json();
+        created["_rid"] = json!("abc==");
+        created["_ts"] = json!(1_700_000_000);
+        (200, "OK", vec![], created)
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let id = storage
+        .save(sample_checkpoint("cp-1", "wf-1"))
+        .await
+        .unwrap();
+    assert_eq!(id, "cp-1");
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request.path,
+        "/dbs/agent-framework/colls/workflow-checkpoints/docs"
+    );
+    // save() upserts (create-or-replace) rather than plain-create, since a
+    // resumed workflow may re-save the same checkpoint_id.
+    assert_eq!(
+        request.header("x-ms-documentdb-is-upsert").as_deref(),
+        Some("True")
+    );
+    // Partitioned by the checkpoint's own id (see module docs), not
+    // workflow_id.
+    assert_valid_cosmos_headers(request, "cp-1");
+
+    let body = request.body_json();
+    assert_eq!(body["id"], json!("cp-1"));
+    assert_eq!(body["workflowId"], json!("wf-1"));
+    let inner: WorkflowCheckpoint =
+        serde_json::from_str(body["checkpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(inner.checkpoint_id, "cp-1");
+    assert_eq!(inner.iteration_count, 3);
+}
+
+#[tokio::test]
+async fn checkpoint_load_returns_none_on_404() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            404,
+            "Not Found",
+            vec![],
+            json!({"code": "NotFound", "message": "Resource not found"}),
+        )
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let loaded = storage.load("missing-checkpoint").await.unwrap();
+    assert!(loaded.is_none());
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        "/dbs/agent-framework/colls/workflow-checkpoints/docs/missing-checkpoint"
+    );
+    assert_valid_cosmos_headers(&requests[0], "missing-checkpoint");
+}
+
+#[tokio::test]
+async fn checkpoint_load_found_document_round_trips() {
+    let checkpoint = sample_checkpoint("cp-2", "wf-2");
+    let checkpoint_json = serde_json::to_string(&checkpoint).unwrap();
+    let doc = json!({
+        "id": "cp-2",
+        "workflowId": "wf-2",
+        "checkpoint": checkpoint_json,
+        "_rid": "r",
+        "_ts": 1_700_000_000,
+    });
+
+    let (base_url, handle) =
+        serve_sequence(1, move |_i, _request| (200, "OK", vec![], doc.clone()));
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let loaded = storage
+        .load("cp-2")
+        .await
+        .unwrap()
+        .expect("checkpoint found");
+    assert_eq!(loaded.checkpoint_id, "cp-2");
+    assert_eq!(loaded.workflow_id, "wf-2");
+    assert_eq!(loaded.iteration_count, 3);
+    assert_eq!(loaded.graph_signature, "sig-123");
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(
+        requests[0].path,
+        "/dbs/agent-framework/colls/workflow-checkpoints/docs/cp-2"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_list_without_workflow_filter_uses_cross_partition_header() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({"_rid": "r", "Documents": [], "_count": 0}),
+        )
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let out = storage.list(None).await.unwrap();
+    assert!(out.is_empty());
+
+    let requests = handle.join().unwrap();
+    let request = &requests[0];
+    assert_eq!(request.method, "POST");
+    assert_eq!(
+        request
+            .header("x-ms-documentdb-query-enablecrosspartition")
+            .as_deref(),
+        Some("True")
+    );
+    // No single partition key can scope this query (see module docs), so no
+    // `x-ms-documentdb-partitionkey` header should be sent.
+    assert!(request.header("x-ms-documentdb-partitionkey").is_none());
+    let body = request.body_json();
+    assert_eq!(body["query"], json!("SELECT * FROM c"));
+}
+
+#[tokio::test]
+async fn checkpoint_list_with_workflow_filter_scopes_query() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({"_rid": "r", "Documents": [], "_count": 0}),
+        )
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    storage.list(Some("wf-9")).await.unwrap();
+
+    let requests = handle.join().unwrap();
+    let body = requests[0].body_json();
+    assert!(body["query"]
+        .as_str()
+        .unwrap()
+        .contains("WHERE c.workflowId = @workflowId"));
+    assert_eq!(
+        body["parameters"],
+        json!([{"name": "@workflowId", "value": "wf-9"}])
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_delete_existing_does_get_then_delete() {
+    let (base_url, handle) = serve_sequence(2, |i, _request| match i {
+        0 => (
+            200,
+            "OK",
+            vec![],
+            json!({"id": "cp-3", "workflowId": "wf-3", "checkpoint": "{}"}),
+        ),
+        1 => (204, "No Content", vec![], Value::Null),
+        _ => unreachable!("only 2 requests expected"),
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let existed = storage.delete("cp-3").await.unwrap();
+    assert!(existed);
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[1].method, "DELETE");
+    assert!(requests[1].path.ends_with("/cp-3"));
+}
+
+#[tokio::test]
+async fn checkpoint_delete_missing_checkpoint_only_does_get() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (404, "Not Found", vec![], json!({"code": "NotFound"}))
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    let existed = storage.delete("cp-missing").await.unwrap();
+    assert!(!existed);
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+}
+
+#[tokio::test]
+async fn checkpoint_ensure_created_uses_id_partition_key() {
+    let (base_url, handle) = serve_sequence(2, |i, _request| match i {
+        0 => (201, "Created", vec![], json!({"id": "agent-framework"})),
+        1 => (
+            201,
+            "Created",
+            vec![],
+            json!({"id": "workflow-checkpoints"}),
+        ),
+        _ => unreachable!("only 2 requests expected"),
+    });
+
+    let storage = CosmosCheckpointStorage::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "workflow-checkpoints",
+    )
+    .unwrap();
+
+    storage.ensure_created().await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/dbs/agent-framework/colls");
+    let body = requests[1].body_json();
+    assert_eq!(body["id"], json!("workflow-checkpoints"));
+    assert_eq!(
+        body["partitionKey"],
+        json!({"paths": ["/id"], "kind": "Hash"})
+    );
+}
+
+// endregion
