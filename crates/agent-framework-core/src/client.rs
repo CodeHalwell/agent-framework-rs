@@ -18,7 +18,7 @@ use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
-    FunctionResultContent, Role, ToolMode,
+    FunctionResultContent, Role, ToolMode, UsageContent,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -593,26 +593,56 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         // merging the tool-call and final assistant messages by role.
         let response = self.get_response(messages, options).await?;
         // Response-level metadata must survive the replay so re-aggregation
-        // (and the agent's thread adoption) sees it.
+        // (and the agent's thread adoption) sees it: ids on every update,
+        // and usage/finish-reason on the final one (usage rides as a
+        // `Content::Usage` item, which `absorb_update` folds into
+        // `usage_details` rather than the message contents — the same shape
+        // providers use for their terminal stream chunk).
         let conversation_id = response.conversation_id.clone();
         let response_id = response.response_id.clone();
-        let updates: Vec<Result<ChatResponseUpdate>> = response
+        let finish_reason = response.finish_reason.clone();
+        let usage_details = response.usage_details.clone();
+        let last = response.messages.len().saturating_sub(1);
+        let mut updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
             .enumerate()
             .map(|(i, m)| {
                 let message_id = m.message_id.clone().or_else(|| Some(format!("replay-{i}")));
+                let mut contents = m.contents;
+                let is_last = i == last;
+                if is_last {
+                    if let Some(usage) = usage_details.clone() {
+                        contents.push(Content::Usage(UsageContent { details: usage }));
+                    }
+                }
                 Ok(ChatResponseUpdate {
-                    contents: m.contents,
+                    contents,
                     role: Some(m.role),
                     author_name: m.author_name,
                     message_id,
                     conversation_id: conversation_id.clone(),
                     response_id: response_id.clone(),
+                    finish_reason: is_last.then(|| finish_reason.clone()).flatten(),
                     ..Default::default()
                 })
             })
             .collect();
+        // A messageless response (unusual, but possible) still carries its
+        // terminal metadata in one trailing update.
+        if updates.is_empty() && (usage_details.is_some() || finish_reason.is_some()) {
+            let contents = usage_details
+                .map(|u| vec![Content::Usage(UsageContent { details: u })])
+                .unwrap_or_default();
+            updates.push(Ok(ChatResponseUpdate {
+                contents,
+                role: Some(Role::assistant()),
+                conversation_id,
+                response_id,
+                finish_reason,
+                ..Default::default()
+            }));
+        }
         Ok(stream::iter(updates).boxed())
     }
 

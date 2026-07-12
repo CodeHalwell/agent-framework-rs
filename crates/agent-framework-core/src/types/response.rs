@@ -434,6 +434,13 @@ pub struct AgentRunResponseUpdate {
     pub response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub message_id: Option<String>,
+    /// Service-side conversation id carried by the underlying chat update
+    /// (Responses / Assistants / Azure AI service-managed conversations).
+    /// Preserved so aggregating a streamed run via
+    /// [`AgentRunResponse::from_updates`] yields the same
+    /// [`AgentRunResponse::conversation_id`] a non-streaming `run()` returns.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     /// Provider-specific metadata for this update. Merged onto
@@ -472,6 +479,7 @@ impl AgentRunResponseUpdate {
             author_name: u.author_name.clone(),
             response_id: u.response_id.clone(),
             message_id: u.message_id.clone(),
+            conversation_id: u.conversation_id.clone(),
             created_at: u.created_at.clone(),
             additional_properties: u.additional_properties.clone(),
             raw_representation: u.raw_representation.clone(),
@@ -485,6 +493,7 @@ impl AgentRunResponseUpdate {
             author_name: self.author_name,
             response_id: self.response_id,
             message_id: self.message_id,
+            conversation_id: self.conversation_id,
             created_at: self.created_at,
             additional_properties: self.additional_properties,
             raw_representation: self.raw_representation,

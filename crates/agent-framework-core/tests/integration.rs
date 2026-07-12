@@ -444,6 +444,108 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
 }
 
 #[tokio::test]
+async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id() {
+    // Usage, finish reason, and the service conversation id must survive the
+    // tool-loop's run-then-replay streaming path, so aggregating the stream
+    // yields the same metadata a non-streaming run() returns.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let mut usage = UsageDetails::new();
+    usage.input_token_count = Some(11);
+    usage.output_token_count = Some(7);
+    let answer = ChatResponse {
+        usage_details: Some(usage),
+        finish_reason: Some(FinishReason::stop()),
+        conversation_id: Some("conv-9".into()),
+        ..ChatResponse::from_text("final answer")
+    };
+
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("done")) },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(noop)
+        .build();
+
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-9"));
+    let usage = aggregated
+        .usage_details
+        .as_ref()
+        .expect("usage must survive the replay");
+    assert_eq!(usage.output_token_count, Some(7));
+    // The usage rode as a Content::Usage item and must have folded into
+    // usage_details, not leaked into the final message's contents.
+    assert!(aggregated
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .all(|c| !matches!(c, Content::Usage(_))));
+    assert_eq!(aggregated.messages.last().unwrap().text(), "final answer");
+}
+
+#[tokio::test]
+async fn chat_level_tool_stream_replay_carries_finish_reason() {
+    // AgentRunResponse has no finish_reason (matching upstream), so the
+    // finish-reason half of the replay metadata is asserted at the
+    // chat-client level, where ChatResponse::from_updates surfaces it.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse {
+        finish_reason: Some(FinishReason::stop()),
+        ..ChatResponse::from_text("done")
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ask, answer]));
+    let options = ChatOptions {
+        tools: vec![noop],
+        ..Default::default()
+    };
+    let mut stream = client
+        .get_streaming_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = ChatResponse::from_updates(updates);
+    assert_eq!(aggregated.finish_reason, Some(FinishReason::stop()));
+    assert_eq!(aggregated.messages.last().unwrap().text(), "done");
+}
+
+#[tokio::test]
 async fn workflow_errors_on_max_iterations() {
     use agent_framework_core::workflow::{FunctionExecutor, WorkflowBuilder};
 
