@@ -651,10 +651,16 @@ fn prepare_options(
                     json!({ "type": "function", "function": { "name": name } }),
                 );
             }
-            // A bare "required" (no function name) is intentionally not sent,
-            // mirroring Python's `elif ... required_function_name is not None`;
-            // an unset choice sends no field (service-side default: auto).
-            Some(ToolMode::Required(None)) | None => {}
+            // A bare "required" forces *some* tool call — sent as "required",
+            // matching this crate's Chat Completions and Responses converters
+            // and the core `ToolMode::Required(None)` contract. (Deliberate
+            // divergence from Python's Assistants client, which only sends a
+            // *named* required choice and drops the bare form.)
+            Some(ToolMode::Required(None)) => {
+                run_options.insert("tool_choice".into(), json!("required"));
+            }
+            // An unset choice sends no field (service-side default: auto).
+            None => {}
         }
     }
 
@@ -668,7 +674,14 @@ fn prepare_options(
         run_options.insert("metadata".into(), json!(metadata));
     }
 
-    let mut instructions = String::new();
+    // Seed the run `instructions` from `ChatOptions::instructions`, then fold
+    // any system/developer message text after it (upstream's `BaseChatClient`
+    // prepends `chat_options.instructions` as the first system message before
+    // the Assistants client splits system text into `instructions`; this port
+    // injects that system message in `ChatAgent`, so a *direct* client call
+    // would otherwise drop it — seeding here honors it either way, and cannot
+    // double-inject because `ChatAgent` takes the option out before dispatch).
+    let mut instructions = options.instructions.clone().unwrap_or_default();
     let mut additional_messages: Vec<Value> = Vec::new();
     let mut tool_results: Option<Vec<FunctionResultContent>> = None;
 
@@ -1297,14 +1310,31 @@ mod tests {
             json!({ "type": "function", "function": { "name": "get_weather" } })
         );
 
-        // A bare "required" (no function name) sends no tool_choice, mirroring
-        // Python (which only maps the named-required case).
+        // A bare "required" (no function name) forces some tool call — sent as
+        // "required", consistent with the Chat Completions / Responses
+        // converters and the core ToolMode::Required(None) contract.
         let mut any = ChatOptions::new().with_tool_choice(ToolMode::Required(None));
         any.tools = vec![function_tool("get_weather")];
         let (run_any, _) = prepare_options(&[ChatMessage::user("hi")], &any);
-        assert!(run_any.get("tool_choice").is_none());
-        // Tools are still emitted (tool_choice is Some and != none).
+        assert_eq!(run_any["tool_choice"], json!("required"));
         assert!(run_any.get("tools").is_some());
+    }
+
+    #[test]
+    fn prepare_options_seeds_instructions_from_chat_options() {
+        // A direct client call using ChatOptions::with_instructions must reach
+        // the run body's `instructions` field, with any system-message text
+        // folded in after it.
+        let options = ChatOptions::new().with_instructions("You are helpful.");
+        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        assert_eq!(run["instructions"], json!("You are helpful."));
+
+        let options = ChatOptions::new().with_instructions("You are helpful.");
+        let (run, _) = prepare_options(
+            &[ChatMessage::system("Be terse."), ChatMessage::user("hi")],
+            &options,
+        );
+        assert_eq!(run["instructions"], json!("You are helpful.Be terse."));
     }
 
     #[test]
