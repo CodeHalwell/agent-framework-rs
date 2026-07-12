@@ -11,6 +11,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
+use crate::compaction::{CompactionProvider, CompactionStrategy};
 use crate::error::{Error, Result};
 use crate::history::ensure_history_provider;
 use crate::memory::{ContextProvider, SessionContext};
@@ -1059,6 +1060,23 @@ impl AgentBuilder {
         self.context_providers = providers;
         self
     }
+    /// Attach conversation-history compaction, via a
+    /// [`CompactionProvider`](crate::compaction::CompactionProvider) wrapping
+    /// `strategy` (with the default `ApproxTokenizer`; use
+    /// [`AgentBuilder::context_provider`] with
+    /// [`CompactionProvider::with_tokenizer`](crate::compaction::CompactionProvider::with_tokenizer)
+    /// for a custom tokenizer).
+    ///
+    /// Registered as one of the agent's own context providers, which
+    /// [`Agent::combined_providers`] always runs *after* the session's —
+    /// including the auto-attached (or explicitly attached)
+    /// [`HistoryProvider`](crate::history::HistoryProvider), which lives on
+    /// the session — so compaction sees, and can shrink, the full
+    /// history-prepended message list for the run. Not calling this leaves
+    /// the default behavior unchanged: the full history is sent every run.
+    pub fn with_compaction(self, strategy: impl CompactionStrategy + 'static) -> Self {
+        self.context_provider(Arc::new(CompactionProvider::new(strategy)))
+    }
     /// Add an agent middleware.
     pub fn middleware(mut self, mw: Arc<crate::middleware::AgentMiddleware>) -> Self {
         self.agent_middleware.push(mw);
@@ -1207,5 +1225,142 @@ impl Agent {
             }
         })
         .into_definition()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ChatStream;
+    use crate::compaction::Truncation;
+    use crate::types::{ChatResponse, ChatResponseUpdate};
+    use futures::stream;
+    use std::sync::Mutex;
+
+    /// A chat client that records the full message list of every request it
+    /// receives and always replies with the same canned text.
+    #[derive(Clone, Default)]
+    struct RecordingClient {
+        received: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl RecordingClient {
+        fn requests(&self) -> Vec<Vec<Message>> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatClient for RecordingClient {
+        async fn get_response(
+            &self,
+            messages: Vec<Message>,
+            _options: ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.received.lock().unwrap().push(messages);
+            Ok(ChatResponse::from_text("ok"))
+        }
+
+        async fn get_streaming_response(
+            &self,
+            messages: Vec<Message>,
+            options: ChatOptions,
+        ) -> Result<ChatStream> {
+            let resp = self.get_response(messages, options).await?;
+            let updates: Vec<Result<ChatResponseUpdate>> = resp
+                .messages
+                .into_iter()
+                .map(|m| {
+                    Ok(ChatResponseUpdate {
+                        contents: m.contents,
+                        role: Some(m.role),
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            Ok(Box::pin(stream::iter(updates)))
+        }
+    }
+
+    #[tokio::test]
+    async fn without_compaction_sends_the_full_accumulated_history() {
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client.clone()).build();
+        let mut session = agent.create_session();
+
+        agent
+            .run(vec![Message::user("turn 1")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 2")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 3")], Some(&mut session))
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 3);
+
+        // Third request: the full history accumulated by turns 1 and 2 (2
+        // user + 2 assistant messages) plus this turn's own input.
+        let last = requests.last().unwrap();
+        assert_eq!(last.len(), 5);
+        assert_eq!(last[0].text(), "turn 1");
+        assert_eq!(last[2].text(), "turn 2");
+        assert_eq!(last.last().unwrap().text(), "turn 3");
+    }
+
+    #[tokio::test]
+    async fn with_compaction_sends_only_the_compacted_message_set() {
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client.clone())
+            .with_compaction(Truncation::new(2))
+            .build();
+        let mut session = agent.create_session();
+
+        agent
+            .run(vec![Message::user("turn 1")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 2")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 3")], Some(&mut session))
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 3);
+
+        // Third request: compaction caps the *stored history* (4 messages
+        // by then) at 2 before this turn's own input is appended, so the
+        // outgoing request is 3 messages, and the oldest turn is gone.
+        let last = requests.last().unwrap();
+        assert_eq!(last.len(), 3);
+        assert!(last.iter().all(|m| m.text() != "turn 1"));
+        assert_eq!(last[0].text(), "turn 2");
+        assert_eq!(last.last().unwrap().text(), "turn 3");
+    }
+
+    #[tokio::test]
+    async fn with_compaction_runs_after_the_history_provider_in_combined_providers() {
+        // Direct check on `combined_providers` ordering: the agent-level
+        // provider attached by `with_compaction` must come after the
+        // session's auto-attached history provider.
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client)
+            .with_compaction(Truncation::new(2))
+            .build();
+        let session = agent.create_session();
+
+        let providers = agent.combined_providers(&session);
+        assert_eq!(providers.len(), 2);
+        assert!(providers[0].is_history_provider());
+        assert!(!providers[1].is_history_provider());
     }
 }

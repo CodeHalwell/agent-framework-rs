@@ -28,6 +28,12 @@
 //! (possibly unchanged) retained subset that satisfies the strategy's
 //! constraint.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::error::Result;
+use crate::memory::{ContextProvider, SessionContext};
 use crate::types::{Content, Message, Role};
 
 /// Counts tokens for a piece of text. Rust equivalent of upstream
@@ -247,6 +253,57 @@ pub fn compact(
     tokenizer: &dyn Tokenizer,
 ) -> Vec<Message> {
     strategy.compact(messages, tokenizer)
+}
+
+/// A [`ContextProvider`] that compacts the accumulated message list —
+/// typically the run's history, once a [`HistoryProvider`](crate::history::HistoryProvider)
+/// has prepended it in `before_run` — down to fit a [`CompactionStrategy`]'s
+/// constraint before it reaches the model. Rust equivalent of (a subset of)
+/// upstream's `CompactionProvider` (see module docs and `UPSTREAM_DRIFT.md`
+/// §9).
+///
+/// Register it via [`AgentBuilder::with_compaction`](crate::agent::AgentBuilder::with_compaction),
+/// which attaches it as one of the agent's own context providers — those run
+/// *after* the session's (which is where a history provider, auto-attached
+/// or explicit, lives — see [`Agent::combined_providers`](crate::agent::Agent)),
+/// so compaction always sees the full, history-prepended message list for the
+/// run.
+pub struct CompactionProvider {
+    strategy: Arc<dyn CompactionStrategy>,
+    tokenizer: Box<dyn Tokenizer>,
+}
+
+impl CompactionProvider {
+    /// A compaction provider using `strategy` with the default
+    /// [`ApproxTokenizer`].
+    pub fn new(strategy: impl CompactionStrategy + 'static) -> Self {
+        Self::with_tokenizer(strategy, ApproxTokenizer)
+    }
+
+    /// A compaction provider using `strategy` and an explicit `tokenizer`.
+    pub fn with_tokenizer(
+        strategy: impl CompactionStrategy + 'static,
+        tokenizer: impl Tokenizer + 'static,
+    ) -> Self {
+        Self {
+            strategy: Arc::new(strategy),
+            tokenizer: Box::new(tokenizer),
+        }
+    }
+}
+
+#[async_trait]
+impl ContextProvider for CompactionProvider {
+    /// Replace `ctx.messages` (the accumulated history + any earlier
+    /// provider-injected messages) with the strategy's compacted subset.
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        ctx.messages = self.strategy.compact(&ctx.messages, &*self.tokenizer);
+        Ok(())
+    }
+
+    // `after_run` is intentionally a no-op (the default from `ContextProvider`):
+    // compaction only shapes the outgoing request, it never observes or
+    // records the run's outcome.
 }
 
 #[cfg(test)]
@@ -518,5 +575,55 @@ mod tests {
         let strategy = SelectiveToolResult::new(0);
         let out = compact(&messages, &strategy, &ApproxTokenizer);
         assert_eq!(out, messages);
+    }
+
+    // ---- CompactionProvider ---------------------------------------------
+
+    #[tokio::test]
+    async fn compaction_provider_before_run_replaces_ctx_messages_with_compacted_subset() {
+        let provider = CompactionProvider::new(Truncation::new(2));
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.messages = vec![
+            text(Role::user(), "1"),
+            text(Role::assistant(), "2"),
+            text(Role::user(), "3"),
+            text(Role::assistant(), "4"),
+        ];
+        provider.before_run(&mut ctx).await.unwrap();
+        assert_eq!(ctx.messages.len(), 2);
+        assert_eq!(ctx.messages[0].text(), "3");
+        assert_eq!(ctx.messages[1].text(), "4");
+    }
+
+    #[tokio::test]
+    async fn compaction_provider_with_tokenizer_uses_the_supplied_tokenizer() {
+        struct FixedTokenizer(usize);
+        impl Tokenizer for FixedTokenizer {
+            fn count_tokens(&self, _text: &str) -> usize {
+                self.0
+            }
+        }
+        let provider = CompactionProvider::with_tokenizer(TokenBudget::new(25), FixedTokenizer(10));
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.messages = vec![
+            text(Role::user(), "1"),
+            text(Role::assistant(), "2"),
+            text(Role::user(), "3"),
+            text(Role::assistant(), "4"),
+        ];
+        provider.before_run(&mut ctx).await.unwrap();
+        // Budget of 25 with a fixed 10-token cost per message keeps 2 messages.
+        assert_eq!(ctx.messages.len(), 2);
+        assert_eq!(ctx.messages[0].text(), "3");
+        assert_eq!(ctx.messages[1].text(), "4");
+    }
+
+    #[tokio::test]
+    async fn compaction_provider_after_run_is_a_noop() {
+        let provider = CompactionProvider::new(Truncation::new(1));
+        provider
+            .after_run(&[Message::new(Role::user(), "hi")], &[], None)
+            .await
+            .unwrap();
     }
 }

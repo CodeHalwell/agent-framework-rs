@@ -65,8 +65,8 @@ pub mod prelude {
         RetryingChatClient,
     };
     pub use crate::compaction::{
-        compact, ApproxTokenizer, CompactionStrategy, SelectiveToolResult, SlidingWindow,
-        TokenBudget, Tokenizer, Truncation,
+        compact, ApproxTokenizer, CompactionProvider, CompactionStrategy, SelectiveToolResult,
+        SlidingWindow, TokenBudget, Tokenizer, Truncation,
     };
     pub use crate::error::{Error, Result};
     pub use crate::history::{FileHistoryProvider, HistoryProvider, InMemoryHistoryProvider};
