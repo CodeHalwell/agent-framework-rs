@@ -1,7 +1,7 @@
 //! Human-in-the-loop tool approval: a tool marked `ApprovalMode::AlwaysRequire`
 //! makes the function-invocation loop pause instead of executing it -- the
 //! caller inspects the pending request, approves (or rejects) it, and
-//! resubmits on the same thread to continue.
+//! resubmits on the same session to continue.
 //!
 //! The flow (not the tool itself) is the point of this example: run -> look
 //! at `user_input_requests()` -> approve via `FunctionApprovalResponseContent`
@@ -16,12 +16,12 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     // A tool that always requires a human sign-off before it runs.
     // `ApprovalMode` lives on the tool itself; the function-invocation loop
     // checks it for every call before executing.
-    let delete_file = AiFunction::new(
+    let delete_file = FunctionTool::new(
         "delete_file",
         "Permanently delete a file by name.",
         json!({
@@ -37,19 +37,19 @@ async fn main() -> Result<()> {
     .with_approval_mode(ApprovalMode::AlwaysRequire)
     .into_definition();
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("file-assistant")
         .instructions("You help manage files. Use tools when the user asks for a file action.")
         .tool(delete_file)
         .build();
 
-    let mut thread = agent.get_new_thread();
-    let mut input = vec![ChatMessage::user("Please delete scratch.txt")];
+    let mut session = agent.create_session();
+    let mut input = vec![Message::user("Please delete scratch.txt")];
 
     // Drive the approve/resubmit loop until a final, non-approval answer
     // comes back (bounded so a misbehaving model can't spin forever).
     for _ in 0..5 {
-        let response = agent.run(input.clone(), Some(&mut thread)).await?;
+        let response = agent.run(input.clone(), Some(&mut session)).await?;
         let requests = response.user_input_requests();
 
         if requests.is_empty() {
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
             .iter()
             .map(|req| Content::FunctionApprovalResponse(req.create_response(true)))
             .collect();
-        input = vec![ChatMessage::with_contents(Role::user(), approvals)];
+        input = vec![Message::with_contents(Role::user(), approvals)];
     }
 
     println!("gave up after 5 rounds without a final answer");

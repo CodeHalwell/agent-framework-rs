@@ -1,51 +1,55 @@
-//! Azure AI Foundry persistent agents: `AzureAIAgentClient` speaks the
-//! Foundry Agents REST routes (Assistants conventions -- agents, threads,
-//! runs) and plugs into `ChatAgent` like any other `ChatClient`. Entra ID
-//! auth comes from the `azure` crate's credential chain -- here the Azure CLI
-//! credential (`az login`), but `ClientSecretCredential`,
-//! `ManagedIdentityCredential`, or a `ChainedTokenCredential` work the same.
+//! Azure AI Foundry Prompt Agents: `FoundryChatClient` speaks the Foundry
+//! project **Responses API** (`{endpoint}/openai/v1/responses`, path-versioned
+//! -- no `?api-version=` query) and plugs into `FoundryAgent`/`Agent` like any
+//! other `ChatClient`. Entra ID auth comes from the `azure` crate's credential
+//! chain -- here the Azure CLI credential (`az login`), but
+//! `ClientSecretCredential`, `ManagedIdentityCredential`, or a
+//! `ChainedTokenCredential` work the same.
 //!
-//! Skips gracefully unless AZURE_AI_PROJECT_ENDPOINT is set (e.g.
+//! `FoundryAgent` realizes a Prompt Agent client-side over the Responses API;
+//! it does not bind to a server-hosted agent by id (the Foundry Agents
+//! control plane) -- see the crate docs.
+//!
+//! Skips gracefully unless FOUNDRY_ENDPOINT is set (e.g.
 //! `https://<resource>.services.ai.azure.com/api/projects/<project>`).
-//! Optional: AZURE_AI_MODEL_DEPLOYMENT_NAME (default `gpt-4o-mini`).
+//! Optional: FOUNDRY_MODEL (default `gpt-4o-mini`).
 //!
 //! ```bash
-//! az login && AZURE_AI_PROJECT_ENDPOINT=https://... \
+//! az login && FOUNDRY_ENDPOINT=https://... \
 //! cargo run -p agent-framework-examples --example azure_foundry_agent
 //! ```
 
 use std::sync::Arc;
 
 use agent_framework::azure::AzureCliCredential;
-use agent_framework::azure_ai::AI_FOUNDRY_SCOPE;
+use agent_framework::foundry::FOUNDRY_SCOPE;
 use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Ok(endpoint) = std::env::var("AZURE_AI_PROJECT_ENDPOINT") else {
-        println!("set AZURE_AI_PROJECT_ENDPOINT (and run `az login`) to run this example");
+    let Ok(endpoint) = std::env::var("FOUNDRY_ENDPOINT") else {
+        println!("set FOUNDRY_ENDPOINT (and run `az login`) to run this example");
         return Ok(());
     };
-    let model = std::env::var("AZURE_AI_MODEL_DEPLOYMENT_NAME")
-        .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = std::env::var("FOUNDRY_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
     // Tokens are fetched per request via `az account get-access-token` for
-    // the Foundry scope. `AzureAIAgentClient::with_existing_agent` targets a
-    // pre-created persistent agent instead; `new` auto-creates a transient
-    // one on first use and deletes it on `close()`.
-    let credential = Arc::new(AzureCliCredential::new(AI_FOUNDRY_SCOPE));
-    let client = AzureAIAgentClient::new(&endpoint, &model, credential)
-        .with_agent_name("rust-example-agent");
+    // the Foundry scope.
+    let credential = Arc::new(AzureCliCredential::new(FOUNDRY_SCOPE));
+    let client = FoundryChatClient::with_token_credential(&endpoint, &model, credential);
 
-    let agent = ChatAgent::builder(client.clone())
+    let agent = FoundryAgent::builder(client)
         .name("foundry-assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();
 
-    let response = agent.run_once("Say hello from Azure AI Foundry!").await?;
+    let response = agent
+        .run(
+            vec![Message::user("Say hello from Azure AI Foundry!")],
+            None,
+        )
+        .await?;
     println!("{}", response.text());
 
-    // Delete the auto-created transient agent server-side.
-    client.close().await?;
     Ok(())
 }

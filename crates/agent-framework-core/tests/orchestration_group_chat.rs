@@ -27,7 +27,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -40,7 +40,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -60,16 +60,16 @@ impl ChatClient for MockClient {
 }
 
 /// Build a named agent that returns the given scripted text replies.
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
-fn conversation(run: &WorkflowRun) -> Vec<ChatMessage> {
+fn conversation(run: &WorkflowRun) -> Vec<Message> {
     let output = run.last_output().expect("group chat should yield output");
     serde_json::from_value(output).expect("output is a conversation")
 }
@@ -91,7 +91,7 @@ async fn round_robin_visits_participants_in_order() {
 
     let run = workflow.run("kick off").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     let ia = texts.iter().position(|t| t.contains("a-speaks")).unwrap();
     let ib = texts.iter().position(|t| t.contains("b-speaks")).unwrap();
@@ -123,7 +123,7 @@ async fn custom_manager_can_finish() {
 
     let run = workflow.run("write something").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     assert!(texts.iter().any(|t| t.contains("draft-text")));
     assert!(
@@ -133,16 +133,16 @@ async fn custom_manager_can_finish() {
 }
 
 /// Build an LLM manager agent scripted to emit JSON `ManagerSelectionResponse`s.
-fn manager_agent(json_responses: Vec<&str>) -> Arc<dyn Agent> {
+fn manager_agent(json_responses: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = json_responses
         .into_iter()
         .map(ChatResponse::from_text)
         .collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name("manager")
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::test]
@@ -163,7 +163,7 @@ async fn llm_manager_parses_json_selection() {
 
     let run = workflow.run("please solve").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     assert!(
         texts.iter().any(|t| t.contains("please answer")),
@@ -204,9 +204,7 @@ async fn termination_condition_halts_conversation() {
         .participant("A", a)
         .round_robin()
         .max_rounds(40)
-        .termination_condition(|conv: &[ChatMessage]| {
-            conv.iter().any(|m| m.text().contains("STOP"))
-        })
+        .termination_condition(|conv: &[Message]| conv.iter().any(|m| m.text().contains("STOP")))
         .build()
         .unwrap();
 
@@ -219,4 +217,99 @@ async fn termination_condition_halts_conversation() {
         "participant should speak exactly once before termination"
     );
     assert_eq!(run.state(), WorkflowRunState::Idle);
+}
+
+/// `intermediate_output_from` demotes the group chat's single final yield
+/// (the finished conversation) from the workflow's terminal output to a
+/// non-terminal `Intermediate` event — useful when a group chat is composed
+/// as one stage of a larger pipeline. See [`GroupChatBuilder::output_from`]
+/// docs for why this is whole-orchestrator-granular rather than
+/// per-participant (a group chat compiles to a single executor).
+#[tokio::test]
+async fn intermediate_output_from_demotes_final_yield() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .round_robin()
+        .max_rounds(1)
+        .intermediate_output_from(["A"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("kick off").await.unwrap();
+
+    assert!(
+        run.last_output().is_none(),
+        "no terminal output should be recorded once demoted to Intermediate"
+    );
+    let intermediate = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Intermediate { .. }))
+        .count();
+    assert_eq!(
+        intermediate, 1,
+        "the sole yield became a non-terminal event"
+    );
+    let output_events = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Output { .. }))
+        .count();
+    assert_eq!(output_events, 0);
+}
+
+/// `output_from` naming a known participant preserves the default: the
+/// finished conversation remains the workflow's terminal output.
+#[tokio::test]
+async fn output_from_preserves_terminal_output() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .round_robin()
+        .max_rounds(1)
+        .output_from(["A"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("kick off").await.unwrap();
+    assert!(run.last_output().is_some());
+}
+
+/// Unknown participant names are rejected at build time.
+#[tokio::test]
+async fn output_from_rejects_unknown_participant() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let err = match GroupChatBuilder::new()
+        .participant("A", a)
+        .output_from(["nobody"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("nobody"));
+}
+
+/// Naming participants in both lists is rejected: on this single-executor
+/// builder both resolve to the same underlying executor id.
+#[tokio::test]
+async fn output_from_and_intermediate_output_from_conflict() {
+    let a = agent("A", vec!["a-speaks"]);
+    let b = agent("B", vec!["b-speaks"]);
+
+    let err = match GroupChatBuilder::new()
+        .participant("A", a)
+        .participant("B", b)
+        .output_from(["A"])
+        .intermediate_output_from(["B"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("group_chat_orchestrator"));
 }

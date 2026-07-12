@@ -1,6 +1,7 @@
 //! Redis-backed conversation history and long-term memory:
-//! `RedisChatMessageStore` keeps a thread's messages in a Redis LIST, and
-//! `RedisContextProvider` stores/retrieves scoped long-term memories.
+//! `RedisChatMessageStore` is a `HistoryProvider` that keeps a session's
+//! messages in a Redis LIST, and `RedisContextProvider` stores/retrieves
+//! scoped long-term memories.
 //!
 //! Prerequisite: a reachable Redis server (default `redis://127.0.0.1:6379`,
 //! override with REDIS_URL) -- e.g. `docker run --rm -p 6379:6379 redis:7`.
@@ -25,7 +26,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         // The provider injects remembered context as extra messages, so the
@@ -38,7 +39,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -57,11 +58,11 @@ impl ChatClient for CannedClient {
 async fn main() -> Result<()> {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
 
-    // Conversation history: one Redis LIST per thread id, trimmed to the
+    // Conversation history: one Redis LIST per session id, trimmed to the
     // most recent 200 messages. Connections are lazy; `ping()` checks
     // reachability so we can skip cleanly on machines without Redis.
     let store = Arc::new(
-        RedisChatMessageStore::new(&url, Some("example-thread".into()))?.with_max_messages(200),
+        RedisChatMessageStore::new(&url, Some("example-session".into()))?.with_max_messages(200),
     );
     if !store.ping().await {
         println!("redis not reachable at {url} -- skipping (start one and re-run)");
@@ -69,25 +70,27 @@ async fn main() -> Result<()> {
     }
     store.clear().await?; // fresh demo state on every run
 
-    // Long-term memory, scoped by user id: `invoked()` persists each turn,
-    // `invoking()` retrieves recent memories into the next request's context.
+    // Long-term memory, scoped by user id: `after_run()` persists each turn,
+    // `before_run()` retrieves recent memories into the next request's context.
     let memory = RedisContextProvider::new(&url)?
         .with_user_id("user-42")
         .with_limit(5);
-    let mut providers = AggregateContextProvider::new();
-    providers.add(Arc::new(memory));
 
-    let agent = ChatAgent::builder(CannedClient)
+    let agent = Agent::builder(CannedClient)
         .instructions("You are a helpful assistant.")
-        .context_provider(Arc::new(providers))
+        .context_provider(Arc::new(memory))
         .build();
 
-    // Both turns share the Redis-backed thread, so the second request also
-    // carries the first turn's history read back from Redis.
-    let mut thread = AgentThread::local(store.clone());
+    // Both turns share the Redis-backed session, so the second request also
+    // carries the first turn's history read back from Redis. Attaching the
+    // store as a context provider is what makes it a `HistoryProvider` for
+    // this session -- `Agent` won't layer on its own `InMemoryHistoryProvider`
+    // since one is already present.
+    let mut session =
+        AgentSession::new().with_context_providers(vec![store.clone() as Arc<dyn ContextProvider>]);
     for text in ["I love hiking in the Alps.", "What do you know about me?"] {
         let response = agent
-            .run(vec![ChatMessage::user(text)], Some(&mut thread))
+            .run(vec![Message::user(text)], Some(&mut session))
             .await?;
         println!("user: {text}\nagent: {}\n", response.text());
     }

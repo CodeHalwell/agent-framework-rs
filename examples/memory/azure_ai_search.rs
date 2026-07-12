@@ -1,9 +1,8 @@
 //! Azure AI Search as a long-term-memory `ContextProvider`:
 //! `AzureAISearchProvider` runs a hybrid/semantic search against a search
 //! index on every turn and injects the retrieved documents as extra
-//! instructions for the model -- the same `invoking()`/`AggregateContextProvider`
-//! wiring `redis_memory.rs` and `mem0_memory.rs` use, backed by a different
-//! store.
+//! instructions for the model -- the same `before_run()` wiring
+//! `redis_memory.rs` and `mem0_memory.rs` use, backed by a different store.
 //!
 //! Skips gracefully unless configured:
 //!   AZURE_SEARCH_ENDPOINT   e.g. https://<service>.search.windows.net
@@ -28,7 +27,7 @@ async fn main() -> Result<()> {
         std::env::var("AZURE_SEARCH_ENDPOINT"),
         std::env::var("AZURE_SEARCH_API_KEY"),
         std::env::var("AZURE_SEARCH_INDEX"),
-        OpenAIClient::from_env("gpt-4o-mini"),
+        OpenAIChatCompletionClient::from_env("gpt-4o-mini"),
     ) else {
         println!(
             "set AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_API_KEY, AZURE_SEARCH_INDEX, \
@@ -46,16 +45,13 @@ async fn main() -> Result<()> {
     // `AzureAISearchProvider::with_token_credential`.
     let search = AzureAISearchProvider::with_api_key(endpoint, index, api_key).with_top(5);
 
-    let mut providers = AggregateContextProvider::new();
-    providers.add(Arc::new(search));
-
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("Answer using the retrieved context when it's relevant.")
-        .context_provider(Arc::new(providers))
+        .context_provider(Arc::new(search))
         .build();
 
-    // Every run's `invoking()` hook queries the index with the latest user
+    // Every run's `before_run()` hook queries the index with the latest user
     // message and folds the results into the request as extra instructions
     // -- the agent never calls Azure AI Search directly.
     let response = agent

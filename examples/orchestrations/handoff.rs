@@ -15,32 +15,32 @@ use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::{handoff_tool_spec, HandoffBuilder};
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     let billing = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("billing")
             .instructions("You resolve billing and invoice questions.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let tech_support = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("tech_support")
             .instructions("You troubleshoot product and technical issues.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     // The triage agent gets a `handoff_to_<target>` tool declared for each
     // specialist it can transfer to, so the model knows the option exists.
     // The coordinator intercepts the call rather than executing it as a real
     // tool -- see `handoff_tool_spec`'s docs for the exact mechanism.
     let triage = Arc::new(
-        ChatAgent::builder(client)
+        Agent::builder(client)
             .name("triage")
             .instructions(
                 "You are the first point of contact. Hand off to 'billing' for payment \
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
                 Some("Transfer to the technical support specialist."),
             ))
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let workflow = HandoffBuilder::new()
         .participant("triage", triage)
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         .run("I was charged twice for my subscription this month.")
         .await?;
 
-    let conversation: Vec<ChatMessage> =
+    let conversation: Vec<Message> =
         serde_json::from_value(run.last_output().unwrap_or_default()).unwrap_or_default();
     for msg in &conversation {
         let speaker = msg.author_name.as_deref().unwrap_or(msg.role.as_str());

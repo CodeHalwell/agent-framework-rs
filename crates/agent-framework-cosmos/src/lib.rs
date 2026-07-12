@@ -1,7 +1,7 @@
 //! # agent-framework-cosmos
 //!
 //! Azure Cosmos DB (NoSQL / SQL API)-backed
-//! [`ChatMessageStore`](agent_framework_core::threads::ChatMessageStore) for
+//! [`HistoryProvider`](agent_framework_core::history::HistoryProvider) for
 //! `agent-framework-rs`, porting `Microsoft.Agents.AI.CosmosNoSql` from the
 //! .NET Agent Framework.
 //!
@@ -17,8 +17,7 @@
 //!
 //! ```no_run
 //! use agent_framework_cosmos::CosmosChatMessageStore;
-//! use agent_framework_core::threads::ChatMessageStore;
-//! use agent_framework_core::types::ChatMessage;
+//! use agent_framework_core::types::Message;
 //!
 //! # async fn demo() -> agent_framework_core::error::Result<()> {
 //! let store = CosmosChatMessageStore::new(
@@ -31,7 +30,7 @@
 //! // Creates the database/container (partition key /threadId) if missing.
 //! store.ensure_created().await?;
 //!
-//! store.add_messages(vec![ChatMessage::user("Hello!")]).await?;
+//! store.add_messages(vec![Message::user("Hello!")]).await?;
 //! let history = store.list_messages().await?;
 //! println!("{} messages", history.len());
 //! # Ok(())
@@ -40,8 +39,12 @@
 
 mod auth;
 mod chat_message_store;
+mod checkpoint_storage;
 mod client;
 mod dates;
 
 pub use chat_message_store::{CosmosChatMessageStore, DEFAULT_PARTITION_KEY_PATH};
+pub use checkpoint_storage::{
+    CosmosCheckpointStorage, DEFAULT_PARTITION_KEY_PATH as DEFAULT_CHECKPOINT_PARTITION_KEY_PATH,
+};
 pub use client::DEFAULT_API_VERSION;

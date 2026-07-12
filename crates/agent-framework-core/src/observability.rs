@@ -28,7 +28,7 @@
 //!
 //! The main entry point is [`ObservableChatClient`], a [`ChatClient`] decorator.
 //! Tool execution inside [`FunctionInvokingChatClient`] and the
-//! [`ChatAgent`](crate::agent::ChatAgent) run paths are instrumented directly by
+//! [`Agent`](crate::agent::Agent) run paths are instrumented directly by
 //! those types using the span constructors here.
 //!
 //! ## Metrics (`otel-metrics` feature)
@@ -97,7 +97,7 @@ use tracing::{Instrument, Span};
 use crate::client::{ChatClient, ChatStream};
 use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
-use crate::types::{ChatMessage, ChatOptions, ChatResponse};
+use crate::types::{ChatOptions, ChatResponse, Message};
 
 /// OpenTelemetry GenAI semantic-convention attribute keys.
 pub mod attr {
@@ -114,6 +114,14 @@ pub mod attr {
     pub const FINISH_REASONS: &str = "gen_ai.response.finish_reasons";
     pub const INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
     pub const OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+    /// Input tokens written to a provider-managed cache.
+    pub const CACHE_CREATION_INPUT_TOKENS: &str = "gen_ai.usage.cache_creation.input_tokens";
+    /// Input tokens served from a provider-managed cache.
+    pub const CACHE_READ_INPUT_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
+    /// Output tokens spent on reasoning.
+    pub const REASONING_OUTPUT_TOKENS: &str = "gen_ai.usage.reasoning.output_tokens";
+    /// Low-cardinality prompt name (e.g. for a named/templated prompt).
+    pub const PROMPT_NAME: &str = "gen_ai.prompt.name";
     pub const REQUEST_TEMPERATURE: &str = "gen_ai.request.temperature";
     pub const REQUEST_TOP_P: &str = "gen_ai.request.top_p";
     pub const REQUEST_MAX_TOKENS: &str = "gen_ai.request.max_tokens";
@@ -159,6 +167,7 @@ pub mod op {
     pub const CHAT: &str = "chat";
     pub const INVOKE_AGENT: &str = "invoke_agent";
     pub const EXECUTE_TOOL: &str = "execute_tool";
+    pub const EMBEDDINGS: &str = "embeddings";
 }
 
 /// The `error.type` value for a framework [`Error`]: its variant discriminant.
@@ -205,6 +214,9 @@ pub fn chat_span(system: &str, model: &str) -> Span {
         gen_ai.response.finish_reasons = Empty,
         gen_ai.usage.input_tokens = Empty,
         gen_ai.usage.output_tokens = Empty,
+        gen_ai.usage.cache_creation.input_tokens = Empty,
+        gen_ai.usage.cache_read.input_tokens = Empty,
+        gen_ai.usage.reasoning.output_tokens = Empty,
         gen_ai.request.temperature = Empty,
         gen_ai.request.top_p = Empty,
         gen_ai.request.max_tokens = Empty,
@@ -341,7 +353,7 @@ pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bo
     if let Some(id) = &response.response_id {
         span.record(attr::RESPONSE_ID, id.as_str());
     }
-    if let Some(model) = &response.model_id {
+    if let Some(model) = &response.model {
         span.record(attr::RESPONSE_MODEL, model.as_str());
     }
     if let Some(usage) = &response.usage_details {
@@ -350,6 +362,15 @@ pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bo
         }
         if let Some(output) = usage.output_token_count {
             span.record(attr::OUTPUT_TOKENS, output);
+        }
+        if let Some(v) = usage.cache_creation_input_token_count {
+            span.record(attr::CACHE_CREATION_INPUT_TOKENS, v);
+        }
+        if let Some(v) = usage.cache_read_input_token_count {
+            span.record(attr::CACHE_READ_INPUT_TOKENS, v);
+        }
+        if let Some(v) = usage.reasoning_output_token_count {
+            span.record(attr::REASONING_OUTPUT_TOKENS, v);
         }
     }
     if capture_content {
@@ -437,7 +458,7 @@ fn tool_definitions_json(tools: &[ToolDefinition]) -> String {
 }
 
 /// Serialize messages to a compact JSON string for content-capture attributes.
-fn messages_json(messages: &[ChatMessage]) -> String {
+fn messages_json(messages: &[Message]) -> String {
     serde_json::to_string(messages).unwrap_or_default()
 }
 
@@ -509,9 +530,9 @@ impl<C: ChatClient> ObservableChatClient<C> {
 
     fn model_for(&self, options: &ChatOptions) -> String {
         options
-            .model_id
+            .model
             .clone()
-            .or_else(|| self.inner.model_id().map(str::to_string))
+            .or_else(|| self.inner.model().map(str::to_string))
             .unwrap_or_default()
     }
 }
@@ -520,7 +541,7 @@ impl<C: ChatClient> ObservableChatClient<C> {
 impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let request_model = self.model_for(&options);
@@ -548,7 +569,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                         metrics::record_chat_completion(
                             &self.system,
                             &request_model,
-                            response.model_id.as_deref(),
+                            response.model.as_deref(),
                             input_tokens,
                             output_tokens,
                             start.elapsed(),
@@ -567,7 +588,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let request_model = self.model_for(&options);
@@ -638,7 +659,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                                 metrics::record_chat_completion(
                                     &telemetry.system,
                                     &telemetry.request_model,
-                                    agg.model_id.as_deref(),
+                                    agg.model.as_deref(),
                                     input_tokens,
                                     output_tokens,
                                     telemetry.start.elapsed(),
@@ -653,8 +674,8 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         Ok(stream.boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }
 
@@ -882,6 +903,28 @@ pub mod metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Attribute string values (cross-language wire contract) ----------
+
+    #[test]
+    fn cache_reasoning_and_embedding_attrs_match_upstream() {
+        // These strings are the OTel GenAI attribute keys upstream emits;
+        // they must match exactly for cross-tool/cross-language consistency.
+        assert_eq!(
+            attr::CACHE_CREATION_INPUT_TOKENS,
+            "gen_ai.usage.cache_creation.input_tokens"
+        );
+        assert_eq!(
+            attr::CACHE_READ_INPUT_TOKENS,
+            "gen_ai.usage.cache_read.input_tokens"
+        );
+        assert_eq!(
+            attr::REASONING_OUTPUT_TOKENS,
+            "gen_ai.usage.reasoning.output_tokens"
+        );
+        assert_eq!(attr::PROMPT_NAME, "gen_ai.prompt.name");
+        assert_eq!(op::EMBEDDINGS, "embeddings");
+    }
 
     // -- ObservabilityConfig::from_env -----------------------------------
 

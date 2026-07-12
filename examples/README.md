@@ -47,45 +47,52 @@ and exits on its own — no second terminal needed).
 
 ## Agents (`agents/`)
 
-Core `ChatAgent` mechanics: building, running, streaming, tools, threads, and
+Core `Agent` mechanics: building, running, streaming, tools, sessions, and
 middleware.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `quickstart` | Minimal `ChatAgent` + OpenAI in a few lines | `OPENAI_API_KEY` |
+| `quickstart` | Minimal `Agent` + OpenAI in a few lines | `OPENAI_API_KEY` |
 | `streaming` | Token-by-token agent streaming | `OPENAI_API_KEY` |
 | `tools` | Local tool calling via the automatic function-invocation loop | `OPENAI_API_KEY` |
-| `typed_tools` | `AiFunction::typed` derives a JSON Schema from a `#[derive(JsonSchema)]` struct | offline (live model optional, `OPENAI_API_KEY`) |
+| `typed_tools` | `FunctionTool::typed` derives a JSON Schema from a `#[derive(JsonSchema)]` struct | offline (live model optional, `OPENAI_API_KEY`) |
 | `structured_output` | `ResponseFormat::json_schema` + `response.parse_json::<T>()` | `OPENAI_API_KEY` |
 | `approvals` | Human-in-the-loop tool approval: pause, inspect, approve, resume | `OPENAI_API_KEY` |
-| `agent_as_tool` | Compose agents: a specialist exposed as a tool via `ChatAgent::as_tool` | `OPENAI_API_KEY` |
+| `agent_as_tool` | Compose agents: a specialist exposed as a tool via `Agent::as_tool` | `OPENAI_API_KEY` |
 | `retry_policy` | `RetryingChatClient` + `RetryPolicy` over a scripted flaky client | offline |
 | `per_run_options` | `AgentRunOptions` merges per-run `ChatOptions` overrides over the agent's defaults | offline |
-| `thread_persistence` | `thread.serialize()` / `ChatAgent::deserialize_thread` round-trip a conversation | offline |
-| `multi_turn_conversation` | One `AgentThread` reused across calls accumulates history automatically | offline |
+| `thread_persistence` | `AgentSession::to_dict()` + `InMemoryHistoryProvider::to_dict()` round-trip a conversation | offline |
+| `multi_turn_conversation` | One `AgentSession` (with an `InMemoryHistoryProvider`) reused across calls accumulates history automatically | offline |
 | `image_input` | Attach an image via `Content::Uri` (URL) or `Content::Data` (inline bytes) | `OPENAI_API_KEY` (vision model; skips gracefully) |
 | `agent_middleware` | Wrap a whole agent run: logging plus early-termination middleware | offline |
 | `function_middleware` | Wrap every local tool call: rewrite arguments, observe/override results | offline |
 | `chat_middleware` | Wrap the underlying `ChatClient` call itself, one level below agent middleware | offline |
-| `custom_context_provider` | A `ContextProvider` with `invoking` / `thread_created` / `invoked` hooks | offline |
+| `custom_context_provider` | A `ContextProvider` with `before_run` / `after_run` hooks | offline |
 
 ## Providers (`providers/`)
 
-Every `ChatClient` backend: OpenAI (Chat + Responses + Assistants), Azure
-OpenAI, Azure AI Foundry, Anthropic, and Copilot Studio.
+Every `ChatClient` backend: OpenAI (Chat + Responses), Azure
+OpenAI, Azure AI Foundry, Anthropic, Ollama, Gemini, Mistral, and Copilot
+Studio.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `openai_responses` | OpenAI Responses API + `conversation_id` (`previous_response_id`) reuse | `OPENAI_API_KEY` |
-| `openai_assistants` | OpenAI Assistants (beta) API: lazy assistant creation, thread-based replies | `OPENAI_API_KEY` (skips gracefully) |
-| `openai_compatible_endpoint` | `OpenAIClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
+| `openai_compatible_endpoint` | `OpenAIChatCompletionClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
 | `anthropic` | The Anthropic (Claude) Messages API client | `ANTHROPIC_API_KEY` |
 | `anthropic_hosted_tools` | Anthropic hosted web-search / code-execution tools (server-side, no local wiring) | `ANTHROPIC_API_KEY` (skips gracefully) |
+| `ollama` | `OllamaChatClient` against a local/remote Ollama server's OpenAI-compatible endpoint | `OLLAMA_HOST` (skips gracefully) |
+| `gemini` | `GeminiChatClient`: Google Gemini's `generateContent` REST API | `GEMINI_API_KEY` or `GOOGLE_API_KEY` (skips gracefully) |
+| `mistral` | `MistralChatClient`: Mistral AI's Chat Completions API | `MISTRAL_API_KEY` (skips gracefully) |
+| `bedrock` | `BedrockChatClient`: AWS Bedrock Converse API, SigV4-signed | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (skips gracefully) |
+| `github_copilot` | `GitHubCopilotChatClient`: GitHub Copilot's chat API (GitHub→Copilot token exchange) | `GITHUB_COPILOT_TOKEN` or `GH_COPILOT_TOKEN` (skips gracefully) |
+| `foundry_local` | `FoundryLocalChatClient`: Microsoft Foundry Local's on-device OpenAI-compatible endpoint | `FOUNDRY_LOCAL_ENDPOINT` (skips gracefully) |
+| `anthropic_multicloud` | Claude via `AnthropicBedrockClient` / `AnthropicVertexClient` (multi-cloud transports in the `anthropic` crate) | AWS creds or `GOOGLE_CLOUD_PROJECT` + `GOOGLE_ACCESS_TOKEN` (skips gracefully) |
 | `azure_openai` | Azure OpenAI with both api-key and Entra ID (`TokenCredential`) auth | `AZURE_OPENAI_*` |
 | `azure_openai_responses` | `AzureOpenAIResponsesClient`: the Responses API on Azure OpenAI | `AZURE_OPENAI_*` (skips gracefully) |
 | `azure_default_credential` | `DefaultAzureCredential`'s four-link Entra ID credential chain | `AZURE_OPENAI_ENDPOINT` (+ `az login`; skips gracefully) |
-| `azure_foundry_agent` | Azure AI Foundry persistent agents (Assistants-style REST) via `AzureAIAgentClient` | `AZURE_AI_PROJECT_ENDPOINT` (+ `az login`; skips gracefully) |
-| `azure_foundry_bing_grounding` | Bing grounding on Azure AI Foundry via a connection id | `AZURE_AI_PROJECT_ENDPOINT`, `BING_CONNECTION_ID` (skips gracefully) |
+| `azure_foundry_agent` | Azure AI Foundry Prompt Agent (Responses API) via `FoundryChatClient` + `FoundryAgent` | `FOUNDRY_ENDPOINT` (+ `az login`; skips gracefully) |
+| `azure_foundry_bing_grounding` | Hosted web search on Azure AI Foundry's Responses API | `FOUNDRY_ENDPOINT` (skips gracefully) |
 | `copilotstudio_agent` | Microsoft Copilot Studio agent over the Direct-to-Engine protocol | `COPILOTSTUDIOAGENT__*` + token (skips gracefully) |
 
 ## Workflows (`workflows/`)
@@ -135,8 +142,8 @@ sampling, and roots. All five connect to
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `mcp_tools` | Connect an MCP stdio server, list its tools, wire them into a `ChatAgent` | `OPENAI_API_KEY`, `npx` |
-| `mcp_first_class_tools` | `ChatAgentBuilder::tool_source`: resolve an MCP server's tools fresh on every run | `OPENAI_API_KEY` (skips gracefully), `npx` |
+| `mcp_tools` | Connect an MCP stdio server, list its tools, wire them into a `Agent` | `OPENAI_API_KEY`, `npx` |
+| `mcp_first_class_tools` | `AgentBuilder::tool_source`: resolve an MCP server's tools fresh on every run | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_prompts` | List an MCP server's prompts, render one, and run it through a real agent | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_roots` | Advertise filesystem roots via `.roots(...)`; explains the server-side `roots/list` flow | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_sampling` | Answer MCP server-initiated `sampling/createMessage` with your own model | `OPENAI_API_KEY` (skips gracefully), `npx` |
@@ -161,7 +168,7 @@ Azure AI Search.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `redis_memory` | Redis-backed thread history (`RedisChatMessageStore`) + long-term memory provider | a local Redis server (skips gracefully) |
+| `redis_memory` | Redis-backed session history (`RedisChatMessageStore`, a `HistoryProvider`) + long-term memory provider | a local Redis server (skips gracefully) |
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
@@ -190,7 +197,7 @@ calls.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `declarative_agent` | Load a `ChatAgent` from an official-schema YAML spec via `DeclarativeLoader` | offline (canned fallback; `OPENAI_API_KEY` optional) |
+| `declarative_agent` | Load a `Agent` from an official-schema YAML spec via `DeclarativeLoader` | offline (canned fallback; `OPENAI_API_KEY` optional) |
 | `declarative_workflow` | Load a `Workflow` from a Rust-native spec: orchestration shorthand and an explicit graph | offline |
 
 ## Compliance (`compliance/`)

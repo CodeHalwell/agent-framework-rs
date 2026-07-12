@@ -12,6 +12,12 @@ description = "A Rust implementation of the Microsoft Agent Framework: build AI 
 default = ["openai"]
 openai = ["dep:agent-framework-openai"]
 anthropic = ["dep:agent-framework-anthropic"]
+ollama = ["dep:agent-framework-ollama"]
+gemini = ["dep:agent-framework-gemini"]
+mistral = ["dep:agent-framework-mistral"]
+foundry-local = ["dep:agent-framework-foundry-local"]
+bedrock = ["dep:agent-framework-bedrock"]
+github-copilot = ["dep:agent-framework-github-copilot"]
 azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
@@ -19,7 +25,7 @@ declarative = ["dep:agent-framework-declarative"]
 hosting = ["dep:agent-framework-hosting"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
-azure-ai = ["dep:agent-framework-azure-ai"]
+foundry = ["dep:agent-framework-foundry"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
@@ -31,6 +37,12 @@ otel-metrics = ["agent-framework-core/otel-metrics"]
 full = [
     "openai",
     "anthropic",
+    "ollama",
+    "gemini",
+    "mistral",
+    "foundry-local",
+    "bedrock",
+    "github-copilot",
     "azure",
     "mcp",
     "a2a",
@@ -38,7 +50,7 @@ full = [
     "hosting",
     "redis",
     "mem0",
-    "azure-ai",
+    "foundry",
     "azure-ai-search",
     "cosmos",
     "copilotstudio",
@@ -49,6 +61,12 @@ full = [
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }
+agent-framework-ollama = { workspace = true, optional = true }
+agent-framework-gemini = { workspace = true, optional = true }
+agent-framework-mistral = { workspace = true, optional = true }
+agent-framework-foundry-local = { workspace = true, optional = true }
+agent-framework-bedrock = { workspace = true, optional = true }
+agent-framework-github-copilot = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
 agent-framework-a2a = { workspace = true, optional = true }
@@ -56,7 +74,7 @@ agent-framework-declarative = { workspace = true, optional = true }
 agent-framework-hosting = { workspace = true, optional = true }
 agent-framework-redis = { workspace = true, optional = true }
 agent-framework-mem0 = { workspace = true, optional = true }
-agent-framework-azure-ai = { workspace = true, optional = true }
+agent-framework-foundry = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }

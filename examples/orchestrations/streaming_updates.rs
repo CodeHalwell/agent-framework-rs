@@ -26,7 +26,7 @@ struct WordStreamingClient(&'static str);
 impl ChatClient for WordStreamingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(self.0))
@@ -34,7 +34,7 @@ impl ChatClient for WordStreamingClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         let chunks: Vec<Result<ChatResponseUpdate>> = self
@@ -54,12 +54,12 @@ impl ChatClient for WordStreamingClient {
     }
 }
 
-fn streaming_agent(name: &str, reply: &'static str) -> Arc<dyn Agent> {
+fn streaming_agent(name: &str, reply: &'static str) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(WordStreamingClient(reply))
+        Agent::builder(WordStreamingClient(reply))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
                 update,
             } => {
                 update_count += 1;
-                let u: AgentRunResponseUpdate =
+                let u: AgentResponseUpdate =
                     serde_json::from_value(update.clone()).unwrap_or_default();
                 println!(
                     "{event_count:>3}  [{executor_id}] update chunk: {:?}",
@@ -102,8 +102,7 @@ async fn main() -> Result<()> {
                 executor_id,
                 response,
             } => {
-                let r: AgentRunResponse =
-                    serde_json::from_value(response.clone()).unwrap_or_default();
+                let r: AgentResponse = serde_json::from_value(response.clone()).unwrap_or_default();
                 println!(
                     "{event_count:>3}  [{executor_id}] run complete: {:?}",
                     r.text()

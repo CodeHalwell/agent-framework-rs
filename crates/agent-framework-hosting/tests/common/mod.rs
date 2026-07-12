@@ -12,17 +12,17 @@ use futures::StreamExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
+use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::Result;
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, Content, Message, Role, UsageDetails,
 };
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
 
 /// A scripted agent that streams multiple text deltas, to exercise the live SSE
 /// paths: `run` returns the concatenation as one message; `run_stream` yields
-/// one [`AgentRunResponseUpdate`] per delta (real incremental streaming).
+/// one [`AgentResponseUpdate`] per delta (real incremental streaming).
 pub struct StreamingAgent {
     id: String,
     deltas: Vec<String>,
@@ -36,35 +36,35 @@ impl StreamingAgent {
         }
     }
 
-    pub fn arc(self) -> Arc<dyn Agent> {
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
         Arc::new(self)
     }
 }
 
 #[async_trait]
-impl Agent for StreamingAgent {
+impl SupportsAgentRun for StreamingAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
-        Ok(AgentRunResponse {
-            messages: vec![ChatMessage::assistant(self.deltas.concat())],
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
+            messages: vec![Message::assistant(self.deltas.concat())],
             ..Default::default()
         })
     }
 
     async fn run_stream(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<AgentThread>,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
         _options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        let updates: Vec<Result<AgentRunResponseUpdate>> = self
+        let updates: Vec<Result<AgentResponseUpdate>> = self
             .deltas
             .iter()
             .map(|d| {
-                Ok(AgentRunResponseUpdate {
+                Ok(AgentResponseUpdate {
                     contents: vec![Content::text(d)],
                     role: Some(Role::assistant()),
                     ..Default::default()
@@ -118,26 +118,26 @@ impl MockAgent {
         self
     }
 
-    pub fn arc(self) -> Arc<dyn Agent> {
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
         Arc::new(self)
     }
 }
 
 #[async_trait]
-impl Agent for MockAgent {
+impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         let input = messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect::<Vec<_>>()
             .join(" ");
         let reply = format!("{}{}", self.prefix, input.trim());
-        Ok(AgentRunResponse {
-            messages: vec![ChatMessage::assistant(reply)],
+        Ok(AgentResponse {
+            messages: vec![Message::assistant(reply)],
             usage_details: self.usage.clone(),
             ..Default::default()
         })

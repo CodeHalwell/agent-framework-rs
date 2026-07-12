@@ -10,6 +10,8 @@ description = "Anthropic (Claude) chat client for agent-framework-rs"
 
 [dependencies]
 agent-framework-core = { workspace = true }
+agent-framework-bedrock = { workspace = true }
+agent-framework-azure = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

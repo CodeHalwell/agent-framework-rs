@@ -1,4 +1,4 @@
-//! Load a `ChatAgent` from a declarative YAML spec. The loader is
+//! Load a `Agent` from a declarative YAML spec. The loader is
 //! provider-agnostic: you register a `ChatClientFactory` closure per provider
 //! key ("OpenAI.Chat" here, i.e. `model.provider` + `model.apiType`), and the
 //! spec's model options (temperature, ...), instructions, and tools are wired
@@ -26,7 +26,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(
@@ -36,7 +36,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -70,13 +70,12 @@ async fn main() -> Result<()> {
     // The factory receives the parsed ModelSpec (id, connection, options) and
     // returns the ChatClient for it. Register one per provider key; the
     // loader tries "provider.apiType" first, then "provider", then a default.
-    let factory =
-        ChatClientFactory::new().with("OpenAI.Chat", |model| {
-            match OpenAIClient::from_env(model.id.as_deref().unwrap_or("gpt-4o-mini")) {
-                Ok(client) => Ok(Arc::new(client) as Arc<dyn ChatClient>),
-                Err(_) => Ok(Arc::new(CannedClient) as Arc<dyn ChatClient>),
-            }
-        });
+    let factory = ChatClientFactory::new().with("OpenAI.Chat", |model| {
+        match OpenAIChatCompletionClient::from_env(model.id.as_deref().unwrap_or("gpt-4o-mini")) {
+            Ok(client) => Ok(Arc::new(client) as Arc<dyn ChatClient>),
+            Err(_) => Ok(Arc::new(CannedClient) as Arc<dyn ChatClient>),
+        }
+    });
 
     let loader = DeclarativeLoader::new().with_client_factory(factory);
 

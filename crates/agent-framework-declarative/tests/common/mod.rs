@@ -16,7 +16,7 @@ use futures::StreamExt;
 pub struct MockClient {
     responses: Arc<Mutex<Vec<ChatResponse>>>,
     /// Every message list the client was asked to respond to.
-    pub seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    pub seen: Arc<Mutex<Vec<Vec<Message>>>>,
     model: Option<String>,
 }
 
@@ -40,7 +40,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.seen.lock().unwrap().push(messages);
@@ -56,7 +56,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -74,14 +74,12 @@ impl ChatClient for MockClient {
         Ok(futures::stream::iter(updates).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 }
 
 /// Build an agent registry entry backed by a mock that always replies `text`.
-pub fn mock_agent(name: &str, text: &str) -> ChatAgent {
-    ChatAgent::builder(MockClient::always(text))
-        .name(name)
-        .build()
+pub fn mock_agent(name: &str, text: &str) -> Agent {
+    Agent::builder(MockClient::always(text)).name(name).build()
 }

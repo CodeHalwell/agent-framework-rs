@@ -5,9 +5,9 @@
 //! `data: [DONE]`). This lets any OpenAI-Chat client talk to an agent.
 //!
 //! # Divergences
-//! - Streaming drives the core `Agent::run_stream` and frames each update as a
+//! - Streaming drives the core `SupportsAgentRun::run_stream` and frames each update as a
 //!   `chat.completion.chunk` live (one content chunk per non-empty update);
-//!   non-streaming requests stay on `Agent::run`. Chunk framing matches the
+//!   non-streaming requests stay on `SupportsAgentRun::run`. Chunk framing matches the
 //!   OpenAI streaming protocol.
 //! - `usage` uses the agent's reported token counts when available, otherwise a
 //!   ~4-chars-per-token estimate.
@@ -22,8 +22,8 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use agent_framework_core::agent::Agent;
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, Role, UsageDetails};
+use agent_framework_core::agent::SupportsAgentRun;
+use agent_framework_core::types::{AgentResponse, Message, Role, UsageDetails};
 
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_response_stream;
@@ -32,16 +32,16 @@ use crate::util;
 /// Serves one agent over the OpenAI Chat Completions API.
 pub struct OpenAiRouter {
     model: String,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
 }
 
 impl OpenAiRouter {
     /// Build a chat-completions host for `agent`, advertised under model id
     /// `name`.
     ///
-    /// Accepts a [`ChatAgent`](agent_framework_core::agent::ChatAgent), a
+    /// Accepts a [`Agent`](agent_framework_core::agent::Agent), a
     /// [`WorkflowAgent`](agent_framework_core::workflow::WorkflowAgent), or an
-    /// `Arc<dyn Agent>`.
+    /// `Arc<dyn SupportsAgentRun>`.
     pub fn for_agent(name: impl Into<String>, agent: impl IntoAgentRegistration) -> Self {
         Self {
             model: name.into(),
@@ -64,7 +64,7 @@ impl OpenAiRouter {
 
 struct OpenAiState {
     model: String,
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -168,7 +168,7 @@ async fn chat_completions(
 
 /// Build the non-streaming `chat.completion` response object.
 fn completion_object(
-    resp: &AgentRunResponse,
+    resp: &AgentResponse,
     id: &str,
     created: u64,
     model: &str,
@@ -231,10 +231,10 @@ fn error_response(message: String) -> Response {
         .into_response()
 }
 
-fn to_chat_messages(messages: &[IncomingMessage]) -> Vec<ChatMessage> {
+fn to_chat_messages(messages: &[IncomingMessage]) -> Vec<Message> {
     messages
         .iter()
-        .map(|m| ChatMessage::new(role_from(&m.role), content_text(&m.content)))
+        .map(|m| Message::new(role_from(&m.role), content_text(&m.content)))
         .collect()
 }
 

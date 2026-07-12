@@ -40,11 +40,11 @@ pub use edge::{Case, Condition, Default, EdgeGroup, Selection};
 pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
 pub use orchestration::{
-    handoff_tool_spec, AgentExecutor, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,
-    GroupChatManager, GroupChatState, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
-    HandoffUserInputRequest, MagenticBuilder, MagenticContext, MagenticManager,
-    MagenticPlanReviewDecision, MagenticPlanReviewRequest, MagenticProgressLedger,
-    MagenticProgressLedgerItem, MagenticStallInterventionDecision,
+    handoff_tool_spec, AgentApprovalExecutor, AgentExecutor, ApprovalRequest, ConcurrentBuilder,
+    GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
+    HandoffEdgeBuilder, HandoffInteractionMode, HandoffUserInputRequest, MagenticBuilder,
+    MagenticContext, MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
+    MagenticProgressLedger, MagenticProgressLedgerItem, MagenticStallInterventionDecision,
     MagenticStallInterventionRequest, MagenticTaskLedger, ManagerSelectionResponse,
     RoundRobinManager, SequentialBuilder, StandardMagenticManager, WorkflowAgent, WorkflowAgentExt,
     DEFAULT_GROUP_CHAT_MAX_ITERATIONS, DEFAULT_MANAGER_INSTRUCTIONS,

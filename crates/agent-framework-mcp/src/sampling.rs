@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::BoxFuture;
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse, Content, DataContent};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Content, DataContent, Message};
 
 use crate::protocol::{role_and_content_to_chat_message, RpcError};
 
@@ -126,7 +126,7 @@ impl CreateMessageResult {
 }
 
 /// Build a [`SamplingHandler`] backed by any [`ChatClient`]: converts the
-/// server's `sampling/createMessage` request into core [`ChatMessage`]s
+/// server's `sampling/createMessage` request into core [`Message`]s
 /// (`messages`/`systemPrompt`/`maxTokens`/`temperature`/`stopSequences` map
 /// onto [`ChatOptions`]), calls [`ChatClient::get_response`], and maps the
 /// reply back into a [`CreateMessageResult`].
@@ -139,7 +139,7 @@ pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHand
     Arc::new(move |params: CreateMessageParams| {
         let client = client.clone();
         Box::pin(async move {
-            let messages: Vec<ChatMessage> = params
+            let messages: Vec<Message> = params
                 .messages
                 .iter()
                 .map(|m| role_and_content_to_chat_message(&m.role, &m.content))
@@ -156,9 +156,9 @@ pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHand
             })?;
 
             let model = response
-                .model_id
+                .model
                 .clone()
-                .or_else(|| client.model_id().map(str::to_string))
+                .or_else(|| client.model().map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string());
             let content = first_sampling_result_content(&response)?;
 
@@ -456,14 +456,14 @@ mod tests {
     /// [`chat_client_sampling_handler`] without any real provider.
     struct StubChatClient {
         text: &'static str,
-        model_id: &'static str,
+        model: &'static str,
     }
 
     #[async_trait]
     impl ChatClient for StubChatClient {
         async fn get_response(
             &self,
-            messages: Vec<ChatMessage>,
+            messages: Vec<Message>,
             options: ChatOptions,
         ) -> Result<ChatResponse> {
             // Exercise that the adapter actually forwards the mapped fields.
@@ -472,19 +472,19 @@ mod tests {
             assert_eq!(options.max_tokens, Some(64));
             assert_eq!(options.instructions.as_deref(), Some("be terse"));
             Ok(ChatResponse {
-                model_id: Some(self.model_id.to_string()),
+                model: Some(self.model.to_string()),
                 ..ChatResponse::from_text(self.text)
             })
         }
         async fn get_streaming_response(
             &self,
-            _messages: Vec<ChatMessage>,
+            _messages: Vec<Message>,
             _options: ChatOptions,
         ) -> Result<agent_framework_core::client::ChatStream> {
             unreachable!("not exercised by these tests")
         }
-        fn model_id(&self) -> Option<&str> {
-            Some(self.model_id)
+        fn model(&self) -> Option<&str> {
+            Some(self.model)
         }
     }
 
@@ -492,7 +492,7 @@ mod tests {
     async fn chat_client_sampling_handler_round_trips_a_text_response() {
         let client: Arc<dyn ChatClient> = Arc::new(StubChatClient {
             text: "Paris is the capital of France.",
-            model_id: "stub-model",
+            model: "stub-model",
         });
         let handler = chat_client_sampling_handler(client);
         let params = CreateMessageParams {
@@ -523,14 +523,14 @@ mod tests {
         impl ChatClient for EmptyClient {
             async fn get_response(
                 &self,
-                _messages: Vec<ChatMessage>,
+                _messages: Vec<Message>,
                 _options: ChatOptions,
             ) -> Result<ChatResponse> {
                 Ok(ChatResponse::default())
             }
             async fn get_streaming_response(
                 &self,
-                _messages: Vec<ChatMessage>,
+                _messages: Vec<Message>,
                 _options: ChatOptions,
             ) -> Result<agent_framework_core::client::ChatStream> {
                 unreachable!()

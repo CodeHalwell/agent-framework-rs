@@ -16,9 +16,9 @@ use crate::error::{Error, Result};
 use crate::middleware::{FunctionInvocationContext, MiddlewarePipeline, Terminal};
 use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
-    FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
-    FunctionResultContent, Role, ToolMode, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionApprovalRequestContent,
+    FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent, Message, Role,
+    ToolMode, UsageContent,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -34,19 +34,19 @@ pub trait ChatClient: Send + Sync {
     /// Get a complete (non-streaming) response.
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse>;
 
     /// Get a streaming response as a sequence of updates.
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream>;
 
     /// The default model id for this client, if any.
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         None
     }
 }
@@ -56,20 +56,20 @@ pub trait ChatClient: Send + Sync {
 impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         (**self).get_response(messages, options).await
     }
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         (**self).get_streaming_response(messages, options).await
     }
-    fn model_id(&self) -> Option<&str> {
-        (**self).model_id()
+    fn model(&self) -> Option<&str> {
+        (**self).model()
     }
 }
 
@@ -121,7 +121,7 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
 
     async fn inner_get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.inner.get_response(messages, options).await
@@ -286,7 +286,7 @@ async fn execute_tool_call(
 }
 
 /// Collect all function-approval responses present in a conversation.
-fn collect_approval_responses(messages: &[ChatMessage]) -> Vec<FunctionApprovalResponseContent> {
+fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalResponseContent> {
     let mut out = Vec::new();
     for msg in messages {
         for content in &msg.contents {
@@ -310,7 +310,7 @@ fn collect_approval_responses(messages: &[ChatMessage]) -> Vec<FunctionApprovalR
 /// * A rejected response becomes a [`FunctionResultContent`] carrying the
 ///   rejection payload, and the message role becomes `tool`.
 fn replace_approval_contents_with_results(
-    messages: &mut [ChatMessage],
+    messages: &mut [Message],
     approved_results: &HashMap<String, FunctionResultContent>,
 ) {
     for msg in messages.iter_mut() {
@@ -367,14 +367,14 @@ fn replace_approval_contents_with_results(
 impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         mut options: ChatOptions,
     ) -> Result<ChatResponse> {
         // After the tool loop settles, auto-populate `ChatResponse.value` from
         // the final text when a structured `response_format` was requested
         // (mirrors Python `try_parse_value`). This is the central non-streaming
         // fill point: it covers a bare `FunctionInvokingChatClient` and every
-        // `ChatAgent` run (whose client is always wrapped in one). The tool
+        // `Agent` run (whose client is always wrapped in one). The tool
         // loop is run inside an `async move` block so its interior `return`s
         // funnel through this single fill/return path.
         let response_format = options.response_format.clone();
@@ -392,7 +392,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             }
 
             let mut conversation = messages;
-            let mut carried: Vec<ChatMessage> = Vec::new();
+            let mut carried: Vec<Message> = Vec::new();
             let mut consecutive_errors = 0usize;
 
             for _ in 0..self.config.max_iterations {
@@ -496,10 +496,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     {
                         m.contents.extend(approval_contents);
                     } else {
-                        resp.messages.push(ChatMessage::with_contents(
-                            Role::assistant(),
-                            approval_contents,
-                        ));
+                        resp.messages
+                            .push(Message::with_contents(Role::assistant(), approval_contents));
                     }
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
@@ -573,7 +571,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     consecutive_errors = 0;
                 }
 
-                let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
+                let tool_message = Message::with_contents(Role::tool(), result_contents);
                 carried.push(tool_message.clone());
                 match response_conversation_id {
                     // A service-managed client that created (or continued) the
@@ -612,7 +610,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let tools = executable_tools(&options);
@@ -697,8 +695,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         Ok(stream::iter(updates).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }
 
@@ -975,7 +973,7 @@ impl<C: ChatClient> RetryingChatClient<C> {
 impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut attempt = 0usize;
@@ -1000,7 +998,7 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let mut attempt = 0usize;
@@ -1043,7 +1041,7 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
         }
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }

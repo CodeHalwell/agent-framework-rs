@@ -1,13 +1,16 @@
 //! # agent-framework-redis
 //!
-//! Redis-backed [`ChatMessageStore`](agent_framework_core::threads::ChatMessageStore)
+//! Redis-backed [`HistoryProvider`](agent_framework_core::history::HistoryProvider)
 //! and [`ContextProvider`](agent_framework_core::memory::ContextProvider) for
 //! `agent-framework-rs`, porting `agent_framework_redis` from the Python
 //! Agent Framework.
 //!
-//! - [`RedisChatMessageStore`] — one Redis `LIST` per conversation thread,
+//! - [`RedisChatMessageStore`] — one Redis `LIST` per session,
 //!   JSON-serialized messages, optional automatic trimming. A close mirror
-//!   of the Python `RedisChatMessageStore`.
+//!   of the Python `RedisChatMessageStore`, adapted to the
+//!   [`HistoryProvider`](agent_framework_core::history::HistoryProvider)
+//!   contract (`before_run`/`after_run`) now that conversation history lives
+//!   in a context provider rather than on the session/thread itself.
 //! - [`RedisContextProvider`] — scoped long-term memory storage/retrieval.
 //!   Ports the Python `RedisProvider`'s *scoping* semantics
 //!   (application/agent/user/thread id). When the connected server has
@@ -32,17 +35,15 @@
 //!     .with_max_messages(200);
 //!
 //! let memory = RedisContextProvider::new("redis://127.0.0.1:6379")?.with_user_id("user-42");
-//! let mut providers = AggregateContextProvider::new();
-//! providers.add(Arc::new(memory));
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
-//!     .context_provider(Arc::new(providers))
+//!     .context_provider(Arc::new(memory))
 //!     .build();
 //!
-//! let mut thread = AgentThread::local(Arc::new(store));
+//! let mut session = AgentSession::new().with_context_providers(vec![Arc::new(store)]);
 //! let response = agent
-//!     .run(vec![ChatMessage::user("Hello!")], Some(&mut thread))
+//!     .run(vec![Message::user("Hello!")], Some(&mut session))
 //!     .await?;
 //! println!("{}", response.text());
 //! # Ok(())

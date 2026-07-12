@@ -1,4 +1,4 @@
-//! Agent-spec parsing, field mapping, agent building, and error tests.
+//! SupportsAgentRun-spec parsing, field mapping, agent building, and error tests.
 //!
 //! The `specs/*.yaml` fixtures are verbatim copies of upstream reference
 //! samples, cited at each test:
@@ -23,7 +23,7 @@ const GET_WEATHER: &str = include_str!("specs/GetWeather.yaml");
 const OPENAI_CHAT: &str = include_str!("specs/OpenAIChat.yaml");
 const MS_LEARN: &str = include_str!("specs/MicrosoftLearnAgent.yaml");
 
-/// `ChatAgent` does not implement `Debug`, so `Result::unwrap_err` is
+/// `Agent` does not implement `Debug`, so `Result::unwrap_err` is
 /// unavailable; extract the error explicitly.
 fn expect_load_err(loader: &DeclarativeLoader, yaml: &str) -> DeclarativeError {
     match loader.load_agent(yaml) {
@@ -87,7 +87,7 @@ async fn get_weather_binds_and_executes_native_tool() {
     // A native tool the spec's function tool binds to (via `bindings.get_weather`).
     let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let calls_for_tool = calls.clone();
-    let get_weather = AiFunction::new(
+    let get_weather = FunctionTool::new(
         "get_weather",
         "native get weather",
         json!({"type": "object", "properties": {"location": {"type": "string"}}}),
@@ -115,7 +115,7 @@ async fn get_weather_binds_and_executes_native_tool() {
         )),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],

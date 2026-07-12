@@ -1,4 +1,4 @@
-//! WorkflowAgent tests: expose a built workflow as an `Agent`, aggregate its
+//! WorkflowAgent tests: expose a built workflow as an `SupportsAgentRun`, aggregate its
 //! output as the response, surface pending request-info as user-input requests,
 //! and act as an `.as_tool()` target.
 
@@ -26,7 +26,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -39,7 +39,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -58,13 +58,13 @@ impl ChatClient for MockClient {
     }
 }
 
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::test]
@@ -81,10 +81,10 @@ async fn sequential_workflow_as_agent_aggregates_response() {
     assert_eq!(wf_agent.name(), Some("pipeline"));
 
     let response = wf_agent
-        .run(vec![ChatMessage::user("start")], None)
+        .run(vec![Message::user("start")], None)
         .await
         .unwrap();
-    let texts: Vec<String> = response.messages.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = response.messages.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("step-A")),
         "aggregated: {texts:?}"
@@ -125,7 +125,7 @@ async fn workflow_agent_surfaces_pending_request_info() {
 
     let wf_agent = WorkflowAgent::new(workflow, "handoff-agent");
     let response = wf_agent
-        .run(vec![ChatMessage::user("hello")], None)
+        .run(vec![Message::user("hello")], None)
         .await
         .unwrap();
 
@@ -144,7 +144,7 @@ async fn workflow_agent_streams_agent_updates() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "streamer");
 
-    let mut stream = wf_agent.run_stream_with_thread(vec![ChatMessage::user("go")], None);
+    let mut stream = wf_agent.run_stream_with_thread(vec![Message::user("go")], None);
     let mut text = String::new();
     while let Some(update) = stream.next().await {
         text.push_str(&update.unwrap().text());
@@ -163,20 +163,25 @@ async fn workflow_agent_streams_agent_updates() {
 async fn workflow_agent_run_persists_input_and_response_to_thread() {
     // A single-participant sequential workflow whose (mocked) agent answers
     // "reply-1" then "reply-2" across two separate `run` calls on the same
-    // thread.
+    // session.
     let a = agent("A", vec!["reply-1", "reply-2"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "solo");
 
-    let mut thread = wf_agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it
+    // directly (`Agent::run`'s auto-attached one isn't downcastable from a
+    // `dyn ContextProvider`).
+    let history = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread.context_providers.push(Arc::new(history.clone()));
     assert!(
-        thread.list_messages().await.unwrap().is_empty(),
-        "a fresh thread starts empty"
+        history.list_messages().is_empty(),
+        "a fresh session starts empty"
     );
 
     // --- First run ---
     let resp1 = wf_agent
-        .run(vec![ChatMessage::user("first")], Some(&mut thread))
+        .run(vec![Message::user("first")], Some(&mut thread))
         .await
         .unwrap();
     assert!(
@@ -185,23 +190,23 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
         resp1.messages
     );
 
-    let after_first = thread.list_messages().await.unwrap();
+    let after_first = history.list_messages();
     assert!(
         !after_first.is_empty(),
-        "the thread must be populated after the first run (input write-back missing)"
+        "the history provider must be populated after the first run (write-back missing)"
     );
     assert!(
         after_first.iter().any(|m| m.text() == "first"),
-        "input message set 1 missing from thread: {after_first:?}"
+        "input message set 1 missing from history: {after_first:?}"
     );
     assert!(
         after_first.iter().any(|m| m.text() == "reply-1"),
-        "response message set 1 missing from thread: {after_first:?}"
+        "response message set 1 missing from history: {after_first:?}"
     );
 
-    // --- Second run, same thread ---
+    // --- Second run, same session ---
     let resp2 = wf_agent
-        .run(vec![ChatMessage::user("second")], Some(&mut thread))
+        .run(vec![Message::user("second")], Some(&mut thread))
         .await
         .unwrap();
     assert!(
@@ -210,15 +215,15 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
         resp2.messages
     );
 
-    let after_second = thread.list_messages().await.unwrap();
+    let after_second = history.list_messages();
     assert!(
         after_second.len() > after_first.len(),
-        "the second run must append to, not replace, the thread history \
+        "the second run must append to, not replace, the history \
          (before: {after_first:?}, after: {after_second:?})"
     );
-    // Matching `ChatAgent`'s exact convention (see `agent_surfaces_and_resolves_approval_round_trip`
+    // Matching `Agent`'s exact convention (see `agent_surfaces_and_resolves_approval_round_trip`
     // in `tests/integration.rs`): both runs' input and response message sets
-    // are all present in the thread store after two runs.
+    // are all present in the history provider after two runs.
     assert!(after_second.iter().any(|m| m.text() == "first"));
     assert!(after_second.iter().any(|m| m.text() == "reply-1"));
     assert!(after_second.iter().any(|m| m.text() == "second"));
@@ -228,15 +233,12 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
 #[tokio::test]
 async fn workflow_agent_run_without_explicit_thread_does_not_panic() {
     // No thread supplied: `run` must create and use an ephemeral one
-    // internally (mirroring `ChatAgent::run`) rather than erroring.
+    // internally (mirroring `Agent::run`) rather than erroring.
     let a = agent("A", vec!["only-reply"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "solo");
 
-    let resp = wf_agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
+    let resp = wf_agent.run(vec![Message::user("hi")], None).await.unwrap();
     assert!(resp.messages.iter().any(|m| m.text() == "only-reply"));
 }
 
@@ -246,39 +248,47 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "streamer");
 
-    let thread = wf_agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it
+    // directly; its `Arc<Mutex<..>>` is shared with the clone passed into
+    // `run_stream_with_thread`.
+    let history_provider = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread
+        .context_providers
+        .push(Arc::new(history_provider.clone()));
+
     let mut stream =
-        wf_agent.run_stream_with_thread(vec![ChatMessage::user("go")], Some(thread.clone()));
+        wf_agent.run_stream_with_thread(vec![Message::user("go")], Some(thread.clone()));
     let mut text = String::new();
     while let Some(update) = stream.next().await {
         text.push_str(&update.unwrap().text());
     }
     assert!(text.contains("streamed-reply"), "streamed text: {text}");
 
-    // Because message stores are shared via `Arc`, the write-back that
-    // happened on the internal thread clone is visible through this clone
-    // too (same pattern as `ChatAgent::run_stream`).
-    let history = thread.list_messages().await.unwrap();
+    // Because history-provider storage is shared via `Arc`, the write-back
+    // that happened on the internal session clone is visible through this
+    // clone too (same pattern as `Agent::run_stream`).
+    let history = history_provider.list_messages();
     assert!(
         history.iter().any(|m| m.text() == "go"),
-        "input missing from thread: {history:?}"
+        "input missing from history: {history:?}"
     );
     assert!(
         history.iter().any(|m| m.text() == "streamed-reply"),
-        "response missing from thread: {history:?}"
+        "response missing from history: {history:?}"
     );
 }
 
 #[tokio::test]
 async fn workflow_agent_trait_run_stream_yields_updates() {
-    // The object-safe `Agent::run_stream` override streams the workflow's agent
-    // activity (exercised through a `dyn Agent`, as hosting/orchestration do).
+    // The object-safe `SupportsAgentRun::run_stream` override streams the workflow's agent
+    // activity (exercised through a `dyn SupportsAgentRun`, as hosting/orchestration do).
     let a = agent("A", vec!["hello-from-A"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
-    let wf_agent: Arc<dyn Agent> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
+    let wf_agent: Arc<dyn SupportsAgentRun> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
 
     let mut stream = wf_agent
-        .run_stream(vec![ChatMessage::user("go")], None, None)
+        .run_stream(vec![Message::user("go")], None, None)
         .await
         .unwrap();
     let mut text = String::new();

@@ -8,25 +8,25 @@ use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::SequentialBuilder;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     let writer = Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name("writer")
             .instructions("You write a short first draft paragraph on the given topic.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let editor = Arc::new(
-        ChatAgent::builder(client)
+        Agent::builder(client)
             .name("editor")
             .instructions("You improve the previous draft for clarity and concision.")
             .build(),
-    ) as Arc<dyn Agent>;
+    ) as Arc<dyn SupportsAgentRun>;
 
     let workflow = SequentialBuilder::new()
         .participants(vec![writer, editor])
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         .await?;
 
     if let Some(output) = result.last_output() {
-        let conversation: Vec<ChatMessage> = serde_json::from_value(output).unwrap_or_default();
+        let conversation: Vec<Message> = serde_json::from_value(output).unwrap_or_default();
         if let Some(last) = conversation.last() {
             println!("Final:\n{}", last.text());
         }

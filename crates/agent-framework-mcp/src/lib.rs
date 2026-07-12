@@ -3,7 +3,7 @@
 //! A Model Context Protocol (MCP) client for `agent-framework-rs`. Connects to
 //! MCP servers, lists their tools, and turns them into
 //! [`ToolDefinition`](agent_framework_core::tools::ToolDefinition)s that plug
-//! straight into a `ChatAgent`.
+//! straight into a `Agent`.
 //!
 //! This is the Rust equivalent of `agent_framework._mcp` (`MCPStdioTool`,
 //! `MCPStreamableHTTPTool`) in the Python reference implementation.
@@ -32,7 +32,7 @@
 //! ## Dynamic tools ([`ToolSource`](agent_framework_core::tools::ToolSource))
 //!
 //! [`McpStdioTool`], [`McpStreamableHttpTool`], and [`McpWebsocketTool`] all
-//! implement `ToolSource`, so `ChatAgent::builder().tool_source(Arc::new(mcp))`
+//! implement `ToolSource`, so `Agent::builder().tool_source(Arc::new(mcp))`
 //! resolves the server's tool list fresh on every agent run instead of
 //! freezing it at build time (the alternative, `.tool_definitions().await`
 //! once up front). Resolution connects lazily on first use and thereafter
@@ -50,7 +50,7 @@
 //! - **Prompts** (`prompts/list` / `prompts/get`): [`McpClient::list_prompts`]
 //!   / [`McpClient::get_prompt`], and on each tool wrapper, `.prompts()` /
 //!   `.get_prompt(name, arguments)` (mapping MCP `PromptMessage`s into core
-//!   `ChatMessage`s, mirroring Python's `MCPTool.get_prompt`).
+//!   `Message`s, mirroring Python's `MCPTool.get_prompt`).
 //!   `list_prompts`/`.prompts()` short-circuit to an empty list — without
 //!   issuing any request — when the server didn't declare the `prompts`
 //!   capability during `initialize`.
@@ -100,7 +100,7 @@
 //! // Connects (if needed) and lists the server's tools as ToolDefinitions.
 //! let tools = mcp.tool_definitions().await?;
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .name("assistant")
 //!     .instructions("You can read files when needed.")
 //!     .tools(tools)

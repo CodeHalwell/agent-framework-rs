@@ -16,7 +16,7 @@ use agent_framework_azure::{
 };
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::Error;
-use agent_framework_core::types::{ChatMessage, ChatOptions};
+use agent_framework_core::types::{ChatOptions, Message};
 use futures::StreamExt;
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -309,7 +309,7 @@ async fn azure_openai_maps_429_to_service_status_with_retry_after() {
 
     let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
     let err = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -331,7 +331,7 @@ async fn azure_openai_maps_401_to_invalid_auth() {
 
     let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
     let err = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -354,7 +354,7 @@ async fn azure_openai_maps_plain_400_to_invalid_request() {
 
     let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
     let err = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -379,7 +379,7 @@ async fn azure_openai_maps_content_filter_400_to_content_filter() {
 
     let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
     let err = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -402,7 +402,7 @@ async fn azure_openai_responses_client_maps_403_to_invalid_auth() {
 
     let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
     let err = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -437,7 +437,7 @@ async fn azure_openai_responses_client_loopback_round_trip() {
 
     let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
     let response = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
 
@@ -479,7 +479,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"
 
     let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
     let mut stream = client
-        .get_streaming_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_streaming_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
 
@@ -491,7 +491,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"
         if update.response_id.as_deref() == Some("resp_stream_1") {
             saw_completed = true;
             // `store != Some(false)` auto-populates `conversation_id`,
-            // identical to `OpenAIResponsesClient`'s streaming behavior.
+            // identical to `OpenAIChatClient`'s streaming behavior.
             assert_eq!(update.conversation_id.as_deref(), Some("resp_stream_1"));
         }
     }

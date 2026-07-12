@@ -3,7 +3,7 @@
 //! A [Microsoft Copilot Studio](https://copilotstudio.microsoft.com/) agent
 //! **client** for `agent-framework-rs`: talk to a published (or prebuilt)
 //! Copilot Studio agent over its Direct-to-Engine (D2E) API as if it were a
-//! local [`Agent`](agent_framework_core::agent::Agent).
+//! local [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun).
 //!
 //! This is the Rust equivalent of `agent_framework_copilotstudio`
 //! (`CopilotStudioAgent`) in the Python reference implementation. Python
@@ -45,7 +45,7 @@
 //! - [`activity`] — the Direct-to-Engine `Activity` wire shape and
 //!   SSE/JSON-array response parsing.
 //! - [`agent`] — [`CopilotStudioAgent`]: the
-//!   [`Agent`](agent_framework_core::agent::Agent) wrapper.
+//!   [`SupportsAgentRun`](agent_framework_core::agent::SupportsAgentRun) wrapper.
 //!
 //! ## Example
 //!
@@ -72,23 +72,24 @@
 //! # }
 //! ```
 //!
-//! Reuse the same [`AgentThread`](agent_framework_core::threads::AgentThread)
+//! Reuse the same [`AgentSession`](agent_framework_core::session::AgentSession)
 //! across calls for a multi-turn conversation:
 //!
 //! ```no_run
 //! # use agent_framework_copilotstudio::{CopilotStudioAgent, CopilotStudioConnectionSettings, StaticTokenProvider};
 //! use agent_framework_core::prelude::*;
+//! use agent_framework_core::agent::SupportsAgentRun;
 //!
 //! # async fn demo() -> Result<()> {
 //! # let agent = CopilotStudioAgent::new(
 //! #     CopilotStudioConnectionSettings::new("env-id", "schema-name"),
 //! #     StaticTokenProvider::new("token"),
 //! # );
-//! let mut thread = agent.get_new_thread();
-//! agent.run(vec![ChatMessage::user("What's the weather in Seattle?")], Some(&mut thread)).await?;
-//! // The Direct-to-Engine conversation id is now attached to `thread`, so
+//! let mut session = agent.create_session();
+//! agent.run(vec![Message::user("What's the weather in Seattle?")], Some(&mut session)).await?;
+//! // The Direct-to-Engine conversation id is now attached to `session`, so
 //! // this second call continues the same conversation.
-//! let reply = agent.run(vec![ChatMessage::user("What about tomorrow?")], Some(&mut thread)).await?;
+//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut session)).await?;
 //! println!("{}", reply.text());
 //! # Ok(())
 //! # }
@@ -113,10 +114,10 @@
 //!   speaks Direct-to-Engine directly over `reqwest`, as described above.
 //! - **Real conversation-id continuity.** Python's `CopilotStudioAgent.run`
 //!   calls `self._start_new_conversation()` *unconditionally* on every
-//!   invocation — even when a `thread` with an existing
-//!   `service_thread_id` is passed in — discarding whatever conversation
+//!   invocation — even when a `session` with an existing
+//!   `service_session_id` is passed in — discarding whatever conversation
 //!   context existed before. This port instead starts a new Direct-to-Engine
-//!   conversation only the first time an [`AgentThread`](agent_framework_core::threads::AgentThread)
+//!   conversation only the first time an [`AgentSession`](agent_framework_core::session::AgentSession)
 //!   is used, and reuses its conversation id on subsequent calls (the same
 //!   fix `agent-framework-a2a`'s `A2AAgent` applies for `contextId`/`taskId`
 //!   continuity — see that crate's docs for the identical rationale).
@@ -124,12 +125,12 @@
 //!   continuity above: this port sends just the last message's text as the
 //!   outgoing `message` activity, relying on the conversation id for
 //!   everything earlier — mirroring `agent-framework-a2a`. Python instead
-//!   joins *every* `ChatMessage` passed to a single `run()` call with `"\n"`
+//!   joins *every* `Message` passed to a single `run()` call with `"\n"`
 //!   into one question string (relevant when a caller passes several
 //!   messages in one call, e.g. `agent.run(["Hello", "How are you?"])`);
 //!   that per-call flattening is not reproduced here.
 //! - **`run_stream` uses the trait's buffered default.**
-//!   [`agent_framework_core::agent::Agent`] now has an object-safe `run_stream`
+//!   [`agent_framework_core::agent::SupportsAgentRun`] now has an object-safe `run_stream`
 //!   (with a default that runs to completion and replays the messages as
 //!   updates), but [`CopilotStudioAgent`] deliberately does **not** override it
 //!   with real streaming. This sidesteps a genuine oddity in the Python
@@ -137,7 +138,7 @@
 //!   streaming=True)` call only ever surfaces `type == "typing"` activity text
 //!   as updates and *never* yields the final `type == "message"` activity — so
 //!   real Copilot Studio streaming would emit only interim typing indicators.
-//!   This port's [`Agent::run`](agent_framework_core::agent::Agent::run)
+//!   This port's [`SupportsAgentRun::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   mirrors Python's **non**-streaming path (`streaming=False`), which
 //!   correctly surfaces `message` activities and skips `typing`/other types;
 //!   the buffered `run_stream` default then replays that complete answer.

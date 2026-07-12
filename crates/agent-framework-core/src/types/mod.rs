@@ -8,13 +8,14 @@ mod options;
 mod response;
 
 pub use content::{
-    prepare_function_call_results, CitationAnnotation, Content, DataContent, ErrorContent,
+    prepare_function_call_results, Annotation, AnnotationKind, Content, DataContent, ErrorContent,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
 };
-pub use message::{prepare_messages, ChatMessage, IntoMessages, Role};
+pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatResponse, ChatResponseUpdate, FinishReason,
+    AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate, ContinuationToken,
+    FinishReason,
 };

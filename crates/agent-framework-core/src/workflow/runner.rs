@@ -2,7 +2,8 @@
 //! the superstep runner.
 
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -10,7 +11,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::checkpoint::{CheckpointStorage, WorkflowCheckpoint};
 use super::context::{DrainedEffects, WorkflowContext, WorkflowMessage};
-use super::edge::{Case, Default as SwitchDefault, EdgeGroup};
+use super::edge::{
+    wrap_async_condition, wrap_sync_condition, Case, Default as SwitchDefault, EdgeGroup, Selection,
+};
 use super::events::{WorkflowEvent, WorkflowRunState};
 use super::executor::Executor;
 use super::request_info::{PendingRequest, RequestResponse};
@@ -18,6 +21,7 @@ use super::shared_state::SharedState;
 use super::validation::validate_workflow_graph;
 use super::viz::WorkflowViz;
 use crate::error::{Error, Result};
+use crate::tools::BoxFuture;
 
 const DEFAULT_MAX_ITERATIONS: usize = 100;
 
@@ -139,6 +143,15 @@ pub(crate) struct WorkflowShared {
     pub id: String,
     /// Deterministic fingerprint of the graph topology, checked on resume.
     pub graph_signature: String,
+    /// Executor ids whose yields are workflow-level [`Output`](WorkflowEvent::Output)
+    /// events (see [`WorkflowBuilder::output_from`]). Empty means "no
+    /// restriction" — see [`WorkflowRun::classify_yield`] for the full
+    /// precedence rule.
+    pub output_executors: HashSet<String>,
+    /// Executor ids whose yields are non-terminal
+    /// [`Intermediate`](WorkflowEvent::Intermediate) events (see
+    /// [`WorkflowBuilder::intermediate_output_from`]).
+    pub intermediate_executors: HashSet<String>,
 }
 
 /// Fluent builder for a [`Workflow`]. Rust equivalent of `WorkflowBuilder`.
@@ -150,6 +163,8 @@ pub struct WorkflowBuilder {
     name: Option<String>,
     description: Option<String>,
     checkpoint_storage: Option<Arc<dyn CheckpointStorage>>,
+    output_executors: Vec<String>,
+    intermediate_executors: Vec<String>,
 }
 
 impl std::default::Default for WorkflowBuilder {
@@ -162,6 +177,8 @@ impl std::default::Default for WorkflowBuilder {
             name: None,
             description: None,
             checkpoint_storage: None,
+            output_executors: Vec::new(),
+            intermediate_executors: Vec::new(),
         }
     }
 }
@@ -195,7 +212,7 @@ impl WorkflowBuilder {
         self
     }
 
-    /// Add a single directed edge guarded by a condition.
+    /// Add a single directed edge guarded by a synchronous condition.
     pub fn add_conditional_edge(
         mut self,
         source: impl Into<String>,
@@ -205,7 +222,31 @@ impl WorkflowBuilder {
         self.edge_groups.push(EdgeGroup::Single {
             source: source.into(),
             target: target.into(),
-            condition: Some(Arc::new(condition)),
+            condition: Some(wrap_sync_condition(condition)),
+        });
+        self
+    }
+
+    /// Add a single directed edge guarded by an async condition.
+    ///
+    /// Equivalent to [`WorkflowBuilder::add_conditional_edge`] but for a
+    /// predicate that itself needs to `.await` (e.g. an I/O check); the
+    /// condition is awaited at routing time (see `UPSTREAM_DRIFT.md` §10,
+    /// `Edge.should_route` becoming async upstream).
+    pub fn add_conditional_edge_async<F, Fut>(
+        mut self,
+        source: impl Into<String>,
+        target: impl Into<String>,
+        condition: F,
+    ) -> Self
+    where
+        F: Fn(&Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.edge_groups.push(EdgeGroup::Single {
+            source: source.into(),
+            target: target.into(),
+            condition: Some(wrap_async_condition(condition)),
         });
         self
     }
@@ -256,15 +297,26 @@ impl WorkflowBuilder {
         targets.push(default.target.clone());
         labels.push("default".to_string());
 
-        let conds: Vec<Case> = cases;
+        // Extract owned `(condition, target)` pairs so the selection closure
+        // below doesn't need to borrow `cases` from its own captured
+        // environment (the returned future must own everything it touches).
+        let case_targets: Vec<(super::edge::Condition, String)> = cases
+            .iter()
+            .map(|case| (case.condition.clone(), case.target.clone()))
+            .collect();
         let default_target = default.target.clone();
-        let selection = Arc::new(move |msg: &Value, _candidates: &[String]| {
-            for case in &conds {
-                if (case.condition)(msg) {
-                    return vec![case.target.clone()];
+        let selection: Selection = Arc::new(move |msg: &Value, _candidates: &[String]| {
+            let case_targets = case_targets.clone();
+            let default_target = default_target.clone();
+            let msg = msg.clone();
+            Box::pin(async move {
+                for (condition, target) in &case_targets {
+                    if condition(&msg).await {
+                        return vec![target.clone()];
+                    }
                 }
-            }
-            vec![default_target.clone()]
+                vec![default_target.clone()]
+            }) as BoxFuture<Vec<String>>
         });
         self.edge_groups.push(EdgeGroup::FanOut {
             source,
@@ -308,15 +360,56 @@ impl WorkflowBuilder {
         self
     }
 
+    /// Designate `ids` as workflow-level output sources: their `yield_output`
+    /// calls become terminal [`WorkflowEvent::Output`] events and are recorded
+    /// in [`WorkflowRun::last_output`]/[`WorkflowRun::outputs`].
+    ///
+    /// Once any executor is designated with `output_from`, executors *not*
+    /// named here (and not named via [`WorkflowBuilder::intermediate_output_from`])
+    /// have their yields demoted to non-terminal [`WorkflowEvent::Intermediate`]
+    /// events rather than dropped — see [`WorkflowEvent::Intermediate`] for the
+    /// full precedence rule. Leaving both designation lists empty preserves the
+    /// default behavior: every yield is a terminal `Output`.
+    ///
+    /// Rejected at [`WorkflowBuilder::build`] if any id is unknown or overlaps
+    /// [`WorkflowBuilder::intermediate_output_from`].
+    pub fn output_from(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.output_executors
+            .extend(ids.into_iter().map(Into::into));
+        self
+    }
+
+    /// Designate `ids` as intermediate-output sources: their `yield_output`
+    /// calls become non-terminal [`WorkflowEvent::Intermediate`] events and are
+    /// never recorded as the run's final output.
+    ///
+    /// Rejected at [`WorkflowBuilder::build`] if any id is unknown or overlaps
+    /// [`WorkflowBuilder::output_from`].
+    pub fn intermediate_output_from(
+        mut self,
+        ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.intermediate_executors
+            .extend(ids.into_iter().map(Into::into));
+        self
+    }
+
     /// Validate and build the workflow.
     pub fn build(self) -> Result<Workflow> {
         let start = self
             .start
             .ok_or_else(|| Error::Workflow("no start executor set".into()))?;
 
-        // Full graph validation (start presence, duplicate edges, connectivity).
-        validate_workflow_graph(&self.executors, &self.edge_groups, &start)
-            .map_err(|e| Error::Workflow(e.to_string()))?;
+        // Full graph validation (start presence, duplicate edges, connectivity,
+        // output designation).
+        validate_workflow_graph(
+            &self.executors,
+            &self.edge_groups,
+            &start,
+            &self.output_executors,
+            &self.intermediate_executors,
+        )
+        .map_err(|e| Error::Workflow(e.to_string()))?;
 
         let graph_signature = compute_graph_signature(&self.executors, &self.edge_groups, &start);
 
@@ -331,6 +424,8 @@ impl WorkflowBuilder {
                 checkpoint_storage: self.checkpoint_storage,
                 id: uuid::Uuid::new_v4().to_string(),
                 graph_signature,
+                output_executors: self.output_executors.into_iter().collect(),
+                intermediate_executors: self.intermediate_executors.into_iter().collect(),
             }),
         })
     }
@@ -505,6 +600,9 @@ impl Workflow {
 /// run concurrently, so nothing here borrows the runner.
 struct Invocation {
     executor: Arc<dyn Executor>,
+    /// The target executor's id. Invocations sharing an id are serialized
+    /// within a superstep (see [`WorkflowRun::run_loop`]).
+    executor_id: String,
     data: Value,
     source_ids: Vec<String>,
 }
@@ -545,6 +643,41 @@ impl WorkflowRun {
             let _ = tx.send(event.clone());
         }
         self.events.push(event);
+    }
+
+    /// Classify a value yielded by executor `id` into the right
+    /// [`WorkflowEvent`], per the workflow's output designation
+    /// (`output_from`/`intermediate_output_from`).
+    ///
+    /// Precedence:
+    /// 1. `id` is in `intermediate_executors` -> [`WorkflowEvent::Intermediate`]
+    ///    (never counted as the run's output, regardless of `output_executors`).
+    /// 2. Otherwise, if `output_executors` is empty (no designation configured
+    ///    at all) -> [`WorkflowEvent::Output`], preserving the pre-designation
+    ///    default where every yield is terminal output.
+    /// 3. Otherwise (`output_executors` is non-empty), `id` in it ->
+    ///    [`WorkflowEvent::Output`]; `id` not in it -> demoted to
+    ///    [`WorkflowEvent::Intermediate`] as a safe non-terminal signal, rather
+    ///    than silently dropped.
+    fn classify_yield(&self, id: &str, data: Value) -> WorkflowEvent {
+        let source_executor_id = id.to_string();
+        if self.shared.intermediate_executors.contains(id) {
+            return WorkflowEvent::Intermediate {
+                data,
+                source_executor_id,
+            };
+        }
+        if self.shared.output_executors.is_empty() || self.shared.output_executors.contains(id) {
+            WorkflowEvent::Output {
+                data,
+                source_executor_id,
+            }
+        } else {
+            WorkflowEvent::Intermediate {
+                data,
+                source_executor_id,
+            }
+        }
     }
 
     async fn start(&mut self, input: Value) -> Result<()> {
@@ -628,7 +761,7 @@ impl WorkflowRun {
             let deliveries = std::mem::take(&mut self.queue);
             let mut by_target: HashMap<String, Vec<WorkflowMessage>> = HashMap::new();
             for msg in deliveries {
-                for target in self.resolve_targets(&msg) {
+                for target in self.resolve_targets(&msg).await {
                     by_target.entry(target).or_default().push(msg.clone());
                 }
             }
@@ -662,6 +795,7 @@ impl WorkflowRun {
                 for m in direct {
                     invocations.push(Invocation {
                         executor: executor.clone(),
+                        executor_id: target_id.clone(),
                         data: m.data,
                         source_ids: vec![m.source_id],
                     });
@@ -689,6 +823,7 @@ impl WorkflowRun {
                     self.fanin.remove(target_id);
                     invocations.push(Invocation {
                         executor,
+                        executor_id: target_id.clone(),
                         data: Value::Array(collected),
                         source_ids: sources,
                     });
@@ -696,6 +831,7 @@ impl WorkflowRun {
                     for m in msgs {
                         invocations.push(Invocation {
                             executor: executor.clone(),
+                            executor_id: target_id.clone(),
                             data: m.data,
                             source_ids: vec![m.source_id],
                         });
@@ -703,22 +839,53 @@ impl WorkflowRun {
                 }
             }
 
-            // Run the planned invocations concurrently — upstream parity with
-            // `asyncio.gather` over a superstep's deliveries (`_runner.py`).
-            // Each future builds its own context and drains its own effects, so
-            // the executes (typically LLM calls) genuinely overlap instead of
-            // running one after another. `join_all` preserves input order, so
-            // `results` is still in the planned (sorted-target) order.
+            // Group the planned invocations by target executor. Invocations
+            // for one executor are contiguous (each target is visited once, in
+            // sorted order), so a linear scan reconstructs the groups while
+            // preserving planned order.
+            let mut groups: Vec<Vec<Invocation>> = Vec::new();
+            for inv in invocations {
+                match groups.last_mut() {
+                    Some(g) if g[0].executor_id == inv.executor_id => g.push(inv),
+                    _ => groups.push(vec![inv]),
+                }
+            }
+
+            // Run the groups concurrently, but serialize the invocations *within*
+            // a group: two deliveries to the same executor instance in one
+            // superstep must not have overlapping `execute()` calls, or a
+            // stateful executor sees a nondeterministic interleaving. This
+            // mirrors upstream's per-executor `_execution_lock` (PR #6776):
+            // different executors stay concurrent (`asyncio.gather` /
+            // `join_all`), same-executor deliveries run one at a time. Each
+            // future builds its own context and drains its own effects, so
+            // distinct executors (typically LLM calls) still genuinely overlap.
+            // Flattening the group results in group order — which is the sorted
+            // planned order, with each group's own invocations kept sequential —
+            // yields `results` in exactly the planned order the apply loop below
+            // relies on for determinism.
             let shared_state = self.shared_state.clone();
-            let results = futures::future::join_all(invocations.into_iter().map(|inv| {
-                Self::run_executor_isolated(
-                    inv.executor,
-                    inv.data,
-                    inv.source_ids,
-                    shared_state.clone(),
-                )
+            let group_results = futures::future::join_all(groups.into_iter().map(|group| {
+                let shared_state = shared_state.clone();
+                async move {
+                    let mut out = Vec::with_capacity(group.len());
+                    for inv in group {
+                        out.push(
+                            Self::run_executor_isolated(
+                                inv.executor,
+                                inv.data,
+                                inv.source_ids,
+                                shared_state.clone(),
+                            )
+                            .await,
+                        );
+                    }
+                    out
+                }
             }))
             .await;
+            let results: Vec<(String, Result<DrainedEffects>)> =
+                group_results.into_iter().flatten().collect();
 
             // Apply results in planned order so the emitted event sequence and
             // the next superstep's queue are identical to sequential execution.
@@ -729,21 +896,19 @@ impl WorkflowRun {
             // invocations' *drained* effects (messages, events, outputs,
             // requests) are simply not applied.
             //
-            // Live side effects are a different matter, by design: sibling
+            // External side effects are a different matter, by design: sibling
             // invocations that already ran (or were mid-flight) when another
-            // failed have still performed their external work and any
-            // `SharedState` writes — shared state is live within a superstep,
-            // not transactional, and there is no rollback. This matches
-            // upstream exactly: Python's `_run_iteration` drives a
-            // superstep's deliveries with plain `asyncio.gather`
-            // (`_runner.py:147-183`), which neither cancels sibling tasks on
-            // the first exception nor stages `SharedState` mutations.
-            // Cancelling siblings here could not retract writes already made
-            // (it would only shrink the window while imposing
-            // cancellation-safety on user executors), and staging would break
-            // the live cross-executor visibility both engines document — so
-            // a failed run may retain state from branches whose messages
-            // never took effect, and a resume replays the whole superstep.
+            // failed have still performed their external work (network calls,
+            // etc.), and there is no rollback for those. `SharedState` writes,
+            // however, are staged: they land in the pending buffer during a
+            // superstep and are folded into committed state only by the
+            // `commit()` below, which a failed superstep never reaches. So a
+            // failed superstep discards its shared-state writes rather than
+            // persisting a partial, branch-dependent state — matching upstream's
+            // Pregel-style commit-at-boundary model (`_state.py` / `_runner.py`),
+            // where `commit()` runs only after a superstep's executors all
+            // complete. A resume then replays the whole superstep from the last
+            // committed boundary.
             let mut next: Vec<WorkflowMessage> = Vec::new();
             for (id, result) in results {
                 self.emit(WorkflowEvent::ExecutorInvoked {
@@ -752,10 +917,7 @@ impl WorkflowRun {
                 match result {
                     Ok((sent, outputs, custom, requests)) => {
                         for out in outputs {
-                            self.emit(WorkflowEvent::Output {
-                                data: out,
-                                source_executor_id: id.clone(),
-                            });
+                            self.emit(self.classify_yield(&id, out));
                         }
                         for ev in custom {
                             self.emit(ev);
@@ -793,6 +955,13 @@ impl WorkflowRun {
                     }
                 }
             }
+
+            // Superstep barrier: fold this superstep's staged shared-state
+            // writes into committed state before emitting completion or
+            // checkpointing, so a checkpoint captures exactly the committed
+            // boundary. Only reached when every executor succeeded (an error
+            // returns above, leaving the writes discarded).
+            self.shared_state.commit().await;
 
             self.emit(WorkflowEvent::SuperStepCompleted(step));
             self.queue = next;
@@ -928,7 +1097,10 @@ impl WorkflowRun {
     }
 
     /// Resolve which executors a message should be delivered to.
-    fn resolve_targets(&self, msg: &WorkflowMessage) -> Vec<String> {
+    ///
+    /// Awaits each matching group's condition/selection (see
+    /// `UPSTREAM_DRIFT.md` §10 — upstream's `Edge.should_route` is async).
+    async fn resolve_targets(&self, msg: &WorkflowMessage) -> Vec<String> {
         // Explicit target wins (direct sends and routed responses).
         if let Some(t) = &msg.target_id {
             return vec![t.clone()];
@@ -941,7 +1113,11 @@ impl WorkflowRun {
                     target,
                     condition,
                 } if *source == msg.source_id => {
-                    if condition.as_ref().map(|c| c(&msg.data)).unwrap_or(true) {
+                    let route = match condition {
+                        Some(c) => c(&msg.data).await,
+                        None => true,
+                    };
+                    if route {
                         targets.push(target.clone());
                     }
                 }
@@ -951,7 +1127,7 @@ impl WorkflowRun {
                     selection,
                     ..
                 } if *source == msg.source_id => match selection {
-                    Some(sel) => targets.extend(sel(&msg.data, outs)),
+                    Some(sel) => targets.extend(sel(&msg.data, outs).await),
                     None => targets.extend(outs.clone()),
                 },
                 EdgeGroup::FanIn { sources, target } if sources.contains(&msg.source_id) => {
@@ -1039,5 +1215,109 @@ impl futures::Stream for WorkflowRunStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod async_condition_tests {
+    //! Regression + new-behavior coverage for `UPSTREAM_DRIFT.md` §10: edge
+    //! routing conditions became async upstream (`Edge.should_route`); these
+    //! confirm the sync builder API still routes correctly (regression) and
+    //! that the new `*_async` builder API also routes correctly.
+
+    use super::*;
+    use crate::workflow::executor::FunctionExecutor;
+    use serde_json::json;
+
+    /// An executor that immediately yields whatever message it receives as a
+    /// workflow output, so a run's `outputs()` directly reveal which branch(es)
+    /// were taken.
+    fn echo(id: &str) -> Arc<dyn Executor> {
+        Arc::new(FunctionExecutor::new(id, |msg, ctx| async move {
+            ctx.yield_output(msg).await
+        }))
+    }
+
+    #[tokio::test]
+    async fn sync_condition_still_routes() {
+        // Regression: the pre-existing sync `add_conditional_edge` builder
+        // must keep routing correctly now that `Condition` is async
+        // internally.
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hit"))
+            .add_executor(echo("miss"))
+            .set_start("start")
+            .add_conditional_edge("start", "hit", |v| v == &json!("go"))
+            .add_conditional_edge("start", "miss", |v| v != &json!("go"))
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+    }
+
+    #[tokio::test]
+    async fn async_condition_routes() {
+        // New: `add_conditional_edge_async` accepts a condition that actually
+        // awaits (yields to the scheduler) before resolving.
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hit"))
+            .add_executor(echo("miss"))
+            .set_start("start")
+            .add_conditional_edge_async("start", "hit", |v| {
+                let matched = v == &json!("go");
+                async move {
+                    tokio::task::yield_now().await;
+                    matched
+                }
+            })
+            .add_conditional_edge_async("start", "miss", |v| {
+                let matched = v != &json!("go");
+                async move {
+                    tokio::task::yield_now().await;
+                    matched
+                }
+            })
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+    }
+
+    #[tokio::test]
+    async fn async_switch_case_routes() {
+        // New: `Case::new_async`/`labeled_async` let a switch/case group's
+        // branches await too, exercised through the existing `add_switch`
+        // builder (which now awaits each case's condition in order).
+        let workflow = WorkflowBuilder::new()
+            .add_executor(echo("start"))
+            .add_executor(echo("hot"))
+            .add_executor(echo("cold"))
+            .set_start("start")
+            .add_switch(
+                "start",
+                vec![Case::new_async(
+                    |v| {
+                        let matched = v == &json!("go");
+                        async move {
+                            tokio::task::yield_now().await;
+                            matched
+                        }
+                    },
+                    "hot",
+                )],
+                SwitchDefault::new("cold"),
+            )
+            .build()
+            .unwrap();
+
+        let run = workflow.run(json!("go")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("go")]);
+
+        let run = workflow.run(json!("stop")).await.unwrap();
+        assert_eq!(run.outputs(), vec![json!("stop")]);
     }
 }

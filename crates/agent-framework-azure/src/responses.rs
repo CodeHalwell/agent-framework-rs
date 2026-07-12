@@ -10,7 +10,7 @@
 //! newer, OpenAI-compatible "v1 preview" surface: there is no deployment
 //! segment in the URL at all, and the deployment instead flows into the
 //! request body's `model` field, exactly like the plain
-//! [`OpenAIResponsesClient`](agent_framework_openai::responses::OpenAIResponsesClient).
+//! [`OpenAIChatClient`](agent_framework_openai::responses::OpenAIChatClient).
 //!
 //! This mirrors upstream `AzureOpenAIResponsesClient.__init__`
 //! (`azure/_responses_client.py:99-146`), which:
@@ -42,7 +42,7 @@
 //! [`AzureOpenAIClient`](crate::AzureOpenAIClient) reuses
 //! [`agent_framework_openai::convert`] for Chat Completions. `conversation_id`
 //! ↔ `previous_response_id` and `store` ↔ auto-populated `conversation_id`
-//! behave identically to [`OpenAIResponsesClient`](agent_framework_openai::responses::OpenAIResponsesClient)
+//! behave identically to [`OpenAIChatClient`](agent_framework_openai::responses::OpenAIChatClient)
 //! because the same conversion functions are called.
 //!
 //! ```no_run
@@ -55,7 +55,7 @@
 //!     "my-gpt4o-deployment",
 //!     "my-api-key",
 //! );
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;
@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
@@ -301,16 +301,16 @@ impl AzureOpenAIResponsesClient {
     /// Build the Responses API request body, reusing conversion from
     /// [`agent_framework_openai::responses`] verbatim — see the
     /// [module docs](self).
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         // Unlike Chat Completions (deployment selects the model via the URL
         // path), the `/openai/v1/responses` route carries no deployment
         // segment, so `model` is the *only* way to select it and is always
-        // sent — mirroring `OpenAIResponsesClient::build_body` and upstream's
-        // `run_options["model"] = self.model_id` fallback
+        // sent — mirroring `OpenAIChatClient::build_body` and upstream's
+        // `run_options["model"] = self.model` fallback
         // (`openai/_responses_client.py:432-435`).
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.deployment.clone());
         body.insert("model".into(), json!(model));
@@ -428,7 +428,7 @@ impl AzureOpenAIResponsesClient {
 impl ChatClient for AzureOpenAIResponsesClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -437,7 +437,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
             .json()
             .await
             .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        // Mirrors `OpenAIResponsesClient::get_response`: a failed run reports
+        // Mirrors `OpenAIChatClient::get_response`: a failed run reports
         // `status: "failed"` with a 2xx HTTP status, so the error has to be
         // pulled out of the body rather than the transport layer —
         // content-filter failures get the granular variant.
@@ -452,7 +452,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -463,7 +463,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         )
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
     }
 }
@@ -482,8 +482,8 @@ mod tests {
         )
     }
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
     // region: URL building
@@ -573,7 +573,7 @@ mod tests {
         let c = client();
         assert_eq!(c.deployment(), "my-gpt4o-deployment");
         assert_eq!(c.api_version(), Some("preview"));
-        assert_eq!(c.model_id(), Some("my-gpt4o-deployment"));
+        assert_eq!(c.model(), Some("my-gpt4o-deployment"));
         assert_eq!(c.base_url(), None);
     }
 
@@ -604,7 +604,7 @@ mod tests {
 
     // endregion
 
-    // region: request-body parity with `agent_framework_openai::responses::OpenAIResponsesClient`
+    // region: request-body parity with `agent_framework_openai::responses::OpenAIChatClient`
     //
     // These mirror the equivalent `build_body_*` tests in
     // `agent-framework-openai/src/responses.rs` field-for-field (substituting
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn build_body_extracts_leading_system_message_as_instructions() {
         let c = client();
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(body["instructions"], json!("Be terse."));
         assert_eq!(
@@ -674,11 +674,11 @@ mod tests {
             "get_weather",
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
-        let assistant_msg = ChatMessage::with_contents(
+        let assistant_msg = Message::with_contents(
             agent_framework_core::types::Role::assistant(),
             vec![Content::FunctionCall(call)],
         );
-        let tool_msg = ChatMessage::with_contents(
+        let tool_msg = Message::with_contents(
             agent_framework_core::types::Role::tool(),
             vec![Content::FunctionResult(
                 agent_framework_core::types::FunctionResultContent::new(
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(resp.text(), "Hello!");
         assert_eq!(resp.response_id.as_deref(), Some("resp_abc123"));
         // `store != Some(false)` defaults `conversation_id` to the response
-        // id, identical to `OpenAIResponsesClient`.
+        // id, identical to `OpenAIChatClient`.
         assert_eq!(resp.conversation_id.as_deref(), Some("resp_abc123"));
         assert_eq!(resp.usage_details.unwrap().total_token_count, Some(15));
     }

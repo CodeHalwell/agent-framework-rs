@@ -1,18 +1,18 @@
-//! [`OpenAIResponsesClient`]: a [`ChatClient`] for the OpenAI Responses API
+//! [`OpenAIChatClient`]: a [`ChatClient`] for the OpenAI Responses API
 //! (`POST /v1/responses`).
 //!
 //! The Responses API uses an item-based `input`/`output` shape rather than
 //! the `messages` array used by Chat Completions, and supports a dedicated
 //! `previous_response_id` for service-side conversation state. Wire framing
-//! (SSE parsing style, error handling) mirrors [`crate::OpenAIClient`].
+//! (SSE parsing style, error handling) mirrors [`crate::OpenAIChatCompletionClient`].
 //!
 //! ```no_run
-//! use agent_framework_openai::responses::OpenAIResponsesClient;
+//! use agent_framework_openai::responses::OpenAIChatClient;
 //! use agent_framework_core::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIResponsesClient::new("sk-...", "gpt-4o-mini");
-//! let agent = ChatAgent::builder(client)
+//! let client = OpenAIChatClient::new("sk-...", "gpt-4o-mini");
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;
@@ -29,10 +29,10 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, CitationAnnotation, Content,
-    DataContent, FinishReason, FunctionApprovalRequestContent, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, ResponseFormat, Role, TextContent,
-    TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
+    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
+    FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+    Message, ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode,
+    UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -45,7 +45,7 @@ use crate::{ByteStream, DEFAULT_BASE_URL};
 
 /// An OpenAI Responses API chat client (`POST /v1/responses`).
 #[derive(Clone)]
-pub struct OpenAIResponsesClient {
+pub struct OpenAIChatClient {
     inner: Arc<Inner>,
 }
 
@@ -58,9 +58,9 @@ struct Inner {
     organization: Option<String>,
 }
 
-impl std::fmt::Debug for OpenAIResponsesClient {
+impl std::fmt::Debug for OpenAIChatClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAIResponsesClient")
+        f.debug_struct("OpenAIChatClient")
             .field("base_url", &self.inner.base_url)
             .field("model", &self.inner.model)
             .field("organization", &self.inner.organization)
@@ -68,7 +68,7 @@ impl std::fmt::Debug for OpenAIResponsesClient {
     }
 }
 
-impl OpenAIResponsesClient {
+impl OpenAIChatClient {
     /// Create a client for the given API key and default model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -111,10 +111,10 @@ impl OpenAIResponsesClient {
         &self.inner.model
     }
 
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.model.clone());
         body.insert("model".into(), json!(model));
@@ -205,10 +205,10 @@ impl OpenAIResponsesClient {
 }
 
 #[async_trait::async_trait]
-impl ChatClient for OpenAIResponsesClient {
+impl ChatClient for OpenAIChatClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -225,7 +225,7 @@ impl ChatClient for OpenAIResponsesClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -233,7 +233,7 @@ impl ChatClient for OpenAIResponsesClient {
         Ok(parse_responses_sse_stream(resp, options.store).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
 }
@@ -249,9 +249,9 @@ impl ChatClient for OpenAIResponsesClient {
 /// [`messages_to_input`] when building the Azure OpenAI Responses request
 /// body, instead of reimplementing it.
 pub fn extract_instructions<'a>(
-    messages: &'a [ChatMessage],
+    messages: &'a [Message],
     options_instructions: Option<&str>,
-) -> (Option<String>, &'a [ChatMessage]) {
+) -> (Option<String>, &'a [Message]) {
     let mut parts = Vec::new();
     if let Some(instr) = options_instructions {
         if !instr.is_empty() {
@@ -280,7 +280,7 @@ pub fn extract_instructions<'a>(
 /// `pub` so `agent-framework-azure`'s Responses client can reuse this
 /// conversion verbatim rather than reimplementing it (Azure OpenAI's
 /// Responses API shares the exact same `input` item wire shape).
-pub fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         let role = msg.role.as_str();
@@ -483,6 +483,20 @@ pub fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             spec.insert("require_approval".into(), mcp_require_approval(tool));
             Value::Object(spec)
         }
+        ToolKind::HostedImageGeneration => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("image_generation"));
+            // Pass through any caller-supplied generation options (size,
+            // quality, background, …) carried on the marker's parameters.
+            if let Value::Object(params) = &tool.parameters {
+                for (k, v) in params {
+                    if k != "type" && k != "properties" {
+                        spec.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(spec)
+        }
         ToolKind::Function => json!({
             "type": "function",
             "name": tool.name,
@@ -621,7 +635,7 @@ pub fn response_failure_error(value: &Value) -> Option<Error> {
 pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 
@@ -632,7 +646,7 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
         }
     }
 
-    let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+    let mut message = Message::with_contents(Role::assistant(), contents);
     message.message_id = response.response_id.clone();
     response.messages.push(message);
 
@@ -818,11 +832,11 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
     }
 }
 
-/// Parse the `annotations` on an `output_text` part into [`CitationAnnotation`]s
+/// Parse the `annotations` on an `output_text` part into [`Annotation`]s
 /// (`_create_response_content:667-724`). The core annotation type has no free
 /// `additional_properties`, so upstream's `index`/`container_id` extras are
 /// dropped.
-fn parse_annotations(part: &Value) -> Option<Vec<CitationAnnotation>> {
+fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
     let arr = part.get("annotations").and_then(Value::as_array)?;
     let mut out = Vec::new();
     for ann in arr {
@@ -834,22 +848,22 @@ fn parse_annotations(part: &Value) -> Option<Vec<CitationAnnotation>> {
             }])
         };
         match ann.get("type").and_then(Value::as_str) {
-            Some("file_path") => out.push(CitationAnnotation {
+            Some("file_path") => out.push(Annotation {
                 file_id: str_field("file_id"),
                 ..Default::default()
             }),
-            Some("file_citation") => out.push(CitationAnnotation {
+            Some("file_citation") => out.push(Annotation {
                 url: str_field("filename"),
                 file_id: str_field("file_id"),
                 ..Default::default()
             }),
-            Some("url_citation") => out.push(CitationAnnotation {
+            Some("url_citation") => out.push(Annotation {
                 title: str_field("title"),
                 url: str_field("url"),
                 annotated_regions: regions(),
                 ..Default::default()
             }),
-            Some("container_file_citation") => out.push(CitationAnnotation {
+            Some("container_file_citation") => out.push(Annotation {
                 file_id: str_field("file_id"),
                 url: str_field("filename"),
                 annotated_regions: regions(),
@@ -900,7 +914,7 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
         total_token_count: usage.get("total_tokens").and_then(Value::as_u64),
-        additional_counts: Default::default(),
+        ..Default::default()
     };
     if let Some(cached) = usage
         .get("input_tokens_details")
@@ -910,6 +924,8 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         details
             .additional_counts
             .insert("openai.cached_input_tokens".into(), cached);
+        // Mirror upstream: also surface as the typed, cross-language field.
+        details.cache_read_input_token_count = Some(cached);
     }
     if let Some(reasoning) = usage
         .get("output_tokens_details")
@@ -919,6 +935,7 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         details
             .additional_counts
             .insert("openai.reasoning_tokens".into(), reasoning);
+        details.reasoning_output_token_count = Some(reasoning);
     }
     details
 }
@@ -1048,17 +1065,17 @@ fn parse_responses_event(
                 .and_then(|r| r.get("id"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            let model_id = resp
+            let model = resp
                 .and_then(|r| r.get("model"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            if response_id.is_none() && model_id.is_none() {
+            if response_id.is_none() && model.is_none() {
                 return EventOutcome::None;
             }
             EventOutcome::Update(ChatResponseUpdate {
                 role: Some(Role::assistant()),
                 response_id,
-                model_id,
+                model,
                 ..Default::default()
             })
         }
@@ -1141,7 +1158,7 @@ fn parse_responses_event(
                 .and_then(|r| r.get("id"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            let model_id = resp
+            let model = resp
                 .and_then(|r| r.get("model"))
                 .and_then(Value::as_str)
                 .map(String::from);
@@ -1161,7 +1178,7 @@ fn parse_responses_event(
                 contents,
                 role: Some(Role::assistant()),
                 response_id,
-                model_id,
+                model,
                 conversation_id,
                 finish_reason,
                 ..Default::default()
@@ -1208,12 +1225,12 @@ mod tests {
         FunctionApprovalResponseContent, FunctionResultContent, HostedFileContent,
     };
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
-    fn user_with(contents: Vec<Content>) -> ChatMessage {
-        ChatMessage::with_contents(Role::user(), contents)
+    fn user_with(contents: Vec<Content>) -> Message {
+        Message::with_contents(Role::user(), contents)
     }
 
     /// Parse a single Responses output item into its content list.
@@ -1223,8 +1240,8 @@ mod tests {
         contents
     }
 
-    fn client() -> OpenAIResponsesClient {
-        OpenAIResponsesClient::new("test-key", "gpt-4o-mini")
+    fn client() -> OpenAIChatClient {
+        OpenAIChatClient::new("test-key", "gpt-4o-mini")
     }
 
     // region: request body building
@@ -1249,7 +1266,7 @@ mod tests {
     #[test]
     fn build_body_extracts_leading_system_message_as_instructions() {
         let c = client();
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(body["instructions"], json!("Be terse."));
         assert_eq!(
@@ -1265,7 +1282,7 @@ mod tests {
     #[test]
     fn build_body_combines_options_instructions_and_system_message() {
         let c = client();
-        let messages = vec![ChatMessage::system("Also be nice."), user("Hi")];
+        let messages = vec![Message::system("Also be nice."), user("Hi")];
         let options = ChatOptions::new().with_instructions("Be terse.");
         let body = c.build_body(&messages, &options, false);
         assert_eq!(body["instructions"], json!("Be terse.\n\nAlso be nice."));
@@ -1274,7 +1291,7 @@ mod tests {
     #[test]
     fn build_body_assistant_text_uses_output_text_type() {
         let c = client();
-        let messages = vec![user("Hi"), ChatMessage::assistant("Hello!")];
+        let messages = vec![user("Hi"), Message::assistant("Hello!")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(
             body["input"][1],
@@ -1293,8 +1310,8 @@ mod tests {
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
         let assistant_msg =
-            ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
-        let tool_msg = ChatMessage::with_contents(
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+        let tool_msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 "call_1",
@@ -1537,7 +1554,7 @@ mod tests {
         // A reasoning content with no preserved raw item (e.g. from streaming
         // display) has no valid input form and must be dropped, not sent as a
         // bogus reasoning item lacking id/encrypted_content.
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::TextReasoning(TextReasoningContent {
                 text: "just display".into(),
@@ -1766,7 +1783,7 @@ mod tests {
             std::env::set_var("OPENAI_API_KEY", "sk-test-123");
             std::env::set_var("OPENAI_BASE_URL", "https://example.test/v1");
         }
-        let client = OpenAIResponsesClient::from_env("gpt-4o-mini").unwrap();
+        let client = OpenAIChatClient::from_env("gpt-4o-mini").unwrap();
         assert_eq!(client.inner.api_key, "sk-test-123");
         assert_eq!(client.inner.base_url, "https://example.test/v1");
         unsafe {
@@ -1783,7 +1800,7 @@ mod tests {
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("OPENAI_BASE_URL");
         }
-        let result = OpenAIResponsesClient::from_env("gpt-4o-mini");
+        let result = OpenAIChatClient::from_env("gpt-4o-mini");
         assert!(result.is_err());
     }
     #[test]
@@ -1895,7 +1912,7 @@ mod tests {
                 Some(FunctionArguments::Raw(r#"{"q":"x"}"#.into())),
             ),
         };
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionApprovalRequest(req)],
         );
@@ -2148,6 +2165,19 @@ mod tests {
         let spec = tool_to_responses_spec(&tool);
         assert_eq!(spec["vector_store_ids"], json!(["vs_1"]));
         assert_eq!(spec["max_num_results"], json!(12));
+    }
+
+    #[test]
+    fn image_generation_maps_to_responses_tool_with_passthrough_params() {
+        let tool = hosted(
+            ToolKind::HostedImageGeneration,
+            "image_generation",
+            json!({ "size": "1024x1024", "quality": "high" }),
+        );
+        let spec = tool_to_responses_spec(&tool);
+        assert_eq!(spec["type"], json!("image_generation"));
+        assert_eq!(spec["size"], json!("1024x1024"));
+        assert_eq!(spec["quality"], json!("high"));
     }
 
     #[test]

@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use agent_framework_core::error::Result;
-use agent_framework_core::middleware::{AgentRunContext, ChatContext, Middleware, Next};
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, ChatResponse, Role};
+use agent_framework_core::middleware::{AgentContext, ChatContext, Middleware, Next};
+use agent_framework_core::types::{AgentResponse, ChatResponse, Message, Role};
 
 use crate::auth::TokenProvider;
 use crate::client::PurviewClient;
@@ -46,7 +46,7 @@ impl PurviewPolicyCore {
     /// the call site), same as Python re-raising.
     async fn check(
         &self,
-        messages: &[ChatMessage],
+        messages: &[Message],
         provided_user_id: Option<&str>,
         phase: &'static str,
     ) -> Result<(bool, Option<String>)> {
@@ -72,19 +72,19 @@ impl PurviewPolicyCore {
         }
     }
 
-    fn blocked_prompt_message(&self) -> ChatMessage {
-        ChatMessage::new(Role::system(), self.settings.blocked_prompt_message.clone())
+    fn blocked_prompt_message(&self) -> Message {
+        Message::new(Role::system(), self.settings.blocked_prompt_message.clone())
     }
 
-    fn blocked_response_message(&self) -> ChatMessage {
-        ChatMessage::new(
+    fn blocked_response_message(&self) -> Message {
+        Message::new(
             Role::system(),
             self.settings.blocked_response_message.clone(),
         )
     }
 }
 
-/// Agent middleware enforcing Purview policy on both the outgoing prompt and
+/// SupportsAgentRun middleware enforcing Purview policy on both the outgoing prompt and
 /// the agent's response. Mirrors Python's `PurviewPolicyMiddleware`.
 ///
 /// - **Prompt (pre) check**: evaluates `ctx.messages`. If blocked,
@@ -115,7 +115,7 @@ impl PurviewPolicyCore {
 ///     ));
 /// let middleware = PurviewAgentMiddleware::new(StaticTokenProvider::new("<graph-bearer-token>"), settings);
 ///
-/// let agent = ChatAgent::builder(client)
+/// let agent = Agent::builder(client)
 ///     .instructions("You are a helpful assistant.")
 ///     .middleware(Arc::new(middleware))
 ///     .build();
@@ -131,15 +131,15 @@ impl PurviewAgentMiddleware {
 }
 
 #[async_trait]
-impl Middleware<AgentRunContext> for PurviewAgentMiddleware {
+impl Middleware<AgentContext> for PurviewAgentMiddleware {
     async fn process(
         &self,
-        mut ctx: AgentRunContext,
-        next: Next<AgentRunContext>,
-    ) -> Result<AgentRunContext> {
+        mut ctx: AgentContext,
+        next: Next<AgentContext>,
+    ) -> Result<AgentContext> {
         let (should_block, resolved_user_id) = self.0.check(&ctx.messages, None, "prompt").await?;
         if should_block {
-            ctx.result = Some(AgentRunResponse {
+            ctx.result = Some(AgentResponse {
                 messages: vec![self.0.blocked_prompt_message()],
                 ..Default::default()
             });
@@ -157,7 +157,7 @@ impl Middleware<AgentRunContext> for PurviewAgentMiddleware {
                     .check(&messages, resolved_user_id.as_deref(), "response")
                     .await?;
                 if should_block {
-                    ctx.result = Some(AgentRunResponse {
+                    ctx.result = Some(AgentResponse {
                         messages: vec![self.0.blocked_response_message()],
                         ..Default::default()
                     });
@@ -242,7 +242,7 @@ mod tests {
     // `PurviewAgentMiddleware`/`PurviewChatMiddleware::process`'s
     // short-circuit and error-propagation logic hermetically, using a "mock
     // next" continuation built from `agent-framework-core`'s own
-    // `MiddlewarePipeline`/`Terminal` — the same machinery `ChatAgent` uses
+    // `MiddlewarePipeline`/`Terminal` — the same machinery `Agent` uses
     // internally — per this work package's "core test patterns" note. The
     // happy-path HTTP call itself (an actual `processContent` round trip) is
     // covered by `tests/loopback.rs`.
@@ -255,16 +255,16 @@ mod tests {
         PurviewChatMiddleware::new(StaticTokenProvider::new("token"), settings)
     }
 
-    fn agent_terminal(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentRunContext> {
-        Box::new(move |mut ctx: AgentRunContext| {
+    fn agent_terminal(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentContext> {
+        Box::new(move |mut ctx: AgentContext| {
             called.store(true, Ordering::SeqCst);
             Box::pin(async move {
-                ctx.result = Some(AgentRunResponse {
-                    messages: vec![ChatMessage::assistant(text)],
+                ctx.result = Some(AgentResponse {
+                    messages: vec![Message::assistant(text)],
                     ..Default::default()
                 });
                 Ok(ctx)
-            }) as BoxFuture<Result<AgentRunContext>>
+            }) as BoxFuture<Result<AgentContext>>
         })
     }
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// `Result::unwrap_err` requires the `Ok` type to implement `Debug`,
-    /// which `AgentRunContext`/`ChatContext` deliberately don't (they carry
+    /// which `AgentContext`/`ChatContext` deliberately don't (they carry
     /// non-`Debug` middleware/result trait objects). Same shape, without
     /// that bound.
     fn expect_err<T>(result: Result<T>) -> agent_framework_core::error::Error {
@@ -297,7 +297,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![Message::user("hi")], false);
 
         let err = expect_err(
             pipeline
@@ -317,7 +317,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![Message::user("hi")], false);
 
         let result_ctx = pipeline
             .execute(ctx, agent_terminal(called.clone(), "real response"))
@@ -343,8 +343,8 @@ mod tests {
         let middleware = agent_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
+        let ctx = AgentContext::new(
+            vec![Message::user("hello, nothing identifying here")],
             false,
         );
 
@@ -364,10 +364,7 @@ mod tests {
         let middleware = agent_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
-            true,
-        );
+        let ctx = AgentContext::new(vec![Message::user("hello, nothing identifying here")], true);
 
         let result_ctx = pipeline
             .execute(ctx, agent_terminal(called.clone(), "streamed response"))
@@ -383,7 +380,7 @@ mod tests {
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = ChatContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
+            vec![Message::user("hello, nothing identifying here")],
             agent_framework_core::types::ChatOptions::new(),
             false,
         );
@@ -404,7 +401,7 @@ mod tests {
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = ChatContext::new(
-            vec![ChatMessage::user("hi")],
+            vec![Message::user("hi")],
             agent_framework_core::types::ChatOptions::new(),
             false,
         );

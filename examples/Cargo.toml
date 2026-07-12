@@ -102,6 +102,34 @@ name = "anthropic"
 path = "providers/anthropic.rs"
 
 [[example]]
+name = "ollama"
+path = "providers/ollama.rs"
+
+[[example]]
+name = "gemini"
+path = "providers/gemini.rs"
+
+[[example]]
+name = "mistral"
+path = "providers/mistral.rs"
+
+[[example]]
+name = "foundry_local"
+path = "providers/foundry_local.rs"
+
+[[example]]
+name = "bedrock"
+path = "providers/bedrock.rs"
+
+[[example]]
+name = "github_copilot"
+path = "providers/github_copilot.rs"
+
+[[example]]
+name = "anthropic_multicloud"
+path = "providers/anthropic_multicloud.rs"
+
+[[example]]
 name = "azure_openai"
 path = "providers/azure_openai.rs"
 
@@ -112,10 +140,6 @@ path = "providers/azure_foundry_agent.rs"
 [[example]]
 name = "copilotstudio_agent"
 path = "providers/copilotstudio_agent.rs"
-
-[[example]]
-name = "openai_assistants"
-path = "providers/openai_assistants.rs"
 
 [[example]]
 name = "anthropic_hosted_tools"

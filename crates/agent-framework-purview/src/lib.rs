@@ -57,7 +57,7 @@
 //!   error (itself subject to [`PurviewSettings::ignore_exceptions`], same
 //!   as any other evaluation failure).
 //! - **User id resolution from messages is still ported.** The *other* half
-//!   of Python's user-id resolution — scanning `ChatMessage::additional_properties["user_id"]`,
+//!   of Python's user-id resolution — scanning `Message::additional_properties["user_id"]`,
 //!   falling back to a GUID-shaped `author_name` — has nothing to do with
 //!   the bearer token and is faithfully ported; see
 //!   [`processor::resolve_user_id`].
@@ -111,15 +111,15 @@
 //! let token_provider = StaticTokenProvider::new("<graph-bearer-token>");
 //! let middleware = PurviewAgentMiddleware::new(token_provider, settings);
 //!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
 //!     .middleware(Arc::new(middleware))
 //!     .build();
 //!
-//! // A `ChatMessage` needs a GUID-shaped `additional_properties["user_id"]`
+//! // A `Message` needs a GUID-shaped `additional_properties["user_id"]`
 //! // (or `author_name`) for policy evaluation to run at all -- see the
 //! // crate docs' "Scope" section.
-//! let mut message = ChatMessage::user("Summarize this quarter's roadmap.");
+//! let mut message = Message::user("Summarize this quarter's roadmap.");
 //! message
 //!     .additional_properties
 //!     .insert("user_id".into(), serde_json::json!("00000000-0000-0000-0000-0000000000aa"));

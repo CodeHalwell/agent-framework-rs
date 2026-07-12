@@ -1,4 +1,4 @@
-//! Agents: the [`Agent`] trait and the concrete [`ChatAgent`].
+//! Agents: the [`SupportsAgentRun`] trait and the concrete [`Agent`].
 //!
 //! Rust equivalent of `agent_framework._agents`.
 
@@ -11,21 +11,23 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
+use crate::compaction::{CompactionProvider, CompactionStrategy};
 use crate::error::{Error, Result};
-use crate::memory::{AggregateContextProvider, ContextProvider};
-use crate::middleware::{AgentRunContext, ChatContext, MiddlewarePipeline, Terminal};
-use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
-use crate::tools::{AiFunction, ToolDefinition, ToolSource};
+use crate::history::ensure_history_provider;
+use crate::memory::{ContextProvider, SessionContext};
+use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
+use crate::session::AgentSession;
+use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
 use crate::types::{
-    prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
-    ChatResponse, IntoMessages, ResponseFormat,
+    prepare_messages, AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, IntoMessages,
+    Message, ResponseFormat,
 };
 
 /// A boxed stream of agent run updates.
-pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentRunResponseUpdate>> + Send>>;
+pub type AgentRunStream = Pin<Box<dyn Stream<Item = Result<AgentResponseUpdate>> + Send>>;
 
-/// Per-run option overrides for a single [`Agent::run_with_options`] /
-/// [`Agent::run_stream`] call, merged over the agent's build-time defaults.
+/// Per-run option overrides for a single [`SupportsAgentRun::run_with_options`] /
+/// [`SupportsAgentRun::run_stream`] call, merged over the agent's build-time defaults.
 ///
 /// Mirrors upstream `run`/`run_stream` per-call keyword arguments and .NET
 /// `AgentRunOptions`: the per-run [`ChatOptions`] take precedence over the
@@ -71,7 +73,7 @@ impl AgentRunOptions {
     }
 
     /// Whether these options carry no overrides at all. Used by the default
-    /// [`Agent::run_with_options`] to decide whether to warn about ignoring
+    /// [`SupportsAgentRun::run_with_options`] to decide whether to warn about ignoring
     /// options it cannot honor.
     pub fn is_empty(&self) -> bool {
         self.chat_options.is_none() && self.additional_tools.is_empty()
@@ -80,19 +82,17 @@ impl AgentRunOptions {
 
 /// Map a completed run into buffered agent updates — one update per message,
 /// each with a distinct `message_id` so that re-aggregation via
-/// [`AgentRunResponse::from_updates`] keeps the message boundaries. Shared by
-/// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path
+/// [`AgentResponse::from_updates`] keeps the message boundaries. Shared by
+/// the default [`SupportsAgentRun::run_stream`] and [`Agent`]'s middleware-path
 /// replay.
 ///
 /// Response-level metadata survives the replay: `response_id` and
 /// `conversation_id` ride on every update, and `usage_details` rides the
 /// final update as a [`Content::Usage`] item (aggregation folds it back into
-/// [`AgentRunResponse::usage_details`], never into message contents) — the
+/// [`AgentResponse::usage_details`], never into message contents) — the
 /// same contract as the tool-loop replay in `FunctionInvokingChatClient`.
-pub(crate) fn response_to_updates(
-    response: AgentRunResponse,
-) -> Vec<Result<AgentRunResponseUpdate>> {
-    let AgentRunResponse {
+pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentResponseUpdate>> {
+    let AgentResponse {
         messages,
         response_id,
         conversation_id,
@@ -103,7 +103,7 @@ pub(crate) fn response_to_updates(
     // Keep provider message ids only when all present and distinct; otherwise
     // positional ids for every message. A service (e.g. Assistants) can reuse
     // one run id across the tool-call and final assistant messages, and
-    // `AgentRunResponse::from_updates` keys by id — a duplicate would merge
+    // `AgentResponse::from_updates` keys by id — a duplicate would merge
     // the final answer into the tool-call message, so streamed and
     // non-streamed responses would differ.
     let keep_provider_ids = {
@@ -114,7 +114,7 @@ pub(crate) fn response_to_updates(
                 .is_some_and(|id| !id.is_empty() && seen.insert(id.as_str()))
         })
     };
-    let mut updates: Vec<Result<AgentRunResponseUpdate>> = messages
+    let mut updates: Vec<Result<AgentResponseUpdate>> = messages
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
@@ -131,7 +131,7 @@ pub(crate) fn response_to_updates(
                     }));
                 }
             }
-            Ok(AgentRunResponseUpdate {
+            Ok(AgentResponseUpdate {
                 contents,
                 role: Some(m.role),
                 author_name: m.author_name,
@@ -150,7 +150,7 @@ pub(crate) fn response_to_updates(
                 })]
             })
             .unwrap_or_default();
-        updates.push(Ok(AgentRunResponseUpdate {
+        updates.push(Ok(AgentResponseUpdate {
             contents,
             role: Some(crate::types::Role::assistant()),
             response_id,
@@ -160,13 +160,6 @@ pub(crate) fn response_to_updates(
     }
     updates
 }
-
-/// A factory that builds a fresh [`ChatMessageStore`] for each new local
-/// thread, mirroring Python's `chat_message_store_factory`
-/// (`_agents.py:1088-1092`). Configured via
-/// [`ChatAgentBuilder::chat_message_store_factory`] and used by
-/// [`ChatAgent::get_new_thread`] / [`ChatAgent::deserialize_thread`].
-pub type ChatMessageStoreFactory = Arc<dyn Fn() -> Arc<dyn ChatMessageStore> + Send + Sync>;
 
 /// Sanitize an agent name into a valid tool/function identifier, mirroring
 /// Python's `_sanitize_agent_name` (`_agents.py:53-87`).
@@ -214,56 +207,57 @@ fn sanitize_agent_name(agent_name: Option<&str>) -> Option<String> {
 
 /// The common interface implemented by all agents.
 #[async_trait]
-pub trait Agent: Send + Sync {
+pub trait SupportsAgentRun: Send + Sync {
     /// Run the agent to completion.
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse>;
+        messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse>;
 
     /// Run the agent to completion, applying per-run [`AgentRunOptions`] over
     /// the agent's build-time defaults.
     ///
     /// The default implementation ignores `options` and delegates to
-    /// [`Agent::run`], emitting a `tracing::warn!` when non-empty options are
+    /// [`SupportsAgentRun::run`], emitting a `tracing::warn!` when non-empty options are
     /// supplied — mirroring upstream agents that silently drop kwargs they do
     /// not understand. Agents that support per-run overrides (notably
-    /// [`ChatAgent`]) override this.
+    /// [`Agent`]) override this.
     async fn run_with_options(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<&mut AgentThread>,
+        messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
         options: AgentRunOptions,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         if !options.is_empty() {
             tracing::warn!(
                 agent = %self.id(),
                 "agent does not support per-run options; ignoring them"
             );
         }
-        self.run(messages, thread).await
+        self.run(messages, session).await
     }
 
-    /// Run the agent and stream incremental [`AgentRunResponseUpdate`]s.
+    /// Run the agent and stream incremental [`AgentResponseUpdate`]s.
     ///
     /// The default implementation is a **buffered fallback**: it runs to
-    /// completion via [`Agent::run_with_options`] and yields the response's
+    /// completion via [`SupportsAgentRun::run_with_options`] and yields the response's
     /// messages as updates. Agents with a real streaming backend (notably
-    /// [`ChatAgent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
+    /// [`Agent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
     /// A2A client agent) override this to stream incrementally.
     ///
-    /// `thread` is taken **by value**: the returned stream owns it and writes
-    /// the conversation back once the stream is fully consumed. When the
-    /// thread's message store is shared (as [`ChatAgent`]'s is, via `Arc`), the
-    /// write-back is observable through a clone taken before streaming.
+    /// `session` is taken **by value**: the returned stream owns it and
+    /// drives its context providers (including any history provider) once
+    /// the stream is fully consumed. When a provider's storage is shared (as
+    /// [`InMemoryHistoryProvider`]'s is, via `Arc`), the write-back is
+    /// observable through a clone taken before streaming.
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<AgentThread>,
+        messages: Vec<Message>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        let mut owned = thread;
+        let mut owned = session;
         let response = self
             .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
             .await?;
@@ -285,9 +279,9 @@ pub trait Agent: Send + Sync {
             .unwrap_or_else(|| self.id().to_string())
     }
 
-    /// A fresh thread for a new conversation.
-    fn get_new_thread(&self) -> AgentThread {
-        AgentThread::new()
+    /// A fresh session for a new conversation.
+    fn create_session(&self) -> AgentSession {
+        AgentSession::new()
     }
 }
 
@@ -295,29 +289,26 @@ pub trait Agent: Send + Sync {
 /// options, tools, context providers, and middleware.
 ///
 /// Cheaply cloneable (the client, context providers, and middleware are shared
-/// via `Arc`), which is what makes [`ChatAgent::as_tool`] possible.
+/// via `Arc`), which is what makes [`Agent::as_tool`] possible.
 #[derive(Clone)]
-pub struct ChatAgent {
+pub struct Agent {
     id: String,
     name: Option<String>,
     description: Option<String>,
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
-    context_provider: Option<Arc<AggregateContextProvider>>,
-    /// Factory for a new local thread's message store. When unset,
-    /// [`InMemoryChatMessageStore`] is used.
-    chat_message_store_factory: Option<ChatMessageStoreFactory>,
-    agent_middleware: MiddlewarePipeline<AgentRunContext>,
+    context_providers: Vec<Arc<dyn ContextProvider>>,
+    agent_middleware: MiddlewarePipeline<AgentContext>,
     /// Middleware run around the underlying chat-client call (mirrors
-    /// Python's `use_chat_middleware`). See [`ChatAgent::call_chat_client`].
+    /// Python's `use_chat_middleware`). See [`Agent::call_chat_client`].
     chat_middleware: MiddlewarePipeline<ChatContext>,
     /// Dynamic tool sources (e.g. MCP servers), resolved fresh on every run
     /// and appended after the agent's static/context/per-run tools. See
-    /// [`ToolSource`] and [`ChatAgent::prepare_request`].
+    /// [`ToolSource`] and [`Agent::prepare_request`].
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
-/// Options for [`ChatAgent::as_tool`].
+/// Options for [`Agent::as_tool`].
 #[derive(Debug, Clone, Default)]
 pub struct AsToolOptions {
     /// The tool name. Defaults to the agent's name (else its id).
@@ -356,11 +347,11 @@ impl AsToolOptions {
     }
 }
 
-impl ChatAgent {
+impl Agent {
     /// Start building an agent from a chat client. The client is automatically
     /// wrapped with [`FunctionInvokingChatClient`] so local tools are executed.
-    pub fn builder(client: impl ChatClient + 'static) -> ChatAgentBuilder {
-        ChatAgentBuilder::new(client)
+    pub fn builder(client: impl ChatClient + 'static) -> AgentBuilder {
+        AgentBuilder::new(client)
     }
 
     /// The agent's default instructions.
@@ -369,45 +360,46 @@ impl ChatAgent {
     }
 
     /// Run and stream incremental updates — an ergonomic wrapper over the
-    /// object-safe [`Agent::run_stream`] trait method (the real streaming
+    /// object-safe [`SupportsAgentRun::run_stream`] trait method (the real streaming
     /// implementation), accepting `impl IntoMessages`.
     ///
-    /// The thread's history is updated when the stream completes; because
-    /// message stores are shared via `Arc`, updates are visible on the original
-    /// thread once the returned stream is fully consumed. Pass per-run
-    /// [`AgentRunOptions`] to override the agent's defaults for this call only.
+    /// The session's context providers (including any history provider) are
+    /// driven when the stream completes; because provider storage is shared
+    /// via `Arc`, updates are visible on the original session once the
+    /// returned stream is fully consumed. Pass per-run [`AgentRunOptions`] to
+    /// override the agent's defaults for this call only.
     pub async fn run_stream(
         &self,
         messages: impl IntoMessages,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        Agent::run_stream(self, messages.into_messages(), thread, options).await
+        SupportsAgentRun::run_stream(self, messages.into_messages(), session, options).await
     }
 
-    /// Ergonomic streaming run with a fresh thread and no per-run options
-    /// (mirrors [`ChatAgent::run_once`]).
+    /// Ergonomic streaming run with a fresh session and no per-run options
+    /// (mirrors [`Agent::run_once`]).
     pub async fn run_stream_once(&self, messages: impl IntoMessages) -> Result<AgentRunStream> {
-        Agent::run_stream(self, messages.into_messages(), None, None).await
+        SupportsAgentRun::run_stream(self, messages.into_messages(), None, None).await
     }
 
-    /// Ergonomic run without an explicit thread.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+    /// Ergonomic run without an explicit session.
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
 
-    /// The real streaming implementation, shared by the [`Agent::run_stream`]
+    /// The real streaming implementation, shared by the [`SupportsAgentRun::run_stream`]
     /// trait impl. Kept as an inherent helper so the trait method stays a thin
     /// forwarder.
     async fn run_stream_impl(
         &self,
-        input: Vec<ChatMessage>,
-        thread: Option<AgentThread>,
+        input: Vec<Message>,
+        session: Option<AgentSession>,
         run_options: AgentRunOptions,
     ) -> Result<AgentRunStream> {
-        let mut thread = thread.unwrap_or_else(|| self.get_new_thread());
+        let mut session = session.unwrap_or_else(|| self.create_session());
         let (final_messages, options) = self
-            .prepare_request(&input, &mut thread, &run_options)
+            .prepare_request(&input, &mut session, &run_options)
             .await?;
 
         // When agent middleware is configured, route the run through the same
@@ -418,18 +410,15 @@ impl ChatAgent {
             let response = match self.run_core(final_messages, options, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    if let Some(cp) = self.resolve_provider(&thread) {
-                        let _ = cp.invoked(&input, &[], Some(&e)).await;
+                    for cp in self.combined_providers(&session) {
+                        let _ = cp.after_run(&input, &[], Some(&e)).await;
                     }
                     return Err(e);
                 }
             };
-            self.update_thread_conversation_id(&mut thread, response.conversation_id.as_deref())
-                .await?;
-            thread.on_new_messages(input.clone()).await?;
-            thread.on_new_messages(response.messages.clone()).await?;
-            if let Some(cp) = self.resolve_provider(&thread) {
-                cp.invoked(&input, &response.messages, None).await?;
+            self.update_session_conversation_id(&mut session, response.conversation_id.as_deref())?;
+            for cp in self.combined_providers(&session) {
+                cp.after_run(&input, &response.messages, None).await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
             // response's conversation/response ids and usage ride along so
@@ -444,7 +433,7 @@ impl ChatAgent {
         // the stream's terminal aggregation can auto-populate `value` (task 3).
         let response_format = options.response_format.clone();
         let agent_name = self.name.clone();
-        let provider = self.resolve_provider(&thread);
+        let providers = self.combined_providers(&session);
         let inner = match self
             .client
             .get_streaming_response(final_messages, options)
@@ -453,36 +442,39 @@ impl ChatAgent {
             Ok(s) => s,
             Err(e) => {
                 // Failure before the stream opens: let providers observe it.
-                if let Some(cp) = &provider {
-                    let _ = cp.invoked(&input, &[], Some(&e)).await;
+                for cp in &providers {
+                    let _ = cp.after_run(&input, &[], Some(&e)).await;
                 }
                 return Err(e);
             }
         };
 
-        // Wrap the inner stream: forward mapped updates, then update the thread.
-        let stream =
-            async_stream_forward(inner, agent_name, thread, input, provider, response_format);
+        // Wrap the inner stream: forward mapped updates, then update the session.
+        let stream = async_stream_forward(
+            inner,
+            agent_name,
+            session,
+            input,
+            providers,
+            response_format,
+        );
         Ok(stream.boxed())
     }
 
     /// Assemble the final message list and options for a request, applying
-    /// thread history and context providers.
+    /// context providers (including history) over the session.
     async fn prepare_request(
         &self,
-        input: &[ChatMessage],
-        thread: &mut AgentThread,
+        input: &[Message],
+        session: &mut AgentSession,
         run_options: &AgentRunOptions,
-    ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
-        // Fire the context-provider `thread_created` hook when a run uses a
-        // service-managed thread (mirrors `_agents.py:1264-1265`). The id
-        // argument is the service thread id.
-        let service_thread_id = thread.service_thread_id().map(str::to_string);
-        if let Some(id) = &service_thread_id {
-            if let Some(cp) = self.resolve_provider(thread) {
-                cp.thread_created(Some(id)).await?;
-            }
-        }
+    ) -> Result<(Vec<Message>, ChatOptions)> {
+        // Auto-attach a fresh `InMemoryHistoryProvider` to a non-service-managed
+        // session that doesn't already carry a history provider, so local
+        // multi-turn conversations keep accumulating history the way the old
+        // `AgentThread` message store used to.
+        ensure_history_provider(session);
+        let service_session_id = session.service_session_id().map(str::to_string);
 
         // Merge per-run chat-option overrides over the agent's defaults, with
         // the per-run side winning (mirrors Python's `run_chat_options &
@@ -492,36 +484,42 @@ impl ChatAgent {
             Some(overrides) => self.chat_options.clone().merge(overrides.clone()),
             None => self.chat_options.clone(),
         };
-        // A service-managed thread's id drives continuity and wins; on a
-        // local thread, a per-run / agent-default `conversation_id` override
+        // A service-managed session's id drives continuity and wins; on a
+        // local session, a per-run / agent-default `conversation_id` override
         // survives (previously it was unconditionally cleared here, silently
         // starting a new service conversation despite the documented per-run
         // precedence).
-        options.conversation_id = service_thread_id.or(options.conversation_id.take());
-
-        let mut history = thread.list_messages().await?;
-
-        // Context provider injection.
-        let provider = thread
-            .context_provider
+        options.conversation_id = service_session_id
             .clone()
-            .or_else(|| self.context_provider.clone());
-        if let Some(cp) = provider {
-            let ctx = cp.invoking(input).await?;
-            if let Some(instr) = ctx.instructions {
-                options.instructions = Some(match options.instructions.take() {
-                    Some(base) => format!("{base}\n{instr}"),
-                    None => instr,
-                });
-            }
-            history.extend(ctx.messages);
-            // Deduplicate by name: a tool may be defined on the agent and also
-            // injected by a context provider. Providers rejecting duplicate
-            // tool names would otherwise fail the request.
-            for t in ctx.tools {
-                if !options.tools.iter().any(|existing| existing.name == t.name) {
-                    options.tools.push(t);
-                }
+            .or(options.conversation_id.take());
+
+        // Context provider injection: run every provider's `before_run` over a
+        // shared `SessionContext`, then fold the result into the request
+        // (provider instructions AFTER the agent's own; provider messages —
+        // including, via the auto-attached/explicit `HistoryProvider`, thread
+        // history — PREPENDED ahead of the run's own input; provider tools
+        // appended, deduplicated by name).
+        let providers = self.combined_providers(session);
+        let mut ctx = SessionContext::new(input.to_vec());
+        ctx.session_id = Some(session.session_id().to_string());
+        ctx.service_session_id = service_session_id.clone();
+        for provider in &providers {
+            provider.before_run(&mut ctx).await?;
+        }
+        if let Some(instr) = ctx.instructions {
+            options.instructions = Some(match options.instructions.take() {
+                Some(base) => format!("{base}\n{instr}"),
+                None => instr,
+            });
+        }
+        let mut history = ctx.messages;
+
+        // Deduplicate by name: a tool may be defined on the agent and also
+        // injected by a context provider. Providers rejecting duplicate
+        // tool names would otherwise fail the request.
+        for t in ctx.tools {
+            if !options.tools.iter().any(|existing| existing.name == t.name) {
+                options.tools.push(t);
             }
         }
 
@@ -573,10 +571,10 @@ impl ChatAgent {
     /// the chat-client decorator level (see [`crate::observability`]).
     async fn run_core(
         &self,
-        final_messages: Vec<ChatMessage>,
+        final_messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let span = crate::observability::agent_span(
             self.name.as_deref().unwrap_or(self.id.as_str()),
             &self.id,
@@ -609,13 +607,13 @@ impl ChatAgent {
 
     async fn run_core_inner(
         &self,
-        final_messages: Vec<ChatMessage>,
+        final_messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
-    ) -> Result<AgentRunResponse> {
+    ) -> Result<AgentResponse> {
         let client = self.client.clone();
         let chat_middleware = self.chat_middleware.clone();
-        let terminal: Terminal<AgentRunContext> = Box::new(move |mut ctx: AgentRunContext| {
+        let terminal: Terminal<AgentContext> = Box::new(move |mut ctx: AgentContext| {
             let client = client.clone();
             let options = options.clone();
             let chat_middleware = chat_middleware.clone();
@@ -631,12 +629,12 @@ impl ChatAgent {
                     ctx.is_streaming,
                 )
                 .await?;
-                ctx.result = Some(AgentRunResponse::from_chat_response(response));
+                ctx.result = Some(AgentResponse::from_chat_response(response));
                 Ok(ctx)
-            }) as crate::tools::BoxFuture<Result<AgentRunContext>>
+            }) as crate::tools::BoxFuture<Result<AgentContext>>
         });
 
-        let ctx = AgentRunContext::new(final_messages, is_streaming);
+        let ctx = AgentContext::new(final_messages, is_streaming);
         let ctx = self.agent_middleware.execute(ctx, terminal).await?;
         let mut response = ctx.result.ok_or_else(|| {
             crate::error::Error::AgentExecution("agent produced no result".into())
@@ -664,7 +662,7 @@ impl ChatAgent {
     async fn call_chat_client(
         client: &Arc<dyn ChatClient>,
         chat_middleware: &MiddlewarePipeline<ChatContext>,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
     ) -> Result<ChatResponse> {
@@ -695,7 +693,7 @@ impl ChatAgent {
     /// Apply chat middleware to a *streaming* call's `messages`/`chat_options`
     /// before the real network call.
     ///
-    /// Unlike [`ChatAgent::call_chat_client`], this only honors *pre-call*
+    /// Unlike [`Agent::call_chat_client`], this only honors *pre-call*
     /// mutation: a real token stream can't flow back through
     /// [`ChatContext::result`] (typed for a complete [`ChatResponse`]), so any
     /// middleware logic placed *after* `next.run(...)` observes
@@ -705,15 +703,15 @@ impl ChatAgent {
     /// path likewise hands middleware an unconsumed async generator rather
     /// than driving it through the pipeline. Full interception (including
     /// short-circuiting) for chat middleware is available via
-    /// [`ChatAgent::run`]/[`ChatAgent::run_once`], and via `run_stream` too
+    /// [`Agent::run`]/[`Agent::run_once`], and via `run_stream` too
     /// when at least one agent middleware is also configured (that path
-    /// funnels through [`ChatAgent::run_core`] and replays the result as
+    /// funnels through [`Agent::run_core`] and replays the result as
     /// updates).
     async fn apply_chat_middleware_pre_call(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
-    ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
+    ) -> Result<(Vec<Message>, ChatOptions)> {
         if self.chat_middleware.is_empty() {
             return Ok((messages, options));
         }
@@ -728,41 +726,33 @@ impl ChatAgent {
         !self.agent_middleware.is_empty()
     }
 
-    /// The effective context provider for a run: the thread's, else the agent's.
-    fn resolve_provider(&self, thread: &AgentThread) -> Option<Arc<AggregateContextProvider>> {
-        thread
-            .context_provider
-            .clone()
-            .or_else(|| self.context_provider.clone())
+    /// The effective context providers for a run: the session's, combined
+    /// with the agent's own. There is no aggregate wrapper any more — callers
+    /// iterate this list directly.
+    fn combined_providers(&self, session: &AgentSession) -> Vec<Arc<dyn ContextProvider>> {
+        let mut providers = session.context_providers.clone();
+        providers.extend(self.context_providers.iter().cloned());
+        providers
     }
 
-    /// Build a fresh message store from the configured factory, or an
-    /// [`InMemoryChatMessageStore`] when none is set.
-    fn new_message_store(&self) -> Arc<dyn ChatMessageStore> {
-        match &self.chat_message_store_factory {
-            Some(factory) => factory(),
-            None => Arc::new(InMemoryChatMessageStore::new()),
-        }
-    }
-
-    /// Reconcile a run's conversation id with the thread, mirroring Python's
+    /// Reconcile a run's conversation id with the session, mirroring Python's
     /// `_update_thread_with_type_and_conversation_id` (`_agents.py:1204-1234`).
     ///
-    /// * No id returned while the thread *is* service-managed → the service
-    ///   doesn't support service-managed threads for this request, so surface
+    /// * No id returned while the session *is* service-managed → the service
+    ///   doesn't support service-managed sessions for this request, so surface
     ///   an [`Error::AgentExecution`] (matches Python raising
     ///   `AgentExecutionException`, GAP item 14).
-    /// * An id returned that the thread newly adopts → fire the
-    ///   `thread_created` context-provider hook with the adopted id (task 1,
-    ///   `_agents.py:1228-1229`).
-    async fn update_thread_conversation_id(
+    /// * An id returned that the session newly adopts is simply recorded on
+    ///   the session; there is no `thread_created` hook any more (upstream
+    ///   removed it — see [`crate::memory::ContextProvider`]).
+    fn update_session_conversation_id(
         &self,
-        thread: &mut AgentThread,
+        session: &mut AgentSession,
         response_conversation_id: Option<&str>,
     ) -> Result<()> {
         match response_conversation_id {
             None => {
-                if thread.service_thread_id().is_some() {
+                if session.service_session_id().is_some() {
                     return Err(Error::AgentExecution(
                         "Service did not return a valid conversation id when using a service \
                          managed thread."
@@ -772,11 +762,7 @@ impl ChatAgent {
                 Ok(())
             }
             Some(cid) => {
-                if thread.try_adopt_service_thread_id(cid).await? {
-                    if let Some(cp) = self.resolve_provider(thread) {
-                        cp.thread_created(Some(cid)).await?;
-                    }
-                }
+                session.try_adopt_service_session_id(cid);
                 Ok(())
             }
         }
@@ -785,22 +771,22 @@ impl ChatAgent {
 
 /// State carried while forwarding a chat stream as agent updates.
 type ForwardFinish = Option<(
-    AgentThread,
-    Vec<ChatMessage>,
-    Option<Arc<AggregateContextProvider>>,
+    AgentSession,
+    Vec<Message>,
+    Vec<Arc<dyn ContextProvider>>,
     Option<ResponseFormat>,
 )>;
 
-/// Forward an inner chat stream as agent updates and update the thread on end.
+/// Forward an inner chat stream as agent updates and update the session on end.
 fn async_stream_forward(
     inner: crate::client::ChatStream,
     agent_name: Option<String>,
-    thread: AgentThread,
-    input: Vec<ChatMessage>,
-    provider: Option<Arc<AggregateContextProvider>>,
+    session: AgentSession,
+    input: Vec<Message>,
+    providers: Vec<Arc<dyn ContextProvider>>,
     response_format: Option<ResponseFormat>,
-) -> impl Stream<Item = Result<AgentRunResponseUpdate>> + Send {
-    let finish: ForwardFinish = Some((thread, input, provider, response_format));
+) -> impl Stream<Item = Result<AgentResponseUpdate>> + Send {
+    let finish: ForwardFinish = Some((session, input, providers, response_format));
     futures::stream::unfold(
         (
             inner,
@@ -817,7 +803,7 @@ fn async_stream_forward(
                 match inner.next().await {
                     Some(Ok(update)) => {
                         collected.push(update.clone());
-                        let mut au = AgentRunResponseUpdate::from_chat_update(&update);
+                        let mut au = AgentResponseUpdate::from_chat_update(&update);
                         if au.author_name.is_none() {
                             au.author_name = agent_name.clone();
                         }
@@ -825,19 +811,22 @@ fn async_stream_forward(
                     }
                     Some(Err(e)) => {
                         // Failure mid-stream: let context providers observe the
-                        // error (task 2) before surfacing it. The stream error
-                        // takes precedence, so the hook result is discarded.
-                        if let Some((_thread, input, Some(cp), _rf)) = finish.take() {
-                            let _ = cp.invoked(&input, &[], Some(&e)).await;
+                        // error before surfacing it. The stream error takes
+                        // precedence, so the hooks' results are discarded.
+                        if let Some((_session, input, providers, _rf)) = finish.take() {
+                            for cp in &providers {
+                                let _ = cp.after_run(&input, &[], Some(&e)).await;
+                            }
                         }
                         Some((Err(e), (inner, collected, true, None)))
                     }
                     None => {
-                        // Stream finished: reconcile the conversation id, update
-                        // the thread history, and fire the completion hook.
-                        // Surface any failure as the final item rather than
-                        // dropping it.
-                        if let Some((mut thread, input, provider, response_format)) = finish.take()
+                        // Stream finished: reconcile the conversation id and fire
+                        // the context providers' completion hook (which records
+                        // history, for any attached `HistoryProvider`). Surface
+                        // any failure as the final item rather than dropping it.
+                        if let Some((mut session, input, providers, response_format)) =
+                            finish.take()
                         {
                             let response = ChatResponse::from_updates_with_format(
                                 collected.clone(),
@@ -845,7 +834,7 @@ fn async_stream_forward(
                             );
                             match response.conversation_id.as_deref() {
                                 None => {
-                                    if thread.service_thread_id().is_some() {
+                                    if session.service_session_id().is_some() {
                                         return Some((
                                             Err(Error::AgentExecution(
                                                 "Service did not return a valid conversation id \
@@ -856,32 +845,13 @@ fn async_stream_forward(
                                         ));
                                     }
                                 }
-                                Some(cid) => match thread.try_adopt_service_thread_id(cid).await {
-                                    Ok(true) => {
-                                        if let Some(cp) = &provider {
-                                            if let Err(e) = cp.thread_created(Some(cid)).await {
-                                                return Some((
-                                                    Err(e),
-                                                    (inner, collected, true, None),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        return Some((Err(e), (inner, collected, true, None)))
-                                    }
-                                },
+                                Some(cid) => {
+                                    session.try_adopt_service_session_id(cid);
+                                }
                             }
-                            if let Err(e) = thread.on_new_messages(input.clone()).await {
-                                return Some((Err(e), (inner, collected, true, None)));
-                            }
-                            if let Err(e) = thread.on_new_messages(response.messages.clone()).await
-                            {
-                                return Some((Err(e), (inner, collected, true, None)));
-                            }
-                            if let Some(cp) = provider {
-                                if let Err(e) = cp.invoked(&input, &response.messages, None).await {
+                            for cp in providers {
+                                if let Err(e) = cp.after_run(&input, &response.messages, None).await
+                                {
                                     return Some((Err(e), (inner, collected, true, None)));
                                 }
                             }
@@ -895,58 +865,55 @@ fn async_stream_forward(
 }
 
 #[async_trait]
-impl Agent for ChatAgent {
+impl SupportsAgentRun for Agent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
-        self.run_with_options(messages, thread, AgentRunOptions::default())
+        messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        self.run_with_options(messages, session, AgentRunOptions::default())
             .await
     }
 
     async fn run_with_options(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<&mut AgentThread>,
+        messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
         options: AgentRunOptions,
-    ) -> Result<AgentRunResponse> {
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+    ) -> Result<AgentResponse> {
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
 
         let (final_messages, chat_options) =
-            self.prepare_request(&messages, thread, &options).await?;
+            self.prepare_request(&messages, session, &options).await?;
         let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
-                // Failure path: let context providers observe the error
-                // (task 2). The run's error takes precedence over any hook
-                // failure, so the hook result is intentionally discarded.
-                if let Some(cp) = self.resolve_provider(thread) {
-                    let _ = cp.invoked(&messages, &[], Some(&e)).await;
+                // Failure path: let context providers observe the error.
+                // The run's error takes precedence over any hook failure, so
+                // the hook result is intentionally discarded.
+                for cp in self.combined_providers(session) {
+                    let _ = cp.after_run(&messages, &[], Some(&e)).await;
                 }
                 return Err(e);
             }
         };
 
         // Persist / validate the service-managed conversation id before
-        // touching local history (tasks: service-thread adoption + missing-id
-        // error). Fires `thread_created` on newly adopted ids.
-        self.update_thread_conversation_id(thread, response.conversation_id.as_deref())
-            .await?;
-        // Update thread history.
-        thread.on_new_messages(messages.clone()).await?;
-        thread.on_new_messages(response.messages.clone()).await?;
+        // firing the completion hooks (tasks: service-session adoption +
+        // missing-id error).
+        self.update_session_conversation_id(session, response.conversation_id.as_deref())?;
 
-        // Fire the context provider's success completion hook.
-        if let Some(cp) = self.resolve_provider(thread) {
-            cp.invoked(&messages, &response.messages, None).await?;
+        // Fire the context providers' success completion hook (this is what
+        // records history, for any attached `HistoryProvider`).
+        for cp in self.combined_providers(session) {
+            cp.after_run(&messages, &response.messages, None).await?;
         }
 
         Ok(response)
@@ -954,11 +921,11 @@ impl Agent for ChatAgent {
 
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<AgentThread>,
+        messages: Vec<Message>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        self.run_stream_impl(messages, thread, options.unwrap_or_default())
+        self.run_stream_impl(messages, session, options.unwrap_or_default())
             .await
     }
 
@@ -969,42 +936,50 @@ impl Agent for ChatAgent {
         self.name.as_deref()
     }
 
-    fn get_new_thread(&self) -> AgentThread {
-        // A service-managed conversation id yields a service thread; otherwise
-        // create a local thread with a shared store (from the configured
-        // factory, else in-memory) so history is observable across clones
-        // (e.g. during streaming).
-        let mut thread = match &self.chat_options.conversation_id {
-            Some(id) => AgentThread::service(id.clone()),
-            None => AgentThread::local(self.new_message_store()),
-        };
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
+    fn create_session(&self) -> AgentSession {
+        // A service-managed conversation id yields a service session;
+        // otherwise eagerly attach a fresh `InMemoryHistoryProvider` (rather
+        // than relying solely on `prepare_request`'s auto-attach) so history
+        // is observable across clones (e.g. during streaming): the only way a
+        // caller observes the post-stream write-back through a clone taken
+        // beforehand is if the provider (and therefore its `Arc`) already
+        // exists at clone time.
+        //
+        // The agent's own context providers are NOT copied onto the session
+        // here: [`Agent::combined_providers`] merges the session's providers
+        // with the agent's own at request time, so copying them here would
+        // double-invoke the agent's providers for every run against this
+        // session.
+        match &self.chat_options.conversation_id {
+            Some(id) => AgentSession::service(id.clone()),
+            None => {
+                let mut session = AgentSession::new();
+                ensure_history_provider(&mut session);
+                session
+            }
         }
-        thread
     }
 }
 
-/// Builder for [`ChatAgent`].
-pub struct ChatAgentBuilder {
+/// Builder for [`Agent`].
+pub struct AgentBuilder {
     id: Option<String>,
     name: Option<String>,
     description: Option<String>,
     instructions: Option<String>,
     /// The raw, caller-supplied client. Wrapping in [`FunctionInvokingChatClient`]
-    /// is deferred to [`ChatAgentBuilder::build`] so that builder-collected
+    /// is deferred to [`AgentBuilder::build`] so that builder-collected
     /// function middleware can be threaded into the wrapper's constructor.
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
-    context_provider: Option<Arc<AggregateContextProvider>>,
-    chat_message_store_factory: Option<ChatMessageStoreFactory>,
+    context_providers: Vec<Arc<dyn ContextProvider>>,
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
     chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
     function_middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
-impl ChatAgentBuilder {
+impl AgentBuilder {
     fn new(client: impl ChatClient + 'static) -> Self {
         Self {
             id: None,
@@ -1013,8 +988,7 @@ impl ChatAgentBuilder {
             instructions: None,
             client: Arc::new(client),
             chat_options: ChatOptions::new(),
-            context_provider: None,
-            chat_message_store_factory: None,
+            context_providers: Vec::new(),
             agent_middleware: Vec::new(),
             chat_middleware: Vec::new(),
             function_middleware: Vec::new(),
@@ -1038,8 +1012,8 @@ impl ChatAgentBuilder {
         self.instructions = Some(instructions.into());
         self
     }
-    pub fn model(mut self, model_id: impl Into<String>) -> Self {
-        self.chat_options.model_id = Some(model_id.into());
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.chat_options.model = Some(model.into());
         self
     }
     pub fn temperature(mut self, temperature: f32) -> Self {
@@ -1070,26 +1044,38 @@ impl ChatAgentBuilder {
     /// per-run tools (dedup by name against those and any earlier-registered
     /// source; first registrant wins). Call repeatedly to register more than
     /// one source. See [`ToolSource`], resolved internally by every
-    /// [`ChatAgent`] run.
+    /// [`Agent`] run.
     pub fn tool_source(mut self, source: Arc<dyn ToolSource>) -> Self {
         self.tool_sources.push(source);
         self
     }
-    /// Set the context provider(s).
-    pub fn context_provider(mut self, provider: Arc<AggregateContextProvider>) -> Self {
-        self.context_provider = Some(provider);
+    /// Add a single context provider (repeatable; providers run in
+    /// registration order, agent providers after any thread-level ones).
+    pub fn context_provider(mut self, provider: Arc<dyn ContextProvider>) -> Self {
+        self.context_providers.push(provider);
         self
     }
-    /// Set a factory for the message store of each new local thread, mirroring
-    /// Python's `chat_message_store_factory`. Used by
-    /// [`ChatAgent::get_new_thread`] and [`ChatAgent::deserialize_thread`]
-    /// instead of hardcoding [`InMemoryChatMessageStore`].
-    pub fn chat_message_store_factory<F>(mut self, factory: F) -> Self
-    where
-        F: Fn() -> Arc<dyn ChatMessageStore> + Send + Sync + 'static,
-    {
-        self.chat_message_store_factory = Some(Arc::new(factory));
+    /// Set the context provider list, replacing any previously registered.
+    pub fn context_providers(mut self, providers: Vec<Arc<dyn ContextProvider>>) -> Self {
+        self.context_providers = providers;
         self
+    }
+    /// Attach conversation-history compaction, via a
+    /// [`CompactionProvider`](crate::compaction::CompactionProvider) wrapping
+    /// `strategy` (with the default `ApproxTokenizer`; use
+    /// [`AgentBuilder::context_provider`] with
+    /// [`CompactionProvider::with_tokenizer`](crate::compaction::CompactionProvider::with_tokenizer)
+    /// for a custom tokenizer).
+    ///
+    /// Registered as one of the agent's own context providers, which
+    /// [`Agent::combined_providers`] always runs *after* the session's —
+    /// including the auto-attached (or explicitly attached)
+    /// [`HistoryProvider`](crate::history::HistoryProvider), which lives on
+    /// the session — so compaction sees, and can shrink, the full
+    /// history-prepended message list for the run. Not calling this leaves
+    /// the default behavior unchanged: the full history is sent every run.
+    pub fn with_compaction(self, strategy: impl CompactionStrategy + 'static) -> Self {
+        self.context_provider(Arc::new(CompactionProvider::new(strategy)))
     }
     /// Add an agent middleware.
     pub fn middleware(mut self, mw: Arc<crate::middleware::AgentMiddleware>) -> Self {
@@ -1097,7 +1083,7 @@ impl ChatAgentBuilder {
         self
     }
     /// Add a chat middleware, run around the underlying chat-client call on
-    /// every request (repeatable, like [`ChatAgentBuilder::middleware`]).
+    /// every request (repeatable, like [`AgentBuilder::middleware`]).
     /// See the chat-client call pipeline for exactly what it can observe
     /// and mutate.
     pub fn chat_middleware(mut self, mw: Arc<crate::middleware::ChatMiddleware>) -> Self {
@@ -1119,15 +1105,15 @@ impl ChatAgentBuilder {
     }
 
     /// Build the agent.
-    pub fn build(mut self) -> ChatAgent {
+    pub fn build(mut self) -> Agent {
         if let Some(instr) = self.instructions.take() {
             self.chat_options.instructions = Some(match self.chat_options.instructions.take() {
                 Some(existing) => format!("{instr}\n{existing}"),
                 None => instr,
             });
         }
-        if self.chat_options.model_id.is_none() {
-            self.chat_options.model_id = self.client.model_id().map(str::to_string);
+        if self.chat_options.model.is_none() {
+            self.chat_options.model = self.client.model().map(str::to_string);
         }
         // Wrap the raw client in `FunctionInvokingChatClient` now that all
         // builder-collected function middleware is known.
@@ -1135,14 +1121,13 @@ impl ChatAgentBuilder {
             FunctionInvokingChatClient::new(self.client)
                 .with_function_middleware(self.function_middleware),
         );
-        ChatAgent {
+        Agent {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: self.name,
             description: self.description,
             client,
             chat_options: self.chat_options,
-            context_provider: self.context_provider,
-            chat_message_store_factory: self.chat_message_store_factory,
+            context_providers: self.context_providers,
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
             tool_sources: self.tool_sources,
@@ -1150,46 +1135,37 @@ impl ChatAgentBuilder {
     }
 }
 
-impl ChatAgent {
+impl Agent {
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
 
-    /// Create a new **service-managed** thread bound to `service_thread_id`,
+    /// Create a new **service-managed** session bound to `service_session_id`,
     /// mirroring Python's `get_new_thread(service_thread_id=…)`
     /// (`_agents.py:1078-1082`).
     ///
-    /// The agent's context provider (if any) is attached. Returns an error if
-    /// the requested combination is invalid (a service id plus a local store);
-    /// this constructor only sets the service id, so it always succeeds, but
-    /// routing through [`AgentThread::try_from_parts`] keeps the service-xor-
-    /// store invariant in one place.
-    pub fn get_new_thread_with_service_id(
+    /// The agent's own context providers are NOT copied onto the returned
+    /// session; see the note on [`Agent::create_session`].
+    pub fn create_session_with_service_id(
         &self,
-        service_thread_id: impl Into<String>,
-    ) -> Result<AgentThread> {
-        let mut thread = AgentThread::try_from_parts(Some(service_thread_id.into()), None)?;
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
-        }
-        Ok(thread)
+        service_session_id: impl Into<String>,
+    ) -> AgentSession {
+        AgentSession::service(service_session_id)
     }
 
-    /// Reconstruct a thread from serialized state (as produced by
-    /// [`AgentThread::serialize`]), mirroring Python's
+    /// Reconstruct a session from state (as produced by
+    /// [`AgentSession::to_dict`]), mirroring Python's
     /// `BaseAgent.deserialize_thread` (`_agents.py:378-392`).
     ///
-    /// A local thread's store is built via the agent's
-    /// `chat_message_store_factory` (or an [`InMemoryChatMessageStore`]) and
-    /// populated from the state; the agent's context provider is attached.
-    pub async fn deserialize_thread(&self, serialized_thread: &Value) -> Result<AgentThread> {
-        let mut thread =
-            AgentThread::deserialize(serialized_thread, Some(self.new_message_store())).await?;
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
-        }
-        Ok(thread)
+    /// Conversation history is **not** part of this state (see
+    /// [`AgentSession::to_dict`]); reattach a [`crate::history::HistoryProvider`]
+    /// (e.g. via [`crate::history::InMemoryHistoryProvider::from_dict`]) to
+    /// `context_providers` separately when restoring a conversation. The
+    /// agent's own context providers are NOT copied onto the returned
+    /// session; see the note on [`Agent::create_session`].
+    pub fn session_from_dict(&self, state: &Value) -> Result<AgentSession> {
+        AgentSession::from_dict(state)
     }
 
     /// Wrap this agent as a [`ToolDefinition`] usable by another agent's
@@ -1202,9 +1178,9 @@ impl ChatAgent {
     /// ```no_run
     /// # use agent_framework_core::prelude::*;
     /// # use agent_framework_core::agent::AsToolOptions;
-    /// # fn demo(researcher: ChatAgent, coordinator_client: impl ChatClient + 'static) {
+    /// # fn demo(researcher: Agent, coordinator_client: impl ChatClient + 'static) {
     /// let research_tool = researcher.as_tool(AsToolOptions::new().name("research"));
-    /// let coordinator = ChatAgent::builder(coordinator_client)
+    /// let coordinator = Agent::builder(coordinator_client)
     ///     .tool(research_tool)
     ///     .build();
     /// # let _ = coordinator;
@@ -1235,7 +1211,7 @@ impl ChatAgent {
             "required": [arg_name.clone()],
         });
         let arg_key = arg_name;
-        AiFunction::new(tool_name, description, schema, move |args: Value| {
+        FunctionTool::new(tool_name, description, schema, move |args: Value| {
             let agent = agent.clone();
             let arg_key = arg_key.clone();
             async move {
@@ -1249,5 +1225,142 @@ impl ChatAgent {
             }
         })
         .into_definition()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ChatStream;
+    use crate::compaction::Truncation;
+    use crate::types::{ChatResponse, ChatResponseUpdate};
+    use futures::stream;
+    use std::sync::Mutex;
+
+    /// A chat client that records the full message list of every request it
+    /// receives and always replies with the same canned text.
+    #[derive(Clone, Default)]
+    struct RecordingClient {
+        received: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl RecordingClient {
+        fn requests(&self) -> Vec<Vec<Message>> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatClient for RecordingClient {
+        async fn get_response(
+            &self,
+            messages: Vec<Message>,
+            _options: ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.received.lock().unwrap().push(messages);
+            Ok(ChatResponse::from_text("ok"))
+        }
+
+        async fn get_streaming_response(
+            &self,
+            messages: Vec<Message>,
+            options: ChatOptions,
+        ) -> Result<ChatStream> {
+            let resp = self.get_response(messages, options).await?;
+            let updates: Vec<Result<ChatResponseUpdate>> = resp
+                .messages
+                .into_iter()
+                .map(|m| {
+                    Ok(ChatResponseUpdate {
+                        contents: m.contents,
+                        role: Some(m.role),
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            Ok(Box::pin(stream::iter(updates)))
+        }
+    }
+
+    #[tokio::test]
+    async fn without_compaction_sends_the_full_accumulated_history() {
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client.clone()).build();
+        let mut session = agent.create_session();
+
+        agent
+            .run(vec![Message::user("turn 1")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 2")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 3")], Some(&mut session))
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 3);
+
+        // Third request: the full history accumulated by turns 1 and 2 (2
+        // user + 2 assistant messages) plus this turn's own input.
+        let last = requests.last().unwrap();
+        assert_eq!(last.len(), 5);
+        assert_eq!(last[0].text(), "turn 1");
+        assert_eq!(last[2].text(), "turn 2");
+        assert_eq!(last.last().unwrap().text(), "turn 3");
+    }
+
+    #[tokio::test]
+    async fn with_compaction_sends_only_the_compacted_message_set() {
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client.clone())
+            .with_compaction(Truncation::new(2))
+            .build();
+        let mut session = agent.create_session();
+
+        agent
+            .run(vec![Message::user("turn 1")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 2")], Some(&mut session))
+            .await
+            .unwrap();
+        agent
+            .run(vec![Message::user("turn 3")], Some(&mut session))
+            .await
+            .unwrap();
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 3);
+
+        // Third request: compaction caps the *stored history* (4 messages
+        // by then) at 2 before this turn's own input is appended, so the
+        // outgoing request is 3 messages, and the oldest turn is gone.
+        let last = requests.last().unwrap();
+        assert_eq!(last.len(), 3);
+        assert!(last.iter().all(|m| m.text() != "turn 1"));
+        assert_eq!(last[0].text(), "turn 2");
+        assert_eq!(last.last().unwrap().text(), "turn 3");
+    }
+
+    #[tokio::test]
+    async fn with_compaction_runs_after_the_history_provider_in_combined_providers() {
+        // Direct check on `combined_providers` ordering: the agent-level
+        // provider attached by `with_compaction` must come after the
+        // session's auto-attached history provider.
+        let client = RecordingClient::default();
+        let agent = Agent::builder(client)
+            .with_compaction(Truncation::new(2))
+            .build();
+        let session = agent.create_session();
+
+        let providers = agent.combined_providers(&session);
+        assert_eq!(providers.len(), 2);
+        assert!(providers[0].is_history_provider());
+        assert!(!providers[1].is_history_provider());
     }
 }

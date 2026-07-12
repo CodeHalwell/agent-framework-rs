@@ -1,5 +1,5 @@
-//! Agent middleware: wraps a whole `agent.run(...)` call. A middleware
-//! receives an owned `AgentRunContext` and a `Next` continuation -- call
+//! SupportsAgentRun middleware: wraps a whole `agent.run(...)` call. A middleware
+//! receives an owned `AgentContext` and a `Next` continuation -- call
 //! `next.run(ctx)` to continue the chain and observe/rewrite the result, or
 //! return without calling it (optionally setting `ctx.terminate = true`) to
 //! short-circuit the run entirely, before the underlying model is ever
@@ -28,12 +28,8 @@ use async_trait::async_trait;
 struct LoggingMiddleware;
 
 #[async_trait]
-impl Middleware<AgentRunContext> for LoggingMiddleware {
-    async fn process(
-        &self,
-        ctx: AgentRunContext,
-        next: Next<AgentRunContext>,
-    ) -> Result<AgentRunContext> {
+impl Middleware<AgentContext> for LoggingMiddleware {
+    async fn process(&self, ctx: AgentContext, next: Next<AgentContext>) -> Result<AgentContext> {
         println!(
             "  [logging] -> run starting ({} input message(s))",
             ctx.messages.len()
@@ -41,7 +37,7 @@ impl Middleware<AgentRunContext> for LoggingMiddleware {
         let ctx = next.run(ctx).await?;
         println!(
             "  [logging] <- run finished: {:?}",
-            ctx.result.as_ref().map(AgentRunResponse::text)
+            ctx.result.as_ref().map(AgentResponse::text)
         );
         Ok(ctx)
     }
@@ -55,17 +51,13 @@ struct BlockedWordsMiddleware {
 }
 
 #[async_trait]
-impl Middleware<AgentRunContext> for BlockedWordsMiddleware {
+impl Middleware<AgentContext> for BlockedWordsMiddleware {
     async fn process(
         &self,
-        mut ctx: AgentRunContext,
-        next: Next<AgentRunContext>,
-    ) -> Result<AgentRunContext> {
-        let last_text = ctx
-            .messages
-            .last()
-            .map(ChatMessage::text)
-            .unwrap_or_default();
+        mut ctx: AgentContext,
+        next: Next<AgentContext>,
+    ) -> Result<AgentContext> {
+        let last_text = ctx.messages.last().map(Message::text).unwrap_or_default();
         let hit = self
             .blocked
             .iter()
@@ -73,8 +65,8 @@ impl Middleware<AgentRunContext> for BlockedWordsMiddleware {
 
         if let Some(word) = hit {
             println!("  [blocked-words] refusing request containing '{word}' -- model not called");
-            ctx.result = Some(AgentRunResponse {
-                messages: vec![ChatMessage::assistant(format!(
+            ctx.result = Some(AgentResponse {
+                messages: vec![Message::assistant(format!(
                     "Sorry, I can't help with requests containing '{word}'."
                 ))],
                 ..Default::default()
@@ -97,7 +89,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(
@@ -107,7 +99,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -116,7 +108,7 @@ impl ChatClient for CannedClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(CannedClient)
+    let agent = Agent::builder(CannedClient)
         .name("assistant")
         .middleware(Arc::new(LoggingMiddleware))
         .middleware(Arc::new(BlockedWordsMiddleware {

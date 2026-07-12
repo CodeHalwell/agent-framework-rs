@@ -7,13 +7,13 @@
 //! - a **custom** manager — any [`GroupChatManager`] implementation or a sync
 //!   closure via [`GroupChatBuilder::manager_fn`] — decides the next speaker or
 //!   finishes;
-//! - an **LLM manager** — a [`ChatAgent`](crate::agent::ChatAgent) (any
-//!   [`Agent`]) prompted with [`DEFAULT_MANAGER_INSTRUCTIONS`] that returns a
+//! - an **LLM manager** — a [`Agent`](crate::agent::Agent) (any
+//!   [`SupportsAgentRun`]) prompted with [`DEFAULT_MANAGER_INSTRUCTIONS`] that returns a
 //!   [`ManagerSelectionResponse`] as JSON.
 //!
 //! Divergence from Python: the reference builds a graph of orchestrator +
 //! participant nodes. Here a single orchestrator [`Executor`] drives the loop,
-//! calling participants via [`Agent::run`] directly. Python's group chat has no
+//! calling participants via [`SupportsAgentRun::run`] directly. Python's group chat has no
 //! built-in round-robin manager (it requires `set_manager` or
 //! `set_select_speakers_func`); round-robin is a Rust convenience. Python's
 //! manager rounds default to unlimited (bounded only by the workflow's
@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ensure_author, parse_conversation, run_agent_and_emit};
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
-use crate::types::ChatMessage;
+use crate::types::Message;
 use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext};
 
 /// Safety bound on manager rounds applied by [`GroupChatBuilder`] when no
@@ -82,7 +82,7 @@ pub enum GroupChatDirective {
     /// Finish the conversation, optionally with a final message.
     Finish {
         /// The final message to append (defaults to a completion notice).
-        final_message: Option<ChatMessage>,
+        final_message: Option<Message>,
     },
 }
 
@@ -111,7 +111,7 @@ impl GroupChatDirective {
     }
 
     /// Finish with an explicit final message.
-    pub fn finish_with(message: ChatMessage) -> Self {
+    pub fn finish_with(message: Message) -> Self {
         GroupChatDirective::Finish {
             final_message: Some(message),
         }
@@ -120,7 +120,7 @@ impl GroupChatDirective {
     /// Finish with a plain-text final answer.
     pub fn finish_text(text: impl Into<String>) -> Self {
         GroupChatDirective::Finish {
-            final_message: Some(ChatMessage::assistant(text)),
+            final_message: Some(Message::assistant(text)),
         }
     }
 }
@@ -130,11 +130,11 @@ impl GroupChatDirective {
 #[derive(Debug, Clone)]
 pub struct GroupChatState {
     /// The original task message, if any.
-    pub task: Option<ChatMessage>,
+    pub task: Option<Message>,
     /// Registered participants as `(name, description)` pairs, in order.
     pub participants: Vec<(String, String)>,
     /// The full running conversation transcript.
-    pub conversation: Vec<ChatMessage>,
+    pub conversation: Vec<Message>,
     /// The number of participant turns taken so far.
     pub round_index: usize,
 }
@@ -236,7 +236,7 @@ impl ManagerSelectionResponse {
     /// Convert the parsed selection into a [`GroupChatDirective`].
     fn into_directive(self) -> Result<GroupChatDirective> {
         if self.finish {
-            let msg = self.final_message.map(ChatMessage::assistant);
+            let msg = self.final_message.map(Message::assistant);
             return Ok(GroupChatDirective::Finish { final_message: msg });
         }
         match self.selected_participant {
@@ -251,12 +251,12 @@ impl ManagerSelectionResponse {
     }
 }
 
-/// An LLM-driven manager: a [`ChatAgent`](crate::agent::ChatAgent) is prompted
+/// An LLM-driven manager: a [`Agent`](crate::agent::Agent) is prompted
 /// with the participant roster and running conversation and returns a
 /// [`ManagerSelectionResponse`] as JSON. Created by
 /// [`GroupChatBuilder::manager_agent`].
 struct LlmGroupChatManager {
-    agent: Arc<dyn Agent>,
+    agent: Arc<dyn SupportsAgentRun>,
     name: String,
 }
 
@@ -264,7 +264,7 @@ impl LlmGroupChatManager {
     /// Build the system context message listing participants (mirrors Python's
     /// `_build_manager_context_message`), plus the manager instructions and the
     /// JSON schema contract.
-    fn system_message(&self, state: &GroupChatState) -> ChatMessage {
+    fn system_message(&self, state: &GroupChatState) -> Message {
         let roster = state
             .participants
             .iter()
@@ -275,13 +275,13 @@ impl LlmGroupChatManager {
             "{DEFAULT_MANAGER_INSTRUCTIONS}\n\nAvailable participants:\n{roster}\n\n\
 IMPORTANT: Choose only from these exact participant names (case-sensitive).\n\n{MANAGER_SELECTION_SCHEMA_PROMPT}"
         );
-        ChatMessage::system(text)
+        Message::system(text)
     }
 
     /// Parse the manager agent's response into a [`ManagerSelectionResponse`],
     /// mirroring Python's `_parse_manager_selection`: prefer the structured
     /// `value`, then fall back to parsing the message text as JSON.
-    fn parse(response: &crate::types::AgentRunResponse) -> Result<ManagerSelectionResponse> {
+    fn parse(response: &crate::types::AgentResponse) -> Result<ManagerSelectionResponse> {
         if let Some(value) = &response.value {
             if let Ok(sel) = serde_json::from_value::<ManagerSelectionResponse>(value.clone()) {
                 return Ok(sel);
@@ -312,13 +312,13 @@ impl GroupChatManager for LlmGroupChatManager {
     }
 }
 
-type TerminationCondition = Arc<dyn Fn(&[ChatMessage]) -> bool + Send + Sync>;
+type TerminationCondition = Arc<dyn Fn(&[Message]) -> bool + Send + Sync>;
 
 /// The single executor that drives a group chat conversation.
 struct GroupChatOrchestrator {
     id: String,
     manager: Arc<dyn GroupChatManager>,
-    participants: Vec<(String, Arc<dyn Agent>)>,
+    participants: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     descriptions: Vec<(String, String)>,
     manager_name: String,
     max_rounds: Option<usize>,
@@ -326,7 +326,7 @@ struct GroupChatOrchestrator {
 }
 
 impl GroupChatOrchestrator {
-    fn find(&self, name: &str) -> Option<&Arc<dyn Agent>> {
+    fn find(&self, name: &str) -> Option<&Arc<dyn SupportsAgentRun>> {
         self.participants
             .iter()
             .find(|(n, _)| n == name)
@@ -349,7 +349,7 @@ impl Executor for GroupChatOrchestrator {
             if let Some(max) = self.max_rounds {
                 if round_index >= max {
                     conversation.push(ensure_author(
-                        ChatMessage::assistant(
+                        Message::assistant(
                             "Conversation halted after reaching manager round limit.",
                         ),
                         &self.manager_name,
@@ -360,7 +360,7 @@ impl Executor for GroupChatOrchestrator {
             if let Some(term) = &self.termination {
                 if term(&conversation) {
                     conversation.push(ensure_author(
-                        ChatMessage::assistant(
+                        Message::assistant(
                             "Conversation halted after termination condition was met.",
                         ),
                         &self.manager_name,
@@ -380,7 +380,7 @@ impl Executor for GroupChatOrchestrator {
             match directive {
                 GroupChatDirective::Finish { final_message } => {
                     let msg = final_message
-                        .unwrap_or_else(|| ChatMessage::assistant("Conversation completed."));
+                        .unwrap_or_else(|| Message::assistant("Conversation completed."));
                     conversation.push(ensure_author(msg, &self.manager_name));
                     break;
                 }
@@ -395,10 +395,8 @@ impl Executor for GroupChatOrchestrator {
                     })?;
                     if let Some(instr) = instruction {
                         if !instr.is_empty() {
-                            conversation.push(ensure_author(
-                                ChatMessage::assistant(instr),
-                                &self.manager_name,
-                            ));
+                            conversation
+                                .push(ensure_author(Message::assistant(instr), &self.manager_name));
                         }
                     }
                     let response = run_agent_and_emit(
@@ -426,7 +424,7 @@ impl Executor for GroupChatOrchestrator {
 enum ManagerChoice {
     RoundRobin,
     Custom(Arc<dyn GroupChatManager>),
-    Agent(Arc<dyn Agent>),
+    Agent(Arc<dyn SupportsAgentRun>),
 }
 
 /// Builder for a group chat workflow. Rust analogue of `GroupChatBuilder`.
@@ -435,7 +433,7 @@ enum ManagerChoice {
 /// # use std::sync::Arc;
 /// # use agent_framework_core::prelude::*;
 /// # use agent_framework_core::workflow::GroupChatBuilder;
-/// # fn demo(writer: Arc<dyn Agent>, reviewer: Arc<dyn Agent>) -> Result<()> {
+/// # fn demo(writer: Arc<dyn SupportsAgentRun>, reviewer: Arc<dyn SupportsAgentRun>) -> Result<()> {
 /// let workflow = GroupChatBuilder::new()
 ///     .participant("writer", writer)
 ///     .participant("reviewer", reviewer)
@@ -447,12 +445,14 @@ enum ManagerChoice {
 /// # }
 /// ```
 pub struct GroupChatBuilder {
-    participants: Vec<(String, String, Arc<dyn Agent>)>,
+    participants: Vec<(String, String, Arc<dyn SupportsAgentRun>)>,
     manager: ManagerChoice,
     manager_name: Option<String>,
     max_rounds: Option<usize>,
     termination: Option<TerminationCondition>,
     name: Option<String>,
+    output_from: Vec<String>,
+    intermediate_output_from: Vec<String>,
 }
 
 impl Default for GroupChatBuilder {
@@ -464,6 +464,8 @@ impl Default for GroupChatBuilder {
             max_rounds: None,
             termination: None,
             name: None,
+            output_from: Vec::new(),
+            intermediate_output_from: Vec::new(),
         }
     }
 }
@@ -475,7 +477,11 @@ impl GroupChatBuilder {
     }
 
     /// Register a participant (its description defaults to its name).
-    pub fn participant(mut self, name: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn participant(
+        mut self,
+        name: impl Into<String>,
+        agent: Arc<dyn SupportsAgentRun>,
+    ) -> Self {
         let name = name.into();
         self.participants.push((name.clone(), name, agent));
         self
@@ -487,7 +493,7 @@ impl GroupChatBuilder {
         mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        agent: Arc<dyn Agent>,
+        agent: Arc<dyn SupportsAgentRun>,
     ) -> Self {
         self.participants
             .push((name.into(), description.into(), agent));
@@ -497,7 +503,7 @@ impl GroupChatBuilder {
     /// Register several participants as `(name, agent)` pairs.
     pub fn participants(
         mut self,
-        participants: impl IntoIterator<Item = (String, Arc<dyn Agent>)>,
+        participants: impl IntoIterator<Item = (String, Arc<dyn SupportsAgentRun>)>,
     ) -> Self {
         for (name, agent) in participants {
             self.participants.push((name.clone(), name, agent));
@@ -532,7 +538,7 @@ impl GroupChatBuilder {
     /// Use an LLM agent as the manager (prompted with
     /// [`DEFAULT_MANAGER_INSTRUCTIONS`] and asked for a
     /// [`ManagerSelectionResponse`] as JSON).
-    pub fn manager_agent(mut self, agent: Arc<dyn Agent>) -> Self {
+    pub fn manager_agent(mut self, agent: Arc<dyn SupportsAgentRun>) -> Self {
         self.manager = ManagerChoice::Agent(agent);
         self
     }
@@ -548,7 +554,7 @@ impl GroupChatBuilder {
     /// before each manager turn.
     pub fn termination_condition<F>(mut self, condition: F) -> Self
     where
-        F: Fn(&[ChatMessage]) -> bool + Send + Sync + 'static,
+        F: Fn(&[Message]) -> bool + Send + Sync + 'static,
     {
         self.termination = Some(Arc::new(condition));
         self
@@ -566,6 +572,48 @@ impl GroupChatBuilder {
         self
     }
 
+    /// Designate participants (by the name passed to
+    /// [`Self::participant`]/[`Self::participant_described`]) as a workflow
+    /// output source, forwarded to [`WorkflowBuilder::output_from`].
+    ///
+    /// **Divergence from Sequential/Concurrent:** unlike those builders, a
+    /// group chat compiles to a *single* orchestrator [`Executor`] that runs
+    /// the whole manager/participant loop internally (see the module-level
+    /// design note) rather than one executor per participant, so there is no
+    /// per-participant executor id to route to individually. Naming any
+    /// participant here is therefore equivalent to naming every participant:
+    /// it simply keeps the orchestrator's single final yield — the finished
+    /// conversation — as the terminal [`WorkflowEvent::Output`](crate::workflow::WorkflowEvent::Output)
+    /// (already the default when no designation is set at all). Its
+    /// practical purpose is composing a group chat into a larger workflow:
+    /// call [`Self::intermediate_output_from`] instead to demote the group
+    /// chat's result to a non-terminal
+    /// [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event, e.g. when this workflow feeds a downstream stage.
+    ///
+    /// Rejected at `build()` if a name does not match any registered
+    /// participant, or if this and [`Self::intermediate_output_from`] are
+    /// both non-empty (both resolve to the same underlying executor id, so
+    /// the id would be designated as both terminal and non-terminal).
+    pub fn output_from(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.output_from.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Designate participants (by name) as an intermediate-output source,
+    /// demoting the group chat orchestrator's single final yield to a
+    /// non-terminal [`WorkflowEvent::Intermediate`](crate::workflow::WorkflowEvent::Intermediate)
+    /// event instead of the workflow's terminal output. See
+    /// [`Self::output_from`] for the single-executor caveat.
+    pub fn intermediate_output_from(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.intermediate_output_from
+            .extend(names.into_iter().map(Into::into));
+        self
+    }
+
     /// Validate and build the group chat workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -573,6 +621,25 @@ impl GroupChatBuilder {
                 "group chat needs at least one participant".into(),
             ));
         }
+
+        let known_names: std::collections::HashSet<&str> = self
+            .participants
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        for n in self
+            .output_from
+            .iter()
+            .chain(self.intermediate_output_from.iter())
+        {
+            if !known_names.contains(n.as_str()) {
+                return Err(Error::Workflow(format!(
+                    "output designation references unknown participant '{n}'"
+                )));
+            }
+        }
+        let designate_output = !self.output_from.is_empty();
+        let designate_intermediate = !self.intermediate_output_from.is_empty();
 
         let manager: Arc<dyn GroupChatManager> = match self.manager {
             ManagerChoice::RoundRobin => Arc::new(RoundRobinManager::new()),
@@ -591,7 +658,7 @@ impl GroupChatBuilder {
             .iter()
             .map(|(n, d, _)| (n.clone(), d.clone()))
             .collect();
-        let participants: Vec<(String, Arc<dyn Agent>)> = self
+        let participants: Vec<(String, Arc<dyn SupportsAgentRun>)> = self
             .participants
             .into_iter()
             .map(|(n, _, a)| (n, a))
@@ -610,6 +677,12 @@ impl GroupChatBuilder {
         let mut builder = WorkflowBuilder::new()
             .add_executor(Arc::new(orchestrator))
             .set_start("group_chat_orchestrator");
+        if designate_output {
+            builder = builder.output_from(["group_chat_orchestrator"]);
+        }
+        if designate_intermediate {
+            builder = builder.intermediate_output_from(["group_chat_orchestrator"]);
+        }
         if let Some(name) = self.name {
             builder = builder.name(name);
         }

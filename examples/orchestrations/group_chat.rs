@@ -11,20 +11,24 @@ use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::GroupChatBuilder;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
-fn participant(client: &OpenAIClient, name: &str, instructions: &str) -> Arc<dyn Agent> {
+fn participant(
+    client: &OpenAIChatCompletionClient,
+    name: &str,
+    instructions: &str,
+) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(client.clone())
+        Agent::builder(client.clone())
             .name(name)
             .instructions(instructions)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
     let task = "Write a one-line tagline for a coffee shop called Terra.";
 
     let writer = participant(&client, "writer", "You draft short, punchy marketing copy.");
@@ -70,7 +74,7 @@ fn print_transcript(label: &str, output: Option<serde_json::Value>) {
         println!("(no output)");
         return;
     };
-    let conversation: Vec<ChatMessage> = serde_json::from_value(output).unwrap_or_default();
+    let conversation: Vec<Message> = serde_json::from_value(output).unwrap_or_default();
     for msg in &conversation {
         let speaker = msg.author_name.as_deref().unwrap_or(msg.role.as_str());
         println!("{speaker}: {}", msg.text());

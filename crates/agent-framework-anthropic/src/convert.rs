@@ -5,10 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, CitationAnnotation, Content, DataContent, FinishReason,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, HostedFileContent,
-    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
-    UsageContent, UsageDetails,
+    Annotation, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, HostedFileContent, Message, ResponseFormat, Role,
+    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
+    UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -55,7 +55,7 @@ pub(crate) fn compute_beta_flags(
 
 /// Build a full Anthropic `POST /v1/messages` request body.
 pub fn build_request(
-    messages: &[ChatMessage],
+    messages: &[Message],
     options: &ChatOptions,
     model: &str,
     max_tokens: u32,
@@ -64,7 +64,44 @@ pub fn build_request(
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(max_tokens));
+    fill_request_body(body, messages, options, stream)
+}
 
+/// Build an Anthropic Messages-API-shaped request body for the multi-cloud
+/// transports ([`crate::bedrock`], [`crate::vertex`], [`crate::foundry`]).
+///
+/// AWS Bedrock, Google Vertex AI, and Azure AI Foundry all select the model
+/// through the request *URL* (a path segment or deployment), not the JSON
+/// body, and all three require an explicit `anthropic_version` string in the
+/// body in place of the direct API's top-level `model` field. Everything
+/// else — system prompt extraction, message conversion, sampling options,
+/// tools/tool_choice, and `additional_properties` passthrough — is identical
+/// to [`build_request`], via the same [`fill_request_body`] helper, so the
+/// two stay in lockstep by construction rather than by convention.
+pub fn build_cloud_request(
+    messages: &[Message],
+    options: &ChatOptions,
+    max_tokens: u32,
+    stream: bool,
+    anthropic_version: &str,
+) -> Value {
+    let mut body = Map::new();
+    body.insert("anthropic_version".into(), json!(anthropic_version));
+    body.insert("max_tokens".into(), json!(max_tokens));
+    fill_request_body(body, messages, options, stream)
+}
+
+/// Fill in the fields shared by [`build_request`] and [`build_cloud_request`]
+/// onto an already-started body map (which differs only in whether it leads
+/// with `model` or `anthropic_version`): `system`, `messages`, sampling
+/// parameters, `tools`/`mcp_servers`/`tool_choice`, `additional_properties`
+/// passthrough, and the `stream` flag.
+fn fill_request_body(
+    mut body: Map<String, Value>,
+    messages: &[Message],
+    options: &ChatOptions,
+    stream: bool,
+) -> Value {
     let (system, rest) = extract_system(messages, options.instructions.as_deref());
     let system = append_response_format_instructions(system, options.response_format.as_ref());
     if let Some(system) = system {
@@ -116,9 +153,9 @@ pub fn build_request(
 /// it is a system message; any other content keeps its original position and
 /// maps to a `user` turn (see [`messages_to_anthropic`]'s role mapping).
 pub fn extract_system<'a>(
-    messages: &'a [ChatMessage],
+    messages: &'a [Message],
     options_instructions: Option<&str>,
-) -> (Option<String>, &'a [ChatMessage]) {
+) -> (Option<String>, &'a [Message]) {
     let mut parts = Vec::new();
     if let Some(instr) = options_instructions {
         if !instr.is_empty() {
@@ -196,7 +233,7 @@ fn append_response_format_instructions(
 /// Anthropic has no `system` or `tool` role: everything that isn't
 /// `assistant` (including tool results) is sent as a `user` turn, matching
 /// the Python client's `ROLE_MAP`.
-pub fn messages_to_anthropic(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = if msg.role == Role::assistant() {
@@ -444,6 +481,12 @@ pub fn tools_to_anthropic(tools: &[ToolDefinition]) -> (Vec<Value>, Vec<Value>) 
                     "Anthropic: hosted file-search tools are not supported by the Anthropic Messages API; skipping"
                 );
             }
+            ToolKind::HostedImageGeneration => {
+                tracing::warn!(
+                    tool = %t.name,
+                    "Anthropic: hosted image-generation tools are not supported by the Anthropic Messages API; skipping"
+                );
+            }
         }
     }
     (tool_list, mcp_servers)
@@ -478,7 +521,7 @@ fn tool_choice_to_anthropic(mode: &ToolMode, allow_multiple: Option<bool>) -> Va
 pub fn parse_response(value: &Value) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 
@@ -488,7 +531,7 @@ pub fn parse_response(value: &Value) -> ChatResponse {
         .map(|blocks| parse_content_blocks(blocks))
         .unwrap_or_default();
 
-    let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+    let mut message = Message::with_contents(Role::assistant(), contents);
     message.message_id = response.response_id.clone();
     response.messages.push(message);
 
@@ -668,7 +711,7 @@ fn tool_use_id(block: &Value) -> String {
 }
 
 /// Parse the `citations` array on a text content block into
-/// [`CitationAnnotation`]s. Mirrors upstream's `_parse_citations`
+/// [`Annotation`]s. Mirrors upstream's `_parse_citations`
 /// (`_chat_client.py` ~611-670), including which field feeds `title` for
 /// each citation type:
 ///
@@ -698,14 +741,14 @@ fn tool_use_id(block: &Value) -> String {
 /// in practice is always absent) rather than "corrected" to `document_title`,
 /// per this task's mandate to match upstream's exact behavior; flagged in
 /// the implementation report.
-pub(crate) fn parse_citations(block: &Value) -> Option<Vec<CitationAnnotation>> {
+pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
     let citations = block.get("citations").and_then(Value::as_array)?;
     if citations.is_empty() {
         return None;
     }
     let mut annotations = Vec::with_capacity(citations.len());
     for citation in citations {
-        let mut cit = CitationAnnotation::default();
+        let mut cit = Annotation::default();
         // Plain (possibly-absent) string field, assigned unconditionally --
         // mirrors upstream's bare `cit.title = citation.xxx` /
         // `cit.snippet = citation.cited_text` / `cit.url = citation.xxx`,
@@ -804,24 +847,14 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
     let mut details = UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
-        total_token_count: None,
-        additional_counts: Default::default(),
+        cache_creation_input_token_count: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        ..Default::default()
     };
     if let (Some(i), Some(o)) = (details.input_token_count, details.output_token_count) {
         details.total_token_count = Some(i + o);
-    }
-    if let Some(v) = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-    {
-        details
-            .additional_counts
-            .insert("anthropic.cache_creation_input_tokens".into(), v);
-    }
-    if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-        details
-            .additional_counts
-            .insert("anthropic.cache_read_input_tokens".into(), v);
     }
     details
 }
@@ -834,24 +867,18 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 /// aggregating a stream) would double-count output tokens, so this
 /// deliberately omits `output_tokens` here.
 pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
-    let mut details = UsageDetails {
+    let details = UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
+        cache_creation_input_token_count: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
         ..Default::default()
     };
-    if let Some(v) = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
+    if details.input_token_count.is_none()
+        && details.cache_creation_input_token_count.is_none()
+        && details.cache_read_input_token_count.is_none()
     {
-        details
-            .additional_counts
-            .insert("anthropic.cache_creation_input_tokens".into(), v);
-    }
-    if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-        details
-            .additional_counts
-            .insert("anthropic.cache_read_input_tokens".into(), v);
-    }
-    if details.input_token_count.is_none() && details.additional_counts.is_empty() {
         return None;
     }
     Some(UsageContent { details })
@@ -862,8 +889,8 @@ mod tests {
     use super::*;
     use agent_framework_core::tools::ApprovalMode;
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
     // region: request building
@@ -891,7 +918,7 @@ mod tests {
 
     #[test]
     fn build_request_extracts_leading_system_message() {
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = build_request(&messages, &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(body["system"], json!("Be terse."));
         assert_eq!(
@@ -902,7 +929,7 @@ mod tests {
 
     #[test]
     fn build_request_combines_options_instructions_and_system_message() {
-        let messages = vec![ChatMessage::system("Also be nice."), user("Hi")];
+        let messages = vec![Message::system("Also be nice."), user("Hi")];
         let options = ChatOptions::new().with_instructions("Be terse.");
         let body = build_request(&messages, &options, "claude-x", 4096, false);
         assert_eq!(body["system"], json!("Be terse.\n\nAlso be nice."));
@@ -910,7 +937,7 @@ mod tests {
 
     #[test]
     fn build_request_tool_role_message_becomes_user_tool_result() {
-        let tool_msg = ChatMessage::with_contents(
+        let tool_msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 "call_1",
@@ -931,8 +958,7 @@ mod tests {
     fn build_request_tool_result_error_sets_is_error() {
         let mut result = FunctionResultContent::new("call_1", None);
         result.exception = Some("boom".into());
-        let tool_msg =
-            ChatMessage::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
+        let tool_msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         let body = build_request(&[tool_msg], &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(
             body["messages"][0]["content"][0],
@@ -951,7 +977,7 @@ mod tests {
             )]))),
         );
         let assistant_msg =
-            ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
         let body = build_request(
             &[assistant_msg],
             &ChatOptions::new(),
@@ -977,7 +1003,7 @@ mod tests {
     #[test]
     fn build_request_data_content_image_uses_embedded_base64() {
         let dc = DataContent::from_bytes(b"hello", "image/png");
-        let msg = ChatMessage::with_contents(Role::user(), vec![Content::Data(dc.clone())]);
+        let msg = Message::with_contents(Role::user(), vec![Content::Data(dc.clone())]);
         let body = build_request(&[msg], &ChatOptions::new(), "claude-x", 4096, false);
         let (_, expected_data) = split_data_uri(&dc.uri).unwrap();
         assert_eq!(
@@ -992,7 +1018,7 @@ mod tests {
             uri: "https://example.com/cat.png".into(),
             media_type: "image/png".into(),
         };
-        let msg = ChatMessage::with_contents(Role::user(), vec![Content::Uri(uc)]);
+        let msg = Message::with_contents(Role::user(), vec![Content::Uri(uc)]);
         let body = build_request(&[msg], &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(
             body["messages"][0]["content"][0],
@@ -1063,6 +1089,71 @@ mod tests {
 
     // endregion
 
+    // region: build_cloud_request (multi-cloud transports)
+
+    #[test]
+    fn build_cloud_request_omits_model_and_sets_anthropic_version() {
+        let body = build_cloud_request(
+            &[user("hi")],
+            &ChatOptions::new(),
+            4096,
+            false,
+            "bedrock-2023-05-31",
+        );
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], json!("bedrock-2023-05-31"));
+        assert_eq!(body["max_tokens"], json!(4096));
+    }
+
+    #[test]
+    fn build_cloud_request_uses_given_anthropic_version() {
+        let body = build_cloud_request(
+            &[user("hi")],
+            &ChatOptions::new(),
+            4096,
+            false,
+            "vertex-2023-10-16",
+        );
+        assert_eq!(body["anthropic_version"], json!("vertex-2023-10-16"));
+    }
+
+    #[test]
+    fn build_cloud_request_messages_system_and_tools_match_build_request() {
+        let tool = ToolDefinition {
+            name: "get_weather".into(),
+            description: "Get the weather".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            kind: ToolKind::Function,
+            approval_mode: ApprovalMode::NeverRequire,
+            executor: None,
+        };
+        let messages = vec![Message::system("Be terse."), user("Hi")];
+        let options = ChatOptions::new()
+            .with_tool(tool)
+            .with_tool_choice(ToolMode::Required(Some("get_weather".into())));
+
+        let direct = build_request(&messages, &options, "claude-x", 4096, false);
+        let cloud = build_cloud_request(&messages, &options, 4096, false, "bedrock-2023-05-31");
+
+        assert_eq!(cloud["messages"], direct["messages"]);
+        assert_eq!(cloud["system"], direct["system"]);
+        assert_eq!(cloud["tools"], direct["tools"]);
+        assert_eq!(cloud["tool_choice"], direct["tool_choice"]);
+    }
+
+    #[test]
+    fn build_cloud_request_stream_flag_and_additional_properties() {
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("top_k".into(), json!(5));
+        let body = build_cloud_request(&[user("hi")], &options, 4096, true, "foundry-2025-01-01");
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["top_k"], json!(5));
+    }
+
+    // endregion
+
     // region: response_format (structured output)
     //
     // Anthropic's Messages API has no native `response_format` field (see
@@ -1114,7 +1205,7 @@ mod tests {
     fn build_request_response_format_json_schema_appends_after_existing_system() {
         // A leading system message and `response_format` must combine, not
         // clobber one another.
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let mut options = ChatOptions::new();
         options.response_format = Some(ResponseFormat::JsonObject);
         let body = build_request(&messages, &options, "claude-x", 4096, false);
@@ -1185,18 +1276,8 @@ mod tests {
         });
         let resp = parse_response(&value);
         let usage = resp.usage_details.unwrap();
-        assert_eq!(
-            usage
-                .additional_counts
-                .get("anthropic.cache_creation_input_tokens"),
-            Some(&50)
-        );
-        assert_eq!(
-            usage
-                .additional_counts
-                .get("anthropic.cache_read_input_tokens"),
-            Some(&20)
-        );
+        assert_eq!(usage.cache_creation_input_token_count, Some(50));
+        assert_eq!(usage.cache_read_input_token_count, Some(20));
     }
 
     #[test]
@@ -1222,11 +1303,11 @@ mod tests {
     #[test]
     fn consecutive_same_role_messages_are_merged() {
         let msgs = vec![
-            ChatMessage::user("first"),
-            ChatMessage::user("second"),
-            ChatMessage::assistant("reply"),
-            ChatMessage::assistant("more"),
-            ChatMessage::user("third"),
+            Message::user("first"),
+            Message::user("second"),
+            Message::assistant("reply"),
+            Message::assistant("more"),
+            Message::user("third"),
         ];
         let out = messages_to_anthropic(&msgs);
         assert_eq!(out.len(), 3);
@@ -1239,10 +1320,7 @@ mod tests {
 
     #[test]
     fn leading_assistant_message_gets_synthetic_user_turn() {
-        let msgs = vec![
-            ChatMessage::assistant("greeting"),
-            ChatMessage::user("hello"),
-        ];
+        let msgs = vec![Message::assistant("greeting"), Message::user("hello")];
         let out = messages_to_anthropic(&msgs);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["role"], "user");
@@ -1895,7 +1973,7 @@ mod tests {
         });
         let annotations = parse_citations(&block).unwrap();
         assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0], CitationAnnotation::default());
+        assert_eq!(annotations[0], Annotation::default());
     }
 
     #[test]

@@ -11,13 +11,13 @@ use axum::http::StatusCode;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use agent_framework_core::agent::{Agent, ChatAgent};
+use agent_framework_core::agent::{Agent, SupportsAgentRun};
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
-    AgentRunResponse, ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, Role,
+    AgentResponse, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, Message, Role,
 };
 use agent_framework_hosting::agui::AgUiRouter;
 
@@ -113,19 +113,19 @@ async fn missing_ids_are_generated_and_echoed() {
 struct FrontendToolAgent;
 
 #[async_trait]
-impl Agent for FrontendToolAgent {
+impl SupportsAgentRun for FrontendToolAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_1",
             "get_weather",
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
-        Ok(AgentRunResponse {
-            messages: vec![ChatMessage::with_contents(
+        Ok(AgentResponse {
+            messages: vec![Message::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call)],
             )],
@@ -139,8 +139,11 @@ impl Agent for FrontendToolAgent {
 
 #[tokio::test]
 async fn frontend_tool_call_framing_without_result() {
-    let app =
-        AgUiRouter::for_agent("tools", Arc::new(FrontendToolAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "tools",
+        Arc::new(FrontendToolAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({
         "threadId": "t", "runId": "r",
@@ -181,20 +184,20 @@ async fn frontend_tool_call_framing_without_result() {
 struct ExecutedToolAgent;
 
 #[async_trait]
-impl Agent for ExecutedToolAgent {
+impl SupportsAgentRun for ExecutedToolAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_9",
             "lookup",
             Some(FunctionArguments::Raw(r#"{"q":"x"}"#.to_string())),
         );
         let result = FunctionResultContent::new("call_9", Some(json!({ "answer": 42 })));
-        Ok(AgentRunResponse {
-            messages: vec![ChatMessage::with_contents(
+        Ok(AgentResponse {
+            messages: vec![Message::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call), Content::FunctionResult(result)],
             )],
@@ -208,8 +211,11 @@ impl Agent for ExecutedToolAgent {
 
 #[tokio::test]
 async fn executed_tool_call_emits_end_then_result() {
-    let app =
-        AgUiRouter::for_agent("tools", Arc::new(ExecutedToolAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "tools",
+        Arc::new(ExecutedToolAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({ "threadId": "t", "runId": "r", "messages": [] });
     let (status, text) = post_raw(app, "/", body.to_string()).await;
@@ -246,12 +252,12 @@ async fn executed_tool_call_emits_end_then_result() {
 struct FailingAgent;
 
 #[async_trait]
-impl Agent for FailingAgent {
+impl SupportsAgentRun for FailingAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         Err(Error::AgentExecution("kaboom".to_string()))
     }
     fn id(&self) -> &str {
@@ -261,7 +267,8 @@ impl Agent for FailingAgent {
 
 #[tokio::test]
 async fn agent_failure_emits_run_error() {
-    let app = AgUiRouter::for_agent("boom", Arc::new(FailingAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent("boom", Arc::new(FailingAgent) as Arc<dyn SupportsAgentRun>)
+        .into_router();
 
     let body = json!({ "threadId": "t", "runId": "r", "messages": [] });
     // The stream itself is a normal 200 text/event-stream; the failure is in-band.
@@ -294,12 +301,12 @@ async fn malformed_input_is_400() {
 struct InspectAgent;
 
 #[async_trait]
-impl Agent for InspectAgent {
+impl SupportsAgentRun for InspectAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         let mut parts: Vec<String> = Vec::new();
         for m in &messages {
             for c in &m.contents {
@@ -317,8 +324,8 @@ impl Agent for InspectAgent {
                 }
             }
         }
-        Ok(AgentRunResponse {
-            messages: vec![ChatMessage::assistant(parts.join("|"))],
+        Ok(AgentResponse {
+            messages: vec![Message::assistant(parts.join("|"))],
             ..Default::default()
         })
     }
@@ -331,8 +338,11 @@ impl Agent for InspectAgent {
 async fn assistant_tool_call_and_tool_result_messages_are_mapped() {
     // A prior assistant tool call + a tool result in the history should map to
     // FunctionCall / FunctionResult content and reach the agent intact.
-    let app =
-        AgUiRouter::for_agent("inspect", Arc::new(InspectAgent) as Arc<dyn Agent>).into_router();
+    let app = AgUiRouter::for_agent(
+        "inspect",
+        Arc::new(InspectAgent) as Arc<dyn SupportsAgentRun>,
+    )
+    .into_router();
 
     let body = json!({
         "threadId": "t", "runId": "r",
@@ -457,7 +467,7 @@ struct WeatherClient;
 impl ChatClient for WeatherClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         if options.tools.iter().any(|t| t.name == "get_weather") {
@@ -467,7 +477,7 @@ impl ChatClient for WeatherClient {
                 Some(FunctionArguments::Raw(json!({"city": "Paris"}).to_string())),
             );
             Ok(ChatResponse {
-                messages: vec![ChatMessage::with_contents(
+                messages: vec![Message::with_contents(
                     Role::assistant(),
                     vec![Content::FunctionCall(call)],
                 )],
@@ -480,7 +490,7 @@ impl ChatClient for WeatherClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -501,7 +511,7 @@ impl ChatClient for WeatherClient {
 
 #[tokio::test]
 async fn client_declared_tools_are_injected_and_round_trip_as_frontend_tools() {
-    let agent = ChatAgent::builder(WeatherClient).name("assistant").build();
+    let agent = Agent::builder(WeatherClient).name("assistant").build();
     let app = AgUiRouter::for_agent("assistant", agent).into_router();
 
     let body = json!({

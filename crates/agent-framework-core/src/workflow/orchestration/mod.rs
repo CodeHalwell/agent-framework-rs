@@ -1,7 +1,7 @@
 //! Prebuilt orchestration patterns built on the workflow engine.
 //!
-//! Each pattern wraps [`Agent`]s as workflow [`Executor`] nodes that pass a
-//! shared conversation (`Vec<ChatMessage>`, carried as JSON) between
+//! Each pattern wraps [`SupportsAgentRun`]s as workflow [`Executor`] nodes that pass a
+//! shared conversation (`Vec<Message>`, carried as JSON) between
 //! participants:
 //!
 //! - [`SequentialBuilder`] / [`ConcurrentBuilder`] — pipeline and fan-out/fan-in.
@@ -11,7 +11,7 @@
 //!   calls, optionally requesting fresh user input between turns.
 //! - [`MagenticBuilder`] — Magentic-One style planning + progress-ledger
 //!   orchestration driven by a [`MagenticManager`].
-//! - [`WorkflowAgent`] — expose a built [`Workflow`] as an [`Agent`].
+//! - [`WorkflowAgent`] — expose a built [`Workflow`] as an [`SupportsAgentRun`].
 //!
 //! Rust equivalents of `agent_framework._workflows` (`_sequential`,
 //! `_concurrent`, `_group_chat`, `_handoff`, `_magentic`, `_agent`).
@@ -21,7 +21,7 @@
 //! The Python orchestrators build a multi-node graph in which the orchestrator
 //! and every participant are separate executors that exchange envelope messages.
 //! This Rust port keeps each orchestrator as a **single** [`Executor`] that
-//! drives its participants by calling [`Agent::run`] directly (the same approach
+//! drives its participants by calling [`SupportsAgentRun::run`] directly (the same approach
 //! the built-in [`AgentExecutor`] already uses), looping internally within one
 //! superstep. Human-in-the-loop patterns (handoff interactive mode) still pause
 //! and resume across supersteps via the engine's
@@ -37,10 +37,11 @@ use serde_json::Value;
 use super::context::WorkflowContext;
 use super::events::WorkflowEvent;
 use super::executor::Executor;
-use crate::agent::Agent;
+use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
-use crate::types::{AgentRunResponse, AgentRunResponseUpdate, ChatMessage};
+use crate::types::{AgentResponse, AgentResponseUpdate, Message};
 
+mod approval;
 mod concurrent;
 mod group_chat;
 mod handoff;
@@ -48,6 +49,7 @@ mod magentic;
 mod sequential;
 mod workflow_agent;
 
+pub use approval::{AgentApprovalExecutor, ApprovalRequest};
 pub use concurrent::ConcurrentBuilder;
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
@@ -74,13 +76,13 @@ pub use workflow_agent::{WorkflowAgent, WorkflowAgentExt};
 ///
 /// Accepts a bare string (→ one user message), an array of messages, or a
 /// single message object. Shared by every orchestration executor.
-pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<ChatMessage>> {
+pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<Message>> {
     match value {
-        Value::String(s) => Ok(vec![ChatMessage::user(s.clone())]),
+        Value::String(s) => Ok(vec![Message::user(s.clone())]),
         Value::Array(_) => serde_json::from_value(value.clone())
             .map_err(|e| Error::Workflow(format!("invalid conversation: {e}"))),
         Value::Object(_) => {
-            let msg: ChatMessage = serde_json::from_value(value.clone())
+            let msg: Message = serde_json::from_value(value.clone())
                 .map_err(|e| Error::Workflow(format!("invalid message: {e}")))?;
             Ok(vec![msg])
         }
@@ -92,7 +94,7 @@ pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<ChatMessage>> {
 ///
 /// Mirrors Python's `ensure_author`: participants and orchestrators tag their
 /// messages so the running transcript attributes each turn to its speaker.
-pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage {
+pub(crate) fn ensure_author(mut message: Message, name: &str) -> Message {
     if message.author_name.is_none() {
         message.author_name = Some(name.to_string());
     }
@@ -101,23 +103,23 @@ pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage
 
 /// Run an agent over a conversation and surface its activity on the event
 /// stream incrementally: an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate)
-/// per streamed [`AgentRunResponseUpdate`] as it arrives, then a final
+/// per streamed [`AgentResponseUpdate`] as it arrives, then a final
 /// aggregated [`AgentRun`](WorkflowEvent::AgentRun). Returns the response with
 /// every message attributed to `author`.
 ///
 /// Mirrors upstream `AgentExecutor`'s streaming (`_agent_executor.py:268-360`),
 /// which drives the agent via `run_stream` and emits an `AgentRunUpdateEvent`
 /// per update before the terminal `AgentRunEvent`. The updates are aggregated
-/// back into an [`AgentRunResponse`] via [`AgentRunResponse::from_updates`].
+/// back into an [`AgentResponse`] via [`AgentResponse::from_updates`].
 pub(crate) async fn run_agent_and_emit(
-    agent: &Arc<dyn Agent>,
-    conversation: Vec<ChatMessage>,
+    agent: &Arc<dyn SupportsAgentRun>,
+    conversation: Vec<Message>,
     executor_id: &str,
     author: &str,
     ctx: &WorkflowContext,
-) -> Result<AgentRunResponse> {
+) -> Result<AgentResponse> {
     let mut stream = agent.run_stream(conversation, None, None).await?;
-    let mut updates: Vec<AgentRunResponseUpdate> = Vec::new();
+    let mut updates: Vec<AgentResponseUpdate> = Vec::new();
     while let Some(item) = stream.next().await {
         let mut update = item?;
         if update.author_name.is_none() {
@@ -132,7 +134,7 @@ pub(crate) async fn run_agent_and_emit(
         updates.push(update);
     }
 
-    let mut response = AgentRunResponse::from_updates(updates);
+    let mut response = AgentResponse::from_updates(updates);
     for msg in &mut response.messages {
         if msg.author_name.is_none() {
             msg.author_name = Some(author.to_string());
@@ -147,29 +149,51 @@ pub(crate) async fn run_agent_and_emit(
     Ok(response)
 }
 
-/// An [`Executor`] that runs an [`Agent`] over the incoming conversation and
+/// An [`Executor`] that runs an [`SupportsAgentRun`] over the incoming conversation and
 /// appends the agent's reply. Rust analogue of `AgentExecutor`.
 pub struct AgentExecutor {
     id: String,
-    agent: Arc<dyn Agent>,
-    /// When true, yield the conversation as workflow output instead of sending.
+    agent: Arc<dyn SupportsAgentRun>,
+    /// When true, yield the conversation as a workflow output (in addition to
+    /// sending it downstream when [`Self::also_send`] is set).
     emit_output: bool,
+    /// When true, forward the conversation downstream even though
+    /// `emit_output` is also set. Lets a builder designate an interior
+    /// participant (not just the terminal one) as an output/intermediate
+    /// source — see [`SequentialBuilder::output_from`](super::SequentialBuilder::output_from)
+    /// and [`ConcurrentBuilder::output_from`](super::ConcurrentBuilder::output_from).
+    also_send: bool,
 }
 
 impl AgentExecutor {
     /// Wrap `agent` as an executor with the given `id`.
-    pub fn new(id: impl Into<String>, agent: Arc<dyn Agent>) -> Self {
+    pub fn new(id: impl Into<String>, agent: Arc<dyn SupportsAgentRun>) -> Self {
         Self {
             id: id.into(),
             agent,
             emit_output: false,
+            also_send: false,
         }
     }
 
     /// When set, the executor yields the running conversation as a workflow
-    /// output instead of forwarding it downstream.
+    /// output. Unless [`Self::with_also_send`] is also set, this replaces
+    /// forwarding the conversation downstream (the pre-designation default:
+    /// a pipeline's terminal executor only yields, it has nothing downstream
+    /// to send to).
     pub fn with_output(mut self, emit_output: bool) -> Self {
         self.emit_output = emit_output;
+        self
+    }
+
+    /// When set, the executor forwards the conversation downstream via
+    /// [`WorkflowContext::send_message`] even if [`Self::with_output`] is
+    /// also set (rather than the exclusive-or default). Needed whenever an
+    /// interior (non-terminal) participant is designated as an output or
+    /// intermediate-output source and must still hand the conversation to
+    /// the next stage / the fan-in barrier.
+    pub fn with_also_send(mut self, also_send: bool) -> Self {
+        self.also_send = also_send;
         self
     }
 }
@@ -189,8 +213,9 @@ impl Executor for AgentExecutor {
         let payload = serde_json::to_value(&conversation)
             .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))?;
         if self.emit_output {
-            ctx.yield_output(payload).await?;
-        } else {
+            ctx.yield_output(payload.clone()).await?;
+        }
+        if !self.emit_output || self.also_send {
             ctx.send_message(payload).await?;
         }
         Ok(())

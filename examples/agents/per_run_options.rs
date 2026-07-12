@@ -18,8 +18,8 @@ use serde_json::json;
 /// A client that reports the system instructions, temperature, and tool
 /// names it was actually called with, so the merge is observable. Note that
 /// by the time a request reaches the client, `ChatOptions::instructions` has
-/// already been consumed and turned into a leading system `ChatMessage` (see
-/// `ChatAgent::prepare_request`) -- so we read it off `messages`, not
+/// already been consumed and turned into a leading system `Message` (see
+/// `Agent::prepare_request`) -- so we read it off `messages`, not
 /// `options`.
 #[derive(Clone)]
 struct ReportingClient;
@@ -28,13 +28,13 @@ struct ReportingClient;
 impl ChatClient for ReportingClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let system = messages
             .iter()
             .find(|m| m.role == Role::system())
-            .map(ChatMessage::text);
+            .map(Message::text);
         let tool_names: Vec<&str> = options.tools.iter().map(|t| t.name.as_str()).collect();
         Ok(ChatResponse::from_text(format!(
             "[client received] system={system:?} temperature={:?} tools={tool_names:?}",
@@ -44,7 +44,7 @@ impl ChatClient for ReportingClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -54,7 +54,7 @@ impl ChatClient for ReportingClient {
 #[tokio::main]
 async fn main() -> Result<()> {
     // A tool available only for the second run below.
-    let scratch_note = AiFunction::new(
+    let scratch_note = FunctionTool::new(
         "scratch_note",
         "Jot down a scratch note (per-run-only tool).",
         json!({ "type": "object", "properties": {} }),
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     )
     .into_definition();
 
-    let agent = ChatAgent::builder(ReportingClient)
+    let agent = Agent::builder(ReportingClient)
         .name("assistant")
         .instructions("Be terse.")
         .temperature(0.2)
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         )
         .with_tool(scratch_note);
     let r2 = agent
-        .run_with_options(vec![ChatMessage::user("Hi again")], None, overrides)
+        .run_with_options(vec![Message::user("Hi again")], None, overrides)
         .await?;
     println!("{}", r2.text());
 

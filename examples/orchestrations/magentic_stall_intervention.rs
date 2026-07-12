@@ -43,17 +43,17 @@ struct ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
-            facts: ChatMessage::assistant("Fact: the dataset lives in data/."),
-            plan: ChatMessage::assistant("1. Load data. 2. Compute stats."),
+            facts: Message::assistant("Fact: the dataset lives in data/."),
+            plan: Message::assistant("1. Load data. 2. Compute stats."),
         });
-        Ok(ChatMessage::assistant("combined ledger"))
+        Ok(Message::assistant("combined ledger"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
         println!("  manager replanning after human intervention");
-        Ok(ChatMessage::assistant("revised combined ledger"))
+        Ok(Message::assistant("revised combined ledger"))
     }
 
     async fn create_progress_ledger(
@@ -76,8 +76,8 @@ impl MagenticManager for ScriptedManager {
             .unwrap_or_else(|| ledger(true, true)))
     }
 
-    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<ChatMessage> {
-        Ok(ChatMessage::assistant("Stats computed successfully."))
+    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
+        Ok(Message::assistant("Stats computed successfully."))
     }
 
     fn max_stall_count(&self) -> usize {
@@ -91,16 +91,16 @@ impl MagenticManager for ScriptedManager {
 
 /// Never invoked (the demo stalls before any speaker turn, then finishes),
 /// but the builder requires a participant.
-fn placeholder() -> Arc<dyn Agent> {
+fn placeholder() -> Arc<dyn SupportsAgentRun> {
     struct Silent;
     #[async_trait]
-    impl Agent for Silent {
+    impl SupportsAgentRun for Silent {
         async fn run(
             &self,
-            _messages: Vec<ChatMessage>,
-            _thread: Option<&mut AgentThread>,
-        ) -> Result<AgentRunResponse> {
-            Ok(AgentRunResponse::default())
+            _messages: Vec<Message>,
+            _session: Option<&mut AgentSession>,
+        ) -> Result<AgentResponse> {
+            Ok(AgentResponse::default())
         }
         fn id(&self) -> &str {
             "worker"
@@ -145,14 +145,11 @@ async fn main() -> Result<()> {
     .await?;
 
     assert_eq!(run.state(), WorkflowRunState::Idle);
-    let conversation: Vec<ChatMessage> =
+    let conversation: Vec<Message> =
         serde_json::from_value(run.last_output().unwrap_or_default()).unwrap_or_default();
     println!(
         "final: {}",
-        conversation
-            .last()
-            .map(ChatMessage::text)
-            .unwrap_or_default()
+        conversation.last().map(Message::text).unwrap_or_default()
     );
 
     Ok(())

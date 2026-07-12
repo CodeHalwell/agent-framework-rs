@@ -32,11 +32,11 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("The answer is 42.");
-        resp.model_id = Some("canned-model-v1".to_string());
+        resp.model = Some("canned-model-v1".to_string());
         resp.finish_reason = Some(FinishReason::stop());
         resp.usage_details = Some(UsageDetails {
             input_token_count: Some(12),
@@ -49,13 +49,13 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some("canned-model-v1")
     }
 }
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     for _ in 0..3 {
         let _ = client
             .get_response(
-                vec![ChatMessage::user("What is the answer?")],
+                vec![Message::user("What is the answer?")],
                 ChatOptions::new().with_model("demo-model"),
             )
             .await?;

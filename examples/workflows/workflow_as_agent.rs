@@ -1,7 +1,7 @@
-//! workflow_as_agent: expose a built `Workflow` as an `Agent` via
+//! workflow_as_agent: expose a built `Workflow` as an `SupportsAgentRun` via
 //! `WorkflowAgentExt::as_agent`, then drive it exactly like any other agent
-//! -- `run` with a caller-supplied `AgentThread` that accumulates history
-//! across calls.
+//! -- `run` with a caller-supplied `AgentSession` (carrying an explicit
+//! `InMemoryHistoryProvider`) that accumulates history across calls.
 //!
 //! Runs fully offline against scripted `ChatClient`s -- no API key or
 //! network needed.
@@ -37,7 +37,7 @@ impl ScriptedClient {
 impl ChatClient for ScriptedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut queue = self.replies.lock().unwrap();
@@ -50,7 +50,7 @@ impl ChatClient for ScriptedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -69,12 +69,12 @@ impl ChatClient for ScriptedClient {
     }
 }
 
-fn scripted_agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn scripted_agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(ScriptedClient::new(replies))
+        Agent::builder(ScriptedClient::new(replies))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]
@@ -104,13 +104,18 @@ async fn main() -> Result<()> {
     let agent = workflow.as_agent("writer_pipeline");
     println!("agent name: {:?}", agent.name());
 
-    let mut thread = agent.get_new_thread();
+    // Attach our own `InMemoryHistoryProvider` (rather than relying on the
+    // one `create_session()` attaches implicitly) so we can inspect the
+    // accumulated history below.
+    let history = Arc::new(InMemoryHistoryProvider::new());
+    let mut session = AgentSession::new()
+        .with_context_providers(vec![history.clone() as Arc<dyn ContextProvider>]);
     for topic in [
         "Explain workflows in one sentence.",
         "Now do the same for sub-workflows.",
     ] {
         let response = agent
-            .run(vec![ChatMessage::user(topic)], Some(&mut thread))
+            .run(vec![Message::user(topic)], Some(&mut session))
             .await?;
         println!("\n> {topic}");
         for msg in &response.messages {
@@ -122,17 +127,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Both turns' input and response messages accumulated on the same thread.
-    // Per turn, `WorkflowAgent::run` writes back the raw input (1 message)
-    // plus the sequential workflow's yielded output -- the full running
-    // conversation (user + drafter + editor, 3 messages) -- so each turn
-    // adds 4 entries: 2 turns x 4 = 8.
-    let history = thread.list_messages().await?;
+    // Both turns' input and response messages accumulated on the same
+    // session. Per turn, `WorkflowAgent::run` writes back the raw input (1
+    // message) plus the sequential workflow's yielded output -- the full
+    // running conversation (user + drafter + editor, 3 messages) -- so each
+    // turn adds 4 entries: 2 turns x 4 = 8.
+    let stored = history.list_messages();
     println!(
-        "\nthread now holds {} messages across both turns",
-        history.len()
+        "\nsession now holds {} messages across both turns",
+        stored.len()
     );
-    assert_eq!(history.len(), 8);
+    assert_eq!(stored.len(), 8);
 
     Ok(())
 }

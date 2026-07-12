@@ -30,22 +30,22 @@ struct ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
-            facts: ChatMessage::assistant("Fact: the release notes live in CHANGELOG.md."),
-            plan: ChatMessage::assistant("1. Draft the notes. 2. Have the editor review."),
+            facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
+            plan: Message::assistant("1. Draft the notes. 2. Have the editor review."),
         };
         *self.ledger.lock().unwrap() = Some(ledger);
-        Ok(ChatMessage::assistant("initial combined ledger"))
+        Ok(Message::assistant("initial combined ledger"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
-            facts: ChatMessage::assistant("Fact: the release notes live in CHANGELOG.md."),
-            plan: ChatMessage::assistant("1. Draft. 2. Review. 3. Add upgrade warnings."),
+            facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
+            plan: Message::assistant("1. Draft. 2. Review. 3. Add upgrade warnings."),
         };
         *self.ledger.lock().unwrap() = Some(ledger);
-        Ok(ChatMessage::assistant("revised combined ledger"))
+        Ok(Message::assistant("revised combined ledger"))
     }
 
     async fn create_progress_ledger(
@@ -63,10 +63,8 @@ impl MagenticManager for ScriptedManager {
         }))?)
     }
 
-    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<ChatMessage> {
-        Ok(ChatMessage::assistant(
-            "Release notes drafted and reviewed.",
-        ))
+    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
+        Ok(Message::assistant("Release notes drafted and reviewed."))
     }
 
     /// Feeds facts/plan text into the plan-review request.
@@ -77,16 +75,16 @@ impl MagenticManager for ScriptedManager {
 
 /// Never actually invoked here (the ledger reports "satisfied" immediately),
 /// but the builder requires at least one participant.
-fn placeholder_participant() -> Arc<dyn Agent> {
+fn placeholder_participant() -> Arc<dyn SupportsAgentRun> {
     struct Silent;
     #[async_trait]
-    impl Agent for Silent {
+    impl SupportsAgentRun for Silent {
         async fn run(
             &self,
-            _messages: Vec<ChatMessage>,
-            _thread: Option<&mut AgentThread>,
-        ) -> Result<AgentRunResponse> {
-            Ok(AgentRunResponse::default())
+            _messages: Vec<Message>,
+            _session: Option<&mut AgentSession>,
+        ) -> Result<AgentResponse> {
+            Ok(AgentResponse::default())
         }
         fn id(&self) -> &str {
             "writer"
@@ -139,14 +137,11 @@ async fn main() -> Result<()> {
     .await?;
     assert_eq!(run.state(), WorkflowRunState::Idle);
 
-    let conversation: Vec<ChatMessage> =
+    let conversation: Vec<Message> =
         serde_json::from_value(run.last_output().unwrap_or_default()).unwrap_or_default();
     println!(
         "final: {}",
-        conversation
-            .last()
-            .map(ChatMessage::text)
-            .unwrap_or_default()
+        conversation.last().map(Message::text).unwrap_or_default()
     );
 
     Ok(())

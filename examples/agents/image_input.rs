@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // bytes. `DataContent::from_bytes` does the encoding.
     let inline = Content::Data(DataContent::from_bytes(TINY_PNG, "image/png"));
 
-    let message = ChatMessage::with_contents(
+    let message = Message::with_contents(
         Role::user(),
         vec![
             Content::text("What do you see in these two images?"),
@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
+    let agent = Agent::builder(client)
         .name("vision-assistant")
         .instructions("Describe images concisely.")
         .build();

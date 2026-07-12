@@ -5,14 +5,14 @@
 //! tool catalog into ready-to-use [`ToolDefinition`]s whose executors call
 //! back into that shared session.
 //!
-//! Two ways to wire one into a [`agent_framework_core::agent::ChatAgent`]:
+//! Two ways to wire one into a [`agent_framework_core::agent::Agent`]:
 //!
 //! - **Static** (frozen at build time): `mcp.tool_definitions().await` once,
-//!   up front, and hand the result to `ChatAgent::builder().tools(..)`. The
+//!   up front, and hand the result to `Agent::builder().tools(..)`. The
 //!   agent never notices a later server-side tool-catalog change.
 //! - **Dynamic** (resolved on every run): all three types implement
 //!   [`agent_framework_core::tools::ToolSource`], so
-//!   `ChatAgent::builder().tool_source(Arc::new(mcp))` connects lazily on
+//!   `Agent::builder().tool_source(Arc::new(mcp))` connects lazily on
 //!   the agent's first run and re-resolves the tool list on every
 //!   subsequent run from a cache that self-invalidates on the server's
 //!   `notifications/tools/list_changed` (see [`McpClient::list_tools_cached`]).
@@ -28,7 +28,7 @@ use tokio::sync::OnceCell;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::{ApprovalMode, Tool, ToolDefinition, ToolSource};
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::client::McpClient;
 use crate::protocol::{
@@ -40,9 +40,9 @@ use crate::transport::{McpStdioTransport, McpStreamableHttpTransport, McpWebsock
 /// The `clientInfo.name` this crate sends during `initialize`.
 const CLIENT_NAME: &str = "agent-framework-rs";
 
-/// Map an MCP `prompts/get` message into a core [`ChatMessage`] — mirrors
+/// Map an MCP `prompts/get` message into a core [`Message`] — mirrors
 /// the Python reference's `_mcp_prompt_message_to_chat_message`.
-fn prompt_message_to_chat_message(msg: &crate::protocol::PromptMessage) -> ChatMessage {
+fn prompt_message_to_chat_message(msg: &crate::protocol::PromptMessage) -> Message {
     role_and_content_to_chat_message(&msg.role, &msg.content)
 }
 /// The `clientInfo.version` this crate sends during `initialize`.
@@ -445,9 +445,9 @@ impl McpStdioTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session
@@ -708,9 +708,9 @@ impl McpStreamableHttpTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session
@@ -980,9 +980,9 @@ impl McpWebsocketTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session

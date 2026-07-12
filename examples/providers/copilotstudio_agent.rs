@@ -1,6 +1,6 @@
 //! Talk to a published Microsoft Copilot Studio agent via the Direct-to-
-//! Engine (D2E) protocol. `CopilotStudioAgent` implements the `Agent` trait;
-//! reusing one `AgentThread` keeps the Copilot Studio conversation id across
+//! Engine (D2E) protocol. `CopilotStudioAgent` implements the `SupportsAgentRun` trait;
+//! reusing one `AgentSession` keeps the Copilot Studio conversation id across
 //! turns.
 //!
 //! Skips gracefully unless configured. Uses Python's env-var conventions:
@@ -42,12 +42,12 @@ async fn main() -> Result<()> {
     let agent = CopilotStudioAgent::new(connection, StaticTokenProvider::new(token))
         .with_name("copilot-studio");
 
-    // A thread keeps the server-side conversation going across turns.
-    let mut thread = agent.get_new_thread();
+    // A session keeps the server-side conversation going across turns.
+    let mut session = agent.create_session();
     let response = agent
         .run(
-            vec![ChatMessage::user("Hello! What can you help with?")],
-            Some(&mut thread),
+            vec![Message::user("Hello! What can you help with?")],
+            Some(&mut session),
         )
         .await?;
     println!("{}", response.text());

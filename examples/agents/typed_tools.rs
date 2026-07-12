@@ -1,10 +1,10 @@
-//! Typed tools: `AiFunction::typed` derives a JSON Schema straight from a
+//! Typed tools: `FunctionTool::typed` derives a JSON Schema straight from a
 //! `#[derive(Deserialize, JsonSchema)]` struct instead of a hand-written
 //! `serde_json::Value` (compare with `agents/tools.rs`, which builds the
 //! schema by hand).
 //!
 //! Runs offline: the schema-derivation and direct-invocation steps need no
-//! network. Only the final step -- wiring the tool into a live `ChatAgent` --
+//! network. Only the final step -- wiring the tool into a live `Agent` --
 //! is env-gated on `OPENAI_API_KEY` and skips gracefully without it.
 //!
 //! ```bash
@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// The tool's arguments. `Deserialize` lets `Tool::invoke` parse the model's
-/// JSON arguments into this type; `JsonSchema` is what `AiFunction::typed`
+/// JSON arguments into this type; `JsonSchema` is what `FunctionTool::typed`
 /// uses to derive the parameters schema below -- no hand-written schema
 /// needed.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -33,10 +33,10 @@ struct WeatherArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `AiFunction::typed` derives the parameters schema from `WeatherArgs`
+    // `FunctionTool::typed` derives the parameters schema from `WeatherArgs`
     // via `schemars` at construction time, and deserializes the model's raw
     // JSON arguments into `WeatherArgs` before calling the closure.
-    let get_weather = AiFunction::typed(
+    let get_weather = FunctionTool::typed(
         "get_weather",
         "Get the current weather for a city.",
         |args: WeatherArgs| async move {
@@ -65,12 +65,12 @@ async fn main() -> Result<()> {
 
     // Wiring it into a live agent is the only part that needs a real model.
     let Ok(_) = std::env::var("OPENAI_API_KEY") else {
-        println!("set OPENAI_API_KEY to also run this tool through a live ChatAgent");
+        println!("set OPENAI_API_KEY to also run this tool through a live Agent");
         return Ok(());
     };
 
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
-    let agent = ChatAgent::builder(client)
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
+    let agent = Agent::builder(client)
         .name("weather-assistant")
         .instructions("You are a weather assistant. Use tools when needed.")
         .tool(get_weather.into_definition())

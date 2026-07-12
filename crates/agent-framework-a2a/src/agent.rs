@@ -1,4 +1,4 @@
-//! [`A2AAgent`]: wraps an [`A2AClient`] as a local [`Agent`].
+//! [`A2AAgent`]: wraps an [`A2AClient`] as a local [`SupportsAgentRun`].
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -9,12 +9,12 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
+use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, DataContent, IntoMessages,
-    Role, UriContent,
+    AgentResponse, AgentResponseUpdate, Content, DataContent, IntoMessages, Message, Role,
+    UriContent,
 };
 
 use crate::client::{A2AClient, A2AEventStream};
@@ -27,9 +27,9 @@ use crate::types::{
 /// Agent2Agent (A2A) protocol client agent.
 ///
 /// Wraps an [`A2AClient`] so a remote, A2A-compliant agent can be used
-/// anywhere the framework expects a local [`Agent`]: [`ChatMessage`]s in,
-/// [`AgentRunResponse`] out, with `contextId`/`taskId` continuity tracked per
-/// [`AgentThread`]. See the crate docs for the exact mapping and how this
+/// anywhere the framework expects a local [`SupportsAgentRun`]: [`Message`]s in,
+/// [`AgentResponse`] out, with `contextId`/`taskId` continuity tracked per
+/// [`AgentSession`]. See the crate docs for the exact mapping and how this
 /// diverges from the Python reference implementation.
 #[derive(Debug, Clone)]
 pub struct A2AAgent {
@@ -41,7 +41,7 @@ pub struct A2AAgent {
 
 impl A2AAgent {
     /// Point at a remote agent's JSON-RPC endpoint directly. The real
-    /// [`AgentCard`] is discovered lazily — on the first [`Agent::run`] call,
+    /// [`AgentCard`] is discovered lazily — on the first [`SupportsAgentRun::run`] call,
     /// or explicitly via [`Self::initialize`] — falling back to using `url`
     /// itself as the JSON-RPC endpoint if discovery isn't available (many
     /// minimal A2A servers don't expose a `.well-known` document).
@@ -89,17 +89,17 @@ impl A2AAgent {
         &self.client
     }
 
-    /// Ergonomic run without an explicit thread (mirrors
-    /// `ChatAgent::run_once`): the conversation starts fresh every call,
-    /// since no [`AgentThread`] is carried across calls to persist
+    /// Ergonomic run without an explicit session (mirrors
+    /// `Agent::run_once`): the conversation starts fresh every call,
+    /// since no [`AgentSession`] is carried across calls to persist
     /// `contextId`/`taskId`.
-    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentRunResponse> {
+    pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
 
     /// Resolve the remote [`AgentCard`], propagating discovery failures.
     ///
-    /// [`Agent::run`] performs the best-effort equivalent of this
+    /// [`SupportsAgentRun::run`] performs the best-effort equivalent of this
     /// automatically on first use; call this explicitly when you want to
     /// know discovery actually succeeded (e.g. to read `capabilities` /
     /// `skills` before the first run) rather than have it silently fall back
@@ -108,7 +108,7 @@ impl A2AAgent {
         self.client.get_agent_card().await
     }
 
-    /// Best-effort card discovery used internally by [`Agent::run`]: unlike
+    /// Best-effort card discovery used internally by [`SupportsAgentRun::run`]: unlike
     /// [`Self::initialize`], never fails the run just because `.well-known`
     /// discovery isn't available.
     async fn ensure_initialized(&self) {
@@ -116,15 +116,15 @@ impl A2AAgent {
     }
 }
 
-/// `contextId`/`taskId` continuity for one [`AgentThread`], packed into
-/// [`AgentThread::service_thread_id`] as JSON (that field is a single
+/// `contextId`/`taskId` continuity for one [`AgentSession`], packed into
+/// [`AgentSession::service_session_id`] as JSON (that field is a single
 /// string, and A2A conversation continuity needs both ids).
 ///
 /// The Python reference does not track this at all: `A2AAgent.run_stream`
 /// accepts a `thread` parameter but never reads or writes it, so every call
 /// sends a context-less message and relies entirely on whatever session
 /// affinity the remote agent infers on its own. Tracking it here lets a
-/// caller that reuses the same [`AgentThread`] across calls have a real
+/// caller that reuses the same [`AgentSession`] across calls have a real
 /// multi-turn A2A conversation, including resuming a task that is paused in
 /// [`TaskState::InputRequired`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -136,8 +136,8 @@ struct ThreadState {
 }
 
 impl ThreadState {
-    /// Decode from `AgentThread::service_thread_id()`; anything absent,
-    /// unparseable, or from an unrelated thread just yields an empty state,
+    /// Decode from `AgentSession::service_session_id()`; anything absent,
+    /// unparseable, or from an unrelated session just yields an empty state,
     /// i.e. "start a fresh A2A conversation".
     fn decode(raw: Option<&str>) -> Self {
         raw.and_then(|s| serde_json::from_str(s).ok())
@@ -155,12 +155,12 @@ impl ThreadState {
 }
 
 #[async_trait]
-impl Agent for A2AAgent {
+impl SupportsAgentRun for A2AAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
+        messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
         // Mirrors the Python reference: only the newest message is sent —
         // earlier turns are already known to the remote agent via its
         // `contextId`/`taskId`, which this port tracks below.
@@ -170,16 +170,16 @@ impl Agent for A2AAgent {
 
         self.ensure_initialized().await;
 
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
 
-        let state = ThreadState::decode(thread.service_thread_id());
+        let state = ThreadState::decode(session.service_session_id());
         let outgoing = chat_message_to_a2a_message(
             last,
             state.context_id.as_deref(),
@@ -214,16 +214,11 @@ impl Agent for A2AAgent {
             }
         };
 
-        // Best effort: this only fails if `thread` already owns a local
-        // message store (mutually exclusive with a service thread id on
-        // `AgentThread`) — e.g. a thread borrowed from a `ChatAgent`. In that
-        // case the run still succeeds; it just won't get contextId/taskId
-        // continuity on that particular thread.
         if let Some(encoded) = new_state.encode() {
-            let _ = thread.set_service_thread_id(encoded);
+            session.set_service_session_id(encoded);
         }
 
-        let mut response = AgentRunResponse {
+        let mut response = AgentResponse {
             messages: out_messages,
             response_id: Some(response_id),
             ..Default::default()
@@ -240,22 +235,22 @@ impl Agent for A2AAgent {
 
     /// Real streaming override: sends the newest message via the client's
     /// `message/stream` SSE endpoint and maps each
-    /// [`MessageStreamEvent`] to an [`AgentRunResponseUpdate`] as it arrives,
+    /// [`MessageStreamEvent`] to an [`AgentResponseUpdate`] as it arrives,
     /// accumulating `contextId`/`taskId` and writing the resulting
-    /// continuity state back onto the (owned) thread once the stream ends —
-    /// mirroring [`Agent::run`]'s bookkeeping on this type. Per-run
+    /// continuity state back onto the (owned) session once the stream ends —
+    /// mirroring [`SupportsAgentRun::run`]'s bookkeeping on this type. Per-run
     /// [`AgentRunOptions`] have no A2A representation; non-empty options are
     /// ignored with a warning.
     ///
-    /// Note: unlike [`ChatAgent`](agent_framework_core::agent::ChatAgent),
-    /// A2A continuity state lives in a plain (non-shared) thread field, so the
-    /// end-of-stream write-back is not observable through a thread clone taken
+    /// Note: unlike [`Agent`](agent_framework_core::agent::Agent),
+    /// A2A continuity state lives in a plain (non-shared) session field, so the
+    /// end-of-stream write-back is not observable through a session clone taken
     /// before streaming — carry the returned continuity forward via
-    /// [`Agent::run`] when you need multi-turn A2A conversations.
+    /// [`SupportsAgentRun::run`] when you need multi-turn A2A conversations.
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
-        thread: Option<AgentThread>,
+        messages: Vec<Message>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         if let Some(opts) = &options {
@@ -276,8 +271,8 @@ impl Agent for A2AAgent {
 
         self.ensure_initialized().await;
 
-        let thread = thread.unwrap_or_else(|| self.get_new_thread());
-        let state = ThreadState::decode(thread.service_thread_id());
+        let session = session.unwrap_or_else(|| self.create_session());
+        let state = ThreadState::decode(session.service_session_id());
         let outgoing = chat_message_to_a2a_message(
             &last,
             state.context_id.as_deref(),
@@ -291,8 +286,8 @@ impl Agent for A2AAgent {
 
         // `state` (decoded above) is threaded through the forwarder, which
         // accumulates `contextId`/`taskId` from the streamed events and writes
-        // the result back onto the thread once the stream ends.
-        let stream = a2a_forward_stream(inner, thread, state, self.name.clone());
+        // the result back onto the session once the stream ends.
+        let stream = a2a_forward_stream(inner, session, state, self.name.clone());
         Ok(stream.boxed())
     }
 
@@ -313,11 +308,11 @@ fn stream_event_to_updates(
     event: &MessageStreamEvent,
     state: &mut ThreadState,
     name: Option<&str>,
-) -> Vec<Result<AgentRunResponseUpdate>> {
+) -> Vec<Result<AgentResponseUpdate>> {
     // `response_id` follows the same rule as the non-streaming `run()`
     // (`SendMessageResult` mapping above): a bare message exposes its
     // message id, task-bearing events expose the task id — so aggregating
-    // the stream yields the same `AgentRunResponse.response_id` and
+    // the stream yields the same `AgentResponse.response_id` and
     // streaming clients can cancel/poll the A2A task.
     let (updates, response_id) = match event {
         MessageStreamEvent::Message(m) => {
@@ -366,7 +361,7 @@ fn stream_event_to_updates(
             )
         }
     };
-    let mut updates: Vec<Result<AgentRunResponseUpdate>> = updates
+    let mut updates: Vec<Result<AgentResponseUpdate>> = updates
         .into_iter()
         .map(|u| {
             u.map(|mut update| {
@@ -390,7 +385,7 @@ fn stream_event_to_updates(
     );
     if updates.is_empty() && is_task_bearing {
         if let Some(id) = response_id {
-            updates.push(Ok(AgentRunResponseUpdate {
+            updates.push(Ok(AgentResponseUpdate {
                 response_id: Some(id),
                 ..Default::default()
             }));
@@ -399,18 +394,15 @@ fn stream_event_to_updates(
     updates
 }
 
-fn wrap_message(
-    result: Result<ChatMessage>,
-    name: Option<&str>,
-) -> Vec<Result<AgentRunResponseUpdate>> {
+fn wrap_message(result: Result<Message>, name: Option<&str>) -> Vec<Result<AgentResponseUpdate>> {
     match result {
         Ok(cm) => vec![Ok(message_to_update(cm, name))],
         Err(e) => vec![Err(e)],
     }
 }
 
-fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentRunResponseUpdate {
-    AgentRunResponseUpdate {
+fn message_to_update(cm: Message, name: Option<&str>) -> AgentResponseUpdate {
+    AgentResponseUpdate {
         contents: cm.contents,
         role: Some(cm.role),
         author_name: cm.author_name.or_else(|| name.map(str::to_string)),
@@ -422,28 +414,28 @@ fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentRunResponseUpd
 /// State carried while forwarding an A2A event stream as agent updates.
 struct A2AForward {
     inner: A2AEventStream,
-    queue: VecDeque<Result<AgentRunResponseUpdate>>,
+    queue: VecDeque<Result<AgentResponseUpdate>>,
     state: ThreadState,
-    thread: Option<AgentThread>,
+    session: Option<AgentSession>,
     name: Option<String>,
     done: bool,
 }
 
 /// Forward an A2A `message/stream` event stream as agent updates, writing the
-/// accumulated `contextId`/`taskId` continuity back onto `thread` once the
+/// accumulated `contextId`/`taskId` continuity back onto `session` once the
 /// stream is exhausted.
 fn a2a_forward_stream(
     inner: A2AEventStream,
-    thread: AgentThread,
+    session: AgentSession,
     state: ThreadState,
     name: Option<String>,
-) -> impl futures::Stream<Item = Result<AgentRunResponseUpdate>> + Send {
+) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
     futures::stream::unfold(
         A2AForward {
             inner,
             queue: VecDeque::new(),
             state,
-            thread: Some(thread),
+            session: Some(session),
             name,
             done: false,
         },
@@ -454,9 +446,9 @@ fn a2a_forward_stream(
                 }
                 if st.done {
                     // Stream exhausted: persist the accumulated continuity.
-                    if let Some(mut thread) = st.thread.take() {
+                    if let Some(mut session) = st.session.take() {
                         if let Some(encoded) = st.state.encode() {
-                            let _ = thread.set_service_thread_id(encoded);
+                            session.set_service_session_id(encoded);
                         }
                     }
                     return None;
@@ -479,10 +471,10 @@ fn a2a_forward_stream(
 }
 
 // ---------------------------------------------------------------------
-// ChatMessage <-> A2A Message/Part conversion
+// Message <-> A2A Message/Part conversion
 // ---------------------------------------------------------------------
 
-/// Convert a framework [`ChatMessage`] into an A2A [`A2AMessage`], carrying
+/// Convert a framework [`Message`] into an A2A [`A2AMessage`], carrying
 /// forward `contextId`/`taskId` for conversation continuity.
 ///
 /// Mirrors the Python reference's `_chat_message_to_a2a_message`: text,
@@ -492,13 +484,13 @@ fn a2a_forward_stream(
 /// matching Python — framework messages passed to `run` are treated as user
 /// input regardless of their original [`Role`].
 fn chat_message_to_a2a_message(
-    message: &ChatMessage,
+    message: &Message,
     context_id: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<A2AMessage> {
     if message.contents.is_empty() {
         return Err(Error::Content(
-            "ChatMessage.contents is empty; cannot convert to an A2A message".into(),
+            "Message.contents is empty; cannot convert to an A2A message".into(),
         ));
     }
 
@@ -586,8 +578,20 @@ fn content_type_name(content: &Content) -> &'static str {
         Content::Usage(_) => "usage",
         Content::HostedFile(_) => "hosted_file",
         Content::HostedVectorStore(_) => "hosted_vector_store",
+        Content::CodeInterpreterToolCall(_) => "code_interpreter_tool_call",
+        Content::CodeInterpreterToolResult(_) => "code_interpreter_tool_result",
+        Content::ImageGenerationToolCall(_) => "image_generation_tool_call",
+        Content::ImageGenerationToolResult(_) => "image_generation_tool_result",
+        Content::McpServerToolCall(_) => "mcp_server_tool_call",
+        Content::McpServerToolResult(_) => "mcp_server_tool_result",
+        Content::SearchToolCall(_) => "search_tool_call",
+        Content::SearchToolResult(_) => "search_tool_result",
+        Content::ShellToolCall(_) => "shell_tool_call",
+        Content::ShellToolResult(_) => "shell_tool_result",
+        Content::ShellCommandOutput(_) => "shell_command_output",
         Content::FunctionApprovalRequest(_) => "function_approval_request",
         Content::FunctionApprovalResponse(_) => "function_approval_response",
+        Content::OauthConsentRequest(_) => "oauth_consent_request",
         Content::Unknown => "unknown",
     }
 }
@@ -655,8 +659,8 @@ fn metadata_to_additional_properties(metadata: &Option<Value>) -> HashMap<String
     }
 }
 
-fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<ChatMessage> {
-    Ok(ChatMessage {
+fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<Message> {
+    Ok(Message {
         role: a2a_role_to_role(message.role),
         contents: a2a_parts_to_contents(&message.parts)?,
         author_name: None,
@@ -665,8 +669,8 @@ fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<ChatMessage> {
     })
 }
 
-fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
-    Ok(ChatMessage {
+fn artifact_to_chat_message(artifact: &Artifact) -> Result<Message> {
+    Ok(Message {
         role: Role::assistant(),
         contents: a2a_parts_to_contents(&artifact.parts)?,
         author_name: None,
@@ -675,7 +679,7 @@ fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
     })
 }
 
-/// Map a returned [`Task`] to zero or more [`ChatMessage`]s.
+/// Map a returned [`Task`] to zero or more [`Message`]s.
 ///
 /// Priority:
 /// 1. If the task is paused in [`TaskState::InputRequired`] and carries a
@@ -686,12 +690,12 @@ fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
 ///    no messages here unless the server happens to also put the question in
 ///    `history`.
 /// 2. Otherwise, mirrors Python's `_task_to_chat_messages`: prefer
-///    `artifacts` (one [`ChatMessage`] per artifact), falling back to the
+///    `artifacts` (one [`Message`] per artifact), falling back to the
 ///    last `history` entry, else no messages at all (the task is still
 ///    `working`/`submitted` with nothing to show yet — poll
 ///    [`A2AClient::get_task`](crate::client::A2AClient::get_task) for
 ///    updates).
-fn task_to_chat_messages(task: &Task) -> Result<Vec<ChatMessage>> {
+fn task_to_chat_messages(task: &Task) -> Result<Vec<Message>> {
     if task.status.state == TaskState::InputRequired {
         if let Some(msg) = &task.status.message {
             return Ok(vec![a2a_message_to_chat_message(msg)?]);
@@ -718,11 +722,11 @@ mod tests {
         ErrorContent, FunctionCallContent, HostedFileContent, TextContent,
     };
 
-    fn text_message(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn text_message(text: &str) -> Message {
+        Message::user(text)
     }
 
-    // -- ChatMessage -> A2A Message -----------------------------------
+    // -- Message -> A2A Message -----------------------------------
 
     #[test]
     fn chat_message_to_a2a_message_maps_text() {
@@ -738,7 +742,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_error_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Error(ErrorContent {
                 message: Some("Test error message".into()),
@@ -755,7 +759,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_uri_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Uri(UriContent {
                 uri: "http://example.com/file.pdf".into(),
@@ -777,7 +781,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_data_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Data(DataContent::from_bytes(
                 b"hello",
@@ -800,7 +804,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_hosted_file() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::HostedFile(HostedFileContent {
                 file_id: "hosted://storage/document.pdf".into(),
@@ -821,7 +825,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_rejects_function_call_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::assistant(),
             vec![Content::FunctionCall(FunctionCallContent::new(
                 "call-1",
@@ -835,7 +839,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_empty_contents_errors() {
-        let msg = ChatMessage::with_contents(agent_framework_core::types::Role::user(), Vec::new());
+        let msg = Message::with_contents(agent_framework_core::types::Role::user(), Vec::new());
         let err = chat_message_to_a2a_message(&msg, None, None).unwrap_err();
         assert!(matches!(err, Error::Content(_)));
     }
@@ -850,7 +854,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_with_multiple_contents() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![
                 Content::Text(TextContent::new("Here's the analysis:")),
@@ -1072,7 +1076,7 @@ mod tests {
 
     // -- ThreadState --------------------------------------------------
 
-    // -- Streaming event -> update mapping (Agent::run_stream override) -----
+    // -- Streaming event -> update mapping (SupportsAgentRun::run_stream override) -----
 
     #[test]
     fn stream_event_message_maps_to_update_and_tracks_ids() {
@@ -1256,7 +1260,7 @@ mod tests {
         );
     }
 
-    // -- Agent trait plumbing -------------------------------------------
+    // -- SupportsAgentRun trait plumbing -------------------------------------------
 
     #[test]
     fn from_url_sets_name_and_random_id() {

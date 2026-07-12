@@ -28,7 +28,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -41,7 +41,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -60,13 +60,13 @@ impl ChatClient for MockClient {
     }
 }
 
-fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
+fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn SupportsAgentRun> {
     let responses = replies.into_iter().map(ChatResponse::from_text).collect();
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
 fn ledger_json(
@@ -85,7 +85,7 @@ fn ledger_json(
     )
 }
 
-fn conversation(run: &WorkflowRun) -> Vec<ChatMessage> {
+fn conversation(run: &WorkflowRun) -> Vec<Message> {
     serde_json::from_value(run.last_output().expect("magentic yields output")).unwrap()
 }
 
@@ -100,7 +100,7 @@ async fn standard_manager_drives_agents_to_completion() {
         ChatResponse::from_text("FINAL ANSWER: the sum is 42"),
     ]);
     let manager_agent =
-        Arc::new(ChatAgent::builder(manager_client).name("mgr").build()) as Arc<dyn Agent>;
+        Arc::new(Agent::builder(manager_client).name("mgr").build()) as Arc<dyn SupportsAgentRun>;
     let manager = StandardMagenticManager::new(manager_agent).max_round_count(10);
 
     let coder = agent("coder", vec!["def solve(): return 42"]);
@@ -115,7 +115,7 @@ async fn standard_manager_drives_agents_to_completion() {
 
     let run = workflow.run("compute the answer").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts
             .iter()
@@ -143,14 +143,14 @@ fn ledger(satisfied: bool, progress: bool, in_loop: bool, next: &str) -> Magenti
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("PLAN"))
+        Ok(Message::assistant("PLAN"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("REPLAN"))
+        Ok(Message::assistant("REPLAN"))
     }
 
     async fn create_progress_ledger(
@@ -168,9 +168,9 @@ impl MagenticManager for ScriptedManager {
         }
     }
 
-    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
         self.final_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("FINAL"))
+        Ok(Message::assistant("FINAL"))
     }
 
     fn max_stall_count(&self) -> usize {
@@ -254,4 +254,81 @@ async fn round_limit_yields_partial_not_final() {
         "round-limit exhaustion yields a partial result, not a synthesized final answer"
     );
     assert!(!conv.is_empty(), "a partial result is yielded");
+}
+
+/// `intermediate_output_from` demotes the orchestrator's single final yield
+/// (the synthesized final answer) from the workflow's terminal output to a
+/// non-terminal `Intermediate` event — useful when Magentic is composed as
+/// one stage of a larger pipeline. See [`MagenticBuilder::output_from`] docs
+/// for why this is whole-orchestrator-granular rather than per-participant
+/// (Magentic compiles to a single executor).
+#[tokio::test]
+async fn intermediate_output_from_demotes_final_yield() {
+    let manager = ScriptedManager {
+        ledgers: Mutex::new(Vec::new()), // immediately satisfied
+        fixed_ledger: None,
+        plan_calls: Arc::new(AtomicUsize::new(0)),
+        replan_calls: Arc::new(AtomicUsize::new(0)),
+        final_calls: Arc::new(AtomicUsize::new(0)),
+        max_stall: 5,
+        max_rounds: Some(5),
+        max_resets: Some(5),
+    };
+
+    let coder = agent("coder", vec!["turn-1"]);
+    let workflow = MagenticBuilder::new()
+        .participant("coder", coder)
+        .manager(Arc::new(manager))
+        .intermediate_output_from(["coder"])
+        .build()
+        .unwrap();
+
+    let run = workflow.run("do something").await.unwrap();
+
+    assert!(
+        run.last_output().is_none(),
+        "no terminal output should be recorded once demoted to Intermediate"
+    );
+    let intermediate = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Intermediate { .. }))
+        .count();
+    assert_eq!(
+        intermediate, 1,
+        "the sole yield became a non-terminal event"
+    );
+    let output_events = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::Output { .. }))
+        .count();
+    assert_eq!(output_events, 0);
+}
+
+/// Unknown participant names are rejected at build time.
+#[tokio::test]
+async fn output_from_rejects_unknown_participant() {
+    let coder = agent("coder", vec!["turn-1"]);
+    let manager = ScriptedManager {
+        ledgers: Mutex::new(Vec::new()),
+        fixed_ledger: None,
+        plan_calls: Arc::new(AtomicUsize::new(0)),
+        replan_calls: Arc::new(AtomicUsize::new(0)),
+        final_calls: Arc::new(AtomicUsize::new(0)),
+        max_stall: 5,
+        max_rounds: Some(5),
+        max_resets: Some(5),
+    };
+
+    let err = match MagenticBuilder::new()
+        .participant("coder", coder)
+        .manager(Arc::new(manager))
+        .output_from(["nobody"])
+        .build()
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("nobody"));
 }

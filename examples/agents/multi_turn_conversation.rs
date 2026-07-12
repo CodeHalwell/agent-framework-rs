@@ -1,6 +1,7 @@
-//! One `AgentThread` reused across several `agent.run(...)` calls: each turn
+//! One `AgentSession` reused across several `agent.run(...)` calls: each turn
 //! automatically sees the full history of every prior turn (both sides --
-//! user and assistant messages), accumulated in the thread's message store.
+//! user and assistant messages), accumulated by the session's attached
+//! `InMemoryHistoryProvider`.
 //!
 //! Runs fully offline against a canned client that echoes back every user
 //! message it has seen so far, so the accumulation is visible in the printed
@@ -9,6 +10,8 @@
 //! ```bash
 //! cargo run -p agent-framework-examples --example multi_turn_conversation
 //! ```
+
+use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use async_trait::async_trait;
@@ -22,13 +25,13 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let user_texts: Vec<String> = messages
             .iter()
             .filter(|m| m.role == Role::user())
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect();
         Ok(ChatResponse::from_text(format!(
             "(canned reply) so far you've told me: {}",
@@ -38,7 +41,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -47,8 +50,14 @@ impl ChatClient for CannedClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let agent = ChatAgent::builder(CannedClient).name("assistant").build();
-    let mut thread = agent.get_new_thread();
+    let agent = Agent::builder(CannedClient).name("assistant").build();
+
+    // Keep our own handle to the `InMemoryHistoryProvider` (rather than
+    // letting `create_session()` attach one implicitly) so we can inspect
+    // the accumulated history below.
+    let history = Arc::new(InMemoryHistoryProvider::new());
+    let mut session = AgentSession::new()
+        .with_context_providers(vec![history.clone() as Arc<dyn ContextProvider>]);
 
     let turns = [
         "My favorite color is teal.",
@@ -58,16 +67,16 @@ async fn main() -> Result<()> {
 
     for (i, query) in turns.iter().enumerate() {
         let response = agent
-            .run(vec![ChatMessage::user(*query)], Some(&mut thread))
+            .run(vec![Message::user(*query)], Some(&mut session))
             .await?;
-        let history_len = thread.list_messages().await?.len();
+        let history_len = history.list_messages().len();
         println!("turn {}: user: {query}", i + 1);
         println!("turn {}: assistant: {}", i + 1, response.text());
-        println!("  (thread now holds {history_len} message(s))\n");
+        println!("  (session now holds {history_len} message(s))\n");
     }
 
-    println!("-- full transcript from the thread's message store --");
-    for m in thread.list_messages().await? {
+    println!("-- full transcript from the session's history provider --");
+    for m in history.list_messages() {
         println!("  {}: {}", m.role, m.text());
     }
 

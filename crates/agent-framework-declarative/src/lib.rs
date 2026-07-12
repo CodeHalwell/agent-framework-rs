@@ -1,6 +1,6 @@
 //! # agent-framework-declarative
 //!
-//! Load [`ChatAgent`](agent_framework_core::agent::ChatAgent)s and
+//! Load [`Agent`](agent_framework_core::agent::Agent)s and
 //! [`Workflow`](agent_framework_core::workflow::Workflow)s from declarative
 //! YAML/JSON specifications, mirroring the Microsoft Agent Framework
 //! `agent-framework-declarative` (Python) package.
@@ -12,9 +12,9 @@
 //! agents, then call [`DeclarativeLoader::load_agent`] /
 //! [`DeclarativeLoader::load_workflow`].
 //!
-//! ## Agent specs
+//! ## SupportsAgentRun specs
 //!
-//! Agent specs follow the official schema vocabulary (`kind: Prompt`, `name`,
+//! SupportsAgentRun specs follow the official schema vocabulary (`kind: Prompt`, `name`,
 //! `instructions`, `model.id`/`provider`/`apiType`/`connection`/`options`,
 //! `tools`, `outputSchema`, …). String fields support `${VAR}` /
 //! `${VAR:-default}` environment interpolation.

@@ -10,6 +10,12 @@
 //! | --- | --- | --- |
 //! | `openai` | [`agent_framework_openai`] — OpenAI Chat Completions + Responses API | yes |
 //! | `anthropic` | [`agent_framework_anthropic`] — Anthropic (Claude) Messages API | no |
+//! | `ollama` | [`agent_framework_ollama`] — Ollama (local/remote, OpenAI-compatible) | no |
+//! | `gemini` | [`agent_framework_gemini`] — Google Gemini `generateContent` API | no |
+//! | `mistral` | [`agent_framework_mistral`] — Mistral AI Chat Completions API | no |
+//! | `foundry-local` | [`agent_framework_foundry_local`] — Microsoft Foundry Local (OpenAI-compatible localhost endpoint) | no |
+//! | `bedrock` | [`agent_framework_bedrock`] — AWS Bedrock Converse API (SigV4-signed) | no |
+//! | `github-copilot` | [`agent_framework_github_copilot`] — GitHub Copilot chat API | no |
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
@@ -17,7 +23,7 @@
 //! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, OpenAI-compatible) | no |
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
-//! | `azure-ai` | [`agent_framework_azure_ai`] — Azure AI Foundry persistent agents | no |
+//! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
@@ -29,8 +35,8 @@
 //! use agent_framework::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIClient::from_env("gpt-4o-mini")?;
-//! let agent = ChatAgent::builder(client)
+//! let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
+//! let agent = Agent::builder(client)
 //!     .name("assistant")
 //!     .instructions("You are a helpful assistant.")
 //!     .build();
@@ -52,6 +58,30 @@ pub use agent_framework_openai as openai;
 /// The Anthropic (Claude) provider (enable the `anthropic` feature).
 #[cfg(feature = "anthropic")]
 pub use agent_framework_anthropic as anthropic;
+
+/// The Ollama provider (enable the `ollama` feature).
+#[cfg(feature = "ollama")]
+pub use agent_framework_ollama as ollama;
+
+/// The Google Gemini provider (enable the `gemini` feature).
+#[cfg(feature = "gemini")]
+pub use agent_framework_gemini as gemini;
+
+/// The Mistral AI provider (enable the `mistral` feature).
+#[cfg(feature = "mistral")]
+pub use agent_framework_mistral as mistral;
+
+/// The Microsoft Foundry Local provider (enable the `foundry-local` feature).
+#[cfg(feature = "foundry-local")]
+pub use agent_framework_foundry_local as foundry_local;
+
+/// The AWS Bedrock provider (enable the `bedrock` feature).
+#[cfg(feature = "bedrock")]
+pub use agent_framework_bedrock as bedrock;
+
+/// The GitHub Copilot provider (enable the `github-copilot` feature).
+#[cfg(feature = "github-copilot")]
+pub use agent_framework_github_copilot as github_copilot;
 
 /// The Azure OpenAI provider (enable the `azure` feature).
 #[cfg(feature = "azure")]
@@ -81,9 +111,10 @@ pub use agent_framework_redis as redis;
 #[cfg(feature = "mem0")]
 pub use agent_framework_mem0 as mem0;
 
-/// Azure AI Foundry persistent-agents client (enable the `azure-ai` feature).
-#[cfg(feature = "azure-ai")]
-pub use agent_framework_azure_ai as azure_ai;
+/// Azure AI Foundry Responses API chat client + Prompt Agents (enable the
+/// `foundry` feature).
+#[cfg(feature = "foundry")]
+pub use agent_framework_foundry as foundry;
 
 /// Azure AI Search context provider (enable the `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
@@ -106,10 +137,30 @@ pub mod prelude {
     pub use agent_framework_core::prelude::*;
 
     #[cfg(feature = "openai")]
-    pub use agent_framework_openai::{OpenAIClient, OpenAIResponsesClient};
+    pub use agent_framework_openai::{OpenAIChatClient, OpenAIChatCompletionClient};
 
     #[cfg(feature = "anthropic")]
-    pub use agent_framework_anthropic::AnthropicClient;
+    pub use agent_framework_anthropic::{
+        AnthropicBedrockClient, AnthropicClient, AnthropicFoundryClient, AnthropicVertexClient,
+    };
+
+    #[cfg(feature = "ollama")]
+    pub use agent_framework_ollama::OllamaChatClient;
+
+    #[cfg(feature = "gemini")]
+    pub use agent_framework_gemini::GeminiChatClient;
+
+    #[cfg(feature = "mistral")]
+    pub use agent_framework_mistral::MistralChatClient;
+
+    #[cfg(feature = "foundry-local")]
+    pub use agent_framework_foundry_local::FoundryLocalChatClient;
+
+    #[cfg(feature = "bedrock")]
+    pub use agent_framework_bedrock::BedrockChatClient;
+
+    #[cfg(feature = "github-copilot")]
+    pub use agent_framework_github_copilot::GitHubCopilotChatClient;
 
     #[cfg(feature = "azure")]
     pub use agent_framework_azure::{AzureOpenAIClient, StaticTokenCredential, TokenCredential};
@@ -132,8 +183,8 @@ pub mod prelude {
     #[cfg(feature = "mem0")]
     pub use agent_framework_mem0::Mem0Provider;
 
-    #[cfg(feature = "azure-ai")]
-    pub use agent_framework_azure_ai::AzureAIAgentClient;
+    #[cfg(feature = "foundry")]
+    pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient};
 
     #[cfg(feature = "azure-ai-search")]
     pub use agent_framework_azure_ai_search::AzureAISearchProvider;

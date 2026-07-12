@@ -1,4 +1,4 @@
-//! [`ContentProcessor`]: maps [`ChatMessage`]s to `processContent` requests,
+//! [`ContentProcessor`]: maps [`Message`]s to `processContent` requests,
 //! resolves the acting user id, and evaluates the resulting verdicts.
 //!
 //! A scoped-down port of Python's `ScopedContentProcessor` — see
@@ -11,7 +11,7 @@
 //! bearer-token-JWT fallback — see the crate docs).
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::client::PurviewClient;
 use crate::models::{
@@ -41,7 +41,7 @@ fn is_valid_guid(value: &str) -> bool {
 /// 4. Otherwise `None` — callers must treat this as "cannot evaluate; do not
 ///    block" (see [`ContentProcessor::evaluate`]), matching Python's
 ///    fail-open behavior when no resolvable user id exists.
-pub fn resolve_user_id(messages: &[ChatMessage], provided: Option<&str>) -> Option<String> {
+pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<String> {
     let mut author_name_fallback: Option<String> = None;
     for message in messages {
         if let Some(user_id) = message
@@ -69,7 +69,7 @@ pub fn resolve_user_id(messages: &[ChatMessage], provided: Option<&str>) -> Opti
 /// metadata is always `"Unknown"`/`"Unknown"`, matching Python's hardcoded
 /// values there).
 fn build_request(
-    message: &ChatMessage,
+    message: &Message,
     user_id: &str,
     tenant_id: &str,
     app_name: &str,
@@ -142,7 +142,7 @@ impl ContentProcessor {
     /// (see [`crate::middleware`]), same as Python.
     pub async fn evaluate(
         &self,
-        messages: &[ChatMessage],
+        messages: &[Message],
         settings: &PurviewSettings,
         provided_user_id: Option<&str>,
     ) -> Result<(bool, Option<String>)> {
@@ -200,16 +200,16 @@ mod tests {
     use agent_framework_core::types::Role;
     use std::collections::HashMap;
 
-    fn msg_with_user_id(text: &str, user_id: &str) -> ChatMessage {
-        let mut m = ChatMessage::user(text);
+    fn msg_with_user_id(text: &str, user_id: &str) -> Message {
+        let mut m = Message::user(text);
         let mut props = HashMap::new();
         props.insert("user_id".to_string(), serde_json::json!(user_id));
         m.additional_properties = props;
         m
     }
 
-    fn msg_with_author(text: &str, author_name: &str) -> ChatMessage {
-        ChatMessage::new(Role::user(), text).with_author(author_name)
+    fn msg_with_author(text: &str, author_name: &str) -> Message {
+        Message::new(Role::user(), text).with_author(author_name)
     }
 
     // -- is_valid_guid ------------------------------------------------------
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn resolve_user_id_falls_back_to_provided_when_nothing_in_messages() {
         let guid = "33333333-3333-3333-3333-333333333333";
-        let messages = vec![ChatMessage::user("hi")];
+        let messages = vec![Message::user("hi")];
         assert_eq!(
             resolve_user_id(&messages, Some(guid)).as_deref(),
             Some(guid)
@@ -268,13 +268,13 @@ mod tests {
 
     #[test]
     fn resolve_user_id_ignores_non_guid_provided_fallback() {
-        let messages = vec![ChatMessage::user("hi")];
+        let messages = vec![Message::user("hi")];
         assert!(resolve_user_id(&messages, Some("not-a-guid")).is_none());
     }
 
     #[test]
     fn resolve_user_id_none_when_nothing_resolvable() {
-        let messages = vec![ChatMessage::user("hi"), ChatMessage::assistant("there")];
+        let messages = vec![Message::user("hi"), Message::assistant("there")];
         assert!(resolve_user_id(&messages, None).is_none());
     }
 
@@ -299,7 +299,7 @@ mod tests {
             &settings,
         ));
         let err = processor
-            .evaluate(&[ChatMessage::user("hi")], &settings, None)
+            .evaluate(&[Message::user("hi")], &settings, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("tenant_id"));
@@ -314,7 +314,7 @@ mod tests {
             &settings,
         ));
         let err = processor
-            .evaluate(&[ChatMessage::user("hi")], &settings, None)
+            .evaluate(&[Message::user("hi")], &settings, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("purview_app_location"));
@@ -337,7 +337,7 @@ mod tests {
         ));
         let (should_block, user_id) = processor
             .evaluate(
-                &[ChatMessage::user("hi, no identifying info here")],
+                &[Message::user("hi, no identifying info here")],
                 &settings,
                 None,
             )

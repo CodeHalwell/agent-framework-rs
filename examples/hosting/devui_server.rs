@@ -32,10 +32,10 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let last = messages.last().map(ChatMessage::text).unwrap_or_default();
+        let last = messages.last().map(Message::text).unwrap_or_default();
         Ok(ChatResponse::from_text(format!(
             "(canned reply -- set OPENAI_API_KEY for a real model) You said: {last}"
         )))
@@ -43,7 +43,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -58,15 +58,15 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn build_agent() -> ChatAgent {
+fn build_agent() -> Agent {
     let instructions = "You are a helpful, concise assistant.";
-    match OpenAIClient::from_env("gpt-4o-mini") {
-        Ok(client) => ChatAgent::builder(client)
+    match OpenAIChatCompletionClient::from_env("gpt-4o-mini") {
+        Ok(client) => Agent::builder(client)
             .name("assistant")
             .description("General-purpose assistant served over HTTP.")
             .instructions(instructions)
             .build(),
-        Err(_) => ChatAgent::builder(CannedClient)
+        Err(_) => Agent::builder(CannedClient)
             .name("assistant")
             .description("Offline canned assistant (no OPENAI_API_KEY).")
             .instructions(instructions)

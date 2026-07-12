@@ -56,7 +56,26 @@ pub enum WorkflowEvent {
         response: Value,
     },
     /// A workflow-level output was yielded (`WorkflowOutputEvent`).
+    ///
+    /// Terminal: recorded as (part of) the run's final output. Emitted for
+    /// yields from an executor named by
+    /// [`WorkflowBuilder::output_from`](super::WorkflowBuilder::output_from),
+    /// or from any executor when no output designation is configured at all
+    /// (see [`WorkflowEvent::Intermediate`] for the non-terminal counterpart).
     Output {
+        data: Value,
+        source_executor_id: String,
+    },
+    /// A non-terminal, workflow-level progress signal.
+    ///
+    /// Mirrors upstream's `intermediate` yield classification: emitted for
+    /// yields from an executor named by
+    /// [`WorkflowBuilder::intermediate_output_from`](super::WorkflowBuilder::intermediate_output_from),
+    /// and (when an `output_from` allowlist is configured) for yields from any
+    /// executor *not* on that allowlist, as a safe non-terminal fallback. Never
+    /// recorded as the run's final output ([`WorkflowRun::last_output`](super::WorkflowRun::last_output)
+    /// ignores it).
+    Intermediate {
         data: Value,
         source_executor_id: String,
     },
@@ -78,6 +97,14 @@ impl WorkflowEvent {
     pub fn as_output(&self) -> Option<&Value> {
         match self {
             WorkflowEvent::Output { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// If this is a [`WorkflowEvent::Intermediate`], return the data.
+    pub fn as_intermediate(&self) -> Option<&Value> {
+        match self {
+            WorkflowEvent::Intermediate { data, .. } => Some(data),
             _ => None,
         }
     }

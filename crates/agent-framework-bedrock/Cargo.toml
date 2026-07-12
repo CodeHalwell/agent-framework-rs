@@ -1,0 +1,31 @@
+[package]
+name = "agent-framework-bedrock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AWS Bedrock (Converse API) chat client for agent-framework-rs"
+
+[dependencies]
+agent-framework-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+tokio-stream = { workspace = true }
+uuid = { workspace = true }
+# SigV4 request signing.
+hmac = "0.12"
+sha2 = "0.10"
+# URI canonicalization for the SigV4 canonical request.
+percent-encoding = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }

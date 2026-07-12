@@ -1,69 +1,78 @@
-//! A [`ChatMessageStore`] backed by a Redis `LIST`.
+//! A Redis-backed [`HistoryProvider`]: conversation history stored in a
+//! Redis `LIST`.
 //!
 //! Mirrors the Python `agent_framework_redis.RedisChatMessageStore`: each
-//! conversation thread owns one Redis list at key `{key_prefix}:{thread_id}`,
-//! messages are appended with `RPUSH` (chronological order, oldest first),
-//! read back with `LRANGE`, and — when `max_messages` is configured —
-//! trimmed to the most recent N entries with `LTRIM` after every write. Each
-//! list element is one message, JSON-serialized with `serde_json`
-//! (equivalent to the Python store's `ChatMessage.to_json()` /
-//! `ChatMessage.from_json()` round trip).
+//! session owns one Redis list at key `{key_prefix}:{session_id}`, messages
+//! are appended with `RPUSH` (chronological order, oldest first), read back
+//! with `LRANGE`, and — when `max_messages` is configured — trimmed to the
+//! most recent N entries with `LTRIM` after every write. Each list element
+//! is one message, JSON-serialized with `serde_json` (equivalent to the
+//! Python store's `Message.to_json()` / `Message.from_json()` round trip).
+//!
+//! Upstream folded the standalone `ChatMessageStore` abstraction into
+//! [`HistoryProvider`](agent_framework_core::history::HistoryProvider) — a
+//! `ContextProvider` that prepends its stored messages ahead of a run
+//! (`before_run`) and records the run's request + response messages after a
+//! successful run (`after_run`). [`RedisChatMessageStore`] follows suit
+//! directly (rather than wrapping an [`InMemoryHistoryProvider`]) so history
+//! actually persists to Redis, the same way
+//! [`FileHistoryProvider`](agent_framework_core::history::FileHistoryProvider)
+//! persists to disk.
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::ChatMessageStore;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::history::HistoryProvider;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::types::Message;
 
 use crate::internal::{map_redis_err, LazyConnection};
 
 /// Default Redis key prefix, matching the Python store's default.
 pub const DEFAULT_KEY_PREFIX: &str = "chat_messages";
 
-/// Redis-backed [`ChatMessageStore`]: one Redis `LIST` per conversation
-/// thread, JSON-serialized messages, optional automatic trimming.
+/// Redis-backed [`HistoryProvider`]: one Redis `LIST` per session,
+/// JSON-serialized messages, optional automatic trimming.
 ///
 /// ```no_run
 /// use agent_framework_redis::RedisChatMessageStore;
-/// use agent_framework_core::threads::ChatMessageStore;
-/// use agent_framework_core::types::ChatMessage;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let store = RedisChatMessageStore::new("redis://127.0.0.1:6379", None)?
 ///     .with_key_prefix("my_app")
 ///     .with_max_messages(100);
 ///
-/// store.add_messages(vec![ChatMessage::user("hello")]).await?;
+/// store.add_messages(vec![agent_framework_core::types::Message::user("hello")]).await?;
 /// let history = store.list_messages().await?;
-/// println!("{} messages for thread {}", history.len(), store.thread_id());
+/// println!("{} messages for session {}", history.len(), store.session_id());
 /// # Ok(())
 /// # }
 /// ```
 pub struct RedisChatMessageStore {
     conn: LazyConnection,
     redis_url: String,
-    thread_id: String,
+    session_id: String,
     key_prefix: String,
     max_messages: Option<usize>,
 }
 
 impl RedisChatMessageStore {
     /// Create a store for `redis_url`, optionally pinned to an existing
-    /// `thread_id`. When `thread_id` is `None` a fresh id is generated as
+    /// `session_id`. When `session_id` is `None` a fresh id is generated as
     /// `thread_{uuid}`, matching the Python store's `f"thread_{uuid4()}"`.
     ///
     /// The connection to Redis is *not* established here; only the URL is
     /// parsed. Errors if `redis_url` cannot be parsed as a Redis connection
     /// string.
-    pub fn new(redis_url: impl Into<String>, thread_id: Option<String>) -> Result<Self> {
+    pub fn new(redis_url: impl Into<String>, session_id: Option<String>) -> Result<Self> {
         let redis_url = redis_url.into();
         let conn = LazyConnection::open(&redis_url)?;
         Ok(Self {
             conn,
             redis_url,
-            thread_id: thread_id.unwrap_or_else(|| format!("thread_{}", Uuid::new_v4())),
+            session_id: session_id.unwrap_or_else(|| format!("thread_{}", Uuid::new_v4())),
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
             max_messages: None,
         })
@@ -83,9 +92,9 @@ impl RedisChatMessageStore {
         self
     }
 
-    /// This thread's id (auto-generated if not supplied to [`Self::new`]).
-    pub fn thread_id(&self) -> &str {
-        &self.thread_id
+    /// This store's session id (auto-generated if not supplied to [`Self::new`]).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// The configured key prefix.
@@ -98,12 +107,12 @@ impl RedisChatMessageStore {
         self.max_messages
     }
 
-    /// The Redis key holding this thread's messages: `{key_prefix}:{thread_id}`.
+    /// The Redis key holding this session's messages: `{key_prefix}:{session_id}`.
     pub fn redis_key(&self) -> String {
-        format!("{}:{}", self.key_prefix, self.thread_id)
+        format!("{}:{}", self.key_prefix, self.session_id)
     }
 
-    /// Remove all messages for this thread (`DEL` on [`Self::redis_key`]).
+    /// Remove all messages for this session (`DEL` on [`Self::redis_key`]).
     pub async fn clear(&self) -> Result<()> {
         let mut conn = self.conn.get().await?;
         let _: () = conn.del(self.redis_key()).await.map_err(map_redis_err)?;
@@ -122,50 +131,8 @@ impl RedisChatMessageStore {
             .is_ok()
     }
 
-    /// Reconstruct a store from a value previously produced by
-    /// [`ChatMessageStore::serialize`] (the `redis_store_state` shape).
-    /// Mirrors the Python store's `deserialize` classmethod; the
-    /// `ChatMessageStore` trait itself has no restore hook, so this is
-    /// provided as an inherent associated function.
-    pub fn from_state(state: &serde_json::Value) -> Result<Self> {
-        let thread_id = state
-            .get("thread_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::Configuration("state is missing 'thread_id'".into()))?
-            .to_string();
-        let redis_url = state
-            .get("redis_url")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| Error::Configuration("state is missing 'redis_url'".into()))?
-            .to_string();
-        let key_prefix = state
-            .get("key_prefix")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(DEFAULT_KEY_PREFIX)
-            .to_string();
-        let max_messages = state
-            .get("max_messages")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize);
-
-        let mut store = Self::new(redis_url, Some(thread_id))?;
-        store.key_prefix = key_prefix;
-        store.max_messages = max_messages;
-        Ok(store)
-    }
-
-    fn serialize_message(message: &ChatMessage) -> Result<String> {
-        Ok(serde_json::to_string(message)?)
-    }
-
-    fn deserialize_message(data: &str) -> Result<ChatMessage> {
-        Ok(serde_json::from_str(data)?)
-    }
-}
-
-#[async_trait]
-impl ChatMessageStore for RedisChatMessageStore {
-    async fn list_messages(&self) -> Result<Vec<ChatMessage>> {
+    /// The stored messages, in chronological order (`LRANGE 0 -1`).
+    pub async fn list_messages(&self) -> Result<Vec<Message>> {
         let mut conn = self.conn.get().await?;
         let raw: Vec<String> = conn
             .lrange(self.redis_key(), 0, -1)
@@ -174,7 +141,10 @@ impl ChatMessageStore for RedisChatMessageStore {
         raw.iter().map(|s| Self::deserialize_message(s)).collect()
     }
 
-    async fn add_messages(&self, messages: Vec<ChatMessage>) -> Result<()> {
+    /// Append `messages` (`RPUSH`, chronological order), then trim to
+    /// [`Self::max_messages`] via `LTRIM` when configured. A no-op for an
+    /// empty `messages`.
+    pub async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -203,21 +173,92 @@ impl ChatMessageStore for RedisChatMessageStore {
         Ok(())
     }
 
-    /// Serialize the store's *configuration* (thread id, Redis URL, key
+    /// Serialize this store's *configuration* (session id, Redis URL, key
     /// prefix, message limit) rather than the message contents — Redis
     /// already persists the messages durably, so only the pointer back to
     /// them needs to survive. This mirrors the Python store's `serialize()`
-    /// / `RedisStoreState`, including the `"type"` discriminator field.
-    async fn serialize(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
+    /// / `RedisStoreState`, including the `"type"` discriminator field. No
+    /// I/O is involved, so — like
+    /// [`AgentSession::to_dict`](agent_framework_core::session::AgentSession::to_dict) —
+    /// this is a plain, synchronous call.
+    pub fn to_dict(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "redis_store_state",
-            "thread_id": self.thread_id,
+            "session_id": self.session_id,
             "redis_url": self.redis_url,
             "key_prefix": self.key_prefix,
             "max_messages": self.max_messages,
-        }))
+        })
+    }
+
+    /// Reconstruct a store from a value previously produced by
+    /// [`Self::to_dict`].
+    pub fn from_dict(state: &serde_json::Value) -> Result<Self> {
+        let session_id = state
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Configuration("state is missing 'session_id'".into()))?
+            .to_string();
+        let redis_url = state
+            .get("redis_url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::Configuration("state is missing 'redis_url'".into()))?
+            .to_string();
+        let key_prefix = state
+            .get("key_prefix")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(DEFAULT_KEY_PREFIX)
+            .to_string();
+        let max_messages = state
+            .get("max_messages")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
+
+        let mut store = Self::new(redis_url, Some(session_id))?;
+        store.key_prefix = key_prefix;
+        store.max_messages = max_messages;
+        Ok(store)
+    }
+
+    fn serialize_message(message: &Message) -> Result<String> {
+        Ok(serde_json::to_string(message)?)
+    }
+
+    fn deserialize_message(data: &str) -> Result<Message> {
+        Ok(serde_json::from_str(data)?)
     }
 }
+
+#[async_trait]
+impl ContextProvider for RedisChatMessageStore {
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        let stored = self.list_messages().await?;
+        let existing = std::mem::take(&mut ctx.messages);
+        ctx.messages = stored.into_iter().chain(existing).collect();
+        Ok(())
+    }
+
+    async fn after_run(
+        &self,
+        request_messages: &[Message],
+        response_messages: &[Message],
+        error: Option<&Error>,
+    ) -> Result<()> {
+        if error.is_none() {
+            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
+            combined.extend(request_messages.iter().cloned());
+            combined.extend(response_messages.iter().cloned());
+            self.add_messages(combined).await?;
+        }
+        Ok(())
+    }
+
+    fn is_history_provider(&self) -> bool {
+        true
+    }
+}
+
+impl HistoryProvider for RedisChatMessageStore {}
 
 #[cfg(test)]
 mod tests {
@@ -225,10 +266,10 @@ mod tests {
     use agent_framework_core::types::{Content, Role, TextContent};
     use std::collections::HashMap;
 
-    fn store(thread_id: &str) -> RedisChatMessageStore {
+    fn store(session_id: &str) -> RedisChatMessageStore {
         // `redis://.../0` parses without touching the network — safe to
         // construct in hermetic unit tests.
-        RedisChatMessageStore::new("redis://127.0.0.1:6379/0", Some(thread_id.to_string()))
+        RedisChatMessageStore::new("redis://127.0.0.1:6379/0", Some(session_id.to_string()))
             .expect("valid redis url")
     }
 
@@ -247,20 +288,20 @@ mod tests {
     }
 
     #[test]
-    fn thread_id_auto_generated_when_absent() {
+    fn session_id_auto_generated_when_absent() {
         let s = RedisChatMessageStore::new("redis://127.0.0.1:6379/0", None).unwrap();
-        assert!(s.thread_id().starts_with("thread_"));
+        assert!(s.session_id().starts_with("thread_"));
         // "thread_" (7) + a UUIDv4 (36) = 43 chars.
-        assert!(s.thread_id().len() > 10);
+        assert!(s.session_id().len() > 10);
         // Two auto-generated stores must not collide.
         let s2 = RedisChatMessageStore::new("redis://127.0.0.1:6379/0", None).unwrap();
-        assert_ne!(s.thread_id(), s2.thread_id());
+        assert_ne!(s.session_id(), s2.session_id());
     }
 
     #[test]
-    fn explicit_thread_id_is_preserved() {
+    fn explicit_session_id_is_preserved() {
         let s = store("user123_session456");
-        assert_eq!(s.thread_id(), "user123_session456");
+        assert_eq!(s.session_id(), "user123_session456");
         assert_eq!(s.redis_key(), "chat_messages:user123_session456");
     }
 
@@ -288,7 +329,7 @@ mod tests {
 
     #[test]
     fn message_serialization_roundtrip_simple() {
-        let message = ChatMessage::new(Role::user(), "Hello").with_author("tester");
+        let message = Message::new(Role::user(), "Hello").with_author("tester");
         let serialized = RedisChatMessageStore::serialize_message(&message).unwrap();
         assert!(serialized.contains("Hello"));
         let deserialized = RedisChatMessageStore::deserialize_message(&serialized).unwrap();
@@ -301,7 +342,7 @@ mod tests {
     fn message_serialization_roundtrip_complex_content() {
         let mut additional_properties = HashMap::new();
         additional_properties.insert("metadata".to_string(), serde_json::json!("test"));
-        let message = ChatMessage {
+        let message = Message {
             role: Role::assistant(),
             contents: vec![
                 Content::Text(TextContent::new("Hello")),
@@ -332,17 +373,17 @@ mod tests {
 
     // endregion
 
-    // region: serialize()/from_state() config round trip (no server required)
+    // region: to_dict()/from_dict() config round trip (no server required)
 
-    #[tokio::test]
-    async fn serialize_produces_python_compatible_shape() {
+    #[test]
+    fn to_dict_produces_python_compatible_shape() {
         let s = store("test_thread_123");
-        let state = s.serialize().await.unwrap();
+        let state = s.to_dict();
         assert_eq!(
             state,
             serde_json::json!({
                 "type": "redis_store_state",
-                "thread_id": "test_thread_123",
+                "session_id": "test_thread_123",
                 "redis_url": "redis://127.0.0.1:6379/0",
                 "key_prefix": "chat_messages",
                 "max_messages": null,
@@ -350,26 +391,35 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn serialize_then_from_state_round_trips() {
+    #[test]
+    fn to_dict_then_from_dict_round_trips() {
         let s = store("test_thread_123")
             .with_key_prefix("custom")
             .with_max_messages(50);
-        let state = s.serialize().await.unwrap();
+        let state = s.to_dict();
 
-        let restored = RedisChatMessageStore::from_state(&state).unwrap();
-        assert_eq!(restored.thread_id(), "test_thread_123");
+        let restored = RedisChatMessageStore::from_dict(&state).unwrap();
+        assert_eq!(restored.session_id(), "test_thread_123");
         assert_eq!(restored.key_prefix(), "custom");
         assert_eq!(restored.max_messages(), Some(50));
         assert_eq!(restored.redis_key(), "custom:test_thread_123");
     }
 
     #[test]
-    fn from_state_requires_thread_id_and_redis_url() {
-        assert!(RedisChatMessageStore::from_state(&serde_json::json!({})).is_err());
+    fn from_dict_requires_session_id_and_redis_url() {
+        assert!(RedisChatMessageStore::from_dict(&serde_json::json!({})).is_err());
         assert!(
-            RedisChatMessageStore::from_state(&serde_json::json!({"thread_id": "t1"})).is_err()
+            RedisChatMessageStore::from_dict(&serde_json::json!({"session_id": "t1"})).is_err()
         );
+    }
+
+    // endregion
+
+    // region: ContextProvider / HistoryProvider surface (pure, no server)
+
+    #[test]
+    fn is_history_provider_reports_true() {
+        assert!(store("t1").is_history_provider());
     }
 
     // endregion

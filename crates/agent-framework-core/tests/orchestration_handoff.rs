@@ -29,7 +29,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -42,7 +42,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -69,7 +69,7 @@ fn handoff_response(call_id: &str, target: &str) -> ChatResponse {
         Some(FunctionArguments::Raw("{}".into())),
     );
     ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -78,15 +78,15 @@ fn handoff_response(call_id: &str, target: &str) -> ChatResponse {
     }
 }
 
-fn agent_with(name: &str, responses: Vec<ChatResponse>) -> Arc<dyn Agent> {
+fn agent_with(name: &str, responses: Vec<ChatResponse>) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
-        ChatAgent::builder(MockClient::new(responses))
+        Agent::builder(MockClient::new(responses))
             .name(name)
             .build(),
-    ) as Arc<dyn Agent>
+    ) as Arc<dyn SupportsAgentRun>
 }
 
-fn conversation(value: serde_json::Value) -> Vec<ChatMessage> {
+fn conversation(value: serde_json::Value) -> Vec<Message> {
     serde_json::from_value(value).expect("output is a conversation")
 }
 
@@ -109,7 +109,7 @@ async fn autonomous_handoff_completes_after_transfer() {
     let run = workflow.run("please help").await.unwrap();
     assert_eq!(run.state(), WorkflowRunState::Idle);
     let conv = conversation(run.last_output().expect("autonomous run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("B handled it")),
         "specialist answer present: {texts:?}"
@@ -133,7 +133,7 @@ async fn interactive_handoff_pauses_and_resumes() {
         .initial_agent("A")
         .with_user_input_request()
         // Terminate only after 3 user turns so the second agent turn runs.
-        .termination_condition(|conv: &[ChatMessage]| {
+        .termination_condition(|conv: &[Message]| {
             conv.iter().filter(|m| m.role == Role::user()).count() >= 3
         })
         .build()
@@ -195,12 +195,130 @@ async fn unknown_handoff_target_is_fed_back() {
 
     let run = workflow.run("do it").await.unwrap();
     let conv = conversation(run.last_output().expect("run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts
             .iter()
             .any(|t| t.contains("Recovered and answered directly.")),
         "agent recovered after unknown-target error: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_topology_rejects_undeclared_target() {
+    // triage declares edges only to billing and refunds; a handoff to the
+    // undeclared "shipping" participant must be rejected (fed back as an
+    // unknown-target error) even though shipping IS a registered participant.
+    let triage = agent_with(
+        "triage",
+        vec![
+            handoff_response("c1", "shipping"),
+            handoff_response("c2", "billing"),
+        ],
+    );
+    let billing = agent_with(
+        "billing",
+        vec![ChatResponse::from_text("billing handled it")],
+    );
+    let refunds = agent_with(
+        "refunds",
+        vec![ChatResponse::from_text("refunds handled it")],
+    );
+    let shipping = agent_with(
+        "shipping",
+        vec![ChatResponse::from_text("shipping handled it")],
+    );
+
+    let workflow = HandoffBuilder::new()
+        .participant("triage", triage)
+        .participant("billing", billing)
+        .participant("refunds", refunds)
+        .participant("shipping", shipping)
+        .initial_agent("triage")
+        .add_handoff("triage")
+        .to(["billing", "refunds"])
+        .autonomous()
+        .build()
+        .unwrap();
+
+    let run = workflow.run("help me").await.unwrap();
+    let conv = conversation(run.last_output().expect("run yields output"));
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("shipping handled it")),
+        "undeclared target must never run: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("billing handled it")),
+        "declared target accepted after the rejected attempt: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_topology_full_mesh_when_no_edges_declared() {
+    // No add_handoff edges at all -> full mesh (back-compat): any registered
+    // participant is a valid target.
+    let a = agent_with("A", vec![handoff_response("c1", "Z")]);
+    let z = agent_with("Z", vec![ChatResponse::from_text("Z handled it")]);
+
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .participant("Z", z)
+        .initial_agent("A")
+        .autonomous()
+        .build()
+        .unwrap();
+
+    let run = workflow.run("go").await.unwrap();
+    let conv = conversation(run.last_output().expect("run yields output"));
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("Z handled it")),
+        "no edges declared -> any target reachable: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_topology_leaf_source_cannot_handoff() {
+    // Edges declared only from "triage"; "billing" has no outgoing edges of
+    // its own, so a handoff attempt from billing must be rejected even
+    // though "refunds" is a legitimate participant.
+    let triage = agent_with("triage", vec![handoff_response("c1", "billing")]);
+    let billing = agent_with(
+        "billing",
+        vec![
+            handoff_response("c2", "refunds"),
+            ChatResponse::from_text("billing answered directly"),
+        ],
+    );
+    let refunds = agent_with(
+        "refunds",
+        vec![ChatResponse::from_text("refunds handled it")],
+    );
+
+    let workflow = HandoffBuilder::new()
+        .participant("triage", triage)
+        .participant("billing", billing)
+        .participant("refunds", refunds)
+        .initial_agent("triage")
+        .add_handoff("triage")
+        .to(["billing"])
+        .autonomous()
+        .build()
+        .unwrap();
+
+    let run = workflow.run("help").await.unwrap();
+    let conv = conversation(run.last_output().expect("run yields output"));
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("refunds handled it")),
+        "leaf source (billing) must not be able to hand off: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("billing answered directly")),
+        "billing recovered locally after the rejected handoff attempt: {texts:?}"
     );
 }
 
@@ -226,7 +344,7 @@ async fn specialist_to_specialist_handoff_chains() {
 
     let run = workflow.run("start").await.unwrap();
     let conv = conversation(run.last_output().expect("run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("C final answer")),
         "chained: {texts:?}"

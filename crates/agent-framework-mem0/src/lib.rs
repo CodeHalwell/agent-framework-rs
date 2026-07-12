@@ -18,12 +18,9 @@
 //! // Reads MEM0_API_KEY (and optional MEM0_API_BASE) from the environment.
 //! let memory = Mem0Provider::from_env()?.with_user_id("user-42");
 //!
-//! let mut providers = AggregateContextProvider::new();
-//! providers.add(Arc::new(memory));
-//!
-//! let agent = ChatAgent::builder(client)
+//! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
-//!     .context_provider(Arc::new(providers))
+//!     .context_provider(Arc::new(memory))
 //!     .build();
 //!
 //! let response = agent.run_once("What do you remember about me?").await?;

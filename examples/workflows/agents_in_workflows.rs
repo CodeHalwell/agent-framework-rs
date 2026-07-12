@@ -1,11 +1,11 @@
-//! agents_in_workflows: wrap `Agent`s as graph nodes via `AgentExecutor`, and
+//! agents_in_workflows: wrap `SupportsAgentRun`s as graph nodes via `AgentExecutor`, and
 //! mix them with a plain `FunctionExecutor` in the same graph -- something
 //! the `SequentialBuilder`/`ConcurrentBuilder` sugar doesn't expose. Each
 //! `AgentExecutor` appends its agent's reply to the running conversation and
 //! forwards the whole conversation downstream.
 //!
 //! Runs fully offline against a scripted `ChatClient` -- swap `CannedClient`
-//! for a real provider client (e.g. `OpenAIClient::from_env(...)`) and the
+//! for a real provider client (e.g. `OpenAIChatCompletionClient::from_env(...)`) and the
 //! graph is unchanged.
 //!
 //! ```bash
@@ -27,7 +27,7 @@ struct CannedClient(&'static str);
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(self.0))
@@ -35,7 +35,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         // AgentExecutor always drives its agent via `run_stream`, so the
@@ -56,8 +56,8 @@ impl ChatClient for CannedClient {
     }
 }
 
-fn canned_agent(name: &str, reply: &'static str) -> Arc<dyn Agent> {
-    Arc::new(ChatAgent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn Agent>
+fn canned_agent(name: &str, reply: &'static str) -> Arc<dyn SupportsAgentRun> {
+    Arc::new(Agent::builder(CannedClient(reply)).name(name).build()) as Arc<dyn SupportsAgentRun>
 }
 
 #[tokio::main]
@@ -74,12 +74,9 @@ async fn main() -> Result<()> {
     // A plain function executor sits downstream of the agents in the same
     // graph, pulling out just the final reply for the workflow's output.
     let extract_final = FunctionExecutor::new("extract_final", |message, ctx| async move {
-        let conversation: Vec<ChatMessage> = serde_json::from_value(message)
+        let conversation: Vec<Message> = serde_json::from_value(message)
             .map_err(|e| Error::Workflow(format!("bad conversation: {e}")))?;
-        let last = conversation
-            .last()
-            .map(ChatMessage::text)
-            .unwrap_or_default();
+        let last = conversation.last().map(Message::text).unwrap_or_default();
         ctx.yield_output(json!({ "final_reply": last, "turns": conversation.len() }))
             .await?;
         Ok(())

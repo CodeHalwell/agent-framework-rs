@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     // AZURE_OPENAI_CHAT_DEPLOYMENT_NAME, and optional AZURE_OPENAI_API_VERSION.
     let client = AzureOpenAIClient::from_env()?;
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You are a helpful, concise assistant.")
         .build();

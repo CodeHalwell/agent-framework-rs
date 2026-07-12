@@ -1,10 +1,10 @@
 //! Tools: executable functions and hosted-tool markers.
 //!
-//! Rust equivalent of `agent_framework._tools`. An [`AiFunction`] is a locally
+//! Rust equivalent of `agent_framework._tools`. An [`FunctionTool`] is a locally
 //! executable tool; hosted [`ToolKind`] variants are markers handed to the service.
 //! Both are represented uniformly to a chat client as a [`ToolDefinition`].
 //!
-//! Prefer [`AiFunction::typed`] over [`AiFunction::new`] when the arguments can
+//! Prefer [`FunctionTool::typed`] over [`FunctionTool::new`] when the arguments can
 //! be expressed as a `#[derive(Deserialize, JsonSchema)]` struct: it derives the
 //! parameters JSON Schema via `schemars` instead of requiring a hand-written
 //! [`serde_json::Value`].
@@ -45,14 +45,14 @@ pub trait Tool: Send + Sync {
 /// being frozen into the agent's tool list at build time.
 ///
 /// The motivating case is an MCP server: without this trait, wiring one into
-/// a [`crate::agent::ChatAgent`] means calling `mcp.tool_definitions().await`
+/// a [`crate::agent::Agent`] means calling `mcp.tool_definitions().await`
 /// once, up front, and handing the (now-frozen) result to
-/// [`crate::agent::ChatAgentBuilder::tools`] — the agent never notices a
+/// [`crate::agent::AgentBuilder::tools`] — the agent never notices a
 /// server-side tool-catalog change (`notifications/tools/list_changed`)
 /// afterward. Registering a `ToolSource` via
-/// [`crate::agent::ChatAgentBuilder::tool_source`] instead defers resolution
-/// to every [`crate::agent::Agent::run`] / [`crate::agent::Agent::run_with_options`]
-/// / [`crate::agent::Agent::run_stream`] call (see `ChatAgent::prepare_request`),
+/// [`crate::agent::AgentBuilder::tool_source`] instead defers resolution
+/// to every [`crate::agent::SupportsAgentRun::run`] / [`crate::agent::SupportsAgentRun::run_with_options`]
+/// / [`crate::agent::SupportsAgentRun::run_stream`] call (see `Agent::prepare_request`),
 /// so a source that caches internally — invalidating that cache when the
 /// server signals a change — can serve an up-to-date catalog on every run
 /// without a live round trip each time.
@@ -70,7 +70,7 @@ pub trait ToolSource: Send + Sync {
     ///
     /// An `Err` returned here propagates out of the whole run rather than
     /// being swallowed — this mirrors the upstream Python reference, whose
-    /// `ChatAgent.run`/`run_stream` do not catch a failure raised while
+    /// `Agent.run`/`run_stream` do not catch a failure raised while
     /// connecting to an `MCPTool` at run time (`_agents.py:855-865,
     /// 970-980`: `await self._async_exit_stack.enter_async_context(tool)`
     /// is not wrapped in a `try`/`except`).
@@ -89,6 +89,8 @@ pub enum ToolKind {
     Function,
     /// Service-side code interpreter.
     HostedCodeInterpreter,
+    /// Service-side image generation.
+    HostedImageGeneration,
     /// Service-side web search.
     HostedWebSearch,
     /// Service-side file search over hosted vector stores.
@@ -397,9 +399,10 @@ type ToolClosure = Arc<dyn Fn(Value) -> BoxFuture<Result<Value>> + Send + Sync>;
 
 /// A concrete, locally executable tool built from a closure.
 ///
-/// This is the Rust analogue of `AIFunction` / the `@ai_function` decorator.
+/// This is the Rust analogue of upstream's `FunctionTool` / the `@tool`
+/// decorator (formerly `AIFunction` / `@ai_function`).
 #[derive(Clone)]
-pub struct AiFunction {
+pub struct FunctionTool {
     name: String,
     description: String,
     parameters: Value,
@@ -407,7 +410,7 @@ pub struct AiFunction {
     func: ToolClosure,
     max_invocations: Option<usize>,
     max_invocation_exceptions: Option<usize>,
-    // `Arc` so every `Clone` of an `AiFunction` shares one pair of counters
+    // `Arc` so every `Clone` of an `FunctionTool` shares one pair of counters
     // with its source rather than silently resetting the limits; mirrors
     // Python's `invocation_count`/`invocation_exception_count` being mutable
     // state on the (singular) `AIFunction` instance itself.
@@ -415,13 +418,13 @@ pub struct AiFunction {
     invocation_exception_count: Arc<AtomicUsize>,
 }
 
-impl AiFunction {
+impl FunctionTool {
     /// Create a function tool from a hand-written JSON Schema.
     ///
     /// * `parameters` is the JSON Schema for the arguments object.
     /// * `func` receives the parsed JSON arguments and returns a JSON result.
     ///
-    /// Prefer [`AiFunction::typed`] when the arguments can be expressed as a
+    /// Prefer [`FunctionTool::typed`] when the arguments can be expressed as a
     /// `#[derive(Deserialize, JsonSchema)]` struct.
     pub fn new<F, Fut>(
         name: impl Into<String>,
@@ -481,7 +484,7 @@ impl AiFunction {
     /// returns `Err(`[`Error::Tool`]`)` rather than panicking or silently
     /// substituting a default -- the same `Result`-propagation shape used
     /// for every other tool-execution failure (a closure error from
-    /// [`AiFunction::new`], an [`AiFunction::max_invocations`] limit, ...),
+    /// [`FunctionTool::new`], an [`FunctionTool::max_invocations`] limit, ...),
     /// which the function-invocation loop turns into an error
     /// [`crate::types::FunctionResultContent`] exactly as it would for any
     /// of those.
@@ -489,7 +492,7 @@ impl AiFunction {
     /// # Example
     ///
     /// ```
-    /// use agent_framework_core::tools::AiFunction;
+    /// use agent_framework_core::tools::FunctionTool;
     ///
     /// #[derive(serde::Deserialize, schemars::JsonSchema)]
     /// struct WeatherArgs {
@@ -498,7 +501,7 @@ impl AiFunction {
     ///     units: Option<String>,
     /// }
     ///
-    /// let _tool = AiFunction::typed(
+    /// let _tool = FunctionTool::typed(
     ///     "get_weather",
     ///     "Get the weather.",
     ///     |args: WeatherArgs| async move {
@@ -551,7 +554,7 @@ impl AiFunction {
 
     /// Builder: set the human-in-the-loop approval mode (default
     /// [`ApprovalMode::NeverRequire`]). Carried through to the
-    /// [`ToolDefinition`] produced by [`AiFunction::into_definition`].
+    /// [`ToolDefinition`] produced by [`FunctionTool::into_definition`].
     pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
         self.approval_mode = mode;
         self
@@ -559,7 +562,7 @@ impl AiFunction {
 
     /// Builder: cap the number of times this function may be invoked.
     ///
-    /// Once [`AiFunction::invocation_count`] reaches `max`, further calls to
+    /// Once [`FunctionTool::invocation_count`] reaches `max`, further calls to
     /// [`Tool::invoke`] return `Err(`[`Error::Tool`]`)` instead of running
     /// the function again -- mirrors Python's
     /// `AIFunction(max_invocations=...)` (`_tools.py:599-600, 687-690`).
@@ -571,8 +574,8 @@ impl AiFunction {
     /// (the same terminal state Python's validation exists to prevent
     /// constructing in the first place).
     ///
-    /// The counter is shared by every `Clone` of this `AiFunction` (see the
-    /// note on [`AiFunction`]'s fields), not reset per clone.
+    /// The counter is shared by every `Clone` of this `FunctionTool` (see the
+    /// note on [`FunctionTool`]'s fields), not reset per clone.
     pub fn max_invocations(mut self, max: usize) -> Self {
         self.max_invocations = Some(max);
         self
@@ -582,13 +585,13 @@ impl AiFunction {
     /// tolerates.
     ///
     /// Every [`Tool::invoke`] call that returns `Err` -- whether from
-    /// argument deserialization (see [`AiFunction::typed`]), the wrapped
+    /// argument deserialization (see [`FunctionTool::typed`]), the wrapped
     /// closure itself, or result serialization -- increments
-    /// [`AiFunction::invocation_exception_count`]. Once that count reaches
+    /// [`FunctionTool::invocation_exception_count`]. Once that count reaches
     /// `max`, further calls return `Err(`[`Error::Tool`]`)` immediately
     /// without re-attempting the function. `None` (the default) means no
     /// limit. Mirrors Python's `AIFunction(max_invocation_exceptions=...)`
-    /// (`_tools.py:601-602, 691-698`); see [`AiFunction::max_invocations`]
+    /// (`_tools.py:601-602, 691-698`); see [`FunctionTool::max_invocations`]
     /// for how the `0` case differs from Python's constructor-time
     /// validation.
     pub fn max_invocation_exceptions(mut self, max: usize) -> Self {
@@ -597,8 +600,8 @@ impl AiFunction {
     }
 
     /// The number of times [`Tool::invoke`] has run the wrapped function
-    /// (i.e. got past any [`AiFunction::max_invocations`]/
-    /// [`AiFunction::max_invocation_exceptions`] gate). Mirrors Python's
+    /// (i.e. got past any [`FunctionTool::max_invocations`]/
+    /// [`FunctionTool::max_invocation_exceptions`] gate). Mirrors Python's
     /// public `invocation_count` attribute.
     pub fn invocation_count(&self) -> usize {
         self.invocation_count.load(Ordering::SeqCst)
@@ -618,7 +621,7 @@ impl AiFunction {
 }
 
 #[async_trait]
-impl Tool for AiFunction {
+impl Tool for FunctionTool {
     fn name(&self) -> &str {
         &self.name
     }
@@ -630,11 +633,11 @@ impl Tool for AiFunction {
     }
 
     /// Run the wrapped function, first enforcing
-    /// [`AiFunction::max_invocations`] and
-    /// [`AiFunction::max_invocation_exceptions`] (mirrors Python's
+    /// [`FunctionTool::max_invocations`] and
+    /// [`FunctionTool::max_invocation_exceptions`] (mirrors Python's
     /// `AIFunction.__call__`, `_tools.py:683-707`): a limit that has already
     /// been reached errors *before* the function runs and *before*
-    /// [`AiFunction::invocation_count`] is bumped again, so calling an
+    /// [`FunctionTool::invocation_count`] is bumped again, so calling an
     /// already-exhausted function any number of further times does not
     /// drift its counters.
     ///
@@ -705,6 +708,22 @@ pub fn hosted_code_interpreter() -> ToolDefinition {
     }
 }
 
+/// Construct a hosted image-generation tool marker.
+///
+/// Supported by services that expose server-side image generation as a tool
+/// (e.g. the OpenAI Responses API's `image_generation` tool). Its results
+/// surface as [`Content::ImageGenerationToolResult`](crate::types::Content).
+pub fn hosted_image_generation() -> ToolDefinition {
+    ToolDefinition {
+        name: "image_generation".into(),
+        description: String::new(),
+        parameters: empty_schema(),
+        kind: ToolKind::HostedImageGeneration,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
 /// Construct a hosted web-search tool marker.
 pub fn hosted_web_search() -> ToolDefinition {
     ToolDefinition {
@@ -754,7 +773,7 @@ pub fn empty_schema() -> Value {
 }
 
 /// Derive an OpenAI-style parameters JSON Schema for `Args` via `schemars`,
-/// stripping the top-level `$schema`/`title` keys. See [`AiFunction::typed`]
+/// stripping the top-level `$schema`/`title` keys. See [`FunctionTool::typed`]
 /// for exactly what this does and does not normalize.
 fn typed_parameters_schema<Args: schemars::JsonSchema>() -> Value {
     let root = schemars::gen::SchemaGenerator::default().into_root_schema_for::<Args>();
@@ -861,7 +880,7 @@ mod tests {
     #[test]
     fn typed_schema_nested_struct_and_enum_keep_schemars_ref_definitions() {
         // Nested/enum fields are not inlined: they keep schemars' own
-        // `$ref`/`definitions` representation, per `AiFunction::typed`'s
+        // `$ref`/`definitions` representation, per `FunctionTool::typed`'s
         // documented contract (every provider converter forwards
         // `parameters` to the wire unmodified, so this round-trips fine).
         let schema = typed_parameters_schema::<TaskArgs>();
@@ -899,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_invoke_deserializes_valid_arguments_and_serializes_result() {
-        let tool = AiFunction::typed(
+        let tool = FunctionTool::typed(
             "get_weather",
             "Get the weather.",
             |args: WeatherArgs| async move {
@@ -918,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_invoke_missing_required_field_errors_like_a_tool_error() {
-        let tool = AiFunction::typed(
+        let tool = FunctionTool::typed(
             "get_weather",
             "Get the weather.",
             |_args: WeatherArgs| async move { Ok(serde_json::Value::Null) },
@@ -930,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_invoke_wrong_field_type_errors_like_a_tool_error() {
-        let tool = AiFunction::typed(
+        let tool = FunctionTool::typed(
             "get_weather",
             "Get the weather.",
             |_args: WeatherArgs| async move { Ok(serde_json::Value::Null) },
@@ -949,12 +968,12 @@ mod tests {
         // from `typed` and a closure failure from `new` are indistinguishable
         // in shape to the caller (both `Err(Error::Tool(_))`), which is what
         // lets `execute_tool_call` in `client.rs` treat them identically.
-        let untyped = AiFunction::new("f", "d", empty_schema(), |_args| async move {
+        let untyped = FunctionTool::new("f", "d", empty_schema(), |_args| async move {
             Err(Error::tool("boom"))
         });
         let untyped_err = untyped.invoke(serde_json::json!({})).await.unwrap_err();
 
-        let typed = AiFunction::typed("f", "d", |_args: WeatherArgs| async move {
+        let typed = FunctionTool::typed("f", "d", |_args: WeatherArgs| async move {
             Ok(serde_json::Value::Null)
         });
         let typed_err = typed.invoke(serde_json::json!({})).await.unwrap_err();
@@ -972,7 +991,7 @@ mod tests {
     #[tokio::test]
     async fn typed_invoke_serializes_a_generic_serializable_return_type() {
         // `Ret` need not be `serde_json::Value`; any `Serialize` type works.
-        let tool = AiFunction::typed(
+        let tool = FunctionTool::typed(
             "get_weather",
             "Get the weather.",
             |args: WeatherArgs| async move {
@@ -1000,7 +1019,7 @@ mod tests {
     async fn max_invocations_blocks_calls_past_the_limit() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = Arc::clone(&calls);
-        let tool = AiFunction::new("f", "d", empty_schema(), move |_args| {
+        let tool = FunctionTool::new("f", "d", empty_schema(), move |_args| {
             let calls = Arc::clone(&calls_clone);
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1034,7 +1053,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (gate_c, calls_c) = (Arc::clone(&gate), Arc::clone(&calls));
         let tool = Arc::new(
-            AiFunction::new("f", "d", empty_schema(), move |_args| {
+            FunctionTool::new("f", "d", empty_schema(), move |_args| {
                 let (gate, calls) = (Arc::clone(&gate_c), Arc::clone(&calls_c));
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1065,7 +1084,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_invocation_exceptions_blocks_calls_past_the_limit() {
-        let tool = AiFunction::new("f", "d", empty_schema(), |_args| async move {
+        let tool = FunctionTool::new("f", "d", empty_schema(), |_args| async move {
             Err(Error::tool("boom"))
         })
         .max_invocation_exceptions(2);
@@ -1089,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn invocation_counters_are_shared_across_clones() {
-        let tool = AiFunction::new("f", "d", empty_schema(), |_args| async move {
+        let tool = FunctionTool::new("f", "d", empty_schema(), |_args| async move {
             Ok(serde_json::Value::Null)
         })
         .max_invocations(1);

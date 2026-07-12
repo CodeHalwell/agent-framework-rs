@@ -3,8 +3,8 @@
 
 use agent_framework_core::tools::ToolKind;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Role, TextContent, ToolMode, UsageDetails,
+    ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, Message, Role, TextContent, ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -55,7 +55,7 @@ pub(crate) fn data_content_media_type(data: &DataContent) -> Option<String> {
 }
 
 /// Convert framework messages into the OpenAI `messages` array.
-pub fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = msg.role.as_str();
@@ -300,7 +300,7 @@ pub fn apply_options(body: &mut Map<String, Value>, options: &ChatOptions) {
 pub fn parse_response(value: &Value) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 
@@ -335,7 +335,7 @@ pub fn parse_response(value: &Value) -> ChatResponse {
                 }
             }
         }
-        let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+        let mut message = Message::with_contents(Role::assistant(), contents);
         message.message_id = response.response_id.clone();
         response.messages.push(message);
 
@@ -383,7 +383,7 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
         input_token_count: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("completion_tokens").and_then(Value::as_u64),
         total_token_count: usage.get("total_tokens").and_then(Value::as_u64),
-        additional_counts: Default::default(),
+        ..Default::default()
     };
     if let Some(ctd) = usage.get("completion_tokens_details") {
         add_usage_detail(
@@ -399,6 +399,9 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
             "reasoning_tokens",
             "completion/reasoning_tokens",
         );
+        // Mirror upstream: the reasoning count is also surfaced as the typed,
+        // cross-language field in addition to the provider-prefixed extra.
+        details.reasoning_output_token_count = ctd.get("reasoning_tokens").and_then(Value::as_u64);
         add_usage_detail(
             &mut details,
             ctd,
@@ -409,6 +412,8 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
     if let Some(ptd) = usage.get("prompt_tokens_details") {
         add_usage_detail(&mut details, ptd, "audio_tokens", "prompt/audio_tokens");
         add_usage_detail(&mut details, ptd, "cached_tokens", "prompt/cached_tokens");
+        // Mirror upstream: cached prompt tokens also populate the typed field.
+        details.cache_read_input_token_count = ptd.get("cached_tokens").and_then(Value::as_u64);
     }
     details
 }
@@ -444,15 +449,15 @@ mod tests {
         }
     }
 
-    fn user_with(contents: Vec<Content>) -> ChatMessage {
-        ChatMessage::with_contents(Role::user(), contents)
+    fn user_with(contents: Vec<Content>) -> Message {
+        Message::with_contents(Role::user(), contents)
     }
 
     // region: multimodal input
 
     #[test]
     fn text_only_message_stays_a_content_string() {
-        let out = messages_to_openai(&[ChatMessage::user("hi")]);
+        let out = messages_to_openai(&[Message::user("hi")]);
         assert_eq!(out[0], json!({ "role": "user", "content": "hi" }));
     }
 
@@ -579,7 +584,7 @@ mod tests {
 
     #[test]
     fn assistant_tool_call_only_still_omits_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(FunctionCallContent::new(
                 "call_1",

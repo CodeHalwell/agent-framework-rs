@@ -72,7 +72,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -85,7 +85,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         Some(FunctionArguments::Raw(json!({"a": 2, "b": 3}).to_string())),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     let answer = ChatResponse::from_text("Done -- check the tool result above.");
     let client = MockClient::new(vec![ask, answer]);
 
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add two integers.",
         json!({
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     )
     .into_definition();
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("calculator")
         .tool(add)
         .function_middleware(Arc::new(ArgRewriteMiddleware))

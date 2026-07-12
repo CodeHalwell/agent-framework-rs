@@ -67,7 +67,7 @@ struct CountingClient {
 impl ChatClient for CountingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -79,7 +79,7 @@ impl ChatClient for CountingClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     // Scenario 1: pre-call rewrite + post-call observation.
     let client = CountingClient::default();
     let calls = client.calls.clone();
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("assistant")
         .temperature(0.9)
         .chat_middleware(Arc::new(PinTemperatureMiddleware))
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     // Scenario 2: short-circuiting -- the underlying client is never reached.
     let client2 = CountingClient::default();
     let calls2 = client2.calls.clone();
-    let agent2 = ChatAgent::builder(client2)
+    let agent2 = Agent::builder(client2)
         .name("assistant")
         .chat_middleware(Arc::new(CachingMiddleware {
             cached: ChatResponse::from_text("(cached) no need to call the model for this."),

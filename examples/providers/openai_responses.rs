@@ -10,12 +10,12 @@ use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIResponsesClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatClient::from_env("gpt-4o-mini")?;
 
     // First turn: no conversation_id yet.
     let first = client
         .get_response(
-            vec![ChatMessage::user("My name is Ada. Remember that.")],
+            vec![Message::user("My name is Ada. Remember that.")],
             ChatOptions::new(),
         )
         .await?;
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     options.conversation_id = first.conversation_id.clone();
 
     let second = client
-        .get_response(vec![ChatMessage::user("What is my name?")], options)
+        .get_response(vec![Message::user("What is my name?")], options)
         .await?;
     println!("assistant: {}", second.text());
 

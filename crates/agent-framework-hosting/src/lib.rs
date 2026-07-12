@@ -9,23 +9,29 @@
 //!   `GET /health`, `GET /v1/entities`, `GET /v1/entities/{id}/info`,
 //!   `POST /v1/responses` (JSON or SSE), plus an embedded single-file debug
 //!   page at `GET /` and `GET /ui`. See [`devui`].
-//! - **A2A hosting** ([`a2a::A2ARouter`]) — the Agent-to-Agent protocol:
+//! - **A2A hosting** ([`a2a::A2ARouter`]) — the SupportsAgentRun-to-SupportsAgentRun protocol:
 //!   `GET /.well-known/agent-card.json` and a JSON-RPC 2.0 `POST /`.
 //! - **OpenAI Chat Completions** ([`openai_compat::OpenAiRouter`]) —
 //!   `POST /v1/chat/completions` (JSON or SSE), for OpenAI-Chat clients.
-//! - **AG-UI protocol** ([`agui::AgUiRouter`]) — CopilotKit's Agent-User
+//! - **AG-UI protocol** ([`agui::AgUiRouter`]) — CopilotKit's SupportsAgentRun-User
 //!   Interaction protocol: `POST {path}` streaming camelCase SSE events
 //!   (`RUN_STARTED` → `TEXT_MESSAGE_*` / `TOOL_CALL_*` → `RUN_FINISHED`),
 //!   mirroring the Python `agent_framework_ag_ui` package.
+//!
+//! The OpenAI-Responses request/response types and the
+//! [`responses::responses_to_run`]/[`responses::responses_from_run`]
+//! conversion functions that back the DevUI API are a standalone, reusable
+//! module ([`responses`]), mirroring the Python `hosting-responses` package;
+//! any host can depend on it without pulling in DevUI's routing/SSE layer.
 //!
 //! Each surface builds a plain [`axum::Router`] you can nest into your own app,
 //! or run directly with [`AgentHost::serve`].
 //!
 //! ```no_run
-//! use agent_framework_core::agent::ChatAgent;
+//! use agent_framework_core::agent::Agent;
 //! use agent_framework_hosting::{AgentHost, a2a::A2ARouter, openai_compat::OpenAiRouter};
 //!
-//! # async fn demo(assistant: ChatAgent) -> std::io::Result<()> {
+//! # async fn demo(assistant: Agent) -> std::io::Result<()> {
 //! // DevUI host with one agent.
 //! let host = AgentHost::new().agent("assistant", assistant.clone());
 //!
@@ -55,6 +61,8 @@ pub mod agui;
 pub mod devui;
 pub mod openai_compat;
 pub mod registry;
+pub mod responses;
+pub mod security;
 
 mod sse;
 mod ui;
@@ -64,3 +72,7 @@ pub use registry::{AgentHost, AgentRegistration, IntoAgentRegistration};
 
 // Re-export the DevUI model types for callers building responses/clients.
 pub use devui::models::{DiscoveryResponse, EntityInfo, HealthResponse};
+
+// Re-export the reusable OpenAI-Responses conversion surface (mirrors
+// upstream `hosting-responses`; UPSTREAM_DRIFT.md §14).
+pub use responses::{responses_from_run, responses_to_run, ResponseObject, ResponsesRequest};

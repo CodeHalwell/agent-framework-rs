@@ -26,7 +26,7 @@ struct FlakyClient {
 impl ChatClient for FlakyClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -49,7 +49,7 @@ impl ChatClient for FlakyClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -82,9 +82,9 @@ async fn main() -> Result<()> {
 
     let client = RetryingChatClient::new(flaky).with_policy(policy);
 
-    // Works standalone or as the client behind a ChatAgent -- retries happen
+    // Works standalone or as the client behind a Agent -- retries happen
     // beneath the function-invocation loop either way.
-    let agent = ChatAgent::builder(client).name("resilient").build();
+    let agent = Agent::builder(client).name("resilient").build();
 
     println!("running (watch the attempts):");
     let response = agent.run_once("Hi!").await?;

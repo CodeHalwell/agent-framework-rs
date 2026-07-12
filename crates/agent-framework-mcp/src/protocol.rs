@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use agent_framework_core::types::{ChatMessage, Content, DataContent, Role, UriContent};
+use agent_framework_core::types::{Content, DataContent, Message, Role, UriContent};
 
 /// The MCP protocol version this client requests during `initialize`.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -353,12 +353,12 @@ impl ContentBlock {
     }
 }
 
-/// Build a core [`ChatMessage`] from an MCP role string plus a single raw
+/// Build a core [`Message`] from an MCP role string plus a single raw
 /// content value. Shared by prompt-message (`prompts/get`) and
 /// sampling-message (`sampling/createMessage`) mapping: both carry a role
 /// and exactly one content block each, unlike `tools/call`'s content array.
-pub(crate) fn role_and_content_to_chat_message(role: &str, content: &Value) -> ChatMessage {
-    ChatMessage::with_contents(
+pub(crate) fn role_and_content_to_chat_message(role: &str, content: &Value) -> Message {
+    Message::with_contents(
         Role::new(role.to_string()),
         vec![ContentBlock::from_value(content).to_core_content()],
     )

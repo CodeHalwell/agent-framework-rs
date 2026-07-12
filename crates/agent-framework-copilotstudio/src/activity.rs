@@ -37,7 +37,7 @@ pub struct WireActivity {
 }
 
 /// `ChannelAccount`, reduced to the `name` this port surfaces as
-/// [`ChatMessage::author_name`](agent_framework_core::types::ChatMessage::author_name).
+/// [`Message::author_name`](agent_framework_core::types::Message::author_name).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WireChannelAccount {
     #[serde(default)]

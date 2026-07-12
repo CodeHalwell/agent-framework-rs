@@ -29,10 +29,10 @@
 //!   `/v1/entities/{id}/runs/{run_id}/responses` endpoint, so per the work
 //!   package we surface pending requests (in-stream and in the final response)
 //!   but do not persist runs or support resume.
-//! - Agent streaming drives the core `Agent::run_stream` and frames each update
+//! - SupportsAgentRun streaming drives the core `SupportsAgentRun::run_stream` and frames each update
 //!   as SSE live (one `response.output_text.delta` per update); the terminal
 //!   `response.completed` aggregates the run. Event ordering and payloads match
-//!   DevUI's names. Non-streaming requests stay on `Agent::run`. (Workflow
+//!   DevUI's names. Non-streaming requests stay on `SupportsAgentRun::run`. (Workflow
 //!   streaming still frames the workflow's own event stream after the run.)
 
 pub mod models;
@@ -48,18 +48,17 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use agent_framework_core::types::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Role, UsageDetails,
-};
+use agent_framework_core::types::{AgentResponse, AgentResponseUpdate, Message};
 use agent_framework_core::workflow::WorkflowEvent;
 
 use crate::registry::{AgentRecord, EntityRecord, HostState, WorkflowRecord};
-use crate::sse::{sse_response, sse_response_stream};
-use crate::util;
-use models::{
-    openai_error, DiscoveryResponse, EntityInfo, HealthResponse, InputTokensDetails, OutputMessage,
+use crate::responses::{
+    openai_error, responses_from_run, responses_to_run, InputTokensDetails, OutputMessage,
     OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
 };
+use crate::sse::{sse_response, sse_response_stream};
+use crate::util;
+use models::{DiscoveryResponse, EntityInfo, HealthResponse};
 
 /// Build the DevUI router for a registry.
 ///
@@ -158,13 +157,13 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
             name: a.name.clone(),
             description: a.description.clone(),
             framework: "agent_framework",
-            // The core `Agent` trait exposes no tool list, so this is absent.
+            // The core `SupportsAgentRun` trait exposes no tool list, so this is absent.
             tools: None,
             metadata: Map::new(),
             source: "in_memory",
             instructions: a.instructions.clone(),
-            // `model_id` is not accessible through the `Agent` trait.
-            model_id: None,
+            // `model` is not accessible through the `SupportsAgentRun` trait.
+            model: None,
             executors: None,
             input_schema: None,
             start_executor_id: None,
@@ -179,7 +178,7 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
             metadata: Map::new(),
             source: "in_memory",
             instructions: None,
-            model_id: None,
+            model: None,
             // The full executor set is not enumerable through the public
             // `Workflow` API; the start executor is.
             executors: Some(vec![w.workflow.start_executor_id().to_string()]),
@@ -190,11 +189,11 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Agent execution
+// SupportsAgentRun execution
 // ---------------------------------------------------------------------------
 
 async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: String) -> Response {
-    let messages = input_to_messages(&request.input);
+    let messages = responses_to_run(request);
     let input_len = approx_input_len(&request.input);
 
     if request.stream {
@@ -245,29 +244,20 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
 }
 
 /// Build the aggregated (non-streaming) response for an agent run.
-fn agent_response_object(resp: &AgentRunResponse, model: &str, input_len: usize) -> ResponseObject {
-    let text = resp.text();
-    let mid = util::msg_id();
-    let usage = build_usage(&resp.usage_details, input_len, text.len());
-    ResponseObject {
-        id: util::resp_id(),
-        object: "response",
-        created_at: util::now_ts(),
-        model: model.to_string(),
-        status: "completed",
-        output: vec![OutputMessage::assistant_text(mid, text.clone())],
-        output_text: Some(text),
-        usage: Some(usage),
-        outputs: None,
-        pending_requests: Vec::new(),
-        parallel_tool_calls: false,
-        tool_choice: "none",
-        tools: Vec::new(),
+///
+/// Delegates the OpenAI-Responses shape to [`responses_from_run`], then fills
+/// in DevUI's `~4-chars-per-token` usage estimate when the run reported none.
+fn agent_response_object(resp: &AgentResponse, model: &str, input_len: usize) -> ResponseObject {
+    let mut obj = responses_from_run(resp, &util::resp_id(), model);
+    if obj.usage.is_none() {
+        let output_len = obj.output_text.as_deref().unwrap_or_default().len();
+        obj.usage = Some(usage_estimate(input_len, output_len));
     }
+    obj
 }
 
 /// Incremental OpenAI-Responses SSE framing for a streamed agent run, driven
-/// one [`AgentRunResponseUpdate`] at a time. Emits the fixed preamble, one
+/// one [`AgentResponseUpdate`] at a time. Emits the fixed preamble, one
 /// `response.output_text.delta` per non-empty update, and a final
 /// `response.completed` aggregating the run (text + usage).
 struct AgentStreamFraming {
@@ -277,8 +267,8 @@ struct AgentStreamFraming {
     mid: String,
     seq: u64,
     /// Updates collected so the terminal `response.completed` can aggregate the
-    /// full text and usage via [`AgentRunResponse::from_updates`].
-    collected: Vec<AgentRunResponseUpdate>,
+    /// full text and usage via [`AgentResponse::from_updates`].
+    collected: Vec<AgentResponseUpdate>,
 }
 
 impl AgentStreamFraming {
@@ -325,7 +315,7 @@ impl AgentStreamFraming {
 
     /// Frame one streamed update: a `response.output_text.delta` when it carries
     /// text (otherwise nothing). The update is retained for final aggregation.
-    fn push_update(&mut self, update: &AgentRunResponseUpdate) -> Vec<Value> {
+    fn push_update(&mut self, update: &AgentResponseUpdate) -> Vec<Value> {
         self.collected.push(update.clone());
         let delta = update.text();
         if delta.is_empty() {
@@ -346,27 +336,19 @@ impl AgentStreamFraming {
 
     /// The terminal `response.completed`, aggregating all collected updates.
     fn completed(&mut self) -> Value {
-        let response = AgentRunResponse::from_updates(std::mem::take(&mut self.collected));
-        let text = response.text();
-        let usage = build_usage(&response.usage_details, self.input_len, text.len());
-        let completed = ResponseObject {
-            id: self.rid.clone(),
-            object: "response",
-            created_at: util::now_ts(),
-            model: self.model.clone(),
-            status: "completed",
-            output: vec![OutputMessage::assistant_text(
-                self.mid.clone(),
-                text.clone(),
-            )],
-            output_text: Some(text),
-            usage: Some(usage),
-            outputs: None,
-            pending_requests: Vec::new(),
-            parallel_tool_calls: false,
-            tool_choice: "none",
-            tools: Vec::new(),
-        };
+        let response = AgentResponse::from_updates(std::mem::take(&mut self.collected));
+        let mut completed = responses_from_run(&response, &self.rid, &self.model);
+        // The streamed response item id (`mid`) was already announced in the
+        // preamble; use it here too instead of `responses_from_run`'s freshly
+        // generated one, so the completed event refers to the same item.
+        completed.output = vec![OutputMessage::assistant_text(
+            self.mid.clone(),
+            completed.output_text.clone().unwrap_or_default(),
+        )];
+        if completed.usage.is_none() {
+            let output_len = completed.output_text.as_deref().unwrap_or_default().len();
+            completed.usage = Some(usage_estimate(self.input_len, output_len));
+        }
         let seq = self.next();
         json!({
             "type": "response.completed",
@@ -602,6 +584,25 @@ fn map_workflow_event(ev: &WorkflowEvent, ctx: &mut WfCtx, out: &mut Vec<Value>)
                 }
             }));
         }
+        WorkflowEvent::Intermediate {
+            data,
+            source_executor_id,
+        } => {
+            // Non-terminal progress signal, analogous to `Output` but never
+            // recorded as the run's final output: surfaced as a workflow
+            // debug event rather than an output message item.
+            out.push(json!({
+                "type": "response.workflow_event.completed",
+                "item_id": ctx.item_id,
+                "output_index": ctx.output_index.max(0),
+                "sequence_number": ctx.next(),
+                "data": {
+                    "event_type": "WorkflowIntermediateEvent",
+                    "source_executor_id": source_executor_id,
+                    "data": data,
+                },
+            }));
+        }
         WorkflowEvent::RequestInfo {
             request_id,
             source_executor_id,
@@ -694,6 +695,14 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
             "source_executor_id": source_executor_id,
             "request_data": request_data,
         }),
+        WorkflowEvent::Intermediate {
+            data,
+            source_executor_id,
+        } => json!({
+            "event_type": "WorkflowIntermediateEvent",
+            "source_executor_id": source_executor_id,
+            "data": data,
+        }),
     }
 }
 
@@ -713,36 +722,20 @@ fn execution_error(message: String) -> Response {
         .into_response()
 }
 
-fn build_usage(usage: &Option<UsageDetails>, input_len: usize, output_len: usize) -> Usage {
-    match usage {
-        Some(u) => {
-            let input = u.input_token_count.unwrap_or(0);
-            let output = u.output_token_count.unwrap_or(0);
-            let total = u.total_token_count.unwrap_or(input + output);
-            Usage {
-                input_tokens: input,
-                output_tokens: output,
-                total_tokens: total,
-                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            }
-        }
-        None => {
-            // DevUI's fallback estimate: ~4 characters per token.
-            let input = (input_len / 4) as u64;
-            let output = (output_len / 4) as u64;
-            Usage {
-                input_tokens: input,
-                output_tokens: output,
-                total_tokens: input + output,
-                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            }
-        }
+/// DevUI's fallback usage estimate (~4 characters per token) for runs that
+/// report no usage details, applied on top of [`responses_from_run`]'s
+/// pass-through usage mapping.
+fn usage_estimate(input_len: usize, output_len: usize) -> Usage {
+    let input = (input_len / 4) as u64;
+    let output = (output_len / 4) as u64;
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input + output,
+        input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+        output_tokens_details: OutputTokensDetails {
+            reasoning_tokens: 0,
+        },
     }
 }
 
@@ -762,74 +755,6 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
-/// Parse the OpenAI-style `input` into chat messages for an agent.
-///
-/// Accepts a bare string, an array of input items (OpenAI `{type:"message",
-/// content:[…]}` or `{role, content}`), or falls back to a stringified value.
-fn input_to_messages(input: &Value) -> Vec<ChatMessage> {
-    match input {
-        Value::String(s) => vec![ChatMessage::user(s.clone())],
-        Value::Null => vec![ChatMessage::user(String::new())],
-        Value::Array(items) => {
-            let msgs: Vec<ChatMessage> = items.iter().filter_map(item_to_message).collect();
-            if msgs.is_empty() {
-                vec![ChatMessage::user(String::new())]
-            } else {
-                msgs
-            }
-        }
-        obj @ Value::Object(_) => item_to_message(obj)
-            .map(|m| vec![m])
-            .unwrap_or_else(|| vec![ChatMessage::user(obj.to_string())]),
-        other => vec![ChatMessage::user(other.to_string())],
-    }
-}
-
-/// Convert one input item into a chat message, if it carries text.
-fn item_to_message(item: &Value) -> Option<ChatMessage> {
-    match item {
-        Value::String(s) => Some(ChatMessage::user(s.clone())),
-        Value::Object(map) => {
-            let role = map
-                .get("role")
-                .and_then(Value::as_str)
-                .map(role_from)
-                .unwrap_or_else(Role::user);
-            let text = map.get("content").map(content_text).unwrap_or_default();
-            Some(ChatMessage::new(role, text))
-        }
-        _ => None,
-    }
-}
-
-/// Extract text from an OpenAI `content` value (string or array of parts).
-fn content_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| {
-                p.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| p.as_str().map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        other => other.to_string(),
-    }
-}
-
-fn role_from(role: &str) -> Role {
-    match role {
-        "user" => Role::user(),
-        "assistant" => Role::assistant(),
-        "system" => Role::system(),
-        "tool" => Role::tool(),
-        other => Role::new(other),
-    }
-}
-
 /// Reduce the OpenAI-style `input` to a value fed to `Workflow::run`.
 ///
 /// Strings and structured objects pass through; a message array is flattened to
@@ -839,9 +764,9 @@ fn input_to_workflow_value(input: &Value) -> Value {
         Value::String(s) => Value::String(s.clone()),
         Value::Null => Value::String(String::new()),
         Value::Array(_) => {
-            let text = input_to_messages(input)
+            let text = crate::responses::input_to_messages(input)
                 .iter()
-                .map(ChatMessage::text)
+                .map(Message::text)
                 .collect::<Vec<_>>()
                 .join("\n");
             Value::String(text)

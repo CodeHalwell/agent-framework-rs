@@ -7,12 +7,12 @@
 //! base URL.
 //!
 //! ```no_run
-//! use agent_framework_openai::OpenAIClient;
+//! use agent_framework_openai::OpenAIChatCompletionClient;
 //! use agent_framework_core::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIClient::new("sk-...", "gpt-4o-mini");
-//! let agent = ChatAgent::builder(client)
+//! let client = OpenAIChatCompletionClient::new("sk-...", "gpt-4o-mini");
+//! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
 //! let reply = agent.run_once("Say hi").await?;
@@ -32,10 +32,7 @@
 pub mod convert;
 
 pub mod responses;
-pub use responses::OpenAIResponsesClient;
-
-pub mod assistants;
-pub use assistants::OpenAIAssistantsClient;
+pub use responses::OpenAIChatClient;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -44,8 +41,8 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
-    FunctionArguments, FunctionCallContent, Role, TextContent, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason, FunctionArguments,
+    FunctionCallContent, Message, Role, TextContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -67,12 +64,12 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         .filter(|s| s.is_finite() && *s >= 0.0)
 }
 
-/// Classify a non-success OpenAI-wire (Chat Completions / Responses /
-/// Assistants) HTTP response into a granular [`Error`].
+/// Classify a non-success OpenAI-wire (Chat Completions / Responses) HTTP
+/// response into a granular [`Error`].
 ///
 /// The single point of truth for status/body interpretation, used by every
-/// endpoint in this crate ([`OpenAIClient::post`], [`responses`], and
-/// [`assistants`]) and reused by `agent-framework-azure` (Azure OpenAI is
+/// endpoint in this crate ([`OpenAIChatCompletionClient::post`] and [`responses`]) and reused
+/// by `agent-framework-azure` (Azure OpenAI is
 /// wire-compatible for Chat Completions and Responses), so the two stay
 /// identical rather than drifting.
 ///
@@ -154,7 +151,7 @@ fn is_content_filter_marker(v: &Value) -> bool {
 
 /// An OpenAI (or OpenAI-compatible) chat client.
 #[derive(Clone)]
-pub struct OpenAIClient {
+pub struct OpenAIChatCompletionClient {
     inner: Arc<Inner>,
 }
 
@@ -167,7 +164,7 @@ struct Inner {
     organization: Option<String>,
 }
 
-impl OpenAIClient {
+impl OpenAIChatCompletionClient {
     /// Create a client for the given API key and default model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -205,10 +202,10 @@ impl OpenAIClient {
         self
     }
 
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.model.clone());
         body.insert("model".into(), json!(model));
@@ -270,10 +267,10 @@ impl OpenAIClient {
 }
 
 #[async_trait::async_trait]
-impl ChatClient for OpenAIClient {
+impl ChatClient for OpenAIChatCompletionClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -287,7 +284,7 @@ impl ChatClient for OpenAIClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -295,7 +292,7 @@ impl ChatClient for OpenAIClient {
         Ok(parse_sse_stream(resp).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
 }
@@ -400,7 +397,7 @@ fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseS
 fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<ChatResponseUpdate> {
     let mut update = ChatResponseUpdate {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 
@@ -479,8 +476,8 @@ mod tests {
     // -- classify_service_error --------------------------------------------
     //
     // Canned status+body combinations run through the exact classification
-    // `OpenAIClient::post`, `responses::OpenAIResponsesClient::post`, and
-    // `assistants::OpenAIAssistantsClient::send` all delegate to.
+    // `OpenAIChatCompletionClient::post` and `responses::OpenAIChatClient::post`
+    // both delegate to.
 
     #[test]
     fn classifies_401_and_403_as_invalid_auth() {

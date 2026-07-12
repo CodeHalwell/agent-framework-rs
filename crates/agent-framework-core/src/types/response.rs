@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::content::{Content, FunctionApprovalRequestContent, FunctionCallContent, UsageDetails};
-use super::message::{ChatMessage, Role};
+use super::message::{Message, Role};
 use super::options::ResponseFormat;
 use crate::error::{Error, Result};
 
@@ -35,16 +35,36 @@ impl FinishReason {
     }
 }
 
+/// An opaque, provider-issued token that resumes a background / long-running
+/// run where it left off.
+///
+/// Mirrors the Python `ContinuationToken`: the framework treats it as opaque
+/// and simply threads it back to the provider to continue a resumable run. It
+/// is surfaced on [`ChatResponse`] / [`AgentResponse`] when a run is not yet
+/// complete and can be resumed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContinuationToken(pub String);
+
+impl ContinuationToken {
+    pub fn new(v: impl Into<String>) -> Self {
+        ContinuationToken(v.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A full (non-streaming) response from a chat client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatResponse {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -54,6 +74,11 @@ pub struct ChatResponse {
     /// Parsed structured-output value, when a response format was requested.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<Value>,
+    /// Opaque token to resume this run when it is a background/long-running
+    /// request that has not yet completed. `None` for ordinary complete
+    /// responses.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_properties: HashMap<String, Value>,
 }
@@ -62,7 +87,7 @@ impl ChatResponse {
     /// Build a response from a single assistant text message.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
-            messages: vec![ChatMessage::assistant(text)],
+            messages: vec![Message::assistant(text)],
             ..Default::default()
         }
     }
@@ -71,7 +96,7 @@ impl ChatResponse {
     pub fn text(&self) -> String {
         self.messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -179,8 +204,8 @@ impl ChatResponse {
         if let Some(c) = &update.conversation_id {
             self.conversation_id.get_or_insert_with(|| c.clone());
         }
-        if let Some(m) = &update.model_id {
-            self.model_id.get_or_insert_with(|| m.clone());
+        if let Some(m) = &update.model {
+            self.model.get_or_insert_with(|| m.clone());
         }
         if let Some(cr) = &update.created_at {
             self.created_at.get_or_insert_with(|| cr.clone());
@@ -201,7 +226,7 @@ impl ChatResponse {
         let msg_idx = match idx {
             Some(i) => i,
             None => {
-                let mut m = ChatMessage::with_contents(role, Vec::new());
+                let mut m = Message::with_contents(role, Vec::new());
                 m.message_id = update.message_id.clone();
                 m.author_name = update.author_name.clone();
                 self.messages.push(m);
@@ -295,7 +320,7 @@ pub struct ChatResponseUpdate {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -330,13 +355,13 @@ impl ChatResponseUpdate {
 
 /// A full response from an agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentRunResponse {
-    pub messages: Vec<ChatMessage>,
+pub struct AgentResponse {
+    pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
     /// Service-side conversation id, when the backing service manages the
     /// conversation (e.g. Responses API `previous_response_id`, Azure AI
-    /// thread id). `ChatAgent` persists it onto the [`AgentThread`].
+    /// thread id). `Agent` persists it onto the [`AgentThread`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -345,22 +370,23 @@ pub struct AgentRunResponse {
     pub usage_details: Option<UsageDetails>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<Value>,
+    /// Opaque token to resume this run when it is a background/long-running
+    /// request that has not yet completed. `None` for ordinary complete runs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_properties: HashMap<String, Value>,
 }
 
-impl AgentRunResponse {
+impl AgentResponse {
     /// The concatenated text of all messages (no separator), matching Python.
     pub fn text(&self) -> String {
-        self.messages
-            .iter()
-            .map(ChatMessage::text)
-            .collect::<String>()
+        self.messages.iter().map(Message::text).collect::<String>()
     }
 
     /// All pending user-input (function-approval) requests across the messages.
     ///
-    /// Mirrors Python `AgentRunResponse.user_input_requests`; use this to detect
+    /// Mirrors Python `AgentResponse.user_input_requests`; use this to detect
     /// when a run paused awaiting human approval of a tool call.
     pub fn user_input_requests(&self) -> Vec<&FunctionApprovalRequestContent> {
         self.messages
@@ -388,26 +414,27 @@ impl AgentRunResponse {
             created_at: resp.created_at,
             usage_details: resp.usage_details,
             value: resp.value,
+            continuation_token: resp.continuation_token,
             additional_properties: resp.additional_properties,
         }
     }
 
     /// Aggregate a stream of agent updates into a full response.
-    pub fn from_updates(updates: Vec<AgentRunResponseUpdate>) -> Self {
+    pub fn from_updates(updates: Vec<AgentResponseUpdate>) -> Self {
         Self::from_updates_with_format(updates, None)
     }
 
     /// Aggregate a stream of agent updates into a full response, auto-populating
-    /// [`AgentRunResponse::value`] from the aggregated text when a structured
+    /// [`AgentResponse::value`] from the aggregated text when a structured
     /// `response_format` was requested (mirrors Python's
     /// `output_format_type` argument to `from_agent_run_response_updates`).
     pub fn from_updates_with_format(
-        updates: Vec<AgentRunResponseUpdate>,
+        updates: Vec<AgentResponseUpdate>,
         response_format: Option<&ResponseFormat>,
     ) -> Self {
         let chat_updates: Vec<ChatResponseUpdate> = updates
             .into_iter()
-            .map(AgentRunResponseUpdate::into_chat_update)
+            .map(AgentResponseUpdate::into_chat_update)
             .collect();
         Self::from_chat_response(ChatResponse::from_updates_with_format(
             chat_updates,
@@ -415,16 +442,16 @@ impl AgentRunResponse {
         ))
     }
 
-    /// Alias for [`AgentRunResponse::from_updates`], matching Python's
-    /// `AgentRunResponse.from_agent_run_response_updates`.
-    pub fn from_agent_run_response_updates(updates: Vec<AgentRunResponseUpdate>) -> Self {
+    /// Alias for [`AgentResponse::from_updates`], matching Python's
+    /// `AgentResponse.from_agent_run_response_updates`.
+    pub fn from_agent_run_response_updates(updates: Vec<AgentResponseUpdate>) -> Self {
         Self::from_updates(updates)
     }
 }
 
 /// A single streaming chunk from an agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentRunResponseUpdate {
+pub struct AgentResponseUpdate {
     pub contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub role: Option<Role>,
@@ -437,14 +464,14 @@ pub struct AgentRunResponseUpdate {
     /// Service-side conversation id carried by the underlying chat update
     /// (Responses / Assistants / Azure AI service-managed conversations).
     /// Preserved so aggregating a streamed run via
-    /// [`AgentRunResponse::from_updates`] yields the same
-    /// [`AgentRunResponse::conversation_id`] a non-streaming `run()` returns.
+    /// [`AgentResponse::from_updates`] yields the same
+    /// [`AgentResponse::conversation_id`] a non-streaming `run()` returns.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     /// Provider-specific metadata for this update. Merged onto
-    /// [`AgentRunResponse::additional_properties`] during aggregation.
+    /// [`AgentResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_properties: HashMap<String, Value>,
     /// The raw provider payload this update was decoded from, if retained.
@@ -452,7 +479,7 @@ pub struct AgentRunResponseUpdate {
     pub raw_representation: Option<Value>,
 }
 
-impl AgentRunResponseUpdate {
+impl AgentResponseUpdate {
     /// The concatenated text of this update.
     pub fn text(&self) -> String {
         self.contents
@@ -463,7 +490,7 @@ impl AgentRunResponseUpdate {
 
     /// The user-input (function-approval) requests carried by this update.
     ///
-    /// Mirrors Python `AgentRunResponseUpdate.user_input_requests`.
+    /// Mirrors Python `AgentResponseUpdate.user_input_requests`.
     pub fn user_input_requests(&self) -> Vec<&FunctionApprovalRequestContent> {
         self.contents
             .iter()
@@ -516,6 +543,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuation_token_roundtrips_and_maps_across_responses() {
+        let token = ContinuationToken::new("resume-abc");
+        assert_eq!(token.as_str(), "resume-abc");
+        // Transparent newtype: serializes as a bare string.
+        assert_eq!(serde_json::to_value(&token).unwrap(), json!("resume-abc"));
+
+        let mut chat = ChatResponse::from_text("partial");
+        chat.continuation_token = Some(token.clone());
+        // Present on the wire and survives a round-trip.
+        let v = serde_json::to_value(&chat).unwrap();
+        assert_eq!(v.get("continuation_token"), Some(&json!("resume-abc")));
+        let back: ChatResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back.continuation_token, Some(token.clone()));
+
+        // The chat->agent-run mapping carries the token over.
+        let agent = AgentResponse::from_chat_response(chat);
+        assert_eq!(agent.continuation_token, Some(token));
+
+        // Ordinary responses omit the field entirely.
+        let plain = serde_json::to_value(ChatResponse::from_text("done")).unwrap();
+        assert!(plain.get("continuation_token").is_none());
+    }
+
     // region: task 3 — structured-output value auto-fill on streaming aggregation
 
     #[test]
@@ -554,13 +605,13 @@ mod tests {
 
     #[test]
     fn agent_run_response_from_updates_with_format_propagates_value() {
-        let updates = vec![AgentRunResponseUpdate {
+        let updates = vec![AgentResponseUpdate {
             contents: vec![Content::text("{\"n\": 42}")],
             role: Some(Role::assistant()),
             ..Default::default()
         }];
         let resp =
-            AgentRunResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
+            AgentResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
         assert_eq!(resp.value, Some(json!({"n": 42})));
     }
 

@@ -22,7 +22,7 @@ use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Ok(client) = OpenAIClient::from_env("gpt-4o-mini") else {
+    let Ok(client) = OpenAIChatCompletionClient::from_env("gpt-4o-mini") else {
         println!("set OPENAI_API_KEY to run this example");
         return Ok(());
     };
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     let tools = mcp.tool_definitions().await?;
     println!("connected; {} tool(s) discovered", tools.len());
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .instructions("Use the available tools when asked.")
         .tools(tools)
         .build();

@@ -20,7 +20,7 @@ struct Recipe {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     // `ResponseFormat::json_schema` takes a raw JSON Schema value. Hand-writing
     // it is fine for a small shape like this; a larger app might derive one
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
         "additionalProperties": false
     });
 
-    let agent = ChatAgent::builder(client)
+    let agent = Agent::builder(client)
         .name("chef")
         .instructions("You suggest simple recipes.")
         .response_format(ResponseFormat::json_schema("Recipe", schema))

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_framework_core::error::Result;
-use agent_framework_core::prelude::{Agent, AgentRunResponse, ChatMessage, ChatResponse};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::prelude::{AgentResponse, ChatResponse, Message, SupportsAgentRun};
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::workflow::{
     get_checkpoint_summary, validate_workflow_graph, AgentExecutor, Case, CheckpointStorage,
     Default as SwitchDefault, EdgeGroup, Executor, FileCheckpointStorage, FunctionExecutor,
@@ -186,7 +186,7 @@ fn validate_workflow_graph_returns_typed_error() {
         target: "b".into(),
         condition: None,
     }];
-    let err = validate_workflow_graph(&execs, &groups, "a").unwrap_err();
+    let err = validate_workflow_graph(&execs, &groups, "a", &[], &[]).unwrap_err();
     assert_eq!(err.validation_type, ValidationType::GraphConnectivity);
 
     // Duplicate edge is also surfaced with the right category.
@@ -205,7 +205,7 @@ fn validate_workflow_graph_returns_typed_error() {
     let mut ab: HashMap<String, Arc<dyn Executor>> = HashMap::new();
     ab.insert("a".into(), noop("a"));
     ab.insert("b".into(), noop("b"));
-    let err = validate_workflow_graph(&ab, &dup_groups, "a").unwrap_err();
+    let err = validate_workflow_graph(&ab, &dup_groups, "a", &[], &[]).unwrap_err();
     assert_eq!(err.validation_type, ValidationType::EdgeDuplication);
 }
 
@@ -290,6 +290,7 @@ fn tag(event: &WorkflowEvent) -> String {
         WorkflowEvent::AgentRunUpdate { .. } => "AgentRunUpdate".into(),
         WorkflowEvent::AgentRun { .. } => "AgentRun".into(),
         WorkflowEvent::Output { .. } => "Output".into(),
+        WorkflowEvent::Intermediate { .. } => "Intermediate".into(),
         WorkflowEvent::Custom(_) => "Custom".into(),
         WorkflowEvent::RequestInfo { .. } => "RequestInfo".into(),
         WorkflowEvent::Failed { .. } => "Failed".into(),
@@ -343,6 +344,76 @@ async fn run_stream_event_ordering() {
     let run = stream.into_run().await.unwrap();
     assert_eq!(run.last_output(), Some(json!(42)));
     assert_eq!(run.state(), WorkflowRunState::Idle);
+}
+
+// ----------------------------------------------------------------------------
+// Per-executor serialization within a superstep (upstream PR #6776)
+// ----------------------------------------------------------------------------
+
+/// An executor that records the peak number of concurrently-running
+/// `execute()` calls it observes. It yields to the runtime while "inside"
+/// `execute` so a racing sibling call on the *same* instance would be seen.
+struct ConcurrencyProbe {
+    id: String,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Executor for ConcurrencyProbe {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn execute(&self, _message: Value, _ctx: WorkflowContext) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        // Give any concurrently-scheduled sibling call ample opportunity to
+        // interleave before we lower the in-flight count.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Two messages delivered to the same executor instance in one superstep must
+/// have their `execute()` calls serialized, even though distinct executors run
+/// concurrently. Without per-executor serialization the two calls overlap and
+/// `max_in_flight` reaches 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_executor_deliveries_serialize_within_a_superstep() {
+    // `src` emits two messages down the single edge to `sink`, so in the next
+    // superstep `sink` receives two separate (non-fan-in) deliveries.
+    let src = FunctionExecutor::new("src", |_msg, ctx| async move {
+        ctx.send_message(json!(1)).await?;
+        ctx.send_message(json!(2)).await?;
+        Ok(())
+    });
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = ConcurrencyProbe {
+        id: "sink".into(),
+        in_flight: in_flight.clone(),
+        max_in_flight: max_in_flight.clone(),
+    };
+
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(src))
+        .add_executor(Arc::new(sink))
+        .set_start("src")
+        .add_edge("src", "sink")
+        .build()
+        .unwrap();
+
+    let run = workflow.run(json!(0)).await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    assert_eq!(
+        max_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "two deliveries to the same executor must not run concurrently"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -620,15 +691,15 @@ struct MockAgent {
 }
 
 #[async_trait]
-impl Agent for MockAgent {
+impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
-        Ok(AgentRunResponse::from_chat_response(
-            ChatResponse::from_text(&self.reply),
-        ))
+        _messages: Vec<Message>,
+        _thread: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse::from_chat_response(ChatResponse::from_text(
+            &self.reply,
+        )))
     }
     fn id(&self) -> &str {
         &self.id
@@ -640,7 +711,7 @@ async fn agent_executor_emits_agent_events() {
     let agent = Arc::new(MockAgent {
         id: "m".into(),
         reply: "hello".into(),
-    }) as Arc<dyn Agent>;
+    }) as Arc<dyn SupportsAgentRun>;
     let exec = AgentExecutor::new("a1", agent).with_output(true);
 
     let workflow = WorkflowBuilder::new()
@@ -670,17 +741,17 @@ async fn agent_executor_emits_agent_events() {
 struct MultiMessageAgent;
 
 #[async_trait]
-impl Agent for MultiMessageAgent {
+impl SupportsAgentRun for MultiMessageAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
-        _thread: Option<&mut AgentThread>,
-    ) -> Result<AgentRunResponse> {
-        Ok(AgentRunResponse {
+        _messages: Vec<Message>,
+        _thread: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
             messages: vec![
-                ChatMessage::assistant("one"),
-                ChatMessage::assistant("two"),
-                ChatMessage::assistant("three"),
+                Message::assistant("one"),
+                Message::assistant("two"),
+                Message::assistant("three"),
             ],
             ..Default::default()
         })
@@ -694,7 +765,7 @@ impl Agent for MultiMessageAgent {
 async fn agent_executor_emits_incremental_agent_run_updates() {
     // The orchestration layer now drives `run_stream` and emits one
     // `AgentRunUpdate` per streamed update, then a single terminal `AgentRun`.
-    let agent = Arc::new(MultiMessageAgent) as Arc<dyn Agent>;
+    let agent = Arc::new(MultiMessageAgent) as Arc<dyn SupportsAgentRun>;
     let exec = AgentExecutor::new("a1", agent).with_output(true);
     let workflow = WorkflowBuilder::new()
         .add_executor(Arc::new(exec))
@@ -990,4 +1061,171 @@ async fn fan_out_event_and_output_order_is_deterministic() {
         "outputs follow sorted-target order"
     );
     assert_eq!(run2.outputs(), run1.outputs());
+}
+
+// ----------------------------------------------------------------------------
+// Workflow output designation: output_from / intermediate_output_from
+// ----------------------------------------------------------------------------
+
+/// Two-stage pipeline, `first -> second`, both yielding a value. Used to probe
+/// the interaction between `output_from`/`intermediate_output_from` and
+/// `last_output`/`outputs`/`events`.
+fn two_stage_yield_workflow(
+    output_from: Option<Vec<&'static str>>,
+    intermediate_from: Option<Vec<&'static str>>,
+) -> Result<Workflow> {
+    let first = FunctionExecutor::new("first", |_msg, ctx| async move {
+        ctx.yield_output(json!("from-first")).await?;
+        ctx.send_message(json!("go")).await?;
+        Ok(())
+    });
+    let second = FunctionExecutor::new("second", |_msg, ctx| async move {
+        ctx.yield_output(json!("from-second")).await?;
+        Ok(())
+    });
+
+    let mut builder = WorkflowBuilder::new()
+        .add_executor(Arc::new(first))
+        .add_executor(Arc::new(second))
+        .set_start("first")
+        .add_edge("first", "second");
+    if let Some(ids) = output_from {
+        builder = builder.output_from(ids);
+    }
+    if let Some(ids) = intermediate_from {
+        builder = builder.intermediate_output_from(ids);
+    }
+    builder.build()
+}
+
+#[tokio::test]
+async fn default_output_designation_is_unchanged() {
+    // With neither `output_from` nor `intermediate_output_from` configured,
+    // every yield is a terminal `Output` and `last_output` is the last one
+    // produced, exactly as before this feature existed.
+    let workflow = two_stage_yield_workflow(None, None).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(
+        run.outputs(),
+        vec![json!("from-first"), json!("from-second")]
+    );
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+    assert!(
+        !run.events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::Intermediate { .. })),
+        "no Intermediate events without a designation"
+    );
+}
+
+#[tokio::test]
+async fn intermediate_output_from_is_non_terminal_output_from_wins() {
+    // `first` is marked intermediate-only; `second` is the designated output.
+    // `first`'s yield must surface as `Intermediate` (never as the run's final
+    // output), while `second`'s yield is the `Output` / `last_output`.
+    let workflow = two_stage_yield_workflow(Some(vec!["second"]), Some(vec!["first"])).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(
+        run.outputs(),
+        vec![json!("from-second")],
+        "only the output_from executor's yield counts as Output"
+    );
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+
+    let intermediates: Vec<Value> = run
+        .events()
+        .iter()
+        .filter_map(|e| e.as_intermediate().cloned())
+        .collect();
+    assert_eq!(
+        intermediates,
+        vec![json!("from-first")],
+        "the intermediate_output_from executor's yield is Intermediate, not Output"
+    );
+
+    // Sanity: the intermediate value never leaks into last_output/outputs.
+    assert_ne!(run.last_output(), Some(json!("from-first")));
+    assert!(!run.outputs().contains(&json!("from-first")));
+}
+
+#[tokio::test]
+async fn output_from_demotes_undesignated_executors_to_intermediate() {
+    // Only `second` is designated as an output source; `first` is not listed
+    // in either set. Per the documented precedence, its yield is demoted to a
+    // non-terminal Intermediate rather than silently dropped.
+    let workflow = two_stage_yield_workflow(Some(vec!["second"]), None).unwrap();
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    assert_eq!(run.outputs(), vec![json!("from-second")]);
+    assert_eq!(run.last_output(), Some(json!("from-second")));
+    assert!(run.events().iter().any(
+        |e| matches!(e, WorkflowEvent::Intermediate { data, source_executor_id }
+            if data == &json!("from-first") && source_executor_id == "first")
+    ));
+}
+
+#[test]
+fn output_designation_validation_rejects_overlap_and_unknown_ids() {
+    let mut execs: HashMap<String, Arc<dyn Executor>> = HashMap::new();
+    execs.insert("a".into(), noop("a"));
+    execs.insert("b".into(), noop("b"));
+    let groups = vec![EdgeGroup::Single {
+        source: "a".into(),
+        target: "b".into(),
+        condition: None,
+    }];
+
+    // Overlapping designation.
+    let overlap = vec!["a".to_string()];
+    let err = validate_workflow_graph(&execs, &groups, "a", &overlap, &overlap).unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Unknown id in output_from.
+    let err = validate_workflow_graph(
+        &execs,
+        &groups,
+        "a",
+        &["not-a-real-executor".to_string()],
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Unknown id in intermediate_output_from.
+    let err = validate_workflow_graph(
+        &execs,
+        &groups,
+        "a",
+        &[],
+        &["not-a-real-executor".to_string()],
+    )
+    .unwrap_err();
+    assert_eq!(err.validation_type, ValidationType::OutputValidation);
+
+    // Disjoint, known ids: valid.
+    assert!(
+        validate_workflow_graph(&execs, &groups, "a", &["a".to_string()], &["b".to_string()],)
+            .is_ok()
+    );
+}
+
+#[test]
+fn workflow_builder_rejects_overlapping_output_designation_at_build() {
+    let first = FunctionExecutor::new("first", |_msg, ctx| async move {
+        ctx.yield_output(json!("x")).await?;
+        Ok(())
+    });
+    let result = WorkflowBuilder::new()
+        .add_executor(Arc::new(first))
+        .set_start("first")
+        .output_from(["first"])
+        .intermediate_output_from(["first"])
+        .build();
+    let err = match result {
+        Ok(_) => panic!("expected build() to reject an overlapping output designation"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("OUTPUT_VALIDATION"));
 }

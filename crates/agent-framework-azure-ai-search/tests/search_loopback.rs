@@ -1,7 +1,7 @@
 //! Hermetic loopback tests for [`AzureAISearchProvider`] against a hand-rolled
 //! fake Azure AI Search server on a bare `std::net::TcpListener` — no external
 //! process, no real network. Verifies the request (route, auth header, body)
-//! and the response → [`Context`] formatting for both api-key and
+//! and the response → [`SessionContext`] formatting for both api-key and
 //! token-credential auth.
 
 use std::io::{Read, Write};
@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use agent_framework_azure::StaticTokenCredential;
 use agent_framework_azure_ai_search::AzureAISearchProvider;
-use agent_framework_core::memory::ContextProvider;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::types::Message;
 use serde_json::Value;
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -137,13 +137,11 @@ async fn api_key_search_formats_context_with_citations() {
         .with_top(2)
         .with_semantic_configuration("sem");
 
-    let context = provider
-        .invoking(&[ChatMessage::user("what color is the sky?")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("what color is the sky?")]);
+    provider.before_run(&mut ctx).await.unwrap();
 
     // Header + one cited block per result, folded into instructions.
-    let instructions = context.instructions.unwrap();
+    let instructions = ctx.instructions.unwrap();
     assert!(instructions.starts_with("Use the following context to answer the question:"));
     assert!(instructions.contains("[Source: doc1] The sky is blue."));
     assert!(instructions.contains("[Source: doc2] Water is wet."));
@@ -174,11 +172,9 @@ async fn token_credential_search_uses_bearer_auth() {
         Arc::new(StaticTokenCredential::new("jwt-token")),
     );
 
-    let context = provider
-        .invoking(&[ChatMessage::user("query")])
-        .await
-        .unwrap();
-    assert!(context.instructions.is_some());
+    let mut ctx = SessionContext::new(vec![Message::user("query")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.instructions.is_some());
 
     let (_line, headers, _body) = server.requests().remove(0);
     assert!(
@@ -200,12 +196,10 @@ async fn empty_query_makes_no_request() {
     let provider = AzureAISearchProvider::with_api_key(&server.addr, "idx", "key");
 
     // No user message → empty context, no search issued.
-    let context = provider
-        .invoking(&[ChatMessage::system("system only")])
-        .await
-        .unwrap();
-    assert!(context.instructions.is_none());
-    assert!(context.messages.is_empty());
+    let mut ctx = SessionContext::new(vec![Message::system("system only")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.instructions.is_none());
+    assert!(ctx.messages.is_empty());
 
     std::thread::sleep(Duration::from_millis(30));
     assert_eq!(server.requests().len(), 0, "no query should have been sent");
@@ -215,9 +209,7 @@ async fn empty_query_makes_no_request() {
 async fn no_results_yields_empty_context() {
     let server = FakeSearch::start(r#"{"value":[]}"#);
     let provider = AzureAISearchProvider::with_api_key(&server.addr, "idx", "key");
-    let context = provider
-        .invoking(&[ChatMessage::user("nothing matches")])
-        .await
-        .unwrap();
-    assert!(context.instructions.is_none());
+    let mut ctx = SessionContext::new(vec![Message::user("nothing matches")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.instructions.is_none());
 }
