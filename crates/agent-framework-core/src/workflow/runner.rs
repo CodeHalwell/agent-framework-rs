@@ -505,6 +505,9 @@ impl Workflow {
 /// run concurrently, so nothing here borrows the runner.
 struct Invocation {
     executor: Arc<dyn Executor>,
+    /// The target executor's id. Invocations sharing an id are serialized
+    /// within a superstep (see [`WorkflowRun::run_loop`]).
+    executor_id: String,
     data: Value,
     source_ids: Vec<String>,
 }
@@ -662,6 +665,7 @@ impl WorkflowRun {
                 for m in direct {
                     invocations.push(Invocation {
                         executor: executor.clone(),
+                        executor_id: target_id.clone(),
                         data: m.data,
                         source_ids: vec![m.source_id],
                     });
@@ -689,6 +693,7 @@ impl WorkflowRun {
                     self.fanin.remove(target_id);
                     invocations.push(Invocation {
                         executor,
+                        executor_id: target_id.clone(),
                         data: Value::Array(collected),
                         source_ids: sources,
                     });
@@ -696,6 +701,7 @@ impl WorkflowRun {
                     for m in msgs {
                         invocations.push(Invocation {
                             executor: executor.clone(),
+                            executor_id: target_id.clone(),
                             data: m.data,
                             source_ids: vec![m.source_id],
                         });
@@ -703,22 +709,53 @@ impl WorkflowRun {
                 }
             }
 
-            // Run the planned invocations concurrently — upstream parity with
-            // `asyncio.gather` over a superstep's deliveries (`_runner.py`).
-            // Each future builds its own context and drains its own effects, so
-            // the executes (typically LLM calls) genuinely overlap instead of
-            // running one after another. `join_all` preserves input order, so
-            // `results` is still in the planned (sorted-target) order.
+            // Group the planned invocations by target executor. Invocations
+            // for one executor are contiguous (each target is visited once, in
+            // sorted order), so a linear scan reconstructs the groups while
+            // preserving planned order.
+            let mut groups: Vec<Vec<Invocation>> = Vec::new();
+            for inv in invocations {
+                match groups.last_mut() {
+                    Some(g) if g[0].executor_id == inv.executor_id => g.push(inv),
+                    _ => groups.push(vec![inv]),
+                }
+            }
+
+            // Run the groups concurrently, but serialize the invocations *within*
+            // a group: two deliveries to the same executor instance in one
+            // superstep must not have overlapping `execute()` calls, or a
+            // stateful executor sees a nondeterministic interleaving. This
+            // mirrors upstream's per-executor `_execution_lock` (PR #6776):
+            // different executors stay concurrent (`asyncio.gather` /
+            // `join_all`), same-executor deliveries run one at a time. Each
+            // future builds its own context and drains its own effects, so
+            // distinct executors (typically LLM calls) still genuinely overlap.
+            // Flattening the group results in group order — which is the sorted
+            // planned order, with each group's own invocations kept sequential —
+            // yields `results` in exactly the planned order the apply loop below
+            // relies on for determinism.
             let shared_state = self.shared_state.clone();
-            let results = futures::future::join_all(invocations.into_iter().map(|inv| {
-                Self::run_executor_isolated(
-                    inv.executor,
-                    inv.data,
-                    inv.source_ids,
-                    shared_state.clone(),
-                )
+            let group_results = futures::future::join_all(groups.into_iter().map(|group| {
+                let shared_state = shared_state.clone();
+                async move {
+                    let mut out = Vec::with_capacity(group.len());
+                    for inv in group {
+                        out.push(
+                            Self::run_executor_isolated(
+                                inv.executor,
+                                inv.data,
+                                inv.source_ids,
+                                shared_state.clone(),
+                            )
+                            .await,
+                        );
+                    }
+                    out
+                }
             }))
             .await;
+            let results: Vec<(String, Result<DrainedEffects>)> =
+                group_results.into_iter().flatten().collect();
 
             // Apply results in planned order so the emitted event sequence and
             // the next superstep's queue are identical to sequential execution.

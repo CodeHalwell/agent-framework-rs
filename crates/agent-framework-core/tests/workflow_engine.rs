@@ -346,6 +346,76 @@ async fn run_stream_event_ordering() {
 }
 
 // ----------------------------------------------------------------------------
+// Per-executor serialization within a superstep (upstream PR #6776)
+// ----------------------------------------------------------------------------
+
+/// An executor that records the peak number of concurrently-running
+/// `execute()` calls it observes. It yields to the runtime while "inside"
+/// `execute` so a racing sibling call on the *same* instance would be seen.
+struct ConcurrencyProbe {
+    id: String,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Executor for ConcurrencyProbe {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn execute(&self, _message: Value, _ctx: WorkflowContext) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        // Give any concurrently-scheduled sibling call ample opportunity to
+        // interleave before we lower the in-flight count.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Two messages delivered to the same executor instance in one superstep must
+/// have their `execute()` calls serialized, even though distinct executors run
+/// concurrently. Without per-executor serialization the two calls overlap and
+/// `max_in_flight` reaches 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_executor_deliveries_serialize_within_a_superstep() {
+    // `src` emits two messages down the single edge to `sink`, so in the next
+    // superstep `sink` receives two separate (non-fan-in) deliveries.
+    let src = FunctionExecutor::new("src", |_msg, ctx| async move {
+        ctx.send_message(json!(1)).await?;
+        ctx.send_message(json!(2)).await?;
+        Ok(())
+    });
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = ConcurrencyProbe {
+        id: "sink".into(),
+        in_flight: in_flight.clone(),
+        max_in_flight: max_in_flight.clone(),
+    };
+
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(src))
+        .add_executor(Arc::new(sink))
+        .set_start("src")
+        .add_edge("src", "sink")
+        .build()
+        .unwrap();
+
+    let run = workflow.run(json!(0)).await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    assert_eq!(
+        max_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "two deliveries to the same executor must not run concurrently"
+    );
+}
+
+// ----------------------------------------------------------------------------
 // Checkpointing: save -> restore -> resume (both storages) + executor state
 // ----------------------------------------------------------------------------
 
