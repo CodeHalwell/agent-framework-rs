@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     let mut thread = agent.get_new_thread();
     let response = agent
         .run(
-            vec![ChatMessage::user("Hello! What can you help with?")],
+            vec![Message::user("Hello! What can you help with?")],
             Some(&mut thread),
         )
         .await?;

@@ -22,13 +22,13 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let user_texts: Vec<String> = messages
             .iter()
             .filter(|m| m.role == Role::user())
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect();
         Ok(ChatResponse::from_text(format!(
             "(canned reply) so far you've told me: {}",
@@ -38,7 +38,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 
     for (i, query) in turns.iter().enumerate() {
         let response = agent
-            .run(vec![ChatMessage::user(*query)], Some(&mut thread))
+            .run(vec![Message::user(*query)], Some(&mut thread))
             .await?;
         let history_len = thread.list_messages().await?.len();
         println!("turn {}: user: {query}", i + 1);

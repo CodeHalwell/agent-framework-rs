@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
         .build();
 
     let mut thread = agent.get_new_thread();
-    let mut input = vec![ChatMessage::user("Please delete scratch.txt")];
+    let mut input = vec![Message::user("Please delete scratch.txt")];
 
     // Drive the approve/resubmit loop until a final, non-approval answer
     // comes back (bounded so a misbehaving model can't spin forever).
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
             .iter()
             .map(|req| Content::FunctionApprovalResponse(req.create_response(true)))
             .collect();
-        input = vec![ChatMessage::with_contents(Role::user(), approvals)];
+        input = vec![Message::with_contents(Role::user(), approvals)];
     }
 
     println!("gave up after 5 rounds without a final answer");

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use agent_framework_core::middleware::{AgentContext, MiddlewarePipeline, Terminal};
 use agent_framework_core::tools::BoxFuture;
-use agent_framework_core::types::{AgentResponse, ChatMessage};
+use agent_framework_core::types::{AgentResponse, Message};
 use agent_framework_purview::{
     PurviewAgentMiddleware, PurviewAppLocation, PurviewLocationType, PurviewSettings,
     StaticTokenProvider,
@@ -158,8 +158,8 @@ fn settings_pointed_at(base_url: &str) -> PurviewSettings {
         .with_graph_base_uri(base_url.to_string())
 }
 
-fn user_message() -> ChatMessage {
-    let mut m = ChatMessage::user("What's our Q3 roadmap?");
+fn user_message() -> Message {
+    let mut m = Message::user("What's our Q3 roadmap?");
     m.additional_properties.insert(
         "user_id".to_string(),
         serde_json::json!("87654321-4321-4321-4321-210987654321"),
@@ -172,7 +172,7 @@ fn terminal_returning(called: Arc<AtomicBool>, text: &'static str) -> Terminal<A
         called.store(true, Ordering::SeqCst);
         Box::pin(async move {
             ctx.result = Some(AgentResponse {
-                messages: vec![ChatMessage::assistant(text)],
+                messages: vec![Message::assistant(text)],
                 ..Default::default()
             });
             Ok(ctx)

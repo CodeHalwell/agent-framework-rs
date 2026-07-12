@@ -23,7 +23,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(format!(
@@ -34,7 +34,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     println!("-- turn 1 --");
     let query = "My name is Ada.";
     let r1 = agent
-        .run(vec![ChatMessage::user(query)], Some(&mut thread))
+        .run(vec![Message::user(query)], Some(&mut thread))
         .await?;
     println!("user: {query}\nassistant: {}\n", r1.text());
 
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     println!("-- turn 2, continuing the restored thread --");
     let query = "What is my name?";
     let r2 = agent
-        .run(vec![ChatMessage::user(query)], Some(&mut restored))
+        .run(vec![Message::user(query)], Some(&mut restored))
         .await?;
     println!("user: {query}\nassistant: {}", r2.text());
     println!(

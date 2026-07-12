@@ -28,7 +28,7 @@ use tokio::sync::OnceCell;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::{ApprovalMode, Tool, ToolDefinition, ToolSource};
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::client::McpClient;
 use crate::protocol::{
@@ -40,9 +40,9 @@ use crate::transport::{McpStdioTransport, McpStreamableHttpTransport, McpWebsock
 /// The `clientInfo.name` this crate sends during `initialize`.
 const CLIENT_NAME: &str = "agent-framework-rs";
 
-/// Map an MCP `prompts/get` message into a core [`ChatMessage`] — mirrors
+/// Map an MCP `prompts/get` message into a core [`Message`] — mirrors
 /// the Python reference's `_mcp_prompt_message_to_chat_message`.
-fn prompt_message_to_chat_message(msg: &crate::protocol::PromptMessage) -> ChatMessage {
+fn prompt_message_to_chat_message(msg: &crate::protocol::PromptMessage) -> Message {
     role_and_content_to_chat_message(&msg.role, &msg.content)
 }
 /// The `clientInfo.version` this crate sends during `initialize`.
@@ -445,9 +445,9 @@ impl McpStdioTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session
@@ -708,9 +708,9 @@ impl McpStreamableHttpTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session
@@ -980,9 +980,9 @@ impl McpWebsocketTool {
     }
 
     /// Connect (if not already connected) and fetch a rendered prompt's
-    /// messages, mapped into core [`ChatMessage`]s — mirrors Python's
+    /// messages, mapped into core [`Message`]s — mirrors Python's
     /// `MCPTool.get_prompt`.
-    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<ChatMessage>> {
+    pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Vec<Message>> {
         self.connect().await?;
         let client = self
             .session

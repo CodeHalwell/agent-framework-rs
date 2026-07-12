@@ -37,16 +37,10 @@ async fn main() -> Result<()> {
     // on the next call and the server sees one continuous conversation.
     let mut thread = agent.get_new_thread();
     agent
-        .run(
-            vec![ChatMessage::user("My name is Ada.")],
-            Some(&mut thread),
-        )
+        .run(vec![Message::user("My name is Ada.")], Some(&mut thread))
         .await?;
     let reply = agent
-        .run(
-            vec![ChatMessage::user("What is my name?")],
-            Some(&mut thread),
-        )
+        .run(vec![Message::user("What is my name?")], Some(&mut thread))
         .await?;
     println!("agent (same conversation): {}", reply.text());
 

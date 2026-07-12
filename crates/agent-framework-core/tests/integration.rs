@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 struct MockClient {
     responses: Arc<Mutex<Vec<ChatResponse>>>,
-    seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    seen: Arc<Mutex<Vec<Vec<Message>>>>,
     seen_options: Arc<Mutex<Vec<ChatOptions>>>,
 }
 
@@ -38,7 +38,7 @@ impl MockClient {
         self.seen_options.lock().unwrap().clone()
     }
     /// Every call's message list, in order.
-    fn all_seen(&self) -> Vec<Vec<ChatMessage>> {
+    fn all_seen(&self) -> Vec<Vec<Message>> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -47,7 +47,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.seen.lock().unwrap().push(messages);
@@ -62,7 +62,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -127,7 +127,7 @@ async fn tool_loop_executes_function() {
         Some(FunctionArguments::Raw(json!({"a": 2, "b": 3}).to_string())),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -183,7 +183,7 @@ async fn sequential_workflow_chains_agents() {
 
     let result = workflow.run("start").await.unwrap();
     let output = result.last_output().expect("a final output");
-    let conversation: Vec<ChatMessage> = serde_json::from_value(output).unwrap();
+    let conversation: Vec<Message> = serde_json::from_value(output).unwrap();
     let texts: Vec<String> = conversation.iter().map(|m| m.text()).collect();
     assert!(texts.contains(&"step-A".to_string()));
     assert!(texts.contains(&"step-B".to_string()));
@@ -209,7 +209,7 @@ async fn concurrent_workflow_fans_out() {
 
     let result = workflow.run("question").await.unwrap();
     let output = result.last_output().expect("a final output");
-    let conversation: Vec<ChatMessage> = serde_json::from_value(output).unwrap();
+    let conversation: Vec<Message> = serde_json::from_value(output).unwrap();
     let texts: Vec<String> = conversation.iter().map(|m| m.text()).collect();
     assert!(texts.iter().any(|t| t == "from-A"));
     assert!(texts.iter().any(|t| t == "from-B"));
@@ -315,7 +315,7 @@ async fn tool_loop_reports_invalid_arguments() {
         Some(FunctionArguments::Raw("{ not json".into())),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(bad_call)],
         )],
@@ -368,7 +368,7 @@ struct RecordingProvider {
 
 #[async_trait]
 impl ContextProvider for RecordingProvider {
-    async fn invoking(&self, _messages: &[ChatMessage]) -> Result<Context> {
+    async fn invoking(&self, _messages: &[Message]) -> Result<Context> {
         Ok(Context::new().with_instructions("remember: be brief"))
     }
     async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
@@ -380,8 +380,8 @@ impl ContextProvider for RecordingProvider {
     }
     async fn invoked(
         &self,
-        _request: &[ChatMessage],
-        _response: &[ChatMessage],
+        _request: &[Message],
+        _response: &[Message],
         error: Option<&Error>,
     ) -> Result<()> {
         *self.invoked.lock().unwrap() = true;
@@ -417,7 +417,7 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
     let call =
         FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -465,7 +465,7 @@ async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id
     let call =
         FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -529,7 +529,7 @@ async fn per_run_conversation_id_survives_on_a_local_thread() {
         ..Default::default()
     });
     agent
-        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .run_with_options(vec![Message::user("hi")], Some(&mut thread), options)
         .await
         .unwrap();
     assert_eq!(
@@ -555,7 +555,7 @@ async fn service_thread_id_wins_over_per_run_conversation_id() {
         ..Default::default()
     });
     agent
-        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .run_with_options(vec![Message::user("hi")], Some(&mut thread), options)
         .await
         .unwrap();
     assert_eq!(
@@ -605,7 +605,7 @@ async fn service_created_conversation_id_propagates_into_tool_followup() {
     let call =
         FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
     let first = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -628,7 +628,7 @@ async fn service_created_conversation_id_propagates_into_tool_followup() {
         ..Default::default()
     };
     let resp = client
-        .get_response(vec![ChatMessage::user("go")], options)
+        .get_response(vec![Message::user("go")], options)
         .await
         .unwrap();
     assert_eq!(resp.text(), "done");
@@ -660,13 +660,13 @@ async fn duplicate_provider_message_ids_do_not_merge_on_replay() {
     let call =
         FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
     let mut tool_call_msg =
-        ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+        Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
     tool_call_msg.message_id = Some("run_dup".into());
     let ask = ChatResponse {
         messages: vec![tool_call_msg],
         ..Default::default()
     };
-    let mut final_msg = ChatMessage::with_contents(Role::assistant(), vec![Content::text("final")]);
+    let mut final_msg = Message::with_contents(Role::assistant(), vec![Content::text("final")]);
     final_msg.message_id = Some("run_dup".into()); // same id as the tool-call turn
     let answer = ChatResponse {
         messages: vec![final_msg],
@@ -711,7 +711,7 @@ async fn provider_resolved_tool_calls_are_not_executed_locally() {
         Some(FunctionArguments::Raw("{}".into())),
     );
     let resolved = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![
                 Content::FunctionCall(call),
@@ -757,7 +757,7 @@ async fn chat_level_tool_stream_replay_carries_finish_reason() {
     let call =
         FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -781,7 +781,7 @@ async fn chat_level_tool_stream_replay_carries_finish_reason() {
         ..Default::default()
     };
     let mut stream = client
-        .get_streaming_response(vec![ChatMessage::user("go")], options)
+        .get_streaming_response(vec![Message::user("go")], options)
         .await
         .unwrap();
     let mut updates = Vec::new();
@@ -976,7 +976,7 @@ fn approval_tool(counter: Arc<Mutex<u32>>) -> ToolDefinition {
 
 fn secret_call() -> ChatResponse {
     ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(FunctionCallContent::new(
                 "call_1",
@@ -1002,10 +1002,7 @@ async fn approval_loop_approve_executes_and_answers() {
     // Request 1: the model asks for an approval-gated tool -> we get an approval
     // request back, and the tool has NOT run.
     let resp1 = client
-        .get_response(
-            vec![ChatMessage::user("what is the secret?")],
-            options.clone(),
-        )
+        .get_response(vec![Message::user("what is the secret?")], options.clone())
         .await
         .unwrap();
     let requests = resp1.user_input_requests();
@@ -1017,9 +1014,9 @@ async fn approval_loop_approve_executes_and_answers() {
 
     // Request 2: approve -> the tool runs and the model produces a final answer.
     let approval = requests[0].create_response(true);
-    let mut conversation = vec![ChatMessage::user("what is the secret?")];
+    let mut conversation = vec![Message::user("what is the secret?")];
     conversation.extend(resp1.messages.clone());
-    conversation.push(ChatMessage::with_contents(
+    conversation.push(Message::with_contents(
         Role::user(),
         vec![Content::FunctionApprovalResponse(approval)],
     ));
@@ -1039,10 +1036,7 @@ async fn approval_loop_reject_skips_execution() {
     let options = ChatOptions::new().with_tool(tool);
 
     let resp1 = client
-        .get_response(
-            vec![ChatMessage::user("what is the secret?")],
-            options.clone(),
-        )
+        .get_response(vec![Message::user("what is the secret?")], options.clone())
         .await
         .unwrap();
     let requests = resp1.user_input_requests();
@@ -1050,9 +1044,9 @@ async fn approval_loop_reject_skips_execution() {
 
     // Reject the call.
     let rejection = requests[0].create_response(false);
-    let mut conversation = vec![ChatMessage::user("what is the secret?")];
+    let mut conversation = vec![Message::user("what is the secret?")];
     conversation.extend(resp1.messages.clone());
-    conversation.push(ChatMessage::with_contents(
+    conversation.push(Message::with_contents(
         Role::user(),
         vec![Content::FunctionApprovalResponse(rejection)],
     ));
@@ -1079,7 +1073,7 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     // First run pauses awaiting approval; the request is surfaced on the agent
     // response and persisted to the thread.
     let resp1 = agent
-        .run(vec![ChatMessage::user("get the secret")], Some(&mut thread))
+        .run(vec![Message::user("get the secret")], Some(&mut thread))
         .await
         .unwrap();
     assert_eq!(resp1.user_input_requests().len(), 1);
@@ -1088,7 +1082,7 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     // Supplying the approval response as new input resolves the exchange.
     let resp2 = agent
         .run(
-            vec![ChatMessage::with_contents(
+            vec![Message::with_contents(
                 Role::user(),
                 vec![Content::FunctionApprovalResponse(approval)],
             )],
@@ -1129,7 +1123,7 @@ async fn agent_as_tool_is_callable_by_another_agent() {
         )),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -1175,7 +1169,7 @@ async fn observable_chat_client_is_transparent() {
         "mock",
     );
     let resp = client
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
     assert_eq!(resp.text(), "plain");
@@ -1193,7 +1187,7 @@ impl Middleware<ChatContext> for RewriteUserMessage {
     async fn process(&self, mut ctx: ChatContext, next: Next<ChatContext>) -> Result<ChatContext> {
         for m in &mut ctx.messages {
             if m.role == Role::user() {
-                *m = ChatMessage::user("REWRITTEN");
+                *m = Message::user("REWRITTEN");
             }
         }
         next.run(ctx).await
@@ -1274,7 +1268,7 @@ fn add_call(a: i64, b: i64) -> ChatResponse {
         Some(FunctionArguments::Raw(json!({"a": a, "b": b}).to_string())),
     );
     ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -1419,7 +1413,7 @@ async fn function_middleware_order_is_onion_nested() {
     // middleware has called `next`).
     let client = MockClient::new(vec![
         ChatResponse {
-            messages: vec![ChatMessage::with_contents(
+            messages: vec![Message::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(FunctionCallContent::new(
                     "call_1",
@@ -1473,7 +1467,7 @@ async fn service_conversation_id_is_adopted_by_thread() {
     impl ChatClient for ServiceClient {
         async fn get_response(
             &self,
-            _messages: Vec<ChatMessage>,
+            _messages: Vec<Message>,
             options: ChatOptions,
         ) -> Result<ChatResponse> {
             self.seen_options.lock().unwrap().push(options);
@@ -1483,7 +1477,7 @@ async fn service_conversation_id_is_adopted_by_thread() {
         }
         async fn get_streaming_response(
             &self,
-            messages: Vec<ChatMessage>,
+            messages: Vec<Message>,
             options: ChatOptions,
         ) -> Result<agent_framework_core::client::ChatStream> {
             let resp = self.get_response(messages, options).await?;
@@ -1504,7 +1498,7 @@ async fn service_conversation_id_is_adopted_by_thread() {
     // service conversation id must still be adopted.
     let mut thread = agent.get_new_thread();
     let response = agent
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
     assert_eq!(response.conversation_id.as_deref(), Some("conv-1"));
@@ -1512,7 +1506,7 @@ async fn service_conversation_id_is_adopted_by_thread() {
 
     // Turn two must carry the id back to the service.
     agent
-        .run(vec![ChatMessage::user("again")], Some(&mut thread))
+        .run(vec![Message::user("again")], Some(&mut thread))
         .await
         .unwrap();
     let opts = seen_options.lock().unwrap();
@@ -1560,7 +1554,7 @@ async fn service_thread_without_conversation_id_errors() {
     let agent = ChatAgent::builder(client).name("svc").build();
     let mut thread = agent.get_new_thread_with_service_id("svc-thread").unwrap();
     let err = agent
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::AgentExecution(_)));
@@ -1579,7 +1573,7 @@ struct EchoServiceClient;
 impl ChatClient for EchoServiceClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("ok");
@@ -1588,7 +1582,7 @@ impl ChatClient for EchoServiceClient {
     }
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -1604,7 +1598,7 @@ struct AdoptServiceClient;
 impl ChatClient for AdoptServiceClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("ok");
@@ -1613,7 +1607,7 @@ impl ChatClient for AdoptServiceClient {
     }
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -1636,7 +1630,7 @@ async fn thread_created_fires_for_service_thread() {
 
     let mut thread = agent.get_new_thread_with_service_id("svc-1").unwrap();
     agent
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
 
@@ -1659,7 +1653,7 @@ async fn thread_created_fires_on_service_id_adoption() {
     // A local thread that adopts the id returned by the service.
     let mut thread = agent.get_new_thread();
     agent
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
 
@@ -1700,14 +1694,14 @@ struct FailingClient;
 impl ChatClient for FailingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Err(Error::service("boom"))
     }
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Err(Error::service("boom"))
@@ -1795,7 +1789,7 @@ async fn structured_output_value_autofilled_on_bare_client() {
     let mut opts = ChatOptions::new();
     opts.response_format = Some(ResponseFormat::JsonObject);
     let resp = client
-        .get_response(vec![ChatMessage::user("x")], opts)
+        .get_response(vec![Message::user("x")], opts)
         .await
         .unwrap();
     assert_eq!(resp.value, Some(json!({"n": 5})));
@@ -1811,7 +1805,7 @@ async fn chat_message_store_factory_used_by_get_new_thread() {
     let agent = ChatAgent::builder(MockClient::new(vec![]))
         .chat_message_store_factory(|| {
             Arc::new(InMemoryChatMessageStore::with_messages(vec![
-                ChatMessage::system("MARKER"),
+                Message::system("MARKER"),
             ]))
         })
         .build();
@@ -1825,8 +1819,8 @@ async fn chat_message_store_factory_used_by_get_new_thread() {
 async fn agent_deserialize_thread_roundtrips_history() {
     let agent = ChatAgent::builder(MockClient::new(vec![])).build();
     let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-        ChatMessage::user("hi"),
-        ChatMessage::assistant("hello"),
+        Message::user("hi"),
+        Message::assistant("hello"),
     ]));
     let state = AgentThread::local(store).serialize().await.unwrap();
 
@@ -1859,7 +1853,7 @@ struct DeltaClient {
 impl ChatClient for DeltaClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(self.deltas.concat()))
@@ -1867,7 +1861,7 @@ impl ChatClient for DeltaClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         let updates: Vec<Result<ChatResponseUpdate>> = self
@@ -1898,7 +1892,7 @@ impl RecordingClient {
 impl ChatClient for RecordingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.seen.lock().unwrap().push(options);
@@ -1907,7 +1901,7 @@ impl ChatClient for RecordingClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -1946,12 +1940,12 @@ async fn trait_default_run_stream_buffers_for_minimal_agent() {
     impl Agent for EchoAgent {
         async fn run(
             &self,
-            messages: Vec<ChatMessage>,
+            messages: Vec<Message>,
             _thread: Option<&mut AgentThread>,
         ) -> Result<AgentResponse> {
-            let text = messages.last().map(ChatMessage::text).unwrap_or_default();
+            let text = messages.last().map(Message::text).unwrap_or_default();
             Ok(AgentResponse {
-                messages: vec![ChatMessage::assistant(format!("echo: {text}"))],
+                messages: vec![Message::assistant(format!("echo: {text}"))],
                 ..Default::default()
             })
         }
@@ -1961,7 +1955,7 @@ async fn trait_default_run_stream_buffers_for_minimal_agent() {
     }
 
     let agent = EchoAgent;
-    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+    let mut stream = Agent::run_stream(&agent, vec![Message::user("hi")], None, None)
         .await
         .unwrap();
     let mut text = String::new();
@@ -1981,7 +1975,7 @@ async fn chat_agent_trait_stream_yields_real_deltas() {
         deltas: vec!["Hel".into(), "lo ".into(), "world".into()],
     };
     let agent = ChatAgent::builder(client).build();
-    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+    let mut stream = Agent::run_stream(&agent, vec![Message::user("hi")], None, None)
         .await
         .unwrap();
     let mut deltas = Vec::new();
@@ -2005,7 +1999,7 @@ async fn per_run_chat_options_override_agent_defaults() {
         ..Default::default()
     });
     let _ = agent
-        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .run_with_options(vec![Message::user("hi")], None, options)
         .await
         .unwrap();
 
@@ -2029,14 +2023,11 @@ async fn per_run_tools_are_visible_only_for_that_call() {
     // Run 1: inject an extra per-run tool.
     let options = AgentRunOptions::new().with_tool(declaration_only_tool("run_tool"));
     let _ = agent
-        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .run_with_options(vec![Message::user("hi")], None, options)
         .await
         .unwrap();
     // Run 2: no per-run tools.
-    let _ = agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
+    let _ = agent.run(vec![Message::user("hi")], None).await.unwrap();
 
     let recorded = seen.lock().unwrap();
     let names =
@@ -2063,7 +2054,7 @@ async fn declaration_only_tool_call_is_returned_to_caller() {
         Some(FunctionArguments::Raw(json!({"x": 1}).to_string())),
     );
     let resp = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -2085,7 +2076,7 @@ async fn declaration_only_tool_call_is_returned_to_caller() {
         ..Default::default()
     };
     let out = client
-        .get_response(vec![ChatMessage::user("go")], options)
+        .get_response(vec![Message::user("go")], options)
         .await
         .unwrap();
 
@@ -2106,7 +2097,7 @@ async fn unknown_tool_call_is_not_declaration_only() {
     // error result, loop continues), NOT the declaration-only early return.
     let call = FunctionCallContent::new("c1", "ghost_tool", None);
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -2128,7 +2119,7 @@ async fn unknown_tool_call_is_not_declaration_only() {
         ..Default::default()
     };
     let out = client
-        .get_response(vec![ChatMessage::user("go")], options)
+        .get_response(vec![Message::user("go")], options)
         .await
         .unwrap();
 
@@ -2214,12 +2205,9 @@ async fn tool_source_resolved_fresh_each_run_sees_catalog_change() {
     ));
     let agent = ChatAgent::builder(client).tool_source(source).build();
 
+    let _ = agent.run(vec![Message::user("hi")], None).await.unwrap();
     let _ = agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
-    let _ = agent
-        .run(vec![ChatMessage::user("hi again")], None)
+        .run(vec![Message::user("hi again")], None)
         .await
         .unwrap();
 
@@ -2256,10 +2244,7 @@ async fn tool_source_dedup_explicit_tool_wins_over_source_tool() {
         .tool_source(source)
         .build();
 
-    let _ = agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
+    let _ = agent.run(vec![Message::user("hi")], None).await.unwrap();
 
     let recorded = seen.lock().unwrap();
     let shared: Vec<_> = recorded[0]
@@ -2303,10 +2288,7 @@ async fn tool_source_dedup_first_registered_source_wins() {
         .tool_source(second)
         .build();
 
-    let _ = agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
+    let _ = agent.run(vec![Message::user("hi")], None).await.unwrap();
 
     let recorded = seen.lock().unwrap();
     let shared: Vec<_> = recorded[0]
@@ -2337,7 +2319,7 @@ async fn tool_source_dedup_against_per_run_additional_tools() {
     };
     let options = AgentRunOptions::new().with_tool(per_run_tool);
     let _ = agent
-        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .run_with_options(vec![Message::user("hi")], None, options)
         .await
         .unwrap();
 
@@ -2362,7 +2344,7 @@ async fn failing_tool_source_propagates_error_out_of_run() {
         .build();
 
     let err = agent
-        .run(vec![ChatMessage::user("hi")], None)
+        .run(vec![Message::user("hi")], None)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Service(_)));
@@ -2379,7 +2361,7 @@ async fn tool_source_tool_is_invokable_by_the_function_loop() {
         Some(FunctionArguments::Raw(json!({"n": 21}).to_string())),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],

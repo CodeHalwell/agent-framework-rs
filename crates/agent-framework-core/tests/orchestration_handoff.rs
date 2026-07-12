@@ -29,7 +29,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -42,7 +42,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -69,7 +69,7 @@ fn handoff_response(call_id: &str, target: &str) -> ChatResponse {
         Some(FunctionArguments::Raw("{}".into())),
     );
     ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],
@@ -86,7 +86,7 @@ fn agent_with(name: &str, responses: Vec<ChatResponse>) -> Arc<dyn Agent> {
     ) as Arc<dyn Agent>
 }
 
-fn conversation(value: serde_json::Value) -> Vec<ChatMessage> {
+fn conversation(value: serde_json::Value) -> Vec<Message> {
     serde_json::from_value(value).expect("output is a conversation")
 }
 
@@ -109,7 +109,7 @@ async fn autonomous_handoff_completes_after_transfer() {
     let run = workflow.run("please help").await.unwrap();
     assert_eq!(run.state(), WorkflowRunState::Idle);
     let conv = conversation(run.last_output().expect("autonomous run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("B handled it")),
         "specialist answer present: {texts:?}"
@@ -133,7 +133,7 @@ async fn interactive_handoff_pauses_and_resumes() {
         .initial_agent("A")
         .with_user_input_request()
         // Terminate only after 3 user turns so the second agent turn runs.
-        .termination_condition(|conv: &[ChatMessage]| {
+        .termination_condition(|conv: &[Message]| {
             conv.iter().filter(|m| m.role == Role::user()).count() >= 3
         })
         .build()
@@ -195,7 +195,7 @@ async fn unknown_handoff_target_is_fed_back() {
 
     let run = workflow.run("do it").await.unwrap();
     let conv = conversation(run.last_output().expect("run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts
             .iter()
@@ -226,7 +226,7 @@ async fn specialist_to_specialist_handoff_chains() {
 
     let run = workflow.run("start").await.unwrap();
     let conv = conversation(run.last_output().expect("run yields output"));
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("C final answer")),
         "chained: {texts:?}"

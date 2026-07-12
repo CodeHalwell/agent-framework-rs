@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::BoxFuture;
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse, Content, DataContent};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Content, DataContent, Message};
 
 use crate::protocol::{role_and_content_to_chat_message, RpcError};
 
@@ -126,7 +126,7 @@ impl CreateMessageResult {
 }
 
 /// Build a [`SamplingHandler`] backed by any [`ChatClient`]: converts the
-/// server's `sampling/createMessage` request into core [`ChatMessage`]s
+/// server's `sampling/createMessage` request into core [`Message`]s
 /// (`messages`/`systemPrompt`/`maxTokens`/`temperature`/`stopSequences` map
 /// onto [`ChatOptions`]), calls [`ChatClient::get_response`], and maps the
 /// reply back into a [`CreateMessageResult`].
@@ -139,7 +139,7 @@ pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHand
     Arc::new(move |params: CreateMessageParams| {
         let client = client.clone();
         Box::pin(async move {
-            let messages: Vec<ChatMessage> = params
+            let messages: Vec<Message> = params
                 .messages
                 .iter()
                 .map(|m| role_and_content_to_chat_message(&m.role, &m.content))
@@ -463,7 +463,7 @@ mod tests {
     impl ChatClient for StubChatClient {
         async fn get_response(
             &self,
-            messages: Vec<ChatMessage>,
+            messages: Vec<Message>,
             options: ChatOptions,
         ) -> Result<ChatResponse> {
             // Exercise that the adapter actually forwards the mapped fields.
@@ -478,7 +478,7 @@ mod tests {
         }
         async fn get_streaming_response(
             &self,
-            _messages: Vec<ChatMessage>,
+            _messages: Vec<Message>,
             _options: ChatOptions,
         ) -> Result<agent_framework_core::client::ChatStream> {
             unreachable!("not exercised by these tests")
@@ -523,14 +523,14 @@ mod tests {
         impl ChatClient for EmptyClient {
             async fn get_response(
                 &self,
-                _messages: Vec<ChatMessage>,
+                _messages: Vec<Message>,
                 _options: ChatOptions,
             ) -> Result<ChatResponse> {
                 Ok(ChatResponse::default())
             }
             async fn get_streaming_response(
                 &self,
-                _messages: Vec<ChatMessage>,
+                _messages: Vec<Message>,
                 _options: ChatOptions,
             ) -> Result<agent_framework_core::client::ChatStream> {
                 unreachable!()

@@ -1,7 +1,7 @@
 //! Prebuilt orchestration patterns built on the workflow engine.
 //!
 //! Each pattern wraps [`Agent`]s as workflow [`Executor`] nodes that pass a
-//! shared conversation (`Vec<ChatMessage>`, carried as JSON) between
+//! shared conversation (`Vec<Message>`, carried as JSON) between
 //! participants:
 //!
 //! - [`SequentialBuilder`] / [`ConcurrentBuilder`] — pipeline and fan-out/fan-in.
@@ -39,7 +39,7 @@ use super::events::WorkflowEvent;
 use super::executor::Executor;
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::{AgentResponse, AgentResponseUpdate, ChatMessage};
+use crate::types::{AgentResponse, AgentResponseUpdate, Message};
 
 mod concurrent;
 mod group_chat;
@@ -74,13 +74,13 @@ pub use workflow_agent::{WorkflowAgent, WorkflowAgentExt};
 ///
 /// Accepts a bare string (→ one user message), an array of messages, or a
 /// single message object. Shared by every orchestration executor.
-pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<ChatMessage>> {
+pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<Message>> {
     match value {
-        Value::String(s) => Ok(vec![ChatMessage::user(s.clone())]),
+        Value::String(s) => Ok(vec![Message::user(s.clone())]),
         Value::Array(_) => serde_json::from_value(value.clone())
             .map_err(|e| Error::Workflow(format!("invalid conversation: {e}"))),
         Value::Object(_) => {
-            let msg: ChatMessage = serde_json::from_value(value.clone())
+            let msg: Message = serde_json::from_value(value.clone())
                 .map_err(|e| Error::Workflow(format!("invalid message: {e}")))?;
             Ok(vec![msg])
         }
@@ -92,7 +92,7 @@ pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<ChatMessage>> {
 ///
 /// Mirrors Python's `ensure_author`: participants and orchestrators tag their
 /// messages so the running transcript attributes each turn to its speaker.
-pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage {
+pub(crate) fn ensure_author(mut message: Message, name: &str) -> Message {
     if message.author_name.is_none() {
         message.author_name = Some(name.to_string());
     }
@@ -111,7 +111,7 @@ pub(crate) fn ensure_author(mut message: ChatMessage, name: &str) -> ChatMessage
 /// back into an [`AgentResponse`] via [`AgentResponse::from_updates`].
 pub(crate) async fn run_agent_and_emit(
     agent: &Arc<dyn Agent>,
-    conversation: Vec<ChatMessage>,
+    conversation: Vec<Message>,
     executor_id: &str,
     author: &str,
     ctx: &WorkflowContext,

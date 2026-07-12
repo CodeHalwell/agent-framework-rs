@@ -64,7 +64,7 @@ use std::time::Duration;
 use agent_framework_azure::TokenCredential;
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse, Role};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message, Role};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
@@ -558,14 +558,14 @@ impl AzureAIAgentClient {
         match status.as_str() {
             "requires_action" => {
                 let contents = convert::required_action_contents(&run, &run_id);
-                let mut m = ChatMessage::with_contents(Role::assistant(), contents);
+                let mut m = Message::with_contents(Role::assistant(), contents);
                 m.message_id = Some(run_id);
                 resp.messages.push(m);
             }
             "completed" => {
                 let list = self.list_run_messages(thread_id, &run_id).await?;
                 let text = convert::assistant_text_from_messages(&list);
-                let mut m = ChatMessage::assistant(text);
+                let mut m = Message::assistant(text);
                 m.message_id = Some(run_id);
                 resp.messages.push(m);
             }
@@ -592,7 +592,7 @@ fn combined_instructions(options: &ChatOptions, prepared: &PreparedMessages) -> 
 impl ChatClient for AzureAIAgentClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let prepared = convert::prepare_messages(&messages);
@@ -646,7 +646,7 @@ impl ChatClient for AzureAIAgentClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let prepared = convert::prepare_messages(&messages);
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn instructions_combine_options_and_system_messages() {
-        let prepared = convert::prepare_messages(&[ChatMessage::system("from message")]);
+        let prepared = convert::prepare_messages(&[Message::system("from message")]);
         let options = ChatOptions::new().with_instructions("from options");
         assert_eq!(
             combined_instructions(&options, &prepared).as_deref(),

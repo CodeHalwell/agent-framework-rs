@@ -60,7 +60,7 @@ impl From<String> for Role {
 
 /// A single chat message: an author role plus an ordered list of content items.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChatMessage {
+pub struct Message {
     pub role: Role,
     pub contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -71,7 +71,7 @@ pub struct ChatMessage {
     pub additional_properties: HashMap<String, serde_json::Value>,
 }
 
-impl ChatMessage {
+impl Message {
     /// Create a message with a single text content item.
     pub fn new(role: impl Into<Role>, text: impl Into<String>) -> Self {
         Self {
@@ -85,7 +85,7 @@ impl ChatMessage {
 
     /// Create a message with a single text content item, from an explicit role.
     ///
-    /// Parity alias for the Python `ChatMessage(role=…, text=…)` constructor.
+    /// Parity alias for the Python `Message(role=…, text=…)` constructor.
     pub fn from_text(role: impl Into<Role>, text: impl Into<String>) -> Self {
         Self::new(role, text)
     }
@@ -156,14 +156,11 @@ impl ChatMessage {
 
 /// Normalize loosely-typed input into a list of chat messages, optionally
 /// prepending a system instruction. Mirrors `prepare_messages`.
-pub fn prepare_messages(
-    messages: Vec<ChatMessage>,
-    system_instructions: Option<&str>,
-) -> Vec<ChatMessage> {
+pub fn prepare_messages(messages: Vec<Message>, system_instructions: Option<&str>) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len() + 1);
     if let Some(instr) = system_instructions {
         if !instr.is_empty() {
-            out.push(ChatMessage::system(instr));
+            out.push(Message::system(instr));
         }
     }
     out.extend(messages);
@@ -171,39 +168,39 @@ pub fn prepare_messages(
 }
 
 /// Trait for values that can be turned into a list of chat messages, so the
-/// public API can accept `&str`, `String`, `ChatMessage`, or vectors thereof —
-/// mirroring the Python `str | ChatMessage | list[...]` unions.
+/// public API can accept `&str`, `String`, `Message`, or vectors thereof —
+/// mirroring the Python `str | Message | list[...]` unions.
 pub trait IntoMessages {
-    fn into_messages(self) -> Vec<ChatMessage>;
+    fn into_messages(self) -> Vec<Message>;
 }
 
-impl IntoMessages for Vec<ChatMessage> {
-    fn into_messages(self) -> Vec<ChatMessage> {
+impl IntoMessages for Vec<Message> {
+    fn into_messages(self) -> Vec<Message> {
         self
     }
 }
-impl IntoMessages for ChatMessage {
-    fn into_messages(self) -> Vec<ChatMessage> {
+impl IntoMessages for Message {
+    fn into_messages(self) -> Vec<Message> {
         vec![self]
     }
 }
 impl IntoMessages for &str {
-    fn into_messages(self) -> Vec<ChatMessage> {
-        vec![ChatMessage::user(self)]
+    fn into_messages(self) -> Vec<Message> {
+        vec![Message::user(self)]
     }
 }
 impl IntoMessages for String {
-    fn into_messages(self) -> Vec<ChatMessage> {
-        vec![ChatMessage::user(self)]
+    fn into_messages(self) -> Vec<Message> {
+        vec![Message::user(self)]
     }
 }
 impl IntoMessages for Vec<String> {
-    fn into_messages(self) -> Vec<ChatMessage> {
-        self.into_iter().map(ChatMessage::user).collect()
+    fn into_messages(self) -> Vec<Message> {
+        self.into_iter().map(Message::user).collect()
     }
 }
 impl IntoMessages for Vec<&str> {
-    fn into_messages(self) -> Vec<ChatMessage> {
-        self.into_iter().map(ChatMessage::user).collect()
+    fn into_messages(self) -> Vec<Message> {
+        self.into_iter().map(Message::user).collect()
     }
 }

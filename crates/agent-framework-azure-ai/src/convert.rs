@@ -10,8 +10,8 @@
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, Content, FinishReason, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Role, ToolMode, UsageDetails,
+    ChatOptions, Content, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -94,7 +94,7 @@ fn result_to_output(fr: &FunctionResultContent) -> String {
 /// * function results / approval responses are pulled out as tool results
 ///   (decoded from their synthetic `[run_id, call_id]` call ids) rather than
 ///   added as messages.
-pub fn prepare_messages(messages: &[ChatMessage]) -> PreparedMessages {
+pub fn prepare_messages(messages: &[Message]) -> PreparedMessages {
     let mut out = PreparedMessages::default();
     let mut instructions: Vec<String> = Vec::new();
 
@@ -848,8 +848,7 @@ mod tests {
 
     #[test]
     fn system_messages_become_instructions() {
-        let prepared =
-            prepare_messages(&[ChatMessage::system("be terse"), ChatMessage::user("hi")]);
+        let prepared = prepare_messages(&[Message::system("be terse"), Message::user("hi")]);
         assert_eq!(prepared.instructions.as_deref(), Some("be terse"));
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.messages[0]["role"], json!("user"));
@@ -859,7 +858,7 @@ mod tests {
     #[test]
     fn function_results_are_pulled_out_as_tool_outputs() {
         let call_id = encode_call_id("run_7", "call_3");
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 call_id,
@@ -879,7 +878,7 @@ mod tests {
     fn failed_tool_result_submits_its_error_text() {
         // A failed local tool (exception set, result None) must surface the
         // error to the model via submit_tool_outputs, not an empty string.
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent {
                 call_id: encode_call_id("run_7", "call_3"),

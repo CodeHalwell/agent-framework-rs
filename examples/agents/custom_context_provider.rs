@@ -27,7 +27,7 @@ struct DemoProvider {
 
 #[async_trait]
 impl ContextProvider for DemoProvider {
-    async fn invoking(&self, _messages: &[ChatMessage]) -> Result<Context> {
+    async fn invoking(&self, _messages: &[Message]) -> Result<Context> {
         let n = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
         println!("  [context] invoking (call #{n}) -- injecting an instruction");
         Ok(Context::new().with_instructions(format!("This is invocation #{n}.")))
@@ -40,8 +40,8 @@ impl ContextProvider for DemoProvider {
 
     async fn invoked(
         &self,
-        request: &[ChatMessage],
-        response: &[ChatMessage],
+        request: &[Message],
+        response: &[Message],
         error: Option<&Error>,
     ) -> Result<()> {
         match error {
@@ -65,7 +65,7 @@ struct EchoingClient;
 impl ChatClient for EchoingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("ok, using the existing service thread");
@@ -74,7 +74,7 @@ impl ChatClient for EchoingClient {
     }
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -90,7 +90,7 @@ struct AdoptingClient;
 impl ChatClient for AdoptingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("ok, minted a new service thread");
@@ -99,7 +99,7 @@ impl ChatClient for AdoptingClient {
     }
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -114,14 +114,14 @@ struct FailingClient;
 impl ChatClient for FailingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Err(Error::service("simulated outage"))
     }
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Err(Error::service("simulated outage"))
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
         .build();
     let mut thread1 = agent1.get_new_thread_with_service_id("demo-thread")?;
     let r1 = agent1
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread1))
+        .run(vec![Message::user("hi")], Some(&mut thread1))
         .await?;
     println!("agent: {}\n", r1.text());
 
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
         .build();
     let mut thread2 = agent2.get_new_thread();
     let r2 = agent2
-        .run(vec![ChatMessage::user("hi")], Some(&mut thread2))
+        .run(vec![Message::user("hi")], Some(&mut thread2))
         .await?;
     println!(
         "agent: {} (thread adopted id: {:?})\n",

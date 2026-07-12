@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use agent_framework_core::agent::Agent;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
-use agent_framework_core::types::{AgentResponse, ChatMessage, IntoMessages, Role};
+use agent_framework_core::types::{AgentResponse, IntoMessages, Message, Role};
 
 use crate::activity::{
     build_message_activity_body, build_start_conversation_body, parse_activities, WireActivity,
@@ -157,7 +157,7 @@ impl CopilotStudioAgent {
 impl Agent for CopilotStudioAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         // Mirrors agent-framework-a2a's A2AAgent: only the newest message is
@@ -207,7 +207,7 @@ impl Agent for CopilotStudioAgent {
         // Mirrors `_process_activities(activities, streaming=False)`: only
         // `type == "message"` activities become response messages; `typing`/
         // `trace`/anything else is skipped.
-        let mut response_messages: Vec<ChatMessage> = Vec::new();
+        let mut response_messages: Vec<Message> = Vec::new();
         for activity in &activities {
             if activity.activity_type != "message" {
                 continue;
@@ -215,7 +215,7 @@ impl Agent for CopilotStudioAgent {
             let Some(text) = activity.text.as_ref().filter(|t| !t.is_empty()) else {
                 continue;
             };
-            let mut message = ChatMessage::new(Role::assistant(), text.clone());
+            let mut message = Message::new(Role::assistant(), text.clone());
             message.message_id = activity.id.clone();
             message.author_name = activity.from.as_ref().and_then(|f| f.name.clone());
             response_messages.push(message);

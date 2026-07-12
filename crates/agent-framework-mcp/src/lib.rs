@@ -50,7 +50,7 @@
 //! - **Prompts** (`prompts/list` / `prompts/get`): [`McpClient::list_prompts`]
 //!   / [`McpClient::get_prompt`], and on each tool wrapper, `.prompts()` /
 //!   `.get_prompt(name, arguments)` (mapping MCP `PromptMessage`s into core
-//!   `ChatMessage`s, mirroring Python's `MCPTool.get_prompt`).
+//!   `Message`s, mirroring Python's `MCPTool.get_prompt`).
 //!   `list_prompts`/`.prompts()` short-circuit to an empty list — without
 //!   issuing any request — when the server didn't declare the `prompts`
 //!   capability during `initialize`.

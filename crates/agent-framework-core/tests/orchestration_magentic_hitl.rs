@@ -31,7 +31,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -44,7 +44,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -118,18 +118,18 @@ impl ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
-        let facts = ChatMessage::assistant("FACTS v1");
-        let plan = ChatMessage::assistant("PLAN v1");
+        let facts = Message::assistant("FACTS v1");
+        let plan = Message::assistant("PLAN v1");
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
             facts: facts.clone(),
             plan: plan.clone(),
         });
-        Ok(ChatMessage::assistant("combined ledger v1"))
+        Ok(Message::assistant("combined ledger v1"))
     }
 
-    async fn replan(&self, context: &MagenticContext) -> Result<ChatMessage> {
+    async fn replan(&self, context: &MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
         let saw_feedback = context
             .chat_history
@@ -137,13 +137,13 @@ impl MagenticManager for ScriptedManager {
             .any(|m| m.text().contains("Human plan feedback"));
         *self.saw_feedback_on_last_replan.lock().unwrap() = saw_feedback;
 
-        let facts = ChatMessage::assistant("FACTS v1");
-        let plan = ChatMessage::assistant("REVISED PLAN");
+        let facts = Message::assistant("FACTS v1");
+        let plan = Message::assistant("REVISED PLAN");
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
             facts: facts.clone(),
             plan: plan.clone(),
         });
-        Ok(ChatMessage::assistant("combined ledger v2"))
+        Ok(Message::assistant("combined ledger v2"))
     }
 
     async fn create_progress_ledger(
@@ -153,9 +153,9 @@ impl MagenticManager for ScriptedManager {
         Ok(satisfied_ledger())
     }
 
-    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
         self.final_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("FINAL ANSWER"))
+        Ok(Message::assistant("FINAL ANSWER"))
     }
 
     fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
@@ -163,7 +163,7 @@ impl MagenticManager for ScriptedManager {
     }
 }
 
-fn conversation(run: &WorkflowRun) -> Vec<ChatMessage> {
+fn conversation(run: &WorkflowRun) -> Vec<Message> {
     serde_json::from_value(run.last_output().expect("magentic yields output")).unwrap()
 }
 
@@ -218,7 +218,7 @@ async fn plan_review_pauses_with_request_then_approve_completes() {
     assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("FINAL ANSWER")),
         "final answer synthesized: {texts:?}"
@@ -297,7 +297,7 @@ async fn plan_review_revise_then_approve_completes() {
     assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("FINAL ANSWER")),
         "final answer synthesized after revise+approve: {texts:?}"
@@ -383,7 +383,7 @@ async fn plan_review_exceeds_max_rounds_force_proceeds() {
     assert_eq!(final_calls.load(Ordering::SeqCst), 1);
 
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("FINAL ANSWER")),
         "still reaches a final answer: {texts:?}"

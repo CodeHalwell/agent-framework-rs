@@ -37,7 +37,7 @@ struct StubClient {
 impl ChatClient for StubClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         if self.fail {
@@ -57,7 +57,7 @@ impl ChatClient for StubClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -124,7 +124,7 @@ fn observable_chat_client_emits_chat_span() {
             let client = ObservableChatClient::new(StubClient::default(), "stub");
             let resp = client
                 .get_response(
-                    vec![ChatMessage::user("hello")],
+                    vec![Message::user("hello")],
                     ChatOptions::new().with_model("test-model"),
                 )
                 .await
@@ -290,7 +290,7 @@ fn chat_span_records_request_attributes() {
         options.stop = Some(vec!["STOP".to_string(), "END".to_string()]);
         options.conversation_id = Some("conv-123".to_string());
         let _ = client
-            .get_response(vec![ChatMessage::user("hello")], options)
+            .get_response(vec![Message::user("hello")], options)
             .await;
     });
 
@@ -332,7 +332,7 @@ fn chat_span_omits_unset_request_attributes() {
         let client = ObservableChatClient::new(StubClient::default(), "stub-provider");
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hello")],
+                vec![Message::user("hello")],
                 ChatOptions::new().with_model("test-model"),
             )
             .await;
@@ -364,7 +364,7 @@ fn chat_span_dual_emits_system_and_provider_name() {
         let client = ObservableChatClient::new(StubClient::default(), "my-provider");
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hi")],
+                vec![Message::user("hi")],
                 ChatOptions::new().with_model("m"),
             )
             .await;
@@ -394,7 +394,7 @@ fn chat_span_records_response_model() {
         );
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hi")],
+                vec![Message::user("hi")],
                 ChatOptions::new().with_model("m"),
             )
             .await;
@@ -427,7 +427,7 @@ fn chat_span_content_capture_disabled_omits_gated_attributes() {
     let capture = run_captured(|| async {
         let client = ObservableChatClient::new(StubClient::default(), "p");
         let _ = client
-            .get_response(vec![ChatMessage::user("hi")], options_with_tool())
+            .get_response(vec![Message::user("hi")], options_with_tool())
             .await;
     });
     let span = capture.by_name("chat").expect("expected a chat span");
@@ -443,7 +443,7 @@ fn chat_span_content_capture_enabled_includes_gated_attributes() {
         let client =
             ObservableChatClient::new(StubClient::default(), "p").with_content_capture(true);
         let _ = client
-            .get_response(vec![ChatMessage::user("hi")], options_with_tool())
+            .get_response(vec![Message::user("hi")], options_with_tool())
             .await;
     });
     let span = capture.by_name("chat").expect("expected a chat span");
@@ -475,7 +475,7 @@ fn chat_span_records_error_status_on_failure() {
         );
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hi")],
+                vec![Message::user("hi")],
                 ChatOptions::new().with_model("m"),
             )
             .await;

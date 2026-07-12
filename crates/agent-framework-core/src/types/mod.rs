@@ -13,7 +13,7 @@ pub use content::{
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
 };
-pub use message::{prepare_messages, ChatMessage, IntoMessages, Role};
+pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
     AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate, ContinuationToken,

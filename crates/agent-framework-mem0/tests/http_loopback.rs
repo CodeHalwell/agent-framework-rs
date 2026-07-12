@@ -16,7 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use agent_framework_core::memory::ContextProvider;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 use agent_framework_mem0::Mem0Provider;
 use serde_json::{json, Value};
 
@@ -162,11 +162,7 @@ async fn invoked_posts_to_v1_memories_with_body_and_auth_header() {
         .with_application_id("app-1");
 
     provider
-        .invoked(
-            &[ChatMessage::user("I moved to Austin last month")],
-            &[],
-            None,
-        )
+        .invoked(&[Message::user("I moved to Austin last month")], &[], None)
         .await
         .unwrap();
 
@@ -202,8 +198,8 @@ async fn invoked_combines_request_and_response_messages() {
         .with_user_id("u1");
     provider
         .invoked(
-            &[ChatMessage::user("What's the weather?")],
-            &[ChatMessage::assistant("It's sunny today.")],
+            &[Message::user("What's the weather?")],
+            &[Message::assistant("It's sunny today.")],
             None,
         )
         .await
@@ -237,7 +233,7 @@ async fn invoking_posts_to_v2_search_and_parses_hits_into_context() {
         .with_user_id("user-42");
 
     let ctx = provider
-        .invoking(&[ChatMessage::user("What's the weather like where I live?")])
+        .invoking(&[Message::user("What's the weather like where I live?")])
         .await
         .unwrap();
 
@@ -272,10 +268,7 @@ async fn invoking_handles_results_wrapper_response_shape() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_agent_id("agent-1");
-    let ctx = provider
-        .invoking(&[ChatMessage::user("hello")])
-        .await
-        .unwrap();
+    let ctx = provider.invoking(&[Message::user("hello")]).await.unwrap();
     assert!(ctx.messages[0]
         .text()
         .contains("Previous conversation context"));
@@ -290,10 +283,7 @@ async fn invoking_empty_results_returns_empty_context() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let ctx = provider
-        .invoking(&[ChatMessage::user("hello")])
-        .await
-        .unwrap();
+    let ctx = provider.invoking(&[Message::user("hello")]).await.unwrap();
     assert!(ctx.messages.is_empty());
 }
 
@@ -311,10 +301,7 @@ async fn invoking_surfaces_non_2xx_status_as_service_error() {
     let provider = Mem0Provider::new("bad-key")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let err = provider
-        .invoking(&[ChatMessage::user("hi")])
-        .await
-        .unwrap_err();
+    let err = provider.invoking(&[Message::user("hi")]).await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("401"), "message was: {msg}");
     assert!(msg.contains("Invalid API key"), "message was: {msg}");
@@ -335,7 +322,7 @@ async fn invoked_surfaces_non_2xx_status_as_service_error() {
         .with_api_base(base_url)
         .with_user_id("u1");
     let err = provider
-        .invoked(&[ChatMessage::user("hi")], &[], None)
+        .invoked(&[Message::user("hi")], &[], None)
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -361,10 +348,7 @@ async fn invoking_surfaces_malformed_json_response_as_error() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let err = provider
-        .invoking(&[ChatMessage::user("hi")])
-        .await
-        .unwrap_err();
+    let err = provider.invoking(&[Message::user("hi")]).await.unwrap_err();
     assert!(err.to_string().contains("invalid Mem0 API response JSON"));
 }
 
@@ -379,10 +363,7 @@ async fn invoking_scopes_search_to_agent_and_run_id() {
         .with_agent_id("agent-1")
         .with_thread_id("thread-1");
 
-    provider
-        .invoking(&[ChatMessage::user("hello")])
-        .await
-        .unwrap();
+    provider.invoking(&[Message::user("hello")]).await.unwrap();
 
     let request = handle.join().unwrap();
     let body = request.body_json();

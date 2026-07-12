@@ -27,7 +27,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -40,7 +40,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -69,7 +69,7 @@ fn agent(name: &str, replies: Vec<&str>) -> Arc<dyn Agent> {
     ) as Arc<dyn Agent>
 }
 
-fn conversation(run: &WorkflowRun) -> Vec<ChatMessage> {
+fn conversation(run: &WorkflowRun) -> Vec<Message> {
     let output = run.last_output().expect("group chat should yield output");
     serde_json::from_value(output).expect("output is a conversation")
 }
@@ -91,7 +91,7 @@ async fn round_robin_visits_participants_in_order() {
 
     let run = workflow.run("kick off").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     let ia = texts.iter().position(|t| t.contains("a-speaks")).unwrap();
     let ib = texts.iter().position(|t| t.contains("b-speaks")).unwrap();
@@ -123,7 +123,7 @@ async fn custom_manager_can_finish() {
 
     let run = workflow.run("write something").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     assert!(texts.iter().any(|t| t.contains("draft-text")));
     assert!(
@@ -163,7 +163,7 @@ async fn llm_manager_parses_json_selection() {
 
     let run = workflow.run("please solve").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
 
     assert!(
         texts.iter().any(|t| t.contains("please answer")),
@@ -204,9 +204,7 @@ async fn termination_condition_halts_conversation() {
         .participant("A", a)
         .round_robin()
         .max_rounds(40)
-        .termination_condition(|conv: &[ChatMessage]| {
-            conv.iter().any(|m| m.text().contains("STOP"))
-        })
+        .termination_condition(|conv: &[Message]| conv.iter().any(|m| m.text().contains("STOP")))
         .build()
         .unwrap();
 

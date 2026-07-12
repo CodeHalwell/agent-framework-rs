@@ -26,7 +26,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -39,7 +39,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -81,10 +81,10 @@ async fn sequential_workflow_as_agent_aggregates_response() {
     assert_eq!(wf_agent.name(), Some("pipeline"));
 
     let response = wf_agent
-        .run(vec![ChatMessage::user("start")], None)
+        .run(vec![Message::user("start")], None)
         .await
         .unwrap();
-    let texts: Vec<String> = response.messages.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = response.messages.iter().map(Message::text).collect();
     assert!(
         texts.iter().any(|t| t.contains("step-A")),
         "aggregated: {texts:?}"
@@ -125,7 +125,7 @@ async fn workflow_agent_surfaces_pending_request_info() {
 
     let wf_agent = WorkflowAgent::new(workflow, "handoff-agent");
     let response = wf_agent
-        .run(vec![ChatMessage::user("hello")], None)
+        .run(vec![Message::user("hello")], None)
         .await
         .unwrap();
 
@@ -144,7 +144,7 @@ async fn workflow_agent_streams_agent_updates() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "streamer");
 
-    let mut stream = wf_agent.run_stream_with_thread(vec![ChatMessage::user("go")], None);
+    let mut stream = wf_agent.run_stream_with_thread(vec![Message::user("go")], None);
     let mut text = String::new();
     while let Some(update) = stream.next().await {
         text.push_str(&update.unwrap().text());
@@ -176,7 +176,7 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
 
     // --- First run ---
     let resp1 = wf_agent
-        .run(vec![ChatMessage::user("first")], Some(&mut thread))
+        .run(vec![Message::user("first")], Some(&mut thread))
         .await
         .unwrap();
     assert!(
@@ -201,7 +201,7 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
 
     // --- Second run, same thread ---
     let resp2 = wf_agent
-        .run(vec![ChatMessage::user("second")], Some(&mut thread))
+        .run(vec![Message::user("second")], Some(&mut thread))
         .await
         .unwrap();
     assert!(
@@ -233,10 +233,7 @@ async fn workflow_agent_run_without_explicit_thread_does_not_panic() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "solo");
 
-    let resp = wf_agent
-        .run(vec![ChatMessage::user("hi")], None)
-        .await
-        .unwrap();
+    let resp = wf_agent.run(vec![Message::user("hi")], None).await.unwrap();
     assert!(resp.messages.iter().any(|m| m.text() == "only-reply"));
 }
 
@@ -248,7 +245,7 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
 
     let thread = wf_agent.get_new_thread();
     let mut stream =
-        wf_agent.run_stream_with_thread(vec![ChatMessage::user("go")], Some(thread.clone()));
+        wf_agent.run_stream_with_thread(vec![Message::user("go")], Some(thread.clone()));
     let mut text = String::new();
     while let Some(update) = stream.next().await {
         text.push_str(&update.unwrap().text());
@@ -278,7 +275,7 @@ async fn workflow_agent_trait_run_stream_yields_updates() {
     let wf_agent: Arc<dyn Agent> = Arc::new(WorkflowAgent::new(workflow, "streamer"));
 
     let mut stream = wf_agent
-        .run_stream(vec![ChatMessage::user("go")], None, None)
+        .run_stream(vec![Message::user("go")], None, None)
         .await
         .unwrap();
     let mut text = String::new();

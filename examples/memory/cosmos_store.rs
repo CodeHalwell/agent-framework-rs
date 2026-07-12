@@ -49,8 +49,8 @@ async fn main() -> Result<()> {
     // the store directly so the example needs no model credentials.
     store
         .add_messages(vec![
-            ChatMessage::user("What is the capital of France?"),
-            ChatMessage::assistant("Paris."),
+            Message::user("What is the capital of France?"),
+            Message::assistant("Paris."),
         ])
         .await?;
 
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     // To drive an agent with it instead:
     //   let mut thread = AgentThread::local(store.clone());
-    //   agent.run(vec![ChatMessage::user("...")], Some(&mut thread)).await?;
+    //   agent.run(vec![Message::user("...")], Some(&mut thread)).await?;
 
     Ok(())
 }

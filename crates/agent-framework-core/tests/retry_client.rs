@@ -56,7 +56,7 @@ impl FlakyClient {
 impl ChatClient for FlakyClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.resp_calls.fetch_add(1, Ordering::SeqCst);
@@ -69,7 +69,7 @@ impl ChatClient for FlakyClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -81,8 +81,8 @@ impl ChatClient for FlakyClient {
     }
 }
 
-fn user() -> Vec<ChatMessage> {
-    vec![ChatMessage::user("hi")]
+fn user() -> Vec<Message> {
+    vec![Message::user("hi")]
 }
 
 fn update(text: &str) -> ChatResponseUpdate {

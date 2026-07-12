@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_framework_core::error::Result;
-use agent_framework_core::prelude::{Agent, AgentResponse, ChatMessage, ChatResponse};
+use agent_framework_core::prelude::{Agent, AgentResponse, ChatResponse, Message};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::workflow::{
     get_checkpoint_summary, validate_workflow_graph, AgentExecutor, Case, CheckpointStorage,
@@ -693,7 +693,7 @@ struct MockAgent {
 impl Agent for MockAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse::from_chat_response(ChatResponse::from_text(
@@ -743,14 +743,14 @@ struct MultiMessageAgent;
 impl Agent for MultiMessageAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse {
             messages: vec![
-                ChatMessage::assistant("one"),
-                ChatMessage::assistant("two"),
-                ChatMessage::assistant("three"),
+                Message::assistant("one"),
+                Message::assistant("two"),
+                Message::assistant("three"),
             ],
             ..Default::default()
         })

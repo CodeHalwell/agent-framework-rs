@@ -16,7 +16,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use agent_framework_core::threads::ChatMessageStore;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 use agent_framework_cosmos::CosmosChatMessageStore;
 use serde_json::{json, Value};
 
@@ -246,7 +246,7 @@ async fn create_document_sends_signed_headers_and_expected_body() {
     .unwrap();
 
     store
-        .add_messages(vec![ChatMessage::user("Hello, Cosmos!")])
+        .add_messages(vec![Message::user("Hello, Cosmos!")])
         .await
         .unwrap();
 
@@ -269,7 +269,7 @@ async fn create_document_sends_signed_headers_and_expected_body() {
     assert_eq!(body["threadId"], json!("thread-1"));
     assert!(body["id"].as_str().is_some());
     assert!(body["seq"].is_number());
-    let inner: ChatMessage = serde_json::from_str(body["message"].as_str().unwrap()).unwrap();
+    let inner: Message = serde_json::from_str(body["message"].as_str().unwrap()).unwrap();
     assert_eq!(inner.text(), "Hello, Cosmos!");
 }
 
@@ -363,7 +363,7 @@ async fn add_then_list_round_trip() {
     .unwrap();
 
     store
-        .add_messages(vec![ChatMessage::user("round trip me")])
+        .add_messages(vec![Message::user("round trip me")])
         .await
         .unwrap();
 
@@ -413,10 +413,7 @@ async fn add_multiple_messages_then_list_preserves_order() {
     .unwrap();
 
     store
-        .add_messages(vec![
-            ChatMessage::user("first"),
-            ChatMessage::assistant("second"),
-        ])
+        .add_messages(vec![Message::user("first"), Message::assistant("second")])
         .await
         .unwrap();
 
@@ -439,11 +436,11 @@ async fn add_multiple_messages_then_list_preserves_order() {
 async fn query_documents_follows_continuation_token_across_pages() {
     let page1_doc = json!({
         "id": "d1", "threadId": "thread-page", "seq": 1,
-        "message": serde_json::to_string(&ChatMessage::user("page one")).unwrap(),
+        "message": serde_json::to_string(&Message::user("page one")).unwrap(),
     });
     let page2_doc = json!({
         "id": "d2", "threadId": "thread-page", "seq": 2,
-        "message": serde_json::to_string(&ChatMessage::user("page two")).unwrap(),
+        "message": serde_json::to_string(&Message::user("page two")).unwrap(),
     });
 
     let (base_url, handle) = serve_sequence(2, move |i, _request| match i {
@@ -599,7 +596,7 @@ async fn create_document_surfaces_non_2xx_status_as_service_error() {
     .unwrap();
 
     let err = store
-        .add_messages(vec![ChatMessage::user("hi")])
+        .add_messages(vec![Message::user("hi")])
         .await
         .unwrap_err();
     let msg = err.to_string();

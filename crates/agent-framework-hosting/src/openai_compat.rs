@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use agent_framework_core::agent::Agent;
-use agent_framework_core::types::{AgentResponse, ChatMessage, Role, UsageDetails};
+use agent_framework_core::types::{AgentResponse, Message, Role, UsageDetails};
 
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_response_stream;
@@ -231,10 +231,10 @@ fn error_response(message: String) -> Response {
         .into_response()
 }
 
-fn to_chat_messages(messages: &[IncomingMessage]) -> Vec<ChatMessage> {
+fn to_chat_messages(messages: &[IncomingMessage]) -> Vec<Message> {
     messages
         .iter()
-        .map(|m| ChatMessage::new(role_from(&m.role), content_text(&m.content)))
+        .map(|m| Message::new(role_from(&m.role), content_text(&m.content)))
         .collect()
 }
 

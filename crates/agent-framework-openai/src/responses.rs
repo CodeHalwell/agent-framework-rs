@@ -29,10 +29,10 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, CitationAnnotation, Content,
-    DataContent, FinishReason, FunctionApprovalRequestContent, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, ResponseFormat, Role, TextContent,
-    TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
+    ChatOptions, ChatResponse, ChatResponseUpdate, CitationAnnotation, Content, DataContent,
+    FinishReason, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, ResponseFormat, Role, TextContent, TextReasoningContent,
+    TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -111,7 +111,7 @@ impl OpenAIResponsesClient {
         &self.inner.model
     }
 
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
             .model_id
@@ -208,7 +208,7 @@ impl OpenAIResponsesClient {
 impl ChatClient for OpenAIResponsesClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -225,7 +225,7 @@ impl ChatClient for OpenAIResponsesClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -249,9 +249,9 @@ impl ChatClient for OpenAIResponsesClient {
 /// [`messages_to_input`] when building the Azure OpenAI Responses request
 /// body, instead of reimplementing it.
 pub fn extract_instructions<'a>(
-    messages: &'a [ChatMessage],
+    messages: &'a [Message],
     options_instructions: Option<&str>,
-) -> (Option<String>, &'a [ChatMessage]) {
+) -> (Option<String>, &'a [Message]) {
     let mut parts = Vec::new();
     if let Some(instr) = options_instructions {
         if !instr.is_empty() {
@@ -280,7 +280,7 @@ pub fn extract_instructions<'a>(
 /// `pub` so `agent-framework-azure`'s Responses client can reuse this
 /// conversion verbatim rather than reimplementing it (Azure OpenAI's
 /// Responses API shares the exact same `input` item wire shape).
-pub fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         let role = msg.role.as_str();
@@ -632,7 +632,7 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
         }
     }
 
-    let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+    let mut message = Message::with_contents(Role::assistant(), contents);
     message.message_id = response.response_id.clone();
     response.messages.push(message);
 
@@ -1211,12 +1211,12 @@ mod tests {
         FunctionApprovalResponseContent, FunctionResultContent, HostedFileContent,
     };
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
-    fn user_with(contents: Vec<Content>) -> ChatMessage {
-        ChatMessage::with_contents(Role::user(), contents)
+    fn user_with(contents: Vec<Content>) -> Message {
+        Message::with_contents(Role::user(), contents)
     }
 
     /// Parse a single Responses output item into its content list.
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn build_body_extracts_leading_system_message_as_instructions() {
         let c = client();
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(body["instructions"], json!("Be terse."));
         assert_eq!(
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn build_body_combines_options_instructions_and_system_message() {
         let c = client();
-        let messages = vec![ChatMessage::system("Also be nice."), user("Hi")];
+        let messages = vec![Message::system("Also be nice."), user("Hi")];
         let options = ChatOptions::new().with_instructions("Be terse.");
         let body = c.build_body(&messages, &options, false);
         assert_eq!(body["instructions"], json!("Be terse.\n\nAlso be nice."));
@@ -1277,7 +1277,7 @@ mod tests {
     #[test]
     fn build_body_assistant_text_uses_output_text_type() {
         let c = client();
-        let messages = vec![user("Hi"), ChatMessage::assistant("Hello!")];
+        let messages = vec![user("Hi"), Message::assistant("Hello!")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(
             body["input"][1],
@@ -1296,8 +1296,8 @@ mod tests {
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
         let assistant_msg =
-            ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
-        let tool_msg = ChatMessage::with_contents(
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+        let tool_msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 "call_1",
@@ -1540,7 +1540,7 @@ mod tests {
         // A reasoning content with no preserved raw item (e.g. from streaming
         // display) has no valid input form and must be dropped, not sent as a
         // bogus reasoning item lacking id/encrypted_content.
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::TextReasoning(TextReasoningContent {
                 text: "just display".into(),
@@ -1898,7 +1898,7 @@ mod tests {
                 Some(FunctionArguments::Raw(r#"{"q":"x"}"#.into())),
             ),
         };
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionApprovalRequest(req)],
         );

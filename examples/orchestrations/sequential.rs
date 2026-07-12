@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::SequentialBuilder;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         .await?;
 
     if let Some(output) = result.last_output() {
-        let conversation: Vec<ChatMessage> = serde_json::from_value(output).unwrap_or_default();
+        let conversation: Vec<Message> = serde_json::from_value(output).unwrap_or_default();
         if let Some(last) = conversation.last() {
             println!("Final:\n{}", last.text());
         }

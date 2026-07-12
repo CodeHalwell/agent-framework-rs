@@ -5,7 +5,7 @@
 //! `agent_framework_redis.RedisProvider`: `invoked()` persists the
 //! request/response exchange as JSON entries tagged with the provider's
 //! scope, and `invoking()` retrieves matching entries and injects them into
-//! the conversation as a single `user`-role [`ChatMessage`] prefixed by
+//! the conversation as a single `user`-role [`Message`] prefixed by
 //! [`DEFAULT_CONTEXT_PROMPT`] (same default text as Python's
 //! `ContextProvider.DEFAULT_CONTEXT_PROMPT`).
 //!
@@ -110,7 +110,7 @@ use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::memory::{Context, ContextProvider};
-use agent_framework_core::types::{ChatMessage, Role};
+use agent_framework_core::types::{Message, Role};
 
 use crate::internal::{map_redis_err, LazyConnection};
 
@@ -266,7 +266,7 @@ fn format_context(context_prompt: &str, joined_memories: &str) -> Context {
         Context::default()
     } else {
         Context {
-            messages: vec![ChatMessage::user(format!(
+            messages: vec![Message::user(format!(
                 "{context_prompt}\n{joined_memories}"
             ))],
             ..Default::default()
@@ -474,17 +474,17 @@ async fn probe_redisearch(conn: &mut redis::aio::MultiplexedConnection) -> bool 
 /// ```no_run
 /// use agent_framework_redis::RedisContextProvider;
 /// use agent_framework_core::memory::ContextProvider;
-/// use agent_framework_core::types::ChatMessage;
+/// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let provider = RedisContextProvider::new("redis://127.0.0.1:6379")?
 ///     .with_user_id("user-42")
 ///     .with_limit(5);
 ///
-/// let request = vec![ChatMessage::user("I love hiking in the Cascades")];
+/// let request = vec![Message::user("I love hiking in the Cascades")];
 /// provider.invoked(&request, &[], None).await?;
 ///
-/// let ctx = provider.invoking(&[ChatMessage::user("Any outdoor hobbies?")]).await?;
+/// let ctx = provider.invoking(&[Message::user("Any outdoor hobbies?")]).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -766,8 +766,8 @@ impl ContextProvider for RedisContextProvider {
 
     async fn invoked(
         &self,
-        request_messages: &[ChatMessage],
-        response_messages: &[ChatMessage],
+        request_messages: &[Message],
+        response_messages: &[Message],
         _error: Option<&Error>,
     ) -> Result<()> {
         self.validate_filters()?;
@@ -825,12 +825,12 @@ impl ContextProvider for RedisContextProvider {
         Ok(())
     }
 
-    async fn invoking(&self, messages: &[ChatMessage]) -> Result<Context> {
+    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
         self.validate_filters()?;
 
         let input_text = messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .filter(|t| !t.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
@@ -1476,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn invoking_fails_without_scope_configured() {
         let p = RedisContextProvider::new("redis://127.0.0.1:6379/0").unwrap();
-        let err = p.invoking(&[ChatMessage::user("hi")]).await.unwrap_err();
+        let err = p.invoking(&[Message::user("hi")]).await.unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
     }
 
@@ -1484,7 +1484,7 @@ mod tests {
     async fn invoked_fails_without_scope_configured() {
         let p = RedisContextProvider::new("redis://127.0.0.1:6379/0").unwrap();
         let err = p
-            .invoked(&[ChatMessage::user("hi")], &[], None)
+            .invoked(&[Message::user("hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));

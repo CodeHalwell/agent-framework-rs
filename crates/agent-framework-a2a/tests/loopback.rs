@@ -404,7 +404,7 @@ async fn a2a_agent_run_stream_maps_sse_events_to_updates() {
         A2AAgent, AgentCard, Message, MessageRole, Part, SendMessageResult, TextPart,
     };
     use agent_framework_core::agent::Agent;
-    use agent_framework_core::types::ChatMessage;
+    use agent_framework_core::types::Message as CoreMessage;
     use futures::StreamExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
@@ -452,7 +452,7 @@ async fn a2a_agent_run_stream_maps_sse_events_to_updates() {
     let agent = A2AAgent::from_card("weather", card);
 
     let updates = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("weather?")], None, None)
+        let mut stream = Agent::run_stream(&agent, vec![CoreMessage::user("weather?")], None, None)
             .await
             .expect("run_stream opens");
         let mut collected = Vec::new();

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::tools::BoxFuture;
-use crate::types::{AgentResponse, ChatMessage, ChatOptions, ChatResponse};
+use crate::types::{AgentResponse, ChatOptions, ChatResponse, Message};
 
 /// The terminal handler invoked at the end of a middleware chain.
 pub type Terminal<C> = Box<dyn FnOnce(C) -> BoxFuture<Result<C>> + Send>;
@@ -94,7 +94,7 @@ impl<C: Send + 'static> MiddlewarePipeline<C> {
 
 /// Context flowing through the agent middleware pipeline.
 pub struct AgentContext {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     pub is_streaming: bool,
     pub metadata: HashMap<String, serde_json::Value>,
     /// The run result; populated by the terminal handler or overridden here.
@@ -104,7 +104,7 @@ pub struct AgentContext {
 }
 
 impl AgentContext {
-    pub fn new(messages: Vec<ChatMessage>, is_streaming: bool) -> Self {
+    pub fn new(messages: Vec<Message>, is_streaming: bool) -> Self {
         Self {
             messages,
             is_streaming,
@@ -117,7 +117,7 @@ impl AgentContext {
 
 /// Context flowing through the chat middleware pipeline.
 pub struct ChatContext {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     pub chat_options: ChatOptions,
     pub is_streaming: bool,
     pub metadata: HashMap<String, serde_json::Value>,
@@ -126,7 +126,7 @@ pub struct ChatContext {
 }
 
 impl ChatContext {
-    pub fn new(messages: Vec<ChatMessage>, chat_options: ChatOptions, is_streaming: bool) -> Self {
+    pub fn new(messages: Vec<Message>, chat_options: ChatOptions, is_streaming: bool) -> Self {
         Self {
             messages,
             chat_options,

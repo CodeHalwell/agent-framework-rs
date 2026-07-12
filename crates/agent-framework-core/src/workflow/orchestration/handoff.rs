@@ -32,7 +32,7 @@ use super::{parse_conversation, run_agent_and_emit};
 use crate::agent::Agent;
 use crate::error::{Error, Result};
 use crate::tools::{ApprovalMode, ToolDefinition, ToolKind};
-use crate::types::{ChatMessage, Content, FunctionCallContent, FunctionResultContent, Role};
+use crate::types::{Content, FunctionCallContent, FunctionResultContent, Message, Role};
 use crate::workflow::{Executor, RequestResponse, Workflow, WorkflowBuilder, WorkflowContext};
 
 /// Whether the workflow pauses for fresh user input between agent turns.
@@ -52,7 +52,7 @@ pub enum HandoffInteractionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffUserInputRequest {
     /// The conversation so far (cleaned of tool-call plumbing).
-    pub conversation: Vec<ChatMessage>,
+    pub conversation: Vec<Message>,
     /// The id of the agent awaiting the user's reply.
     pub awaiting_agent: String,
     /// A human-facing prompt describing what input is needed.
@@ -213,7 +213,7 @@ impl HandoffResolution {
 
 /// Remove tool-call plumbing from a conversation for clean display / routing.
 /// Rust analogue of `clean_conversation_for_handoff`.
-fn clean_conversation(conversation: &[ChatMessage]) -> Vec<ChatMessage> {
+fn clean_conversation(conversation: &[Message]) -> Vec<Message> {
     let mut cleaned = Vec::new();
     for msg in conversation {
         if msg.role == Role::tool() {
@@ -231,7 +231,7 @@ fn clean_conversation(conversation: &[ChatMessage]) -> Vec<ChatMessage> {
         }
         let text = msg.text();
         if !text.trim().is_empty() {
-            let mut fresh = ChatMessage::new(msg.role.clone(), text);
+            let mut fresh = Message::new(msg.role.clone(), text);
             fresh.author_name = msg.author_name.clone();
             fresh.additional_properties = msg.additional_properties.clone();
             cleaned.push(fresh);
@@ -242,45 +242,45 @@ fn clean_conversation(conversation: &[ChatMessage]) -> Vec<ChatMessage> {
 
 /// Coerce an arbitrary request-info response payload into user messages. Rust
 /// analogue of `_as_user_messages`.
-fn as_user_messages(value: &Value) -> Vec<ChatMessage> {
+fn as_user_messages(value: &Value) -> Vec<Message> {
     match value {
-        Value::String(s) => vec![ChatMessage::user(s.clone())],
+        Value::String(s) => vec![Message::user(s.clone())],
         Value::Array(_) => {
-            if let Ok(msgs) = serde_json::from_value::<Vec<ChatMessage>>(value.clone()) {
+            if let Ok(msgs) = serde_json::from_value::<Vec<Message>>(value.clone()) {
                 return msgs
                     .into_iter()
                     .map(|m| {
                         if m.role == Role::user() {
                             m
                         } else {
-                            ChatMessage::user(m.text())
+                            Message::user(m.text())
                         }
                     })
                     .collect();
             }
-            vec![ChatMessage::user(value.to_string())]
+            vec![Message::user(value.to_string())]
         }
         Value::Object(_) => {
-            if let Ok(m) = serde_json::from_value::<ChatMessage>(value.clone()) {
+            if let Ok(m) = serde_json::from_value::<Message>(value.clone()) {
                 return vec![if m.role == Role::user() {
                     m
                 } else {
-                    ChatMessage::user(m.text())
+                    Message::user(m.text())
                 }];
             }
             if let Some(Value::String(text)) = value.get("text").or_else(|| value.get("content")) {
-                return vec![ChatMessage::user(text.clone())];
+                return vec![Message::user(text.clone())];
             }
-            vec![ChatMessage::user(value.to_string())]
+            vec![Message::user(value.to_string())]
         }
-        _ => vec![ChatMessage::user(value.to_string())],
+        _ => vec![Message::user(value.to_string())],
     }
 }
 
-type TerminationCondition = Arc<dyn Fn(&[ChatMessage]) -> bool + Send + Sync>;
+type TerminationCondition = Arc<dyn Fn(&[Message]) -> bool + Send + Sync>;
 
 /// Default termination: stop after 10 user messages (Python's default).
-fn default_termination(conversation: &[ChatMessage]) -> bool {
+fn default_termination(conversation: &[Message]) -> bool {
     conversation
         .iter()
         .filter(|m| m.role == Role::user())
@@ -291,7 +291,7 @@ fn default_termination(conversation: &[ChatMessage]) -> bool {
 /// Persisted coordinator state carried across a request-info pause.
 #[derive(Default, Serialize, Deserialize)]
 struct HandoffPersisted {
-    conversation: Vec<ChatMessage>,
+    conversation: Vec<Message>,
     current_agent: String,
 }
 
@@ -315,11 +315,7 @@ impl HandoffCoordinator {
     }
 
     /// Append a synthetic tool result acknowledging the resolved handoff target.
-    fn append_tool_ack(
-        conversation: &mut Vec<ChatMessage>,
-        call: &FunctionCallContent,
-        target: &str,
-    ) {
+    fn append_tool_ack(conversation: &mut Vec<Message>, call: &FunctionCallContent, target: &str) {
         if call.call_id.is_empty() {
             return;
         }
@@ -328,31 +324,25 @@ impl HandoffCoordinator {
             result: Some(json!({ "handoff_to": target })),
             exception: None,
         };
-        let mut msg =
-            ChatMessage::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
+        let mut msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         msg.author_name = Some(call.name.clone());
         conversation.push(msg);
     }
 
     /// Append a tool result reporting an unknown handoff target (fed back to the
     /// agent so it can correct).
-    fn append_error_ack(
-        conversation: &mut Vec<ChatMessage>,
-        call: &FunctionCallContent,
-        name: &str,
-    ) {
+    fn append_error_ack(conversation: &mut Vec<Message>, call: &FunctionCallContent, name: &str) {
         let result = FunctionResultContent {
             call_id: call.call_id.clone(),
             result: None,
             exception: Some(format!("Error: unknown handoff target '{name}'.")),
         };
-        let mut msg =
-            ChatMessage::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
+        let mut msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         msg.author_name = Some(call.name.clone());
         conversation.push(msg);
     }
 
-    async fn save_state(&self, ctx: &WorkflowContext, conversation: &[ChatMessage], current: &str) {
+    async fn save_state(&self, ctx: &WorkflowContext, conversation: &[Message], current: &str) {
         let state = HandoffPersisted {
             conversation: conversation.to_vec(),
             current_agent: current.to_string(),
@@ -374,7 +364,7 @@ impl HandoffCoordinator {
     /// terminus (completion or a user-input pause).
     async fn run_loop(
         &self,
-        mut conversation: Vec<ChatMessage>,
+        mut conversation: Vec<Message>,
         mut current: String,
         ctx: &WorkflowContext,
     ) -> Result<()> {
@@ -603,7 +593,7 @@ impl HandoffBuilder {
     /// Set a termination condition evaluated against the conversation.
     pub fn termination_condition<F>(mut self, condition: F) -> Self
     where
-        F: Fn(&[ChatMessage]) -> bool + Send + Sync + 'static,
+        F: Fn(&[Message]) -> bool + Send + Sync + 'static,
     {
         self.termination = Some(Arc::new(condition));
         self

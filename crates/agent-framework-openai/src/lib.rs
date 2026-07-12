@@ -44,8 +44,8 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
-    FunctionArguments, FunctionCallContent, Role, TextContent, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason, FunctionArguments,
+    FunctionCallContent, Message, Role, TextContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -205,7 +205,7 @@ impl OpenAIClient {
         self
     }
 
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
             .model_id
@@ -273,7 +273,7 @@ impl OpenAIClient {
 impl ChatClient for OpenAIClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -287,7 +287,7 @@ impl ChatClient for OpenAIClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);

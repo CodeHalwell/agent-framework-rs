@@ -28,7 +28,7 @@ impl MockClient {
 impl ChatClient for MockClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resps = self.responses.lock().unwrap();
@@ -41,7 +41,7 @@ impl ChatClient for MockClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -85,7 +85,7 @@ fn ledger_json(
     )
 }
 
-fn conversation(run: &WorkflowRun) -> Vec<ChatMessage> {
+fn conversation(run: &WorkflowRun) -> Vec<Message> {
     serde_json::from_value(run.last_output().expect("magentic yields output")).unwrap()
 }
 
@@ -115,7 +115,7 @@ async fn standard_manager_drives_agents_to_completion() {
 
     let run = workflow.run("compute the answer").await.unwrap();
     let conv = conversation(&run);
-    let texts: Vec<String> = conv.iter().map(ChatMessage::text).collect();
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
     assert!(
         texts
             .iter()
@@ -143,14 +143,14 @@ fn ledger(satisfied: bool, progress: bool, in_loop: bool, next: &str) -> Magenti
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("PLAN"))
+        Ok(Message::assistant("PLAN"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("REPLAN"))
+        Ok(Message::assistant("REPLAN"))
     }
 
     async fn create_progress_ledger(
@@ -168,9 +168,9 @@ impl MagenticManager for ScriptedManager {
         }
     }
 
-    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<ChatMessage> {
+    async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
         self.final_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ChatMessage::assistant("FINAL"))
+        Ok(Message::assistant("FINAL"))
     }
 
     fn max_stall_count(&self) -> usize {

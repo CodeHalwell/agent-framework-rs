@@ -115,7 +115,7 @@ async fn get_weather_binds_and_executes_native_tool() {
         )),
     );
     let ask = ChatResponse {
-        messages: vec![ChatMessage::with_contents(
+        messages: vec![Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(call)],
         )],

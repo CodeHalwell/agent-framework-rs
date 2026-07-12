@@ -21,7 +21,7 @@
 //!   [`AgentCard`] discovery via `.well-known` (auto-upgrading to the
 //!   authenticated extended card when the server advertises it).
 //! - [`agent`] — [`A2AAgent`]: the [`Agent`](agent_framework_core::agent::Agent)
-//!   wrapper, converting [`ChatMessage`](agent_framework_core::types::ChatMessage)s
+//!   wrapper, converting [`Message`](agent_framework_core::types::Message)s
 //!   to/from A2A [`Message`]s and [`Task`]s.
 //!
 //! ## Example
@@ -48,10 +48,10 @@
 //! # async fn demo() -> Result<()> {
 //! let agent = A2AAgent::from_url("weather-agent", "https://weather.example.com/a2a");
 //! let mut thread = agent.get_new_thread();
-//! agent.run(vec![ChatMessage::user("What's the forecast for Seattle?")], Some(&mut thread)).await?;
+//! agent.run(vec![Message::user("What's the forecast for Seattle?")], Some(&mut thread)).await?;
 //! // The remote agent's contextId/taskId are now attached to `thread`, so
 //! // this second call continues the same A2A conversation.
-//! let reply = agent.run(vec![ChatMessage::user("What about tomorrow?")], Some(&mut thread)).await?;
+//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut thread)).await?;
 //! println!("{}", reply.text());
 //! # Ok(())
 //! # }

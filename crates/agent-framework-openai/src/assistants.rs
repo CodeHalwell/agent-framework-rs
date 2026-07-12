@@ -67,8 +67,8 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolKind;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Role, TextContent, ToolMode, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, TextContent, ToolMode, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -497,7 +497,7 @@ impl ChatClient for OpenAIAssistantsClient {
     /// generator (`_assistants_client.py:172-182`).
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let response_format = options.response_format.clone();
@@ -516,7 +516,7 @@ impl ChatClient for OpenAIAssistantsClient {
     /// map its events to updates (`_assistants_client.py:184-212`).
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let (run_options, tool_results) = prepare_options(&messages, &options);
@@ -565,7 +565,7 @@ impl ChatClient for OpenAIAssistantsClient {
 /// passed via kwargs). Scalar options are omitted when `None` rather than sent
 /// as JSON `null`, matching this crate's other clients.
 fn prepare_options(
-    messages: &[ChatMessage],
+    messages: &[Message],
     options: &ChatOptions,
 ) -> (Map<String, Value>, Option<Vec<FunctionResultContent>>) {
     let mut run_options = Map::new();
@@ -1255,7 +1255,7 @@ mod tests {
         let options = ChatOptions::new()
             .with_tool_choice(ToolMode::Auto)
             .with_tool(hosted_file_search(None).vector_store_ids(vec!["vs_1".into()]));
-        let (mut run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (mut run, _) = prepare_options(&[Message::user("hi")], &options);
         assert!(run.contains_key("tool_resources"));
         assert!(run.contains_key("additional_messages"));
 
@@ -1290,7 +1290,7 @@ mod tests {
             .with_max_tokens(256);
         options.top_p = Some(0.25);
         options.allow_multiple_tool_calls = Some(true);
-        let (run, tool_results) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, tool_results) = prepare_options(&[Message::user("hi")], &options);
         assert_eq!(run["model"], json!("gpt-4o"));
         assert_eq!(run["temperature"], json!(0.5));
         assert_eq!(run["top_p"], json!(0.25));
@@ -1298,7 +1298,7 @@ mod tests {
         assert_eq!(run["parallel_tool_calls"], json!(true));
         assert!(tool_results.is_none());
         // Scalars are omitted, not sent as null, when unset.
-        let (bare, _) = prepare_options(&[ChatMessage::user("hi")], &ChatOptions::new());
+        let (bare, _) = prepare_options(&[Message::user("hi")], &ChatOptions::new());
         assert!(bare.get("temperature").is_none());
         assert!(bare.get("model").is_none());
         assert!(bare.get("tools").is_none());
@@ -1313,7 +1313,7 @@ mod tests {
             hosted_code_interpreter(),
             hosted_file_search(Some(7)),
         ];
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         let tools = run["tools"].as_array().unwrap();
         assert_eq!(tools[0]["type"], json!("function"));
         assert_eq!(tools[0]["function"]["name"], json!("get_weather"));
@@ -1329,7 +1329,7 @@ mod tests {
     fn prepare_options_tools_dropped_when_tool_choice_none() {
         let mut options = ChatOptions::new().with_tool_choice(ToolMode::None);
         options.tools = vec![function_tool("f")];
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         assert!(run.get("tools").is_none());
         assert_eq!(run["tool_choice"], json!("none"));
     }
@@ -1345,7 +1345,7 @@ mod tests {
             function_tool("f"),
             hosted_file_search(None).vector_store_ids(vec!["vs_1".into()]),
         ];
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         let tools = run["tools"].as_array().expect("tools sent");
         assert_eq!(tools.len(), 2);
         assert_eq!(
@@ -1360,7 +1360,7 @@ mod tests {
         let mut named =
             ChatOptions::new().with_tool_choice(ToolMode::Required(Some("get_weather".into())));
         named.tools = vec![function_tool("get_weather")];
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &named);
+        let (run, _) = prepare_options(&[Message::user("hi")], &named);
         assert_eq!(
             run["tool_choice"],
             json!({ "type": "function", "function": { "name": "get_weather" } })
@@ -1371,7 +1371,7 @@ mod tests {
         // converters and the core ToolMode::Required(None) contract.
         let mut any = ChatOptions::new().with_tool_choice(ToolMode::Required(None));
         any.tools = vec![function_tool("get_weather")];
-        let (run_any, _) = prepare_options(&[ChatMessage::user("hi")], &any);
+        let (run_any, _) = prepare_options(&[Message::user("hi")], &any);
         assert_eq!(run_any["tool_choice"], json!("required"));
         assert!(run_any.get("tools").is_some());
     }
@@ -1382,12 +1382,12 @@ mod tests {
         // the run body's `instructions` field, with any system-message text
         // folded in after it.
         let options = ChatOptions::new().with_instructions("You are helpful.");
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         assert_eq!(run["instructions"], json!("You are helpful."));
 
         let options = ChatOptions::new().with_instructions("You are helpful.");
         let (run, _) = prepare_options(
-            &[ChatMessage::system("Be terse."), ChatMessage::user("hi")],
+            &[Message::system("Be terse."), Message::user("hi")],
             &options,
         );
         // Fragments are newline-joined (matching the port's instruction
@@ -1402,7 +1402,7 @@ mod tests {
             hosted_file_search(None).vector_store_ids(vec!["vs_1".into(), "vs_2".into()]),
             hosted_code_interpreter().file_ids(vec!["file-1".into()]),
         ];
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         assert_eq!(
             run["tool_resources"],
             json!({
@@ -1421,7 +1421,7 @@ mod tests {
             schema: json!({ "type": "object" }),
             strict: Some(true),
         });
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         assert_eq!(
             run["response_format"],
             json!({
@@ -1441,7 +1441,7 @@ mod tests {
         options
             .additional_properties
             .insert("max_prompt_tokens".into(), json!(1024));
-        let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
+        let (run, _) = prepare_options(&[Message::user("hi")], &options);
         assert_eq!(run["metadata"], json!({ "session": "abc" }));
         assert_eq!(run["max_prompt_tokens"], json!(1024));
     }
@@ -1449,9 +1449,9 @@ mod tests {
     #[test]
     fn prepare_options_system_and_developer_messages_become_instructions() {
         let messages = vec![
-            ChatMessage::system("Be terse."),
-            ChatMessage::new(Role::new("developer"), "Prefer bullet points."),
-            ChatMessage::user("hi"),
+            Message::system("Be terse."),
+            Message::new(Role::new("developer"), "Prefer bullet points."),
+            Message::user("hi"),
         ];
         let (run, _) = prepare_options(&messages, &ChatOptions::new());
         // Newline-joined (the port's instruction convention), so distinct
@@ -1468,7 +1468,7 @@ mod tests {
 
     #[test]
     fn prepare_options_additional_messages_text_image_and_roles() {
-        let assistant_msg = ChatMessage::with_contents(
+        let assistant_msg = Message::with_contents(
             Role::assistant(),
             vec![
                 Content::Text(TextContent::new("prior")),
@@ -1478,10 +1478,7 @@ mod tests {
                 }),
             ],
         );
-        let (run, _) = prepare_options(
-            &[assistant_msg, ChatMessage::user("now")],
-            &ChatOptions::new(),
-        );
+        let (run, _) = prepare_options(&[assistant_msg, Message::user("now")], &ChatOptions::new());
         let add = run["additional_messages"].as_array().unwrap();
         assert_eq!(
             add[0],
@@ -1499,7 +1496,7 @@ mod tests {
     #[test]
     fn prepare_options_function_results_split_out_as_tool_results() {
         let call_id = serde_json::to_string(&json!(["run_1", "call_1"])).unwrap();
-        let tool_msg = ChatMessage::with_contents(
+        let tool_msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 call_id.clone(),

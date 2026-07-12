@@ -13,7 +13,7 @@ use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentResponse, AgentResponseUpdate, ChatMessage, Content, DataContent, IntoMessages, Role,
+    AgentResponse, AgentResponseUpdate, Content, DataContent, IntoMessages, Message, Role,
     UriContent,
 };
 
@@ -27,7 +27,7 @@ use crate::types::{
 /// Agent2Agent (A2A) protocol client agent.
 ///
 /// Wraps an [`A2AClient`] so a remote, A2A-compliant agent can be used
-/// anywhere the framework expects a local [`Agent`]: [`ChatMessage`]s in,
+/// anywhere the framework expects a local [`Agent`]: [`Message`]s in,
 /// [`AgentResponse`] out, with `contextId`/`taskId` continuity tracked per
 /// [`AgentThread`]. See the crate docs for the exact mapping and how this
 /// diverges from the Python reference implementation.
@@ -158,7 +158,7 @@ impl ThreadState {
 impl Agent for A2AAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         // Mirrors the Python reference: only the newest message is sent —
@@ -254,7 +254,7 @@ impl Agent for A2AAgent {
     /// [`Agent::run`] when you need multi-turn A2A conversations.
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<AgentThread>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
@@ -399,17 +399,14 @@ fn stream_event_to_updates(
     updates
 }
 
-fn wrap_message(
-    result: Result<ChatMessage>,
-    name: Option<&str>,
-) -> Vec<Result<AgentResponseUpdate>> {
+fn wrap_message(result: Result<Message>, name: Option<&str>) -> Vec<Result<AgentResponseUpdate>> {
     match result {
         Ok(cm) => vec![Ok(message_to_update(cm, name))],
         Err(e) => vec![Err(e)],
     }
 }
 
-fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentResponseUpdate {
+fn message_to_update(cm: Message, name: Option<&str>) -> AgentResponseUpdate {
     AgentResponseUpdate {
         contents: cm.contents,
         role: Some(cm.role),
@@ -479,10 +476,10 @@ fn a2a_forward_stream(
 }
 
 // ---------------------------------------------------------------------
-// ChatMessage <-> A2A Message/Part conversion
+// Message <-> A2A Message/Part conversion
 // ---------------------------------------------------------------------
 
-/// Convert a framework [`ChatMessage`] into an A2A [`A2AMessage`], carrying
+/// Convert a framework [`Message`] into an A2A [`A2AMessage`], carrying
 /// forward `contextId`/`taskId` for conversation continuity.
 ///
 /// Mirrors the Python reference's `_chat_message_to_a2a_message`: text,
@@ -492,13 +489,13 @@ fn a2a_forward_stream(
 /// matching Python — framework messages passed to `run` are treated as user
 /// input regardless of their original [`Role`].
 fn chat_message_to_a2a_message(
-    message: &ChatMessage,
+    message: &Message,
     context_id: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<A2AMessage> {
     if message.contents.is_empty() {
         return Err(Error::Content(
-            "ChatMessage.contents is empty; cannot convert to an A2A message".into(),
+            "Message.contents is empty; cannot convert to an A2A message".into(),
         ));
     }
 
@@ -667,8 +664,8 @@ fn metadata_to_additional_properties(metadata: &Option<Value>) -> HashMap<String
     }
 }
 
-fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<ChatMessage> {
-    Ok(ChatMessage {
+fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<Message> {
+    Ok(Message {
         role: a2a_role_to_role(message.role),
         contents: a2a_parts_to_contents(&message.parts)?,
         author_name: None,
@@ -677,8 +674,8 @@ fn a2a_message_to_chat_message(message: &A2AMessage) -> Result<ChatMessage> {
     })
 }
 
-fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
-    Ok(ChatMessage {
+fn artifact_to_chat_message(artifact: &Artifact) -> Result<Message> {
+    Ok(Message {
         role: Role::assistant(),
         contents: a2a_parts_to_contents(&artifact.parts)?,
         author_name: None,
@@ -687,7 +684,7 @@ fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
     })
 }
 
-/// Map a returned [`Task`] to zero or more [`ChatMessage`]s.
+/// Map a returned [`Task`] to zero or more [`Message`]s.
 ///
 /// Priority:
 /// 1. If the task is paused in [`TaskState::InputRequired`] and carries a
@@ -698,12 +695,12 @@ fn artifact_to_chat_message(artifact: &Artifact) -> Result<ChatMessage> {
 ///    no messages here unless the server happens to also put the question in
 ///    `history`.
 /// 2. Otherwise, mirrors Python's `_task_to_chat_messages`: prefer
-///    `artifacts` (one [`ChatMessage`] per artifact), falling back to the
+///    `artifacts` (one [`Message`] per artifact), falling back to the
 ///    last `history` entry, else no messages at all (the task is still
 ///    `working`/`submitted` with nothing to show yet — poll
 ///    [`A2AClient::get_task`](crate::client::A2AClient::get_task) for
 ///    updates).
-fn task_to_chat_messages(task: &Task) -> Result<Vec<ChatMessage>> {
+fn task_to_chat_messages(task: &Task) -> Result<Vec<Message>> {
     if task.status.state == TaskState::InputRequired {
         if let Some(msg) = &task.status.message {
             return Ok(vec![a2a_message_to_chat_message(msg)?]);
@@ -730,11 +727,11 @@ mod tests {
         ErrorContent, FunctionCallContent, HostedFileContent, TextContent,
     };
 
-    fn text_message(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn text_message(text: &str) -> Message {
+        Message::user(text)
     }
 
-    // -- ChatMessage -> A2A Message -----------------------------------
+    // -- Message -> A2A Message -----------------------------------
 
     #[test]
     fn chat_message_to_a2a_message_maps_text() {
@@ -750,7 +747,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_error_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Error(ErrorContent {
                 message: Some("Test error message".into()),
@@ -767,7 +764,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_uri_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Uri(UriContent {
                 uri: "http://example.com/file.pdf".into(),
@@ -789,7 +786,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_data_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::Data(DataContent::from_bytes(
                 b"hello",
@@ -812,7 +809,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_maps_hosted_file() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![Content::HostedFile(HostedFileContent {
                 file_id: "hosted://storage/document.pdf".into(),
@@ -833,7 +830,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_rejects_function_call_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::assistant(),
             vec![Content::FunctionCall(FunctionCallContent::new(
                 "call-1",
@@ -847,7 +844,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_empty_contents_errors() {
-        let msg = ChatMessage::with_contents(agent_framework_core::types::Role::user(), Vec::new());
+        let msg = Message::with_contents(agent_framework_core::types::Role::user(), Vec::new());
         let err = chat_message_to_a2a_message(&msg, None, None).unwrap_err();
         assert!(matches!(err, Error::Content(_)));
     }
@@ -862,7 +859,7 @@ mod tests {
 
     #[test]
     fn chat_message_to_a2a_message_with_multiple_contents() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             agent_framework_core::types::Role::user(),
             vec![
                 Content::Text(TextContent::new("Here's the analysis:")),

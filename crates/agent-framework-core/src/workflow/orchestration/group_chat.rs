@@ -30,7 +30,7 @@ use serde_json::Value;
 use super::{ensure_author, parse_conversation, run_agent_and_emit};
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::ChatMessage;
+use crate::types::Message;
 use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext};
 
 /// Safety bound on manager rounds applied by [`GroupChatBuilder`] when no
@@ -82,7 +82,7 @@ pub enum GroupChatDirective {
     /// Finish the conversation, optionally with a final message.
     Finish {
         /// The final message to append (defaults to a completion notice).
-        final_message: Option<ChatMessage>,
+        final_message: Option<Message>,
     },
 }
 
@@ -111,7 +111,7 @@ impl GroupChatDirective {
     }
 
     /// Finish with an explicit final message.
-    pub fn finish_with(message: ChatMessage) -> Self {
+    pub fn finish_with(message: Message) -> Self {
         GroupChatDirective::Finish {
             final_message: Some(message),
         }
@@ -120,7 +120,7 @@ impl GroupChatDirective {
     /// Finish with a plain-text final answer.
     pub fn finish_text(text: impl Into<String>) -> Self {
         GroupChatDirective::Finish {
-            final_message: Some(ChatMessage::assistant(text)),
+            final_message: Some(Message::assistant(text)),
         }
     }
 }
@@ -130,11 +130,11 @@ impl GroupChatDirective {
 #[derive(Debug, Clone)]
 pub struct GroupChatState {
     /// The original task message, if any.
-    pub task: Option<ChatMessage>,
+    pub task: Option<Message>,
     /// Registered participants as `(name, description)` pairs, in order.
     pub participants: Vec<(String, String)>,
     /// The full running conversation transcript.
-    pub conversation: Vec<ChatMessage>,
+    pub conversation: Vec<Message>,
     /// The number of participant turns taken so far.
     pub round_index: usize,
 }
@@ -236,7 +236,7 @@ impl ManagerSelectionResponse {
     /// Convert the parsed selection into a [`GroupChatDirective`].
     fn into_directive(self) -> Result<GroupChatDirective> {
         if self.finish {
-            let msg = self.final_message.map(ChatMessage::assistant);
+            let msg = self.final_message.map(Message::assistant);
             return Ok(GroupChatDirective::Finish { final_message: msg });
         }
         match self.selected_participant {
@@ -264,7 +264,7 @@ impl LlmGroupChatManager {
     /// Build the system context message listing participants (mirrors Python's
     /// `_build_manager_context_message`), plus the manager instructions and the
     /// JSON schema contract.
-    fn system_message(&self, state: &GroupChatState) -> ChatMessage {
+    fn system_message(&self, state: &GroupChatState) -> Message {
         let roster = state
             .participants
             .iter()
@@ -275,7 +275,7 @@ impl LlmGroupChatManager {
             "{DEFAULT_MANAGER_INSTRUCTIONS}\n\nAvailable participants:\n{roster}\n\n\
 IMPORTANT: Choose only from these exact participant names (case-sensitive).\n\n{MANAGER_SELECTION_SCHEMA_PROMPT}"
         );
-        ChatMessage::system(text)
+        Message::system(text)
     }
 
     /// Parse the manager agent's response into a [`ManagerSelectionResponse`],
@@ -312,7 +312,7 @@ impl GroupChatManager for LlmGroupChatManager {
     }
 }
 
-type TerminationCondition = Arc<dyn Fn(&[ChatMessage]) -> bool + Send + Sync>;
+type TerminationCondition = Arc<dyn Fn(&[Message]) -> bool + Send + Sync>;
 
 /// The single executor that drives a group chat conversation.
 struct GroupChatOrchestrator {
@@ -349,7 +349,7 @@ impl Executor for GroupChatOrchestrator {
             if let Some(max) = self.max_rounds {
                 if round_index >= max {
                     conversation.push(ensure_author(
-                        ChatMessage::assistant(
+                        Message::assistant(
                             "Conversation halted after reaching manager round limit.",
                         ),
                         &self.manager_name,
@@ -360,7 +360,7 @@ impl Executor for GroupChatOrchestrator {
             if let Some(term) = &self.termination {
                 if term(&conversation) {
                     conversation.push(ensure_author(
-                        ChatMessage::assistant(
+                        Message::assistant(
                             "Conversation halted after termination condition was met.",
                         ),
                         &self.manager_name,
@@ -380,7 +380,7 @@ impl Executor for GroupChatOrchestrator {
             match directive {
                 GroupChatDirective::Finish { final_message } => {
                     let msg = final_message
-                        .unwrap_or_else(|| ChatMessage::assistant("Conversation completed."));
+                        .unwrap_or_else(|| Message::assistant("Conversation completed."));
                     conversation.push(ensure_author(msg, &self.manager_name));
                     break;
                 }
@@ -395,10 +395,8 @@ impl Executor for GroupChatOrchestrator {
                     })?;
                     if let Some(instr) = instruction {
                         if !instr.is_empty() {
-                            conversation.push(ensure_author(
-                                ChatMessage::assistant(instr),
-                                &self.manager_name,
-                            ));
+                            conversation
+                                .push(ensure_author(Message::assistant(instr), &self.manager_name));
                         }
                     }
                     let response = run_agent_and_emit(
@@ -548,7 +546,7 @@ impl GroupChatBuilder {
     /// before each manager turn.
     pub fn termination_condition<F>(mut self, condition: F) -> Self
     where
-        F: Fn(&[ChatMessage]) -> bool + Send + Sync + 'static,
+        F: Fn(&[Message]) -> bool + Send + Sync + 'static,
     {
         self.termination = Some(Arc::new(condition));
         self

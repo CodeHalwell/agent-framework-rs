@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
-use crate::types::ChatMessage;
+use crate::types::Message;
 
 /// Additional context supplied by a provider for a single invocation.
 #[derive(Debug, Clone, Default)]
 pub struct Context {
     pub instructions: Option<String>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
 }
 
@@ -34,7 +34,7 @@ impl Context {
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
     /// Called before the model is invoked; returns context to inject.
-    async fn invoking(&self, messages: &[ChatMessage]) -> Result<Context>;
+    async fn invoking(&self, messages: &[Message]) -> Result<Context>;
 
     /// Optional hook fired when a new thread is created.
     async fn thread_created(&self, _thread_id: Option<&str>) -> Result<()> {
@@ -52,8 +52,8 @@ pub trait ContextProvider: Send + Sync {
     /// successful turns can ignore `error`.
     async fn invoked(
         &self,
-        _request_messages: &[ChatMessage],
-        _response_messages: &[ChatMessage],
+        _request_messages: &[Message],
+        _response_messages: &[Message],
         _error: Option<&Error>,
     ) -> Result<()> {
         Ok(())
@@ -87,7 +87,7 @@ impl AggregateContextProvider {
 
 #[async_trait]
 impl ContextProvider for AggregateContextProvider {
-    async fn invoking(&self, messages: &[ChatMessage]) -> Result<Context> {
+    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
         let mut merged = Context::new();
         for provider in &self.providers {
             let ctx = provider.invoking(messages).await?;
@@ -111,8 +111,8 @@ impl ContextProvider for AggregateContextProvider {
 
     async fn invoked(
         &self,
-        request: &[ChatMessage],
-        response: &[ChatMessage],
+        request: &[Message],
+        response: &[Message],
         error: Option<&Error>,
     ) -> Result<()> {
         for provider in &self.providers {

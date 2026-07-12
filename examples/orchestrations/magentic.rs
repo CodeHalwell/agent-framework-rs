@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::{MagenticBuilder, StandardMagenticManager};
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         .run("What year was the Eiffel Tower completed, and why was it built?")
         .await?;
 
-    let conversation: Vec<ChatMessage> =
+    let conversation: Vec<Message> =
         serde_json::from_value(run.last_output().unwrap_or_default()).unwrap_or_default();
     for msg in &conversation {
         let speaker = msg.author_name.as_deref().unwrap_or(msg.role.as_str());

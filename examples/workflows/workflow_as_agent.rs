@@ -37,7 +37,7 @@ impl ScriptedClient {
 impl ChatClient for ScriptedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut queue = self.replies.lock().unwrap();
@@ -50,7 +50,7 @@ impl ChatClient for ScriptedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         "Now do the same for sub-workflows.",
     ] {
         let response = agent
-            .run(vec![ChatMessage::user(topic)], Some(&mut thread))
+            .run(vec![Message::user(topic)], Some(&mut thread))
             .await?;
         println!("\n> {topic}");
         for msg in &response.messages {

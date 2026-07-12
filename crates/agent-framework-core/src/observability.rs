@@ -97,7 +97,7 @@ use tracing::{Instrument, Span};
 use crate::client::{ChatClient, ChatStream};
 use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
-use crate::types::{ChatMessage, ChatOptions, ChatResponse};
+use crate::types::{ChatOptions, ChatResponse, Message};
 
 /// OpenTelemetry GenAI semantic-convention attribute keys.
 pub mod attr {
@@ -458,7 +458,7 @@ fn tool_definitions_json(tools: &[ToolDefinition]) -> String {
 }
 
 /// Serialize messages to a compact JSON string for content-capture attributes.
-fn messages_json(messages: &[ChatMessage]) -> String {
+fn messages_json(messages: &[Message]) -> String {
     serde_json::to_string(messages).unwrap_or_default()
 }
 
@@ -541,7 +541,7 @@ impl<C: ChatClient> ObservableChatClient<C> {
 impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let request_model = self.model_for(&options);
@@ -588,7 +588,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let request_model = self.model_for(&options);

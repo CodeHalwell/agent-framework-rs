@@ -43,10 +43,10 @@ struct CannedClient {
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let last = messages.last().map(ChatMessage::text).unwrap_or_default();
+        let last = messages.last().map(Message::text).unwrap_or_default();
         Ok(ChatResponse::from_text(format!(
             "[{}] (canned) {last}",
             self.name
@@ -55,7 +55,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -169,14 +169,14 @@ async fn main() -> Result<()> {
 }
 
 /// A workflow's output `Value` for an agent-backed node is the running
-/// conversation, serialized as a JSON array of `ChatMessage`s (see
+/// conversation, serialized as a JSON array of `Message`s (see
 /// `AgentExecutor::execute`). Deserialize it back and print each turn.
 fn print_conversation(output: Option<serde_json::Value>) {
     let Some(value) = output else {
         println!("(no output)");
         return;
     };
-    match serde_json::from_value::<Vec<ChatMessage>>(value.clone()) {
+    match serde_json::from_value::<Vec<Message>>(value.clone()) {
         Ok(messages) => {
             for m in &messages {
                 println!("  [{}] {}", m.role, m.text());

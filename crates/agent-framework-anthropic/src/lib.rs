@@ -31,8 +31,8 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
-    FunctionCallContent, Role, TextContent, TextReasoningContent, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
+    Message, Role, TextContent, TextReasoningContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -256,7 +256,7 @@ impl AnthropicClient {
     /// also copied into the request body as a stray top-level field.
     fn build_body(
         &self,
-        messages: &[ChatMessage],
+        messages: &[Message],
         options: &ChatOptions,
         stream: bool,
     ) -> (Value, Vec<String>) {
@@ -298,7 +298,7 @@ impl AnthropicClient {
 impl ChatClient for AnthropicClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let (body, betas) = self.build_body(&messages, &options, false);
@@ -320,7 +320,7 @@ impl ChatClient for AnthropicClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let (body, betas) = self.build_body(&messages, &options, true);
@@ -880,16 +880,14 @@ mod tests {
         // Matches upstream's `ANTHROPIC_DEFAULT_MAX_TOKENS` (`_chat_client.py`
         // ~line 53), not the historical Rust default of 4096.
         let client = AnthropicClient::new("key", "claude-x");
-        let (body, _betas) =
-            client.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let (body, _betas) = client.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         assert_eq!(body["max_tokens"], serde_json::json!(1024));
     }
 
     #[test]
     fn with_max_tokens_overrides_default() {
         let client = AnthropicClient::new("key", "claude-x").with_max_tokens(8192);
-        let (body, _betas) =
-            client.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let (body, _betas) = client.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         assert_eq!(body["max_tokens"], serde_json::json!(8192));
     }
 
@@ -897,7 +895,7 @@ mod tests {
     fn per_request_max_tokens_overrides_client_default() {
         let client = AnthropicClient::new("key", "claude-x").with_max_tokens(8192);
         let options = ChatOptions::new().with_max_tokens(256);
-        let (body, _betas) = client.build_body(&[ChatMessage::user("hi")], &options, false);
+        let (body, _betas) = client.build_body(&[Message::user("hi")], &options, false);
         assert_eq!(body["max_tokens"], serde_json::json!(256));
     }
 
@@ -905,15 +903,14 @@ mod tests {
     fn with_default_options_merged_under_per_request_options() {
         let client = AnthropicClient::new("key", "claude-x")
             .with_default_options(ChatOptions::new().with_temperature(0.2));
-        let (body, _betas) =
-            client.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let (body, _betas) = client.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         // `temperature` is `f32`; compare against an `f32` literal so the
         // widened-to-f64 JSON values match exactly.
         assert_eq!(body["temperature"], serde_json::json!(0.2_f32));
 
         // Per-request temperature overrides the client default.
         let (body2, _betas2) = client.build_body(
-            &[ChatMessage::user("hi")],
+            &[Message::user("hi")],
             &ChatOptions::new().with_temperature(0.9),
             false,
         );
@@ -928,8 +925,7 @@ mod tests {
         // only when hosted tools/MCP servers are present -- verified against
         // `_create_run_options` (`_chat_client.py` ~254-264).
         let client = AnthropicClient::new("key", "claude-x");
-        let (_body, betas) =
-            client.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let (_body, betas) = client.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         assert!(betas.contains(&"mcp-client-2025-04-04".to_string()));
         assert!(betas.contains(&"code-execution-2025-08-25".to_string()));
         assert_eq!(betas.len(), 2);
@@ -939,8 +935,7 @@ mod tests {
     fn build_body_merges_client_level_additional_beta_flags() {
         let client =
             AnthropicClient::new("key", "claude-x").with_additional_beta_flags(["my-custom-beta"]);
-        let (_body, betas) =
-            client.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let (_body, betas) = client.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         assert!(betas.contains(&"my-custom-beta".to_string()));
         assert!(betas.contains(&"mcp-client-2025-04-04".to_string()));
         assert_eq!(betas.len(), 3);
@@ -954,7 +949,7 @@ mod tests {
             "additional_beta_flags".into(),
             serde_json::json!(["request-only-beta"]),
         );
-        let (body, betas) = client.build_body(&[ChatMessage::user("hi")], &options, false);
+        let (body, betas) = client.build_body(&[Message::user("hi")], &options, false);
         assert!(betas.contains(&"request-only-beta".to_string()));
         // Popped, like upstream's `.pop("additional_beta_flags")` -- must not
         // leak into the JSON body as a stray top-level field.

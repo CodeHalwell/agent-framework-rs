@@ -49,7 +49,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 use agent_framework_core::types::{
-    AgentResponse, AgentResponseUpdate, ChatMessage, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, Message, Role, UsageDetails,
 };
 use agent_framework_core::workflow::WorkflowEvent;
 
@@ -766,29 +766,29 @@ fn value_to_text(v: &Value) -> String {
 ///
 /// Accepts a bare string, an array of input items (OpenAI `{type:"message",
 /// content:[…]}` or `{role, content}`), or falls back to a stringified value.
-fn input_to_messages(input: &Value) -> Vec<ChatMessage> {
+fn input_to_messages(input: &Value) -> Vec<Message> {
     match input {
-        Value::String(s) => vec![ChatMessage::user(s.clone())],
-        Value::Null => vec![ChatMessage::user(String::new())],
+        Value::String(s) => vec![Message::user(s.clone())],
+        Value::Null => vec![Message::user(String::new())],
         Value::Array(items) => {
-            let msgs: Vec<ChatMessage> = items.iter().filter_map(item_to_message).collect();
+            let msgs: Vec<Message> = items.iter().filter_map(item_to_message).collect();
             if msgs.is_empty() {
-                vec![ChatMessage::user(String::new())]
+                vec![Message::user(String::new())]
             } else {
                 msgs
             }
         }
         obj @ Value::Object(_) => item_to_message(obj)
             .map(|m| vec![m])
-            .unwrap_or_else(|| vec![ChatMessage::user(obj.to_string())]),
-        other => vec![ChatMessage::user(other.to_string())],
+            .unwrap_or_else(|| vec![Message::user(obj.to_string())]),
+        other => vec![Message::user(other.to_string())],
     }
 }
 
 /// Convert one input item into a chat message, if it carries text.
-fn item_to_message(item: &Value) -> Option<ChatMessage> {
+fn item_to_message(item: &Value) -> Option<Message> {
     match item {
-        Value::String(s) => Some(ChatMessage::user(s.clone())),
+        Value::String(s) => Some(Message::user(s.clone())),
         Value::Object(map) => {
             let role = map
                 .get("role")
@@ -796,7 +796,7 @@ fn item_to_message(item: &Value) -> Option<ChatMessage> {
                 .map(role_from)
                 .unwrap_or_else(Role::user);
             let text = map.get("content").map(content_text).unwrap_or_default();
-            Some(ChatMessage::new(role, text))
+            Some(Message::new(role, text))
         }
         _ => None,
     }
@@ -841,7 +841,7 @@ fn input_to_workflow_value(input: &Value) -> Value {
         Value::Array(_) => {
             let text = input_to_messages(input)
                 .iter()
-                .map(ChatMessage::text)
+                .map(Message::text)
                 .collect::<Vec<_>>()
                 .join("\n");
             Value::String(text)

@@ -6,7 +6,7 @@
 //! scoped by `user_id`/`agent_id`/`run_id`/`application_id`; `invoking()`
 //! searches Mem0 with the latest input text (plus the same scope) and
 //! injects the hits into the conversation as a single `user`-role
-//! [`ChatMessage`] prefixed by [`DEFAULT_CONTEXT_PROMPT`].
+//! [`Message`] prefixed by [`DEFAULT_CONTEXT_PROMPT`].
 //!
 //! # Divergence from Python: hand-rolled REST calls, not the `mem0` SDK
 //!
@@ -65,7 +65,7 @@ use tokio::sync::Mutex;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::memory::{Context, ContextProvider};
-use agent_framework_core::types::{ChatMessage, Role};
+use agent_framework_core::types::{Message, Role};
 
 /// Default Mem0 API base URL, matching the hosted service.
 pub const DEFAULT_API_BASE: &str = "https://api.mem0.ai";
@@ -91,7 +91,7 @@ fn is_storable_role(role: &Role) -> bool {
 /// the Python provider's `if messages: await self.mem0_client.add(...)`
 /// guard — the HTTP call is skipped entirely rather than sent empty).
 fn build_add_body(
-    messages: &[&ChatMessage],
+    messages: &[&Message],
     user_id: Option<&str>,
     agent_id: Option<&str>,
     run_id: Option<&str>,
@@ -166,7 +166,7 @@ fn parse_search_response(value: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Join memory texts and wrap them in a `user`-role [`ChatMessage`] under
+/// Join memory texts and wrap them in a `user`-role [`Message`] under
 /// `context_prompt`, or an empty [`Context`] if there's nothing to inject
 /// (mirrors Python's `Context(messages=[...] if line_separated_memories
 /// else None)`).
@@ -176,7 +176,7 @@ fn format_context(context_prompt: &str, memory_texts: &[String]) -> Context {
         Context::default()
     } else {
         Context {
-            messages: vec![ChatMessage::user(format!("{context_prompt}\n{joined}"))],
+            messages: vec![Message::user(format!("{context_prompt}\n{joined}"))],
             ..Default::default()
         }
     }
@@ -196,16 +196,16 @@ fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
 /// ```no_run
 /// use agent_framework_mem0::Mem0Provider;
 /// use agent_framework_core::memory::ContextProvider;
-/// use agent_framework_core::types::ChatMessage;
+/// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let provider = Mem0Provider::from_env()?.with_user_id("user-42");
 ///
-/// let request = vec![ChatMessage::user("I moved to Austin last month")];
+/// let request = vec![Message::user("I moved to Austin last month")];
 /// provider.invoked(&request, &[], None).await?;
 ///
 /// let ctx = provider
-///     .invoking(&[ChatMessage::user("Where do I live?")])
+///     .invoking(&[Message::user("Where do I live?")])
 ///     .await?;
 /// # Ok(())
 /// # }
@@ -395,12 +395,12 @@ impl ContextProvider for Mem0Provider {
 
     async fn invoked(
         &self,
-        request_messages: &[ChatMessage],
-        response_messages: &[ChatMessage],
+        request_messages: &[Message],
+        response_messages: &[Message],
         _error: Option<&Error>,
     ) -> Result<()> {
         self.validate_filters()?;
-        let all: Vec<&ChatMessage> = request_messages
+        let all: Vec<&Message> = request_messages
             .iter()
             .chain(response_messages.iter())
             .collect();
@@ -418,11 +418,11 @@ impl ContextProvider for Mem0Provider {
         Ok(())
     }
 
-    async fn invoking(&self, messages: &[ChatMessage]) -> Result<Context> {
+    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
         self.validate_filters()?;
         let input_text = messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .filter(|t| !t.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
@@ -450,8 +450,8 @@ mod tests {
     use super::*;
     use agent_framework_core::types::{FunctionApprovalRequestContent, FunctionCallContent};
 
-    fn msg(role: Role, text: &str) -> ChatMessage {
-        ChatMessage::new(role, text)
+    fn msg(role: Role, text: &str) -> Message {
+        Message::new(role, text)
     }
 
     // region: build_add_body
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn build_add_body_ignores_non_text_content_messages() {
-        let m = ChatMessage::with_contents(
+        let m = Message::with_contents(
             Role::user(),
             vec![
                 agent_framework_core::types::Content::FunctionApprovalRequest(
@@ -893,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn invoking_fails_without_filters() {
         let p = Mem0Provider::new("k");
-        let err = p.invoking(&[ChatMessage::user("Hi")]).await.unwrap_err();
+        let err = p.invoking(&[Message::user("Hi")]).await.unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
     }
 
@@ -901,7 +901,7 @@ mod tests {
     async fn invoked_fails_without_filters() {
         let p = Mem0Provider::new("k");
         let err = p
-            .invoked(&[ChatMessage::user("Hi")], &[], None)
+            .invoked(&[Message::user("Hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
@@ -914,7 +914,7 @@ mod tests {
         // building a request — if it didn't, this test would hang/error
         // trying to reach api.mem0.ai.
         let p = Mem0Provider::new("k").with_user_id("u1");
-        let m = ChatMessage::with_contents(
+        let m = Message::with_contents(
             Role::user(),
             vec![
                 agent_framework_core::types::Content::FunctionApprovalRequest(

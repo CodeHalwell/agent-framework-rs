@@ -3,8 +3,8 @@
 
 use agent_framework_core::tools::ToolKind;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Role, TextContent, ToolMode, UsageDetails,
+    ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, Message, Role, TextContent, ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -55,7 +55,7 @@ pub(crate) fn data_content_media_type(data: &DataContent) -> Option<String> {
 }
 
 /// Convert framework messages into the OpenAI `messages` array.
-pub fn messages_to_openai(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = msg.role.as_str();
@@ -335,7 +335,7 @@ pub fn parse_response(value: &Value) -> ChatResponse {
                 }
             }
         }
-        let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+        let mut message = Message::with_contents(Role::assistant(), contents);
         message.message_id = response.response_id.clone();
         response.messages.push(message);
 
@@ -449,15 +449,15 @@ mod tests {
         }
     }
 
-    fn user_with(contents: Vec<Content>) -> ChatMessage {
-        ChatMessage::with_contents(Role::user(), contents)
+    fn user_with(contents: Vec<Content>) -> Message {
+        Message::with_contents(Role::user(), contents)
     }
 
     // region: multimodal input
 
     #[test]
     fn text_only_message_stays_a_content_string() {
-        let out = messages_to_openai(&[ChatMessage::user("hi")]);
+        let out = messages_to_openai(&[Message::user("hi")]);
         assert_eq!(out[0], json!({ "role": "user", "content": "hi" }));
     }
 
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn assistant_tool_call_only_still_omits_content() {
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             Role::assistant(),
             vec![Content::FunctionCall(FunctionCallContent::new(
                 "call_1",

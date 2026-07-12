@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use agent_framework_core::agent::Agent;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::registry::IntoAgentRegistration;
 
@@ -316,7 +316,7 @@ async fn handle_message_send(state: &A2AState, params: Value) -> Result<Value, R
 
     let run = state
         .agent
-        .run(vec![ChatMessage::user(input_text)], None)
+        .run(vec![Message::user(input_text)], None)
         .await
         .map_err(|e| RpcErr::new(-32603, format!("Agent execution failed: {e}")))?;
     let response_text = run.text();

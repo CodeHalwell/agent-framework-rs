@@ -82,7 +82,7 @@ use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
@@ -235,7 +235,7 @@ impl AzureOpenAIClient {
 
     /// Build the Chat Completions request body, reusing conversion from
     /// `agent-framework-openai` verbatim.
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         // The deployment in the URL already selects the model; only send
         // `model` if the caller explicitly asked for a specific one.
@@ -309,7 +309,7 @@ impl AzureOpenAIClient {
 impl ChatClient for AzureOpenAIClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -323,7 +323,7 @@ impl ChatClient for AzureOpenAIClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn build_body_omits_model_by_default() {
         let c = client();
-        let body = c.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), false);
+        let body = c.build_body(&[Message::user("hi")], &ChatOptions::new(), false);
         assert!(body.get("model").is_none());
         assert_eq!(
             body["messages"],
@@ -421,14 +421,14 @@ mod tests {
     fn build_body_includes_model_when_explicitly_set() {
         let c = client();
         let options = ChatOptions::new().with_model("gpt-4o-override");
-        let body = c.build_body(&[ChatMessage::user("hi")], &options, false);
+        let body = c.build_body(&[Message::user("hi")], &options, false);
         assert_eq!(body["model"], json!("gpt-4o-override"));
     }
 
     #[test]
     fn build_body_stream_includes_usage_option() {
         let c = client();
-        let body = c.build_body(&[ChatMessage::user("hi")], &ChatOptions::new(), true);
+        let body = c.build_body(&[Message::user("hi")], &ChatOptions::new(), true);
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
     }
@@ -441,12 +441,12 @@ mod tests {
             "get_weather",
             Some(FunctionArguments::Raw("{}".to_string())),
         );
-        let assistant_msg = ChatMessage::with_contents(
+        let assistant_msg = Message::with_contents(
             agent_framework_core::types::Role::assistant(),
             vec![Content::FunctionCall(call)],
         );
         let body = c.build_body(
-            &[ChatMessage::user("weather?"), assistant_msg],
+            &[Message::user("weather?"), assistant_msg],
             &ChatOptions::new(),
             false,
         );

@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, ChatResponse, CitationAnnotation, Content, DataContent, FinishReason,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, HostedFileContent,
+    ChatOptions, ChatResponse, CitationAnnotation, Content, DataContent, FinishReason,
+    FunctionArguments, FunctionCallContent, FunctionResultContent, HostedFileContent, Message,
     ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
     UsageContent, UsageDetails,
 };
@@ -55,7 +55,7 @@ pub(crate) fn compute_beta_flags(
 
 /// Build a full Anthropic `POST /v1/messages` request body.
 pub fn build_request(
-    messages: &[ChatMessage],
+    messages: &[Message],
     options: &ChatOptions,
     model: &str,
     max_tokens: u32,
@@ -116,9 +116,9 @@ pub fn build_request(
 /// it is a system message; any other content keeps its original position and
 /// maps to a `user` turn (see [`messages_to_anthropic`]'s role mapping).
 pub fn extract_system<'a>(
-    messages: &'a [ChatMessage],
+    messages: &'a [Message],
     options_instructions: Option<&str>,
-) -> (Option<String>, &'a [ChatMessage]) {
+) -> (Option<String>, &'a [Message]) {
     let mut parts = Vec::new();
     if let Some(instr) = options_instructions {
         if !instr.is_empty() {
@@ -196,7 +196,7 @@ fn append_response_format_instructions(
 /// Anthropic has no `system` or `tool` role: everything that isn't
 /// `assistant` (including tool results) is sent as a `user` turn, matching
 /// the Python client's `ROLE_MAP`.
-pub fn messages_to_anthropic(messages: &[ChatMessage]) -> Vec<Value> {
+pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = if msg.role == Role::assistant() {
@@ -488,7 +488,7 @@ pub fn parse_response(value: &Value) -> ChatResponse {
         .map(|blocks| parse_content_blocks(blocks))
         .unwrap_or_default();
 
-    let mut message = ChatMessage::with_contents(Role::assistant(), contents);
+    let mut message = Message::with_contents(Role::assistant(), contents);
     message.message_id = response.response_id.clone();
     response.messages.push(message);
 
@@ -846,8 +846,8 @@ mod tests {
     use super::*;
     use agent_framework_core::tools::ApprovalMode;
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
     // region: request building
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn build_request_extracts_leading_system_message() {
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = build_request(&messages, &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(body["system"], json!("Be terse."));
         assert_eq!(
@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn build_request_combines_options_instructions_and_system_message() {
-        let messages = vec![ChatMessage::system("Also be nice."), user("Hi")];
+        let messages = vec![Message::system("Also be nice."), user("Hi")];
         let options = ChatOptions::new().with_instructions("Be terse.");
         let body = build_request(&messages, &options, "claude-x", 4096, false);
         assert_eq!(body["system"], json!("Be terse.\n\nAlso be nice."));
@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn build_request_tool_role_message_becomes_user_tool_result() {
-        let tool_msg = ChatMessage::with_contents(
+        let tool_msg = Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 "call_1",
@@ -915,8 +915,7 @@ mod tests {
     fn build_request_tool_result_error_sets_is_error() {
         let mut result = FunctionResultContent::new("call_1", None);
         result.exception = Some("boom".into());
-        let tool_msg =
-            ChatMessage::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
+        let tool_msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         let body = build_request(&[tool_msg], &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(
             body["messages"][0]["content"][0],
@@ -935,7 +934,7 @@ mod tests {
             )]))),
         );
         let assistant_msg =
-            ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
         let body = build_request(
             &[assistant_msg],
             &ChatOptions::new(),
@@ -961,7 +960,7 @@ mod tests {
     #[test]
     fn build_request_data_content_image_uses_embedded_base64() {
         let dc = DataContent::from_bytes(b"hello", "image/png");
-        let msg = ChatMessage::with_contents(Role::user(), vec![Content::Data(dc.clone())]);
+        let msg = Message::with_contents(Role::user(), vec![Content::Data(dc.clone())]);
         let body = build_request(&[msg], &ChatOptions::new(), "claude-x", 4096, false);
         let (_, expected_data) = split_data_uri(&dc.uri).unwrap();
         assert_eq!(
@@ -976,7 +975,7 @@ mod tests {
             uri: "https://example.com/cat.png".into(),
             media_type: "image/png".into(),
         };
-        let msg = ChatMessage::with_contents(Role::user(), vec![Content::Uri(uc)]);
+        let msg = Message::with_contents(Role::user(), vec![Content::Uri(uc)]);
         let body = build_request(&[msg], &ChatOptions::new(), "claude-x", 4096, false);
         assert_eq!(
             body["messages"][0]["content"][0],
@@ -1098,7 +1097,7 @@ mod tests {
     fn build_request_response_format_json_schema_appends_after_existing_system() {
         // A leading system message and `response_format` must combine, not
         // clobber one another.
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let mut options = ChatOptions::new();
         options.response_format = Some(ResponseFormat::JsonObject);
         let body = build_request(&messages, &options, "claude-x", 4096, false);
@@ -1196,11 +1195,11 @@ mod tests {
     #[test]
     fn consecutive_same_role_messages_are_merged() {
         let msgs = vec![
-            ChatMessage::user("first"),
-            ChatMessage::user("second"),
-            ChatMessage::assistant("reply"),
-            ChatMessage::assistant("more"),
-            ChatMessage::user("third"),
+            Message::user("first"),
+            Message::user("second"),
+            Message::assistant("reply"),
+            Message::assistant("more"),
+            Message::user("third"),
         ];
         let out = messages_to_anthropic(&msgs);
         assert_eq!(out.len(), 3);
@@ -1213,10 +1212,7 @@ mod tests {
 
     #[test]
     fn leading_assistant_message_gets_synthetic_user_turn() {
-        let msgs = vec![
-            ChatMessage::assistant("greeting"),
-            ChatMessage::user("hello"),
-        ];
+        let msgs = vec![Message::assistant("greeting"), Message::user("hello")];
         let out = messages_to_anthropic(&msgs);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["role"], "user");

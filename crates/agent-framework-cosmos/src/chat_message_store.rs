@@ -12,7 +12,7 @@
 //!   "id": "<fresh uuid, Cosmos's item id>",
 //!   "threadId": "<this store's thread id — the partition key>",
 //!   "seq": 1751971200000123,
-//!   "message": "<ChatMessage, JSON-serialized to a STRING>"
+//!   "message": "<Message, JSON-serialized to a STRING>"
 //! }
 //! ```
 //!
@@ -65,7 +65,7 @@ use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::ChatMessageStore;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::client::CosmosRestClient;
 
@@ -77,10 +77,10 @@ pub const DEFAULT_PARTITION_KEY_PATH: &str = crate::client::PARTITION_KEY_PATH;
 
 /// Build the Cosmos document for one stored chat message. `id` is a fresh
 /// UUID — Cosmos's own item identifier, distinct from
-/// [`ChatMessage::message_id`], which travels untouched, still embedded,
+/// [`Message::message_id`], which travels untouched, still embedded,
 /// inside the serialized `message` string. `seq` is this store's
 /// [module-documented](self) ordering key.
-fn build_message_document(thread_id: &str, seq: i64, message: &ChatMessage) -> Result<Value> {
+fn build_message_document(thread_id: &str, seq: i64, message: &Message) -> Result<Value> {
     let message_json = serde_json::to_string(message)?;
     Ok(serde_json::json!({
         "id": Uuid::new_v4().to_string(),
@@ -90,14 +90,14 @@ fn build_message_document(thread_id: &str, seq: i64, message: &ChatMessage) -> R
     }))
 }
 
-/// Parse one Cosmos document back into a [`ChatMessage`], requiring a
+/// Parse one Cosmos document back into a [`Message`], requiring a
 /// string `message` field (see the [module docs](self) for the
 /// double-encoded-string shape). Mirrors
 /// `agent_framework_redis::RedisChatMessageStore`'s strictness: a malformed
 /// or missing `message` field fails the whole [`ChatMessageStore::list_messages`]
 /// call rather than being silently skipped, so callers never see a
 /// silently-truncated history.
-fn parse_message_document(doc: &Value) -> Result<ChatMessage> {
+fn parse_message_document(doc: &Value) -> Result<Message> {
     let raw = doc.get("message").and_then(Value::as_str).ok_or_else(|| {
         Error::Serialization("Cosmos document is missing a string 'message' field".into())
     })?;
@@ -127,7 +127,7 @@ fn seq_base() -> i64 {
 /// ```no_run
 /// use agent_framework_cosmos::CosmosChatMessageStore;
 /// use agent_framework_core::threads::ChatMessageStore;
-/// use agent_framework_core::types::ChatMessage;
+/// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let store = CosmosChatMessageStore::new(
@@ -139,7 +139,7 @@ fn seq_base() -> i64 {
 /// )?;
 /// store.ensure_created().await?;
 ///
-/// store.add_messages(vec![ChatMessage::user("hello")]).await?;
+/// store.add_messages(vec![Message::user("hello")]).await?;
 /// let history = store.list_messages().await?;
 /// println!("{} messages for thread {}", history.len(), store.thread_id());
 /// # Ok(())
@@ -276,7 +276,7 @@ impl CosmosChatMessageStore {
 
 #[async_trait]
 impl ChatMessageStore for CosmosChatMessageStore {
-    async fn list_messages(&self) -> Result<Vec<ChatMessage>> {
+    async fn list_messages(&self) -> Result<Vec<Message>> {
         let docs = self
             .client
             .query_documents(
@@ -290,7 +290,7 @@ impl ChatMessageStore for CosmosChatMessageStore {
         docs.iter().map(parse_message_document).collect()
     }
 
-    async fn add_messages(&self, messages: Vec<ChatMessage>) -> Result<()> {
+    async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -402,20 +402,20 @@ mod tests {
 
     #[test]
     fn build_message_document_shape() {
-        let message = ChatMessage::user("hello");
+        let message = Message::user("hello");
         let doc = build_message_document("thread-1", 42, &message).unwrap();
         assert_eq!(doc["threadId"], serde_json::json!("thread-1"));
         assert_eq!(doc["seq"], serde_json::json!(42));
         assert!(doc["id"].as_str().is_some());
         // `message` is a JSON *string* (double-encoded), not a nested object.
         assert!(doc["message"].is_string());
-        let inner: ChatMessage = serde_json::from_str(doc["message"].as_str().unwrap()).unwrap();
+        let inner: Message = serde_json::from_str(doc["message"].as_str().unwrap()).unwrap();
         assert_eq!(inner.text(), "hello");
     }
 
     #[test]
     fn build_message_document_ids_are_unique_across_calls() {
-        let message = ChatMessage::user("hi");
+        let message = Message::user("hi");
         let a = build_message_document("t", 1, &message).unwrap();
         let b = build_message_document("t", 1, &message).unwrap();
         assert_ne!(a["id"], b["id"]);
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn parse_message_document_round_trips_complex_message() {
-        let message = ChatMessage::new(Role::assistant(), "Hi there!").with_author("bot");
+        let message = Message::new(Role::assistant(), "Hi there!").with_author("bot");
         let doc = build_message_document("t", 1, &message).unwrap();
         let parsed = parse_message_document(&doc).unwrap();
         assert_eq!(parsed.role, Role::assistant());

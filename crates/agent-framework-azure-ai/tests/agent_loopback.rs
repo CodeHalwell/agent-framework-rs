@@ -16,7 +16,7 @@ use agent_framework_azure_ai::AzureAIAgentClient;
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::Error;
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, Content, FinishReason, FunctionResultContent, Role,
+    ChatOptions, Content, FinishReason, FunctionResultContent, Message, Role,
 };
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -221,7 +221,7 @@ async fn non_streaming_run_creates_thread_and_returns_text() {
 
     let c = client(&server.addr);
     let resp = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
 
@@ -255,7 +255,7 @@ async fn unauthorized_agent_creation_becomes_invalid_auth() {
 
     let c = client(&server.addr);
     let err = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -280,7 +280,7 @@ async fn content_filtered_run_becomes_content_filter_error() {
 
     let c = client(&server.addr);
     let err = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -304,7 +304,7 @@ async fn non_content_filter_run_failure_stays_generic_service_error() {
 
     let c = client(&server.addr);
     let err = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap_err();
 
@@ -328,7 +328,7 @@ async fn thread_continuity_reuses_conversation_id() {
 
     // First turn: no conversation id → a thread is created and surfaced.
     let first = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
     let thread_id = first.conversation_id.clone().unwrap();
@@ -338,7 +338,7 @@ async fn thread_continuity_reuses_conversation_id() {
     let mut options = ChatOptions::new();
     options.conversation_id = Some(thread_id.clone());
     let _ = c
-        .get_response(vec![ChatMessage::user("again")], options)
+        .get_response(vec![Message::user("again")], options)
         .await
         .unwrap();
 
@@ -387,7 +387,7 @@ async fn tool_round_trip_submits_outputs_to_active_run() {
 
     // Turn 1: model asks for a tool call.
     let first = c
-        .get_response(vec![ChatMessage::user("weather?")], ChatOptions::new())
+        .get_response(vec![Message::user("weather?")], ChatOptions::new())
         .await
         .unwrap();
     assert_eq!(first.finish_reason, Some(FinishReason::tool_calls()));
@@ -398,7 +398,7 @@ async fn tool_round_trip_submits_outputs_to_active_run() {
     let thread_id = first.conversation_id.clone().unwrap();
 
     // Turn 2: hand back the tool result on the same conversation.
-    let tool_msg = ChatMessage::with_contents(
+    let tool_msg = Message::with_contents(
         Role::tool(),
         vec![Content::FunctionResult(FunctionResultContent::new(
             call_id,
@@ -454,7 +454,7 @@ async fn streaming_run_yields_text_and_usage() {
 
     let c = client(&server.addr);
     let mut stream = c
-        .get_streaming_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_streaming_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
 
@@ -508,7 +508,7 @@ async fn existing_agent_definition_is_fetched_once_and_merged_into_every_run() {
     // Turn 1: no local tools/instructions at all — everything comes from the
     // persistent agent's own definition.
     let first = c
-        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .get_response(vec![Message::user("hi")], ChatOptions::new())
         .await
         .unwrap();
     assert_eq!(first.conversation_id.as_deref(), Some("thread_1"));
@@ -517,7 +517,7 @@ async fn existing_agent_definition_is_fetched_once_and_merged_into_every_run() {
     let mut options = ChatOptions::new();
     options.conversation_id = Some("thread_1".to_string());
     let _ = c
-        .get_response(vec![ChatMessage::user("again")], options)
+        .get_response(vec![Message::user("again")], options)
         .await
         .unwrap();
 

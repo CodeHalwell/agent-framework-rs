@@ -83,8 +83,8 @@ use serde_json::{json, Map, Value};
 use agent_framework_core::agent::{Agent, AgentRunOptions};
 use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatMessage, Content, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Role, TextContent,
+    Content, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, TextContent,
 };
 
 use crate::registry::IntoAgentRegistration;
@@ -530,17 +530,17 @@ pub struct RunAgentInput {
     pub forwarded_props: Option<Value>,
 }
 
-/// Map AG-UI `messages[]` to core [`ChatMessage`]s.
+/// Map AG-UI `messages[]` to core [`Message`]s.
 ///
 /// Mirrors `agui_messages_to_agent_framework`: `role:"tool"` →
 /// [`FunctionResultContent`]; an assistant with `toolCalls` →
 /// [`FunctionCallContent`]s (plus any text); everything else → a text message
 /// under the mapped role.
-fn input_to_messages(messages: &[Value]) -> Vec<ChatMessage> {
+fn input_to_messages(messages: &[Value]) -> Vec<Message> {
     messages.iter().filter_map(map_message).collect()
 }
 
-fn map_message(msg: &Value) -> Option<ChatMessage> {
+fn map_message(msg: &Value) -> Option<Message> {
     let obj = msg.as_object()?;
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
 
@@ -557,7 +557,7 @@ fn map_message(msg: &Value) -> Option<ChatMessage> {
             .or_else(|| obj.get("result"))
             .cloned()
             .unwrap_or(Value::String(String::new()));
-        return Some(ChatMessage::with_contents(
+        return Some(Message::with_contents(
             Role::tool(),
             vec![Content::FunctionResult(FunctionResultContent::new(
                 call_id,
@@ -580,12 +580,12 @@ fn map_message(msg: &Value) -> Option<ChatMessage> {
                 contents.push(Content::FunctionCall(fc));
             }
         }
-        return Some(ChatMessage::with_contents(Role::assistant(), contents));
+        return Some(Message::with_contents(Role::assistant(), contents));
     }
 
     // Plain text message under its role.
     let text = content_text(obj.get("content"));
-    Some(ChatMessage::new(role_from(role), text))
+    Some(Message::new(role_from(role), text))
 }
 
 /// Convert one AG-UI `ToolCall` (`{id, type:"function", function:{name,

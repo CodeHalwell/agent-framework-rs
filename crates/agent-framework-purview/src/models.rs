@@ -55,7 +55,7 @@ impl PurviewTextContent {
 /// these, though this port's [`ContentProcessor`](crate::processor::ContentProcessor)
 /// only ever sends one per `processContent` call (mirrors Python's
 /// `_map_messages`, which builds one whole `ProcessContentRequest` — with a
-/// single-element `content_entries` — per [`ChatMessage`](agent_framework_core::types::ChatMessage),
+/// single-element `content_entries` — per [`Message`](agent_framework_core::types::Message),
 /// not one batched request for all of them).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessConversationMetadata {

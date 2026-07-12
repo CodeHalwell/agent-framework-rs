@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use agent_framework_core::memory::ContextProvider;
 use agent_framework_core::threads::ChatMessageStore;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 use agent_framework_redis::{RedisChatMessageStore, RedisContextProvider};
 use uuid::Uuid;
 
@@ -175,8 +175,8 @@ async fn chat_message_store_add_list_clear_round_trip() {
 
     store
         .add_messages(vec![
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi there!"),
+            Message::user("Hello"),
+            Message::assistant("Hi there!"),
         ])
         .await
         .unwrap();
@@ -187,7 +187,7 @@ async fn chat_message_store_add_list_clear_round_trip() {
     assert_eq!(messages[1].text(), "Hi there!");
 
     store
-        .add_messages(vec![ChatMessage::user("How are you?")])
+        .add_messages(vec![Message::user("How are you?")])
         .await
         .unwrap();
     let messages = store.list_messages().await.unwrap();
@@ -209,7 +209,7 @@ async fn chat_message_store_trims_to_max_messages() {
 
     for i in 0..5 {
         store
-            .add_messages(vec![ChatMessage::user(format!("message {i}"))])
+            .add_messages(vec![Message::user(format!("message {i}"))])
             .await
             .unwrap();
     }
@@ -237,7 +237,7 @@ async fn chat_message_store_auto_generated_thread_ids_are_isolated() {
     assert_ne!(store_a.thread_id(), store_b.thread_id());
 
     store_a
-        .add_messages(vec![ChatMessage::user("only in A")])
+        .add_messages(vec![Message::user("only in A")])
         .await
         .unwrap();
 
@@ -253,7 +253,7 @@ async fn chat_message_store_survives_from_state_round_trip_against_live_server()
     let thread_id = unique("thread");
     let store = RedisChatMessageStore::new(&url, Some(thread_id.clone())).unwrap();
     store
-        .add_messages(vec![ChatMessage::user("persisted")])
+        .add_messages(vec![Message::user("persisted")])
         .await
         .unwrap();
 
@@ -275,16 +275,12 @@ async fn context_provider_invoked_then_invoking_surfaces_matching_memory() {
         .with_user_id("user-it-1");
 
     provider
-        .invoked(
-            &[ChatMessage::user("I love hiking in the Cascades")],
-            &[],
-            None,
-        )
+        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
     let ctx = provider
-        .invoking(&[ChatMessage::user("Tell me about hiking")])
+        .invoking(&[Message::user("Tell me about hiking")])
         .await
         .unwrap();
 
@@ -308,17 +304,13 @@ async fn context_provider_invoking_returns_empty_context_when_nothing_matches() 
         .with_user_id("user-it-2");
 
     provider
-        .invoked(
-            &[ChatMessage::user("I love hiking in the Cascades")],
-            &[],
-            None,
-        )
+        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
     // No overlapping token with the stored memory.
     let ctx = provider
-        .invoking(&[ChatMessage::user("What is the capital of France?")])
+        .invoking(&[Message::user("What is the capital of France?")])
         .await
         .unwrap();
     assert!(ctx.messages.is_empty());
@@ -342,7 +334,7 @@ async fn context_provider_scopes_memories_by_user_id() {
 
     provider_a
         .invoked(
-            &[ChatMessage::user("user-a's secret hobby is pottery")],
+            &[Message::user("user-a's secret hobby is pottery")],
             &[],
             None,
         )
@@ -350,7 +342,7 @@ async fn context_provider_scopes_memories_by_user_id() {
         .unwrap();
 
     let ctx_b = provider_b
-        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .invoking(&[Message::user("Tell me about pottery")])
         .await
         .unwrap();
     assert!(
@@ -359,7 +351,7 @@ async fn context_provider_scopes_memories_by_user_id() {
     );
 
     let ctx_a = provider_a
-        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .invoking(&[Message::user("Tell me about pottery")])
         .await
         .unwrap();
     assert_eq!(ctx_a.messages.len(), 1);
@@ -398,16 +390,12 @@ async fn context_provider_force_scan_fallback_works_regardless_of_redisearch_ava
         .with_force_scan_fallback(true);
 
     provider
-        .invoked(
-            &[ChatMessage::user("I love hiking in the Cascades")],
-            &[],
-            None,
-        )
+        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
     let ctx = provider
-        .invoking(&[ChatMessage::user("Tell me about hiking")])
+        .invoking(&[Message::user("Tell me about hiking")])
         .await
         .unwrap();
 
@@ -436,16 +424,12 @@ async fn context_provider_redisearch_finds_and_excludes_memories_when_available(
         .with_user_id("user-ft-1");
 
     provider
-        .invoked(
-            &[ChatMessage::user("I love hiking in the Cascades")],
-            &[],
-            None,
-        )
+        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
     let ctx = provider
-        .invoking(&[ChatMessage::user("Tell me about hiking")])
+        .invoking(&[Message::user("Tell me about hiking")])
         .await
         .unwrap();
     assert_eq!(ctx.messages.len(), 1);
@@ -459,7 +443,7 @@ async fn context_provider_redisearch_finds_and_excludes_memories_when_available(
     // No overlapping meaningful token -> FT.SEARCH finds nothing, mirroring
     // the fallback path's equivalent assertion.
     let ctx_empty = provider
-        .invoking(&[ChatMessage::user("What is the capital of France?")])
+        .invoking(&[Message::user("What is the capital of France?")])
         .await
         .unwrap();
     assert!(ctx_empty.messages.is_empty());
@@ -487,7 +471,7 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
 
     provider_a
         .invoked(
-            &[ChatMessage::user("user-ft-a's secret hobby is pottery")],
+            &[Message::user("user-ft-a's secret hobby is pottery")],
             &[],
             None,
         )
@@ -495,7 +479,7 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
         .unwrap();
 
     let ctx_b = provider_b
-        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .invoking(&[Message::user("Tell me about pottery")])
         .await
         .unwrap();
     assert!(
@@ -504,7 +488,7 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
     );
 
     let ctx_a = provider_a
-        .invoking(&[ChatMessage::user("Tell me about pottery")])
+        .invoking(&[Message::user("Tell me about pottery")])
         .await
         .unwrap();
     assert_eq!(ctx_a.messages.len(), 1);
@@ -529,7 +513,7 @@ async fn context_provider_redisearch_respects_limit_when_available() {
     for i in 0..5 {
         provider
             .invoked(
-                &[ChatMessage::user(format!("apple fact number {i}"))],
+                &[Message::user(format!("apple fact number {i}"))],
                 &[],
                 None,
             )
@@ -537,10 +521,7 @@ async fn context_provider_redisearch_respects_limit_when_available() {
             .unwrap();
     }
 
-    let ctx = provider
-        .invoking(&[ChatMessage::user("apple")])
-        .await
-        .unwrap();
+    let ctx = provider.invoking(&[Message::user("apple")]).await.unwrap();
     assert_eq!(ctx.messages.len(), 1);
     // DEFAULT_CONTEXT_PROMPT is itself two lines; every line after that is
     // one matched memory, so this counts how many FT.SEARCH actually
@@ -576,12 +557,12 @@ async fn context_provider_redisearch_entries_are_not_visible_to_forced_scan_fall
         .with_force_scan_fallback(true);
 
     ft_provider
-        .invoked(&[ChatMessage::user("stored via JSON.SET")], &[], None)
+        .invoked(&[Message::user("stored via JSON.SET")], &[], None)
         .await
         .unwrap();
 
     let ctx = fallback_provider
-        .invoking(&[ChatMessage::user("Tell me about JSON.SET")])
+        .invoking(&[Message::user("Tell me about JSON.SET")])
         .await
         .unwrap();
     assert!(

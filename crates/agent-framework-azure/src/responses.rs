@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{ChatMessage, ChatOptions, ChatResponse};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
@@ -301,7 +301,7 @@ impl AzureOpenAIResponsesClient {
     /// Build the Responses API request body, reusing conversion from
     /// [`agent_framework_openai::responses`] verbatim — see the
     /// [module docs](self).
-    fn build_body(&self, messages: &[ChatMessage], options: &ChatOptions, stream: bool) -> Value {
+    fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         // Unlike Chat Completions (deployment selects the model via the URL
         // path), the `/openai/v1/responses` route carries no deployment
@@ -428,7 +428,7 @@ impl AzureOpenAIResponsesClient {
 impl ChatClient for AzureOpenAIResponsesClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
@@ -452,7 +452,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
@@ -482,8 +482,8 @@ mod tests {
         )
     }
 
-    fn user(text: &str) -> ChatMessage {
-        ChatMessage::user(text)
+    fn user(text: &str) -> Message {
+        Message::user(text)
     }
 
     // region: URL building
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn build_body_extracts_leading_system_message_as_instructions() {
         let c = client();
-        let messages = vec![ChatMessage::system("Be terse."), user("Hi")];
+        let messages = vec![Message::system("Be terse."), user("Hi")];
         let body = c.build_body(&messages, &ChatOptions::new(), false);
         assert_eq!(body["instructions"], json!("Be terse."));
         assert_eq!(
@@ -674,11 +674,11 @@ mod tests {
             "get_weather",
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
-        let assistant_msg = ChatMessage::with_contents(
+        let assistant_msg = Message::with_contents(
             agent_framework_core::types::Role::assistant(),
             vec![Content::FunctionCall(call)],
         );
-        let tool_msg = ChatMessage::with_contents(
+        let tool_msg = Message::with_contents(
             agent_framework_core::types::Role::tool(),
             vec![Content::FunctionResult(
                 agent_framework_core::types::FunctionResultContent::new(

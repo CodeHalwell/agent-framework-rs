@@ -13,7 +13,7 @@ use std::time::Duration;
 use agent_framework_azure::StaticTokenCredential;
 use agent_framework_azure_ai_search::AzureAISearchProvider;
 use agent_framework_core::memory::ContextProvider;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 use serde_json::Value;
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -138,7 +138,7 @@ async fn api_key_search_formats_context_with_citations() {
         .with_semantic_configuration("sem");
 
     let context = provider
-        .invoking(&[ChatMessage::user("what color is the sky?")])
+        .invoking(&[Message::user("what color is the sky?")])
         .await
         .unwrap();
 
@@ -174,10 +174,7 @@ async fn token_credential_search_uses_bearer_auth() {
         Arc::new(StaticTokenCredential::new("jwt-token")),
     );
 
-    let context = provider
-        .invoking(&[ChatMessage::user("query")])
-        .await
-        .unwrap();
+    let context = provider.invoking(&[Message::user("query")]).await.unwrap();
     assert!(context.instructions.is_some());
 
     let (_line, headers, _body) = server.requests().remove(0);
@@ -201,7 +198,7 @@ async fn empty_query_makes_no_request() {
 
     // No user message → empty context, no search issued.
     let context = provider
-        .invoking(&[ChatMessage::system("system only")])
+        .invoking(&[Message::system("system only")])
         .await
         .unwrap();
     assert!(context.instructions.is_none());
@@ -216,7 +213,7 @@ async fn no_results_yields_empty_context() {
     let server = FakeSearch::start(r#"{"value":[]}"#);
     let provider = AzureAISearchProvider::with_api_key(&server.addr, "idx", "key");
     let context = provider
-        .invoking(&[ChatMessage::user("nothing matches")])
+        .invoking(&[Message::user("nothing matches")])
         .await
         .unwrap();
     assert!(context.instructions.is_none());

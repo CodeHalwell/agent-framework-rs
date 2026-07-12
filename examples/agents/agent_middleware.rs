@@ -57,11 +57,7 @@ impl Middleware<AgentContext> for BlockedWordsMiddleware {
         mut ctx: AgentContext,
         next: Next<AgentContext>,
     ) -> Result<AgentContext> {
-        let last_text = ctx
-            .messages
-            .last()
-            .map(ChatMessage::text)
-            .unwrap_or_default();
+        let last_text = ctx.messages.last().map(Message::text).unwrap_or_default();
         let hit = self
             .blocked
             .iter()
@@ -70,7 +66,7 @@ impl Middleware<AgentContext> for BlockedWordsMiddleware {
         if let Some(word) = hit {
             println!("  [blocked-words] refusing request containing '{word}' -- model not called");
             ctx.result = Some(AgentResponse {
-                messages: vec![ChatMessage::assistant(format!(
+                messages: vec![Message::assistant(format!(
                     "Sorry, I can't help with requests containing '{word}'."
                 ))],
                 ..Default::default()
@@ -93,7 +89,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(
@@ -103,7 +99,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))

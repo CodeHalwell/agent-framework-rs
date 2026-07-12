@@ -26,7 +26,7 @@ struct WordStreamingClient(&'static str);
 impl ChatClient for WordStreamingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(self.0))
@@ -34,7 +34,7 @@ impl ChatClient for WordStreamingClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         let chunks: Vec<Result<ChatResponseUpdate>> = self

@@ -209,7 +209,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
     let mut thread = agent.get_new_thread();
     let first = agent
         .run(
-            vec![ChatMessage::user("What is the capital of France?")],
+            vec![Message::user("What is the capital of France?")],
             Some(&mut thread),
         )
         .await
@@ -220,7 +220,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
 
     let second = agent
         .run(
-            vec![ChatMessage::user("What about tomorrow?")],
+            vec![Message::user("What about tomorrow?")],
             Some(&mut thread),
         )
         .await

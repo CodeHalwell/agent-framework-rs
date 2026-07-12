@@ -25,7 +25,7 @@ struct CannedClient;
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         // The provider injects remembered context as extra messages, so the
@@ -38,7 +38,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     let mut thread = AgentThread::local(store.clone());
     for text in ["I love hiking in the Alps.", "What do you know about me?"] {
         let response = agent
-            .run(vec![ChatMessage::user(text)], Some(&mut thread))
+            .run(vec![Message::user(text)], Some(&mut thread))
             .await?;
         println!("user: {text}\nagent: {}\n", response.text());
     }

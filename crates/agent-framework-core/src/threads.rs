@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::memory::AggregateContextProvider;
-use crate::types::ChatMessage;
+use crate::types::Message;
 
 /// The `type` discriminator Python's `AgentThreadState` serializes with; kept
 /// identical so a Rust-serialized thread is readable by the Python/.NET
@@ -25,10 +25,10 @@ pub(crate) const CHAT_MESSAGE_STORE_STATE_TYPE: &str = "chat_message_store_state
 #[async_trait]
 pub trait ChatMessageStore: Send + Sync {
     /// Return the stored messages in ascending chronological order.
-    async fn list_messages(&self) -> Result<Vec<ChatMessage>>;
+    async fn list_messages(&self) -> Result<Vec<Message>>;
 
     /// Append messages to the store.
-    async fn add_messages(&self, messages: Vec<ChatMessage>) -> Result<()>;
+    async fn add_messages(&self, messages: Vec<Message>) -> Result<()>;
 
     /// Serialize the store's state.
     ///
@@ -59,7 +59,7 @@ pub trait ChatMessageStore: Send + Sync {
 /// Default in-memory [`ChatMessageStore`].
 #[derive(Default, Clone)]
 pub struct InMemoryChatMessageStore {
-    messages: Arc<Mutex<Vec<ChatMessage>>>,
+    messages: Arc<Mutex<Vec<Message>>>,
 }
 
 impl InMemoryChatMessageStore {
@@ -67,7 +67,7 @@ impl InMemoryChatMessageStore {
         Self::default()
     }
 
-    pub fn with_messages(messages: Vec<ChatMessage>) -> Self {
+    pub fn with_messages(messages: Vec<Message>) -> Self {
         Self {
             messages: Arc::new(Mutex::new(messages)),
         }
@@ -76,10 +76,10 @@ impl InMemoryChatMessageStore {
 
 #[async_trait]
 impl ChatMessageStore for InMemoryChatMessageStore {
-    async fn list_messages(&self) -> Result<Vec<ChatMessage>> {
+    async fn list_messages(&self) -> Result<Vec<Message>> {
         Ok(self.messages.lock().await.clone())
     }
-    async fn add_messages(&self, messages: Vec<ChatMessage>) -> Result<()> {
+    async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         self.messages.lock().await.extend(messages);
         Ok(())
     }
@@ -98,7 +98,7 @@ impl ChatMessageStore for InMemoryChatMessageStore {
         if raw.is_null() {
             return Ok(());
         }
-        let messages: Vec<ChatMessage> = serde_json::from_value(raw.clone()).map_err(|e| {
+        let messages: Vec<Message> = serde_json::from_value(raw.clone()).map_err(|e| {
             Error::Serialization(format!("failed to restore chat message store: {e}"))
         })?;
         *self.messages.lock().await = messages;
@@ -220,7 +220,7 @@ impl AgentThread {
     /// Notify the thread of new messages. For service-managed threads this is a
     /// no-op (the service tracks history); for local threads the messages are
     /// appended to the store.
-    pub async fn on_new_messages(&mut self, messages: Vec<ChatMessage>) -> Result<()> {
+    pub async fn on_new_messages(&mut self, messages: Vec<Message>) -> Result<()> {
         if self.service_thread_id.is_some() {
             return Ok(());
         }
@@ -230,7 +230,7 @@ impl AgentThread {
 
     /// Return the current history for seeding a request (empty for
     /// service-managed threads).
-    pub async fn list_messages(&self) -> Result<Vec<ChatMessage>> {
+    pub async fn list_messages(&self) -> Result<Vec<Message>> {
         match &self.message_store {
             Some(store) => store.list_messages().await,
             None => Ok(Vec::new()),
@@ -360,14 +360,14 @@ impl AgentThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::Message;
 
     #[tokio::test]
     async fn restoring_an_empty_state_clears_stale_history() {
         // A reused store with prior messages must end up empty when the
         // restored thread state carries an (intentionally) empty list.
         let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-            ChatMessage::user("stale"),
+            Message::user("stale"),
         ]));
         store
             .update_from_state(&serde_json::json!({ "messages": [] }))
@@ -377,7 +377,7 @@ mod tests {
 
         // A state with no `messages` key restores nothing (unchanged).
         let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-            ChatMessage::user("kept"),
+            Message::user("kept"),
         ]));
         store
             .update_from_state(&serde_json::json!({}))
@@ -394,7 +394,7 @@ mod tests {
             "service_thread_id": null,
             "chat_message_store_state": {
                 "type": "chat_message_store_state",
-                "messages": [ChatMessage::user("hello")],
+                "messages": [Message::user("hello")],
             },
         });
         thread.update_from_state(&state).await.unwrap();
@@ -403,7 +403,7 @@ mod tests {
         // The thread now behaves as local end to end: history records and a
         // re-serialize emits the local shape (store state set, id null).
         thread
-            .on_new_messages(vec![ChatMessage::user("again")])
+            .on_new_messages(vec![Message::user("again")])
             .await
             .unwrap();
         let reserialized = thread.serialize().await.unwrap();
@@ -420,7 +420,7 @@ mod tests {
         // `service_thread_id` present as null. Keys match Python's
         // AgentThreadState.to_dict(exclude_none=False).
         let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-            ChatMessage::user("hello"),
+            Message::user("hello"),
         ]));
         let thread = AgentThread::local(store);
         let state = thread.serialize().await.unwrap();
@@ -440,8 +440,8 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_local_thread_with_messages() {
         let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-            ChatMessage::user("q1"),
-            ChatMessage::assistant("a1"),
+            Message::user("q1"),
+            Message::assistant("a1"),
         ]));
         let thread = AgentThread::local(store);
         let state = thread.serialize().await.unwrap();
@@ -466,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn deserialize_uses_provided_store() {
         let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
-            ChatMessage::user("seed"),
+            Message::user("seed"),
         ]));
         let state = AgentThread::local(store).serialize().await.unwrap();
 
@@ -482,10 +482,10 @@ mod tests {
 
     #[tokio::test]
     async fn store_update_from_state_replaces_messages() {
-        let store = InMemoryChatMessageStore::with_messages(vec![ChatMessage::user("old")]);
+        let store = InMemoryChatMessageStore::with_messages(vec![Message::user("old")]);
         let state = serde_json::json!({
             "type": "chat_message_store_state",
-            "messages": [ChatMessage::user("new")],
+            "messages": [Message::user("new")],
         });
         store.update_from_state(&state).await.unwrap();
         let msgs = store.list_messages().await.unwrap();

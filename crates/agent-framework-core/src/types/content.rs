@@ -622,7 +622,7 @@ mod base64_lite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::Message;
 
     #[test]
     fn unknown_content_type_deserializes_inertly_and_keeps_siblings() {
@@ -636,7 +636,7 @@ mod tests {
                 {"type": "function_call", "call_id": "c1", "name": "f"}
             ]
         });
-        let msg: ChatMessage =
+        let msg: Message =
             serde_json::from_value(json).expect("unknown content must not fail the message");
         assert_eq!(
             msg.contents.len(),
@@ -661,7 +661,7 @@ mod tests {
         let v = serde_json::to_value(&c).expect("Unknown must serialize");
         assert_eq!(v, serde_json::json!({"type": "unknown"}));
         // And a full message round-trips through serialization without panic.
-        let msg = ChatMessage::with_contents(
+        let msg = Message::with_contents(
             crate::types::Role::assistant(),
             vec![Content::text("keep"), Content::Unknown],
         );

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use super::content::{Content, FunctionApprovalRequestContent, FunctionCallContent, UsageDetails};
-use super::message::{ChatMessage, Role};
+use super::message::{Message, Role};
 use super::options::ResponseFormat;
 use crate::error::{Error, Result};
 
@@ -58,7 +58,7 @@ impl ContinuationToken {
 /// A full (non-streaming) response from a chat client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatResponse {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -87,7 +87,7 @@ impl ChatResponse {
     /// Build a response from a single assistant text message.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
-            messages: vec![ChatMessage::assistant(text)],
+            messages: vec![Message::assistant(text)],
             ..Default::default()
         }
     }
@@ -96,7 +96,7 @@ impl ChatResponse {
     pub fn text(&self) -> String {
         self.messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -226,7 +226,7 @@ impl ChatResponse {
         let msg_idx = match idx {
             Some(i) => i,
             None => {
-                let mut m = ChatMessage::with_contents(role, Vec::new());
+                let mut m = Message::with_contents(role, Vec::new());
                 m.message_id = update.message_id.clone();
                 m.author_name = update.author_name.clone();
                 self.messages.push(m);
@@ -356,7 +356,7 @@ impl ChatResponseUpdate {
 /// A full response from an agent run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentResponse {
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_id: Option<String>,
     /// Service-side conversation id, when the backing service manages the
@@ -381,10 +381,7 @@ pub struct AgentResponse {
 impl AgentResponse {
     /// The concatenated text of all messages (no separator), matching Python.
     pub fn text(&self) -> String {
-        self.messages
-            .iter()
-            .map(ChatMessage::text)
-            .collect::<String>()
+        self.messages.iter().map(Message::text).collect::<String>()
     }
 
     /// All pending user-input (function-approval) requests across the messages.

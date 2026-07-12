@@ -16,8 +16,8 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentResponse, ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, Role,
+    AgentResponse, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, Message, Role,
 };
 use agent_framework_hosting::agui::AgUiRouter;
 
@@ -116,7 +116,7 @@ struct FrontendToolAgent;
 impl Agent for FrontendToolAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
@@ -125,7 +125,7 @@ impl Agent for FrontendToolAgent {
             Some(FunctionArguments::Raw(r#"{"city":"Paris"}"#.to_string())),
         );
         Ok(AgentResponse {
-            messages: vec![ChatMessage::with_contents(
+            messages: vec![Message::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call)],
             )],
@@ -184,7 +184,7 @@ struct ExecutedToolAgent;
 impl Agent for ExecutedToolAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
@@ -194,7 +194,7 @@ impl Agent for ExecutedToolAgent {
         );
         let result = FunctionResultContent::new("call_9", Some(json!({ "answer": 42 })));
         Ok(AgentResponse {
-            messages: vec![ChatMessage::with_contents(
+            messages: vec![Message::with_contents(
                 Role::assistant(),
                 vec![Content::FunctionCall(call), Content::FunctionResult(result)],
             )],
@@ -249,7 +249,7 @@ struct FailingAgent;
 impl Agent for FailingAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         Err(Error::AgentExecution("kaboom".to_string()))
@@ -297,7 +297,7 @@ struct InspectAgent;
 impl Agent for InspectAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         let mut parts: Vec<String> = Vec::new();
@@ -318,7 +318,7 @@ impl Agent for InspectAgent {
             }
         }
         Ok(AgentResponse {
-            messages: vec![ChatMessage::assistant(parts.join("|"))],
+            messages: vec![Message::assistant(parts.join("|"))],
             ..Default::default()
         })
     }
@@ -457,7 +457,7 @@ struct WeatherClient;
 impl ChatClient for WeatherClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         if options.tools.iter().any(|t| t.name == "get_weather") {
@@ -467,7 +467,7 @@ impl ChatClient for WeatherClient {
                 Some(FunctionArguments::Raw(json!({"city": "Paris"}).to_string())),
             );
             Ok(ChatResponse {
-                messages: vec![ChatMessage::with_contents(
+                messages: vec![Message::with_contents(
                     Role::assistant(),
                     vec![Content::FunctionCall(call)],
                 )],
@@ -480,7 +480,7 @@ impl ChatClient for WeatherClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;

@@ -150,14 +150,14 @@ async fn responses_uses_real_chat_agent() {
     impl ChatClient for FixedClient {
         async fn get_response(
             &self,
-            _m: Vec<agent_framework_core::types::ChatMessage>,
+            _m: Vec<agent_framework_core::types::Message>,
             _o: ChatOptions,
         ) -> agent_framework_core::error::Result<ChatResponse> {
             Ok(ChatResponse::from_text("real agent reply"))
         }
         async fn get_streaming_response(
             &self,
-            _m: Vec<agent_framework_core::types::ChatMessage>,
+            _m: Vec<agent_framework_core::types::Message>,
             _o: ChatOptions,
         ) -> agent_framework_core::error::Result<ChatStream> {
             unreachable!("hosting uses run(), not run_stream()")

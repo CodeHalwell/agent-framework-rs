@@ -18,7 +18,7 @@
 //! ```no_run
 //! use agent_framework_cosmos::CosmosChatMessageStore;
 //! use agent_framework_core::threads::ChatMessageStore;
-//! use agent_framework_core::types::ChatMessage;
+//! use agent_framework_core::types::Message;
 //!
 //! # async fn demo() -> agent_framework_core::error::Result<()> {
 //! let store = CosmosChatMessageStore::new(
@@ -31,7 +31,7 @@
 //! // Creates the database/container (partition key /threadId) if missing.
 //! store.ensure_created().await?;
 //!
-//! store.add_messages(vec![ChatMessage::user("Hello!")]).await?;
+//! store.add_messages(vec![Message::user("Hello!")]).await?;
 //! let history = store.list_messages().await?;
 //! println!("{} messages", history.len());
 //! # Ok(())

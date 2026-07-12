@@ -6,8 +6,8 @@
 //! read back with `LRANGE`, and — when `max_messages` is configured —
 //! trimmed to the most recent N entries with `LTRIM` after every write. Each
 //! list element is one message, JSON-serialized with `serde_json`
-//! (equivalent to the Python store's `ChatMessage.to_json()` /
-//! `ChatMessage.from_json()` round trip).
+//! (equivalent to the Python store's `Message.to_json()` /
+//! `Message.from_json()` round trip).
 
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::ChatMessageStore;
-use agent_framework_core::types::ChatMessage;
+use agent_framework_core::types::Message;
 
 use crate::internal::{map_redis_err, LazyConnection};
 
@@ -28,14 +28,14 @@ pub const DEFAULT_KEY_PREFIX: &str = "chat_messages";
 /// ```no_run
 /// use agent_framework_redis::RedisChatMessageStore;
 /// use agent_framework_core::threads::ChatMessageStore;
-/// use agent_framework_core::types::ChatMessage;
+/// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let store = RedisChatMessageStore::new("redis://127.0.0.1:6379", None)?
 ///     .with_key_prefix("my_app")
 ///     .with_max_messages(100);
 ///
-/// store.add_messages(vec![ChatMessage::user("hello")]).await?;
+/// store.add_messages(vec![Message::user("hello")]).await?;
 /// let history = store.list_messages().await?;
 /// println!("{} messages for thread {}", history.len(), store.thread_id());
 /// # Ok(())
@@ -154,18 +154,18 @@ impl RedisChatMessageStore {
         Ok(store)
     }
 
-    fn serialize_message(message: &ChatMessage) -> Result<String> {
+    fn serialize_message(message: &Message) -> Result<String> {
         Ok(serde_json::to_string(message)?)
     }
 
-    fn deserialize_message(data: &str) -> Result<ChatMessage> {
+    fn deserialize_message(data: &str) -> Result<Message> {
         Ok(serde_json::from_str(data)?)
     }
 }
 
 #[async_trait]
 impl ChatMessageStore for RedisChatMessageStore {
-    async fn list_messages(&self) -> Result<Vec<ChatMessage>> {
+    async fn list_messages(&self) -> Result<Vec<Message>> {
         let mut conn = self.conn.get().await?;
         let raw: Vec<String> = conn
             .lrange(self.redis_key(), 0, -1)
@@ -174,7 +174,7 @@ impl ChatMessageStore for RedisChatMessageStore {
         raw.iter().map(|s| Self::deserialize_message(s)).collect()
     }
 
-    async fn add_messages(&self, messages: Vec<ChatMessage>) -> Result<()> {
+    async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn message_serialization_roundtrip_simple() {
-        let message = ChatMessage::new(Role::user(), "Hello").with_author("tester");
+        let message = Message::new(Role::user(), "Hello").with_author("tester");
         let serialized = RedisChatMessageStore::serialize_message(&message).unwrap();
         assert!(serialized.contains("Hello"));
         let deserialized = RedisChatMessageStore::deserialize_message(&serialized).unwrap();
@@ -301,7 +301,7 @@ mod tests {
     fn message_serialization_roundtrip_complex_content() {
         let mut additional_properties = HashMap::new();
         additional_properties.insert("metadata".to_string(), serde_json::json!("test"));
-        let message = ChatMessage {
+        let message = Message {
             role: Role::assistant(),
             contents: vec![
                 Content::Text(TextContent::new("Hello")),

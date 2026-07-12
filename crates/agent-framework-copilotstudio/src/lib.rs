@@ -85,10 +85,10 @@
 //! #     StaticTokenProvider::new("token"),
 //! # );
 //! let mut thread = agent.get_new_thread();
-//! agent.run(vec![ChatMessage::user("What's the weather in Seattle?")], Some(&mut thread)).await?;
+//! agent.run(vec![Message::user("What's the weather in Seattle?")], Some(&mut thread)).await?;
 //! // The Direct-to-Engine conversation id is now attached to `thread`, so
 //! // this second call continues the same conversation.
-//! let reply = agent.run(vec![ChatMessage::user("What about tomorrow?")], Some(&mut thread)).await?;
+//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut thread)).await?;
 //! println!("{}", reply.text());
 //! # Ok(())
 //! # }
@@ -124,7 +124,7 @@
 //!   continuity above: this port sends just the last message's text as the
 //!   outgoing `message` activity, relying on the conversation id for
 //!   everything earlier — mirroring `agent-framework-a2a`. Python instead
-//!   joins *every* `ChatMessage` passed to a single `run()` call with `"\n"`
+//!   joins *every* `Message` passed to a single `run()` call with `"\n"`
 //!   into one question string (relevant when a caller passes several
 //!   messages in one call, e.g. `agent.run(["Hello", "How are you?"])`);
 //!   that per-call flattening is not reproduced here.

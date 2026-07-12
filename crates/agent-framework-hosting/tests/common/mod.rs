@@ -16,7 +16,7 @@ use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::Result;
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentResponse, AgentResponseUpdate, ChatMessage, Content, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, Content, Message, Role, UsageDetails,
 };
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
 
@@ -45,18 +45,18 @@ impl StreamingAgent {
 impl Agent for StreamingAgent {
     async fn run(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse {
-            messages: vec![ChatMessage::assistant(self.deltas.concat())],
+            messages: vec![Message::assistant(self.deltas.concat())],
             ..Default::default()
         })
     }
 
     async fn run_stream(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _thread: Option<AgentThread>,
         _options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
@@ -127,17 +127,17 @@ impl MockAgent {
 impl Agent for MockAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         let input = messages
             .iter()
-            .map(ChatMessage::text)
+            .map(Message::text)
             .collect::<Vec<_>>()
             .join(" ");
         let reply = format!("{}{}", self.prefix, input.trim());
         Ok(AgentResponse {
-            messages: vec![ChatMessage::assistant(reply)],
+            messages: vec![Message::assistant(reply)],
             usage_details: self.usage.clone(),
             ..Default::default()
         })

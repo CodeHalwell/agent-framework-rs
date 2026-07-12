@@ -71,10 +71,10 @@ pub mod prelude {
         ToolSource,
     };
     pub use crate::types::{
-        AgentResponse, AgentResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
-        ChatResponseUpdate, Content, FinishReason, FunctionApprovalRequestContent,
-        FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent,
-        ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
+        AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
+        FinishReason, FunctionApprovalRequestContent, FunctionApprovalResponseContent,
+        FunctionCallContent, FunctionResultContent, Message, ResponseFormat, Role, TextContent,
+        ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
         CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,

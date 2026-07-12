@@ -17,8 +17,8 @@ use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal}
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
 use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
 use crate::types::{
-    prepare_messages, AgentResponse, AgentResponseUpdate, ChatMessage, ChatOptions, ChatResponse,
-    IntoMessages, ResponseFormat,
+    prepare_messages, AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, IntoMessages,
+    Message, ResponseFormat,
 };
 
 /// A boxed stream of agent run updates.
@@ -216,7 +216,7 @@ pub trait Agent: Send + Sync {
     /// Run the agent to completion.
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse>;
 
@@ -230,7 +230,7 @@ pub trait Agent: Send + Sync {
     /// [`ChatAgent`]) override this.
     async fn run_with_options(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
@@ -257,7 +257,7 @@ pub trait Agent: Send + Sync {
     /// write-back is observable through a clone taken before streaming.
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<AgentThread>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
@@ -399,7 +399,7 @@ impl ChatAgent {
     /// forwarder.
     async fn run_stream_impl(
         &self,
-        input: Vec<ChatMessage>,
+        input: Vec<Message>,
         thread: Option<AgentThread>,
         run_options: AgentRunOptions,
     ) -> Result<AgentRunStream> {
@@ -468,10 +468,10 @@ impl ChatAgent {
     /// thread history and context providers.
     async fn prepare_request(
         &self,
-        input: &[ChatMessage],
+        input: &[Message],
         thread: &mut AgentThread,
         run_options: &AgentRunOptions,
-    ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
+    ) -> Result<(Vec<Message>, ChatOptions)> {
         // Fire the context-provider `thread_created` hook when a run uses a
         // service-managed thread (mirrors `_agents.py:1264-1265`). The id
         // argument is the service thread id.
@@ -571,7 +571,7 @@ impl ChatAgent {
     /// the chat-client decorator level (see [`crate::observability`]).
     async fn run_core(
         &self,
-        final_messages: Vec<ChatMessage>,
+        final_messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
     ) -> Result<AgentResponse> {
@@ -607,7 +607,7 @@ impl ChatAgent {
 
     async fn run_core_inner(
         &self,
-        final_messages: Vec<ChatMessage>,
+        final_messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
     ) -> Result<AgentResponse> {
@@ -662,7 +662,7 @@ impl ChatAgent {
     async fn call_chat_client(
         client: &Arc<dyn ChatClient>,
         chat_middleware: &MiddlewarePipeline<ChatContext>,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
         is_streaming: bool,
     ) -> Result<ChatResponse> {
@@ -709,9 +709,9 @@ impl ChatAgent {
     /// updates).
     async fn apply_chat_middleware_pre_call(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
-    ) -> Result<(Vec<ChatMessage>, ChatOptions)> {
+    ) -> Result<(Vec<Message>, ChatOptions)> {
         if self.chat_middleware.is_empty() {
             return Ok((messages, options));
         }
@@ -784,7 +784,7 @@ impl ChatAgent {
 /// State carried while forwarding a chat stream as agent updates.
 type ForwardFinish = Option<(
     AgentThread,
-    Vec<ChatMessage>,
+    Vec<Message>,
     Option<Arc<AggregateContextProvider>>,
     Option<ResponseFormat>,
 )>;
@@ -794,7 +794,7 @@ fn async_stream_forward(
     inner: crate::client::ChatStream,
     agent_name: Option<String>,
     thread: AgentThread,
-    input: Vec<ChatMessage>,
+    input: Vec<Message>,
     provider: Option<Arc<AggregateContextProvider>>,
     response_format: Option<ResponseFormat>,
 ) -> impl Stream<Item = Result<AgentResponseUpdate>> + Send {
@@ -896,7 +896,7 @@ fn async_stream_forward(
 impl Agent for ChatAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         self.run_with_options(messages, thread, AgentRunOptions::default())
@@ -905,7 +905,7 @@ impl Agent for ChatAgent {
 
     async fn run_with_options(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
@@ -952,7 +952,7 @@ impl Agent for ChatAgent {
 
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<AgentThread>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {

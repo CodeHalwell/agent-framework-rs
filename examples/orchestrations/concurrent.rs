@@ -24,7 +24,7 @@ struct CannedClient(&'static str);
 impl ChatClient for CannedClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(self.0))
@@ -32,7 +32,7 @@ impl ChatClient for CannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let resp = self.get_response(messages, options).await?;
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         .run("We're launching a budget electric bike for urban commuters.")
         .await?;
 
-    let conversation: Vec<ChatMessage> =
+    let conversation: Vec<Message> =
         serde_json::from_value(run.last_output().unwrap_or_default()).unwrap_or_default();
     println!("Consolidated review ({} messages):", conversation.len());
     for msg in &conversation {

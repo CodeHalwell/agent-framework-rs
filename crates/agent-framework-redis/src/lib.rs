@@ -42,7 +42,7 @@
 //!
 //! let mut thread = AgentThread::local(Arc::new(store));
 //! let response = agent
-//!     .run(vec![ChatMessage::user("Hello!")], Some(&mut thread))
+//!     .run(vec![Message::user("Hello!")], Some(&mut thread))
 //!     .await?;
 //! println!("{}", response.text());
 //! # Ok(())

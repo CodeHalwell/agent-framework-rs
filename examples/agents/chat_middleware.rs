@@ -67,7 +67,7 @@ struct CountingClient {
 impl ChatClient for CountingClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -79,7 +79,7 @@ impl ChatClient for CountingClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))

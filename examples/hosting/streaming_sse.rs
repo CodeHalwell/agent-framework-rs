@@ -40,7 +40,7 @@ struct StreamingCannedClient;
 impl ChatClient for StreamingCannedClient {
     async fn get_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         Ok(ChatResponse::from_text(reply_to(&messages)))
@@ -48,7 +48,7 @@ impl ChatClient for StreamingCannedClient {
 
     async fn get_streaming_response(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         let words: Vec<String> = reply_to(&messages)
@@ -68,8 +68,8 @@ impl ChatClient for StreamingCannedClient {
     }
 }
 
-fn reply_to(messages: &[ChatMessage]) -> String {
-    let last = messages.last().map(ChatMessage::text).unwrap_or_default();
+fn reply_to(messages: &[Message]) -> String {
+    let last = messages.last().map(Message::text).unwrap_or_default();
     format!(
         "You asked: '{last}' -- this reply is streamed word by word straight off the wire, \
          with a short delay between each, so you can watch it arrive."

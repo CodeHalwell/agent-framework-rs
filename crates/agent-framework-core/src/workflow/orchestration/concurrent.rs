@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::{parse_conversation, AgentExecutor};
 use crate::agent::Agent;
 use crate::error::{Error, Result};
-use crate::types::ChatMessage;
+use crate::types::Message;
 use crate::workflow::{Executor, Workflow, WorkflowBuilder, WorkflowContext};
 
 /// A dispatcher that broadcasts its input to all concurrent participants.
@@ -48,7 +48,7 @@ impl Executor for AggregateExecutor {
             Value::Array(items) => items,
             _ => return Err(Error::Workflow("aggregator expected an array".into())),
         };
-        let mut merged: Vec<ChatMessage> = Vec::new();
+        let mut merged: Vec<Message> = Vec::new();
         let mut seeded = false;
         for conv_value in conversations {
             let conv = parse_conversation(conv_value)?;

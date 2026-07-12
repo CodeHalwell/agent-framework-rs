@@ -41,7 +41,7 @@ struct StubClient {
 impl ChatClient for StubClient {
     async fn get_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         if self.fail {
@@ -61,7 +61,7 @@ impl ChatClient for StubClient {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<ChatMessage>,
+        _messages: Vec<Message>,
         _options: ChatOptions,
     ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -130,7 +130,7 @@ fn chat_completion_records_token_usage_and_operation_duration() {
         let client = ObservableChatClient::new(StubClient::default(), "stub-provider");
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hi")],
+                vec![Message::user("hi")],
                 ChatOptions::new().with_model("request-model"),
             )
             .await
@@ -247,7 +247,7 @@ fn failed_chat_completion_records_neither_histogram() {
         let client = ObservableChatClient::new(StubClient { fail: true }, "stub-provider");
         let _ = client
             .get_response(
-                vec![ChatMessage::user("hi")],
+                vec![Message::user("hi")],
                 ChatOptions::new().with_model("request-model"),
             )
             .await;

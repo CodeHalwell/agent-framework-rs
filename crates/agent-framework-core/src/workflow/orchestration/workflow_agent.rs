@@ -4,7 +4,7 @@
 //! [`WorkflowAgent::run`] feeds the input messages to the workflow (as the
 //! JSON-serialized conversation), runs it, and maps the workflow's
 //! [`Output`](WorkflowEvent::Output) events into the response messages:
-//! `Vec<ChatMessage>` / `ChatMessage` / string payloads become messages, other
+//! `Vec<Message>` / `Message` / string payloads become messages, other
 //! payloads are JSON-stringified. Any pending request-info events are surfaced
 //! as `user_input_requests` on the response (mirroring Python, which maps
 //! `RequestInfoEvent` to a `request_info` function-approval request).
@@ -28,8 +28,8 @@ use crate::error::Result;
 use crate::threads::AgentThread;
 use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::{
-    AgentResponse, AgentResponseUpdate, ChatMessage, Content, FunctionApprovalRequestContent,
-    FunctionArguments, FunctionCallContent, Role,
+    AgentResponse, AgentResponseUpdate, Content, FunctionApprovalRequestContent, FunctionArguments,
+    FunctionCallContent, Message, Role,
 };
 use crate::workflow::{Workflow, WorkflowEvent};
 
@@ -90,7 +90,7 @@ impl WorkflowAgent {
     /// a user-input request update. Other events are ignored. Private helper
     /// behind [`WorkflowAgent::run_stream_with_thread`] and the object-safe
     /// [`Agent::run_stream`] trait method.
-    fn stream_events(&self, messages: Vec<ChatMessage>) -> AgentRunStream {
+    fn stream_events(&self, messages: Vec<Message>) -> AgentRunStream {
         let input = serde_json::to_value(&messages).unwrap_or_else(|_| Value::Array(Vec::new()));
         let name = self.name.clone();
         let stream = self.workflow.run_stream(input);
@@ -120,7 +120,7 @@ impl WorkflowAgent {
     /// returned stream is fully consumed (same pattern as `ChatAgent`'s).
     pub fn run_stream_with_thread(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<AgentThread>,
     ) -> AgentRunStream {
         let thread = thread.unwrap_or_else(|| self.get_new_thread());
@@ -148,7 +148,7 @@ impl WorkflowAgent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let response = agent.run(vec![ChatMessage::user(task)], None).await?;
+                let response = agent.run(vec![Message::user(task)], None).await?;
                 Ok(Value::String(response.text()))
             }
         })
@@ -156,20 +156,20 @@ impl WorkflowAgent {
     }
 
     /// Map the workflow's outputs into response messages.
-    fn outputs_to_messages(&self, outputs: Vec<Value>) -> Vec<ChatMessage> {
+    fn outputs_to_messages(&self, outputs: Vec<Value>) -> Vec<Message> {
         let mut messages = Vec::new();
         for out in outputs {
-            if let Ok(msgs) = serde_json::from_value::<Vec<ChatMessage>>(out.clone()) {
+            if let Ok(msgs) = serde_json::from_value::<Vec<Message>>(out.clone()) {
                 messages.extend(msgs);
                 continue;
             }
-            if let Ok(msg) = serde_json::from_value::<ChatMessage>(out.clone()) {
+            if let Ok(msg) = serde_json::from_value::<Message>(out.clone()) {
                 messages.push(msg);
                 continue;
             }
             match out {
-                Value::String(s) => messages.push(ChatMessage::assistant(s)),
-                other => messages.push(ChatMessage::assistant(other.to_string())),
+                Value::String(s) => messages.push(Message::assistant(s)),
+                other => messages.push(Message::assistant(other.to_string())),
             }
         }
         messages
@@ -177,7 +177,7 @@ impl WorkflowAgent {
 }
 
 /// Convert a pending request into a user-input (function-approval) message.
-fn request_message(request_id: &str, data: &Value, name: Option<&str>) -> ChatMessage {
+fn request_message(request_id: &str, data: &Value, name: Option<&str>) -> Message {
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert(
         "request_id".to_string(),
@@ -193,7 +193,7 @@ fn request_message(request_id: &str, data: &Value, name: Option<&str>) -> ChatMe
         id: request_id.to_string(),
         function_call: call.clone(),
     };
-    let mut msg = ChatMessage::with_contents(
+    let mut msg = Message::with_contents(
         Role::assistant(),
         vec![
             Content::FunctionCall(call),
@@ -242,9 +242,9 @@ fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRespo
 fn forward_and_persist(
     inner: AgentRunStream,
     thread: AgentThread,
-    input: Vec<ChatMessage>,
+    input: Vec<Message>,
 ) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
-    let finish: Option<(AgentThread, Vec<ChatMessage>)> = Some((thread, input));
+    let finish: Option<(AgentThread, Vec<Message>)> = Some((thread, input));
     futures::stream::unfold(
         (inner, Vec::<AgentResponseUpdate>::new(), false, finish),
         move |(mut inner, mut collected, done, mut finish)| async move {
@@ -278,7 +278,7 @@ fn forward_and_persist(
 impl Agent for WorkflowAgent {
     async fn run(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<&mut AgentThread>,
     ) -> Result<AgentResponse> {
         let mut owned_thread;
@@ -326,7 +326,7 @@ impl Agent for WorkflowAgent {
     /// carry their own options); non-empty options are ignored with a warning.
     async fn run_stream(
         &self,
-        messages: Vec<ChatMessage>,
+        messages: Vec<Message>,
         thread: Option<AgentThread>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {

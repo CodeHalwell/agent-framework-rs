@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use agent_framework_core::error::Result;
 use agent_framework_core::middleware::{AgentContext, ChatContext, Middleware, Next};
-use agent_framework_core::types::{AgentResponse, ChatMessage, ChatResponse, Role};
+use agent_framework_core::types::{AgentResponse, ChatResponse, Message, Role};
 
 use crate::auth::TokenProvider;
 use crate::client::PurviewClient;
@@ -46,7 +46,7 @@ impl PurviewPolicyCore {
     /// the call site), same as Python re-raising.
     async fn check(
         &self,
-        messages: &[ChatMessage],
+        messages: &[Message],
         provided_user_id: Option<&str>,
         phase: &'static str,
     ) -> Result<(bool, Option<String>)> {
@@ -72,12 +72,12 @@ impl PurviewPolicyCore {
         }
     }
 
-    fn blocked_prompt_message(&self) -> ChatMessage {
-        ChatMessage::new(Role::system(), self.settings.blocked_prompt_message.clone())
+    fn blocked_prompt_message(&self) -> Message {
+        Message::new(Role::system(), self.settings.blocked_prompt_message.clone())
     }
 
-    fn blocked_response_message(&self) -> ChatMessage {
-        ChatMessage::new(
+    fn blocked_response_message(&self) -> Message {
+        Message::new(
             Role::system(),
             self.settings.blocked_response_message.clone(),
         )
@@ -260,7 +260,7 @@ mod tests {
             called.store(true, Ordering::SeqCst);
             Box::pin(async move {
                 ctx.result = Some(AgentResponse {
-                    messages: vec![ChatMessage::assistant(text)],
+                    messages: vec![Message::assistant(text)],
                     ..Default::default()
                 });
                 Ok(ctx)
@@ -297,7 +297,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![Message::user("hi")], false);
 
         let err = expect_err(
             pipeline
@@ -317,7 +317,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![Message::user("hi")], false);
 
         let result_ctx = pipeline
             .execute(ctx, agent_terminal(called.clone(), "real response"))
@@ -344,7 +344,7 @@ mod tests {
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = AgentContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
+            vec![Message::user("hello, nothing identifying here")],
             false,
         );
 
@@ -364,10 +364,7 @@ mod tests {
         let middleware = agent_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
-            true,
-        );
+        let ctx = AgentContext::new(vec![Message::user("hello, nothing identifying here")], true);
 
         let result_ctx = pipeline
             .execute(ctx, agent_terminal(called.clone(), "streamed response"))
@@ -383,7 +380,7 @@ mod tests {
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = ChatContext::new(
-            vec![ChatMessage::user("hello, nothing identifying here")],
+            vec![Message::user("hello, nothing identifying here")],
             agent_framework_core::types::ChatOptions::new(),
             false,
         );
@@ -404,7 +401,7 @@ mod tests {
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = ChatContext::new(
-            vec![ChatMessage::user("hi")],
+            vec![Message::user("hi")],
             agent_framework_core::types::ChatOptions::new(),
             false,
         );
