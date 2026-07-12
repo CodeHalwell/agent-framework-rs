@@ -35,6 +35,26 @@ impl FinishReason {
     }
 }
 
+/// An opaque, provider-issued token that resumes a background / long-running
+/// run where it left off.
+///
+/// Mirrors the Python `ContinuationToken`: the framework treats it as opaque
+/// and simply threads it back to the provider to continue a resumable run. It
+/// is surfaced on [`ChatResponse`] / [`AgentRunResponse`] when a run is not yet
+/// complete and can be resumed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContinuationToken(pub String);
+
+impl ContinuationToken {
+    pub fn new(v: impl Into<String>) -> Self {
+        ContinuationToken(v.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A full (non-streaming) response from a chat client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatResponse {
@@ -54,6 +74,11 @@ pub struct ChatResponse {
     /// Parsed structured-output value, when a response format was requested.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<Value>,
+    /// Opaque token to resume this run when it is a background/long-running
+    /// request that has not yet completed. `None` for ordinary complete
+    /// responses.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_properties: HashMap<String, Value>,
 }
@@ -345,6 +370,10 @@ pub struct AgentRunResponse {
     pub usage_details: Option<UsageDetails>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<Value>,
+    /// Opaque token to resume this run when it is a background/long-running
+    /// request that has not yet completed. `None` for ordinary complete runs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_properties: HashMap<String, Value>,
 }
@@ -388,6 +417,7 @@ impl AgentRunResponse {
             created_at: resp.created_at,
             usage_details: resp.usage_details,
             value: resp.value,
+            continuation_token: resp.continuation_token,
             additional_properties: resp.additional_properties,
         }
     }
@@ -514,6 +544,30 @@ mod tests {
             role: Some(Role::assistant()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn continuation_token_roundtrips_and_maps_across_responses() {
+        let token = ContinuationToken::new("resume-abc");
+        assert_eq!(token.as_str(), "resume-abc");
+        // Transparent newtype: serializes as a bare string.
+        assert_eq!(serde_json::to_value(&token).unwrap(), json!("resume-abc"));
+
+        let mut chat = ChatResponse::from_text("partial");
+        chat.continuation_token = Some(token.clone());
+        // Present on the wire and survives a round-trip.
+        let v = serde_json::to_value(&chat).unwrap();
+        assert_eq!(v.get("continuation_token"), Some(&json!("resume-abc")));
+        let back: ChatResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back.continuation_token, Some(token.clone()));
+
+        // The chat->agent-run mapping carries the token over.
+        let agent = AgentRunResponse::from_chat_response(chat);
+        assert_eq!(agent.continuation_token, Some(token));
+
+        // Ordinary responses omit the field entirely.
+        let plain = serde_json::to_value(ChatResponse::from_text("done")).unwrap();
+        assert!(plain.get("continuation_token").is_none());
     }
 
     // region: task 3 — structured-output value auto-fill on streaming aggregation

@@ -16,5 +16,6 @@ pub use content::{
 pub use message::{prepare_messages, ChatMessage, IntoMessages, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
-    AgentRunResponse, AgentRunResponseUpdate, ChatResponse, ChatResponseUpdate, FinishReason,
+    AgentRunResponse, AgentRunResponseUpdate, ChatResponse, ChatResponseUpdate, ContinuationToken,
+    FinishReason,
 };
