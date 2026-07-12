@@ -63,6 +63,19 @@ green) before commit.
   (OpenAI-compatible chat endpoint behind the GitHub→Copilot short-lived-token
   exchange, with token caching/refresh) — full `ChatClient` impls, wired into
   the umbrella crate + examples.
+- **`agent-framework-azure-ai` → `agent-framework-foundry`** (the largest
+  provider item): upstream deleted the Azure AI Agents threads/runs data-plane
+  and replaced it with the `foundry` package on the Responses API. Renamed the
+  crate and rewrote it — `FoundryChatClient` (Responses API,
+  `POST {endpoint}/openai/v1/responses`, Entra scope `https://ai.azure.com/.default`)
+  delegates to the existing `agent_framework_azure::responses::AzureOpenAIResponsesClient`
+  rather than reinventing the transport; added `PromptAgentDefinition`,
+  `FoundryAgent` (a `SupportsAgentRun` realizing a Prompt Agent client-side) and
+  `to_prompt_agent()`. Env prefix `AZURE_AI_`→`FOUNDRY_`,
+  `model_deployment_name`→`model`. Rewired umbrella crate (feature/re-export),
+  examples, and docs; the distinct `agent-framework-azure-ai-search` crate is
+  untouched. (Binding to a server-hosted agent on the Foundry Agents
+  control-plane is a documented extension point, not yet wired.)
 - `CosmosCheckpointStorage`; DevUI security middleware (Host-header
   anti-DNS-rebinding guard + optional bearer auth, opt-in).
 
@@ -83,10 +96,11 @@ Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
    `to_dict`/`from_dict`) and history out of the thread into a
    `HistoryProvider` (`InMemory`/`File`), rewiring the agent run loop. Broad
    ripple (a2a/copilotstudio/hosting/redis/examples).
-2. **Provider reworks** — `azure-ai`→`foundry` rename+rewrite onto the Responses
-   API (`FoundryAgent`/`to_prompt_agent`); Anthropic multi-cloud
-   (Bedrock/Vertex/Foundry); Azure "routing mode" realignment; remaining new
-   provider crates (claude, github-copilot).
+2. **Provider reworks** — Anthropic multi-cloud (Bedrock/Vertex/Foundry
+   transports in the same crate); Azure "routing mode" realignment; the
+   `agent-framework-claude` agent crate (Claude Agent SDK subprocess, distinct
+   from the `anthropic` chat client). (`azure-ai`→`foundry` and github-copilot
+   are done.)
 4. **Orchestration depth (§12)** — terminal output shape (`AgentResponse` vs
    transcript). (`AgentApprovalExecutor` HITL and Handoff mesh-topology are
    done.)

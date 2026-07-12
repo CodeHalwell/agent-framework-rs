@@ -87,8 +87,8 @@ Studio.
 | `azure_openai` | Azure OpenAI with both api-key and Entra ID (`TokenCredential`) auth | `AZURE_OPENAI_*` |
 | `azure_openai_responses` | `AzureOpenAIResponsesClient`: the Responses API on Azure OpenAI | `AZURE_OPENAI_*` (skips gracefully) |
 | `azure_default_credential` | `DefaultAzureCredential`'s four-link Entra ID credential chain | `AZURE_OPENAI_ENDPOINT` (+ `az login`; skips gracefully) |
-| `azure_foundry_agent` | Azure AI Foundry persistent agents (Assistants-style REST) via `AzureAIAgentClient` | `AZURE_AI_PROJECT_ENDPOINT` (+ `az login`; skips gracefully) |
-| `azure_foundry_bing_grounding` | Bing grounding on Azure AI Foundry via a connection id | `AZURE_AI_PROJECT_ENDPOINT`, `BING_CONNECTION_ID` (skips gracefully) |
+| `azure_foundry_agent` | Azure AI Foundry Prompt Agent (Responses API) via `FoundryChatClient` + `FoundryAgent` | `FOUNDRY_ENDPOINT` (+ `az login`; skips gracefully) |
+| `azure_foundry_bing_grounding` | Hosted web search on Azure AI Foundry's Responses API | `FOUNDRY_ENDPOINT` (skips gracefully) |
 | `copilotstudio_agent` | Microsoft Copilot Studio agent over the Direct-to-Engine protocol | `COPILOTSTUDIOAGENT__*` + token (skips gracefully) |
 
 ## Workflows (`workflows/`)

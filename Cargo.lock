@@ -9,13 +9,13 @@ dependencies = [
  "agent-framework-a2a",
  "agent-framework-anthropic",
  "agent-framework-azure",
- "agent-framework-azure-ai",
  "agent-framework-azure-ai-search",
  "agent-framework-bedrock",
  "agent-framework-copilotstudio",
  "agent-framework-core",
  "agent-framework-cosmos",
  "agent-framework-declarative",
+ "agent-framework-foundry",
  "agent-framework-foundry-local",
  "agent-framework-gemini",
  "agent-framework-github-copilot",
@@ -78,25 +78,6 @@ version = "0.1.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
- "async-trait",
- "bytes",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "agent-framework-azure-ai"
-version = "0.1.0"
-dependencies = [
- "agent-framework-azure",
- "agent-framework-core",
  "async-trait",
  "bytes",
  "futures",
@@ -233,6 +214,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agent-framework-foundry"
+version = "0.1.0"
+dependencies = [
+ "agent-framework-azure",
+ "agent-framework-core",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

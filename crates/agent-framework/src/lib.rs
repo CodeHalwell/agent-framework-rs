@@ -23,7 +23,7 @@
 //! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, OpenAI-compatible) | no |
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
-//! | `azure-ai` | [`agent_framework_azure_ai`] — Azure AI Foundry persistent agents | no |
+//! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
@@ -111,9 +111,10 @@ pub use agent_framework_redis as redis;
 #[cfg(feature = "mem0")]
 pub use agent_framework_mem0 as mem0;
 
-/// Azure AI Foundry persistent-agents client (enable the `azure-ai` feature).
-#[cfg(feature = "azure-ai")]
-pub use agent_framework_azure_ai as azure_ai;
+/// Azure AI Foundry Responses API chat client + Prompt Agents (enable the
+/// `foundry` feature).
+#[cfg(feature = "foundry")]
+pub use agent_framework_foundry as foundry;
 
 /// Azure AI Search context provider (enable the `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
@@ -171,8 +172,8 @@ pub mod prelude {
     #[cfg(feature = "mem0")]
     pub use agent_framework_mem0::Mem0Provider;
 
-    #[cfg(feature = "azure-ai")]
-    pub use agent_framework_azure_ai::AzureAIAgentClient;
+    #[cfg(feature = "foundry")]
+    pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient};
 
     #[cfg(feature = "azure-ai-search")]
     pub use agent_framework_azure_ai_search::AzureAISearchProvider;

@@ -91,7 +91,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-openai`](crates/agent-framework-openai) | OpenAI Chat Completions and Responses API clients (also for OpenAI-compatible endpoints). |
 | [`agent-framework-anthropic`](crates/agent-framework-anthropic) | Anthropic (Claude) Messages API client. |
 | [`agent-framework-azure`](crates/agent-framework-azure) | Azure OpenAI client + the Entra ID credential chain (CLI / client-secret / managed-identity / chained). |
-| [`agent-framework-azure-ai`](crates/agent-framework-azure-ai) | Azure AI Foundry persistent-agents client (agents, threads, runs, SSE). |
+| [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`) + client-side Prompt Agents (`FoundryAgent`). |
 | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search context provider (semantic + optional vector query). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
@@ -186,7 +186,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `hosting` | [`agent-framework-hosting`](crates/agent-framework-hosting) — serve agents over HTTP (DevUI-style, A2A, AG-UI, OpenAI-compatible) | no |
 | `redis` | [`agent-framework-redis`](crates/agent-framework-redis) — Redis chat-message store & context provider | no |
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
-| `azure-ai` | [`agent-framework-azure-ai`](crates/agent-framework-azure-ai) — Azure AI Foundry persistent agents | no |
+| `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
@@ -249,7 +249,7 @@ one-to-one:
 | `declarative` package | [`agent-framework-declarative`](crates/agent-framework-declarative) (`DeclarativeLoader`) |
 | `devui` / `ag-ui` packages | [`agent-framework-hosting`](crates/agent-framework-hosting) (`AgentHost`, `A2ARouter`, `AgUiRouter`, `OpenAiRouter`, embedded debug UI) |
 | `redis` / `mem0` packages | [`agent-framework-redis`](crates/agent-framework-redis) / [`agent-framework-mem0`](crates/agent-framework-mem0) |
-| `azure-ai` / `azure-ai-search` packages | [`agent-framework-azure-ai`](crates/agent-framework-azure-ai) / [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) |
+| `foundry` / `azure-ai-search` packages | [`agent-framework-foundry`](crates/agent-framework-foundry) / [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) |
 | `copilotstudio` / `purview` packages | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) / [`agent-framework-purview`](crates/agent-framework-purview) |
 | (.NET `Microsoft.Agents.AI.CosmosNoSql`) | [`agent-framework-cosmos`](crates/agent-framework-cosmos) |
 
