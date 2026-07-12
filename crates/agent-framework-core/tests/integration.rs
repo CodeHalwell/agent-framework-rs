@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 struct MockClient {
     responses: Arc<Mutex<Vec<ChatResponse>>>,
     seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    seen_options: Arc<Mutex<Vec<ChatOptions>>>,
 }
 
 impl MockClient {
@@ -22,7 +23,15 @@ impl MockClient {
         Self {
             responses: Arc::new(Mutex::new(responses)),
             seen: Arc::new(Mutex::new(Vec::new())),
+            seen_options: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+}
+
+impl MockClient {
+    /// The `ChatOptions` of the most recent call, if any.
+    fn last_options(&self) -> Option<ChatOptions> {
+        self.seen_options.lock().unwrap().last().cloned()
     }
 }
 
@@ -31,9 +40,10 @@ impl ChatClient for MockClient {
     async fn get_response(
         &self,
         messages: Vec<ChatMessage>,
-        _options: ChatOptions,
+        options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.seen.lock().unwrap().push(messages);
+        self.seen_options.lock().unwrap().push(options);
         let mut resps = self.responses.lock().unwrap();
         if resps.is_empty() {
             Ok(ChatResponse::from_text("(no more scripted responses)"))
@@ -499,6 +509,87 @@ async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id
         .flat_map(|m| m.contents.iter())
         .all(|c| !matches!(c, Content::Usage(_))));
     assert_eq!(aggregated.messages.last().unwrap().text(), "final answer");
+}
+
+#[tokio::test]
+async fn per_run_conversation_id_survives_on_a_local_thread() {
+    // A per-run ChatOptions::conversation_id on a LOCAL thread must reach the
+    // provider (it was previously clobbered by the thread's absent service
+    // id, silently starting a new service conversation).
+    let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
+    let probe = client.clone();
+    let agent = ChatAgent::builder(client).build();
+    let mut thread = agent.get_new_thread();
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.last_options().unwrap().conversation_id.as_deref(),
+        Some("conv-override")
+    );
+}
+
+#[tokio::test]
+async fn service_thread_id_wins_over_per_run_conversation_id() {
+    // Continuity contract: a service-managed thread's id drives the call even
+    // when a per-run override is supplied.
+    let resp = ChatResponse {
+        conversation_id: Some("svc-1".into()),
+        ..ChatResponse::from_text("ok")
+    };
+    let client = MockClient::new(vec![resp]);
+    let probe = client.clone();
+    let agent = ChatAgent::builder(client).build();
+    let mut thread = AgentThread::service("svc-1");
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.last_options().unwrap().conversation_id.as_deref(),
+        Some("svc-1")
+    );
+}
+
+#[tokio::test]
+async fn middleware_stream_replay_preserves_conversation_id_and_usage() {
+    // With agent middleware configured, run_stream replays the completed run;
+    // the response's conversation id and usage must survive that replay.
+    let mut usage = UsageDetails::new();
+    usage.output_token_count = Some(3);
+    let resp = ChatResponse {
+        conversation_id: Some("conv-7".into()),
+        usage_details: Some(usage),
+        ..ChatResponse::from_text("answer")
+    };
+    let client = MockClient::new(vec![resp]);
+    let agent = ChatAgent::builder(client)
+        .middleware(Arc::new(SuffixMiddleware))
+        .build();
+
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-7"));
+    assert_eq!(
+        aggregated
+            .usage_details
+            .expect("usage survives")
+            .output_token_count,
+        Some(3)
+    );
 }
 
 #[tokio::test]

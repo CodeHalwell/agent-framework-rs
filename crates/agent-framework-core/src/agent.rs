@@ -78,27 +78,69 @@ impl AgentRunOptions {
     }
 }
 
-/// Map a completed run's messages into buffered agent updates — one update per
-/// message, each with a distinct `message_id` so that re-aggregation via
+/// Map a completed run into buffered agent updates — one update per message,
+/// each with a distinct `message_id` so that re-aggregation via
 /// [`AgentRunResponse::from_updates`] keeps the message boundaries. Shared by
-/// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path replay.
-pub(crate) fn messages_to_updates(
-    messages: Vec<ChatMessage>,
+/// the default [`Agent::run_stream`] and [`ChatAgent`]'s middleware-path
+/// replay.
+///
+/// Response-level metadata survives the replay: `response_id` and
+/// `conversation_id` ride on every update, and `usage_details` rides the
+/// final update as a [`Content::Usage`] item (aggregation folds it back into
+/// [`AgentRunResponse::usage_details`], never into message contents) — the
+/// same contract as the tool-loop replay in `FunctionInvokingChatClient`.
+pub(crate) fn response_to_updates(
+    response: AgentRunResponse,
 ) -> Vec<Result<AgentRunResponseUpdate>> {
-    messages
+    let AgentRunResponse {
+        messages,
+        response_id,
+        conversation_id,
+        usage_details,
+        ..
+    } = response;
+    let last = messages.len().saturating_sub(1);
+    let mut updates: Vec<Result<AgentRunResponseUpdate>> = messages
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
             let message_id = m.message_id.clone().or_else(|| Some(format!("msg-{i}")));
+            let mut contents = m.contents;
+            if i == last {
+                if let Some(usage) = usage_details.clone() {
+                    contents.push(crate::types::Content::Usage(crate::types::UsageContent {
+                        details: usage,
+                    }));
+                }
+            }
             Ok(AgentRunResponseUpdate {
-                contents: m.contents,
+                contents,
                 role: Some(m.role),
                 author_name: m.author_name,
                 message_id,
+                response_id: response_id.clone(),
+                conversation_id: conversation_id.clone(),
                 ..Default::default()
             })
         })
-        .collect()
+        .collect();
+    if updates.is_empty() && (usage_details.is_some() || response_id.is_some()) {
+        let contents = usage_details
+            .map(|u| {
+                vec![crate::types::Content::Usage(crate::types::UsageContent {
+                    details: u,
+                })]
+            })
+            .unwrap_or_default();
+        updates.push(Ok(AgentRunResponseUpdate {
+            contents,
+            role: Some(crate::types::Role::assistant()),
+            response_id,
+            conversation_id,
+            ..Default::default()
+        }));
+    }
+    updates
 }
 
 /// A factory that builds a fresh [`ChatMessageStore`] for each new local
@@ -207,7 +249,7 @@ pub trait Agent: Send + Sync {
         let response = self
             .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
             .await?;
-        Ok(futures::stream::iter(messages_to_updates(response.messages)).boxed())
+        Ok(futures::stream::iter(response_to_updates(response)).boxed())
     }
 
     /// A stable identifier for this agent.
@@ -371,8 +413,10 @@ impl ChatAgent {
             if let Some(cp) = self.resolve_provider(&thread) {
                 cp.invoked(&input, &response.messages, None).await?;
             }
-            // Distinct message ids keep boundaries when re-aggregated.
-            return Ok(futures::stream::iter(messages_to_updates(response.messages)).boxed());
+            // Distinct message ids keep boundaries when re-aggregated; the
+            // response's conversation/response ids and usage ride along so
+            // service-managed continuity survives the middleware replay.
+            return Ok(futures::stream::iter(response_to_updates(response)).boxed());
         }
 
         let (final_messages, options) = self
@@ -430,7 +474,12 @@ impl ChatAgent {
             Some(overrides) => self.chat_options.clone().merge(overrides.clone()),
             None => self.chat_options.clone(),
         };
-        options.conversation_id = service_thread_id;
+        // A service-managed thread's id drives continuity and wins; on a
+        // local thread, a per-run / agent-default `conversation_id` override
+        // survives (previously it was unconditionally cleared here, silently
+        // starting a new service conversation despite the documented per-run
+        // precedence).
+        options.conversation_id = service_thread_id.or(options.conversation_id.take());
 
         let mut history = thread.list_messages().await?;
 

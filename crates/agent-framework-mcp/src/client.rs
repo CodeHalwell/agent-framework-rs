@@ -272,13 +272,20 @@ impl McpClient {
             .load(std::sync::atomic::Ordering::Acquire);
         let tools = self.list_tools().await?;
         // Publish only if no `list_changed` invalidation raced the fetch;
-        // otherwise the next call refetches a fresh list.
-        if self
-            .tools_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            == generation
+        // otherwise the next call refetches a fresh list. The generation
+        // recheck happens while HOLDING the cache write lock — checked
+        // before acquiring it, an invalidation landing in between would be
+        // overwritten by this stale publish. (The lock is never held across
+        // the fetch itself, so the notification handler cannot deadlock.)
         {
-            *self.tools_cache.write().await = Some(tools.clone());
+            let mut cache = self.tools_cache.write().await;
+            if self
+                .tools_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
+            {
+                *cache = Some(tools.clone());
+            }
         }
         Ok(tools)
     }
@@ -361,12 +368,16 @@ impl McpClient {
             .prompts_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let prompts = self.list_prompts().await?;
-        if self
-            .prompts_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            == generation
+        // Recheck-while-holding-the-lock, as in `list_tools_cached`.
         {
-            *self.prompts_cache.write().await = Some(prompts.clone());
+            let mut cache = self.prompts_cache.write().await;
+            if self
+                .prompts_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                == generation
+            {
+                *cache = Some(prompts.clone());
+            }
         }
         Ok(prompts)
     }
