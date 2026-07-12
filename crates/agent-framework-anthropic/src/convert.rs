@@ -422,11 +422,17 @@ pub fn tools_to_anthropic(tools: &[ToolDefinition]) -> (Vec<Value>, Vec<Value>) 
                         );
                     }
                 }
+                // Case-insensitive: callers may reasonably write
+                // `Authorization` (HTTP header convention) in the map.
                 if let Some(auth) = t
                     .parameters
                     .get("headers")
-                    .and_then(|h| h.get("authorization"))
-                    .and_then(Value::as_str)
+                    .and_then(|h| h.as_object())
+                    .and_then(|obj| {
+                        obj.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            .and_then(|(_, v)| v.as_str())
+                    })
                 {
                     server_def.insert("authorization_token".into(), json!(auth));
                 }
@@ -1428,6 +1434,23 @@ mod tests {
         assert_eq!(
             mcp_servers[0]["authorization_token"],
             json!("Bearer token123")
+        );
+    }
+
+    #[test]
+    fn tools_to_anthropic_mcp_authorization_header_lookup_is_case_insensitive() {
+        let tool = make_tool(
+            ToolKind::HostedMcp {
+                url: "https://example.com/mcp".into(),
+                allowed_tools: None,
+            },
+            "my-mcp",
+            json!({ "headers": { "Authorization": "Bearer token456" } }),
+        );
+        let (_, mcp_servers) = tools_to_anthropic(&[tool]);
+        assert_eq!(
+            mcp_servers[0]["authorization_token"],
+            json!("Bearer token456")
         );
     }
 

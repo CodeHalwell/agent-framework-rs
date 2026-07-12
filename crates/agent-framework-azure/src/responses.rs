@@ -415,15 +415,10 @@ impl ChatClient for AzureOpenAIResponsesClient {
             .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
         // Mirrors `OpenAIResponsesClient::get_response`: a failed run reports
         // `status: "failed"` with a 2xx HTTP status, so the error has to be
-        // pulled out of the body rather than the transport layer.
-        if value.get("status").and_then(Value::as_str) == Some("failed") {
-            let msg = value
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("response failed")
-                .to_string();
-            return Err(Error::service(msg));
+        // pulled out of the body rather than the transport layer —
+        // content-filter failures get the granular variant.
+        if let Some(err) = agent_framework_openai::responses::response_failure_error(&value) {
+            return Err(err);
         }
         Ok(agent_framework_openai::responses::parse_response(
             &value,

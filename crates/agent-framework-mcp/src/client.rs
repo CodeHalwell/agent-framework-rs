@@ -50,6 +50,20 @@ pub struct McpClient {
     /// Cache for [`Self::list_prompts_cached`], invalidated on a
     /// `notifications/prompts/list_changed` notification from the server.
     prompts_cache: Arc<RwLock<Option<Vec<PromptDescriptor>>>>,
+    /// Serializes cache *misses* in [`Self::list_tools_cached`] so concurrent
+    /// resolvers don't each fire their own `tools/list` round trip. A separate
+    /// lock (rather than holding the `tools_cache` write lock across the
+    /// fetch) because the `list_changed` notification handler takes the cache
+    /// write lock and can run *inside* our own fetch's transport processing —
+    /// holding the cache lock across the round trip would deadlock.
+    tools_fetch_lock: tokio::sync::Mutex<()>,
+    /// [`Self::list_prompts_cached`]'s counterpart to `tools_fetch_lock`.
+    prompts_fetch_lock: tokio::sync::Mutex<()>,
+    /// Bumped by every `tools/list_changed` notification; a fetch only
+    /// publishes its result to `tools_cache` when no invalidation raced it.
+    tools_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// `prompts/list_changed` counterpart to `tools_generation`.
+    prompts_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl McpClient {
@@ -73,15 +87,30 @@ impl McpClient {
 
         let tools_cache: Arc<RwLock<Option<Vec<ToolDescriptor>>>> = Arc::new(RwLock::new(None));
         let prompts_cache: Arc<RwLock<Option<Vec<PromptDescriptor>>>> = Arc::new(RwLock::new(None));
+        let tools_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let prompts_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let notif_tools_cache = tools_cache.clone();
         let notif_prompts_cache = prompts_cache.clone();
+        let notif_tools_generation = tools_generation.clone();
+        let notif_prompts_generation = prompts_generation.clone();
         transport.set_notification_handler(Arc::new(move |method: String, _params: Value| {
             let tools_cache = notif_tools_cache.clone();
             let prompts_cache = notif_prompts_cache.clone();
+            let tools_generation = notif_tools_generation.clone();
+            let prompts_generation = notif_prompts_generation.clone();
             Box::pin(async move {
+                // Bump the generation *before* clearing so an in-flight fetch
+                // that started earlier observes the change and declines to
+                // publish its (possibly stale) result.
                 match method.as_str() {
-                    TOOLS_LIST_CHANGED => *tools_cache.write().await = None,
-                    PROMPTS_LIST_CHANGED => *prompts_cache.write().await = None,
+                    TOOLS_LIST_CHANGED => {
+                        tools_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        *tools_cache.write().await = None;
+                    }
+                    PROMPTS_LIST_CHANGED => {
+                        prompts_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        *prompts_cache.write().await = None;
+                    }
                     _ => {}
                 }
             })
@@ -93,6 +122,10 @@ impl McpClient {
             handlers,
             tools_cache,
             prompts_cache,
+            tools_fetch_lock: tokio::sync::Mutex::new(()),
+            prompts_fetch_lock: tokio::sync::Mutex::new(()),
+            tools_generation,
+            prompts_generation,
         }
     }
 
@@ -227,8 +260,26 @@ impl McpClient {
         if let Some(cached) = self.tools_cache.read().await.clone() {
             return Ok(cached);
         }
+        // Serialize misses so concurrent resolvers share one round trip (see
+        // the `tools_fetch_lock` field docs for why this is not done by
+        // holding the cache write lock across the fetch).
+        let _fetch = self.tools_fetch_lock.lock().await;
+        if let Some(cached) = self.tools_cache.read().await.clone() {
+            return Ok(cached);
+        }
+        let generation = self
+            .tools_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let tools = self.list_tools().await?;
-        *self.tools_cache.write().await = Some(tools.clone());
+        // Publish only if no `list_changed` invalidation raced the fetch;
+        // otherwise the next call refetches a fresh list.
+        if self
+            .tools_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            == generation
+        {
+            *self.tools_cache.write().await = Some(tools.clone());
+        }
         Ok(tools)
     }
 
@@ -300,8 +351,23 @@ impl McpClient {
         if let Some(cached) = self.prompts_cache.read().await.clone() {
             return Ok(cached);
         }
+        // Same miss-serialization + raced-invalidation rules as
+        // [`Self::list_tools_cached`].
+        let _fetch = self.prompts_fetch_lock.lock().await;
+        if let Some(cached) = self.prompts_cache.read().await.clone() {
+            return Ok(cached);
+        }
+        let generation = self
+            .prompts_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let prompts = self.list_prompts().await?;
-        *self.prompts_cache.write().await = Some(prompts.clone());
+        if self
+            .prompts_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            == generation
+        {
+            *self.prompts_cache.write().await = Some(prompts.clone());
+        }
         Ok(prompts)
     }
 
@@ -403,6 +469,11 @@ mod tests {
         /// simulate the server sending a notification via
         /// [`Self::fire_notification`].
         notification_handler: Mutex<Option<crate::sampling::BoxedNotificationHandler>>,
+        /// When set to `(trigger_method, notif_method, params)`, the next
+        /// [`McpTransport::call`] whose method equals `trigger_method` fires
+        /// the notification *before returning* — simulating a server
+        /// notification racing an in-flight request.
+        notify_during_call: Mutex<Option<(String, String, Value)>>,
     }
 
     impl MockTransport {
@@ -411,7 +482,15 @@ mod tests {
                 responses: Mutex::new(HashMap::new()),
                 sent: Mutex::new(Vec::new()),
                 notification_handler: Mutex::new(None),
+                notify_during_call: Mutex::new(None),
             }
+        }
+
+        /// Arrange for `notif_method` to fire mid-flight during the next
+        /// `call(trigger_method, ...)`. See `notify_during_call`.
+        fn notify_during(&self, trigger_method: &str, notif_method: &str, params: Value) {
+            *self.notify_during_call.lock().unwrap() =
+                Some((trigger_method.to_string(), notif_method.to_string(), params));
         }
 
         fn push(&self, method: &str, value: Value) {
@@ -452,13 +531,34 @@ mod tests {
     impl McpTransport for MockTransport {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
             self.sent.lock().unwrap().push((method.to_string(), params));
-            let mut guard = self.responses.lock().unwrap();
-            let queue = guard
-                .get_mut(method)
-                .unwrap_or_else(|| panic!("no canned responses queued for method '{method}'"));
-            queue
-                .pop_front()
-                .ok_or_else(|| Error::service(format!("no more canned responses for {method}")))
+            let response = {
+                let mut guard = self.responses.lock().unwrap();
+                let queue = guard
+                    .get_mut(method)
+                    .unwrap_or_else(|| panic!("no canned responses queued for method '{method}'"));
+                queue
+                    .pop_front()
+                    .ok_or_else(|| Error::service(format!("no more canned responses for {method}")))
+            };
+            // Simulate a server notification landing while this very call is
+            // still in flight (as a real transport's reader loop dispatches
+            // mid-response) — used to exercise raced-invalidation handling.
+            let fire = {
+                let mut pending = self.notify_during_call.lock().unwrap();
+                match pending.take() {
+                    Some((trigger, notif_method, notif_params)) if trigger == method => {
+                        Some((notif_method, notif_params))
+                    }
+                    other => {
+                        *pending = other;
+                        None
+                    }
+                }
+            };
+            if let Some((notif_method, notif_params)) = fire {
+                self.fire_notification(&notif_method, notif_params).await;
+            }
+            response
         }
 
         async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
@@ -779,6 +879,69 @@ mod tests {
             third.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"],
             "cache must refetch after a list_changed notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_misses_share_a_single_fetch() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        // Exactly ONE tools/list response queued: if both concurrent misses
+        // fetched, the second would find the queue empty and error.
+        mock.push("tools/list", json!({"tools": [{"name": "a"}]}));
+        let client = Arc::new(McpClient::new(mock.clone()));
+        client.initialize("c", "1").await.unwrap();
+
+        let (c1, c2) = (client.clone(), client.clone());
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { c1.list_tools_cached().await }),
+            tokio::spawn(async move { c2.list_tools_cached().await }),
+        );
+        let names = |r: std::result::Result<Result<Vec<ToolDescriptor>>, _>| {
+            r.expect("join")
+                .expect("list")
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(r1), vec!["a"]);
+        assert_eq!(names(r2), vec!["a"]);
+        let fetches = mock
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "tools/list")
+            .count();
+        assert_eq!(fetches, 1, "concurrent misses must share one round trip");
+    }
+
+    #[tokio::test]
+    async fn invalidation_racing_an_in_flight_fetch_is_not_lost() {
+        // A list_changed notification that lands while a fetch is in flight
+        // (dispatched by the transport mid-call, exactly like a real reader
+        // loop) must prevent that fetch from publishing a possibly-stale
+        // cache — the NEXT call refetches instead of serving the raced list.
+        // This also proves the notification handler cannot deadlock against
+        // an in-flight `list_tools_cached` (the reason the fetch does not
+        // hold the cache write lock across the round trip).
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        mock.push("tools/list", json!({"tools": [{"name": "raced"}]}));
+        mock.push("tools/list", json!({"tools": [{"name": "fresh"}]}));
+        let client = Arc::new(McpClient::new(mock.clone()));
+        client.initialize("c", "1").await.unwrap();
+
+        mock.notify_during("tools/list", "notifications/tools/list_changed", json!({}));
+        let first = client.list_tools_cached().await.unwrap();
+        // The in-flight fetch still returns what it fetched...
+        assert_eq!(first[0].name, "raced");
+        // ...but must NOT have cached it: the raced invalidation wins and the
+        // next call performs a fresh round trip.
+        let second = client.list_tools_cached().await.unwrap();
+        assert_eq!(
+            second[0].name, "fresh",
+            "a fetch raced by list_changed must not publish a stale cache"
         );
     }
 

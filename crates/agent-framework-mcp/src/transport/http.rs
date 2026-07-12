@@ -229,7 +229,7 @@ impl McpStreamableHttpTransport {
         let mut buf = String::new();
         let mut utf8 = Utf8StreamDecoder::new();
         let mut handled_server_request_ids: HashSet<String> = HashSet::new();
-        let mut handled_notifications: HashSet<String> = HashSet::new();
+        let mut handled_notifications: HashSet<usize> = HashSet::new();
         loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
@@ -279,10 +279,12 @@ impl McpStreamableHttpTransport {
     /// `notifications/tools/list_changed`) and dispatch each one not already
     /// present in `handled` exactly once, to whatever handler
     /// [`McpTransport::set_notification_handler`] installed. `handled` is
-    /// keyed by the event's raw text (notifications carry no id to key on,
-    /// unlike [`Self::dispatch_buffered_server_requests`]'s `handled`).
-    async fn dispatch_buffered_notifications(&self, buf: &str, handled: &mut HashSet<String>) {
-        for event_text in buf.split("\n\n") {
+    /// keyed by the event's split index — stable because `buf` only grows
+    /// during one `read_sse_for_id` call — since notifications carry no id;
+    /// keying by index (not raw text) keeps two byte-identical notifications
+    /// distinct and avoids per-rescan string allocations.
+    async fn dispatch_buffered_notifications(&self, buf: &str, handled: &mut HashSet<usize>) {
+        for (idx, event_text) in buf.split("\n\n").enumerate() {
             if event_text.trim().is_empty() {
                 continue;
             }
@@ -292,7 +294,7 @@ impl McpStreamableHttpTransport {
             if let IncomingMessage::Notification { method, params } =
                 protocol::parse_incoming(value)
             {
-                if handled.insert(event_text.to_string()) {
+                if handled.insert(idx) {
                     let handler = self.notification_handler.lock().unwrap().clone();
                     if let Some(handler) = handler {
                         handler(method, params).await;
@@ -439,6 +441,46 @@ mod tests {
         let body = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}});
         let err = extract_json_response(&body, 1).unwrap_err();
         assert!(err.to_string().contains("bad params"));
+    }
+
+    #[tokio::test]
+    async fn identical_notifications_each_dispatch_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let transport =
+            McpStreamableHttpTransport::new("http://localhost:0/mcp", HeaderMap::new(), None);
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        transport.set_notification_handler(Arc::new(move |_method, _params| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        // Two byte-identical notification events: index-keyed dedup must
+        // dispatch BOTH (text-keyed dedup would collapse them into one),
+        // while a rescan of the same grown buffer must not re-dispatch.
+        let notif = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
+            "\n",
+        );
+        let buf = format!("{notif}{notif}");
+        let mut handled = HashSet::new();
+        transport
+            .dispatch_buffered_notifications(&buf, &mut handled)
+            .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        transport
+            .dispatch_buffered_notifications(&buf, &mut handled)
+            .await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "a rescan must not re-dispatch already-handled events"
+        );
     }
 
     #[test]

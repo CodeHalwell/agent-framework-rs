@@ -217,14 +217,8 @@ impl ChatClient for OpenAIResponsesClient {
             .json()
             .await
             .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        if value.get("status").and_then(Value::as_str) == Some("failed") {
-            let msg = value
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("response failed")
-                .to_string();
-            return Err(Error::service(msg));
+        if let Some(err) = response_failure_error(&value) {
+            return Err(err);
         }
         Ok(parse_response(&value, options.store))
     }
@@ -378,9 +372,14 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
         })),
         "audio" => {
             let format = audio_format(media_type)?;
+            // `input_audio.data` is the raw base64 payload, not a data URI —
+            // same wire rule as the Chat Completions converter.
             Some(json!({
                 "type": "input_audio",
-                "input_audio": { "data": uri, "format": format },
+                "input_audio": {
+                    "data": crate::convert::strip_data_uri_prefix(uri),
+                    "format": format,
+                },
             }))
         }
         "application" => Some(json!({
@@ -579,6 +578,32 @@ pub fn response_format_to_text(format: &ResponseFormat) -> Value {
 
 /// Parse a full (non-streaming) Responses API response.
 ///
+/// Map a Responses body whose `status` is `"failed"` to a classified error,
+/// or `None` for a non-failed response. A failed run reports `status:
+/// "failed"` with a 2xx HTTP status, so the error is pulled from the body:
+/// `error.code == "content_filter"` becomes [`Error::ServiceContentFilter`]
+/// (matching the HTTP-level classification in `classify_service_error`),
+/// anything else a generic service error.
+///
+/// `pub` so `agent-framework-azure`'s Responses client can share the exact
+/// classification.
+pub fn response_failure_error(value: &Value) -> Option<Error> {
+    if value.get("status").and_then(Value::as_str) != Some("failed") {
+        return None;
+    }
+    let error = value.get("error");
+    let msg = error
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("response failed")
+        .to_string();
+    let code = error.and_then(|e| e.get("code")).and_then(Value::as_str);
+    Some(match code {
+        Some("content_filter") => Error::service_content_filter(msg),
+        _ => Error::service(msg),
+    })
+}
+
 /// `pub` so `agent-framework-azure`'s Responses client (whose wire format is
 /// otherwise identical) can reuse this parser — including `parse_output_item`,
 /// `parse_annotations`, and usage/finish-reason handling — rather than
@@ -1020,8 +1045,13 @@ fn parse_responses_event(
         "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
             reasoning_update(value.get("delta").and_then(Value::as_str).unwrap_or(""))
         }
+        // `.done` carries the *full* completed text, not another increment —
+        // the deltas above already streamed it, so emitting it again would
+        // duplicate the reasoning in the aggregated response (adjacent
+        // reasoning contents coalesce by appending). Treated as terminal
+        // metadata, like `response.output_text.done`.
         "response.reasoning_text.done" | "response.reasoning_summary_text.done" => {
-            reasoning_update(value.get("text").and_then(Value::as_str).unwrap_or(""))
+            EventOutcome::None
         }
         "response.output_item.added" => {
             let item = value.get("item");
@@ -1681,12 +1711,13 @@ mod tests {
             }),
         ]);
         let input = messages_to_input(&[msg]);
-        // The Responses API keeps the full data URI for audio (unlike Chat
-        // Completions, which strips the prefix).
+        // `input_audio.data` is the raw base64 payload (data-URI prefix
+        // stripped), the same wire rule as Chat Completions; file inputs keep
+        // the full data URI in `file_data`.
         assert_eq!(
             input[0]["content"],
             json!([
-                { "type": "input_audio", "input_audio": { "data": "data:audio/wav;base64,QQ", "format": "wav" } },
+                { "type": "input_audio", "input_audio": { "data": "QQ", "format": "wav" } },
                 { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" },
                 { "type": "input_file", "file_id": "file-123" },
             ])
@@ -1873,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_text_delta_and_done_map_to_reasoning_content() {
+    fn reasoning_text_delta_streams_and_done_is_terminal_metadata() {
         let EventOutcome::Update(delta) =
             reasoning_event(json!({ "type": "response.reasoning_text.delta", "delta": "Th" }))
         else {
@@ -1881,12 +1912,11 @@ mod tests {
         };
         assert!(matches!(&delta.contents[0], Content::TextReasoning(t) if t.text == "Th"));
 
-        let EventOutcome::Update(done) =
-            reasoning_event(json!({ "type": "response.reasoning_text.done", "text": "Think" }))
-        else {
-            panic!("expected update");
-        };
-        assert!(matches!(&done.contents[0], Content::TextReasoning(t) if t.text == "Think"));
+        // `.done` carries the full text the deltas already streamed — emitting
+        // it again would duplicate the reasoning in the aggregate.
+        let done =
+            reasoning_event(json!({ "type": "response.reasoning_text.done", "text": "Think" }));
+        assert!(matches!(done, EventOutcome::None));
     }
 
     #[test]
@@ -1898,12 +1928,41 @@ mod tests {
         };
         assert!(matches!(&delta.contents[0], Content::TextReasoning(t) if t.text == "sum"));
 
-        let EventOutcome::Update(done) = reasoning_event(
+        let done = reasoning_event(
             json!({ "type": "response.reasoning_summary_text.done", "text": "summary" }),
-        ) else {
-            panic!("expected update");
-        };
-        assert!(matches!(&done.contents[0], Content::TextReasoning(t) if t.text == "summary"));
+        );
+        assert!(matches!(done, EventOutcome::None));
+    }
+
+    #[test]
+    fn response_failure_error_classifies_content_filter() {
+        let filtered = json!({
+            "status": "failed",
+            "error": { "code": "content_filter", "message": "blocked" }
+        });
+        assert!(matches!(
+            response_failure_error(&filtered),
+            Some(Error::ServiceContentFilter { .. })
+        ));
+
+        let generic = json!({
+            "status": "failed",
+            "error": { "code": "server_error", "message": "boom" }
+        });
+        assert!(matches!(
+            response_failure_error(&generic),
+            Some(Error::Service(_))
+        ));
+
+        assert!(response_failure_error(&json!({ "status": "completed" })).is_none());
+    }
+
+    #[test]
+    fn input_audio_data_strips_data_uri_prefix() {
+        let part = content_to_input_part("data:audio/wav;base64,QUJD", Some("audio/wav"))
+            .expect("audio part");
+        assert_eq!(part["input_audio"]["data"], "QUJD");
+        assert_eq!(part["input_audio"]["format"], "wav");
     }
 
     // endregion

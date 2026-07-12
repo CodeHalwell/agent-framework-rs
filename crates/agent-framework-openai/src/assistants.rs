@@ -998,6 +998,15 @@ fn process_assistants_event(
             }
         }
         "thread.run.requires_action" => {
+            // The event payload *is* the run object, so its `id` is the run id
+            // even when no `thread.run.step.created` preceded this event —
+            // without it the composite call_id would encode `[null, ...]` and
+            // the tool-output submission would never match the run.
+            if response_id.is_none() {
+                if let Some(rid) = data.get("id").and_then(Value::as_str) {
+                    *response_id = Some(rid.to_string());
+                }
+            }
             let contents = create_function_call_contents(data, response_id);
             if contents.is_empty() {
                 EventOutcome::None
@@ -1026,13 +1035,22 @@ fn process_assistants_event(
             None => EventOutcome::None,
         },
         "thread.run.failed" => {
-            let msg = data
-                .get("last_error")
+            let last_error = data.get("last_error");
+            let msg = last_error
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("run failed")
                 .to_string();
-            EventOutcome::Error(Error::service(msg))
+            // Azure OpenAI Assistants runs report content-filter verdicts via
+            // `last_error.code` — classify them like the azure-ai client's
+            // `classify_last_error` so callers can branch on the variant.
+            let code = last_error
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_str);
+            EventOutcome::Error(match code {
+                Some("content_filter") => Error::service_content_filter(msg),
+                _ => Error::service(msg),
+            })
         }
         "error" => {
             let msg = data
@@ -1590,6 +1608,58 @@ mod tests {
             .find_map(Result::err)
             .expect("expected an error from thread.run.failed");
         assert!(err.to_string().contains("boom"));
+        assert!(!matches!(err, Error::ServiceContentFilter { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_run_failed_with_content_filter_code_classifies() {
+        let text = sse(&[(
+            "thread.run.failed",
+            json!({ "id": "run_1", "status": "failed", "last_error": { "code": "content_filter", "message": "blocked" } }),
+        )]);
+        let items = collect(text, "thread_1").await;
+        let err = items
+            .into_iter()
+            .find_map(Result::err)
+            .expect("expected an error from thread.run.failed");
+        assert!(matches!(err, Error::ServiceContentFilter { .. }));
+    }
+
+    #[tokio::test]
+    async fn requires_action_without_step_event_uses_run_id_from_payload() {
+        // No `thread.run.step.created` precedes `requires_action`: the run id
+        // must come from the event payload itself, not stay null (a
+        // `[null, ...]` call_id would never round-trip to submit_tool_outputs).
+        let text = sse(&[(
+            "thread.run.requires_action",
+            json!({
+                "id": "run_77",
+                "required_action": {
+                    "type": "submit_tool_outputs",
+                    "submit_tool_outputs": {
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "f", "arguments": "{}" }
+                        }]
+                    }
+                }
+            }),
+        )]);
+        let items = collect(text, "thread_1").await;
+        let update = items
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|u| {
+                u.contents
+                    .iter()
+                    .any(|c| matches!(c, Content::FunctionCall(_)))
+            })
+            .expect("expected a function-call update");
+        let Content::FunctionCall(fc) = &update.contents[0] else {
+            panic!("expected a function call");
+        };
+        assert_eq!(fc.call_id, r#"["run_77","call_1"]"#);
     }
 
     #[tokio::test]
