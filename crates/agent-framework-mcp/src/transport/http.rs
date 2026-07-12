@@ -17,7 +17,7 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 
 use crate::protocol::{self, IdGenerator, IncomingMessage, RpcError};
-use crate::sampling::BoxedServerRequestHandler;
+use crate::sampling::{BoxedNotificationHandler, BoxedServerRequestHandler};
 use crate::transport::McpTransport;
 
 const SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -30,9 +30,14 @@ const SESSION_ID_HEADER: &str = "mcp-session-id";
 /// whatever handler [`Self::set_server_request_handler`] installed, and
 /// answered with a best-effort follow-up POST to the same endpoint (there is
 /// no persistent duplex connection to write a response over directly, unlike
-/// the stdio/websocket transports). Standalone GET-based SSE listening (for
+/// the stdio/websocket transports). A notification (e.g.
+/// `notifications/tools/list_changed`) embedded the same way is routed to
+/// whatever handler [`Self::set_notification_handler`] installed; unlike a
+/// request, nothing is written back. Standalone GET-based SSE listening (for
 /// server-initiated messages outside of any request/response cycle) is not
-/// implemented — see the crate docs.
+/// implemented — see the crate docs. This means an HTTP-transported MCP
+/// server's `list_changed` notification is only ever noticed if it happens
+/// to arrive embedded in the SSE response to a call already in flight.
 pub struct McpStreamableHttpTransport {
     http: reqwest::Client,
     url: String,
@@ -41,6 +46,12 @@ pub struct McpStreamableHttpTransport {
     session_id: RwLock<Option<String>>,
     next_id: IdGenerator,
     server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
+    /// Handler for server notifications (e.g. `notifications/tools/list_changed`),
+    /// installed via [`McpTransport::set_notification_handler`]. Only ever
+    /// invoked for a notification embedded in the SSE response to an active
+    /// [`McpTransport::call`] — see the crate docs on standalone GET-based
+    /// SSE listening not being implemented.
+    notification_handler: StdMutex<Option<BoxedNotificationHandler>>,
 }
 
 impl McpStreamableHttpTransport {
@@ -55,6 +66,7 @@ impl McpStreamableHttpTransport {
             session_id: RwLock::new(None),
             next_id: IdGenerator::new(),
             server_request_handler: StdMutex::new(None),
+            notification_handler: StdMutex::new(None),
         }
     }
 
@@ -172,6 +184,10 @@ impl McpTransport for McpStreamableHttpTransport {
     fn set_server_request_handler(&self, handler: BoxedServerRequestHandler) {
         *self.server_request_handler.lock().unwrap() = Some(handler);
     }
+
+    fn set_notification_handler(&self, handler: BoxedNotificationHandler) {
+        *self.notification_handler.lock().unwrap() = Some(handler);
+    }
 }
 
 /// Extract the JSON-RPC response matching `expected_id` from a single
@@ -193,18 +209,19 @@ fn extract_json_response(value: &Value, expected_id: i64) -> Result<Value> {
 
 impl McpStreamableHttpTransport {
     /// Incrementally read a `text/event-stream` response body, returning as
-    /// soon as the JSON-RPC response matching `expected_id` is seen (other
-    /// frames, e.g. server notifications, are logged and skipped). Re-scans
+    /// soon as the JSON-RPC response matching `expected_id` is seen. Re-scans
     /// the accumulated buffer via [`parse_sse_buffer`] as each chunk
     /// arrives — simple and plenty fast for the small, infrequent bodies
     /// MCP responses produce. Any server-initiated request seen along the
-    /// way is dispatched via [`Self::dispatch_buffered_server_requests`],
-    /// deduplicated so a request appearing in an earlier, still-buffered
-    /// scan is only ever answered once.
+    /// way is dispatched via [`Self::dispatch_buffered_server_requests`], and
+    /// any notification (e.g. `notifications/tools/list_changed`) via
+    /// [`Self::dispatch_buffered_notifications`]; both are deduplicated so a
+    /// message appearing in an earlier, still-buffered scan is only ever
+    /// dispatched once.
     ///
     /// Dispatch always runs against the latest buffer content *before* the
     /// "did we find our answer yet" check on each iteration — including the
-    /// answer's own chunk — so a server-initiated request landing in the
+    /// answer's own chunk — so a server-initiated message landing in the
     /// same chunk as the expected response is not skipped just because that
     /// chunk also happens to satisfy the early return.
     async fn read_sse_for_id(&self, resp: reqwest::Response, expected_id: i64) -> Result<Value> {
@@ -212,6 +229,7 @@ impl McpStreamableHttpTransport {
         let mut buf = String::new();
         let mut utf8 = Utf8StreamDecoder::new();
         let mut handled_server_request_ids: HashSet<String> = HashSet::new();
+        let mut handled_notifications: HashSet<usize> = HashSet::new();
         loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
@@ -222,6 +240,8 @@ impl McpStreamableHttpTransport {
                 None => break,
             }
             self.dispatch_buffered_server_requests(&buf, &mut handled_server_request_ids)
+                .await;
+            self.dispatch_buffered_notifications(&buf, &mut handled_notifications)
                 .await;
             if let Some(result) = parse_sse_buffer(&buf, expected_id) {
                 return result;
@@ -250,6 +270,35 @@ impl McpStreamableHttpTransport {
             {
                 if handled.insert(id.to_string()) {
                     self.respond_to_server_request(id, method, params).await;
+                }
+            }
+        }
+    }
+
+    /// Scan `buf` for notification events (no `id`, e.g.
+    /// `notifications/tools/list_changed`) and dispatch each one not already
+    /// present in `handled` exactly once, to whatever handler
+    /// [`McpTransport::set_notification_handler`] installed. `handled` is
+    /// keyed by the event's split index — stable because `buf` only grows
+    /// during one `read_sse_for_id` call — since notifications carry no id;
+    /// keying by index (not raw text) keeps two byte-identical notifications
+    /// distinct and avoids per-rescan string allocations.
+    async fn dispatch_buffered_notifications(&self, buf: &str, handled: &mut HashSet<usize>) {
+        for (idx, event_text) in buf.split("\n\n").enumerate() {
+            if event_text.trim().is_empty() {
+                continue;
+            }
+            let Some(value) = sse_event_json(event_text) else {
+                continue;
+            };
+            if let IncomingMessage::Notification { method, params } =
+                protocol::parse_incoming(value)
+            {
+                if handled.insert(idx) {
+                    let handler = self.notification_handler.lock().unwrap().clone();
+                    if let Some(handler) = handler {
+                        handler(method, params).await;
+                    }
                 }
             }
         }
@@ -392,6 +441,46 @@ mod tests {
         let body = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}});
         let err = extract_json_response(&body, 1).unwrap_err();
         assert!(err.to_string().contains("bad params"));
+    }
+
+    #[tokio::test]
+    async fn identical_notifications_each_dispatch_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let transport =
+            McpStreamableHttpTransport::new("http://localhost:0/mcp", HeaderMap::new(), None);
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        transport.set_notification_handler(Arc::new(move |_method, _params| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        // Two byte-identical notification events: index-keyed dedup must
+        // dispatch BOTH (text-keyed dedup would collapse them into one),
+        // while a rescan of the same grown buffer must not re-dispatch.
+        let notif = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
+            "\n",
+        );
+        let buf = format!("{notif}{notif}");
+        let mut handled = HashSet::new();
+        transport
+            .dispatch_buffered_notifications(&buf, &mut handled)
+            .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        transport
+            .dispatch_buffered_notifications(&buf, &mut handled)
+            .await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "a rescan must not re-dispatch already-handled events"
+        );
     }
 
     #[test]

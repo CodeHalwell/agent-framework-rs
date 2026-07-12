@@ -202,7 +202,7 @@ fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
 /// let provider = Mem0Provider::from_env()?.with_user_id("user-42");
 ///
 /// let request = vec![ChatMessage::user("I moved to Austin last month")];
-/// provider.invoked(&request, &[]).await?;
+/// provider.invoked(&request, &[], None).await?;
 ///
 /// let ctx = provider
 ///     .invoking(&[ChatMessage::user("Where do I live?")])
@@ -397,6 +397,7 @@ impl ContextProvider for Mem0Provider {
         &self,
         request_messages: &[ChatMessage],
         response_messages: &[ChatMessage],
+        _error: Option<&Error>,
     ) -> Result<()> {
         self.validate_filters()?;
         let all: Vec<&ChatMessage> = request_messages
@@ -900,7 +901,7 @@ mod tests {
     async fn invoked_fails_without_filters() {
         let p = Mem0Provider::new("k");
         let err = p
-            .invoked(&[ChatMessage::user("Hi")], &[])
+            .invoked(&[ChatMessage::user("Hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));

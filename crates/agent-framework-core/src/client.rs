@@ -14,11 +14,11 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::middleware::{FunctionInvocationContext, MiddlewarePipeline, Terminal};
-use crate::tools::{FunctionInvocationConfig, ToolDefinition};
+use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
     ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
-    FunctionResultContent, Role, ToolMode,
+    FunctionResultContent, Role, ToolMode, UsageContent,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -138,6 +138,17 @@ fn executable_tools(options: &ChatOptions) -> Vec<ToolDefinition> {
         .collect()
 }
 
+/// Whether `tool` is a *declaration-only* function tool: a known function with
+/// no local executor. Mirrors Python's `AIFunction.declaration_only`. A call to
+/// such a tool is returned to the caller unexecuted (the frontend-tool pattern
+/// that makes AG-UI client-side tools work). Hosted tools (web search, MCP, …)
+/// are deliberately excluded — they are not function tools and a call whose
+/// name matches none of the local function tools is treated as unknown, not
+/// declaration-only, exactly as Python's `_get_tool_map` omits them.
+fn is_declaration_only(tool: &ToolDefinition) -> bool {
+    tool.kind == ToolKind::Function && tool.executor.is_none()
+}
+
 /// The exact rejection payload Python emits for a denied tool call.
 const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by user.";
 
@@ -200,25 +211,45 @@ async fn execute_tool_call(
             };
             let exec = def.executor.as_ref().unwrap().clone();
             let tool_name = def.name.clone();
+            let description = def.description.clone();
             let call_id = call.call_id.clone();
             let terminal: Terminal<FunctionInvocationContext> = Box::new(move |mut ctx| {
                 Box::pin(async move {
                     if ctx.terminate {
                         return Ok(ctx);
                     }
-                    let span = crate::observability::tool_span(&tool_name, &call_id);
+                    let span = crate::observability::tool_span_ex(
+                        &tool_name,
+                        &call_id,
+                        Some(&description),
+                    );
+                    let capture =
+                        crate::observability::ObservabilityConfig::from_env().enable_sensitive_data;
+                    crate::observability::record_tool_arguments(&span, &ctx.arguments, capture);
+                    #[cfg(feature = "otel-metrics")]
+                    let started = std::time::Instant::now();
                     let outcome = async {
                         let result = exec.invoke(ctx.arguments.clone()).await;
                         if let Err(e) = &result {
-                            tracing::Span::current().record(
-                                crate::observability::attr::ERROR_TYPE,
-                                crate::observability::error_type(e).as_str(),
-                            );
+                            crate::observability::record_error(&tracing::Span::current(), e);
                         }
                         result
                     }
-                    .instrument(span)
+                    .instrument(span.clone())
                     .await;
+                    #[cfg(feature = "otel-metrics")]
+                    crate::observability::metrics::record_function_invocation_duration(
+                        &tool_name,
+                        started.elapsed(),
+                        outcome
+                            .as_ref()
+                            .err()
+                            .map(crate::observability::error_type)
+                            .as_deref(),
+                    );
+                    if let Ok(value) = &outcome {
+                        crate::observability::record_tool_result(&span, value, capture);
+                    }
                     ctx.result = Some(outcome?);
                     Ok(ctx)
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
@@ -339,173 +370,244 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         messages: Vec<ChatMessage>,
         mut options: ChatOptions,
     ) -> Result<ChatResponse> {
-        self.config.validate()?;
-        let tools = executable_tools(&options);
+        // After the tool loop settles, auto-populate `ChatResponse.value` from
+        // the final text when a structured `response_format` was requested
+        // (mirrors Python `try_parse_value`). This is the central non-streaming
+        // fill point: it covers a bare `FunctionInvokingChatClient` and every
+        // `ChatAgent` run (whose client is always wrapped in one). The tool
+        // loop is run inside an `async move` block so its interior `return`s
+        // funnel through this single fill/return path.
+        let response_format = options.response_format.clone();
+        let mut response: ChatResponse = async move {
+            self.config.validate()?;
+            let tools = executable_tools(&options);
 
-        // Default tool choice to auto when tools are present and unset.
-        if !options.tools.is_empty() && options.tool_choice.is_none() {
-            options.tool_choice = Some(ToolMode::Auto);
-        }
+            // Default tool choice to auto when tools are present and unset.
+            if !options.tools.is_empty() && options.tool_choice.is_none() {
+                options.tool_choice = Some(ToolMode::Auto);
+            }
 
-        if tools.is_empty() || !self.config.enabled {
-            return self.inner_get_response(messages, options).await;
-        }
+            if tools.is_empty() || !self.config.enabled {
+                return self.inner_get_response(messages, options).await;
+            }
 
-        let mut conversation = messages;
-        let mut carried: Vec<ChatMessage> = Vec::new();
-        let mut consecutive_errors = 0usize;
+            let mut conversation = messages;
+            let mut carried: Vec<ChatMessage> = Vec::new();
+            let mut consecutive_errors = 0usize;
 
-        for _ in 0..self.config.max_iterations {
-            // Process any function-approval responses supplied in the input:
-            // execute the approved calls and splice their results into the
-            // conversation (mirrors Python's `_collect_approval_responses` +
-            // `_replace_approval_contents_with_results`).
-            let approval_responses = collect_approval_responses(&conversation);
-            if !approval_responses.is_empty() {
-                let mut approved_results: HashMap<String, FunctionResultContent> = HashMap::new();
-                let mut had_error = false;
-                for resp in &approval_responses {
-                    if !resp.approved {
-                        continue;
+            for _ in 0..self.config.max_iterations {
+                // Process any function-approval responses supplied in the input:
+                // execute the approved calls and splice their results into the
+                // conversation (mirrors Python's `_collect_approval_responses` +
+                // `_replace_approval_contents_with_results`).
+                let approval_responses = collect_approval_responses(&conversation);
+                if !approval_responses.is_empty() {
+                    let mut approved_results: HashMap<String, FunctionResultContent> =
+                        HashMap::new();
+                    let mut had_error = false;
+                    for resp in &approval_responses {
+                        if !resp.approved {
+                            continue;
+                        }
+                        let call = &resp.function_call;
+                        let tool = tools.iter().find(|t| t.name == call.name).cloned();
+                        let (is_error, content) = execute_tool_call(
+                            tool,
+                            call,
+                            self.config.include_detailed_errors,
+                            self.config.terminate_on_unknown_calls,
+                            &self.function_middleware,
+                        )
+                        .await?;
+                        had_error |= is_error;
+                        approved_results.insert(content.call_id.clone(), content);
                     }
-                    let call = &resp.function_call;
-                    let tool = tools.iter().find(|t| t.name == call.name).cloned();
-                    let (is_error, content) = execute_tool_call(
-                        tool,
-                        call,
-                        self.config.include_detailed_errors,
-                        self.config.terminate_on_unknown_calls,
-                        &self.function_middleware,
-                    )
-                    .await?;
-                    had_error |= is_error;
-                    approved_results.insert(content.call_id.clone(), content);
+                    replace_approval_contents_with_results(&mut conversation, &approved_results);
+                    if had_error {
+                        consecutive_errors += 1;
+                        if consecutive_errors > self.config.max_consecutive_errors_per_request {
+                            options.tool_choice = Some(ToolMode::None);
+                        }
+                    }
                 }
-                replace_approval_contents_with_results(&mut conversation, &approved_results);
+
+                let response = self
+                    .inner_get_response(conversation.clone(), options.clone())
+                    .await?;
+
+                // A call whose result is already present in the same response
+                // was executed by the provider (e.g. Anthropic server-side
+                // web-search/code-execution/MCP `server_tool_use` blocks,
+                // which arrive paired with their `*_tool_result`). Executing
+                // it locally would produce a bogus "tool not found" — only
+                // unresolved calls enter the local tool loop.
+                let resolved_call_ids: std::collections::HashSet<&str> = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .filter_map(Content::as_function_result)
+                    .map(|fr| fr.call_id.as_str())
+                    .collect();
+                let calls: Vec<_> = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .filter_map(Content::as_function_call)
+                    .filter(|fc| !resolved_call_ids.contains(fc.call_id.as_str()))
+                    .cloned()
+                    .collect();
+
+                if calls.is_empty() {
+                    // Prepend the accumulated tool-interaction messages so the final
+                    // assistant message stays last.
+                    let mut final_resp = response;
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut final_resp.messages);
+                    final_resp.messages = msgs;
+                    return Ok(final_resp);
+                }
+
+                // Human-in-the-loop gate: if *any* requested tool requires approval,
+                // defer *all* calls (matching Python) and return an assistant message
+                // that carries the original calls plus one approval request each.
+                let needs_approval = calls.iter().any(|c| {
+                    tools
+                        .iter()
+                        .find(|t| t.name == c.name)
+                        .map(ToolDefinition::requires_approval)
+                        .unwrap_or(false)
+                });
+                if needs_approval {
+                    let mut resp = response;
+                    let approval_contents: Vec<Content> = calls
+                        .iter()
+                        .map(|c| {
+                            Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                                id: c.call_id.clone(),
+                                function_call: c.clone(),
+                            })
+                        })
+                        .collect();
+                    if let Some(m) = resp
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == Role::assistant())
+                    {
+                        m.contents.extend(approval_contents);
+                    } else {
+                        resp.messages.push(ChatMessage::with_contents(
+                            Role::assistant(),
+                            approval_contents,
+                        ));
+                    }
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut resp.messages);
+                    resp.messages = msgs;
+                    return Ok(resp);
+                }
+
+                // Declaration-only calls: a call targeting a KNOWN tool that has
+                // no local executor (declaration-only — e.g. an AG-UI frontend
+                // tool, or a per-run `additional_tools` entry) terminates the
+                // loop and returns the response with the `FunctionCallContent`
+                // intact, so the caller can execute it. Mirrors Python's
+                // `_try_execute_function_calls` `declaration_only` branch
+                // (`_tools.py:1396-1420`): if *any* requested call is
+                // declaration-only, the whole response is returned unexecuted.
+                // A genuinely unknown tool name is NOT declaration-only and
+                // keeps today's not-found handling in `execute_tool_call`.
+                let has_declaration_only = calls.iter().any(|c| {
+                    options
+                        .tools
+                        .iter()
+                        .any(|t| t.name == c.name && is_declaration_only(t))
+                });
+                if has_declaration_only {
+                    let mut resp = response;
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut resp.messages);
+                    resp.messages = msgs;
+                    return Ok(resp);
+                }
+
+                // Record the assistant message(s) that requested the calls.
+                carried.extend(response.messages.iter().cloned());
+                let response_conversation_id = response.conversation_id.clone();
+
+                // Execute all calls concurrently: the model may emit several
+                // parallel tool calls, and I/O-bound tools should not be serialized.
+                let invocations = calls.iter().map(|call| {
+                    let tool = tools.iter().find(|t| t.name == call.name).cloned();
+                    let call = call.clone();
+                    let include_detailed_errors = self.config.include_detailed_errors;
+                    let terminate_on_unknown = self.config.terminate_on_unknown_calls;
+                    let function_middleware = self.function_middleware.clone();
+                    async move {
+                        execute_tool_call(
+                            tool,
+                            &call,
+                            include_detailed_errors,
+                            terminate_on_unknown,
+                            &function_middleware,
+                        )
+                        .await
+                    }
+                });
+
+                let outcomes = futures::future::try_join_all(invocations).await?;
+                let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
+                let mut had_error = false;
+                for (is_error, content) in outcomes {
+                    had_error |= is_error;
+                    result_contents.push(Content::FunctionResult(content));
+                }
+
                 if had_error {
                     consecutive_errors += 1;
                     if consecutive_errors > self.config.max_consecutive_errors_per_request {
+                        // Give up on tools and let the model answer directly.
                         options.tool_choice = Some(ToolMode::None);
+                    }
+                } else {
+                    consecutive_errors = 0;
+                }
+
+                let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
+                carried.push(tool_message.clone());
+                match response_conversation_id {
+                    // A service-managed client that created (or continued) the
+                    // conversation now holds the history server-side. Propagate
+                    // its id so the follow-up tool-output submission targets the
+                    // right thread — without this, Assistants / Azure AI reject
+                    // the submission because `conversation_id` is still `None` —
+                    // and send ONLY the new tool results next turn rather than
+                    // re-sending the whole history (mirrors Python
+                    // `_tools.py:1635-1637, 1695-1699`).
+                    Some(cid) => {
+                        options.conversation_id = Some(cid);
+                        conversation = vec![tool_message];
+                    }
+                    // Stateless client (e.g. Chat Completions): accumulate and
+                    // re-send the full history each turn.
+                    None => {
+                        conversation.extend(response.messages);
+                        conversation.push(tool_message);
                     }
                 }
             }
 
-            let response = self
-                .inner_get_response(conversation.clone(), options.clone())
-                .await?;
-
-            let calls: Vec<_> = response
-                .messages
-                .iter()
-                .flat_map(|m| m.contents.iter())
-                .filter_map(Content::as_function_call)
-                .cloned()
-                .collect();
-
-            if calls.is_empty() {
-                // Prepend the accumulated tool-interaction messages so the final
-                // assistant message stays last.
-                let mut final_resp = response;
-                let mut msgs = std::mem::take(&mut carried);
-                msgs.append(&mut final_resp.messages);
-                final_resp.messages = msgs;
-                return Ok(final_resp);
-            }
-
-            // Human-in-the-loop gate: if *any* requested tool requires approval,
-            // defer *all* calls (matching Python) and return an assistant message
-            // that carries the original calls plus one approval request each.
-            let needs_approval = calls.iter().any(|c| {
-                tools
-                    .iter()
-                    .find(|t| t.name == c.name)
-                    .map(ToolDefinition::requires_approval)
-                    .unwrap_or(false)
-            });
-            if needs_approval {
-                let mut resp = response;
-                let approval_contents: Vec<Content> = calls
-                    .iter()
-                    .map(|c| {
-                        Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
-                            id: c.call_id.clone(),
-                            function_call: c.clone(),
-                        })
-                    })
-                    .collect();
-                if let Some(m) = resp
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.role == Role::assistant())
-                {
-                    m.contents.extend(approval_contents);
-                } else {
-                    resp.messages.push(ChatMessage::with_contents(
-                        Role::assistant(),
-                        approval_contents,
-                    ));
-                }
-                let mut msgs = std::mem::take(&mut carried);
-                msgs.append(&mut resp.messages);
-                resp.messages = msgs;
-                return Ok(resp);
-            }
-
-            // Record the assistant message(s) that requested the calls.
-            carried.extend(response.messages.iter().cloned());
-
-            // Execute all calls concurrently: the model may emit several
-            // parallel tool calls, and I/O-bound tools should not be serialized.
-            let invocations = calls.iter().map(|call| {
-                let tool = tools.iter().find(|t| t.name == call.name).cloned();
-                let call = call.clone();
-                let include_detailed_errors = self.config.include_detailed_errors;
-                let terminate_on_unknown = self.config.terminate_on_unknown_calls;
-                let function_middleware = self.function_middleware.clone();
-                async move {
-                    execute_tool_call(
-                        tool,
-                        &call,
-                        include_detailed_errors,
-                        terminate_on_unknown,
-                        &function_middleware,
-                    )
-                    .await
-                }
-            });
-
-            let outcomes = futures::future::try_join_all(invocations).await?;
-            let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
-            let mut had_error = false;
-            for (is_error, content) in outcomes {
-                had_error |= is_error;
-                result_contents.push(Content::FunctionResult(content));
-            }
-
-            if had_error {
-                consecutive_errors += 1;
-                if consecutive_errors > self.config.max_consecutive_errors_per_request {
-                    // Give up on tools and let the model answer directly.
-                    options.tool_choice = Some(ToolMode::None);
-                }
-            } else {
-                consecutive_errors = 0;
-            }
-
-            let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
-            carried.push(tool_message.clone());
-            conversation.extend(response.messages);
-            conversation.push(tool_message);
+            // Failsafe: one final call with tools disabled.
+            options.tool_choice = Some(ToolMode::None);
+            let mut final_resp = self.inner_get_response(conversation, options).await?;
+            let mut msgs = std::mem::take(&mut carried);
+            msgs.append(&mut final_resp.messages);
+            final_resp.messages = msgs;
+            Ok(final_resp)
         }
-
-        // Failsafe: one final call with tools disabled.
-        options.tool_choice = Some(ToolMode::None);
-        let mut final_resp = self.inner_get_response(conversation, options).await?;
-        let mut msgs = std::mem::take(&mut carried);
-        msgs.append(&mut final_resp.messages);
-        final_resp.messages = msgs;
-        Ok(final_resp)
+        .await?;
+        response.try_parse_value(response_format.as_ref());
+        Ok(response)
     }
 
     async fn get_streaming_response(
@@ -524,26 +626,74 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         // merging the tool-call and final assistant messages by role.
         let response = self.get_response(messages, options).await?;
         // Response-level metadata must survive the replay so re-aggregation
-        // (and the agent's thread adoption) sees it.
+        // (and the agent's thread adoption) sees it: ids on every update,
+        // and usage/finish-reason on the final one (usage rides as a
+        // `Content::Usage` item, which `absorb_update` folds into
+        // `usage_details` rather than the message contents — the same shape
+        // providers use for their terminal stream chunk).
         let conversation_id = response.conversation_id.clone();
         let response_id = response.response_id.clone();
-        let updates: Vec<Result<ChatResponseUpdate>> = response
+        let finish_reason = response.finish_reason.clone();
+        let usage_details = response.usage_details.clone();
+        let last = response.messages.len().saturating_sub(1);
+        // Keep the provider message ids only when they're all present and
+        // distinct; otherwise use positional ids for every message. A service
+        // (e.g. Assistants) can reuse one run id for both the tool-call turn
+        // and the final assistant turn, and `ChatResponse::from_updates` keys
+        // messages by id — a duplicate would merge the final answer into the
+        // tool-call message, ahead of the tool result.
+        let keep_provider_ids = {
+            let mut seen = std::collections::HashSet::new();
+            response.messages.iter().all(|m| {
+                m.message_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty() && seen.insert(id.as_str()))
+            })
+        };
+        let mut updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
             .enumerate()
             .map(|(i, m)| {
-                let message_id = m.message_id.clone().or_else(|| Some(format!("replay-{i}")));
+                let message_id = if keep_provider_ids {
+                    m.message_id.clone()
+                } else {
+                    Some(format!("replay-{i}"))
+                };
+                let mut contents = m.contents;
+                let is_last = i == last;
+                if is_last {
+                    if let Some(usage) = usage_details.clone() {
+                        contents.push(Content::Usage(UsageContent { details: usage }));
+                    }
+                }
                 Ok(ChatResponseUpdate {
-                    contents: m.contents,
+                    contents,
                     role: Some(m.role),
                     author_name: m.author_name,
                     message_id,
                     conversation_id: conversation_id.clone(),
                     response_id: response_id.clone(),
+                    finish_reason: is_last.then(|| finish_reason.clone()).flatten(),
                     ..Default::default()
                 })
             })
             .collect();
+        // A messageless response (unusual, but possible) still carries its
+        // terminal metadata in one trailing update.
+        if updates.is_empty() && (usage_details.is_some() || finish_reason.is_some()) {
+            let contents = usage_details
+                .map(|u| vec![Content::Usage(UsageContent { details: u })])
+                .unwrap_or_default();
+            updates.push(Ok(ChatResponseUpdate {
+                contents,
+                role: Some(Role::assistant()),
+                conversation_id,
+                response_id,
+                finish_reason,
+                ..Default::default()
+            }));
+        }
         Ok(stream::iter(updates).boxed())
     }
 
@@ -562,7 +712,11 @@ pub enum RetryOn {
     /// The built-in default predicate (see [`RetryPolicy`] docs for the exact
     /// rule): retries HTTP `408`/`429`/`5xx` ([`Error::ServiceStatus`]) and
     /// transport-ish [`Error::Service`] failures (timeouts / connection
-    /// errors).
+    /// errors). Never retries [`Error::ServiceInvalidAuth`],
+    /// [`Error::ServiceInvalidRequest`], or [`Error::ServiceContentFilter`] —
+    /// authentication/authorization failures, malformed requests, and
+    /// content-filter refusals are non-transient, so retrying would just
+    /// repeat the same rejection.
     Default,
     /// A fully custom predicate deciding, per error, whether to retry.
     Predicate(Arc<dyn Fn(&Error) -> bool + Send + Sync>),
@@ -606,7 +760,15 @@ impl RetryOn {
 ///   error"`.
 ///
 /// Everything else (4xx other than 408/429, parse errors, tool/workflow errors,
-/// non-transport service errors) is treated as non-retryable.
+/// non-transport service errors) is treated as non-retryable. This explicitly
+/// includes [`Error::ServiceInvalidAuth`], [`Error::ServiceInvalidRequest`],
+/// and [`Error::ServiceContentFilter`] — authentication/authorization
+/// failures, malformed requests, and content-filter refusals are
+/// non-transient, so retrying would just repeat the same rejection. None of
+/// the three carry a status via [`Error::status`], so they fall through to
+/// the final `_ => false` below (there's no dedicated match arm for them:
+/// merging one in would just duplicate that `false`, which `clippy` flags as
+/// `match_same_arms`).
 fn default_should_retry(err: &Error) -> bool {
     if let Some(status) = err.status() {
         return status == 408 || status == 429 || (500..600).contains(&status);

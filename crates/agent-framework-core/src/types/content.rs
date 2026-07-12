@@ -105,6 +105,13 @@ pub struct TextReasoningContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotations: Option<Vec<CitationAnnotation>>,
+    /// The raw provider reasoning item this was decoded from, when it must be
+    /// replayed verbatim. Reasoning models (OpenAI Responses with
+    /// `store: false`) require the original reasoning item — id and encrypted
+    /// content, not just the summary — on the follow-up tool-call turn; the
+    /// Responses input mapper re-emits it from here. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_representation: Option<Value>,
 }
 
 /// Inline binary data encoded as a `data:` URI.
@@ -300,6 +307,16 @@ pub struct FunctionApprovalResponseContent {
 /// The unified content union, discriminated by the `type` tag.
 ///
 /// This is the Rust equivalent of the Python `Contents` union.
+///
+/// The [`Content::Unknown`] variant makes deserialization forward-compatible:
+/// a content item whose `type` tag is not one of the known variants
+/// deserializes to `Unknown` rather than failing the whole message. This
+/// mirrors Python's parse-and-skip behavior for unknown content
+/// (`_types.py:2205-2210`), except the item is retained as an inert
+/// placeholder instead of being dropped. `Unknown` carries no data, so it
+/// re-serializes as `{"type":"unknown"}` (the original tag/fields are not
+/// preserved) and is treated as inert everywhere: it yields no text, no
+/// function call, and is ignored by aggregation/coalescing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
@@ -315,6 +332,11 @@ pub enum Content {
     HostedVectorStore(HostedVectorStoreContent),
     FunctionApprovalRequest(FunctionApprovalRequestContent),
     FunctionApprovalResponse(FunctionApprovalResponseContent),
+    /// A content item whose `type` tag is unknown to this version of the
+    /// library. Deserialization falls back to this inert variant instead of
+    /// erroring; see the type-level docs.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Content {
@@ -431,5 +453,74 @@ mod base64_lite {
             });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChatMessage;
+
+    #[test]
+    fn unknown_content_type_deserializes_inertly_and_keeps_siblings() {
+        // A message carrying a content variant this version doesn't know about,
+        // sandwiched between known variants.
+        let json = serde_json::json!({
+            "role": "assistant",
+            "contents": [
+                {"type": "text", "text": "before"},
+                {"type": "super_future_content", "payload": {"x": 1}, "note": "hi"},
+                {"type": "function_call", "call_id": "c1", "name": "f"}
+            ]
+        });
+        let msg: ChatMessage =
+            serde_json::from_value(json).expect("unknown content must not fail the message");
+        assert_eq!(
+            msg.contents.len(),
+            3,
+            "unknown content is retained, not dropped"
+        );
+        assert!(matches!(msg.contents[0], Content::Text(_)));
+        assert_eq!(msg.contents[1], Content::Unknown, "novel type -> Unknown");
+        assert!(matches!(msg.contents[2], Content::FunctionCall(_)));
+
+        // The known siblings are still usable / inspectable.
+        assert_eq!(msg.contents[0].as_text(), Some("before"));
+        assert_eq!(msg.contents[2].as_function_call().unwrap().name, "f");
+        // Unknown is inert: no text, no function call.
+        assert_eq!(msg.contents[1].as_text(), None);
+        assert!(msg.contents[1].as_function_call().is_none());
+    }
+
+    #[test]
+    fn unknown_content_reserializes_without_panicking() {
+        let c = Content::Unknown;
+        let v = serde_json::to_value(&c).expect("Unknown must serialize");
+        assert_eq!(v, serde_json::json!({"type": "unknown"}));
+        // And a full message round-trips through serialization without panic.
+        let msg = ChatMessage::with_contents(
+            crate::types::Role::assistant(),
+            vec![Content::text("keep"), Content::Unknown],
+        );
+        let s = serde_json::to_string(&msg).expect("message serializes");
+        assert!(s.contains("\"unknown\""));
+    }
+
+    #[test]
+    fn known_variants_roundtrip_unchanged() {
+        let contents = vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new("id", "name", None)),
+            Content::FunctionResult(FunctionResultContent::new(
+                "id",
+                Some(Value::String("ok".into())),
+            )),
+        ];
+        for c in contents {
+            let s = serde_json::to_string(&c).unwrap();
+            let back: Content = serde_json::from_str(&s).unwrap();
+            assert_eq!(c, back);
+            assert_ne!(back, Content::Unknown);
+        }
     }
 }

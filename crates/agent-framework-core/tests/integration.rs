@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 struct MockClient {
     responses: Arc<Mutex<Vec<ChatResponse>>>,
     seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    seen_options: Arc<Mutex<Vec<ChatOptions>>>,
 }
 
 impl MockClient {
@@ -22,7 +23,23 @@ impl MockClient {
         Self {
             responses: Arc::new(Mutex::new(responses)),
             seen: Arc::new(Mutex::new(Vec::new())),
+            seen_options: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+}
+
+impl MockClient {
+    /// The `ChatOptions` of the most recent call, if any.
+    fn last_options(&self) -> Option<ChatOptions> {
+        self.seen_options.lock().unwrap().last().cloned()
+    }
+    /// Every call's `ChatOptions`, in order.
+    fn all_options(&self) -> Vec<ChatOptions> {
+        self.seen_options.lock().unwrap().clone()
+    }
+    /// Every call's message list, in order.
+    fn all_seen(&self) -> Vec<Vec<ChatMessage>> {
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -31,9 +48,10 @@ impl ChatClient for MockClient {
     async fn get_response(
         &self,
         messages: Vec<ChatMessage>,
-        _options: ChatOptions,
+        options: ChatOptions,
     ) -> Result<ChatResponse> {
         self.seen.lock().unwrap().push(messages);
+        self.seen_options.lock().unwrap().push(options);
         let mut resps = self.responses.lock().unwrap();
         if resps.is_empty() {
             Ok(ChatResponse::from_text("(no more scripted responses)"))
@@ -86,7 +104,7 @@ async fn agent_streaming_updates_thread() {
 
     let mut thread = agent.get_new_thread();
     let mut stream = agent
-        .run_stream("hello", Some(thread.clone()))
+        .run_stream("hello", Some(thread.clone()), None)
         .await
         .unwrap();
     let mut text = String::new();
@@ -279,7 +297,7 @@ async fn middleware_applies_on_streaming_path() {
         .build();
 
     // Streaming must honor the middleware just like `run` does.
-    let mut stream = agent.run_stream("hi", None).await.unwrap();
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
     let mut text = String::new();
     while let Some(u) = stream.next().await {
         text.push_str(&u.unwrap().text());
@@ -342,9 +360,14 @@ async fn tool_loop_reports_invalid_arguments() {
         .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))));
 }
 
-/// A context provider that records whether `invoked` fired and injects a tool.
+/// A context provider that records lifecycle-hook activity: whether `invoked`
+/// fired, the error (if any) the last `invoked` carried, and every id passed to
+/// `thread_created`. Also injects an instruction so `invoking` has an effect.
+#[derive(Default, Clone)]
 struct RecordingProvider {
     invoked: Arc<Mutex<bool>>,
+    invoked_error: Arc<Mutex<Option<String>>>,
+    thread_created_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
@@ -352,18 +375,29 @@ impl ContextProvider for RecordingProvider {
     async fn invoking(&self, _messages: &[ChatMessage]) -> Result<Context> {
         Ok(Context::new().with_instructions("remember: be brief"))
     }
-    async fn invoked(&self, _request: &[ChatMessage], _response: &[ChatMessage]) -> Result<()> {
+    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
+        self.thread_created_ids
+            .lock()
+            .unwrap()
+            .push(thread_id.map(str::to_string));
+        Ok(())
+    }
+    async fn invoked(
+        &self,
+        _request: &[ChatMessage],
+        _response: &[ChatMessage],
+        error: Option<&Error>,
+    ) -> Result<()> {
         *self.invoked.lock().unwrap() = true;
+        *self.invoked_error.lock().unwrap() = error.map(|e| e.to_string());
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn context_provider_invoked_hook_fires() {
-    let invoked = Arc::new(Mutex::new(false));
-    let provider = RecordingProvider {
-        invoked: invoked.clone(),
-    };
+    let provider = RecordingProvider::default();
+    let invoked = provider.invoked.clone();
     let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
         provider,
     )]));
@@ -407,7 +441,7 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
         .tool(noop)
         .build();
 
-    let mut stream = agent.run_stream("go", None).await.unwrap();
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
     let mut updates = Vec::new();
     while let Some(u) = stream.next().await {
         updates.push(u.unwrap());
@@ -425,6 +459,342 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
             .all(|c| !matches!(c, Content::FunctionCall(_))),
         "final message was merged with the tool-call message"
     );
+}
+
+#[tokio::test]
+async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id() {
+    // Usage, finish reason, and the service conversation id must survive the
+    // tool-loop's run-then-replay streaming path, so aggregating the stream
+    // yields the same metadata a non-streaming run() returns.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let mut usage = UsageDetails::new();
+    usage.input_token_count = Some(11);
+    usage.output_token_count = Some(7);
+    let answer = ChatResponse {
+        usage_details: Some(usage),
+        finish_reason: Some(FinishReason::stop()),
+        conversation_id: Some("conv-9".into()),
+        ..ChatResponse::from_text("final answer")
+    };
+
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("done")) },
+    )
+    .into_definition();
+
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(noop)
+        .build();
+
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-9"));
+    let usage = aggregated
+        .usage_details
+        .as_ref()
+        .expect("usage must survive the replay");
+    assert_eq!(usage.output_token_count, Some(7));
+    // The usage rode as a Content::Usage item and must have folded into
+    // usage_details, not leaked into the final message's contents.
+    assert!(aggregated
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .all(|c| !matches!(c, Content::Usage(_))));
+    assert_eq!(aggregated.messages.last().unwrap().text(), "final answer");
+}
+
+#[tokio::test]
+async fn per_run_conversation_id_survives_on_a_local_thread() {
+    // A per-run ChatOptions::conversation_id on a LOCAL thread must reach the
+    // provider (it was previously clobbered by the thread's absent service
+    // id, silently starting a new service conversation).
+    let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
+    let probe = client.clone();
+    let agent = ChatAgent::builder(client).build();
+    let mut thread = agent.get_new_thread();
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.last_options().unwrap().conversation_id.as_deref(),
+        Some("conv-override")
+    );
+}
+
+#[tokio::test]
+async fn service_thread_id_wins_over_per_run_conversation_id() {
+    // Continuity contract: a service-managed thread's id drives the call even
+    // when a per-run override is supplied.
+    let resp = ChatResponse {
+        conversation_id: Some("svc-1".into()),
+        ..ChatResponse::from_text("ok")
+    };
+    let client = MockClient::new(vec![resp]);
+    let probe = client.clone();
+    let agent = ChatAgent::builder(client).build();
+    let mut thread = AgentThread::service("svc-1");
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![ChatMessage::user("hi")], Some(&mut thread), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.last_options().unwrap().conversation_id.as_deref(),
+        Some("svc-1")
+    );
+}
+
+#[tokio::test]
+async fn middleware_stream_replay_preserves_conversation_id_and_usage() {
+    // With agent middleware configured, run_stream replays the completed run;
+    // the response's conversation id and usage must survive that replay.
+    let mut usage = UsageDetails::new();
+    usage.output_token_count = Some(3);
+    let resp = ChatResponse {
+        conversation_id: Some("conv-7".into()),
+        usage_details: Some(usage),
+        ..ChatResponse::from_text("answer")
+    };
+    let client = MockClient::new(vec![resp]);
+    let agent = ChatAgent::builder(client)
+        .middleware(Arc::new(SuffixMiddleware))
+        .build();
+
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    assert_eq!(aggregated.conversation_id.as_deref(), Some("conv-7"));
+    assert_eq!(
+        aggregated
+            .usage_details
+            .expect("usage survives")
+            .output_token_count,
+        Some(3)
+    );
+}
+
+#[tokio::test]
+async fn service_created_conversation_id_propagates_into_tool_followup() {
+    // A service-managed client creates the thread on the first tool-call turn
+    // and returns its conversation_id. The follow-up submission (carrying the
+    // FunctionResultContent) must target that thread, and — since the service
+    // now holds the history — send only the new tool results.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let first = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        conversation_id: Some("thread_new".into()),
+        ..Default::default()
+    };
+    let second = ChatResponse::from_text("done");
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+    let probe = MockClient::new(vec![first, second]);
+    let client = FunctionInvokingChatClient::new(probe.clone());
+
+    let options = ChatOptions {
+        tools: vec![noop],
+        ..Default::default()
+    };
+    let resp = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+    assert_eq!(resp.text(), "done");
+
+    let all_opts = probe.all_options();
+    assert_eq!(all_opts.len(), 2, "expected two underlying calls");
+    // First call had no conversation id; the follow-up carries the one the
+    // service created.
+    assert!(all_opts[0].conversation_id.is_none());
+    assert_eq!(all_opts[1].conversation_id.as_deref(), Some("thread_new"));
+
+    // The follow-up sends only the new tool results, not the re-accumulated
+    // history (the service holds it server-side).
+    let seen = probe.all_seen();
+    let followup = &seen[1];
+    assert!(
+        followup.iter().all(|m| m.role == Role::tool()),
+        "follow-up should carry only tool-result messages"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_provider_message_ids_do_not_merge_on_replay() {
+    // A service (e.g. Assistants) can reuse one run id for the tool-call turn
+    // and the final answer. If the replay preserved that duplicate id,
+    // aggregation would merge the final text into the tool-call message and
+    // reorder it ahead of the tool result. The replay must keep the two
+    // assistant messages distinct.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let mut tool_call_msg =
+        ChatMessage::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]);
+    tool_call_msg.message_id = Some("run_dup".into());
+    let ask = ChatResponse {
+        messages: vec![tool_call_msg],
+        ..Default::default()
+    };
+    let mut final_msg = ChatMessage::with_contents(Role::assistant(), vec![Content::text("final")]);
+    final_msg.message_id = Some("run_dup".into()); // same id as the tool-call turn
+    let answer = ChatResponse {
+        messages: vec![final_msg],
+        ..Default::default()
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+    let agent = ChatAgent::builder(MockClient::new(vec![ask, answer]))
+        .tool(noop)
+        .build();
+
+    let mut stream = agent.run_stream("go", None, None).await.unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = AgentRunResponse::from_updates(updates);
+    // Final answer stays its own message, after the tool result — not merged
+    // into the tool-call message.
+    let last = aggregated.messages.last().unwrap();
+    assert_eq!(last.text(), "final");
+    assert!(last
+        .contents
+        .iter()
+        .all(|c| !matches!(c, Content::FunctionCall(_))));
+}
+
+#[tokio::test]
+async fn provider_resolved_tool_calls_are_not_executed_locally() {
+    // A response carrying a function call WITH its matching result in the
+    // same response (e.g. Anthropic server-side web-search/MCP tool use) was
+    // executed by the provider: the call must not enter the local tool loop,
+    // which would emit a bogus "tool not found" and burn an extra iteration.
+    let call = FunctionCallContent::new(
+        "srv_1",
+        "hosted_web_search",
+        Some(FunctionArguments::Raw("{}".into())),
+    );
+    let resolved = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionCall(call),
+                Content::FunctionResult(FunctionResultContent {
+                    call_id: "srv_1".into(),
+                    result: Some(json!({"hits": 3})),
+                    exception: None,
+                }),
+                Content::text("Found 3 results."),
+            ],
+        )],
+        ..Default::default()
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("x")) },
+    )
+    .into_definition();
+    // Exactly one scripted response: a second loop iteration would consume
+    // the "(no more scripted responses)" fallback and change the text.
+    let agent = ChatAgent::builder(MockClient::new(vec![resolved]))
+        .tool(noop)
+        .build();
+
+    let out = agent.run_once("go").await.unwrap();
+    assert_eq!(out.text(), "Found 3 results.");
+    // No synthetic error result was appended for the pre-resolved call.
+    assert!(out
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_result)
+        .all(|fr| fr.exception.is_none()));
+}
+
+#[tokio::test]
+async fn chat_level_tool_stream_replay_carries_finish_reason() {
+    // AgentRunResponse has no finish_reason (matching upstream), so the
+    // finish-reason half of the replay metadata is asserted at the
+    // chat-client level, where ChatResponse::from_updates surfaces it.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse {
+        finish_reason: Some(FinishReason::stop()),
+        ..ChatResponse::from_text("done")
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ask, answer]));
+    let options = ChatOptions {
+        tools: vec![noop],
+        ..Default::default()
+    };
+    let mut stream = client
+        .get_streaming_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Some(u) = stream.next().await {
+        updates.push(u.unwrap());
+    }
+    let aggregated = ChatResponse::from_updates(updates);
+    assert_eq!(aggregated.finish_reason, Some(FinishReason::stop()));
+    assert_eq!(aggregated.messages.last().unwrap().text(), "done");
 }
 
 #[tokio::test]
@@ -1153,4 +1523,897 @@ async fn service_conversation_id_is_adopted_by_thread() {
     assert_eq!(opts.len(), 2);
     assert_eq!(opts[0].conversation_id, None);
     assert_eq!(opts[1].conversation_id.as_deref(), Some("conv-1"));
+}
+
+// ===========================================================================
+// Task 5: as_tool name sanitization
+// ===========================================================================
+
+#[tokio::test]
+async fn as_tool_sanitizes_agent_name() {
+    let agent = ChatAgent::builder(MockClient::new(vec![]))
+        .name("My Weather Agent!! v2")
+        .build();
+    // Spaces/punctuation -> underscores, collapsed, trimmed.
+    let tool = agent.as_tool(AsToolOptions::new());
+    assert_eq!(tool.name, "My_Weather_Agent_v2");
+
+    // An explicit name is used verbatim (mirrors Python `name or sanitize`).
+    let tool2 = agent.as_tool(AsToolOptions::new().name("explicit name"));
+    assert_eq!(tool2.name, "explicit name");
+
+    // Leading digit gets an underscore prefix; all-invalid -> "agent".
+    let numeric = ChatAgent::builder(MockClient::new(vec![]))
+        .name("9lives")
+        .build();
+    assert_eq!(numeric.as_tool(AsToolOptions::new()).name, "_9lives");
+    let junk = ChatAgent::builder(MockClient::new(vec![]))
+        .name("@@@")
+        .build();
+    assert_eq!(junk.as_tool(AsToolOptions::new()).name, "agent");
+}
+
+// ===========================================================================
+// Task 6: service-managed thread with no returned conversation id errors
+// ===========================================================================
+
+#[tokio::test]
+async fn service_thread_without_conversation_id_errors() {
+    // The client succeeds but returns no conversation id.
+    let client = MockClient::new(vec![ChatResponse::from_text("hi")]);
+    let agent = ChatAgent::builder(client).name("svc").build();
+    let mut thread = agent.get_new_thread_with_service_id("svc-thread").unwrap();
+    let err = agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AgentExecution(_)));
+    assert!(err
+        .to_string()
+        .contains("did not return a valid conversation id"));
+}
+
+// ===========================================================================
+// Task 1: ContextProvider::thread_created is fired by ChatAgent
+// ===========================================================================
+
+/// Echoes the request's conversation id back (keeps a service thread valid).
+struct EchoServiceClient;
+#[async_trait]
+impl ChatClient for EchoServiceClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut resp = ChatResponse::from_text("ok");
+        resp.conversation_id = options.conversation_id.clone();
+        Ok(resp)
+    }
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let mut u = ChatResponseUpdate::text(resp.text());
+        u.conversation_id = resp.conversation_id.clone();
+        Ok(Box::pin(futures::stream::iter(vec![Ok(u)])))
+    }
+}
+
+/// Returns a fresh conversation id for a previously-local thread to adopt.
+struct AdoptServiceClient;
+#[async_trait]
+impl ChatClient for AdoptServiceClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut resp = ChatResponse::from_text("ok");
+        resp.conversation_id = Some("adopted-1".to_string());
+        Ok(resp)
+    }
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let mut u = ChatResponseUpdate::text(resp.text());
+        u.conversation_id = Some("adopted-1".to_string());
+        Ok(Box::pin(futures::stream::iter(vec![Ok(u)])))
+    }
+}
+
+#[tokio::test]
+async fn thread_created_fires_for_service_thread() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(EchoServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    let mut thread = agent.get_new_thread_with_service_id("svc-1").unwrap();
+    agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+
+    // Fired once at run start with the service thread id (no re-fire on the
+    // echoed-back same id).
+    assert_eq!(ids.lock().unwrap().clone(), vec![Some("svc-1".to_string())]);
+}
+
+#[tokio::test]
+async fn thread_created_fires_on_service_id_adoption() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(AdoptServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    // A local thread that adopts the id returned by the service.
+    let mut thread = agent.get_new_thread();
+    agent
+        .run(vec![ChatMessage::user("hi")], Some(&mut thread))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids.lock().unwrap().clone(),
+        vec![Some("adopted-1".to_string())]
+    );
+    assert_eq!(thread.service_thread_id(), Some("adopted-1"));
+}
+
+#[tokio::test]
+async fn thread_created_fires_on_adoption_when_streaming() {
+    let provider = RecordingProvider::default();
+    let ids = provider.thread_created_ids.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(AdoptServiceClient)
+        .context_provider(aggregate)
+        .build();
+
+    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
+    while let Some(u) = stream.next().await {
+        u.unwrap();
+    }
+    assert_eq!(
+        ids.lock().unwrap().clone(),
+        vec![Some("adopted-1".to_string())]
+    );
+}
+
+// ===========================================================================
+// Task 2: ContextProvider::invoked observes failures
+// ===========================================================================
+
+struct FailingClient;
+#[async_trait]
+impl ChatClient for FailingClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Err(Error::service("boom"))
+    }
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Err(Error::service("boom"))
+    }
+}
+
+#[tokio::test]
+async fn invoked_hook_observes_failure() {
+    let provider = RecordingProvider::default();
+    let invoked = provider.invoked.clone();
+    let invoked_error = provider.invoked_error.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(FailingClient)
+        .context_provider(aggregate)
+        .build();
+
+    let err = agent.run_once("hi").await.unwrap_err();
+    assert!(err.to_string().contains("boom"));
+    assert!(
+        *invoked.lock().unwrap(),
+        "invoked fired on the failure path"
+    );
+    let recorded = invoked_error.lock().unwrap().clone();
+    assert!(
+        recorded.is_some_and(|m| m.contains("boom")),
+        "provider observed the run error"
+    );
+}
+
+#[tokio::test]
+async fn invoked_hook_observes_streaming_failure() {
+    let provider = RecordingProvider::default();
+    let invoked_error = provider.invoked_error.clone();
+    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
+        provider,
+    )]));
+    let agent = ChatAgent::builder(FailingClient)
+        .context_provider(aggregate)
+        .build();
+
+    let err = agent.run_stream("hi", None, None).await.err().unwrap();
+    assert!(err.to_string().contains("boom"));
+    assert!(
+        invoked_error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|m| m.contains("boom")),
+        "provider observed the streaming failure"
+    );
+}
+
+// ===========================================================================
+// Task 3: structured-output value auto-population
+// ===========================================================================
+
+#[tokio::test]
+async fn structured_output_value_autofilled_on_agent_run() {
+    let client = MockClient::new(vec![ChatResponse::from_text("{\"city\": \"Paris\"}")]);
+    let agent = ChatAgent::builder(client)
+        .response_format(ResponseFormat::JsonObject)
+        .build();
+    let resp = agent.run_once("where?").await.unwrap();
+    assert_eq!(resp.value, Some(json!({"city": "Paris"})));
+}
+
+#[tokio::test]
+async fn structured_output_value_tolerates_non_json() {
+    let client = MockClient::new(vec![ChatResponse::from_text("sorry, no idea")]);
+    let agent = ChatAgent::builder(client)
+        .response_format(ResponseFormat::JsonObject)
+        .build();
+    let resp = agent.run_once("where?").await.unwrap();
+    assert_eq!(resp.value, None);
+}
+
+#[tokio::test]
+async fn structured_output_value_autofilled_on_bare_client() {
+    use agent_framework_core::client::FunctionInvokingChatClient;
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ChatResponse::from_text(
+        "{\"n\": 5}",
+    )]));
+    let mut opts = ChatOptions::new();
+    opts.response_format = Some(ResponseFormat::JsonObject);
+    let resp = client
+        .get_response(vec![ChatMessage::user("x")], opts)
+        .await
+        .unwrap();
+    assert_eq!(resp.value, Some(json!({"n": 5})));
+}
+
+// ===========================================================================
+// Task 7: thread persistence (agent-level: factory, deserialize, service id)
+// ===========================================================================
+
+#[tokio::test]
+async fn chat_message_store_factory_used_by_get_new_thread() {
+    // The factory seeds a marker so we can observe it was used.
+    let agent = ChatAgent::builder(MockClient::new(vec![]))
+        .chat_message_store_factory(|| {
+            Arc::new(InMemoryChatMessageStore::with_messages(vec![
+                ChatMessage::system("MARKER"),
+            ]))
+        })
+        .build();
+    let thread = agent.get_new_thread();
+    let msgs = thread.list_messages().await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].text(), "MARKER");
+}
+
+#[tokio::test]
+async fn agent_deserialize_thread_roundtrips_history() {
+    let agent = ChatAgent::builder(MockClient::new(vec![])).build();
+    let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
+        ChatMessage::user("hi"),
+        ChatMessage::assistant("hello"),
+    ]));
+    let state = AgentThread::local(store).serialize().await.unwrap();
+
+    let restored = agent.deserialize_thread(&state).await.unwrap();
+    let msgs = restored.list_messages().await.unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[1].text(), "hello");
+}
+
+#[tokio::test]
+async fn agent_get_new_thread_with_service_id() {
+    let agent = ChatAgent::builder(MockClient::new(vec![])).build();
+    let thread = agent.get_new_thread_with_service_id("svc-9").unwrap();
+    assert_eq!(thread.service_thread_id(), Some("svc-9"));
+    assert!(thread.message_store().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// GAP 1.4 — trait-level streaming; GAP 1.5 — per-run options; Task 3 — declaration-only
+// ---------------------------------------------------------------------------
+
+/// A client that streams a fixed list of text deltas (real incremental
+/// streaming, distinct from `MockClient`'s per-message replay).
+#[derive(Clone)]
+struct DeltaClient {
+    deltas: Vec<String>,
+}
+
+#[async_trait]
+impl ChatClient for DeltaClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Ok(ChatResponse::from_text(self.deltas.concat()))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let updates: Vec<Result<ChatResponseUpdate>> = self
+            .deltas
+            .iter()
+            .map(|d| Ok(ChatResponseUpdate::text(d.clone())))
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+/// A client that records every `ChatOptions` it is handed (to assert per-run
+/// option precedence and per-run tool visibility).
+#[derive(Clone)]
+struct RecordingClient {
+    seen: Arc<Mutex<Vec<ChatOptions>>>,
+}
+
+impl RecordingClient {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatClient for RecordingClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        self.seen.lock().unwrap().push(options);
+        Ok(ChatResponse::from_text("ok"))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let updates: Vec<Result<ChatResponseUpdate>> = resp
+            .messages
+            .into_iter()
+            .map(|m| {
+                Ok(ChatResponseUpdate {
+                    contents: m.contents,
+                    role: Some(m.role),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+fn declaration_only_tool(name: &str) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: String::new(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        kind: ToolKind::Function,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
+#[tokio::test]
+async fn trait_default_run_stream_buffers_for_minimal_agent() {
+    // A minimal custom agent implementing only `run` + `id` gets the trait's
+    // default buffered `run_stream` for free.
+    struct EchoAgent;
+    #[async_trait]
+    impl Agent for EchoAgent {
+        async fn run(
+            &self,
+            messages: Vec<ChatMessage>,
+            _thread: Option<&mut AgentThread>,
+        ) -> Result<AgentRunResponse> {
+            let text = messages.last().map(ChatMessage::text).unwrap_or_default();
+            Ok(AgentRunResponse {
+                messages: vec![ChatMessage::assistant(format!("echo: {text}"))],
+                ..Default::default()
+            })
+        }
+        fn id(&self) -> &str {
+            "echo"
+        }
+    }
+
+    let agent = EchoAgent;
+    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut count = 0;
+    while let Some(update) = stream.next().await {
+        text.push_str(&update.unwrap().text());
+        count += 1;
+    }
+    assert_eq!(text, "echo: hi");
+    assert_eq!(count, 1, "one buffered update per response message");
+}
+
+#[tokio::test]
+async fn chat_agent_trait_stream_yields_real_deltas() {
+    // ChatAgent's real streaming override forwards one update per model delta.
+    let client = DeltaClient {
+        deltas: vec!["Hel".into(), "lo ".into(), "world".into()],
+    };
+    let agent = ChatAgent::builder(client).build();
+    let mut stream = Agent::run_stream(&agent, vec![ChatMessage::user("hi")], None, None)
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    while let Some(update) = stream.next().await {
+        deltas.push(update.unwrap().text());
+    }
+    assert_eq!(deltas.len(), 3, "one update per streamed delta");
+    assert_eq!(deltas.concat(), "Hello world");
+}
+
+#[tokio::test]
+async fn per_run_chat_options_override_agent_defaults() {
+    // Agent default temperature 0.2; a per-run override of 0.9 must win, matching
+    // Python's `run_chat_options & ChatOptions(...)`.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client).temperature(0.2).build();
+
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        temperature: Some(0.9),
+        ..Default::default()
+    });
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].temperature,
+        Some(0.9),
+        "per-run temperature wins over the agent default"
+    );
+}
+
+#[tokio::test]
+async fn per_run_tools_are_visible_only_for_that_call() {
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let agent = ChatAgent::builder(client)
+        .tool(declaration_only_tool("base_tool"))
+        .build();
+
+    // Run 1: inject an extra per-run tool.
+    let options = AgentRunOptions::new().with_tool(declaration_only_tool("run_tool"));
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+    // Run 2: no per-run tools.
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let names =
+        |i: usize| -> Vec<String> { recorded[i].tools.iter().map(|t| t.name.clone()).collect() };
+    assert!(names(0).contains(&"base_tool".to_string()));
+    assert!(
+        names(0).contains(&"run_tool".to_string()),
+        "per-run tool visible for that call"
+    );
+    assert!(
+        !names(1).contains(&"run_tool".to_string()),
+        "per-run tool must NOT leak into the next call"
+    );
+    assert!(names(1).contains(&"base_tool".to_string()));
+}
+
+#[tokio::test]
+async fn declaration_only_tool_call_is_returned_to_caller() {
+    // The model calls a known-but-declaration-only tool; the loop must return
+    // the response with the FunctionCallContent intact (frontend-tool pattern).
+    let call = FunctionCallContent::new(
+        "c1",
+        "frontend_tool",
+        Some(FunctionArguments::Raw(json!({"x": 1}).to_string())),
+    );
+    let resp = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![resp]));
+    // A real executable tool is present so the invocation loop actually engages;
+    // the model instead calls the declaration-only tool, which the loop must
+    // return unexecuted rather than error on.
+    let real_tool = AiFunction::new(
+        "real",
+        "",
+        json!({ "type": "object", "properties": {} }),
+        |_args: Value| async { Ok(Value::Null) },
+    )
+    .into_definition();
+    let options = ChatOptions {
+        tools: vec![real_tool, declaration_only_tool("frontend_tool")],
+        ..Default::default()
+    };
+    let out = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+
+    let calls = out.function_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "frontend_tool");
+    let has_result = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .any(|c| matches!(c, Content::FunctionResult(_)));
+    assert!(!has_result, "declaration-only call must not be executed");
+}
+
+#[tokio::test]
+async fn unknown_tool_call_is_not_declaration_only() {
+    // A genuinely unknown tool name keeps the not-found error behavior (an
+    // error result, loop continues), NOT the declaration-only early return.
+    let call = FunctionCallContent::new("c1", "ghost_tool", None);
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("done");
+    // A real executable tool is present so the loop engages, but the model calls
+    // a different, unknown tool.
+    let real_tool = AiFunction::new(
+        "real",
+        "",
+        json!({ "type": "object", "properties": {} }),
+        |_args: Value| async { Ok(Value::Null) },
+    )
+    .into_definition();
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![ask, answer]));
+    let options = ChatOptions {
+        tools: vec![real_tool],
+        ..Default::default()
+    };
+    let out = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+
+    let has_error_result = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()));
+    assert!(
+        has_error_result,
+        "unknown tool yields an error result, not a declaration-only return"
+    );
+    assert_eq!(out.text(), "done");
+}
+
+// -- ToolSource: dynamic tool resolution per agent run --------------------
+
+/// A [`ToolSource`] that returns a scripted sequence of tool lists, one per
+/// `resolve_tools` call (the last is repeated once the script is
+/// exhausted). Stands in for an MCP server whose catalog changes between
+/// runs (e.g. after a `notifications/tools/list_changed`), without any real
+/// transport.
+struct StubToolSource {
+    name: String,
+    call_count: Arc<Mutex<usize>>,
+    responses: Vec<Vec<ToolDefinition>>,
+}
+
+impl StubToolSource {
+    fn new(name: &str, responses: Vec<Vec<ToolDefinition>>) -> Self {
+        Self {
+            name: name.to_string(),
+            call_count: Arc::new(Mutex::new(0)),
+            responses,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolSource for StubToolSource {
+    async fn resolve_tools(&self) -> Result<Vec<ToolDefinition>> {
+        let mut count = self.call_count.lock().unwrap();
+        let idx = (*count).min(self.responses.len().saturating_sub(1));
+        *count += 1;
+        Ok(self.responses.get(idx).cloned().unwrap_or_default())
+    }
+
+    fn source_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A [`ToolSource`] whose `resolve_tools` always fails — stands in for an
+/// MCP server that is unreachable at run time.
+struct FailingToolSource;
+
+#[async_trait]
+impl ToolSource for FailingToolSource {
+    async fn resolve_tools(&self) -> Result<Vec<ToolDefinition>> {
+        Err(Error::service("mcp server unreachable"))
+    }
+    fn source_name(&self) -> &str {
+        "failing-source"
+    }
+}
+
+#[tokio::test]
+async fn tool_source_resolved_fresh_each_run_sees_catalog_change() {
+    // Simulates a server whose tool list grows between runs (e.g. after a
+    // notifications/tools/list_changed): the agent must re-resolve the
+    // source on every run rather than resolving it once at build time.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let source = Arc::new(StubToolSource::new(
+        "mcp",
+        vec![
+            vec![declaration_only_tool("tool_a")],
+            vec![
+                declaration_only_tool("tool_a"),
+                declaration_only_tool("tool_b"),
+            ],
+        ],
+    ));
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+    let _ = agent
+        .run(vec![ChatMessage::user("hi again")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    let names =
+        |i: usize| -> Vec<String> { recorded[i].tools.iter().map(|t| t.name.clone()).collect() };
+    assert_eq!(names(0), vec!["tool_a".to_string()]);
+    assert_eq!(
+        names(1),
+        vec!["tool_a".to_string(), "tool_b".to_string()],
+        "second run must see the source's updated catalog"
+    );
+}
+
+#[tokio::test]
+async fn tool_source_dedup_explicit_tool_wins_over_source_tool() {
+    // The agent's own build-time tool named "shared" must win over a
+    // same-named tool produced by a tool source (dedup against "explicit
+    // tools", first wins).
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let explicit = ToolDefinition {
+        description: "explicit".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source_tool = ToolDefinition {
+        description: "from-source".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![source_tool]]));
+    let agent = ChatAgent::builder(client)
+        .tool(explicit)
+        .tool_source(source)
+        .build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(
+        shared.len(),
+        1,
+        "only one 'shared' tool should survive dedup"
+    );
+    assert_eq!(
+        shared[0].description, "explicit",
+        "the explicit tool wins over the source's same-named tool"
+    );
+}
+
+#[tokio::test]
+async fn tool_source_dedup_first_registered_source_wins() {
+    // Two sources both produce a "shared" tool; the first-registered
+    // source's version must win.
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let first = Arc::new(StubToolSource::new(
+        "first",
+        vec![vec![ToolDefinition {
+            description: "from-first".to_string(),
+            ..declaration_only_tool("shared")
+        }]],
+    ));
+    let second = Arc::new(StubToolSource::new(
+        "second",
+        vec![vec![ToolDefinition {
+            description: "from-second".to_string(),
+            ..declaration_only_tool("shared")
+        }]],
+    ));
+    let agent = ChatAgent::builder(client)
+        .tool_source(first)
+        .tool_source(second)
+        .build();
+
+    let _ = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].description, "from-first");
+}
+
+#[tokio::test]
+async fn tool_source_dedup_against_per_run_additional_tools() {
+    // A per-run `additional_tools` entry must also win over a same-named
+    // tool from a source (sources are resolved last).
+    let client = RecordingClient::new();
+    let seen = client.seen.clone();
+    let source_tool = ToolDefinition {
+        description: "from-source".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![source_tool]]));
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+
+    let per_run_tool = ToolDefinition {
+        description: "per-run".to_string(),
+        ..declaration_only_tool("shared")
+    };
+    let options = AgentRunOptions::new().with_tool(per_run_tool);
+    let _ = agent
+        .run_with_options(vec![ChatMessage::user("hi")], None, options)
+        .await
+        .unwrap();
+
+    let recorded = seen.lock().unwrap();
+    let shared: Vec<_> = recorded[0]
+        .tools
+        .iter()
+        .filter(|t| t.name == "shared")
+        .collect();
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].description, "per-run");
+}
+
+#[tokio::test]
+async fn failing_tool_source_propagates_error_out_of_run() {
+    // Mirrors the Python reference's run()/run_stream(), which do not catch
+    // a failure raised while connecting to an MCPTool at run time -- it
+    // propagates out of the whole run rather than being swallowed.
+    let client = MockClient::new(vec![ChatResponse::from_text("should not be reached")]);
+    let agent = ChatAgent::builder(client)
+        .tool_source(Arc::new(FailingToolSource))
+        .build();
+
+    let err = agent
+        .run(vec![ChatMessage::user("hi")], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Service(_)));
+}
+
+#[tokio::test]
+async fn tool_source_tool_is_invokable_by_the_function_loop() {
+    // A tool resolved from a ToolSource must be genuinely usable, not just
+    // present in the assembled ChatOptions: the model calls it and the
+    // function-invocation loop executes it like any other tool.
+    let call = FunctionCallContent::new(
+        "call_1",
+        "double",
+        Some(FunctionArguments::Raw(json!({"n": 21}).to_string())),
+    );
+    let ask = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    };
+    let answer = ChatResponse::from_text("42");
+    let client = MockClient::new(vec![ask, answer]);
+
+    let double = AiFunction::new(
+        "double",
+        "Double a number.",
+        json!({
+            "type": "object",
+            "properties": { "n": {"type": "integer"} },
+            "required": ["n"]
+        }),
+        |args: Value| async move {
+            let n = args["n"].as_i64().unwrap_or(0);
+            Ok(json!(n * 2))
+        },
+    )
+    .into_definition();
+    let source = Arc::new(StubToolSource::new("mcp", vec![vec![double]]));
+
+    let agent = ChatAgent::builder(client).tool_source(source).build();
+    let response = agent.run_once("double 21").await.unwrap();
+    assert!(response.text().contains("42"), "got: {}", response.text());
+    assert!(response.messages.iter().any(|m| m.role == Role::tool()
+        && m.contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionResult(_)))));
 }

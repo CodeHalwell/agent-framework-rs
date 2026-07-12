@@ -11,10 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_framework_azure::{
-    AzureOpenAIClient, ClientSecretCredential, ManagedIdentityCredential, TokenCredential,
+    AzureOpenAIClient, AzureOpenAIResponsesClient, ClientSecretCredential,
+    ManagedIdentityCredential, TokenCredential, WorkloadIdentityCredential,
 };
 use agent_framework_core::client::ChatClient;
+use agent_framework_core::error::Error;
 use agent_framework_core::types::{ChatMessage, ChatOptions};
+use futures::StreamExt;
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -235,6 +238,68 @@ async fn managed_identity_credential_fetches_and_caches() {
 }
 
 #[tokio::test]
+async fn workload_identity_credential_sends_client_assertion_and_caches() {
+    let server = FakeServer::start(
+        "200 OK",
+        vec![],
+        r#"{"token_type":"Bearer","expires_in":3600,"access_token":"workload-token"}"#,
+    );
+
+    // A real scratch file: the credential re-reads it on every token request.
+    let token_path = std::env::temp_dir().join(format!(
+        "af-workload-identity-loopback-{}.jwt",
+        std::process::id()
+    ));
+    std::fs::write(&token_path, "federated-jwt-contents").expect("write fake token file");
+
+    // `with_overrides` supplies everything explicitly so this test never
+    // touches real process env vars (consistent with the rest of this file).
+    let cred = WorkloadIdentityCredential::with_overrides(
+        "https://ai.azure.com/.default",
+        Some("my-tenant".to_string()),
+        Some("my-client".to_string()),
+        Some(token_path.to_str().unwrap().to_string()),
+    )
+    .expect("all required fields supplied")
+    .with_authority(&server.addr);
+
+    // First call hits the network.
+    assert_eq!(cred.get_token().await.unwrap(), "workload-token");
+    // Second call is served from cache (expires_in=3600 keeps it fresh).
+    assert_eq!(cred.get_token().await.unwrap(), "workload-token");
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        server.request_count(),
+        1,
+        "cached token should not re-request"
+    );
+
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /my-tenant/oauth2/v2.0/token"),
+        "got: {line}"
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("grant_type=client_credentials"),
+        "body: {body}"
+    );
+    assert!(body.contains("client_id=my-client"), "body: {body}");
+    assert!(
+        body.contains("client_assertion=federated-jwt-contents"),
+        "body: {body}"
+    );
+    // `:` is percent-escaped in form encoding.
+    assert!(
+        body.contains("client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer"),
+        "body: {body}"
+    );
+
+    std::fs::remove_file(&token_path).ok();
+}
+
+#[tokio::test]
 async fn azure_openai_maps_429_to_service_status_with_retry_after() {
     let server = FakeServer::start(
         "429 Too Many Requests",
@@ -252,6 +317,101 @@ async fn azure_openai_maps_429_to_service_status_with_retry_after() {
     assert_eq!(err.retry_after(), Some(2.0), "error: {err}");
 }
 
+/// Real end-to-end proof (actual `reqwest` round trip, not just a unit test of
+/// the classification function) that `AzureOpenAIClient` reuses
+/// `agent_framework_openai::classify_service_error` and gets the same
+/// granular variants OpenAI's own client would.
+#[tokio::test]
+async fn azure_openai_maps_401_to_invalid_auth() {
+    let server = FakeServer::start(
+        "401 Unauthorized",
+        vec![],
+        r#"{"error":{"message":"Access denied","code":"invalid_api_key"}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidAuth { .. }),
+        "error: {err:?}"
+    );
+    // Not a ServiceStatus, so the retry layer never sees a status/retry_after
+    // for it — it just treats it as non-retryable directly.
+    assert_eq!(err.status(), None, "error: {err}");
+}
+
+#[tokio::test]
+async fn azure_openai_maps_plain_400_to_invalid_request() {
+    let server = FakeServer::start(
+        "400 Bad Request",
+        vec![],
+        r#"{"error":{"message":"Unrecognized field","type":"invalid_request_error"}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidRequest { .. }),
+        "error: {err:?}"
+    );
+}
+
+/// Azure OpenAI's content-filter shape: a `400` whose `error.code` is
+/// `"content_filter"` (with a nested `innererror.code` giving the
+/// `ResponsibleAIPolicyViolation` detail) must classify as
+/// `ServiceContentFilter`, not the generic `ServiceInvalidRequest` a plain
+/// `400` gets.
+#[tokio::test]
+async fn azure_openai_maps_content_filter_400_to_content_filter() {
+    let server = FakeServer::start(
+        "400 Bad Request",
+        vec![],
+        r#"{"error":{"message":"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.","code":"content_filter","status":400,"innererror":{"code":"ResponsibleAIPolicyViolation","content_filter_result":{"violence":{"filtered":true,"severity":"medium"}}}}}"#,
+    );
+
+    let client = AzureOpenAIClient::new(&server.addr, "gpt-4o", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceContentFilter { .. }),
+        "error: {err:?}"
+    );
+}
+
+/// Same classification, proven through `AzureOpenAIResponsesClient` too (a
+/// separate `post` in `responses.rs` that also delegates to
+/// `agent_framework_openai::classify_service_error`).
+#[tokio::test]
+async fn azure_openai_responses_client_maps_403_to_invalid_auth() {
+    let server = FakeServer::start(
+        "403 Forbidden",
+        vec![],
+        r#"{"error":{"message":"Forbidden"}}"#,
+    );
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let err = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::ServiceInvalidAuth { .. }),
+        "error: {err:?}"
+    );
+}
+
 /// A managed-identity credential that fails (non-success status) should surface
 /// a clear error rather than caching anything, so the chain can fall through.
 #[tokio::test]
@@ -260,4 +420,91 @@ async fn managed_identity_non_success_is_an_error() {
     let cred = ManagedIdentityCredential::new("https://ai.azure.com/.default")
         .with_endpoint(format!("{}/token", server.addr));
     assert!(cred.get_token().await.is_err());
+}
+
+/// End-to-end round trip for `AzureOpenAIResponsesClient::get_response`: a
+/// real `reqwest` POST against a loopback server, asserting both the outbound
+/// request (route, api-version, auth header, `model` = deployment name) and
+/// that the JSON response is parsed via the reused
+/// `agent_framework_openai::responses::parse_response`.
+#[tokio::test]
+async fn azure_openai_responses_client_loopback_round_trip() {
+    let server = FakeServer::start(
+        "200 OK",
+        vec![],
+        r#"{"id":"resp_abc123","model":"my-deployment","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from Azure Responses!"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#,
+    );
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let response = client
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+
+    assert_eq!(response.text(), "Hello from Azure Responses!");
+    assert_eq!(response.response_id.as_deref(), Some("resp_abc123"));
+    assert_eq!(response.usage_details.unwrap().total_token_count, Some(15));
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (line, headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /openai/v1/responses?api-version=preview"),
+        "got: {line}"
+    );
+    assert!(
+        headers.to_ascii_lowercase().contains("api-key: test-key"),
+        "headers: {headers}"
+    );
+    let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["model"], serde_json::json!("my-deployment"));
+    assert_eq!(
+        body_json["input"],
+        serde_json::json!([{ "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "hi" }
+        ]}])
+    );
+}
+
+/// SSE parse smoke test: `AzureOpenAIResponsesClient::get_streaming_response`
+/// against a loopback server emitting real Responses-API SSE events, proving
+/// the reused `agent_framework_openai::responses::parse_responses_sse_stream`
+/// is wired all the way through to a live `reqwest::Response` byte stream
+/// (not just exercised against synthetic `serde_json::Value`s, as
+/// `agent-framework-openai`'s own unit tests do).
+#[tokio::test]
+async fn azure_openai_responses_client_streams_sse_events() {
+    let sse_body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"model\":\"my-deployment\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n";
+    let server = FakeServer::start("200 OK", vec![], sse_body);
+
+    let client = AzureOpenAIResponsesClient::new(&server.addr, "my-deployment", "test-key");
+    let mut stream = client
+        .get_streaming_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+
+    let mut text = String::new();
+    let mut saw_completed = false;
+    while let Some(update) = stream.next().await {
+        let update = update.expect("stream update should parse cleanly");
+        text.push_str(&update.text_content());
+        if update.response_id.as_deref() == Some("resp_stream_1") {
+            saw_completed = true;
+            // `store != Some(false)` auto-populates `conversation_id`,
+            // identical to `OpenAIResponsesClient`'s streaming behavior.
+            assert_eq!(update.conversation_id.as_deref(), Some("resp_stream_1"));
+        }
+    }
+
+    assert_eq!(text, "Hi");
+    assert!(saw_completed, "expected a response.completed update");
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(
+        line.starts_with("POST /openai/v1/responses?api-version=preview"),
+        "got: {line}"
+    );
+    let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["stream"], serde_json::json!(true));
 }

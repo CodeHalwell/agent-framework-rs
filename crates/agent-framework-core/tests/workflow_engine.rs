@@ -12,7 +12,8 @@ use agent_framework_core::workflow::{
     get_checkpoint_summary, validate_workflow_graph, AgentExecutor, Case, CheckpointStorage,
     Default as SwitchDefault, EdgeGroup, Executor, FileCheckpointStorage, FunctionExecutor,
     InMemoryCheckpointStorage, RequestInfoExecutor, RequestResponse, ValidationType, Workflow,
-    WorkflowBuilder, WorkflowContext, WorkflowEvent, WorkflowExecutor, WorkflowRunState,
+    WorkflowBuilder, WorkflowCheckpoint, WorkflowContext, WorkflowEvent, WorkflowExecutor,
+    WorkflowRunState,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -664,6 +665,59 @@ async fn agent_executor_emits_agent_events() {
     );
 }
 
+/// An agent that returns several messages, to exercise incremental per-update
+/// `AgentRunUpdate` emission by `run_agent_and_emit`.
+struct MultiMessageAgent;
+
+#[async_trait]
+impl Agent for MultiMessageAgent {
+    async fn run(
+        &self,
+        _messages: Vec<ChatMessage>,
+        _thread: Option<&mut AgentThread>,
+    ) -> Result<AgentRunResponse> {
+        Ok(AgentRunResponse {
+            messages: vec![
+                ChatMessage::assistant("one"),
+                ChatMessage::assistant("two"),
+                ChatMessage::assistant("three"),
+            ],
+            ..Default::default()
+        })
+    }
+    fn id(&self) -> &str {
+        "multi"
+    }
+}
+
+#[tokio::test]
+async fn agent_executor_emits_incremental_agent_run_updates() {
+    // The orchestration layer now drives `run_stream` and emits one
+    // `AgentRunUpdate` per streamed update, then a single terminal `AgentRun`.
+    let agent = Arc::new(MultiMessageAgent) as Arc<dyn Agent>;
+    let exec = AgentExecutor::new("a1", agent).with_output(true);
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(exec))
+        .set_start("a1")
+        .build()
+        .unwrap();
+
+    let run = workflow.run(json!("hi")).await.unwrap();
+
+    let update_count = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::AgentRunUpdate { .. }))
+        .count();
+    assert_eq!(update_count, 3, "one AgentRunUpdate per streamed update");
+    let run_count = run
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::AgentRun { .. }))
+        .count();
+    assert_eq!(run_count, 1, "exactly one terminal AgentRun");
+}
+
 #[tokio::test]
 async fn fanin_sink_request_info_response_bypasses_barrier() {
     // Two sources fan into a joiner; the joiner asks a question through
@@ -716,4 +770,224 @@ async fn fanin_sink_request_info_response_bypasses_barrier() {
 
     assert_eq!(run.state(), WorkflowRunState::Idle);
     assert_eq!(run.last_output(), Some(json!("approved")));
+}
+
+// ----------------------------------------------------------------------------
+// Checkpointing: a fan-in partially satisfied across supersteps survives a
+// resume (BUG: the buffered messages used to be dropped on checkpoint).
+// ----------------------------------------------------------------------------
+
+/// `split` fans out to `a` and `hop`; `a` reaches the `join` fan-in one
+/// superstep before `b` (which sits behind the extra `hop`). So there is a
+/// superstep boundary at which `join`'s barrier holds `a`'s message but not
+/// `b`'s — exactly the state a checkpoint must preserve.
+fn build_staggered_fanin(storage: Arc<dyn CheckpointStorage>) -> Workflow {
+    let split = FunctionExecutor::new("split", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let a = FunctionExecutor::new("a", |_msg, ctx| async move {
+        ctx.send_message(json!("a-done")).await?;
+        Ok(())
+    });
+    let hop = FunctionExecutor::new("hop", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let b = FunctionExecutor::new("b", |_msg, ctx| async move {
+        ctx.send_message(json!("b-done")).await?;
+        Ok(())
+    });
+    let join = FunctionExecutor::new("join", |msg, ctx| async move {
+        // The barrier fires with an array of both sources' payloads (source order).
+        ctx.yield_output(msg).await?;
+        Ok(())
+    });
+
+    WorkflowBuilder::new()
+        .add_executor(Arc::new(split))
+        .add_executor(Arc::new(a))
+        .add_executor(Arc::new(hop))
+        .add_executor(Arc::new(b))
+        .add_executor(Arc::new(join))
+        .set_start("split")
+        .add_fan_out("split", vec!["a".to_string(), "hop".to_string()])
+        .add_edge("hop", "b")
+        .add_fan_in(vec!["a".to_string(), "b".to_string()], "join")
+        .with_checkpointing(storage)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_preserves_partial_fanin_across_supersteps() {
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+
+    // Baseline: the full run joins both inputs, in source order.
+    let run = build_staggered_fanin(storage.clone())
+        .run(json!("go"))
+        .await
+        .unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    assert_eq!(run.last_output(), Some(json!(["a-done", "b-done"])));
+
+    // The superstep-3 checkpoint is taken while `a` has delivered to `join` but
+    // `b` has not: the partial barrier must be captured in `fanin_state`.
+    let cp = storage
+        .list(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.iteration_count == 3)
+        .expect("a checkpoint taken between the two fan-in deliveries");
+    let join_buf = cp
+        .fanin_state
+        .get("join")
+        .expect("join's partial fan-in buffer is captured");
+    assert_eq!(
+        join_buf.get("a"),
+        Some(&json!("a-done")),
+        "a's message is buffered"
+    );
+    assert!(
+        !join_buf.contains_key("b"),
+        "b has not delivered at this checkpoint"
+    );
+
+    // Resume from that mid-barrier checkpoint into a fresh, identical workflow:
+    // the barrier still fires with BOTH inputs (it would silently never fire if
+    // the buffered `a` message were lost on resume).
+    let resumed = build_staggered_fanin(storage.clone());
+    let run2 = resumed
+        .run_from_checkpoint(&cp.checkpoint_id, storage.clone())
+        .await
+        .unwrap();
+    assert_eq!(run2.state(), WorkflowRunState::Idle);
+    assert_eq!(run2.last_output(), Some(json!(["a-done", "b-done"])));
+}
+
+#[tokio::test]
+async fn legacy_checkpoint_without_fanin_state_loads() {
+    // A checkpoint written before `fanin_state` existed omits the field
+    // entirely; it must still deserialize (serde default = empty map).
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let _ = build_staggered_fanin(storage.clone())
+        .run(json!("go"))
+        .await
+        .unwrap();
+    let cp = storage
+        .list(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.iteration_count == 3)
+        .expect("a mid-barrier checkpoint");
+
+    let mut value = serde_json::to_value(&cp).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fanin_state")
+            .is_some(),
+        "sanity: the field is present before stripping"
+    );
+    let legacy: WorkflowCheckpoint = serde_json::from_value(value).unwrap();
+    assert!(
+        legacy.fanin_state.is_empty(),
+        "a signatureless/fan-in-less checkpoint deserializes with an empty buffer"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Within-superstep execution is concurrent (BUG: it used to be sequential),
+// while events and outputs stay deterministic.
+// ----------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn superstep_executes_targets_concurrently() {
+    use std::time::Duration;
+
+    // Two fan-out targets that each sleep 100ms. Run sequentially the fan-out
+    // superstep would take 200ms; run concurrently the two sleeps overlap and
+    // it takes ~100ms of (paused) virtual time.
+    fn slow(id: &str) -> FunctionExecutor {
+        FunctionExecutor::new(id.to_string(), |_msg, ctx| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ctx.yield_output(json!("done")).await?;
+            Ok(())
+        })
+    }
+    let split = FunctionExecutor::new("split", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(split))
+        .add_executor(Arc::new(slow("a")))
+        .add_executor(Arc::new(slow("b")))
+        .set_start("split")
+        .add_fan_out("split", vec!["a".to_string(), "b".to_string()])
+        .build()
+        .unwrap();
+
+    let start = tokio::time::Instant::now();
+    let run = workflow.run(json!("go")).await.unwrap();
+    let elapsed = start.elapsed();
+
+    // Exactly one sleep of virtual time: the two deliveries genuinely overlap.
+    assert_eq!(
+        elapsed,
+        Duration::from_millis(100),
+        "fan-out targets must run concurrently, not one-after-another"
+    );
+    assert_eq!(run.outputs().len(), 2, "both targets produced output");
+}
+
+#[tokio::test]
+async fn fan_out_event_and_output_order_is_deterministic() {
+    // The concurrent superstep must still emit events and outputs in a fixed
+    // (sorted-target) order, so two runs of the same fan-out graph agree.
+    fn build() -> Workflow {
+        let split = FunctionExecutor::new("split", |msg, ctx| async move {
+            ctx.send_message(msg).await?;
+            Ok(())
+        });
+        let mk = |id: &'static str| {
+            FunctionExecutor::new(id, move |_m, ctx| async move {
+                ctx.yield_output(json!(id)).await?;
+                Ok(())
+            })
+        };
+        WorkflowBuilder::new()
+            .add_executor(Arc::new(split))
+            .add_executor(Arc::new(mk("a")))
+            .add_executor(Arc::new(mk("b")))
+            .add_executor(Arc::new(mk("c")))
+            .set_start("split")
+            .add_fan_out(
+                "split",
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            )
+            .build()
+            .unwrap()
+    }
+
+    let run1 = build().run(json!("go")).await.unwrap();
+    let run2 = build().run(json!("go")).await.unwrap();
+
+    let tags1: Vec<String> = run1.events().iter().map(tag).collect();
+    let tags2: Vec<String> = run2.events().iter().map(tag).collect();
+    assert_eq!(
+        tags1, tags2,
+        "the event sequence is identical across runs of the same fan-out graph"
+    );
+
+    // Outputs are ordered by (sorted) target, independent of completion order.
+    assert_eq!(
+        run1.outputs(),
+        vec![json!("a"), json!("b"), json!("c")],
+        "outputs follow sorted-target order"
+    );
+    assert_eq!(run2.outputs(), run1.outputs());
 }

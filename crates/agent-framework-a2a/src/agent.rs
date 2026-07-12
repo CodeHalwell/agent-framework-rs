@@ -1,23 +1,27 @@
 //! [`A2AAgent`]: wraps an [`A2AClient`] as a local [`Agent`].
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::{Agent, AgentRunOptions, AgentRunStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentRunResponse, ChatMessage, Content, DataContent, IntoMessages, Role, UriContent,
+    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, DataContent, IntoMessages,
+    Role, UriContent,
 };
 
-use crate::client::A2AClient;
+use crate::client::{A2AClient, A2AEventStream};
 use crate::types::{
     AgentCard, Artifact, FileData, FilePart, FileWithBytes, FileWithUri, Message as A2AMessage,
-    MessageRole, MessageSendParams, Part, SendMessageResult, Task, TaskState, TextPart,
+    MessageRole, MessageSendParams, MessageStreamEvent, Part, SendMessageResult, Task, TaskState,
+    TextPart,
 };
 
 /// Agent2Agent (A2A) protocol client agent.
@@ -234,6 +238,64 @@ impl Agent for A2AAgent {
         Ok(response)
     }
 
+    /// Real streaming override: sends the newest message via the client's
+    /// `message/stream` SSE endpoint and maps each
+    /// [`MessageStreamEvent`] to an [`AgentRunResponseUpdate`] as it arrives,
+    /// accumulating `contextId`/`taskId` and writing the resulting
+    /// continuity state back onto the (owned) thread once the stream ends —
+    /// mirroring [`Agent::run`]'s bookkeeping on this type. Per-run
+    /// [`AgentRunOptions`] have no A2A representation; non-empty options are
+    /// ignored with a warning.
+    ///
+    /// Note: unlike [`ChatAgent`](agent_framework_core::agent::ChatAgent),
+    /// A2A continuity state lives in a plain (non-shared) thread field, so the
+    /// end-of-stream write-back is not observable through a thread clone taken
+    /// before streaming — carry the returned continuity forward via
+    /// [`Agent::run`] when you need multi-turn A2A conversations.
+    async fn run_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        thread: Option<AgentThread>,
+        options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        if let Some(opts) = &options {
+            if !opts.is_empty() {
+                tracing::warn!(
+                    agent = %self.id,
+                    "A2AAgent does not support per-run options; ignoring them"
+                );
+            }
+        }
+
+        let last = messages
+            .last()
+            .ok_or_else(|| {
+                Error::AgentExecution("A2AAgent::run_stream requires at least one message".into())
+            })?
+            .clone();
+
+        self.ensure_initialized().await;
+
+        let thread = thread.unwrap_or_else(|| self.get_new_thread());
+        let state = ThreadState::decode(thread.service_thread_id());
+        let outgoing = chat_message_to_a2a_message(
+            &last,
+            state.context_id.as_deref(),
+            state.task_id.as_deref(),
+        )?;
+
+        let inner = self
+            .client
+            .send_message_stream(MessageSendParams::new(outgoing))
+            .await?;
+
+        // `state` (decoded above) is threaded through the forwarder, which
+        // accumulates `contextId`/`taskId` from the streamed events and writes
+        // the result back onto the thread once the stream ends.
+        let stream = a2a_forward_stream(inner, thread, state, self.name.clone());
+        Ok(stream.boxed())
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -241,6 +303,179 @@ impl Agent for A2AAgent {
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+}
+
+/// Map one A2A `message/stream` event to zero or more agent updates, threading
+/// `contextId`/`taskId` continuity through `state`. Pure (no I/O) so it can be
+/// unit-tested directly, the same way the crate tests the non-streaming
+/// conversions.
+fn stream_event_to_updates(
+    event: &MessageStreamEvent,
+    state: &mut ThreadState,
+    name: Option<&str>,
+) -> Vec<Result<AgentRunResponseUpdate>> {
+    // `response_id` follows the same rule as the non-streaming `run()`
+    // (`SendMessageResult` mapping above): a bare message exposes its
+    // message id, task-bearing events expose the task id — so aggregating
+    // the stream yields the same `AgentRunResponse.response_id` and
+    // streaming clients can cancel/poll the A2A task.
+    let (updates, response_id) = match event {
+        MessageStreamEvent::Message(m) => {
+            if m.context_id.is_some() {
+                state.context_id = m.context_id.clone();
+            }
+            // Replace unconditionally, exactly like the non-streaming
+            // `SendMessageResult::Message` mapping: a standalone message
+            // with no task id means there is no active task, and keeping a
+            // previous (completed) task's id would make the next outgoing
+            // message continue the wrong task. (`context_id` above keeps the
+            // old value when absent — also matching run().)
+            state.task_id = m.task_id.clone();
+            (
+                wrap_message(a2a_message_to_chat_message(m), name),
+                Some(m.message_id.clone()),
+            )
+        }
+        MessageStreamEvent::Task(t) => {
+            state.context_id = Some(t.context_id.clone());
+            state.task_id = Some(t.id.clone());
+            let updates = match task_to_chat_messages(t) {
+                Ok(msgs) => msgs
+                    .into_iter()
+                    .map(|cm| Ok(message_to_update(cm, name)))
+                    .collect(),
+                Err(e) => vec![Err(e)],
+            };
+            (updates, Some(t.id.clone()))
+        }
+        MessageStreamEvent::StatusUpdate(e) => {
+            state.context_id = Some(e.context_id.clone());
+            state.task_id = Some(e.task_id.clone());
+            let updates = match &e.status.message {
+                Some(msg) => wrap_message(a2a_message_to_chat_message(msg), name),
+                None => Vec::new(),
+            };
+            (updates, Some(e.task_id.clone()))
+        }
+        MessageStreamEvent::ArtifactUpdate(e) => {
+            state.context_id = Some(e.context_id.clone());
+            state.task_id = Some(e.task_id.clone());
+            (
+                wrap_message(artifact_to_chat_message(&e.artifact), name),
+                Some(e.task_id.clone()),
+            )
+        }
+    };
+    let mut updates: Vec<Result<AgentRunResponseUpdate>> = updates
+        .into_iter()
+        .map(|u| {
+            u.map(|mut update| {
+                update.response_id = response_id.clone();
+                update
+            })
+        })
+        .collect();
+
+    // A task-bearing event can carry no message content — a status-only
+    // transition, or a `Task` with no history/artifacts. Surface one
+    // metadata-only update so aggregating the stream still exposes the task id
+    // for polling/cancellation (the non-streaming `run()` likewise returns the
+    // task id even when the task carries no messages). Bare `Message` events
+    // are not task-bearing and get no such fallback.
+    let is_task_bearing = matches!(
+        event,
+        MessageStreamEvent::Task(_)
+            | MessageStreamEvent::StatusUpdate(_)
+            | MessageStreamEvent::ArtifactUpdate(_)
+    );
+    if updates.is_empty() && is_task_bearing {
+        if let Some(id) = response_id {
+            updates.push(Ok(AgentRunResponseUpdate {
+                response_id: Some(id),
+                ..Default::default()
+            }));
+        }
+    }
+    updates
+}
+
+fn wrap_message(
+    result: Result<ChatMessage>,
+    name: Option<&str>,
+) -> Vec<Result<AgentRunResponseUpdate>> {
+    match result {
+        Ok(cm) => vec![Ok(message_to_update(cm, name))],
+        Err(e) => vec![Err(e)],
+    }
+}
+
+fn message_to_update(cm: ChatMessage, name: Option<&str>) -> AgentRunResponseUpdate {
+    AgentRunResponseUpdate {
+        contents: cm.contents,
+        role: Some(cm.role),
+        author_name: cm.author_name.or_else(|| name.map(str::to_string)),
+        message_id: cm.message_id,
+        ..Default::default()
+    }
+}
+
+/// State carried while forwarding an A2A event stream as agent updates.
+struct A2AForward {
+    inner: A2AEventStream,
+    queue: VecDeque<Result<AgentRunResponseUpdate>>,
+    state: ThreadState,
+    thread: Option<AgentThread>,
+    name: Option<String>,
+    done: bool,
+}
+
+/// Forward an A2A `message/stream` event stream as agent updates, writing the
+/// accumulated `contextId`/`taskId` continuity back onto `thread` once the
+/// stream is exhausted.
+fn a2a_forward_stream(
+    inner: A2AEventStream,
+    thread: AgentThread,
+    state: ThreadState,
+    name: Option<String>,
+) -> impl futures::Stream<Item = Result<AgentRunResponseUpdate>> + Send {
+    futures::stream::unfold(
+        A2AForward {
+            inner,
+            queue: VecDeque::new(),
+            state,
+            thread: Some(thread),
+            name,
+            done: false,
+        },
+        |mut st| async move {
+            loop {
+                if let Some(item) = st.queue.pop_front() {
+                    return Some((item, st));
+                }
+                if st.done {
+                    // Stream exhausted: persist the accumulated continuity.
+                    if let Some(mut thread) = st.thread.take() {
+                        if let Some(encoded) = st.state.encode() {
+                            let _ = thread.set_service_thread_id(encoded);
+                        }
+                    }
+                    return None;
+                }
+                match st.inner.next().await {
+                    Some(Ok(event)) => {
+                        let updates =
+                            stream_event_to_updates(&event, &mut st.state, st.name.as_deref());
+                        st.queue.extend(updates);
+                    }
+                    Some(Err(e)) => {
+                        st.done = true;
+                        st.queue.push_back(Err(e));
+                    }
+                    None => st.done = true,
+                }
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -353,6 +588,7 @@ fn content_type_name(content: &Content) -> &'static str {
         Content::HostedVectorStore(_) => "hosted_vector_store",
         Content::FunctionApprovalRequest(_) => "function_approval_request",
         Content::FunctionApprovalResponse(_) => "function_approval_response",
+        Content::Unknown => "unknown",
     }
 }
 
@@ -835,6 +1071,161 @@ mod tests {
     }
 
     // -- ThreadState --------------------------------------------------
+
+    // -- Streaming event -> update mapping (Agent::run_stream override) -----
+
+    #[test]
+    fn stream_event_message_maps_to_update_and_tracks_ids() {
+        let mut state = ThreadState::default();
+        let ev = MessageStreamEvent::Message(A2AMessage {
+            kind: "message".into(),
+            role: MessageRole::Agent,
+            parts: vec![Part::Text(TextPart {
+                text: "hi".into(),
+                metadata: None,
+            })],
+            message_id: "m1".into(),
+            task_id: Some("t1".into()),
+            context_id: Some("c1".into()),
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, Some("weather"));
+        assert_eq!(updates.len(), 1);
+        let u = updates.into_iter().next().unwrap().unwrap();
+        assert_eq!(u.text(), "hi");
+        assert_eq!(u.author_name.as_deref(), Some("weather"));
+        // Same rule as non-streaming run(): a bare message exposes its
+        // message id as the response id.
+        assert_eq!(u.response_id.as_deref(), Some("m1"));
+        // Continuity tracked from the event.
+        assert_eq!(state.context_id.as_deref(), Some("c1"));
+        assert_eq!(state.task_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn stream_event_bare_message_clears_a_stale_task_id() {
+        // Matches run()'s SendMessageResult::Message mapping: a standalone
+        // message without a task id means no active task — a previous
+        // (completed) task's id must not leak into the next outgoing message.
+        let mut state = ThreadState {
+            context_id: Some("c1".into()),
+            task_id: Some("finished-task".into()),
+        };
+        let ev = MessageStreamEvent::Message(A2AMessage {
+            kind: "message".into(),
+            role: MessageRole::Agent,
+            parts: vec![Part::Text(TextPart {
+                text: "standalone".into(),
+                metadata: None,
+            })],
+            message_id: "m2".into(),
+            task_id: None,
+            context_id: None,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        assert_eq!(updates.len(), 1);
+        assert!(state.task_id.is_none());
+        // Context continuity keeps the previous id when absent (run() parity).
+        assert_eq!(state.context_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn stream_event_status_update_surfaces_message_and_tracks_ids() {
+        let mut state = ThreadState::default();
+        let ev = MessageStreamEvent::StatusUpdate(crate::types::TaskStatusUpdateEvent {
+            task_id: "t2".into(),
+            context_id: "c2".into(),
+            status: crate::types::TaskStatus {
+                state: TaskState::InputRequired,
+                message: Some(A2AMessage {
+                    kind: "message".into(),
+                    role: MessageRole::Agent,
+                    parts: vec![Part::Text(TextPart {
+                        text: "What city?".into(),
+                        metadata: None,
+                    })],
+                    message_id: "q1".into(),
+                    task_id: None,
+                    context_id: None,
+                    metadata: None,
+                }),
+                timestamp: None,
+            },
+            is_final: false,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        assert_eq!(updates.len(), 1);
+        let u = updates.into_iter().next().unwrap().unwrap();
+        assert_eq!(u.text(), "What city?");
+        // Task-bearing events expose the task id as the response id, so a
+        // streaming client can cancel/poll the task after aggregation.
+        assert_eq!(u.response_id.as_deref(), Some("t2"));
+        assert_eq!(state.context_id.as_deref(), Some("c2"));
+        assert_eq!(state.task_id.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn stream_event_status_update_without_message_yields_no_update_but_tracks_ids() {
+        let mut state = ThreadState::default();
+        let ev = MessageStreamEvent::StatusUpdate(crate::types::TaskStatusUpdateEvent {
+            task_id: "t3".into(),
+            context_id: "c3".into(),
+            status: crate::types::TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            is_final: false,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        // A status-only transition still surfaces the task id via one
+        // metadata-only update, so aggregation can poll/cancel the task.
+        assert_eq!(updates.len(), 1);
+        let u = updates.into_iter().next().unwrap().unwrap();
+        assert!(u.contents.is_empty());
+        assert_eq!(u.response_id.as_deref(), Some("t3"));
+        assert_eq!(state.task_id.as_deref(), Some("t3"));
+    }
+
+    #[test]
+    fn stream_event_task_updates_carry_the_task_id_as_response_id() {
+        let mut state = ThreadState::default();
+        let ev = MessageStreamEvent::Task(crate::types::Task {
+            id: "task-42".into(),
+            context_id: "c9".into(),
+            status: crate::types::TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            history: Some(vec![A2AMessage {
+                kind: "message".into(),
+                role: MessageRole::Agent,
+                parts: vec![Part::Text(TextPart {
+                    text: "done".into(),
+                    metadata: None,
+                })],
+                message_id: "m9".into(),
+                task_id: Some("task-42".into()),
+                context_id: Some("c9".into()),
+                metadata: None,
+            }]),
+            artifacts: None,
+            metadata: None,
+        });
+        let updates = stream_event_to_updates(&ev, &mut state, None);
+        assert!(!updates.is_empty());
+        for u in updates {
+            let u = u.unwrap();
+            // Mirrors run(): a Task result's response_id is the task id.
+            assert_eq!(u.response_id.as_deref(), Some("task-42"));
+        }
+        assert_eq!(state.task_id.as_deref(), Some("task-42"));
+        assert_eq!(state.context_id.as_deref(), Some("c9"));
+    }
 
     #[test]
     fn thread_state_encode_decode_round_trip() {

@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
 use crate::types::ChatMessage;
 
@@ -41,11 +41,20 @@ pub trait ContextProvider: Send + Sync {
         Ok(())
     }
 
-    /// Optional hook fired after an invocation completes.
+    /// Optional hook fired after an invocation completes, on *both* the
+    /// success and failure paths.
+    ///
+    /// Mirrors Python's `ContextProvider.invoked(..., invoke_exception=...)`
+    /// (`_memory.py:119-138`): providers can observe the request and the
+    /// outcome. On success, `response_messages` holds the produced messages and
+    /// `error` is `None`. On failure, `error` carries the run failure and
+    /// `response_messages` is empty. A provider that only cares about
+    /// successful turns can ignore `error`.
     async fn invoked(
         &self,
         _request_messages: &[ChatMessage],
         _response_messages: &[ChatMessage],
+        _error: Option<&Error>,
     ) -> Result<()> {
         Ok(())
     }
@@ -100,9 +109,14 @@ impl ContextProvider for AggregateContextProvider {
         Ok(())
     }
 
-    async fn invoked(&self, request: &[ChatMessage], response: &[ChatMessage]) -> Result<()> {
+    async fn invoked(
+        &self,
+        request: &[ChatMessage],
+        response: &[ChatMessage],
+        error: Option<&Error>,
+    ) -> Result<()> {
         for provider in &self.providers {
-            provider.invoked(request, response).await?;
+            provider.invoked(request, response, error).await?;
         }
         Ok(())
     }

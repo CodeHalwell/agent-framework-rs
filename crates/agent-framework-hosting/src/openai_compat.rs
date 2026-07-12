@@ -5,9 +5,10 @@
 //! `data: [DONE]`). This lets any OpenAI-Chat client talk to an agent.
 //!
 //! # Divergences
-//! - Streaming is realized by running the agent to completion and then framing
-//!   the result as `chat.completion.chunk`s (the core `Agent` trait exposes only
-//!   `run`). Chunk framing matches the OpenAI streaming protocol.
+//! - Streaming drives the core `Agent::run_stream` and frames each update as a
+//!   `chat.completion.chunk` live (one content chunk per non-empty update);
+//!   non-streaming requests stay on `Agent::run`. Chunk framing matches the
+//!   OpenAI streaming protocol.
 //! - `usage` uses the agent's reported token counts when available, otherwise a
 //!   ~4-chars-per-token estimate.
 
@@ -17,6 +18,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,7 +26,7 @@ use agent_framework_core::agent::Agent;
 use agent_framework_core::types::{AgentRunResponse, ChatMessage, Role, UsageDetails};
 
 use crate::registry::IntoAgentRegistration;
-use crate::sse::sse_response;
+use crate::sse::sse_response_stream;
 use crate::util;
 
 /// Serves one agent over the OpenAI Chat Completions API.
@@ -94,17 +96,69 @@ async fn chat_completions(
         .map(|m| content_text(&m.content).len())
         .sum();
 
-    let response = match state.agent.run(messages, None).await {
-        Ok(r) => r,
-        Err(e) => return error_response(e.to_string()),
-    };
-
     let id = format!("chatcmpl-{}", util::short_hex());
     let created = util::now_ts() as u64;
 
     if request.stream {
-        sse_response(stream_chunks(&response, &id, created, &model))
+        // Live streaming: drive `run_stream` and frame each update as a
+        // `chat.completion.chunk` as it arrives.
+        let agent = state.agent.clone();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+        tokio::spawn(async move {
+            // First chunk carries the assistant role.
+            let _ = tx.unbounded_send(chunk(
+                &id,
+                created,
+                &model,
+                json!({ "role": "assistant" }),
+                Value::Null,
+            ));
+            match agent.run_stream(messages, None, None).await {
+                Ok(mut stream) => {
+                    let mut had_error = false;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(update) => {
+                                let text = update.text();
+                                if !text.is_empty() {
+                                    let _ = tx.unbounded_send(chunk(
+                                        &id,
+                                        created,
+                                        &model,
+                                        json!({ "content": text }),
+                                        Value::Null,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.unbounded_send(stream_error(&e.to_string()));
+                                had_error = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !had_error {
+                        // Terminal chunk.
+                        let _ = tx.unbounded_send(chunk(
+                            &id,
+                            created,
+                            &model,
+                            json!({}),
+                            Value::String("stop".to_string()),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.unbounded_send(stream_error(&e.to_string()));
+                }
+            }
+        });
+        sse_response_stream(rx)
     } else {
+        let response = match state.agent.run(messages, None).await {
+            Ok(r) => r,
+            Err(e) => return error_response(e.to_string()),
+        };
         Json(completion_object(
             &response, &id, created, &model, input_len,
         ))
@@ -140,34 +194,27 @@ fn completion_object(
     })
 }
 
-/// Build the streaming `chat.completion.chunk` sequence.
-fn stream_chunks(resp: &AgentRunResponse, id: &str, created: u64, model: &str) -> Vec<Value> {
-    let mut chunks = Vec::new();
-    let head = |delta: Value, finish: Value| {
-        json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
-        })
-    };
+/// Build one streaming `chat.completion.chunk` with the given `delta` and
+/// `finish_reason`.
+fn chunk(id: &str, created: u64, model: &str, delta: Value, finish: Value) -> Value {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+    })
+}
 
-    // First chunk carries the assistant role.
-    chunks.push(head(json!({ "role": "assistant" }), Value::Null));
-
-    // One content chunk per non-empty message.
-    for message in &resp.messages {
-        let text = message.text();
-        if text.is_empty() {
-            continue;
+/// An in-band error frame for a failure that occurs after streaming began.
+fn stream_error(message: &str) -> Value {
+    json!({
+        "error": {
+            "message": format!("Agent execution failed: {message}"),
+            "type": "server_error",
+            "code": null,
         }
-        chunks.push(head(json!({ "content": text }), Value::Null));
-    }
-
-    // Terminal chunk.
-    chunks.push(head(json!({}), Value::String("stop".to_string())));
-    chunks
+    })
 }
 
 fn error_response(message: String) -> Response {

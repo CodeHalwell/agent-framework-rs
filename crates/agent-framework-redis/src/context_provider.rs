@@ -482,7 +482,7 @@ async fn probe_redisearch(conn: &mut redis::aio::MultiplexedConnection) -> bool 
 ///     .with_limit(5);
 ///
 /// let request = vec![ChatMessage::user("I love hiking in the Cascades")];
-/// provider.invoked(&request, &[]).await?;
+/// provider.invoked(&request, &[], None).await?;
 ///
 /// let ctx = provider.invoking(&[ChatMessage::user("Any outdoor hobbies?")]).await?;
 /// # Ok(())
@@ -768,6 +768,7 @@ impl ContextProvider for RedisContextProvider {
         &self,
         request_messages: &[ChatMessage],
         response_messages: &[ChatMessage],
+        _error: Option<&Error>,
     ) -> Result<()> {
         self.validate_filters()?;
         let scope = self.scope().await;
@@ -1483,7 +1484,7 @@ mod tests {
     async fn invoked_fails_without_scope_configured() {
         let p = RedisContextProvider::new("redis://127.0.0.1:6379/0").unwrap();
         let err = p
-            .invoked(&[ChatMessage::user("hi")], &[])
+            .invoked(&[ChatMessage::user("hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));

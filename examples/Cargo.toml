@@ -1,0 +1,298 @@
+[package]
+name = "agent-framework-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Runnable examples for agent-framework, organized by topic"
+
+[dependencies]
+agent-framework = { path = "../crates/agent-framework", features = ["full", "otel-metrics"] }
+agent-framework-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+axum = "0.8"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+
+[[example]]
+name = "quickstart"
+path = "agents/quickstart.rs"
+
+[[example]]
+name = "streaming"
+path = "agents/streaming.rs"
+
+[[example]]
+name = "tools"
+path = "agents/tools.rs"
+
+[[example]]
+name = "structured_output"
+path = "agents/structured_output.rs"
+
+[[example]]
+name = "approvals"
+path = "agents/approvals.rs"
+
+[[example]]
+name = "agent_as_tool"
+path = "agents/agent_as_tool.rs"
+
+[[example]]
+name = "retry_policy"
+path = "agents/retry_policy.rs"
+
+[[example]]
+name = "typed_tools"
+path = "agents/typed_tools.rs"
+
+[[example]]
+name = "per_run_options"
+path = "agents/per_run_options.rs"
+
+[[example]]
+name = "thread_persistence"
+path = "agents/thread_persistence.rs"
+
+[[example]]
+name = "multi_turn_conversation"
+path = "agents/multi_turn_conversation.rs"
+
+[[example]]
+name = "image_input"
+path = "agents/image_input.rs"
+
+[[example]]
+name = "agent_middleware"
+path = "agents/agent_middleware.rs"
+
+[[example]]
+name = "function_middleware"
+path = "agents/function_middleware.rs"
+
+[[example]]
+name = "chat_middleware"
+path = "agents/chat_middleware.rs"
+
+[[example]]
+name = "custom_context_provider"
+path = "agents/custom_context_provider.rs"
+
+[[example]]
+name = "observability"
+path = "observability/observability.rs"
+
+[[example]]
+name = "otel_metrics"
+path = "observability/otel_metrics.rs"
+
+[[example]]
+name = "openai_responses"
+path = "providers/openai_responses.rs"
+
+[[example]]
+name = "anthropic"
+path = "providers/anthropic.rs"
+
+[[example]]
+name = "azure_openai"
+path = "providers/azure_openai.rs"
+
+[[example]]
+name = "azure_foundry_agent"
+path = "providers/azure_foundry_agent.rs"
+
+[[example]]
+name = "copilotstudio_agent"
+path = "providers/copilotstudio_agent.rs"
+
+[[example]]
+name = "openai_assistants"
+path = "providers/openai_assistants.rs"
+
+[[example]]
+name = "anthropic_hosted_tools"
+path = "providers/anthropic_hosted_tools.rs"
+
+[[example]]
+name = "azure_openai_responses"
+path = "providers/azure_openai_responses.rs"
+
+[[example]]
+name = "azure_default_credential"
+path = "providers/azure_default_credential.rs"
+
+[[example]]
+name = "azure_foundry_bing_grounding"
+path = "providers/azure_foundry_bing_grounding.rs"
+
+[[example]]
+name = "openai_compatible_endpoint"
+path = "providers/openai_compatible_endpoint.rs"
+
+[[example]]
+name = "workflow_checkpoint"
+path = "workflows/checkpoint.rs"
+
+[[example]]
+name = "workflow_hitl"
+path = "workflows/hitl.rs"
+
+[[example]]
+name = "workflow_viz"
+path = "workflows/viz.rs"
+
+[[example]]
+name = "fan_out_fan_in"
+path = "workflows/fan_out_fan_in.rs"
+
+[[example]]
+name = "conditional_edges"
+path = "workflows/conditional_edges.rs"
+
+[[example]]
+name = "switch_case"
+path = "workflows/switch_case.rs"
+
+[[example]]
+name = "loops_and_max_iterations"
+path = "workflows/loops_and_max_iterations.rs"
+
+[[example]]
+name = "shared_state"
+path = "workflows/shared_state.rs"
+
+[[example]]
+name = "sub_workflows"
+path = "workflows/sub_workflows.rs"
+
+[[example]]
+name = "agents_in_workflows"
+path = "workflows/agents_in_workflows.rs"
+
+[[example]]
+name = "workflow_as_agent"
+path = "workflows/workflow_as_agent.rs"
+
+[[example]]
+name = "custom_executors"
+path = "workflows/custom_executors.rs"
+
+[[example]]
+name = "concurrent_supersteps"
+path = "workflows/concurrent_supersteps.rs"
+
+[[example]]
+name = "checkpoint_resume_fanin"
+path = "workflows/checkpoint_resume_fanin.rs"
+
+[[example]]
+name = "sequential"
+path = "orchestrations/sequential.rs"
+
+[[example]]
+name = "group_chat"
+path = "orchestrations/group_chat.rs"
+
+[[example]]
+name = "handoff"
+path = "orchestrations/handoff.rs"
+
+[[example]]
+name = "magentic"
+path = "orchestrations/magentic.rs"
+
+[[example]]
+name = "magentic_plan_review"
+path = "orchestrations/magentic_plan_review.rs"
+
+[[example]]
+name = "magentic_stall_intervention"
+path = "orchestrations/magentic_stall_intervention.rs"
+
+[[example]]
+name = "concurrent"
+path = "orchestrations/concurrent.rs"
+
+[[example]]
+name = "streaming_updates"
+path = "orchestrations/streaming_updates.rs"
+
+[[example]]
+name = "mcp_tools"
+path = "mcp/mcp_tools.rs"
+
+[[example]]
+name = "mcp_sampling"
+path = "mcp/mcp_sampling.rs"
+
+[[example]]
+name = "mcp_first_class_tools"
+path = "mcp/mcp_first_class_tools.rs"
+
+[[example]]
+name = "mcp_prompts"
+path = "mcp/mcp_prompts.rs"
+
+[[example]]
+name = "mcp_roots"
+path = "mcp/mcp_roots.rs"
+
+[[example]]
+name = "hosting_server"
+path = "hosting/devui_server.rs"
+
+[[example]]
+name = "agui_server"
+path = "hosting/agui_server.rs"
+
+[[example]]
+name = "openai_compat_server"
+path = "hosting/openai_compat_server.rs"
+
+[[example]]
+name = "a2a_server"
+path = "hosting/a2a_server.rs"
+
+[[example]]
+name = "streaming_sse"
+path = "hosting/streaming_sse.rs"
+
+[[example]]
+name = "redis_memory"
+path = "memory/redis_memory.rs"
+
+[[example]]
+name = "mem0_memory"
+path = "memory/mem0_memory.rs"
+
+[[example]]
+name = "cosmos_store"
+path = "memory/cosmos_store.rs"
+
+[[example]]
+name = "azure_ai_search"
+path = "memory/azure_ai_search.rs"
+
+[[example]]
+name = "a2a_client"
+path = "a2a/a2a_client.rs"
+
+[[example]]
+name = "declarative_agent"
+path = "declarative/declarative_agent.rs"
+
+[[example]]
+name = "purview_middleware"
+path = "compliance/purview_middleware.rs"
+
+[[example]]
+name = "declarative_workflow"
+path = "declarative/declarative_workflow.rs"

@@ -7,13 +7,14 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_framework_azure::StaticTokenCredential;
 use agent_framework_azure_ai::AzureAIAgentClient;
 use agent_framework_core::client::ChatClient;
+use agent_framework_core::error::Error;
 use agent_framework_core::types::{
     ChatMessage, ChatOptions, Content, FinishReason, FunctionResultContent, Role,
 };
@@ -238,6 +239,79 @@ async fn non_streaming_run_creates_thread_and_returns_text() {
     assert_eq!(runs.body_json()["assistant_id"], json!("asst_1"));
 }
 
+/// A non-success status on a plain CRUD call (agent creation, here) is
+/// classified by `check_status`, end to end through the real `reqwest` path —
+/// not just the extracted `classify_status_error` unit tests in `lib.rs`.
+#[tokio::test]
+async fn unauthorized_agent_creation_becomes_invalid_auth() {
+    let server = MockServer::start(|req| match (req.method.as_str(), req.route()) {
+        ("POST", p) if p.ends_with("/assistants") => Response {
+            status: "401 Unauthorized".into(),
+            event_stream: false,
+            body: r#"{"error":{"message":"Access denied"}}"#.into(),
+        },
+        _ => Response::json("{}"),
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ServiceInvalidAuth { .. }), "{err:?}");
+}
+
+/// A run that ends `"failed"` with `last_error.code == "content_filter"`
+/// becomes `Error::ServiceContentFilter` end to end through the non-streaming
+/// (poll) path — `response_from_run`'s `"failed"` arm now delegates to
+/// `convert::classify_last_error` instead of always building a generic
+/// `Error::Service`.
+#[tokio::test]
+async fn content_filtered_run_becomes_content_filter_error() {
+    let server = MockServer::start(|req| {
+        route_default(req).unwrap_or_else(|| match (req.method.as_str(), req.route()) {
+            ("POST", p) if p.ends_with("/runs") => Response::json(
+                r#"{"id":"run_1","status":"failed","last_error":{"code":"content_filter","message":"The response was filtered due to the prompt triggering content management policy."}}"#,
+            ),
+            _ => Response::json("{}"),
+        })
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+    assert!(err.to_string().contains("content management policy"));
+}
+
+/// The same failed-run scenario, but for a non-content-filter code: stays the
+/// generic `Error::Service` (matching upstream, which does not classify
+/// `last_error.code` at all beyond this crate's content-filter addition).
+#[tokio::test]
+async fn non_content_filter_run_failure_stays_generic_service_error() {
+    let server = MockServer::start(|req| {
+        route_default(req).unwrap_or_else(|| match (req.method.as_str(), req.route()) {
+            ("POST", p) if p.ends_with("/runs") => Response::json(
+                r#"{"id":"run_1","status":"failed","last_error":{"code":"server_error","message":"internal error"}}"#,
+            ),
+            _ => Response::json("{}"),
+        })
+    });
+
+    let c = client(&server.addr);
+    let err = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::Service(_)), "{err:?}");
+    assert!(err.to_string().contains("internal error"));
+}
+
 #[tokio::test]
 async fn thread_continuity_reuses_conversation_id() {
     let server = MockServer::start(|req| {
@@ -401,4 +475,82 @@ async fn streaming_run_yields_text_and_usage() {
     assert_eq!(text, "Hi there");
     assert_eq!(conversation_id.as_deref(), Some("thread_1"));
     assert_eq!(total_tokens, Some(7));
+}
+
+#[tokio::test]
+async fn existing_agent_definition_is_fetched_once_and_merged_into_every_run() {
+    let get_agent_calls = Arc::new(AtomicUsize::new(0));
+    let calls = get_agent_calls.clone();
+    let server = MockServer::start(move |req| match (req.method.as_str(), req.route()) {
+        ("GET", p) if p.ends_with("/assistants/asst_existing") => {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Response::json(
+                r#"{"id":"asst_existing","instructions":"Be terse.","tools":[{"type":"code_interpreter"},{"type":"function","function":{"name":"ignored"}}],"tool_resources":{"code_interpreter":{"file_ids":["file_1"]}}}"#,
+            )
+        }
+        ("POST", p) if p.ends_with("/threads") => Response::json(r#"{"id":"thread_1"}"#),
+        ("POST", p) if p.ends_with("/messages") => Response::json(r#"{"id":"msg_1"}"#),
+        ("POST", p) if p.ends_with("/runs") => {
+            Response::json(r#"{"id":"run_1","status":"completed"}"#)
+        }
+        ("GET", p) if p.ends_with("/messages") => Response::json(
+            r#"{"data":[{"role":"assistant","content":[{"type":"text","text":{"value":"hi"}}]}]}"#,
+        ),
+        _ => Response::json("{}"),
+    });
+
+    let c = AzureAIAgentClient::with_existing_agent(
+        &server.addr,
+        "asst_existing",
+        Arc::new(StaticTokenCredential::new("test-token")),
+    );
+
+    // Turn 1: no local tools/instructions at all — everything comes from the
+    // persistent agent's own definition.
+    let first = c
+        .get_response(vec![ChatMessage::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(first.conversation_id.as_deref(), Some("thread_1"));
+
+    // Turn 2: same conversation.
+    let mut options = ChatOptions::new();
+    options.conversation_id = Some("thread_1".to_string());
+    let _ = c
+        .get_response(vec![ChatMessage::user("again")], options)
+        .await
+        .unwrap();
+
+    // Fetched exactly once despite two turns — cached after the first.
+    assert_eq!(
+        get_agent_calls.load(Ordering::SeqCst),
+        1,
+        "agent definition should be fetched once and cached"
+    );
+    // No agent creation: this client targets an existing agent.
+    let creates = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.route().ends_with("/assistants"))
+        .count();
+    assert_eq!(creates, 0);
+
+    let runs: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST" && r.route().ends_with("/runs"))
+        .collect();
+    assert_eq!(runs.len(), 2, "one run per turn");
+    for run in &runs {
+        let body = run.body_json();
+        assert_eq!(body["assistant_id"], json!("asst_existing"));
+        // Only the non-function tool is replayed; the function tool is
+        // dropped (chat_options.tools carries functions instead).
+        assert_eq!(body["tools"], json!([{"type": "code_interpreter"}]));
+        assert_eq!(body["instructions"], json!("Be terse."));
+        assert_eq!(
+            body["tool_resources"],
+            json!({"code_interpreter": {"file_ids": ["file_1"]}})
+        );
+    }
 }

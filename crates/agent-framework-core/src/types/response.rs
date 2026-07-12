@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use super::content::{Content, FunctionApprovalRequestContent, FunctionCallContent, UsageDetails};
 use super::message::{ChatMessage, Role};
+use super::options::ResponseFormat;
 use crate::error::{Error, Result};
 
 /// Reason a chat response finished. Open value wrapper, like `FinishReason`.
@@ -108,11 +109,28 @@ impl ChatResponse {
 
     /// Aggregate a stream of updates into a full response.
     pub fn from_updates(updates: Vec<ChatResponseUpdate>) -> Self {
+        Self::from_updates_with_format(updates, None)
+    }
+
+    /// Aggregate a stream of updates into a full response, then auto-populate
+    /// [`ChatResponse::value`] from the aggregated text when a structured
+    /// `response_format` was requested.
+    ///
+    /// Mirrors Python `ChatResponse.from_chat_response_updates(...,
+    /// output_format_type=...)`, whose final step calls `try_parse_value`.
+    /// This is the streaming counterpart of the auto-fill that
+    /// [`crate::client::FunctionInvokingChatClient`] performs for
+    /// non-streaming responses.
+    pub fn from_updates_with_format(
+        updates: Vec<ChatResponseUpdate>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Self {
         let mut resp = ChatResponse::default();
         for u in updates {
             resp.absorb_update(u);
         }
         resp.finalize();
+        resp.try_parse_value(response_format);
         resp
     }
 
@@ -120,6 +138,33 @@ impl ChatResponse {
     /// `ChatResponse.from_chat_response_updates`.
     pub fn from_chat_response_updates(updates: Vec<ChatResponseUpdate>) -> Self {
         Self::from_updates(updates)
+    }
+
+    /// Auto-populate [`ChatResponse::value`] from the response text when a
+    /// structured `response_format` (JSON object / JSON schema) was requested
+    /// and `value` is not already set.
+    ///
+    /// Mirrors Python's `try_parse_value` (`_types.py:2551-2557`): the
+    /// concatenated response text is parsed as JSON. A parse failure is *not*
+    /// an error — it is logged at `debug` and `value` is left as `None` (the
+    /// model may still be mid-way to producing valid JSON, or the format was
+    /// advisory).
+    pub fn try_parse_value(&mut self, response_format: Option<&ResponseFormat>) {
+        if self.value.is_some() {
+            return;
+        }
+        let wants_json = matches!(
+            response_format,
+            Some(ResponseFormat::JsonObject) | Some(ResponseFormat::JsonSchema { .. })
+        );
+        if !wants_json {
+            return;
+        }
+        let text = self.text();
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => self.value = Some(v),
+            Err(e) => tracing::debug!("failed to parse structured-output value from text: {e}"),
+        }
     }
 
     /// Merge a single streaming update into this response in place.
@@ -163,6 +208,25 @@ impl ChatResponse {
                 self.messages.len() - 1
             }
         };
+
+        // Incorporate the update's identity fields into the (possibly
+        // pre-existing) target message when later updates carry them, mirroring
+        // Python's `_process_update` (`_types.py:2185-2190`).
+        if let Some(author) = &update.author_name {
+            self.messages[msg_idx].author_name = Some(author.clone());
+        }
+        if let Some(r) = &update.role {
+            self.messages[msg_idx].role = r.clone();
+        }
+        if let Some(mid) = &update.message_id {
+            self.messages[msg_idx].message_id = Some(mid.clone());
+        }
+
+        // Merge the update's `additional_properties` onto the response
+        // (`_types.py:2218-2221`).
+        for (k, v) in &update.additional_properties {
+            self.additional_properties.insert(k.clone(), v.clone());
+        }
 
         for content in update.contents {
             match content {
@@ -236,6 +300,13 @@ pub struct ChatResponseUpdate {
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub finish_reason: Option<FinishReason>,
+    /// Provider-specific metadata for this update. Merged onto
+    /// [`ChatResponse::additional_properties`] during aggregation.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub additional_properties: HashMap<String, Value>,
+    /// The raw provider payload this update was decoded from, if retained.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_representation: Option<Value>,
 }
 
 impl ChatResponseUpdate {
@@ -323,11 +394,25 @@ impl AgentRunResponse {
 
     /// Aggregate a stream of agent updates into a full response.
     pub fn from_updates(updates: Vec<AgentRunResponseUpdate>) -> Self {
+        Self::from_updates_with_format(updates, None)
+    }
+
+    /// Aggregate a stream of agent updates into a full response, auto-populating
+    /// [`AgentRunResponse::value`] from the aggregated text when a structured
+    /// `response_format` was requested (mirrors Python's
+    /// `output_format_type` argument to `from_agent_run_response_updates`).
+    pub fn from_updates_with_format(
+        updates: Vec<AgentRunResponseUpdate>,
+        response_format: Option<&ResponseFormat>,
+    ) -> Self {
         let chat_updates: Vec<ChatResponseUpdate> = updates
             .into_iter()
             .map(AgentRunResponseUpdate::into_chat_update)
             .collect();
-        Self::from_chat_response(ChatResponse::from_updates(chat_updates))
+        Self::from_chat_response(ChatResponse::from_updates_with_format(
+            chat_updates,
+            response_format,
+        ))
     }
 
     /// Alias for [`AgentRunResponse::from_updates`], matching Python's
@@ -349,8 +434,22 @@ pub struct AgentRunResponseUpdate {
     pub response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub message_id: Option<String>,
+    /// Service-side conversation id carried by the underlying chat update
+    /// (Responses / Assistants / Azure AI service-managed conversations).
+    /// Preserved so aggregating a streamed run via
+    /// [`AgentRunResponse::from_updates`] yields the same
+    /// [`AgentRunResponse::conversation_id`] a non-streaming `run()` returns.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
+    /// Provider-specific metadata for this update. Merged onto
+    /// [`AgentRunResponse::additional_properties`] during aggregation.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub additional_properties: HashMap<String, Value>,
+    /// The raw provider payload this update was decoded from, if retained.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_representation: Option<Value>,
 }
 
 impl AgentRunResponseUpdate {
@@ -380,7 +479,10 @@ impl AgentRunResponseUpdate {
             author_name: u.author_name.clone(),
             response_id: u.response_id.clone(),
             message_id: u.message_id.clone(),
+            conversation_id: u.conversation_id.clone(),
             created_at: u.created_at.clone(),
+            additional_properties: u.additional_properties.clone(),
+            raw_representation: u.raw_representation.clone(),
         }
     }
 
@@ -391,8 +493,141 @@ impl AgentRunResponseUpdate {
             author_name: self.author_name,
             response_id: self.response_id,
             message_id: self.message_id,
+            conversation_id: self.conversation_id,
             created_at: self.created_at,
+            additional_properties: self.additional_properties,
+            raw_representation: self.raw_representation,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ResponseFormat;
+    use serde_json::json;
+
+    fn text_update(text: &str) -> ChatResponseUpdate {
+        ChatResponseUpdate {
+            contents: vec![Content::text(text)],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        }
+    }
+
+    // region: task 3 — structured-output value auto-fill on streaming aggregation
+
+    #[test]
+    fn from_updates_with_format_fills_value_for_json_object() {
+        let updates = vec![text_update("{\"a\":"), text_update(" 1}")];
+        let resp =
+            ChatResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
+        assert_eq!(resp.value, Some(json!({"a": 1})));
+    }
+
+    #[test]
+    fn from_updates_with_format_fills_value_for_json_schema() {
+        let fmt = ResponseFormat::json_schema("S", json!({"type": "object"}));
+        let updates = vec![text_update("{\"ok\": true}")];
+        let resp = ChatResponse::from_updates_with_format(updates, Some(&fmt));
+        assert_eq!(resp.value, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn from_updates_without_format_leaves_value_none() {
+        let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
+        assert_eq!(resp.value, None);
+    }
+
+    #[test]
+    fn try_parse_value_is_failure_tolerant() {
+        // Non-JSON text with a JSON format requested must NOT error the call.
+        let updates = vec![text_update("not json at all")];
+        let resp =
+            ChatResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
+        assert_eq!(
+            resp.value, None,
+            "parse failure leaves value None, no panic/err"
+        );
+    }
+
+    #[test]
+    fn agent_run_response_from_updates_with_format_propagates_value() {
+        let updates = vec![AgentRunResponseUpdate {
+            contents: vec![Content::text("{\"n\": 42}")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        }];
+        let resp =
+            AgentRunResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
+        assert_eq!(resp.value, Some(json!({"n": 42})));
+    }
+
+    // region: task 8 — streaming update metadata
+
+    #[test]
+    fn absorb_update_merges_additional_properties_onto_response() {
+        let mut u1 = text_update("hi");
+        u1.additional_properties
+            .insert("provider".into(), json!("openai"));
+        let mut u2 = text_update(" there");
+        u2.additional_properties
+            .insert("region".into(), json!("us"));
+
+        let resp = ChatResponse::from_updates(vec![u1, u2]);
+        assert_eq!(
+            resp.additional_properties.get("provider"),
+            Some(&json!("openai"))
+        );
+        assert_eq!(resp.additional_properties.get("region"), Some(&json!("us")));
+    }
+
+    #[test]
+    fn later_updates_update_author_name_on_in_progress_message() {
+        // First update has no author; a later same-message update supplies one.
+        let mut first = ChatResponseUpdate {
+            contents: vec![Content::text("a")],
+            role: Some(Role::assistant()),
+            message_id: Some("m1".into()),
+            ..Default::default()
+        };
+        first.author_name = None;
+        let second = ChatResponseUpdate {
+            contents: vec![Content::text("b")],
+            role: Some(Role::assistant()),
+            message_id: Some("m1".into()),
+            author_name: Some("assistant-42".into()),
+            ..Default::default()
+        };
+        let resp = ChatResponse::from_updates(vec![first, second]);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(
+            resp.messages[0].author_name.as_deref(),
+            Some("assistant-42")
+        );
+        assert_eq!(resp.messages[0].text(), "ab");
+    }
+
+    #[test]
+    fn update_new_fields_roundtrip_and_are_back_compat() {
+        // Round-trip with the new fields set.
+        let mut u = text_update("x");
+        u.additional_properties.insert("k".into(), json!(1));
+        u.raw_representation = Some(json!({"raw": true}));
+        let s = serde_json::to_string(&u).unwrap();
+        let back: ChatResponseUpdate = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.additional_properties.get("k"), Some(&json!(1)));
+        assert_eq!(back.raw_representation, Some(json!({"raw": true})));
+
+        // Back-compat: an old payload without the new fields still deserializes,
+        // and empty fields are skipped on serialize.
+        let old: ChatResponseUpdate =
+            serde_json::from_str(r#"{"contents":[],"role":"assistant"}"#).unwrap();
+        assert!(old.additional_properties.is_empty());
+        assert_eq!(old.raw_representation, None);
+        let reserialized = serde_json::to_string(&text_update("y")).unwrap();
+        assert!(!reserialized.contains("additional_properties"));
+        assert!(!reserialized.contains("raw_representation"));
     }
 }

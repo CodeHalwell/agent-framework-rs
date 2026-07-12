@@ -93,6 +93,28 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
         .filter(|s| s.is_finite() && *s >= 0.0)
 }
 
+/// Classify a non-success Azure AI Agents API HTTP response by status.
+///
+/// `401`/`403` -> [`Error::ServiceInvalidAuth`]; `400` ->
+/// [`Error::ServiceInvalidRequest`]; anything else — notably `408`/`429`/
+/// `5xx`, which the retry layer depends on — -> [`Error::ServiceStatus`],
+/// unchanged.
+///
+/// Content-filter refusals are *not* classified here: Foundry reports those
+/// asynchronously via a failed run's `last_error.code` (see
+/// [`convert::classify_last_error`]), not as a synchronous HTTP error on
+/// these agent/thread/message/run CRUD calls, so there's no body signal to
+/// check at this layer — mirrors the Python client, which does not classify
+/// these HTTP errors at all beyond `ServiceInitializationError` for local
+/// config problems.
+fn classify_status_error(status: u16, message: String, retry_after: Option<f64>) -> Error {
+    match status {
+        401 | 403 => Error::service_invalid_auth(message),
+        400 => Error::service_invalid_request(message),
+        _ => Error::service_status(status, message, retry_after),
+    }
+}
+
 /// A chat client backed by an Azure AI Foundry persistent agent.
 pub struct AzureAIAgentClient {
     inner: Arc<Inner>,
@@ -112,8 +134,18 @@ struct Inner {
     /// The active agent id: pre-set for an existing agent, or filled in after
     /// auto-creating one.
     agent_id: Mutex<Option<String>>,
+    /// Serializes the auto-create path so concurrent first-use requests share
+    /// one `POST assistants` instead of each creating (and leaking) a transient
+    /// agent. Held across the create round trip, so it is an async mutex; the
+    /// sync `agent_id` mutex is only ever held briefly, never across `.await`.
+    agent_create_lock: tokio::sync::Mutex<()>,
     /// Whether this client created the agent (and so should delete it).
     agent_created: AtomicBool,
+    /// Cached agent definition (`GET .../assistants/{id}`, or the body
+    /// returned when auto-creating), used to replay an agent's own
+    /// tools/instructions/tool_resources onto every run — see
+    /// [`load_agent_definition_if_needed`](AzureAIAgentClient::load_agent_definition_if_needed).
+    agent_definition: Mutex<Option<Value>>,
 }
 
 impl Clone for AzureAIAgentClient {
@@ -175,7 +207,9 @@ impl AzureAIAgentClient {
                 default_thread_id: None,
                 should_cleanup_agent: true,
                 agent_id: Mutex::new(agent_id),
+                agent_create_lock: tokio::sync::Mutex::new(()),
                 agent_created: AtomicBool::new(false),
+                agent_definition: Mutex::new(None),
             }),
         }
     }
@@ -265,11 +299,8 @@ impl AzureAIAgentClient {
         let status = resp.status();
         let retry_after = parse_retry_after(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        Err(Error::service_status(
-            status.as_u16(),
-            format!("Azure AI API error {status}: {text}"),
-            retry_after,
-        ))
+        let message = format!("Azure AI API error {status}: {text}");
+        Err(classify_status_error(status.as_u16(), message, retry_after))
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
@@ -360,6 +391,17 @@ impl AzureAIAgentClient {
                 return Ok(id.clone());
             }
         }
+        // Serialize the create path: without this, two concurrent first-use
+        // requests both pass the check above and each POST a new agent,
+        // leaking one and leaving the two runs on different agent definitions.
+        let _create = self.inner.agent_create_lock.lock().await;
+        // Re-check: a racing task may have created the agent while we waited.
+        {
+            let guard = self.inner.agent_id.lock().unwrap();
+            if let Some(id) = guard.as_ref() {
+                return Ok(id.clone());
+            }
+        }
         let model = options
             .model_id
             .as_deref()
@@ -376,7 +418,7 @@ impl AzureAIAgentClient {
             self.inner.agent_description.as_deref(),
             instructions,
             options,
-        );
+        )?;
         let created = self.create_agent(&body).await?;
         let id = created
             .get("id")
@@ -385,7 +427,34 @@ impl AzureAIAgentClient {
             .to_string();
         *self.inner.agent_id.lock().unwrap() = Some(id.clone());
         self.inner.agent_created.store(true, Ordering::SeqCst);
+        // Cache the just-created agent's own definition so it gets replayed
+        // on later turns the same way an existing (persistent) agent's does
+        // (see `load_agent_definition_if_needed`), instead of an extra GET.
+        *self.inner.agent_definition.lock().unwrap() = Some(created);
         Ok(id)
+    }
+
+    /// Fetch (and cache) the active agent's own definition, mirroring the
+    /// Python client's `_load_agent_definition_if_needed`
+    /// (`_chat_client.py:751-755`): a no-op until an agent id is known (i.e.
+    /// before an auto-created agent exists yet), fetched at most once per
+    /// agent id and reused after that. [`ensure_agent`](Self::ensure_agent)
+    /// seeds this cache directly from its create response, so a freshly
+    /// auto-created agent never needs an extra `GET` either.
+    async fn load_agent_definition_if_needed(&self) -> Result<Option<Value>> {
+        let id = { self.inner.agent_id.lock().unwrap().clone() };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        {
+            let cached = self.inner.agent_definition.lock().unwrap();
+            if let Some(def) = cached.as_ref() {
+                return Ok(Some(def.clone()));
+            }
+        }
+        let def = self.get_agent(&id).await?;
+        *self.inner.agent_definition.lock().unwrap() = Some(def.clone());
+        Ok(Some(def))
     }
 
     async fn create_thread(&self, options: &ChatOptions) -> Result<String> {
@@ -447,6 +516,7 @@ impl AzureAIAgentClient {
                 self.delete_agent(&id).await?;
                 *self.inner.agent_id.lock().unwrap() = None;
                 self.inner.agent_created.store(false, Ordering::SeqCst);
+                *self.inner.agent_definition.lock().unwrap() = None;
             }
         }
         Ok(())
@@ -499,7 +569,7 @@ impl AzureAIAgentClient {
                 m.message_id = Some(run_id);
                 resp.messages.push(m);
             }
-            "failed" => return Err(Error::service(convert::last_error_message(&run))),
+            "failed" => return Err(convert::classify_last_error(&run)),
             other => {
                 return Err(Error::service(format!(
                     "Azure AI run ended in status '{other}'"
@@ -547,6 +617,7 @@ impl ChatClient for AzureAIAgentClient {
         }
 
         // Fresh-run path.
+        let agent_definition = self.load_agent_definition_if_needed().await?;
         let agent_id = self.ensure_agent(&options, instructions.as_deref()).await?;
         let thread_id = match thread_id {
             Some(t) => t,
@@ -558,8 +629,9 @@ impl ChatClient for AzureAIAgentClient {
             self.model_for(&options),
             instructions.as_deref(),
             &options,
+            agent_definition.as_ref(),
             false,
-        );
+        )?;
         let run = self
             .post_json(&format!("threads/{thread_id}/runs"), &body)
             .await?;
@@ -598,6 +670,7 @@ impl ChatClient for AzureAIAgentClient {
         }
 
         // Fresh-run path (streamed).
+        let agent_definition = self.load_agent_definition_if_needed().await?;
         let agent_id = self.ensure_agent(&options, instructions.as_deref()).await?;
         let thread_id = match thread_id {
             Some(t) => t,
@@ -609,8 +682,9 @@ impl ChatClient for AzureAIAgentClient {
             self.model_for(&options),
             instructions.as_deref(),
             &options,
+            agent_definition.as_ref(),
             true,
-        );
+        )?;
         let resp = self
             .post_stream(&format!("threads/{thread_id}/runs"), &body)
             .await?;
@@ -679,5 +753,36 @@ mod tests {
             combined_instructions(&options, &prepared).as_deref(),
             Some("from options\nfrom message")
         );
+    }
+
+    // -- classify_status_error ----------------------------------------------
+
+    #[test]
+    fn classify_status_error_maps_401_and_403_to_invalid_auth() {
+        for status in [401, 403] {
+            let err = classify_status_error(status, format!("err {status}"), None);
+            assert!(
+                matches!(err, Error::ServiceInvalidAuth { .. }),
+                "status {status}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_status_error_maps_400_to_invalid_request() {
+        let err = classify_status_error(400, "bad request".into(), None);
+        assert!(
+            matches!(err, Error::ServiceInvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_status_error_leaves_retryable_statuses_as_service_status() {
+        for status in [408, 429, 500, 503] {
+            let err = classify_status_error(status, format!("err {status}"), Some(3.0));
+            assert_eq!(err.status(), Some(status), "{err:?}");
+            assert_eq!(err.retry_after(), Some(3.0), "{err:?}");
+        }
     }
 }

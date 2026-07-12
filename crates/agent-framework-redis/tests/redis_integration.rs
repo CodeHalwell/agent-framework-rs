@@ -275,7 +275,11 @@ async fn context_provider_invoked_then_invoking_surfaces_matching_memory() {
         .with_user_id("user-it-1");
 
     provider
-        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .invoked(
+            &[ChatMessage::user("I love hiking in the Cascades")],
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -304,7 +308,11 @@ async fn context_provider_invoking_returns_empty_context_when_nothing_matches() 
         .with_user_id("user-it-2");
 
     provider
-        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .invoked(
+            &[ChatMessage::user("I love hiking in the Cascades")],
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -336,6 +344,7 @@ async fn context_provider_scopes_memories_by_user_id() {
         .invoked(
             &[ChatMessage::user("user-a's secret hobby is pottery")],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -389,7 +398,11 @@ async fn context_provider_force_scan_fallback_works_regardless_of_redisearch_ava
         .with_force_scan_fallback(true);
 
     provider
-        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .invoked(
+            &[ChatMessage::user("I love hiking in the Cascades")],
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -423,7 +436,11 @@ async fn context_provider_redisearch_finds_and_excludes_memories_when_available(
         .with_user_id("user-ft-1");
 
     provider
-        .invoked(&[ChatMessage::user("I love hiking in the Cascades")], &[])
+        .invoked(
+            &[ChatMessage::user("I love hiking in the Cascades")],
+            &[],
+            None,
+        )
         .await
         .unwrap();
 
@@ -472,6 +489,7 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
         .invoked(
             &[ChatMessage::user("user-ft-a's secret hobby is pottery")],
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -510,7 +528,11 @@ async fn context_provider_redisearch_respects_limit_when_available() {
 
     for i in 0..5 {
         provider
-            .invoked(&[ChatMessage::user(format!("apple fact number {i}"))], &[])
+            .invoked(
+                &[ChatMessage::user(format!("apple fact number {i}"))],
+                &[],
+                None,
+            )
             .await
             .unwrap();
     }
@@ -554,7 +576,7 @@ async fn context_provider_redisearch_entries_are_not_visible_to_forced_scan_fall
         .with_force_scan_fallback(true);
 
     ft_provider
-        .invoked(&[ChatMessage::user("stored via JSON.SET")], &[])
+        .invoked(&[ChatMessage::user("stored via JSON.SET")], &[], None)
         .await
         .unwrap();
 

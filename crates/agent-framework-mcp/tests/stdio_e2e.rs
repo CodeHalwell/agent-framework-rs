@@ -3,14 +3,16 @@
 //! package is not assumed to be installed, and this test must not touch the
 //! network).
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_framework_core::error::Error;
+use agent_framework_core::tools::ToolSource;
 use agent_framework_mcp::{
     CreateMessageParams, CreateMessageResult, McpClient, McpStdioTool, McpStdioTransport,
-    SamplingHandler,
+    McpTransport as _, SamplingHandler,
 };
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
@@ -420,4 +422,78 @@ async fn stdio_tool_sampling_round_trip_via_server_initiated_request() {
 
     let _ = std::fs::remove_file(&script);
     outcome.expect("stdio_tool_sampling_round_trip_via_server_initiated_request timed out");
+}
+
+/// [`McpStdioTool`] as a [`ToolSource`]: `resolve_tools` must lazily connect
+/// (there's no prior `.connect()`/`.tool_definitions()` call here) and
+/// return the same tools `tool_definitions()` would, filtered by
+/// `allowed_tools`. A second `resolve_tools` call must also succeed and
+/// return the same tools — it's served from `McpClient::list_tools_cached`'s
+/// cache; the cache-hit-vs-live-refetch distinction itself, and
+/// `list_changed` invalidation, are covered deterministically (no process
+/// spawn, no timing) by `client.rs`'s
+/// `list_tools_cached_reuses_result_until_invalidated` test.
+#[tokio::test]
+async fn stdio_tool_source_resolve_tools_lazily_connects_and_returns_tools() {
+    let script = write_fake_server();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let tool = McpStdioTool::new("fake", "python3")
+            .args([script.to_string_lossy().to_string()])
+            .allowed_tools(["echo", "add"]);
+
+        let resolved = ToolSource::resolve_tools(&tool)
+            .await
+            .expect("resolve_tools should lazily connect and list tools");
+        let names: HashSet<&str> = resolved.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["echo", "add"]),
+            "allowed_tools filter should still apply via the ToolSource path"
+        );
+
+        let resolved_again = ToolSource::resolve_tools(&tool)
+            .await
+            .expect("a second resolve_tools call should also succeed");
+        assert_eq!(resolved_again.len(), 2);
+
+        tool.close().await.expect("close");
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&script);
+    outcome.expect("stdio_tool_source_resolve_tools_lazily_connects_and_returns_tools timed out");
+}
+
+/// [`McpStdioTransport::with_request_timeout`] must actually cut off a call
+/// that never gets a response, not just be a stored, unused config value.
+/// `sleep` never reads its stdin or writes to stdout, so a request sent to
+/// it as if it were an MCP server hangs forever without the timeout.
+#[tokio::test]
+async fn stdio_request_timeout_cuts_off_a_call_that_never_responds() {
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let transport = McpStdioTransport::spawn("sleep", &["100".to_string()], None, None)
+            .await
+            .expect("spawn sleep as a stand-in for a hung MCP server")
+            .with_request_timeout(Duration::from_millis(150));
+
+        let started = std::time::Instant::now();
+        let err = transport
+            .call("initialize", json!({}))
+            .await
+            .expect_err("a request to a server that never responds must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout should fire close to the configured 150ms, not fall back to hanging"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error message: {err}"
+        );
+
+        transport.close().await.expect("close");
+    })
+    .await;
+
+    outcome.expect("stdio_request_timeout_cuts_off_a_call_that_never_responds timed out");
 }

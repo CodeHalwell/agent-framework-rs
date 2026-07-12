@@ -7,7 +7,7 @@ use agent_framework_hosting::openai_compat::OpenAiRouter;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{parse_sse, post_json, post_raw, MockAgent};
+use common::{parse_sse, post_json, post_raw, MockAgent, StreamingAgent};
 
 fn router() -> axum::Router {
     OpenAiRouter::for_agent("assistant", MockAgent::new("a1").with_usage(5, 3).arc()).into_router()
@@ -93,4 +93,45 @@ async fn chat_completions_content_parts_array() {
     let (status, resp) = post_json(router(), "/v1/chat/completions", &body).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(resp["choices"][0]["message"]["content"], "echo: hi there");
+}
+
+#[tokio::test]
+async fn chat_completions_stream_emits_incremental_content_chunks() {
+    // A multi-delta streaming agent yields one content chunk per update.
+    let router = OpenAiRouter::for_agent(
+        "assistant",
+        StreamingAgent::new("s1", vec!["Hel", "lo ", "world"]).arc(),
+    )
+    .into_router();
+
+    let body = json!({
+        "model": "assistant",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": true,
+    });
+    let (status, text) = post_raw(router, "/v1/chat/completions", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let data = parse_sse(&text);
+    assert_eq!(data.last().unwrap(), "[DONE]");
+    let chunks: Vec<serde_json::Value> = data
+        .iter()
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+
+    // First chunk: role. Then one content chunk per delta. Last: finish_reason.
+    let contents: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(contents, vec!["Hel", "lo ", "world"]);
+    assert_eq!(
+        chunks.first().unwrap()["choices"][0]["delta"]["role"],
+        "assistant"
+    );
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
 }

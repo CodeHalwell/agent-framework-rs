@@ -34,6 +34,9 @@ pub mod convert;
 pub mod responses;
 pub use responses::OpenAIResponsesClient;
 
+pub mod assistants;
+pub use assistants::OpenAIAssistantsClient;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -62,6 +65,91 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
+}
+
+/// Classify a non-success OpenAI-wire (Chat Completions / Responses /
+/// Assistants) HTTP response into a granular [`Error`].
+///
+/// The single point of truth for status/body interpretation, used by every
+/// endpoint in this crate ([`OpenAIClient::post`], [`responses`], and
+/// [`assistants`]) and reused by `agent-framework-azure` (Azure OpenAI is
+/// wire-compatible for Chat Completions and Responses), so the two stay
+/// identical rather than drifting.
+///
+/// Mirrors upstream's `openai/_chat_client.py` / `_responses_client.py`:
+///
+/// ```text
+/// except BadRequestError as ex:
+///     if ex.code == "content_filter":
+///         raise OpenAIContentFilterException(...)
+///     raise ServiceResponseException(...)
+/// ```
+///
+/// for the content-filter case, and extends upstream's exception
+/// *hierarchy* — `ServiceInvalidAuthError` / `ServiceInvalidRequestError`
+/// already exist in `agent_framework.exceptions`, even though today's Python
+/// OpenAI client folds every other status (auth failures included) into that
+/// same generic `ServiceResponseException` — to also classify by HTTP status:
+///
+/// * `401` / `403` -> [`Error::ServiceInvalidAuth`]
+/// * `400` / `404` / `422` -> [`Error::ServiceInvalidRequest`], unless the
+///   body signals a content-filter refusal (`error.code` or `error.type` ==
+///   `"content_filter"`, checked at the top level and inside a nested
+///   `innererror` for Azure OpenAI's shape) -> [`Error::ServiceContentFilter`]
+/// * anything else — notably `408` / `429` / `5xx`, which
+///   [`RetryOn::Default`](agent_framework_core::client::RetryOn::Default)
+///   depends on — -> [`Error::ServiceStatus`], unchanged
+///
+/// `body` is parsed leniently as JSON purely to look for the content-filter
+/// marker; a non-JSON or differently-shaped body just skips that check and
+/// falls through to the plain status-based classification, so this never
+/// panics or itself errors. `message` is used verbatim as the resulting
+/// error's text (callers already format a provider-specific "OpenAI API
+/// error 400: ..." string; this only picks the variant).
+pub fn classify_service_error(
+    status: u16,
+    body: &str,
+    message: impl Into<String>,
+    retry_after: Option<f64>,
+) -> Error {
+    let message = message.into();
+    match status {
+        401 | 403 => Error::service_invalid_auth(message),
+        400 | 404 | 422 => {
+            if body_signals_content_filter(body) {
+                Error::service_content_filter(message)
+            } else {
+                Error::service_invalid_request(message)
+            }
+        }
+        _ => Error::service_status(status, message, retry_after),
+    }
+}
+
+/// Whether an OpenAI/Azure-OpenAI-shaped error body signals a content-filter
+/// refusal.
+///
+/// Checks `error.code` — the field the OpenAI Python SDK's
+/// `BadRequestError.code` reads, and what upstream compares against
+/// `"content_filter"` — tolerantly falling back to `error.type` and to Azure
+/// OpenAI's nested `error.innererror` (`code`/`type`), since a
+/// `"content_filter"` marker has been observed in slightly different spots
+/// across OpenAI-wire-compatible providers. A non-JSON or unrecognized body
+/// shape is treated as "not a content filter" rather than erroring.
+fn body_signals_content_filter(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    is_content_filter_marker(error)
+        || error
+            .get("innererror")
+            .is_some_and(is_content_filter_marker)
+}
+
+fn is_content_filter_marker(v: &Value) -> bool {
+    v.get("code").and_then(Value::as_str) == Some("content_filter")
+        || v.get("type").and_then(Value::as_str) == Some("content_filter")
 }
 
 /// An OpenAI (or OpenAI-compatible) chat client.
@@ -165,8 +253,9 @@ impl OpenAIClient {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            return Err(classify_service_error(
                 status.as_u16(),
+                &text,
                 format!("OpenAI API error {status}: {text}"),
                 retry_after,
             ));
@@ -381,4 +470,108 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
     }
     update.contents = contents;
     Some(update)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- classify_service_error --------------------------------------------
+    //
+    // Canned status+body combinations run through the exact classification
+    // `OpenAIClient::post`, `responses::OpenAIResponsesClient::post`, and
+    // `assistants::OpenAIAssistantsClient::send` all delegate to.
+
+    #[test]
+    fn classifies_401_and_403_as_invalid_auth() {
+        for status in [401, 403] {
+            let err = classify_service_error(status, "", format!("err {status}"), None);
+            assert!(
+                matches!(err, Error::ServiceInvalidAuth { .. }),
+                "status {status}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_400_404_422_as_invalid_request_by_default() {
+        for status in [400, 404, 422] {
+            let body = r#"{"error":{"message":"nope","type":"invalid_request_error"}}"#;
+            let err = classify_service_error(status, body, format!("err {status}"), None);
+            assert!(
+                matches!(err, Error::ServiceInvalidRequest { .. }),
+                "status {status}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_400_with_content_filter_code_as_content_filter() {
+        // Plain OpenAI shape: `error.code`.
+        let body = r#"{"error":{"message":"flagged","type":"invalid_request_error","code":"content_filter"}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn classifies_azure_openai_content_filter_shape_with_innererror() {
+        // Azure OpenAI's shape: outer `error.code` is already "content_filter"
+        // (mirrors `openai/_exceptions.py`'s `OpenAIContentFilterException`,
+        // which is constructed once `ex.code == "content_filter"` is already
+        // known — the nested `innererror.code` carries the more specific
+        // `ResponsibleAIPolicyViolation` detail, not the marker itself), but
+        // this also tolerates the marker living only in `innererror`.
+        let body = r#"{"error":{"message":"The response was filtered","code":"content_filter","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+
+        let nested_only =
+            r#"{"error":{"message":"filtered","innererror":{"code":"content_filter"}}}"#;
+        let err = classify_service_error(400, nested_only, "err", None);
+        assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn non_json_or_unmarked_body_does_not_trigger_content_filter() {
+        let err = classify_service_error(400, "not json", "err", None);
+        assert!(
+            matches!(err, Error::ServiceInvalidRequest { .. }),
+            "{err:?}"
+        );
+
+        let err = classify_service_error(400, r#"{"error":{"code":"other"}}"#, "err", None);
+        assert!(
+            matches!(err, Error::ServiceInvalidRequest { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_retryable_statuses_as_service_status() {
+        // 408/429/5xx must stay `ServiceStatus` (carrying status +
+        // retry_after) exactly as before — the retry layer depends on it.
+        for status in [408, 429, 500, 503] {
+            let err = classify_service_error(status, "", format!("err {status}"), Some(2.0));
+            assert_eq!(err.status(), Some(status), "{err:?}");
+            assert_eq!(err.retry_after(), Some(2.0), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn unclassified_4xx_stays_service_status() {
+        // e.g. 409 Conflict, 413 Payload Too Large: not in the
+        // auth/invalid-request/content-filter buckets, so this falls back to
+        // the generic status-carrying variant rather than guessing.
+        let err = classify_service_error(409, "", "err", None);
+        assert_eq!(err.status(), Some(409), "{err:?}");
+    }
+
+    #[test]
+    fn message_text_is_preserved_verbatim() {
+        let err = classify_service_error(401, "", "OpenAI API error 401: unauthorized", None);
+        assert_eq!(
+            err.to_string(),
+            "service error: OpenAI API error 401: unauthorized"
+        );
+    }
 }

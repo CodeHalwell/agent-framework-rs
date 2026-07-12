@@ -68,12 +68,15 @@
 
 mod credential;
 mod credentials;
+pub mod responses;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
 pub use credentials::{
-    AzureCliCredential, ChainedTokenCredential, ClientSecretCredential, ManagedIdentityCredential,
+    AzureCliCredential, ChainedTokenCredential, ClientSecretCredential, DefaultAzureCredential,
+    EnvironmentCredential, ManagedIdentityCredential, WorkloadIdentityCredential,
     DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
 };
+pub use responses::AzureOpenAIResponsesClient;
 
 use std::sync::Arc;
 
@@ -287,8 +290,13 @@ impl AzureOpenAIClient {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::service_status(
+            // Azure OpenAI is wire-compatible with OpenAI's Chat Completions,
+            // so status/body classification (401/403 -> auth, 400/404/422 ->
+            // invalid request or content filter) is shared verbatim with
+            // `agent-framework-openai` rather than duplicated.
+            return Err(agent_framework_openai::classify_service_error(
                 status.as_u16(),
+                &text,
                 format!("Azure OpenAI API error {status}: {text}"),
                 retry_after,
             ));

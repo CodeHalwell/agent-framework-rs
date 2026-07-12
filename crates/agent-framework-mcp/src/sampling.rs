@@ -274,6 +274,23 @@ pub(crate) struct ServerRequestHandlers {
 pub type BoxedServerRequestHandler =
     Arc<dyn Fn(String, Value) -> BoxFuture<std::result::Result<Value, RpcError>> + Send + Sync>;
 
+// ---------------------------------------------------------------------
+// Notification dispatch (shared by all three transports)
+// ---------------------------------------------------------------------
+
+/// The transport-facing callback installed via
+/// [`crate::transport::McpTransport::set_notification_handler`]: invoked for
+/// every notification received from the server (no `id`, no response
+/// expected/sent). [`crate::McpClient`] installs one automatically at
+/// construction time to invalidate its cached `tools/list`/`prompts/list`
+/// results on `notifications/tools/list_changed` /
+/// `notifications/prompts/list_changed` — see
+/// [`crate::McpClient::list_tools_cached`] /
+/// [`crate::McpClient::list_prompts_cached`]. Unlike
+/// [`BoxedServerRequestHandler`], there is nothing to write back, so this
+/// returns `()` rather than a `Result`.
+pub type BoxedNotificationHandler = Arc<dyn Fn(String, Value) -> BoxFuture<()> + Send + Sync>;
+
 fn method_not_found(method: &str) -> RpcError {
     RpcError {
         code: METHOD_NOT_FOUND,

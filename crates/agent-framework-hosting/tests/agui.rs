@@ -8,18 +8,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
+use futures::StreamExt;
 use serde_json::{json, Value};
 
-use agent_framework_core::agent::Agent;
+use agent_framework_core::agent::{Agent, ChatAgent};
+use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::threads::AgentThread;
 use agent_framework_core::types::{
-    AgentRunResponse, ChatMessage, Content, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Role,
+    AgentRunResponse, ChatMessage, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
+    FunctionArguments, FunctionCallContent, FunctionResultContent, Role,
 };
 use agent_framework_hosting::agui::AgUiRouter;
 
-use common::{parse_sse, parse_sse_json, post_raw, MockAgent};
+use common::{parse_sse, parse_sse_json, post_raw, MockAgent, StreamingAgent};
 
 /// The `type` string of each SSE event, in order.
 fn event_types(events: &[Value]) -> Vec<String> {
@@ -397,4 +399,136 @@ async fn builder_serves_multiple_agents_at_distinct_paths() {
         .find(|e| e["type"] == "TEXT_MESSAGE_CONTENT")
         .unwrap();
     assert_eq!(delta["delta"], "S: hi");
+}
+
+// ---------------------------------------------------------------------------
+// GAP 1.4 — live streaming: multiple TEXT_MESSAGE_CONTENT deltas per run
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn streaming_agent_emits_multiple_text_message_content_deltas() {
+    let agent = StreamingAgent::new("s1", vec!["Hello", " ", "world"]);
+    let app = AgUiRouter::for_agent("assistant", agent.arc()).into_router();
+
+    let body = json!({
+        "threadId": "t1",
+        "runId": "r1",
+        "messages": [{ "role": "user", "content": "hi" }],
+    });
+    let (status, text) = post_raw(app, "/", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = parse_sse_json(&text);
+    let contents: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "TEXT_MESSAGE_CONTENT")
+        .collect();
+    assert_eq!(
+        contents.len(),
+        3,
+        "one TEXT_MESSAGE_CONTENT per streamed delta"
+    );
+    let joined: String = contents
+        .iter()
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(joined, "Hello world");
+    // A single text message spans the run (one START, one END).
+    assert_eq!(
+        event_types(&events)
+            .iter()
+            .filter(|t| *t == "TEXT_MESSAGE_START")
+            .count(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GAP 1.5 — AG-UI client-declared tools injected as declaration-only per-run tools
+// ---------------------------------------------------------------------------
+
+/// A client that calls `get_weather` only when it is present in the tool list —
+/// so its behavior proves whether the AG-UI-declared tool actually reached the
+/// agent's per-run options.
+#[derive(Clone)]
+struct WeatherClient;
+
+#[async_trait]
+impl ChatClient for WeatherClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        if options.tools.iter().any(|t| t.name == "get_weather") {
+            let call = FunctionCallContent::new(
+                "wc1",
+                "get_weather",
+                Some(FunctionArguments::Raw(json!({"city": "Paris"}).to_string())),
+            );
+            Ok(ChatResponse {
+                messages: vec![ChatMessage::with_contents(
+                    Role::assistant(),
+                    vec![Content::FunctionCall(call)],
+                )],
+                ..Default::default()
+            })
+        } else {
+            Ok(ChatResponse::from_text("no tools available"))
+        }
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<ChatMessage>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let updates: Vec<Result<ChatResponseUpdate>> = resp
+            .messages
+            .into_iter()
+            .map(|m| {
+                Ok(ChatResponseUpdate {
+                    contents: m.contents,
+                    role: Some(m.role),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+#[tokio::test]
+async fn client_declared_tools_are_injected_and_round_trip_as_frontend_tools() {
+    let agent = ChatAgent::builder(WeatherClient).name("assistant").build();
+    let app = AgUiRouter::for_agent("assistant", agent).into_router();
+
+    let body = json!({
+        "threadId": "t1",
+        "runId": "r1",
+        "messages": [{ "role": "user", "content": "weather in Paris?" }],
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
+        }],
+    });
+    let (status, text) = post_raw(app, "/", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = parse_sse_json(&text);
+    // The injected tool reached the model, which called it: surfaced as a
+    // TOOL_CALL_START, and — being declaration-only — WITHOUT a TOOL_CALL_RESULT
+    // (the browser runs it, the frontend-tool pattern).
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "TOOL_CALL_START" && e["toolCallName"] == "get_weather"),
+        "injected client tool must be callable by the model: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "TOOL_CALL_RESULT"),
+        "a declaration-only frontend tool must not produce a server-side result"
+    );
 }

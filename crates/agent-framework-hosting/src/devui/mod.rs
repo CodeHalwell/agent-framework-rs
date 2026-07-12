@@ -29,9 +29,11 @@
 //!   `/v1/entities/{id}/runs/{run_id}/responses` endpoint, so per the work
 //!   package we surface pending requests (in-stream and in the final response)
 //!   but do not persist runs or support resume.
-//! - Streaming is computed by running to completion and then framing the result
-//!   as SSE (the core `Agent` trait exposes only `run`, not `run_stream`); event
-//!   ordering and payloads still match DevUI's names.
+//! - Agent streaming drives the core `Agent::run_stream` and frames each update
+//!   as SSE live (one `response.output_text.delta` per update); the terminal
+//!   `response.completed` aggregates the run. Event ordering and payloads match
+//!   DevUI's names. Non-streaming requests stay on `Agent::run`. (Workflow
+//!   streaming still frames the workflow's own event stream after the run.)
 
 pub mod models;
 
@@ -43,13 +45,16 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-use agent_framework_core::types::{AgentRunResponse, ChatMessage, Role, UsageDetails};
+use agent_framework_core::types::{
+    AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Role, UsageDetails,
+};
 use agent_framework_core::workflow::WorkflowEvent;
 
 use crate::registry::{AgentRecord, EntityRecord, HostState, WorkflowRecord};
-use crate::sse::sse_response;
+use crate::sse::{sse_response, sse_response_stream};
 use crate::util;
 use models::{
     openai_error, DiscoveryResponse, EntityInfo, HealthResponse, InputTokensDetails, OutputMessage,
@@ -192,15 +197,49 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
     let messages = input_to_messages(&request.input);
     let input_len = approx_input_len(&request.input);
 
-    let response = match agent.agent.run(messages, None).await {
-        Ok(r) => r,
-        Err(e) => return execution_error(e.to_string()),
-    };
-
     if request.stream {
-        let events = agent_stream_events(&response, &model, input_len);
-        sse_response(events)
+        // Live streaming: drive `run_stream` and frame each update as OpenAI
+        // Responses SSE events (one `response.output_text.delta` per update)
+        // as they arrive, then a final `response.completed`.
+        let agent = agent.agent.clone();
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+        tokio::spawn(async move {
+            let mut framing = AgentStreamFraming::new(model, input_len);
+            for ev in framing.preamble() {
+                let _ = tx.unbounded_send(ev);
+            }
+            match agent.run_stream(messages, None, None).await {
+                Ok(mut stream) => {
+                    let mut had_error = false;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(update) => {
+                                for ev in framing.push_update(&update) {
+                                    let _ = tx.unbounded_send(ev);
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.unbounded_send(framing.error_event(&e.to_string()));
+                                had_error = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !had_error {
+                        let _ = tx.unbounded_send(framing.completed());
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.unbounded_send(framing.error_event(&e.to_string()));
+                }
+            }
+        });
+        sse_response_stream(rx)
     } else {
+        let response = match agent.agent.run(messages, None).await {
+            Ok(r) => r,
+            Err(e) => return execution_error(e.to_string()),
+        };
         Json(agent_response_object(&response, &model, input_len)).into_response()
     }
 }
@@ -227,80 +266,124 @@ fn agent_response_object(resp: &AgentRunResponse, model: &str, input_len: usize)
     }
 }
 
-/// Build the SSE event sequence for a streamed agent run.
-fn agent_stream_events(resp: &AgentRunResponse, model: &str, input_len: usize) -> Vec<Value> {
-    let rid = util::resp_id();
-    let mid = util::msg_id();
-    let mut seq: u64 = 0;
-    let mut next = || {
-        seq += 1;
-        seq
-    };
-    let in_progress =
-        serde_json::to_value(ResponseObject::in_progress(&rid, model)).unwrap_or(Value::Null);
+/// Incremental OpenAI-Responses SSE framing for a streamed agent run, driven
+/// one [`AgentRunResponseUpdate`] at a time. Emits the fixed preamble, one
+/// `response.output_text.delta` per non-empty update, and a final
+/// `response.completed` aggregating the run (text + usage).
+struct AgentStreamFraming {
+    model: String,
+    input_len: usize,
+    rid: String,
+    mid: String,
+    seq: u64,
+    /// Updates collected so the terminal `response.completed` can aggregate the
+    /// full text and usage via [`AgentRunResponse::from_updates`].
+    collected: Vec<AgentRunResponseUpdate>,
+}
 
-    let mut events = vec![
-        json!({ "type": "response.created", "sequence_number": next(), "response": in_progress }),
-        json!({ "type": "response.in_progress", "sequence_number": next(), "response": in_progress }),
-        json!({
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "sequence_number": next(),
-            "item": { "type": "message", "id": mid, "role": "assistant", "content": [], "status": "in_progress" }
-        }),
-        json!({
-            "type": "response.content_part.added",
-            "output_index": 0,
-            "content_index": 0,
-            "item_id": mid,
-            "sequence_number": next(),
-            "part": { "type": "output_text", "text": "", "annotations": [] }
-        }),
-    ];
-
-    // Emit one text delta per non-empty message.
-    for message in &resp.messages {
-        let delta = message.text();
-        if delta.is_empty() {
-            continue;
+impl AgentStreamFraming {
+    fn new(model: String, input_len: usize) -> Self {
+        Self {
+            model,
+            input_len,
+            rid: util::resp_id(),
+            mid: util::msg_id(),
+            seq: 0,
+            collected: Vec::new(),
         }
-        events.push(json!({
+    }
+
+    fn next(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// The four fixed opening events (`response.created` … `content_part.added`).
+    fn preamble(&mut self) -> Vec<Value> {
+        let in_progress = serde_json::to_value(ResponseObject::in_progress(&self.rid, &self.model))
+            .unwrap_or(Value::Null);
+        let mid = self.mid.clone();
+        vec![
+            json!({ "type": "response.created", "sequence_number": self.next(), "response": in_progress.clone() }),
+            json!({ "type": "response.in_progress", "sequence_number": self.next(), "response": in_progress }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "sequence_number": self.next(),
+                "item": { "type": "message", "id": mid, "role": "assistant", "content": [], "status": "in_progress" }
+            }),
+            json!({
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": mid,
+                "sequence_number": self.next(),
+                "part": { "type": "output_text", "text": "", "annotations": [] }
+            }),
+        ]
+    }
+
+    /// Frame one streamed update: a `response.output_text.delta` when it carries
+    /// text (otherwise nothing). The update is retained for final aggregation.
+    fn push_update(&mut self, update: &AgentRunResponseUpdate) -> Vec<Value> {
+        self.collected.push(update.clone());
+        let delta = update.text();
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mid = self.mid.clone();
+        let seq = self.next();
+        vec![json!({
             "type": "response.output_text.delta",
             "output_index": 0,
             "content_index": 0,
             "item_id": mid,
             "delta": delta,
             "logprobs": [],
-            "sequence_number": next(),
-        }));
+            "sequence_number": seq,
+        })]
     }
 
-    let text = resp.text();
-    let completed = ResponseObject {
-        id: rid.clone(),
-        object: "response",
-        created_at: util::now_ts(),
-        model: model.to_string(),
-        status: "completed",
-        output: vec![OutputMessage::assistant_text(mid, text.clone())],
-        output_text: Some(text),
-        usage: Some(build_usage(
-            &resp.usage_details,
-            input_len,
-            resp.text().len(),
-        )),
-        outputs: None,
-        pending_requests: Vec::new(),
-        parallel_tool_calls: false,
-        tool_choice: "none",
-        tools: Vec::new(),
-    };
-    events.push(json!({
-        "type": "response.completed",
-        "sequence_number": next(),
-        "response": serde_json::to_value(completed).unwrap_or(Value::Null),
-    }));
-    events
+    /// The terminal `response.completed`, aggregating all collected updates.
+    fn completed(&mut self) -> Value {
+        let response = AgentRunResponse::from_updates(std::mem::take(&mut self.collected));
+        let text = response.text();
+        let usage = build_usage(&response.usage_details, self.input_len, text.len());
+        let completed = ResponseObject {
+            id: self.rid.clone(),
+            object: "response",
+            created_at: util::now_ts(),
+            model: self.model.clone(),
+            status: "completed",
+            output: vec![OutputMessage::assistant_text(
+                self.mid.clone(),
+                text.clone(),
+            )],
+            output_text: Some(text),
+            usage: Some(usage),
+            outputs: None,
+            pending_requests: Vec::new(),
+            parallel_tool_calls: false,
+            tool_choice: "none",
+            tools: Vec::new(),
+        };
+        let seq = self.next();
+        json!({
+            "type": "response.completed",
+            "sequence_number": seq,
+            "response": serde_json::to_value(completed).unwrap_or(Value::Null),
+        })
+    }
+
+    /// An in-band error event for a failure that occurs after streaming began.
+    fn error_event(&mut self, message: &str) -> Value {
+        let seq = self.next();
+        json!({
+            "type": "error",
+            "sequence_number": seq,
+            "message": format!("Request execution failed: {message}"),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
