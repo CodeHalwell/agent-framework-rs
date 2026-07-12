@@ -356,29 +356,30 @@ async fn tool_loop_reports_invalid_arguments() {
         .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))));
 }
 
-/// A context provider that records lifecycle-hook activity: whether `invoked`
-/// fired, the error (if any) the last `invoked` carried, and every id passed to
-/// `thread_created`. Also injects an instruction so `invoking` has an effect.
+/// A context provider that records lifecycle-hook activity: whether
+/// `after_run` fired, the error (if any) the last `after_run` carried, and
+/// every `session_id` observed by `before_run` (upstream renamed
+/// `invoking`/`invoked` to `before_run`/`after_run` and removed
+/// `thread_created` entirely). Also injects an instruction so `before_run`
+/// has an observable effect.
 #[derive(Default, Clone)]
 struct RecordingProvider {
     invoked: Arc<Mutex<bool>>,
     invoked_error: Arc<Mutex<Option<String>>>,
-    thread_created_ids: Arc<Mutex<Vec<Option<String>>>>,
+    session_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
 impl ContextProvider for RecordingProvider {
-    async fn invoking(&self, _messages: &[Message]) -> Result<Context> {
-        Ok(Context::new().with_instructions("remember: be brief"))
-    }
-    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
-        self.thread_created_ids
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        self.session_ids
             .lock()
             .unwrap()
-            .push(thread_id.map(str::to_string));
+            .push(ctx.session_id.clone());
+        ctx.add_instructions("remember: be brief");
         Ok(())
     }
-    async fn invoked(
+    async fn after_run(
         &self,
         _request: &[Message],
         _response: &[Message],
@@ -394,17 +395,16 @@ impl ContextProvider for RecordingProvider {
 async fn context_provider_invoked_hook_fires() {
     let provider = RecordingProvider::default();
     let invoked = provider.invoked.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
 
     let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
-    let agent = Agent::builder(client).context_provider(aggregate).build();
+    let agent = Agent::builder(client)
+        .context_provider(Arc::new(provider))
+        .build();
 
     let _ = agent.run_once("hi").await.unwrap();
     assert!(
         *invoked.lock().unwrap(),
-        "invoked hook was not called after run"
+        "after_run hook was not called after run"
     );
 }
 
@@ -1559,7 +1559,11 @@ async fn service_thread_without_conversation_id_errors() {
 }
 
 // ===========================================================================
-// Task 1: ContextProvider::thread_created is fired by Agent
+// Task 1: ContextProvider::before_run observes session/service session ids
+// (upstream removed the `thread_created` hook entirely; the equivalent
+// coverage is that `before_run` sees the correct `session_id` /
+// `service_session_id` for a service-managed thread, and for a thread that
+// newly adopts a service id mid-run).
 // ===========================================================================
 
 /// Echoes the request's conversation id back (keeps a service thread valid).
@@ -1613,14 +1617,11 @@ impl ChatClient for AdoptServiceClient {
 }
 
 #[tokio::test]
-async fn thread_created_fires_for_service_thread() {
+async fn before_run_observes_session_id_for_service_thread() {
     let provider = RecordingProvider::default();
-    let ids = provider.thread_created_ids.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
+    let ids = provider.session_ids.clone();
     let agent = Agent::builder(EchoServiceClient)
-        .context_provider(aggregate)
+        .context_provider(Arc::new(provider))
         .build();
 
     let mut thread = agent.get_new_thread_with_service_id("svc-1").unwrap();
@@ -1629,59 +1630,42 @@ async fn thread_created_fires_for_service_thread() {
         .await
         .unwrap();
 
-    // Fired once at run start with the service thread id (no re-fire on the
-    // echoed-back same id).
+    // `before_run` observes both `session_id` and `service_session_id` set to
+    // the thread's service id (no thread_created hook any more).
     assert_eq!(ids.lock().unwrap().clone(), vec![Some("svc-1".to_string())]);
 }
 
 #[tokio::test]
-async fn thread_created_fires_on_service_id_adoption() {
+async fn before_run_session_id_reflects_service_id_adopted_on_a_prior_run() {
     let provider = RecordingProvider::default();
-    let ids = provider.thread_created_ids.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
+    let ids = provider.session_ids.clone();
     let agent = Agent::builder(AdoptServiceClient)
-        .context_provider(aggregate)
+        .context_provider(Arc::new(provider))
         .build();
 
-    // A local thread that adopts the id returned by the service.
+    // First run: a fresh local thread has no session id yet.
     let mut thread = agent.get_new_thread();
     agent
         .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
-
-    assert_eq!(
-        ids.lock().unwrap().clone(),
-        vec![Some("adopted-1".to_string())]
-    );
     assert_eq!(thread.service_thread_id(), Some("adopted-1"));
-}
 
-#[tokio::test]
-async fn thread_created_fires_on_adoption_when_streaming() {
-    let provider = RecordingProvider::default();
-    let ids = provider.thread_created_ids.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
-    let agent = Agent::builder(AdoptServiceClient)
-        .context_provider(aggregate)
-        .build();
+    // Second run: the thread adopted a service id from the first run, so
+    // `before_run` now observes it.
+    agent
+        .run(vec![Message::user("again")], Some(&mut thread))
+        .await
+        .unwrap();
 
-    let mut stream = agent.run_stream("hi", None, None).await.unwrap();
-    while let Some(u) = stream.next().await {
-        u.unwrap();
-    }
     assert_eq!(
         ids.lock().unwrap().clone(),
-        vec![Some("adopted-1".to_string())]
+        vec![None, Some("adopted-1".to_string())]
     );
 }
 
 // ===========================================================================
-// Task 2: ContextProvider::invoked observes failures
+// Task 2: ContextProvider::after_run observes failures
 // ===========================================================================
 
 struct FailingClient;
@@ -1704,22 +1688,19 @@ impl ChatClient for FailingClient {
 }
 
 #[tokio::test]
-async fn invoked_hook_observes_failure() {
+async fn after_run_hook_observes_failure() {
     let provider = RecordingProvider::default();
     let invoked = provider.invoked.clone();
     let invoked_error = provider.invoked_error.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
     let agent = Agent::builder(FailingClient)
-        .context_provider(aggregate)
+        .context_provider(Arc::new(provider))
         .build();
 
     let err = agent.run_once("hi").await.unwrap_err();
     assert!(err.to_string().contains("boom"));
     assert!(
         *invoked.lock().unwrap(),
-        "invoked fired on the failure path"
+        "after_run fired on the failure path"
     );
     let recorded = invoked_error.lock().unwrap().clone();
     assert!(
@@ -1729,14 +1710,11 @@ async fn invoked_hook_observes_failure() {
 }
 
 #[tokio::test]
-async fn invoked_hook_observes_streaming_failure() {
+async fn after_run_hook_observes_streaming_failure() {
     let provider = RecordingProvider::default();
     let invoked_error = provider.invoked_error.clone();
-    let aggregate = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        provider,
-    )]));
     let agent = Agent::builder(FailingClient)
-        .context_provider(aggregate)
+        .context_provider(Arc::new(provider))
         .build();
 
     let err = agent.run_stream("hi", None, None).await.err().unwrap();

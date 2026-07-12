@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
 use crate::error::{Error, Result};
-use crate::memory::{AggregateContextProvider, ContextProvider};
+use crate::memory::{ContextProvider, SessionContext};
 use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
 use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
@@ -301,7 +301,7 @@ pub struct Agent {
     description: Option<String>,
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
-    context_provider: Option<Arc<AggregateContextProvider>>,
+    context_providers: Vec<Arc<dyn ContextProvider>>,
     /// Factory for a new local thread's message store. When unset,
     /// [`InMemoryChatMessageStore`] is used.
     chat_message_store_factory: Option<ChatMessageStoreFactory>,
@@ -416,8 +416,8 @@ impl Agent {
             let response = match self.run_core(final_messages, options, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    if let Some(cp) = self.resolve_provider(&thread) {
-                        let _ = cp.invoked(&input, &[], Some(&e)).await;
+                    for cp in self.combined_providers(&thread) {
+                        let _ = cp.after_run(&input, &[], Some(&e)).await;
                     }
                     return Err(e);
                 }
@@ -426,8 +426,8 @@ impl Agent {
                 .await?;
             thread.on_new_messages(input.clone()).await?;
             thread.on_new_messages(response.messages.clone()).await?;
-            if let Some(cp) = self.resolve_provider(&thread) {
-                cp.invoked(&input, &response.messages, None).await?;
+            for cp in self.combined_providers(&thread) {
+                cp.after_run(&input, &response.messages, None).await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
             // response's conversation/response ids and usage ride along so
@@ -442,7 +442,7 @@ impl Agent {
         // the stream's terminal aggregation can auto-populate `value` (task 3).
         let response_format = options.response_format.clone();
         let agent_name = self.name.clone();
-        let provider = self.resolve_provider(&thread);
+        let providers = self.combined_providers(&thread);
         let inner = match self
             .client
             .get_streaming_response(final_messages, options)
@@ -451,8 +451,8 @@ impl Agent {
             Ok(s) => s,
             Err(e) => {
                 // Failure before the stream opens: let providers observe it.
-                if let Some(cp) = &provider {
-                    let _ = cp.invoked(&input, &[], Some(&e)).await;
+                for cp in &providers {
+                    let _ = cp.after_run(&input, &[], Some(&e)).await;
                 }
                 return Err(e);
             }
@@ -460,7 +460,7 @@ impl Agent {
 
         // Wrap the inner stream: forward mapped updates, then update the thread.
         let stream =
-            async_stream_forward(inner, agent_name, thread, input, provider, response_format);
+            async_stream_forward(inner, agent_name, thread, input, providers, response_format);
         Ok(stream.boxed())
     }
 
@@ -472,15 +472,7 @@ impl Agent {
         thread: &mut AgentThread,
         run_options: &AgentRunOptions,
     ) -> Result<(Vec<Message>, ChatOptions)> {
-        // Fire the context-provider `thread_created` hook when a run uses a
-        // service-managed thread (mirrors `_agents.py:1264-1265`). The id
-        // argument is the service thread id.
         let service_thread_id = thread.service_thread_id().map(str::to_string);
-        if let Some(id) = &service_thread_id {
-            if let Some(cp) = self.resolve_provider(thread) {
-                cp.thread_created(Some(id)).await?;
-            }
-        }
 
         // Merge per-run chat-option overrides over the agent's defaults, with
         // the per-run side winning (mirrors Python's `run_chat_options &
@@ -495,31 +487,37 @@ impl Agent {
         // survives (previously it was unconditionally cleared here, silently
         // starting a new service conversation despite the documented per-run
         // precedence).
-        options.conversation_id = service_thread_id.or(options.conversation_id.take());
+        options.conversation_id = service_thread_id.clone().or(options.conversation_id.take());
 
-        let mut history = thread.list_messages().await?;
+        let thread_history = thread.list_messages().await?;
 
-        // Context provider injection.
-        let provider = thread
-            .context_provider
-            .clone()
-            .or_else(|| self.context_provider.clone());
-        if let Some(cp) = provider {
-            let ctx = cp.invoking(input).await?;
-            if let Some(instr) = ctx.instructions {
-                options.instructions = Some(match options.instructions.take() {
-                    Some(base) => format!("{base}\n{instr}"),
-                    None => instr,
-                });
-            }
-            history.extend(ctx.messages);
-            // Deduplicate by name: a tool may be defined on the agent and also
-            // injected by a context provider. Providers rejecting duplicate
-            // tool names would otherwise fail the request.
-            for t in ctx.tools {
-                if !options.tools.iter().any(|existing| existing.name == t.name) {
-                    options.tools.push(t);
-                }
+        // Context provider injection: run every provider's `before_run` over a
+        // shared `SessionContext`, then fold the result into the request
+        // (provider instructions AFTER the agent's own; provider messages
+        // PREPENDED ahead of thread history; provider tools appended,
+        // deduplicated by name).
+        let providers = self.combined_providers(thread);
+        let mut ctx = SessionContext::new(input.to_vec());
+        ctx.session_id = service_thread_id.clone();
+        ctx.service_session_id = service_thread_id.clone();
+        for provider in &providers {
+            provider.before_run(&mut ctx).await?;
+        }
+        if let Some(instr) = ctx.instructions {
+            options.instructions = Some(match options.instructions.take() {
+                Some(base) => format!("{base}\n{instr}"),
+                None => instr,
+            });
+        }
+        let mut history = ctx.messages;
+        history.extend(thread_history);
+
+        // Deduplicate by name: a tool may be defined on the agent and also
+        // injected by a context provider. Providers rejecting duplicate
+        // tool names would otherwise fail the request.
+        for t in ctx.tools {
+            if !options.tools.iter().any(|existing| existing.name == t.name) {
+                options.tools.push(t);
             }
         }
 
@@ -726,12 +724,13 @@ impl Agent {
         !self.agent_middleware.is_empty()
     }
 
-    /// The effective context provider for a run: the thread's, else the agent's.
-    fn resolve_provider(&self, thread: &AgentThread) -> Option<Arc<AggregateContextProvider>> {
-        thread
-            .context_provider
-            .clone()
-            .or_else(|| self.context_provider.clone())
+    /// The effective context providers for a run: the thread's, combined with
+    /// the agent's own. There is no aggregate wrapper any more — callers
+    /// iterate this list directly.
+    fn combined_providers(&self, thread: &AgentThread) -> Vec<Arc<dyn ContextProvider>> {
+        let mut providers = thread.context_providers.clone();
+        providers.extend(self.context_providers.iter().cloned());
+        providers
     }
 
     /// Build a fresh message store from the configured factory, or an
@@ -750,9 +749,9 @@ impl Agent {
     ///   doesn't support service-managed threads for this request, so surface
     ///   an [`Error::AgentExecution`] (matches Python raising
     ///   `AgentExecutionException`, GAP item 14).
-    /// * An id returned that the thread newly adopts → fire the
-    ///   `thread_created` context-provider hook with the adopted id (task 1,
-    ///   `_agents.py:1228-1229`).
+    /// * An id returned that the thread newly adopts is simply recorded on the
+    ///   thread; there is no `thread_created` hook any more (upstream removed
+    ///   it — see [`crate::memory::ContextProvider`]).
     async fn update_thread_conversation_id(
         &self,
         thread: &mut AgentThread,
@@ -770,11 +769,7 @@ impl Agent {
                 Ok(())
             }
             Some(cid) => {
-                if thread.try_adopt_service_thread_id(cid).await? {
-                    if let Some(cp) = self.resolve_provider(thread) {
-                        cp.thread_created(Some(cid)).await?;
-                    }
-                }
+                thread.try_adopt_service_thread_id(cid).await?;
                 Ok(())
             }
         }
@@ -785,7 +780,7 @@ impl Agent {
 type ForwardFinish = Option<(
     AgentThread,
     Vec<Message>,
-    Option<Arc<AggregateContextProvider>>,
+    Vec<Arc<dyn ContextProvider>>,
     Option<ResponseFormat>,
 )>;
 
@@ -795,10 +790,10 @@ fn async_stream_forward(
     agent_name: Option<String>,
     thread: AgentThread,
     input: Vec<Message>,
-    provider: Option<Arc<AggregateContextProvider>>,
+    providers: Vec<Arc<dyn ContextProvider>>,
     response_format: Option<ResponseFormat>,
 ) -> impl Stream<Item = Result<AgentResponseUpdate>> + Send {
-    let finish: ForwardFinish = Some((thread, input, provider, response_format));
+    let finish: ForwardFinish = Some((thread, input, providers, response_format));
     futures::stream::unfold(
         (
             inner,
@@ -823,10 +818,12 @@ fn async_stream_forward(
                     }
                     Some(Err(e)) => {
                         // Failure mid-stream: let context providers observe the
-                        // error (task 2) before surfacing it. The stream error
-                        // takes precedence, so the hook result is discarded.
-                        if let Some((_thread, input, Some(cp), _rf)) = finish.take() {
-                            let _ = cp.invoked(&input, &[], Some(&e)).await;
+                        // error before surfacing it. The stream error takes
+                        // precedence, so the hooks' results are discarded.
+                        if let Some((_thread, input, providers, _rf)) = finish.take() {
+                            for cp in &providers {
+                                let _ = cp.after_run(&input, &[], Some(&e)).await;
+                            }
                         }
                         Some((Err(e), (inner, collected, true, None)))
                     }
@@ -835,7 +832,7 @@ fn async_stream_forward(
                         // the thread history, and fire the completion hook.
                         // Surface any failure as the final item rather than
                         // dropping it.
-                        if let Some((mut thread, input, provider, response_format)) = finish.take()
+                        if let Some((mut thread, input, providers, response_format)) = finish.take()
                         {
                             let response = ChatResponse::from_updates_with_format(
                                 collected.clone(),
@@ -854,22 +851,11 @@ fn async_stream_forward(
                                         ));
                                     }
                                 }
-                                Some(cid) => match thread.try_adopt_service_thread_id(cid).await {
-                                    Ok(true) => {
-                                        if let Some(cp) = &provider {
-                                            if let Err(e) = cp.thread_created(Some(cid)).await {
-                                                return Some((
-                                                    Err(e),
-                                                    (inner, collected, true, None),
-                                                ));
-                                            }
-                                        }
+                                Some(cid) => {
+                                    if let Err(e) = thread.try_adopt_service_thread_id(cid).await {
+                                        return Some((Err(e), (inner, collected, true, None)));
                                     }
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        return Some((Err(e), (inner, collected, true, None)))
-                                    }
-                                },
+                                }
                             }
                             if let Err(e) = thread.on_new_messages(input.clone()).await {
                                 return Some((Err(e), (inner, collected, true, None)));
@@ -878,8 +864,9 @@ fn async_stream_forward(
                             {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
-                            if let Some(cp) = provider {
-                                if let Err(e) = cp.invoked(&input, &response.messages, None).await {
+                            for cp in providers {
+                                if let Err(e) = cp.after_run(&input, &response.messages, None).await
+                                {
                                     return Some((Err(e), (inner, collected, true, None)));
                                 }
                             }
@@ -923,11 +910,11 @@ impl SupportsAgentRun for Agent {
         let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
-                // Failure path: let context providers observe the error
-                // (task 2). The run's error takes precedence over any hook
-                // failure, so the hook result is intentionally discarded.
-                if let Some(cp) = self.resolve_provider(thread) {
-                    let _ = cp.invoked(&messages, &[], Some(&e)).await;
+                // Failure path: let context providers observe the error.
+                // The run's error takes precedence over any hook failure, so
+                // the hook result is intentionally discarded.
+                for cp in self.combined_providers(thread) {
+                    let _ = cp.after_run(&messages, &[], Some(&e)).await;
                 }
                 return Err(e);
             }
@@ -935,16 +922,16 @@ impl SupportsAgentRun for Agent {
 
         // Persist / validate the service-managed conversation id before
         // touching local history (tasks: service-thread adoption + missing-id
-        // error). Fires `thread_created` on newly adopted ids.
+        // error).
         self.update_thread_conversation_id(thread, response.conversation_id.as_deref())
             .await?;
         // Update thread history.
         thread.on_new_messages(messages.clone()).await?;
         thread.on_new_messages(response.messages.clone()).await?;
 
-        // Fire the context provider's success completion hook.
-        if let Some(cp) = self.resolve_provider(thread) {
-            cp.invoked(&messages, &response.messages, None).await?;
+        // Fire the context providers' success completion hook.
+        for cp in self.combined_providers(thread) {
+            cp.after_run(&messages, &response.messages, None).await?;
         }
 
         Ok(response)
@@ -972,14 +959,16 @@ impl SupportsAgentRun for Agent {
         // create a local thread with a shared store (from the configured
         // factory, else in-memory) so history is observable across clones
         // (e.g. during streaming).
-        let mut thread = match &self.chat_options.conversation_id {
+        //
+        // The agent's own context providers are NOT copied onto the thread
+        // here: [`Agent::combined_providers`] merges the thread's providers
+        // with the agent's own at request time, so copying them here would
+        // double-invoke the agent's providers for every run against this
+        // thread.
+        match &self.chat_options.conversation_id {
             Some(id) => AgentThread::service(id.clone()),
             None => AgentThread::local(self.new_message_store()),
-        };
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
         }
-        thread
     }
 }
 
@@ -994,7 +983,7 @@ pub struct AgentBuilder {
     /// function middleware can be threaded into the wrapper's constructor.
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
-    context_provider: Option<Arc<AggregateContextProvider>>,
+    context_providers: Vec<Arc<dyn ContextProvider>>,
     chat_message_store_factory: Option<ChatMessageStoreFactory>,
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
     chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
@@ -1011,7 +1000,7 @@ impl AgentBuilder {
             instructions: None,
             client: Arc::new(client),
             chat_options: ChatOptions::new(),
-            context_provider: None,
+            context_providers: Vec::new(),
             chat_message_store_factory: None,
             agent_middleware: Vec::new(),
             chat_middleware: Vec::new(),
@@ -1073,9 +1062,15 @@ impl AgentBuilder {
         self.tool_sources.push(source);
         self
     }
-    /// Set the context provider(s).
-    pub fn context_provider(mut self, provider: Arc<AggregateContextProvider>) -> Self {
-        self.context_provider = Some(provider);
+    /// Add a single context provider (repeatable; providers run in
+    /// registration order, agent providers after any thread-level ones).
+    pub fn context_provider(mut self, provider: Arc<dyn ContextProvider>) -> Self {
+        self.context_providers.push(provider);
+        self
+    }
+    /// Set the context provider list, replacing any previously registered.
+    pub fn context_providers(mut self, providers: Vec<Arc<dyn ContextProvider>>) -> Self {
+        self.context_providers = providers;
         self
     }
     /// Set a factory for the message store of each new local thread, mirroring
@@ -1139,7 +1134,7 @@ impl AgentBuilder {
             description: self.description,
             client,
             chat_options: self.chat_options,
-            context_provider: self.context_provider,
+            context_providers: self.context_providers,
             chat_message_store_factory: self.chat_message_store_factory,
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
@@ -1158,20 +1153,18 @@ impl Agent {
     /// mirroring Python's `get_new_thread(service_thread_id=…)`
     /// (`_agents.py:1078-1082`).
     ///
-    /// The agent's context provider (if any) is attached. Returns an error if
-    /// the requested combination is invalid (a service id plus a local store);
-    /// this constructor only sets the service id, so it always succeeds, but
-    /// routing through [`AgentThread::try_from_parts`] keeps the service-xor-
-    /// store invariant in one place.
+    /// Returns an error if the requested combination is invalid (a service id
+    /// plus a local store); this constructor only sets the service id, so it
+    /// always succeeds, but routing through [`AgentThread::try_from_parts`]
+    /// keeps the service-xor-store invariant in one place.
+    ///
+    /// The agent's own context providers are NOT copied onto the returned
+    /// thread; see the note on [`Agent::get_new_thread`].
     pub fn get_new_thread_with_service_id(
         &self,
         service_thread_id: impl Into<String>,
     ) -> Result<AgentThread> {
-        let mut thread = AgentThread::try_from_parts(Some(service_thread_id.into()), None)?;
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
-        }
-        Ok(thread)
+        AgentThread::try_from_parts(Some(service_thread_id.into()), None)
     }
 
     /// Reconstruct a thread from serialized state (as produced by
@@ -1180,14 +1173,11 @@ impl Agent {
     ///
     /// A local thread's store is built via the agent's
     /// `chat_message_store_factory` (or an [`InMemoryChatMessageStore`]) and
-    /// populated from the state; the agent's context provider is attached.
+    /// populated from the state. The agent's own context providers are NOT
+    /// copied onto the returned thread; see the note on
+    /// [`Agent::get_new_thread`].
     pub async fn deserialize_thread(&self, serialized_thread: &Value) -> Result<AgentThread> {
-        let mut thread =
-            AgentThread::deserialize(serialized_thread, Some(self.new_message_store())).await?;
-        if let Some(cp) = &self.context_provider {
-            thread = thread.with_context_provider(cp.clone());
-        }
-        Ok(thread)
+        AgentThread::deserialize(serialized_thread, Some(self.new_message_store())).await
     }
 
     /// Wrap this agent as a [`ToolDefinition`] usable by another agent's

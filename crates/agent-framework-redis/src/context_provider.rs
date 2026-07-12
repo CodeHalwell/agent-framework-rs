@@ -2,9 +2,9 @@
 //! Redis, scoped by application/agent/user/thread id.
 //!
 //! Mirrors the *scoping and prompt-injection* behavior of the Python
-//! `agent_framework_redis.RedisProvider`: `invoked()` persists the
+//! `agent_framework_redis.RedisProvider`: `after_run()` persists the
 //! request/response exchange as JSON entries tagged with the provider's
-//! scope, and `invoking()` retrieves matching entries and injects them into
+//! scope, and `before_run()` retrieves matching entries and injects them into
 //! the conversation as a single `user`-role [`Message`] prefixed by
 //! [`DEFAULT_CONTEXT_PROMPT`] (same default text as Python's
 //! `ContextProvider.DEFAULT_CONTEXT_PROMPT`).
@@ -14,7 +14,7 @@
 //! Python's `RedisProvider` is built on
 //! [redisvl](https://github.com/redis/redis-vl-python) and RediSearch: it
 //! maintains a `FT.CREATE`d index with `TAG`/`TEXT`/`VECTOR` fields, and
-//! `invoking()` runs a server-side `TextQuery` (BM25 full-text) or
+//! `before_run()` runs a server-side `TextQuery` (BM25 full-text) or
 //! `HybridQuery` (BM25 + KNN vector similarity, when a vectorizer is
 //! configured) against that index.
 //!
@@ -31,7 +31,7 @@
 //!   exists" error) covering every `MemoryEntry` field: `content` is
 //!   `TEXT` (BM25-scored full-text); `application_id`/`agent_id`/`user_id`/
 //!   `thread_id`/`role`/`message_id`/`author_name` are `TAG` (exact-match
-//!   scope filtering); `rank` is `NUMERIC SORTABLE`. `invoking()` runs a
+//!   scope filtering); `rank` is `NUMERIC SORTABLE`. `before_run()` runs a
 //!   single `FT.SEARCH` combining ANDed `TAG` filters for the configured
 //!   scope with an ORed `@content:(...)` clause over the same lowercased,
 //!   stopword-filtered tokens the SCAN path uses (`tokenize_query`),
@@ -74,7 +74,7 @@
 //! 1. Stores each memory as its own key `{key_prefix}:entry:{uuid}` holding
 //!    a JSON blob (content, role, scope fields, a client-assigned recency
 //!    rank) — no index, no schema, no `FT.CREATE`/`overwrite_index`.
-//! 2. On `invoking()`, enumerates candidates with `SCAN MATCH
+//! 2. On `before_run()`, enumerates candidates with `SCAN MATCH
 //!    {key_prefix}:entry:*` (cursor-based, non-blocking — never `KEYS`),
 //!    `MGET`s their values, and **filters entirely client-side**:
 //!    - scope filter: exact-match AND over whichever of
@@ -90,7 +90,7 @@
 //!      `limit` (default 10, matching Python's `num_results` default).
 //!
 //! There is no relevance ranking beyond "did a token match" plus recency,
-//! no stemming, and — because every fallback `invoking()` call does a full
+//! no stemming, and — because every fallback `before_run()` call does a full
 //! `SCAN` over the prefix — retrieval is `O(entries under key_prefix)`
 //! rather than `O(log n)`/index-accelerated. This is adequate for modest
 //! memory volumes (demos, tests, small deployments); reach for Redis Stack
@@ -109,7 +109,7 @@ use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::memory::{Context, ContextProvider};
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::{Message, Role};
 
 use crate::internal::{map_redis_err, LazyConnection};
@@ -122,7 +122,7 @@ pub const DEFAULT_KEY_PREFIX: &str = "context";
 pub const DEFAULT_CONTEXT_PROMPT: &str =
     "## Memories\nConsider the following memories when answering user questions:";
 
-/// Default number of memories returned by `invoking()`, matching Python's
+/// Default number of memories returned by `before_run()`, matching Python's
 /// `RedisProvider._redis_search(..., num_results=10)` default.
 pub const DEFAULT_LIMIT: usize = 10;
 
@@ -152,10 +152,10 @@ struct MemoryEntry {
     author_name: Option<String>,
     /// Client-assigned recency rank: `unix_millis * 1000 + index_in_batch`.
     /// Higher is more recent. Avoids a round trip through a Redis-side
-    /// counter while still giving messages added in the same `invoked()`
+    /// counter while still giving messages added in the same `after_run()`
     /// call (which may share a millisecond) a stable relative order. Used
     /// to sort SCAN-fallback hits; carried into the RediSearch schema too
-    /// (`NUMERIC SORTABLE`) for potential future use, though `invoking()`'s
+    /// (`NUMERIC SORTABLE`) for potential future use, though `before_run()`'s
     /// RediSearch path currently sorts by relevance (BM25), not rank — see
     /// the module docs.
     rank: i64,
@@ -261,16 +261,16 @@ fn is_storable_role(role: &Role) -> bool {
     r == Role::USER || r == Role::ASSISTANT || r == Role::SYSTEM
 }
 
-fn format_context(context_prompt: &str, joined_memories: &str) -> Context {
+/// Build the single `user`-role memory-injection message for `before_run()`
+/// to push onto `SessionContext::messages`, or `None` when there is nothing
+/// to inject (mirrors the old `Context::default()` "no-op" case).
+fn format_context_message(context_prompt: &str, joined_memories: &str) -> Option<Message> {
     if joined_memories.is_empty() {
-        Context::default()
+        None
     } else {
-        Context {
-            messages: vec![Message::user(format!(
-                "{context_prompt}\n{joined_memories}"
-            ))],
-            ..Default::default()
-        }
+        Some(Message::user(format!(
+            "{context_prompt}\n{joined_memories}"
+        )))
     }
 }
 
@@ -367,7 +367,7 @@ fn ft_create_args(key_prefix: &str, index_name: &str) -> Vec<String> {
 /// semantics of the SCAN-fallback's [`select_recent`]). Every scope value
 /// and token is escaped with [`escape_redisearch`] first. Falls back to
 /// `"*"` (match everything) only if both `scope` and `tokens` are empty —
-/// unreachable in practice, since `invoking()` requires non-empty `tokens`
+/// unreachable in practice, since `before_run()` requires non-empty `tokens`
 /// and `validate_filters()` requires a non-empty `scope` before this is
 /// ever called, but kept total rather than partial.
 fn build_ft_search_query(scope: &Scope, tokens: &[String]) -> String {
@@ -473,7 +473,7 @@ async fn probe_redisearch(conn: &mut redis::aio::MultiplexedConnection) -> bool 
 ///
 /// ```no_run
 /// use agent_framework_redis::RedisContextProvider;
-/// use agent_framework_core::memory::ContextProvider;
+/// use agent_framework_core::memory::{ContextProvider, SessionContext};
 /// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
@@ -482,9 +482,10 @@ async fn probe_redisearch(conn: &mut redis::aio::MultiplexedConnection) -> bool 
 ///     .with_limit(5);
 ///
 /// let request = vec![Message::user("I love hiking in the Cascades")];
-/// provider.invoked(&request, &[], None).await?;
+/// provider.after_run(&request, &[], None).await?;
 ///
-/// let ctx = provider.invoking(&[Message::user("Any outdoor hobbies?")]).await?;
+/// let mut ctx = SessionContext::new(vec![Message::user("Any outdoor hobbies?")]);
+/// provider.before_run(&mut ctx).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -498,7 +499,14 @@ pub struct RedisContextProvider {
     scope_to_per_operation_thread_id: bool,
     context_prompt: String,
     limit: usize,
-    per_operation_thread_id: Mutex<Option<String>>,
+    /// The per-operation thread id, captured from `SessionContext::session_id`
+    /// on `before_run()` (the agent threads its scoping id through
+    /// `SessionContext` — see [`agent_framework_core::memory::SessionContext`]).
+    /// Cached here (rather than only living on the stack) so `after_run()` —
+    /// which the trait does not pass a `SessionContext` to — can still scope
+    /// its storage write to the same thread. Only consulted when
+    /// `scope_to_per_operation_thread_id` is set.
+    session_thread_id: Mutex<Option<String>>,
     /// When `true`, always use the SCAN fallback even if RediSearch is
     /// available (builder: [`Self::with_force_scan_fallback`]).
     force_scan_fallback: bool,
@@ -513,7 +521,7 @@ pub struct RedisContextProvider {
 impl RedisContextProvider {
     /// Create a provider for `redis_url` with no scope configured yet (at
     /// least one of application/agent/user/thread id must be set via the
-    /// builder methods before `invoking`/`invoked` are called).
+    /// builder methods before `before_run`/`after_run` are called).
     pub fn new(redis_url: impl Into<String>) -> Result<Self> {
         let redis_url = redis_url.into();
         let conn = LazyConnection::open(&redis_url)?;
@@ -527,7 +535,7 @@ impl RedisContextProvider {
             scope_to_per_operation_thread_id: false,
             context_prompt: DEFAULT_CONTEXT_PROMPT.to_string(),
             limit: DEFAULT_LIMIT,
-            per_operation_thread_id: Mutex::new(None),
+            session_thread_id: Mutex::new(None),
             force_scan_fallback: false,
             search_capability: OnceCell::new(),
             index_ready: OnceCell::new(),
@@ -566,9 +574,10 @@ impl RedisContextProvider {
     }
 
     /// When `true`, the thread id used for scoping is captured from the
-    /// first [`ContextProvider::thread_created`] call instead of the
-    /// static `thread_id` above, and a conflicting thread id on a later
-    /// call is an error (builder style).
+    /// `session_id` of the first [`SessionContext`] seen by
+    /// [`ContextProvider::before_run`] instead of the static `thread_id`
+    /// above, and a conflicting `session_id` on a later call is an error
+    /// (builder style).
     pub fn with_scope_to_per_operation_thread_id(mut self, value: bool) -> Self {
         self.scope_to_per_operation_thread_id = value;
         self
@@ -581,7 +590,7 @@ impl RedisContextProvider {
         self
     }
 
-    /// Maximum memories returned per `invoking()` call (builder style).
+    /// Maximum memories returned per `before_run()` call (builder style).
     /// Defaults to [`DEFAULT_LIMIT`].
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = limit;
@@ -616,10 +625,37 @@ impl RedisContextProvider {
 
     async fn effective_thread_id(&self) -> Option<String> {
         if self.scope_to_per_operation_thread_id {
-            self.per_operation_thread_id.lock().await.clone()
+            self.session_thread_id.lock().await.clone()
         } else {
             self.thread_id.clone()
         }
+    }
+
+    /// Record `session_id` (from `SessionContext::session_id`, on
+    /// `before_run()`) as this provider's per-operation scoping thread id.
+    /// Port of the old `ContextProvider::thread_created` hook, which is no
+    /// longer part of the trait: the agent now threads the scoping id
+    /// through `SessionContext` instead of a separate callback, so this is
+    /// invoked directly from `before_run()`. Same semantics as the old
+    /// method: the first non-`None` id seen wins, and — only when
+    /// [`Self::with_scope_to_per_operation_thread_id`] is set — a later call
+    /// with a *different* non-`None` id is a configuration error, since this
+    /// provider can only be scoped to a single thread at a time.
+    async fn record_session_thread_id(&self, session_id: Option<&str>) -> Result<()> {
+        let mut guard = self.session_thread_id.lock().await;
+        if self.scope_to_per_operation_thread_id {
+            if let (Some(new_id), Some(existing)) = (session_id, guard.as_deref()) {
+                if new_id != existing {
+                    return Err(Error::other(
+                        "RedisContextProvider can only be used with one thread, when scope_to_per_operation_thread_id is True.",
+                    ));
+                }
+            }
+        }
+        if guard.is_none() {
+            *guard = session_id.map(String::from);
+        }
+        Ok(())
     }
 
     async fn scope(&self) -> Scope {
@@ -747,24 +783,62 @@ impl RedisContextProvider {
 
 #[async_trait]
 impl ContextProvider for RedisContextProvider {
-    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
-        let mut guard = self.per_operation_thread_id.lock().await;
-        if self.scope_to_per_operation_thread_id {
-            if let (Some(new_id), Some(existing)) = (thread_id, guard.as_deref()) {
-                if new_id != existing {
-                    return Err(Error::other(
-                        "RedisContextProvider can only be used with one thread, when scope_to_per_operation_thread_id is True.",
-                    ));
-                }
-            }
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        self.validate_filters()?;
+        // Replaces the old `thread_created` hook: the agent now threads the
+        // per-operation scoping id through `SessionContext::session_id`
+        // rather than a separate callback, so we capture it here, on every
+        // `before_run()` call, exactly as `thread_created` used to be called
+        // on every thread-creation event.
+        self.record_session_thread_id(ctx.session_id.as_deref())
+            .await?;
+
+        let input_text = ctx
+            .input_messages
+            .iter()
+            .map(Message::text)
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if input_text.trim().is_empty() {
+            // Python's RedisProvider unconditionally calls `_redis_search`,
+            // which raises on empty text; we instead treat "nothing to
+            // search for" as "no memories" — see module docs.
+            return Ok(());
         }
-        if guard.is_none() {
-            *guard = thread_id.map(String::from);
+
+        let scope = self.scope().await;
+        if scope.is_empty() {
+            // Unreachable given `validate_filters` above (it guarantees at
+            // least one scope field), but keep `Scope` honest in isolation.
+            return Ok(());
         }
+
+        let mut conn = self.conn.get().await?;
+        let hits = if self.use_redisearch(&mut conn).await {
+            let tokens = tokenize_query(&input_text);
+            self.ft_search(&mut conn, &scope, &tokens, self.limit)
+                .await?
+        } else {
+            let entries = self.scan_entries().await?;
+            select_recent(entries, &scope, Some(&input_text), self.limit)
+        };
+
+        let joined = hits
+            .iter()
+            .map(|e| e.content.as_str())
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some(message) = format_context_message(&self.context_prompt, &joined) {
+            ctx.messages.push(message);
+        }
+
         Ok(())
     }
 
-    async fn invoked(
+    async fn after_run(
         &self,
         request_messages: &[Message],
         response_messages: &[Message],
@@ -823,49 +897,6 @@ impl ContextProvider for RedisContextProvider {
         }
         let _: () = pipe.query_async(&mut conn).await.map_err(map_redis_err)?;
         Ok(())
-    }
-
-    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
-        self.validate_filters()?;
-
-        let input_text = messages
-            .iter()
-            .map(Message::text)
-            .filter(|t| !t.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if input_text.trim().is_empty() {
-            // Python's RedisProvider unconditionally calls `_redis_search`,
-            // which raises on empty text; we instead treat "nothing to
-            // search for" as "no memories" — see module docs.
-            return Ok(Context::default());
-        }
-
-        let scope = self.scope().await;
-        if scope.is_empty() {
-            // Unreachable given `validate_filters` above (it guarantees at
-            // least one scope field), but keep `Scope` honest in isolation.
-            return Ok(Context::default());
-        }
-
-        let mut conn = self.conn.get().await?;
-        let hits = if self.use_redisearch(&mut conn).await {
-            let tokens = tokenize_query(&input_text);
-            self.ft_search(&mut conn, &scope, &tokens, self.limit)
-                .await?
-        } else {
-            let entries = self.scan_entries().await?;
-            select_recent(entries, &scope, Some(&input_text), self.limit)
-        };
-
-        let joined = hits
-            .iter()
-            .map(|e| e.content.as_str())
-            .filter(|c| !c.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(format_context(&self.context_prompt, &joined))
     }
 }
 
@@ -1082,21 +1113,19 @@ mod tests {
 
     // endregion
 
-    // region: format_context
+    // region: format_context_message
 
     #[test]
-    fn format_context_empty_when_no_hits() {
-        let ctx = format_context(DEFAULT_CONTEXT_PROMPT, "");
-        assert!(ctx.messages.is_empty());
+    fn format_context_message_none_when_no_hits() {
+        assert!(format_context_message(DEFAULT_CONTEXT_PROMPT, "").is_none());
     }
 
     #[test]
-    fn format_context_builds_user_message_with_prompt_header() {
-        let ctx = format_context(DEFAULT_CONTEXT_PROMPT, "A\nB");
-        assert_eq!(ctx.messages.len(), 1);
-        assert_eq!(ctx.messages[0].role, Role::user());
+    fn format_context_message_builds_user_message_with_prompt_header() {
+        let message = format_context_message(DEFAULT_CONTEXT_PROMPT, "A\nB").unwrap();
+        assert_eq!(message.role, Role::user());
         assert_eq!(
-            ctx.messages[0].text(),
+            message.text(),
             "## Memories\nConsider the following memories when answering user questions:\nA\nB"
         );
     }
@@ -1418,73 +1447,86 @@ mod tests {
 
     // endregion
 
-    // region: thread_created / per-operation scoping (async, no server: pure Mutex state)
+    // region: before_run() session_id scoping (async, no server: empty
+    // input_messages makes before_run() return before any I/O, right after
+    // recording the session thread id — same "pure Mutex state" coverage the
+    // old thread_created tests had.
 
     #[tokio::test]
-    async fn thread_created_sets_per_operation_thread_id() {
+    async fn before_run_sets_session_thread_id() {
         let p = provider().with_scope_to_per_operation_thread_id(true);
-        p.thread_created(Some("t1")).await.unwrap();
-        assert_eq!(
-            p.per_operation_thread_id.lock().await.as_deref(),
-            Some("t1")
-        );
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        assert_eq!(p.session_thread_id.lock().await.as_deref(), Some("t1"));
     }
 
     #[tokio::test]
-    async fn thread_created_does_not_overwrite_existing() {
+    async fn before_run_does_not_overwrite_existing_session_thread_id() {
         let p = provider().with_scope_to_per_operation_thread_id(true);
-        p.thread_created(Some("t1")).await.unwrap();
-        p.thread_created(Some("t1")).await.unwrap();
-        assert_eq!(
-            p.per_operation_thread_id.lock().await.as_deref(),
-            Some("t1")
-        );
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        assert_eq!(p.session_thread_id.lock().await.as_deref(), Some("t1"));
     }
 
     #[tokio::test]
-    async fn thread_created_conflict_when_scoped() {
+    async fn before_run_conflict_when_scoped() {
         let p = provider().with_scope_to_per_operation_thread_id(true);
-        p.thread_created(Some("t1")).await.unwrap();
-        let err = p.thread_created(Some("t2")).await.unwrap_err();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t2".to_string());
+        let err = p.before_run(&mut ctx).await.unwrap_err();
         assert!(err.to_string().contains("only be used with one thread"));
     }
 
     #[tokio::test]
-    async fn thread_created_allows_none_repeatedly() {
+    async fn before_run_allows_none_session_id_repeatedly() {
         let p = provider().with_scope_to_per_operation_thread_id(true);
-        p.thread_created(None).await.unwrap();
-        p.thread_created(None).await.unwrap();
-        p.thread_created(Some("t1")).await.unwrap();
-        assert_eq!(
-            p.per_operation_thread_id.lock().await.as_deref(),
-            Some("t1")
-        );
+        let mut ctx = SessionContext::new(vec![]);
+        p.before_run(&mut ctx).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        p.before_run(&mut ctx).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        assert_eq!(p.session_thread_id.lock().await.as_deref(), Some("t1"));
     }
 
     #[tokio::test]
-    async fn thread_created_without_scoping_never_conflicts() {
+    async fn before_run_without_scoping_never_conflicts() {
         let p = provider(); // scope_to_per_operation_thread_id defaults to false
-        p.thread_created(Some("t1")).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t1".to_string());
+        p.before_run(&mut ctx).await.unwrap();
         // No conflict error even though the id changes, since scoping is off.
-        p.thread_created(Some("t2")).await.unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("t2".to_string());
+        p.before_run(&mut ctx).await.unwrap();
     }
 
     // endregion
 
-    // region: invoking()/invoked() input validation (async, no server: fails before any I/O)
+    // region: before_run()/after_run() input validation (async, no server: fails before any I/O)
 
     #[tokio::test]
-    async fn invoking_fails_without_scope_configured() {
+    async fn before_run_fails_without_scope_configured() {
         let p = RedisContextProvider::new("redis://127.0.0.1:6379/0").unwrap();
-        let err = p.invoking(&[Message::user("hi")]).await.unwrap_err();
+        let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+        let err = p.before_run(&mut ctx).await.unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
     }
 
     #[tokio::test]
-    async fn invoked_fails_without_scope_configured() {
+    async fn after_run_fails_without_scope_configured() {
         let p = RedisContextProvider::new("redis://127.0.0.1:6379/0").unwrap();
         let err = p
-            .invoked(&[Message::user("hi")], &[], None)
+            .after_run(&[Message::user("hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));

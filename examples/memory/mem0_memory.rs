@@ -1,6 +1,6 @@
 //! Long-term memory with the hosted Mem0 API: `Mem0Provider` persists each
-//! turn to Mem0 (`invoked()`) and retrieves relevant memories into the next
-//! request's context (`invoking()`), scoped by user/agent/application/thread
+//! turn to Mem0 (`after_run()`) and retrieves relevant memories into the next
+//! request's context (`before_run()`), scoped by user/agent/application/thread
 //! id.
 //!
 //! Prerequisites: a Mem0 account and MEM0_API_KEY (https://mem0.ai), plus
@@ -28,12 +28,9 @@ async fn main() -> Result<()> {
     // alternative when you want per-thread isolation instead.
     let memory = Mem0Provider::from_env()?.with_user_id("user-42");
 
-    let mut providers = AggregateContextProvider::new();
-    providers.add(Arc::new(memory));
-
     let agent = Agent::builder(OpenAIChatCompletionClient::from_env("gpt-4o-mini")?)
         .instructions("You are a helpful assistant.")
-        .context_provider(Arc::new(providers))
+        .context_provider(Arc::new(memory))
         .build();
 
     // Teach it a fact...

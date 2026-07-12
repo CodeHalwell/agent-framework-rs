@@ -2,11 +2,11 @@
 //! [Mem0](https://mem0.ai) memory API.
 //!
 //! Mirrors `agent_framework_mem0.Mem0Provider` from the Python SupportsAgentRun
-//! Framework: `invoked()` adds the request/response exchange to Mem0,
-//! scoped by `user_id`/`agent_id`/`run_id`/`application_id`; `invoking()`
+//! Framework: `after_run()` adds the request/response exchange to Mem0,
+//! scoped by `user_id`/`agent_id`/`run_id`/`application_id`; `before_run()`
 //! searches Mem0 with the latest input text (plus the same scope) and
-//! injects the hits into the conversation as a single `user`-role
-//! [`Message`] prefixed by [`DEFAULT_CONTEXT_PROMPT`].
+//! injects the hits into the run's [`SessionContext`] as a single
+//! `user`-role [`Message`] prefixed by [`DEFAULT_CONTEXT_PROMPT`].
 //!
 //! # Divergence from Python: hand-rolled REST calls, not the `mem0` SDK
 //!
@@ -15,7 +15,7 @@
 //! the REST API directly with `reqwest`, matching this work package's
 //! explicit endpoint choice:
 //!
-//! - `invoked()` &rarr; `POST {api_base}/v1/memories/` with a body shaped
+//! - `after_run()` &rarr; `POST {api_base}/v1/memories/` with a body shaped
 //!   exactly like the Python provider's kwargs to `.add()`: top-level
 //!   `messages`, `user_id`, `agent_id`, `run_id`, and
 //!   `metadata: { application_id }` — all four scope-ish fields are sent
@@ -23,7 +23,7 @@
 //!   observably what the Python provider passes to the SDK (see
 //!   `test_messages_adding_with_agent_id`, which asserts
 //!   `call_args.kwargs["user_id"] is None`).
-//! - `invoking()` &rarr; `POST {api_base}/v2/memories/search/`. Here the
+//! - `before_run()` &rarr; `POST {api_base}/v2/memories/search/`. Here the
 //!   Python provider's call (`mem0_client.search(query=..., user_id=...,
 //!   agent_id=..., run_id=...)`) does *not* map onto the documented `/v2/`
 //!   wire contract directly — v2 search expects scope constraints nested
@@ -40,8 +40,8 @@
 //!   dropped `/v1/`/`/v2/` support, override the base URL and adjust, or
 //!   treat this crate as a template.
 //! - `application_id` here is **write-only**: it rides along as
-//!   `metadata.application_id` on `invoked()` but is never sent as a search
-//!   constraint on `invoking()`, matching the Python provider (whose
+//!   `metadata.application_id` on `after_run()` but is never sent as a search
+//!   constraint on `before_run()`, matching the Python provider (whose
 //!   `invoking()` only ever forwards `user_id`/`agent_id`/`run_id` to
 //!   `.search()`). This is unlike the sibling `agent-framework-redis`
 //!   crate's `RedisContextProvider`, where `application_id` participates in
@@ -64,7 +64,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::memory::{Context, ContextProvider};
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::{Message, Role};
 
 /// Default Mem0 API base URL, matching the hosted service.
@@ -167,18 +167,15 @@ fn parse_search_response(value: &Value) -> Vec<String> {
 }
 
 /// Join memory texts and wrap them in a `user`-role [`Message`] under
-/// `context_prompt`, or an empty [`Context`] if there's nothing to inject
-/// (mirrors Python's `Context(messages=[...] if line_separated_memories
-/// else None)`).
-fn format_context(context_prompt: &str, memory_texts: &[String]) -> Context {
+/// `context_prompt`, or an empty `Vec` if there's nothing to inject (mirrors
+/// Python's `Context(messages=[...] if line_separated_memories else None)`;
+/// the caller extends `SessionContext::messages` with the result).
+fn format_context(context_prompt: &str, memory_texts: &[String]) -> Vec<Message> {
     let joined = memory_texts.join("\n");
     if joined.is_empty() {
-        Context::default()
+        Vec::new()
     } else {
-        Context {
-            messages: vec![Message::user(format!("{context_prompt}\n{joined}"))],
-            ..Default::default()
-        }
+        vec![Message::user(format!("{context_prompt}\n{joined}"))]
     }
 }
 
@@ -195,18 +192,17 @@ fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
 ///
 /// ```no_run
 /// use agent_framework_mem0::Mem0Provider;
-/// use agent_framework_core::memory::ContextProvider;
+/// use agent_framework_core::memory::{ContextProvider, SessionContext};
 /// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
 /// let provider = Mem0Provider::from_env()?.with_user_id("user-42");
 ///
 /// let request = vec![Message::user("I moved to Austin last month")];
-/// provider.invoked(&request, &[], None).await?;
+/// provider.after_run(&request, &[], None).await?;
 ///
-/// let ctx = provider
-///     .invoking(&[Message::user("Where do I live?")])
-///     .await?;
+/// let mut ctx = SessionContext::new(vec![Message::user("Where do I live?")]);
+/// provider.before_run(&mut ctx).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -220,7 +216,7 @@ pub struct Mem0Provider {
     thread_id: Option<String>,
     scope_to_per_operation_thread_id: bool,
     context_prompt: String,
-    per_operation_thread_id: Mutex<Option<String>>,
+    per_operation_session_id: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for Mem0Provider {
@@ -255,7 +251,7 @@ impl Mem0Provider {
             thread_id: None,
             scope_to_per_operation_thread_id: false,
             context_prompt: DEFAULT_CONTEXT_PROMPT.to_string(),
-            per_operation_thread_id: Mutex::new(None),
+            per_operation_session_id: Mutex::new(None),
         }
     }
 
@@ -307,9 +303,8 @@ impl Mem0Provider {
     }
 
     /// When `true`, the thread id used for scoping (`run_id`) is captured
-    /// from the first [`ContextProvider::thread_created`] call instead of
-    /// the static `thread_id` above, and a conflicting thread id on a later
-    /// call is an error (builder style).
+    /// from `ctx.session_id` on each [`ContextProvider::before_run`] call
+    /// instead of the static `thread_id` above (builder style).
     pub fn with_scope_to_per_operation_thread_id(mut self, value: bool) -> Self {
         self.scope_to_per_operation_thread_id = value;
         self
@@ -338,7 +333,7 @@ impl Mem0Provider {
 
     async fn effective_run_id(&self) -> Option<String> {
         if self.scope_to_per_operation_thread_id {
-            self.per_operation_thread_id.lock().await.clone()
+            self.per_operation_session_id.lock().await.clone()
         } else {
             self.thread_id.clone()
         }
@@ -376,24 +371,46 @@ impl Mem0Provider {
 
 #[async_trait]
 impl ContextProvider for Mem0Provider {
-    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
-        let mut guard = self.per_operation_thread_id.lock().await;
+    /// Searches Mem0 with `ctx.input_messages` and injects any hits into
+    /// `ctx.messages`. When `scope_to_per_operation_thread_id` is set,
+    /// `ctx.session_id` is captured into internal state on every call so
+    /// [`Self::after_run`] (which has no access to the [`SessionContext`])
+    /// can scope its write to the same run — the agent threads the scoping
+    /// id through `SessionContext` in place of the old `thread_created`
+    /// hook.
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        self.validate_filters()?;
         if self.scope_to_per_operation_thread_id {
-            if let (Some(new_id), Some(existing)) = (thread_id, guard.as_deref()) {
-                if new_id != existing {
-                    return Err(Error::other(
-                        "Mem0Provider can only be used with one thread at a time when scope_to_per_operation_thread_id is True.",
-                    ));
-                }
-            }
+            *self.per_operation_session_id.lock().await = ctx.session_id.clone();
         }
-        if guard.is_none() {
-            *guard = thread_id.map(String::from);
+        let input_text = ctx
+            .input_messages
+            .iter()
+            .map(Message::text)
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Mirrors Python: "Validate input text is not empty before
+        // searching (possible for function approval responses)".
+        if input_text.trim().is_empty() {
+            return Ok(());
         }
+
+        let run_id = self.effective_run_id().await;
+        let body = build_search_body(
+            &input_text,
+            self.user_id.as_deref(),
+            self.agent_id.as_deref(),
+            run_id.as_deref(),
+        );
+        let value = self.post(SEARCH_PATH, &body).await?;
+        let memory_texts = parse_search_response(&value);
+        ctx.messages
+            .extend(format_context(&self.context_prompt, &memory_texts));
         Ok(())
     }
 
-    async fn invoked(
+    async fn after_run(
         &self,
         request_messages: &[Message],
         response_messages: &[Message],
@@ -416,32 +433,6 @@ impl ContextProvider for Mem0Provider {
         };
         self.post(ADD_PATH, &body).await?;
         Ok(())
-    }
-
-    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
-        self.validate_filters()?;
-        let input_text = messages
-            .iter()
-            .map(Message::text)
-            .filter(|t| !t.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Mirrors Python: "Validate input text is not empty before
-        // searching (possible for function approval responses)".
-        if input_text.trim().is_empty() {
-            return Ok(Context::default());
-        }
-
-        let run_id = self.effective_run_id().await;
-        let body = build_search_body(
-            &input_text,
-            self.user_id.as_deref(),
-            self.agent_id.as_deref(),
-            run_id.as_deref(),
-        );
-        let value = self.post(SEARCH_PATH, &body).await?;
-        let memory_texts = parse_search_response(&value);
-        Ok(format_context(&self.context_prompt, &memory_texts))
     }
 }
 
@@ -662,33 +653,33 @@ mod tests {
 
     #[test]
     fn format_context_single_memory() {
-        let ctx = format_context(
+        let messages = format_context(
             DEFAULT_CONTEXT_PROMPT,
             &[
                 "User likes outdoor activities".to_string(),
                 "User lives in Seattle".to_string(),
             ],
         );
-        assert_eq!(ctx.messages.len(), 1);
-        assert_eq!(ctx.messages[0].role, Role::user());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::user());
         assert_eq!(
-            ctx.messages[0].text(),
+            messages[0].text(),
             "## Memories\nConsider the following memories when answering user questions:\nUser likes outdoor activities\nUser lives in Seattle"
         );
     }
 
     #[test]
     fn format_context_empty_when_no_memories() {
-        let ctx = format_context(DEFAULT_CONTEXT_PROMPT, &[]);
-        assert!(ctx.messages.is_empty());
+        let messages = format_context(DEFAULT_CONTEXT_PROMPT, &[]);
+        assert!(messages.is_empty());
     }
 
     #[test]
     fn format_context_custom_prompt() {
         let custom = "## Custom Context\nRemember these details:";
-        let ctx = format_context(custom, &["Test memory".to_string()]);
+        let messages = format_context(custom, &["Test memory".to_string()]);
         assert_eq!(
-            ctx.messages[0].text(),
+            messages[0].text(),
             "## Custom Context\nRemember these details:\nTest memory"
         );
     }
@@ -838,79 +829,83 @@ mod tests {
 
     // endregion
 
-    // region: thread_created / per-operation scoping (async, no network: pure Mutex state)
+    // region: before_run() session_id scoping (async, no network: pure Mutex state)
+    //
+    // Ported from the old thread_created()-based tests. There is no more
+    // separate thread_created hook or first-call-wins/conflict-check state
+    // machine: the agent now threads the scoping id through
+    // `SessionContext::session_id`, so before_run() simply captures it (via
+    // blank input so no network call happens) when
+    // scope_to_per_operation_thread_id is set.
 
     #[tokio::test]
-    async fn thread_created_sets_per_operation_thread_id() {
-        let p = Mem0Provider::new("k").with_user_id("u1");
-        p.thread_created(Some("thread123")).await.unwrap();
+    async fn before_run_captures_session_id_when_scoped() {
+        let p = Mem0Provider::new("k")
+            .with_user_id("u1")
+            .with_scope_to_per_operation_thread_id(true);
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("thread123".to_string());
+        p.before_run(&mut ctx).await.unwrap();
         assert_eq!(
-            p.per_operation_thread_id.lock().await.as_deref(),
+            p.per_operation_session_id.lock().await.as_deref(),
             Some("thread123")
         );
     }
 
     #[tokio::test]
-    async fn thread_created_does_not_overwrite_existing() {
-        let p = Mem0Provider::new("k").with_user_id("u1");
-        p.thread_created(Some("thread123")).await.unwrap();
-        p.thread_created(Some("other")).await.unwrap();
+    async fn before_run_overwrites_session_id_on_each_call_when_scoped() {
+        let p = Mem0Provider::new("k")
+            .with_user_id("u1")
+            .with_scope_to_per_operation_thread_id(true);
+        let mut ctx1 = SessionContext::new(vec![]);
+        ctx1.session_id = Some("thread123".to_string());
+        p.before_run(&mut ctx1).await.unwrap();
+
+        let mut ctx2 = SessionContext::new(vec![]);
+        ctx2.session_id = Some("other_thread".to_string());
+        p.before_run(&mut ctx2).await.unwrap();
+
         assert_eq!(
-            p.per_operation_thread_id.lock().await.as_deref(),
-            Some("thread123")
+            p.per_operation_session_id.lock().await.as_deref(),
+            Some("other_thread")
         );
     }
 
     #[tokio::test]
-    async fn thread_created_conflict_when_scoped() {
-        let p = Mem0Provider::new("k")
-            .with_user_id("u1")
-            .with_scope_to_per_operation_thread_id(true);
-        p.thread_created(Some("thread123")).await.unwrap();
-        let err = p
-            .thread_created(Some("different_thread"))
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("can only be used with one thread at a time"));
-    }
-
-    #[tokio::test]
-    async fn thread_created_allows_same_id_and_none_when_scoped() {
-        let p = Mem0Provider::new("k")
-            .with_user_id("u1")
-            .with_scope_to_per_operation_thread_id(true);
-        p.thread_created(Some("thread123")).await.unwrap();
-        p.thread_created(Some("thread123")).await.unwrap();
-        p.thread_created(None).await.unwrap();
+    async fn before_run_does_not_capture_session_id_when_not_scoped() {
+        let p = Mem0Provider::new("k").with_user_id("u1");
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some("thread123".to_string());
+        p.before_run(&mut ctx).await.unwrap();
+        assert!(p.per_operation_session_id.lock().await.is_none());
     }
 
     // endregion
 
-    // region: invoking()/invoked() input validation (async, no network: fails before any I/O)
+    // region: before_run()/after_run() input validation (async, no network: fails before any I/O)
 
     #[tokio::test]
-    async fn invoking_fails_without_filters() {
+    async fn before_run_fails_without_filters() {
         let p = Mem0Provider::new("k");
-        let err = p.invoking(&[Message::user("Hi")]).await.unwrap_err();
+        let mut ctx = SessionContext::new(vec![Message::user("Hi")]);
+        let err = p.before_run(&mut ctx).await.unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
     }
 
     #[tokio::test]
-    async fn invoked_fails_without_filters() {
+    async fn after_run_fails_without_filters() {
         let p = Mem0Provider::new("k");
         let err = p
-            .invoked(&[Message::user("Hi")], &[], None)
+            .after_run(&[Message::user("Hi")], &[], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("At least one of the filters"));
     }
 
     #[tokio::test]
-    async fn invoking_returns_empty_context_for_blank_input_without_network_call() {
+    async fn before_run_injects_no_messages_for_blank_input_without_network_call() {
         // user_id is set (passes validate_filters), but the only message has
-        // no text content, so invoking() must short-circuit before ever
+        // no text content, so before_run() must short-circuit before ever
         // building a request — if it didn't, this test would hang/error
         // trying to reach api.mem0.ai.
         let p = Mem0Provider::new("k").with_user_id("u1");
@@ -925,7 +920,8 @@ mod tests {
                 ),
             ],
         );
-        let ctx = p.invoking(&[m]).await.unwrap();
+        let mut ctx = SessionContext::new(vec![m]);
+        p.before_run(&mut ctx).await.unwrap();
         assert!(ctx.messages.is_empty());
     }
 

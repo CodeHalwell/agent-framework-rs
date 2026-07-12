@@ -69,17 +69,15 @@ async fn main() -> Result<()> {
     }
     store.clear().await?; // fresh demo state on every run
 
-    // Long-term memory, scoped by user id: `invoked()` persists each turn,
-    // `invoking()` retrieves recent memories into the next request's context.
+    // Long-term memory, scoped by user id: `after_run()` persists each turn,
+    // `before_run()` retrieves recent memories into the next request's context.
     let memory = RedisContextProvider::new(&url)?
         .with_user_id("user-42")
         .with_limit(5);
-    let mut providers = AggregateContextProvider::new();
-    providers.add(Arc::new(memory));
 
     let agent = Agent::builder(CannedClient)
         .instructions("You are a helpful assistant.")
-        .context_provider(Arc::new(providers))
+        .context_provider(Arc::new(memory))
         .build();
 
     // Both turns share the Redis-backed thread, so the second request also

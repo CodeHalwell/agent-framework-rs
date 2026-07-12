@@ -1,12 +1,10 @@
 //! A custom `ContextProvider`: injects extra instructions before every run
-//! (`invoking`), and observes two lifecycle hooks: `thread_created` (fired
-//! when a run starts on -- or a response causes adoption of -- a
-//! service-managed thread) and `invoked` (fired after every run, on both the
-//! success and failure paths; `invoked`'s `error` argument carries the
-//! failure on the latter).
+//! (`before_run`, mutating a `&mut SessionContext` in place), and observes
+//! `after_run`, which fires after every run on both the success and failure
+//! paths (`after_run`'s `error` argument carries the failure on the latter).
 //!
-//! Runs fully offline against three small canned clients that each trigger a
-//! different hook -- no API key or network needed.
+//! Runs fully offline against three small canned clients -- no API key or
+//! network needed.
 //!
 //! ```bash
 //! cargo run -p agent-framework-examples --example custom_context_provider
@@ -18,8 +16,8 @@ use std::sync::Arc;
 use agent_framework::prelude::*;
 use async_trait::async_trait;
 
-/// Injects a turn-counter instruction on every `invoking` call, and prints
-/// whenever any of the three `ContextProvider` hooks fire.
+/// Injects a turn-counter instruction on every `before_run` call, and prints
+/// whenever either `ContextProvider` hook fires.
 #[derive(Default)]
 struct DemoProvider {
     turn: AtomicUsize,
@@ -27,27 +25,23 @@ struct DemoProvider {
 
 #[async_trait]
 impl ContextProvider for DemoProvider {
-    async fn invoking(&self, _messages: &[Message]) -> Result<Context> {
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let n = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
-        println!("  [context] invoking (call #{n}) -- injecting an instruction");
-        Ok(Context::new().with_instructions(format!("This is invocation #{n}.")))
-    }
-
-    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
-        println!("  [context] thread_created: {thread_id:?}");
+        println!("  [context] before_run (call #{n}) -- injecting an instruction");
+        ctx.add_instructions(format!("This is invocation #{n}."));
         Ok(())
     }
 
-    async fn invoked(
+    async fn after_run(
         &self,
         request: &[Message],
         response: &[Message],
         error: Option<&Error>,
     ) -> Result<()> {
         match error {
-            Some(e) => println!("  [context] invoked: run FAILED: {e}"),
+            Some(e) => println!("  [context] after_run: run FAILED: {e}"),
             None => println!(
-                "  [context] invoked: run OK ({} request message(s), {} response message(s))",
+                "  [context] after_run: run OK ({} request message(s), {} response message(s))",
                 request.len(),
                 response.len()
             ),
@@ -106,7 +100,7 @@ impl ChatClient for AdoptingClient {
     }
 }
 
-/// Always fails, to demonstrate `invoked`'s `error` argument.
+/// Always fails, to demonstrate `after_run`'s `error` argument.
 #[derive(Clone)]
 struct FailingClient;
 
@@ -130,11 +124,9 @@ impl ChatClient for FailingClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let provider = Arc::new(AggregateContextProvider::from_providers(vec![Arc::new(
-        DemoProvider::default(),
-    )]));
+    let provider: Arc<dyn ContextProvider> = Arc::new(DemoProvider::default());
 
-    println!("-- scenario 1: thread_created fires for an already service-managed thread --");
+    println!("-- scenario 1: an already service-managed thread --");
     let agent1 = Agent::builder(EchoingClient)
         .context_provider(provider.clone())
         .build();
@@ -144,7 +136,7 @@ async fn main() -> Result<()> {
         .await?;
     println!("agent: {}\n", r1.text());
 
-    println!("-- scenario 2: thread_created fires when a local thread adopts a service id --");
+    println!("-- scenario 2: a local thread adopts a service id from the response --");
     let agent2 = Agent::builder(AdoptingClient)
         .context_provider(provider.clone())
         .build();
@@ -158,7 +150,7 @@ async fn main() -> Result<()> {
         thread2.service_thread_id()
     );
 
-    println!("-- scenario 3: invoked observes a failed run --");
+    println!("-- scenario 3: after_run observes a failed run --");
     let agent3 = Agent::builder(FailingClient)
         .context_provider(provider)
         .build();

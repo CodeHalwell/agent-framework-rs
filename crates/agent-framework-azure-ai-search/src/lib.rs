@@ -15,7 +15,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use agent_framework_azure_ai_search::AzureAISearchProvider;
-//! use agent_framework_core::memory::ContextProvider;
+//! use agent_framework_core::memory::{ContextProvider, SessionContext};
 //! use agent_framework_core::types::Message;
 //!
 //! # async fn demo() -> agent_framework_core::error::Result<()> {
@@ -27,10 +27,9 @@
 //! .with_top(5)
 //! .with_semantic_configuration("my-semantic-config");
 //!
-//! let context = provider
-//!     .invoking(&[Message::user("What is in the documents?")])
-//!     .await?;
-//! println!("{}", context.instructions.unwrap_or_default());
+//! let mut ctx = SessionContext::new(vec![Message::user("What is in the documents?")]);
+//! provider.before_run(&mut ctx).await?;
+//! println!("{}", ctx.instructions.unwrap_or_default());
 //! # Ok(())
 //! # }
 //! ```
@@ -41,7 +40,7 @@ use std::sync::Arc;
 
 use agent_framework_azure::TokenCredential;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::memory::{Context, ContextProvider};
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::{Message, Role};
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -363,13 +362,13 @@ fn extract_document_text(doc: &Value) -> String {
 
 #[async_trait]
 impl ContextProvider for AzureAISearchProvider {
-    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
-        let Some(query) = latest_user_query(messages) else {
-            return Ok(Context::new());
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        let Some(query) = latest_user_query(&ctx.input_messages) else {
+            return Ok(());
         };
         let results = self.search(&query).await?;
         if results.is_empty() {
-            return Ok(Context::new());
+            return Ok(());
         }
         // Fold the header + one block per result into the injected instructions.
         let mut instructions = self.context_prompt.clone();
@@ -377,7 +376,8 @@ impl ContextProvider for AzureAISearchProvider {
             instructions.push('\n');
             instructions.push_str(part);
         }
-        Ok(Context::new().with_instructions(instructions))
+        ctx.add_instructions(instructions);
+        Ok(())
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::memory::AggregateContextProvider;
+use crate::memory::ContextProvider;
 use crate::types::Message;
 
 /// The `type` discriminator Python's `AgentThreadState` serializes with; kept
@@ -112,7 +112,7 @@ pub struct AgentThread {
     service_thread_id: Option<String>,
     message_store: Option<Arc<dyn ChatMessageStore>>,
     /// Context providers associated with this thread (memory/RAG injection).
-    pub context_provider: Option<Arc<AggregateContextProvider>>,
+    pub context_providers: Vec<Arc<dyn ContextProvider>>,
 }
 
 impl AgentThread {
@@ -126,7 +126,7 @@ impl AgentThread {
         Self {
             service_thread_id: Some(id.into()),
             message_store: None,
-            context_provider: None,
+            context_providers: Vec::new(),
         }
     }
 
@@ -135,13 +135,13 @@ impl AgentThread {
         Self {
             service_thread_id: None,
             message_store: Some(store),
-            context_provider: None,
+            context_providers: Vec::new(),
         }
     }
 
-    /// Attach context providers to this thread.
-    pub fn with_context_provider(mut self, provider: Arc<AggregateContextProvider>) -> Self {
-        self.context_provider = Some(provider);
+    /// Attach context providers to this thread, replacing any previously set.
+    pub fn with_context_providers(mut self, providers: Vec<Arc<dyn ContextProvider>>) -> Self {
+        self.context_providers = providers;
         self
     }
 
@@ -255,7 +255,7 @@ impl AgentThread {
         Ok(Self {
             service_thread_id,
             message_store,
-            context_provider: None,
+            context_providers: Vec::new(),
         })
     }
 

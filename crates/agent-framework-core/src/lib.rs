@@ -58,7 +58,7 @@ pub mod prelude {
         RetryingChatClient,
     };
     pub use crate::error::{Error, Result};
-    pub use crate::memory::{AggregateContextProvider, Context, ContextProvider};
+    pub use crate::memory::{ContextProvider, SessionContext};
     pub use crate::middleware::{
         AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
     };

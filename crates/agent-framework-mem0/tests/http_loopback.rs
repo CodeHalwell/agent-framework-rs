@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use agent_framework_core::memory::ContextProvider;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::Message;
 use agent_framework_mem0::Mem0Provider;
 use serde_json::{json, Value};
@@ -151,7 +151,7 @@ where
 }
 
 #[tokio::test]
-async fn invoked_posts_to_v1_memories_with_body_and_auth_header() {
+async fn after_run_posts_to_v1_memories_with_body_and_auth_header() {
     let (base_url, handle) = serve_one(|stream| {
         write_json_response(stream, &json!({"message": "queued"}));
     });
@@ -162,7 +162,7 @@ async fn invoked_posts_to_v1_memories_with_body_and_auth_header() {
         .with_application_id("app-1");
 
     provider
-        .invoked(&[Message::user("I moved to Austin last month")], &[], None)
+        .after_run(&[Message::user("I moved to Austin last month")], &[], None)
         .await
         .unwrap();
 
@@ -188,7 +188,7 @@ async fn invoked_posts_to_v1_memories_with_body_and_auth_header() {
 }
 
 #[tokio::test]
-async fn invoked_combines_request_and_response_messages() {
+async fn after_run_combines_request_and_response_messages() {
     let (base_url, handle) = serve_one(|stream| {
         write_json_response(stream, &json!({"message": "queued"}));
     });
@@ -197,7 +197,7 @@ async fn invoked_combines_request_and_response_messages() {
         .with_api_base(base_url)
         .with_user_id("u1");
     provider
-        .invoked(
+        .after_run(
             &[Message::user("What's the weather?")],
             &[Message::assistant("It's sunny today.")],
             None,
@@ -217,7 +217,7 @@ async fn invoked_combines_request_and_response_messages() {
 }
 
 #[tokio::test]
-async fn invoking_posts_to_v2_search_and_parses_hits_into_context() {
+async fn before_run_posts_to_v2_search_and_injects_hits_into_ctx_messages() {
     let (base_url, handle) = serve_one(|stream| {
         write_json_response(
             stream,
@@ -232,10 +232,8 @@ async fn invoking_posts_to_v2_search_and_parses_hits_into_context() {
         .with_api_base(base_url)
         .with_user_id("user-42");
 
-    let ctx = provider
-        .invoking(&[Message::user("What's the weather like where I live?")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("What's the weather like where I live?")]);
+    provider.before_run(&mut ctx).await.unwrap();
 
     let request = handle.join().expect("server thread panicked");
     assert_eq!(request.method, "POST");
@@ -257,7 +255,7 @@ async fn invoking_posts_to_v2_search_and_parses_hits_into_context() {
 }
 
 #[tokio::test]
-async fn invoking_handles_results_wrapper_response_shape() {
+async fn before_run_handles_results_wrapper_response_shape() {
     let (base_url, _handle) = serve_one(|stream| {
         write_json_response(
             stream,
@@ -268,14 +266,15 @@ async fn invoking_handles_results_wrapper_response_shape() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_agent_id("agent-1");
-    let ctx = provider.invoking(&[Message::user("hello")]).await.unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages[0]
         .text()
         .contains("Previous conversation context"));
 }
 
 #[tokio::test]
-async fn invoking_empty_results_returns_empty_context() {
+async fn before_run_empty_results_injects_no_messages() {
     let (base_url, _handle) = serve_one(|stream| {
         write_json_response(stream, &json!([]));
     });
@@ -283,12 +282,13 @@ async fn invoking_empty_results_returns_empty_context() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let ctx = provider.invoking(&[Message::user("hello")]).await.unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages.is_empty());
 }
 
 #[tokio::test]
-async fn invoking_surfaces_non_2xx_status_as_service_error() {
+async fn before_run_surfaces_non_2xx_status_as_service_error() {
     let (base_url, _handle) = serve_one(|stream| {
         write_status_response(
             stream,
@@ -301,14 +301,15 @@ async fn invoking_surfaces_non_2xx_status_as_service_error() {
     let provider = Mem0Provider::new("bad-key")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let err = provider.invoking(&[Message::user("hi")]).await.unwrap_err();
+    let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+    let err = provider.before_run(&mut ctx).await.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("401"), "message was: {msg}");
     assert!(msg.contains("Invalid API key"), "message was: {msg}");
 }
 
 #[tokio::test]
-async fn invoked_surfaces_non_2xx_status_as_service_error() {
+async fn after_run_surfaces_non_2xx_status_as_service_error() {
     let (base_url, _handle) = serve_one(|stream| {
         write_status_response(
             stream,
@@ -322,7 +323,7 @@ async fn invoked_surfaces_non_2xx_status_as_service_error() {
         .with_api_base(base_url)
         .with_user_id("u1");
     let err = provider
-        .invoked(&[Message::user("hi")], &[], None)
+        .after_run(&[Message::user("hi")], &[], None)
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -331,7 +332,7 @@ async fn invoked_surfaces_non_2xx_status_as_service_error() {
 }
 
 #[tokio::test]
-async fn invoking_surfaces_malformed_json_response_as_error() {
+async fn before_run_surfaces_malformed_json_response_as_error() {
     let (base_url, _handle) = serve_one(|stream| {
         let payload = "not valid json";
         let response = format!(
@@ -348,12 +349,13 @@ async fn invoking_surfaces_malformed_json_response_as_error() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_user_id("u1");
-    let err = provider.invoking(&[Message::user("hi")]).await.unwrap_err();
+    let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+    let err = provider.before_run(&mut ctx).await.unwrap_err();
     assert!(err.to_string().contains("invalid Mem0 API response JSON"));
 }
 
 #[tokio::test]
-async fn invoking_scopes_search_to_agent_and_run_id() {
+async fn before_run_scopes_search_to_agent_and_run_id() {
     let (base_url, handle) = serve_one(|stream| {
         write_json_response(stream, &json!([]));
     });
@@ -363,7 +365,8 @@ async fn invoking_scopes_search_to_agent_and_run_id() {
         .with_agent_id("agent-1")
         .with_thread_id("thread-1");
 
-    provider.invoking(&[Message::user("hello")]).await.unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
 
     let request = handle.join().unwrap();
     let body = request.body_json();

@@ -3,54 +3,68 @@
 //! Rust equivalent of `agent_framework._memory`. A [`ContextProvider`] injects
 //! extra instructions, messages, and tools into an agent invocation without
 //! persisting them to the conversation history.
+//!
+//! Upstream renamed `ContextProvider.invoking`/`invoked` to `before_run`/
+//! `after_run` and removed the `thread_created` hook entirely; `before_run`
+//! mutates a [`SessionContext`] in place instead of returning a value. There
+//! is no aggregate wrapper any more — consumers hold a
+//! `Vec<Arc<dyn ContextProvider>>` and iterate it directly.
 
 use async_trait::async_trait;
-use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
 use crate::types::Message;
 
-/// Additional context supplied by a provider for a single invocation.
+/// Per-invocation context a provider contributes to a run. Providers mutate
+/// this in place in before_run. Rust equivalent of upstream SessionContext.
 #[derive(Debug, Clone, Default)]
-pub struct Context {
+pub struct SessionContext {
+    /// Local session identifier (from the thread), for provider scoping.
+    pub session_id: Option<String>,
+    /// Service-managed session/conversation id, when applicable.
+    pub service_session_id: Option<String>,
+    /// The run's input messages (read-only for providers).
+    pub input_messages: Vec<Message>,
+    /// Extra system instructions to inject (providers append via add_instructions).
     pub instructions: Option<String>,
+    /// Extra context messages to inject ahead of history.
     pub messages: Vec<Message>,
+    /// Extra tools to make available for this run.
     pub tools: Vec<ToolDefinition>,
 }
 
-impl Context {
-    pub fn new() -> Self {
-        Self::default()
+impl SessionContext {
+    pub fn new(input_messages: Vec<Message>) -> Self {
+        Self {
+            input_messages,
+            ..Default::default()
+        }
     }
-
-    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
-        self.instructions = Some(instructions.into());
-        self
+    /// Append instructions, newline-concatenating with any already present.
+    pub fn add_instructions(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        self.instructions = match self.instructions.take() {
+            Some(existing) => Some(format!("{existing}\n{s}")),
+            None => Some(s),
+        };
     }
 }
 
 /// A source of per-invocation context (memory, RAG, etc.).
+/// Upstream renamed invoking/invoked -> before_run/after_run and REMOVED
+/// thread_created. before_run mutates the SessionContext in place instead of
+/// returning a Context.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
-    /// Called before the model is invoked; returns context to inject.
-    async fn invoking(&self, messages: &[Message]) -> Result<Context>;
+    /// Called before the model is invoked; mutate ctx to inject instructions,
+    /// messages, and/or tools. Read ctx.input_messages / ctx.session_id.
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()>;
 
-    /// Optional hook fired when a new thread is created.
-    async fn thread_created(&self, _thread_id: Option<&str>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Optional hook fired after an invocation completes, on *both* the
-    /// success and failure paths.
-    ///
-    /// Mirrors Python's `ContextProvider.invoked(..., invoke_exception=...)`
-    /// (`_memory.py:119-138`): providers can observe the request and the
-    /// outcome. On success, `response_messages` holds the produced messages and
-    /// `error` is `None`. On failure, `error` carries the run failure and
-    /// `response_messages` is empty. A provider that only cares about
-    /// successful turns can ignore `error`.
-    async fn invoked(
+    /// Called after an invocation completes, on BOTH success and failure.
+    /// On success, error is None and response_messages holds the output.
+    /// On failure, error is Some and response_messages is empty.
+    async fn after_run(
         &self,
         _request_messages: &[Message],
         _response_messages: &[Message],
@@ -60,64 +74,37 @@ pub trait ContextProvider: Send + Sync {
     }
 }
 
-/// Fan-out/fan-in over multiple [`ContextProvider`]s, merging their output.
-#[derive(Default, Clone)]
-pub struct AggregateContextProvider {
-    providers: Vec<Arc<dyn ContextProvider>>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl AggregateContextProvider {
-    pub fn new() -> Self {
-        Self::default()
+    #[test]
+    fn add_instructions_sets_when_none() {
+        let mut ctx = SessionContext::new(vec![]);
+        assert!(ctx.instructions.is_none());
+        ctx.add_instructions("be brief");
+        assert_eq!(ctx.instructions.as_deref(), Some("be brief"));
     }
 
-    pub fn from_providers(providers: Vec<Arc<dyn ContextProvider>>) -> Self {
-        Self { providers }
+    #[test]
+    fn add_instructions_newline_concatenates() {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.add_instructions("first");
+        ctx.add_instructions("second");
+        ctx.add_instructions("third");
+        assert_eq!(ctx.instructions.as_deref(), Some("first\nsecond\nthird"));
     }
 
-    /// Add a provider.
-    pub fn add(&mut self, provider: Arc<dyn ContextProvider>) {
-        self.providers.push(provider);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
-    }
-}
-
-#[async_trait]
-impl ContextProvider for AggregateContextProvider {
-    async fn invoking(&self, messages: &[Message]) -> Result<Context> {
-        let mut merged = Context::new();
-        for provider in &self.providers {
-            let ctx = provider.invoking(messages).await?;
-            merged.instructions = match (merged.instructions.take(), ctx.instructions) {
-                (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-                (Some(a), None) => Some(a),
-                (None, b) => b,
-            };
-            merged.messages.extend(ctx.messages);
-            merged.tools.extend(ctx.tools);
-        }
-        Ok(merged)
-    }
-
-    async fn thread_created(&self, thread_id: Option<&str>) -> Result<()> {
-        for provider in &self.providers {
-            provider.thread_created(thread_id).await?;
-        }
-        Ok(())
-    }
-
-    async fn invoked(
-        &self,
-        request: &[Message],
-        response: &[Message],
-        error: Option<&Error>,
-    ) -> Result<()> {
-        for provider in &self.providers {
-            provider.invoked(request, response, error).await?;
-        }
-        Ok(())
+    #[test]
+    fn new_sets_input_messages_and_defaults_rest() {
+        let messages = vec![Message::user("hi")];
+        let ctx = SessionContext::new(messages.clone());
+        assert_eq!(ctx.input_messages.len(), messages.len());
+        assert_eq!(ctx.input_messages[0].text(), "hi");
+        assert!(ctx.session_id.is_none());
+        assert!(ctx.service_session_id.is_none());
+        assert!(ctx.instructions.is_none());
+        assert!(ctx.messages.is_empty());
+        assert!(ctx.tools.is_empty());
     }
 }

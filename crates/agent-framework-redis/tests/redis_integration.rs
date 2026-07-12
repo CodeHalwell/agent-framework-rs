@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use agent_framework_core::memory::ContextProvider;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::threads::ChatMessageStore;
 use agent_framework_core::types::Message;
 use agent_framework_redis::{RedisChatMessageStore, RedisContextProvider};
@@ -265,7 +265,7 @@ async fn chat_message_store_survives_from_state_round_trip_against_live_server()
 }
 
 #[tokio::test]
-async fn context_provider_invoked_then_invoking_surfaces_matching_memory() {
+async fn context_provider_after_run_then_before_run_surfaces_matching_memory() {
     let Some((url, _guard)) = test_server().await else {
         return;
     };
@@ -275,14 +275,12 @@ async fn context_provider_invoked_then_invoking_surfaces_matching_memory() {
         .with_user_id("user-it-1");
 
     provider
-        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
+        .after_run(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
-    let ctx = provider
-        .invoking(&[Message::user("Tell me about hiking")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("Tell me about hiking")]);
+    provider.before_run(&mut ctx).await.unwrap();
 
     assert_eq!(ctx.messages.len(), 1);
     assert!(ctx.messages[0]
@@ -294,7 +292,7 @@ async fn context_provider_invoked_then_invoking_surfaces_matching_memory() {
 }
 
 #[tokio::test]
-async fn context_provider_invoking_returns_empty_context_when_nothing_matches() {
+async fn context_provider_before_run_returns_empty_context_when_nothing_matches() {
     let Some((url, _guard)) = test_server().await else {
         return;
     };
@@ -304,15 +302,13 @@ async fn context_provider_invoking_returns_empty_context_when_nothing_matches() 
         .with_user_id("user-it-2");
 
     provider
-        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
+        .after_run(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
     // No overlapping token with the stored memory.
-    let ctx = provider
-        .invoking(&[Message::user("What is the capital of France?")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("What is the capital of France?")]);
+    provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages.is_empty());
 }
 
@@ -333,7 +329,7 @@ async fn context_provider_scopes_memories_by_user_id() {
         .with_user_id("user-b");
 
     provider_a
-        .invoked(
+        .after_run(
             &[Message::user("user-a's secret hobby is pottery")],
             &[],
             None,
@@ -341,24 +337,20 @@ async fn context_provider_scopes_memories_by_user_id() {
         .await
         .unwrap();
 
-    let ctx_b = provider_b
-        .invoking(&[Message::user("Tell me about pottery")])
-        .await
-        .unwrap();
+    let mut ctx_b = SessionContext::new(vec![Message::user("Tell me about pottery")]);
+    provider_b.before_run(&mut ctx_b).await.unwrap();
     assert!(
         ctx_b.messages.is_empty(),
         "provider scoped to user-b must not see user-a's memories"
     );
 
-    let ctx_a = provider_a
-        .invoking(&[Message::user("Tell me about pottery")])
-        .await
-        .unwrap();
+    let mut ctx_a = SessionContext::new(vec![Message::user("Tell me about pottery")]);
+    provider_a.before_run(&mut ctx_a).await.unwrap();
     assert_eq!(ctx_a.messages.len(), 1);
 }
 
 #[tokio::test]
-async fn context_provider_thread_created_conflict_is_enforced_end_to_end() {
+async fn context_provider_session_id_conflict_is_enforced_end_to_end() {
     let Some((url, _guard)) = test_server().await else {
         return;
     };
@@ -368,8 +360,13 @@ async fn context_provider_thread_created_conflict_is_enforced_end_to_end() {
         .with_user_id("user-it-3")
         .with_scope_to_per_operation_thread_id(true);
 
-    provider.thread_created(Some("thread-1")).await.unwrap();
-    let err = provider.thread_created(Some("thread-2")).await.unwrap_err();
+    let mut ctx1 = SessionContext::new(vec![]);
+    ctx1.session_id = Some("thread-1".to_string());
+    provider.before_run(&mut ctx1).await.unwrap();
+
+    let mut ctx2 = SessionContext::new(vec![]);
+    ctx2.session_id = Some("thread-2".to_string());
+    let err = provider.before_run(&mut ctx2).await.unwrap_err();
     assert!(err.to_string().contains("only be used with one thread"));
 }
 
@@ -390,14 +387,12 @@ async fn context_provider_force_scan_fallback_works_regardless_of_redisearch_ava
         .with_force_scan_fallback(true);
 
     provider
-        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
+        .after_run(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
-    let ctx = provider
-        .invoking(&[Message::user("Tell me about hiking")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("Tell me about hiking")]);
+    provider.before_run(&mut ctx).await.unwrap();
 
     assert_eq!(ctx.messages.len(), 1);
     assert!(ctx.messages[0]
@@ -424,14 +419,12 @@ async fn context_provider_redisearch_finds_and_excludes_memories_when_available(
         .with_user_id("user-ft-1");
 
     provider
-        .invoked(&[Message::user("I love hiking in the Cascades")], &[], None)
+        .after_run(&[Message::user("I love hiking in the Cascades")], &[], None)
         .await
         .unwrap();
 
-    let ctx = provider
-        .invoking(&[Message::user("Tell me about hiking")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("Tell me about hiking")]);
+    provider.before_run(&mut ctx).await.unwrap();
     assert_eq!(ctx.messages.len(), 1);
     assert!(ctx.messages[0]
         .text()
@@ -442,10 +435,8 @@ async fn context_provider_redisearch_finds_and_excludes_memories_when_available(
 
     // No overlapping meaningful token -> FT.SEARCH finds nothing, mirroring
     // the fallback path's equivalent assertion.
-    let ctx_empty = provider
-        .invoking(&[Message::user("What is the capital of France?")])
-        .await
-        .unwrap();
+    let mut ctx_empty = SessionContext::new(vec![Message::user("What is the capital of France?")]);
+    provider.before_run(&mut ctx_empty).await.unwrap();
     assert!(ctx_empty.messages.is_empty());
 }
 
@@ -470,7 +461,7 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
         .with_user_id("user-ft-b");
 
     provider_a
-        .invoked(
+        .after_run(
             &[Message::user("user-ft-a's secret hobby is pottery")],
             &[],
             None,
@@ -478,19 +469,15 @@ async fn context_provider_redisearch_scopes_memories_by_tag_filter_when_availabl
         .await
         .unwrap();
 
-    let ctx_b = provider_b
-        .invoking(&[Message::user("Tell me about pottery")])
-        .await
-        .unwrap();
+    let mut ctx_b = SessionContext::new(vec![Message::user("Tell me about pottery")]);
+    provider_b.before_run(&mut ctx_b).await.unwrap();
     assert!(
         ctx_b.messages.is_empty(),
         "provider scoped to user-ft-b must not see user-ft-a's memories via FT.SEARCH's TAG filter"
     );
 
-    let ctx_a = provider_a
-        .invoking(&[Message::user("Tell me about pottery")])
-        .await
-        .unwrap();
+    let mut ctx_a = SessionContext::new(vec![Message::user("Tell me about pottery")]);
+    provider_a.before_run(&mut ctx_a).await.unwrap();
     assert_eq!(ctx_a.messages.len(), 1);
 }
 
@@ -512,7 +499,7 @@ async fn context_provider_redisearch_respects_limit_when_available() {
 
     for i in 0..5 {
         provider
-            .invoked(
+            .after_run(
                 &[Message::user(format!("apple fact number {i}"))],
                 &[],
                 None,
@@ -521,7 +508,8 @@ async fn context_provider_redisearch_respects_limit_when_available() {
             .unwrap();
     }
 
-    let ctx = provider.invoking(&[Message::user("apple")]).await.unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("apple")]);
+    provider.before_run(&mut ctx).await.unwrap();
     assert_eq!(ctx.messages.len(), 1);
     // DEFAULT_CONTEXT_PROMPT is itself two lines; every line after that is
     // one matched memory, so this counts how many FT.SEARCH actually
@@ -557,14 +545,12 @@ async fn context_provider_redisearch_entries_are_not_visible_to_forced_scan_fall
         .with_force_scan_fallback(true);
 
     ft_provider
-        .invoked(&[Message::user("stored via JSON.SET")], &[], None)
+        .after_run(&[Message::user("stored via JSON.SET")], &[], None)
         .await
         .unwrap();
 
-    let ctx = fallback_provider
-        .invoking(&[Message::user("Tell me about JSON.SET")])
-        .await
-        .unwrap();
+    let mut ctx = SessionContext::new(vec![Message::user("Tell me about JSON.SET")]);
+    fallback_provider.before_run(&mut ctx).await.unwrap();
     assert!(
         ctx.messages.is_empty(),
         "SCAN+MGET must not see a JSON.SET-backed entry (documented storage-encoding divergence)"

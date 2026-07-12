@@ -67,7 +67,7 @@ middleware.
 | `agent_middleware` | Wrap a whole agent run: logging plus early-termination middleware | offline |
 | `function_middleware` | Wrap every local tool call: rewrite arguments, observe/override results | offline |
 | `chat_middleware` | Wrap the underlying `ChatClient` call itself, one level below agent middleware | offline |
-| `custom_context_provider` | A `ContextProvider` with `invoking` / `thread_created` / `invoked` hooks | offline |
+| `custom_context_provider` | A `ContextProvider` with `before_run` / `after_run` hooks | offline |
 
 ## Providers (`providers/`)
 

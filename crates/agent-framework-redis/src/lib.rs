@@ -32,12 +32,10 @@
 //!     .with_max_messages(200);
 //!
 //! let memory = RedisContextProvider::new("redis://127.0.0.1:6379")?.with_user_id("user-42");
-//! let mut providers = AggregateContextProvider::new();
-//! providers.add(Arc::new(memory));
 //!
 //! let agent = Agent::builder(client)
 //!     .instructions("You are a helpful assistant.")
-//!     .context_provider(Arc::new(providers))
+//!     .context_provider(Arc::new(memory))
 //!     .build();
 //!
 //! let mut thread = AgentThread::local(Arc::new(store));
