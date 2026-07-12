@@ -26,7 +26,10 @@ async fn main() -> Result<()> {
     // Python's OpenTelemetry instrumentation. Content capture
     // (`gen_ai.input.messages` / `gen_ai.output.messages`) stays off unless
     // you opt in with `.with_content_capture(true)`.
-    let client = ObservableChatClient::new(OpenAIClient::from_env("gpt-4o-mini")?, "openai");
+    let client = ObservableChatClient::new(
+        OpenAIChatCompletionClient::from_env("gpt-4o-mini")?,
+        "openai",
+    );
 
     let agent = Agent::builder(client)
         .name("assistant")

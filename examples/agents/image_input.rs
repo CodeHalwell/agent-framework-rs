@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
     let agent = Agent::builder(client)
         .name("vision-assistant")
         .instructions("Describe images concisely.")

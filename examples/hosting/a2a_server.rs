@@ -64,7 +64,7 @@ impl ChatClient for CannedClient {
 
 fn build_agent() -> Agent {
     let instructions = "You are a helpful, concise assistant.";
-    match OpenAIClient::from_env("gpt-4o-mini") {
+    match OpenAIChatCompletionClient::from_env("gpt-4o-mini") {
         Ok(client) => Agent::builder(client)
             .name("assistant")
             .description("General-purpose assistant served over A2A.")

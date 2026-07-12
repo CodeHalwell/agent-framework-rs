@@ -22,7 +22,7 @@ use agent_framework::purview::{PurviewSettings, StaticTokenProvider};
 async fn main() -> Result<()> {
     let (Ok(token), Ok(client)) = (
         std::env::var("PURVIEW_TOKEN"),
-        OpenAIClient::from_env("gpt-4o-mini"),
+        OpenAIChatCompletionClient::from_env("gpt-4o-mini"),
     ) else {
         println!("set PURVIEW_TOKEN and OPENAI_API_KEY to run this example");
         return Ok(());

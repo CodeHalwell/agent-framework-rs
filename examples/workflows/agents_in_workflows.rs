@@ -5,7 +5,7 @@
 //! forwards the whole conversation downstream.
 //!
 //! Runs fully offline against a scripted `ChatClient` -- swap `CannedClient`
-//! for a real provider client (e.g. `OpenAIClient::from_env(...)`) and the
+//! for a real provider client (e.g. `OpenAIChatCompletionClient::from_env(...)`) and the
 //! graph is unchanged.
 //!
 //! ```bash

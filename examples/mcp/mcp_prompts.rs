@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let Ok(client) = OpenAIClient::from_env("gpt-4o-mini") else {
+    let Ok(client) = OpenAIChatCompletionClient::from_env("gpt-4o-mini") else {
         println!("set OPENAI_API_KEY to run this example");
         return Ok(());
     };

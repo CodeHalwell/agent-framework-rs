@@ -7,11 +7,11 @@
 //! base URL.
 //!
 //! ```no_run
-//! use agent_framework_openai::OpenAIClient;
+//! use agent_framework_openai::OpenAIChatCompletionClient;
 //! use agent_framework_core::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIClient::new("sk-...", "gpt-4o-mini");
+//! let client = OpenAIChatCompletionClient::new("sk-...", "gpt-4o-mini");
 //! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
@@ -32,7 +32,7 @@
 pub mod convert;
 
 pub mod responses;
-pub use responses::OpenAIResponsesClient;
+pub use responses::OpenAIChatClient;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -68,7 +68,7 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 /// response into a granular [`Error`].
 ///
 /// The single point of truth for status/body interpretation, used by every
-/// endpoint in this crate ([`OpenAIClient::post`] and [`responses`]) and reused
+/// endpoint in this crate ([`OpenAIChatCompletionClient::post`] and [`responses`]) and reused
 /// by `agent-framework-azure` (Azure OpenAI is
 /// wire-compatible for Chat Completions and Responses), so the two stay
 /// identical rather than drifting.
@@ -151,7 +151,7 @@ fn is_content_filter_marker(v: &Value) -> bool {
 
 /// An OpenAI (or OpenAI-compatible) chat client.
 #[derive(Clone)]
-pub struct OpenAIClient {
+pub struct OpenAIChatCompletionClient {
     inner: Arc<Inner>,
 }
 
@@ -164,7 +164,7 @@ struct Inner {
     organization: Option<String>,
 }
 
-impl OpenAIClient {
+impl OpenAIChatCompletionClient {
     /// Create a client for the given API key and default model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -267,7 +267,7 @@ impl OpenAIClient {
 }
 
 #[async_trait::async_trait]
-impl ChatClient for OpenAIClient {
+impl ChatClient for OpenAIChatCompletionClient {
     async fn get_response(
         &self,
         messages: Vec<Message>,
@@ -476,7 +476,7 @@ mod tests {
     // -- classify_service_error --------------------------------------------
     //
     // Canned status+body combinations run through the exact classification
-    // `OpenAIClient::post` and `responses::OpenAIResponsesClient::post`
+    // `OpenAIChatCompletionClient::post` and `responses::OpenAIChatClient::post`
     // both delegate to.
 
     #[test]

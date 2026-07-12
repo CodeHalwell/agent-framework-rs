@@ -10,7 +10,7 @@ use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIResponsesClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatClient::from_env("gpt-4o-mini")?;
 
     // First turn: no conversation_id yet.
     let first = client

@@ -16,7 +16,7 @@ use serde_json::json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     // A tool that always requires a human sign-off before it runs.
     // `ApprovalMode` lives on the tool itself; the function-invocation loop

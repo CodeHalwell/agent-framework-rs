@@ -70,13 +70,12 @@ async fn main() -> Result<()> {
     // The factory receives the parsed ModelSpec (id, connection, options) and
     // returns the ChatClient for it. Register one per provider key; the
     // loader tries "provider.apiType" first, then "provider", then a default.
-    let factory =
-        ChatClientFactory::new().with("OpenAI.Chat", |model| {
-            match OpenAIClient::from_env(model.id.as_deref().unwrap_or("gpt-4o-mini")) {
-                Ok(client) => Ok(Arc::new(client) as Arc<dyn ChatClient>),
-                Err(_) => Ok(Arc::new(CannedClient) as Arc<dyn ChatClient>),
-            }
-        });
+    let factory = ChatClientFactory::new().with("OpenAI.Chat", |model| {
+        match OpenAIChatCompletionClient::from_env(model.id.as_deref().unwrap_or("gpt-4o-mini")) {
+            Ok(client) => Ok(Arc::new(client) as Arc<dyn ChatClient>),
+            Err(_) => Ok(Arc::new(CannedClient) as Arc<dyn ChatClient>),
+        }
+    });
 
     let loader = DeclarativeLoader::new().with_client_factory(factory);
 

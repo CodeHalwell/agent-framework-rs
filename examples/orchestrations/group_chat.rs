@@ -13,7 +13,11 @@ use agent_framework::prelude::*;
 use agent_framework::workflow::GroupChatBuilder;
 use agent_framework_core::types::Message;
 
-fn participant(client: &OpenAIClient, name: &str, instructions: &str) -> Arc<dyn SupportsAgentRun> {
+fn participant(
+    client: &OpenAIChatCompletionClient,
+    name: &str,
+    instructions: &str,
+) -> Arc<dyn SupportsAgentRun> {
     Arc::new(
         Agent::builder(client.clone())
             .name(name)
@@ -24,7 +28,7 @@ fn participant(client: &OpenAIClient, name: &str, instructions: &str) -> Arc<dyn
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
     let task = "Write a one-line tagline for a coffee shop called Terra.";
 
     let writer = participant(&client, "writer", "You draft short, punchy marketing copy.");

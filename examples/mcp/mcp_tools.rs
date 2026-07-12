@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         println!("  - {}: {}", tool.name, tool.description);
     }
 
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
     let agent = Agent::builder(client)
         .name("assistant")
         .instructions("You can use the available tools when they help answer the question.")

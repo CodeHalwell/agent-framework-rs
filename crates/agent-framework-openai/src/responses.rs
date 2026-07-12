@@ -1,17 +1,17 @@
-//! [`OpenAIResponsesClient`]: a [`ChatClient`] for the OpenAI Responses API
+//! [`OpenAIChatClient`]: a [`ChatClient`] for the OpenAI Responses API
 //! (`POST /v1/responses`).
 //!
 //! The Responses API uses an item-based `input`/`output` shape rather than
 //! the `messages` array used by Chat Completions, and supports a dedicated
 //! `previous_response_id` for service-side conversation state. Wire framing
-//! (SSE parsing style, error handling) mirrors [`crate::OpenAIClient`].
+//! (SSE parsing style, error handling) mirrors [`crate::OpenAIChatCompletionClient`].
 //!
 //! ```no_run
-//! use agent_framework_openai::responses::OpenAIResponsesClient;
+//! use agent_framework_openai::responses::OpenAIChatClient;
 //! use agent_framework_core::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIResponsesClient::new("sk-...", "gpt-4o-mini");
+//! let client = OpenAIChatClient::new("sk-...", "gpt-4o-mini");
 //! let agent = Agent::builder(client)
 //!     .instructions("You are concise.")
 //!     .build();
@@ -45,7 +45,7 @@ use crate::{ByteStream, DEFAULT_BASE_URL};
 
 /// An OpenAI Responses API chat client (`POST /v1/responses`).
 #[derive(Clone)]
-pub struct OpenAIResponsesClient {
+pub struct OpenAIChatClient {
     inner: Arc<Inner>,
 }
 
@@ -58,9 +58,9 @@ struct Inner {
     organization: Option<String>,
 }
 
-impl std::fmt::Debug for OpenAIResponsesClient {
+impl std::fmt::Debug for OpenAIChatClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAIResponsesClient")
+        f.debug_struct("OpenAIChatClient")
             .field("base_url", &self.inner.base_url)
             .field("model", &self.inner.model)
             .field("organization", &self.inner.organization)
@@ -68,7 +68,7 @@ impl std::fmt::Debug for OpenAIResponsesClient {
     }
 }
 
-impl OpenAIResponsesClient {
+impl OpenAIChatClient {
     /// Create a client for the given API key and default model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -205,7 +205,7 @@ impl OpenAIResponsesClient {
 }
 
 #[async_trait::async_trait]
-impl ChatClient for OpenAIResponsesClient {
+impl ChatClient for OpenAIChatClient {
     async fn get_response(
         &self,
         messages: Vec<Message>,
@@ -1226,8 +1226,8 @@ mod tests {
         contents
     }
 
-    fn client() -> OpenAIResponsesClient {
-        OpenAIResponsesClient::new("test-key", "gpt-4o-mini")
+    fn client() -> OpenAIChatClient {
+        OpenAIChatClient::new("test-key", "gpt-4o-mini")
     }
 
     // region: request body building
@@ -1769,7 +1769,7 @@ mod tests {
             std::env::set_var("OPENAI_API_KEY", "sk-test-123");
             std::env::set_var("OPENAI_BASE_URL", "https://example.test/v1");
         }
-        let client = OpenAIResponsesClient::from_env("gpt-4o-mini").unwrap();
+        let client = OpenAIChatClient::from_env("gpt-4o-mini").unwrap();
         assert_eq!(client.inner.api_key, "sk-test-123");
         assert_eq!(client.inner.base_url, "https://example.test/v1");
         unsafe {
@@ -1786,7 +1786,7 @@ mod tests {
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("OPENAI_BASE_URL");
         }
-        let result = OpenAIResponsesClient::from_env("gpt-4o-mini");
+        let result = OpenAIChatClient::from_env("gpt-4o-mini");
         assert!(result.is_err());
     }
     #[test]

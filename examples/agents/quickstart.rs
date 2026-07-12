@@ -9,7 +9,7 @@ use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     let agent = Agent::builder(client)
         .name("assistant")

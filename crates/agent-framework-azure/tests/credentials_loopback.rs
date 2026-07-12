@@ -491,7 +491,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"
         if update.response_id.as_deref() == Some("resp_stream_1") {
             saw_completed = true;
             // `store != Some(false)` auto-populates `conversation_id`,
-            // identical to `OpenAIResponsesClient`'s streaming behavior.
+            // identical to `OpenAIChatClient`'s streaming behavior.
             assert_eq!(update.conversation_id.as_deref(), Some("resp_stream_1"));
         }
     }

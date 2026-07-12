@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     let mut providers = AggregateContextProvider::new();
     providers.add(Arc::new(memory));
 
-    let agent = Agent::builder(OpenAIClient::from_env("gpt-4o-mini")?)
+    let agent = Agent::builder(OpenAIChatCompletionClient::from_env("gpt-4o-mini")?)
         .instructions("You are a helpful assistant.")
         .context_provider(Arc::new(providers))
         .build();

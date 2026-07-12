@@ -1,4 +1,4 @@
-//! `OpenAIClient` against any OpenAI-Chat-Completions-compatible server --
+//! `OpenAIChatCompletionClient` against any OpenAI-Chat-Completions-compatible server --
 //! llama.cpp's server, Ollama, LM Studio, vLLM, together.ai, and similar --
 //! by overriding the base URL with `.with_base_url(...)`.
 //!
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
     println!("connecting to {base_url} (model \"{model}\")");
-    let client = OpenAIClient::new(api_key, model).with_base_url(base_url);
+    let client = OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url);
 
     let agent = Agent::builder(client)
         .name("assistant")

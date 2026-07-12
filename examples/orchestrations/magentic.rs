@@ -14,7 +14,7 @@ use agent_framework_core::types::Message;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     let researcher = Arc::new(
         Agent::builder(client.clone())

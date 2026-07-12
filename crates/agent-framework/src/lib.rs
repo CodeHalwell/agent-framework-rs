@@ -29,7 +29,7 @@
 //! use agent_framework::prelude::*;
 //!
 //! # async fn demo() -> Result<()> {
-//! let client = OpenAIClient::from_env("gpt-4o-mini")?;
+//! let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 //! let agent = Agent::builder(client)
 //!     .name("assistant")
 //!     .instructions("You are a helpful assistant.")
@@ -106,7 +106,7 @@ pub mod prelude {
     pub use agent_framework_core::prelude::*;
 
     #[cfg(feature = "openai")]
-    pub use agent_framework_openai::{OpenAIClient, OpenAIResponsesClient};
+    pub use agent_framework_openai::{OpenAIChatClient, OpenAIChatCompletionClient};
 
     #[cfg(feature = "anthropic")]
     pub use agent_framework_anthropic::AnthropicClient;

@@ -9,7 +9,7 @@ use agent_framework::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = OpenAIClient::from_env("gpt-4o-mini")?;
+    let client = OpenAIChatCompletionClient::from_env("gpt-4o-mini")?;
 
     // The specialist: answers geography questions. `as_tool` runs it
     // statelessly (a fresh thread per call) and returns its reply text.

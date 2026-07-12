@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         std::env::var("AZURE_SEARCH_ENDPOINT"),
         std::env::var("AZURE_SEARCH_API_KEY"),
         std::env::var("AZURE_SEARCH_INDEX"),
-        OpenAIClient::from_env("gpt-4o-mini"),
+        OpenAIChatCompletionClient::from_env("gpt-4o-mini"),
     ) else {
         println!(
             "set AZURE_SEARCH_ENDPOINT, AZURE_SEARCH_API_KEY, AZURE_SEARCH_INDEX, \
