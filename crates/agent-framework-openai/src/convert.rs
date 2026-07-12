@@ -383,7 +383,7 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
         input_token_count: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("completion_tokens").and_then(Value::as_u64),
         total_token_count: usage.get("total_tokens").and_then(Value::as_u64),
-        additional_counts: Default::default(),
+        ..Default::default()
     };
     if let Some(ctd) = usage.get("completion_tokens_details") {
         add_usage_detail(
@@ -399,6 +399,9 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
             "reasoning_tokens",
             "completion/reasoning_tokens",
         );
+        // Mirror upstream: the reasoning count is also surfaced as the typed,
+        // cross-language field in addition to the provider-prefixed extra.
+        details.reasoning_output_token_count = ctd.get("reasoning_tokens").and_then(Value::as_u64);
         add_usage_detail(
             &mut details,
             ctd,
@@ -409,6 +412,8 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
     if let Some(ptd) = usage.get("prompt_tokens_details") {
         add_usage_detail(&mut details, ptd, "audio_tokens", "prompt/audio_tokens");
         add_usage_detail(&mut details, ptd, "cached_tokens", "prompt/cached_tokens");
+        // Mirror upstream: cached prompt tokens also populate the typed field.
+        details.cache_read_input_token_count = ptd.get("cached_tokens").and_then(Value::as_u64);
     }
     details
 }

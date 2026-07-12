@@ -679,7 +679,7 @@ pub fn parse_usage(value: &Value) -> Option<UsageDetails> {
         input_token_count: usage.get("prompt_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("completion_tokens").and_then(Value::as_u64),
         total_token_count: usage.get("total_tokens").and_then(Value::as_u64),
-        additional_counts: Default::default(),
+        ..Default::default()
     })
 }
 

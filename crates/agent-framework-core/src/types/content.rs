@@ -21,6 +21,15 @@ pub struct UsageDetails {
     pub output_token_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub total_token_count: Option<u64>,
+    /// The number of input tokens written to a provider-managed cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_creation_input_token_count: Option<u64>,
+    /// The number of input tokens served from a provider-managed cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cache_read_input_token_count: Option<u64>,
+    /// The number of output tokens used for reasoning.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reasoning_output_token_count: Option<u64>,
     /// Additional, provider-specific counts merged into the root on serialize.
     #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
     pub additional_counts: HashMap<String, u64>,
@@ -42,6 +51,18 @@ impl UsageDetails {
         merge(&mut self.input_token_count, other.input_token_count);
         merge(&mut self.output_token_count, other.output_token_count);
         merge(&mut self.total_token_count, other.total_token_count);
+        merge(
+            &mut self.cache_creation_input_token_count,
+            other.cache_creation_input_token_count,
+        );
+        merge(
+            &mut self.cache_read_input_token_count,
+            other.cache_read_input_token_count,
+        );
+        merge(
+            &mut self.reasoning_output_token_count,
+            other.reasoning_output_token_count,
+        );
         for (k, v) in &other.additional_counts {
             *self.additional_counts.entry(k.clone()).or_insert(0) += *v;
         }
@@ -304,6 +325,136 @@ pub struct FunctionApprovalResponseContent {
     pub function_call: FunctionCallContent,
 }
 
+/// A provider-hosted code-interpreter tool call (the model's request to run
+/// code). `inputs` carries the submitted code / files as nested content.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CodeInterpreterToolCallContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inputs: Option<Vec<Content>>,
+}
+
+/// The result of a provider-hosted code-interpreter tool call. `outputs`
+/// carries the produced logs / files as nested content.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CodeInterpreterToolResultContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub outputs: Option<Vec<Content>>,
+}
+
+/// A provider-hosted image-generation tool call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenerationToolCallContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image_id: Option<String>,
+}
+
+/// The result of a provider-hosted image-generation tool call. `outputs` is
+/// the provider-specific payload (e.g. the generated image data or references).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenerationToolResultContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub outputs: Option<Value>,
+}
+
+/// A provider-hosted MCP server tool call the service already routed to a
+/// remote MCP server. Recorded for transcript fidelity; not a local function
+/// invocation request (always `informational_only`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerToolCallContent {
+    pub call_id: String,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub arguments: Option<FunctionArguments>,
+}
+
+/// The result of a provider-hosted MCP server tool call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerToolResultContent {
+    pub call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output: Option<Value>,
+}
+
+/// A provider-hosted search tool call (e.g. web/file search).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchToolCallContent {
+    pub call_id: String,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub arguments: Option<FunctionArguments>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+}
+
+/// The result of a provider-hosted search tool call. `items` carries the
+/// retrieved results as nested content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchToolResultContent {
+    pub call_id: String,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub items: Option<Vec<Content>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+}
+
+/// A shell tool call: the model's request to run one or more shell commands.
+/// This is request metadata, not command output.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShellToolCallContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub commands: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub timeout_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_output_length: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+}
+
+/// The aggregate result of a shell tool call. Each per-command output is a
+/// [`ShellCommandOutputContent`] carried in `outputs`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShellToolResultContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub outputs: Option<Vec<Content>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_output_length: Option<i64>,
+}
+
+/// The output of a single shell command execution.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShellCommandOutputContent {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stderr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub timed_out: Option<bool>,
+}
+
+/// A request for the user to complete an OAuth consent flow (human-in-the-loop).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OauthConsentRequestContent {
+    pub consent_link: String,
+}
+
 /// The unified content union, discriminated by the `type` tag.
 ///
 /// This is the Rust equivalent of the Python `Contents` union.
@@ -330,8 +481,20 @@ pub enum Content {
     Usage(UsageContent),
     HostedFile(HostedFileContent),
     HostedVectorStore(HostedVectorStoreContent),
+    CodeInterpreterToolCall(CodeInterpreterToolCallContent),
+    CodeInterpreterToolResult(CodeInterpreterToolResultContent),
+    ImageGenerationToolCall(ImageGenerationToolCallContent),
+    ImageGenerationToolResult(ImageGenerationToolResultContent),
+    McpServerToolCall(McpServerToolCallContent),
+    McpServerToolResult(McpServerToolResultContent),
+    SearchToolCall(SearchToolCallContent),
+    SearchToolResult(SearchToolResultContent),
+    ShellToolCall(ShellToolCallContent),
+    ShellToolResult(ShellToolResultContent),
+    ShellCommandOutput(ShellCommandOutputContent),
     FunctionApprovalRequest(FunctionApprovalRequestContent),
     FunctionApprovalResponse(FunctionApprovalResponseContent),
+    OauthConsentRequest(OauthConsentRequestContent),
     /// A content item whose `type` tag is unknown to this version of the
     /// library. Deserialization falls back to this inert variant instead of
     /// erroring; see the type-level docs.
@@ -504,6 +667,118 @@ mod tests {
         );
         let s = serde_json::to_string(&msg).expect("message serializes");
         assert!(s.contains("\"unknown\""));
+    }
+
+    #[test]
+    fn new_hosted_tool_variants_use_upstream_wire_tags() {
+        // These `type` tags are load-bearing for cross-language interop with
+        // the Python/.NET `Content` union; assert each one exactly.
+        let cases: Vec<(Content, &str)> = vec![
+            (
+                Content::CodeInterpreterToolCall(CodeInterpreterToolCallContent::default()),
+                "code_interpreter_tool_call",
+            ),
+            (
+                Content::CodeInterpreterToolResult(CodeInterpreterToolResultContent::default()),
+                "code_interpreter_tool_result",
+            ),
+            (
+                Content::ImageGenerationToolCall(ImageGenerationToolCallContent::default()),
+                "image_generation_tool_call",
+            ),
+            (
+                Content::ImageGenerationToolResult(ImageGenerationToolResultContent::default()),
+                "image_generation_tool_result",
+            ),
+            (
+                Content::McpServerToolCall(McpServerToolCallContent {
+                    call_id: "c".into(),
+                    tool_name: "t".into(),
+                    server_name: None,
+                    arguments: None,
+                }),
+                "mcp_server_tool_call",
+            ),
+            (
+                Content::McpServerToolResult(McpServerToolResultContent {
+                    call_id: "c".into(),
+                    output: None,
+                }),
+                "mcp_server_tool_result",
+            ),
+            (
+                Content::SearchToolCall(SearchToolCallContent {
+                    call_id: "c".into(),
+                    tool_name: "t".into(),
+                    arguments: None,
+                    status: None,
+                }),
+                "search_tool_call",
+            ),
+            (
+                Content::SearchToolResult(SearchToolResultContent {
+                    call_id: "c".into(),
+                    tool_name: "t".into(),
+                    result: None,
+                    items: None,
+                    status: None,
+                }),
+                "search_tool_result",
+            ),
+            (
+                Content::ShellToolCall(ShellToolCallContent::default()),
+                "shell_tool_call",
+            ),
+            (
+                Content::ShellToolResult(ShellToolResultContent::default()),
+                "shell_tool_result",
+            ),
+            (
+                Content::ShellCommandOutput(ShellCommandOutputContent::default()),
+                "shell_command_output",
+            ),
+            (
+                Content::OauthConsentRequest(OauthConsentRequestContent {
+                    consent_link: "https://example/consent".into(),
+                }),
+                "oauth_consent_request",
+            ),
+        ];
+        for (content, tag) in cases {
+            let v = serde_json::to_value(&content).unwrap();
+            assert_eq!(
+                v.get("type").and_then(serde_json::Value::as_str),
+                Some(tag),
+                "wire tag mismatch for {content:?}"
+            );
+            // And it must round-trip to the same variant (not fall back to Unknown).
+            let back: Content = serde_json::from_value(v).unwrap();
+            assert_eq!(back, content);
+            assert_ne!(back, Content::Unknown);
+        }
+    }
+
+    #[test]
+    fn usage_details_typed_cache_reasoning_fields_roundtrip_and_add() {
+        let a = UsageDetails {
+            input_token_count: Some(10),
+            cache_creation_input_token_count: Some(3),
+            cache_read_input_token_count: Some(4),
+            reasoning_output_token_count: Some(5),
+            ..Default::default()
+        };
+        // Serialize at the top level with the upstream key names.
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v.get("cache_creation_input_token_count"), Some(&3.into()));
+        assert_eq!(v.get("cache_read_input_token_count"), Some(&4.into()));
+        assert_eq!(v.get("reasoning_output_token_count"), Some(&5.into()));
+        let back: UsageDetails = serde_json::from_value(v).unwrap();
+        assert_eq!(back, a);
+        // Element-wise addition folds the typed fields too.
+        let sum = a.clone() + a;
+        assert_eq!(sum.cache_creation_input_token_count, Some(6));
+        assert_eq!(sum.cache_read_input_token_count, Some(8));
+        assert_eq!(sum.reasoning_output_token_count, Some(10));
     }
 
     #[test]

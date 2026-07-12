@@ -804,24 +804,14 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
     let mut details = UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
-        total_token_count: None,
-        additional_counts: Default::default(),
+        cache_creation_input_token_count: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        ..Default::default()
     };
     if let (Some(i), Some(o)) = (details.input_token_count, details.output_token_count) {
         details.total_token_count = Some(i + o);
-    }
-    if let Some(v) = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-    {
-        details
-            .additional_counts
-            .insert("anthropic.cache_creation_input_tokens".into(), v);
-    }
-    if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-        details
-            .additional_counts
-            .insert("anthropic.cache_read_input_tokens".into(), v);
     }
     details
 }
@@ -834,24 +824,18 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 /// aggregating a stream) would double-count output tokens, so this
 /// deliberately omits `output_tokens` here.
 pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
-    let mut details = UsageDetails {
+    let details = UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
+        cache_creation_input_token_count: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
         ..Default::default()
     };
-    if let Some(v) = usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
+    if details.input_token_count.is_none()
+        && details.cache_creation_input_token_count.is_none()
+        && details.cache_read_input_token_count.is_none()
     {
-        details
-            .additional_counts
-            .insert("anthropic.cache_creation_input_tokens".into(), v);
-    }
-    if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-        details
-            .additional_counts
-            .insert("anthropic.cache_read_input_tokens".into(), v);
-    }
-    if details.input_token_count.is_none() && details.additional_counts.is_empty() {
         return None;
     }
     Some(UsageContent { details })
@@ -1185,18 +1169,8 @@ mod tests {
         });
         let resp = parse_response(&value);
         let usage = resp.usage_details.unwrap();
-        assert_eq!(
-            usage
-                .additional_counts
-                .get("anthropic.cache_creation_input_tokens"),
-            Some(&50)
-        );
-        assert_eq!(
-            usage
-                .additional_counts
-                .get("anthropic.cache_read_input_tokens"),
-            Some(&20)
-        );
+        assert_eq!(usage.cache_creation_input_token_count, Some(50));
+        assert_eq!(usage.cache_read_input_token_count, Some(20));
     }
 
     #[test]

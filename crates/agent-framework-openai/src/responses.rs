@@ -900,7 +900,7 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
         total_token_count: usage.get("total_tokens").and_then(Value::as_u64),
-        additional_counts: Default::default(),
+        ..Default::default()
     };
     if let Some(cached) = usage
         .get("input_tokens_details")
@@ -910,6 +910,8 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         details
             .additional_counts
             .insert("openai.cached_input_tokens".into(), cached);
+        // Mirror upstream: also surface as the typed, cross-language field.
+        details.cache_read_input_token_count = Some(cached);
     }
     if let Some(reasoning) = usage
         .get("output_tokens_details")
@@ -919,6 +921,7 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
         details
             .additional_counts
             .insert("openai.reasoning_tokens".into(), reasoning);
+        details.reasoning_output_token_count = Some(reasoning);
     }
     details
 }
