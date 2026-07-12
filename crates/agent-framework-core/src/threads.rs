@@ -84,8 +84,14 @@ impl ChatMessageStore for InMemoryChatMessageStore {
         Ok(())
     }
     async fn update_from_state(&self, serialized_store_state: &Value) -> Result<()> {
-        // Mirrors Python's `ChatMessageStore.update_from_state`: replace the
-        // in-memory history with the serialized messages when present.
+        // Replace the in-memory history with the serialized messages whenever
+        // the state carries a `messages` list — INCLUDING an empty one, so
+        // restoring an intentionally empty thread clears stale history from a
+        // reused store. (Deliberate divergence: Python *appends* the restored
+        // messages onto an existing store, `_threads.py:499-505`, so it can
+        // neither clear nor deduplicate; replace is the honest semantic for a
+        // restore operation.) A state without a `messages` key restores
+        // nothing.
         let Some(raw) = serialized_store_state.get("messages") else {
             return Ok(());
         };
@@ -95,9 +101,7 @@ impl ChatMessageStore for InMemoryChatMessageStore {
         let messages: Vec<ChatMessage> = serde_json::from_value(raw.clone()).map_err(|e| {
             Error::Serialization(format!("failed to restore chat message store: {e}"))
         })?;
-        if !messages.is_empty() {
-            *self.messages.lock().await = messages;
-        }
+        *self.messages.lock().await = messages;
         Ok(())
     }
 }
@@ -341,6 +345,14 @@ impl AgentThread {
                 self.message_store = Some(store);
             }
         }
+        // The restored state is local (its `service_thread_id` was absent or
+        // null), so this thread becomes local: keeping a previous service id
+        // alongside a store would break the service-xor-store invariant —
+        // `serialize()` would emit both fields and `on_new_messages()` would
+        // treat the thread as service-managed and stop recording history.
+        // (Deliberate divergence: Python leaves the stale id in place here,
+        // `_threads.py:493-505`, inheriting exactly that broken state.)
+        self.service_thread_id = None;
         Ok(())
     }
 }
@@ -349,6 +361,58 @@ impl AgentThread {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    #[tokio::test]
+    async fn restoring_an_empty_state_clears_stale_history() {
+        // A reused store with prior messages must end up empty when the
+        // restored thread state carries an (intentionally) empty list.
+        let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
+            ChatMessage::user("stale"),
+        ]));
+        store
+            .update_from_state(&serde_json::json!({ "messages": [] }))
+            .await
+            .unwrap();
+        assert!(store.list_messages().await.unwrap().is_empty());
+
+        // A state with no `messages` key restores nothing (unchanged).
+        let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
+            ChatMessage::user("kept"),
+        ]));
+        store
+            .update_from_state(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(store.list_messages().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restoring_local_state_onto_a_service_thread_clears_the_service_id() {
+        let mut thread = AgentThread::service("svc-9");
+        let state = serde_json::json!({
+            "type": "agent_thread_state",
+            "service_thread_id": null,
+            "chat_message_store_state": {
+                "type": "chat_message_store_state",
+                "messages": [ChatMessage::user("hello")],
+            },
+        });
+        thread.update_from_state(&state).await.unwrap();
+        assert!(thread.service_thread_id().is_none());
+
+        // The thread now behaves as local end to end: history records and a
+        // re-serialize emits the local shape (store state set, id null).
+        thread
+            .on_new_messages(vec![ChatMessage::user("again")])
+            .await
+            .unwrap();
+        let reserialized = thread.serialize().await.unwrap();
+        assert!(reserialized["service_thread_id"].is_null());
+        let messages = reserialized["chat_message_store_state"]["messages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+    }
 
     #[tokio::test]
     async fn serialize_wire_shape_matches_python_keys() {
