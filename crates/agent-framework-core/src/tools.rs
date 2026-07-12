@@ -89,6 +89,8 @@ pub enum ToolKind {
     Function,
     /// Service-side code interpreter.
     HostedCodeInterpreter,
+    /// Service-side image generation.
+    HostedImageGeneration,
     /// Service-side web search.
     HostedWebSearch,
     /// Service-side file search over hosted vector stores.
@@ -701,6 +703,22 @@ pub fn hosted_code_interpreter() -> ToolDefinition {
         description: String::new(),
         parameters: empty_schema(),
         kind: ToolKind::HostedCodeInterpreter,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
+/// Construct a hosted image-generation tool marker.
+///
+/// Supported by services that expose server-side image generation as a tool
+/// (e.g. the OpenAI Responses API's `image_generation` tool). Its results
+/// surface as [`Content::ImageGenerationToolResult`](crate::types::Content).
+pub fn hosted_image_generation() -> ToolDefinition {
+    ToolDefinition {
+        name: "image_generation".into(),
+        description: String::new(),
+        parameters: empty_schema(),
+        kind: ToolKind::HostedImageGeneration,
         approval_mode: ApprovalMode::NeverRequire,
         executor: None,
     }

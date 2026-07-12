@@ -483,6 +483,20 @@ pub fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             spec.insert("require_approval".into(), mcp_require_approval(tool));
             Value::Object(spec)
         }
+        ToolKind::HostedImageGeneration => {
+            let mut spec = Map::new();
+            spec.insert("type".into(), json!("image_generation"));
+            // Pass through any caller-supplied generation options (size,
+            // quality, background, …) carried on the marker's parameters.
+            if let Value::Object(params) = &tool.parameters {
+                for (k, v) in params {
+                    if k != "type" && k != "properties" {
+                        spec.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(spec)
+        }
         ToolKind::Function => json!({
             "type": "function",
             "name": tool.name,
@@ -2151,6 +2165,19 @@ mod tests {
         let spec = tool_to_responses_spec(&tool);
         assert_eq!(spec["vector_store_ids"], json!(["vs_1"]));
         assert_eq!(spec["max_num_results"], json!(12));
+    }
+
+    #[test]
+    fn image_generation_maps_to_responses_tool_with_passthrough_params() {
+        let tool = hosted(
+            ToolKind::HostedImageGeneration,
+            "image_generation",
+            json!({ "size": "1024x1024", "quality": "high" }),
+        );
+        let spec = tool_to_responses_spec(&tool);
+        assert_eq!(spec["type"], json!("image_generation"));
+        assert_eq!(spec["size"], json!("1024x1024"));
+        assert_eq!(spec["quality"], json!("high"));
     }
 
     #[test]

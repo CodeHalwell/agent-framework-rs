@@ -66,9 +66,9 @@ pub mod prelude {
     pub use crate::settings::{load_setting, SecretString};
     pub use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
     pub use crate::tools::{
-        hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, ApprovalMode,
-        FunctionInvocationConfig, FunctionTool, McpApprovalMode, Tool, ToolDefinition, ToolKind,
-        ToolSource,
+        hosted_code_interpreter, hosted_file_search, hosted_image_generation, hosted_mcp,
+        hosted_web_search, ApprovalMode, FunctionInvocationConfig, FunctionTool, McpApprovalMode,
+        Tool, ToolDefinition, ToolKind, ToolSource,
     };
     pub use crate::types::{
         AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, ChatResponseUpdate, Content,

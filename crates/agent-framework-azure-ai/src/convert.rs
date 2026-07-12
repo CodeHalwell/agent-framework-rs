@@ -244,6 +244,14 @@ fn append_tool(tool: &ToolDefinition, out: &mut PreparedTools) -> Result<()> {
                 .expect("mcp_resources is always seeded as a JSON array")
                 .push(mcp_tool_resource(tool));
         }
+        ToolKind::HostedImageGeneration => {
+            // Not exposed as a tool on the Azure AI Foundry (persistent
+            // agents) data plane; skip rather than emit an unusable entry.
+            tracing::warn!(
+                tool = %tool.name,
+                "hosted image generation is not supported on the Azure AI Foundry agents API; skipping",
+            );
+        }
     }
     Ok(())
 }
