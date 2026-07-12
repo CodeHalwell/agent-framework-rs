@@ -2,85 +2,75 @@
 
 Tracks the re-baselining of `agent-framework-rs` onto current upstream, as
 catalogued in [`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md). Section numbers below
-refer to that document.
+refer to that document. Everything under "Done" is landed on
+`claude/rust-agent-framework-alignment-q6bjwp` and independently verified
+(full workspace build + `cargo test` + clippy `--all-targets` + rustfmt, all
+green) before commit.
 
-## Done (landed on `claude/rust-agent-framework-alignment-q6bjwp`, all green)
-
-Every item here builds clean and passes the full workspace suite (67 test
-binaries), clippy `--all-targets`, and rustfmt.
+## Done
 
 ### Naming / type-system cascade — Theme A + Theme F (complete)
 
-| Change | Section |
-|---|---|
-| `trait Agent` → `SupportsAgentRun` | §1 / Theme A |
-| `ChatAgent` → `Agent`, `ChatAgentBuilder` → `AgentBuilder` | §1 |
-| `ChatMessage` → `Message` | §5 |
-| `AgentRunResponse`/`…Update` → `AgentResponse`/`AgentResponseUpdate` | §5 |
-| `ChatResponse.model_id` / `ChatOptions.model_id` → `model` | §5 |
-| `AiFunction` → `FunctionTool` | §6 |
-| `AgentRunContext` → `AgentContext` | §7 |
-| `CitationAnnotation` → `Annotation` (+ `type:"citation"` discriminator) | §5 |
+`trait Agent`→`SupportsAgentRun`, `ChatAgent`→`Agent`, `ChatAgentBuilder`→
+`AgentBuilder`, `ChatMessage`→`Message`, `AgentRunResponse`/`…Update`→
+`AgentResponse`/`AgentResponseUpdate`, `ChatResponse.model_id`/`ChatOptions.model_id`→
+`model`, `AiFunction`→`FunctionTool`, `AgentRunContext`→`AgentContext`,
+`CitationAnnotation`→`Annotation`.
 
-### Type-system additions (§5)
+### Types & tools (§5/§6/§8)
 
-- Twelve new hosted tool-call/result `Content` variants
-  (code-interpreter, image-generation, MCP, search, shell ×2, shell-command-output,
-  oauth-consent) with exact upstream wire tags — previously dropped by the
-  `Unknown` fallback.
-- `UsageDetails` typed `cache_creation` / `cache_read` / `reasoning` token
-  fields, populated by the Anthropic and OpenAI usage parsers.
-- `ContinuationToken` newtype + optional field on `ChatResponse` / `AgentResponse`.
+- 12 new hosted tool-call/result `Content` variants; typed `UsageDetails`
+  cache/reasoning fields (wired from Anthropic/OpenAI); `ContinuationToken`;
+  `Annotation` `type:"citation"` discriminator.
+- `hosted_image_generation()` + `ToolKind::HostedImageGeneration`.
+- Cache/reasoning/`embeddings`/`prompt.name` OTel attributes.
 
-### Correctness fixes (§10 / §11)
+### Sessions / context (§3) & new modules (§9)
 
-- Per-executor serialization within a superstep (upstream PR #6776).
-- Staged shared-state with commit-per-superstep (Pregel `_state.py` model).
+- **ContextProvider → SessionContext reshape**: `Context`→`SessionContext`,
+  `invoking`/`invoked`/`thread_created`→`before_run`/`after_run` (in-place
+  mutation), `AggregateContextProvider` removed; ported across core + the
+  redis/mem0/azure-ai-search provider crates.
+- **`settings`** module (`SecretString` + `load_setting`).
+- **`compaction`** module (`Tokenizer` + Truncation/SlidingWindow/TokenBudget/
+  SelectiveToolResult strategies).
 
-### Providers (§13)
+### Workflow engine & orchestrations (§10/§12)
 
-- Removed the dead `OpenAIAssistantsClient` (upstream deleted the Assistants API).
-- Flipped OpenAI client names: `OpenAIChatClient` = Responses,
-  `OpenAIChatCompletionClient` = Chat Completions.
+- Per-executor serialization within a superstep; staged shared-state
+  (commit-per-superstep).
+- `WorkflowEvent::Intermediate` + `output_from`/`intermediate_output_from`
+  designation + `OutputValidation`, wired through the Sequential/Concurrent/
+  GroupChat/Magentic builders.
+- Async edge conditions (`should_route`) with a backward-compatible sync API +
+  `EdgeGroup::has_condition`.
 
-### New capabilities
+### Providers & hosting (§13/§14)
 
-- `hosted_image_generation()` tool + `ToolKind::HostedImageGeneration` (§6).
-- `settings` module: `SecretString` + `load_setting` precedence (§9).
-- Cache/reasoning/`embeddings`/`prompt.name` OTel attributes (§8).
+- Removed the dead `OpenAIAssistantsClient`; flipped OpenAI client names
+  (`OpenAIChatClient`=Responses, `OpenAIChatCompletionClient`=Chat Completions).
+- New provider crates: **ollama**, **gemini**, **mistral** (full `ChatClient`
+  impls, wired into the umbrella crate + examples).
+- `CosmosCheckpointStorage`; DevUI security middleware (Host-header
+  anti-DNS-rebinding guard + optional bearer auth, opt-in).
 
-## Remaining (large, dedicated efforts — ordered by leverage)
+## Remaining (roadmap)
 
-Each is a multi-file change; several ripple into test-heavy crates and are best
-done as focused, reviewed passes rather than a single sweep.
+Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
 
-1. **Sessions keystone (§2 / §3)** — `AgentThread` → `AgentSession` (history
-   leaves the thread), `ChatMessageStore` → `HistoryProvider`
-   (`InMemory`/`File`), `Context` → `SessionContext`, `invoking`/`invoked` →
-   `before_run`/`after_run` (in-place mutation), remove `thread_created` and
-   `AggregateContextProvider`. Rewrites the agent run loop and the
-   `redis` / `mem0` / `azure-ai-search` `ContextProvider` impls (+ their test
-   suites). Unblocks compaction, skills, security, harness, and the
-   history-provider ecosystem reworks.
-2. **Unified `run(stream=)` / `get_response(stream=)`** (Theme B) — folds the
-   paired streaming entry points into one overloaded call across every client,
-   agent, and workflow surface.
-3. **History compaction (§9)** — new `compaction` module (`TokenizerProtocol`,
-   `CompactionStrategy`, seven strategies, `CompactionProvider`), wired into the
-   client loop. Gated on the sessions keystone.
-4. **Provider reworks (§13)** — rename+rewrite `azure-ai` → `foundry`
-   (`FoundryChatClient` / `FoundryAgent` / `to_prompt_agent`), Anthropic
-   multi-cloud (Bedrock/Vertex/Foundry), Azure "routing mode" realignment, and
-   the seven new provider crates (`claude`, `bedrock`, `gemini`, `mistral`,
-   `ollama`, `github-copilot`, `foundry-local`).
-5. **Workflow / orchestration (§10 / §12)** — `output_from` /
-   `intermediate_output_from` designation + `WorkflowEvent::Intermediate`, async
-   `should_route`, `OUTPUT_VALIDATION`, the shared post-agent
-   `AgentApprovalExecutor` HITL engine, and the Handoff mesh-topology rebuild.
-6. **Hosting / DevUI (§14)** — Responses-conversion extraction, A2A server
-   move, DevUI auth-by-default + anti-DNS-rebinding Host-header middleware, and
-   the remaining ~17 DevUI routes.
-7. **New ecosystem packages (§9 / §14)** — `durabletask`, `azure-cosmos`
-   (`CosmosCheckpointStorage` is unblocked today), the declarative-workflow
-   execution engine, shell-tools crate, and the `@experimental` harness /
-   security / evaluation modules.
+1. **Sessions §2 completion** — `AgentThread`→`AgentSession` (state bag, sync
+   `to_dict`/`from_dict`) and history out of the thread into a
+   `HistoryProvider` (`InMemory`/`File`), rewiring the agent run loop. Broad
+   ripple (a2a/copilotstudio/hosting/redis/examples).
+2. **Unified `run(stream=)` / `get_response(stream=)`** (Theme B) — cross-cutting.
+3. **Provider reworks** — `azure-ai`→`foundry` rename+rewrite onto the Responses
+   API (`FoundryAgent`/`to_prompt_agent`); Anthropic multi-cloud
+   (Bedrock/Vertex/Foundry); Azure "routing mode" realignment; remaining new
+   provider crates (bedrock, foundry-local, claude, github-copilot).
+4. **Orchestration depth (§12)** — shared post-agent `AgentApprovalExecutor`
+   HITL (iterate-until-approved); terminal output shape (`AgentResponse` vs
+   transcript); Handoff mesh-topology rebuild.
+5. **Hosting/DevUI (§14)** — remaining ~17 DevUI routes; Responses-conversion
+   extraction; A2A server move.
+6. **Large ecosystem packages** — `durabletask`; the declarative-workflow
+   execution engine; the `@experimental` harness / security / evaluation modules.
