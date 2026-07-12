@@ -60,8 +60,7 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::memory::{AggregateContextProvider, Context, ContextProvider};
     pub use crate::middleware::{
-        AgentRunContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline,
-        Next,
+        AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
     pub use crate::settings::{load_setting, SecretString};

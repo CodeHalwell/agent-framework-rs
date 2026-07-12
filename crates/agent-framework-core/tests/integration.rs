@@ -273,12 +273,8 @@ fn function_call_merge_does_not_duplicate_name() {
 struct SuffixMiddleware;
 
 #[async_trait]
-impl Middleware<AgentRunContext> for SuffixMiddleware {
-    async fn process(
-        &self,
-        ctx: AgentRunContext,
-        next: Next<AgentRunContext>,
-    ) -> Result<AgentRunContext> {
+impl Middleware<AgentContext> for SuffixMiddleware {
+    async fn process(&self, ctx: AgentContext, next: Next<AgentContext>) -> Result<AgentContext> {
         let mut ctx = next.run(ctx).await?;
         if let Some(resp) = ctx.result.as_mut() {
             for m in &mut resp.messages {

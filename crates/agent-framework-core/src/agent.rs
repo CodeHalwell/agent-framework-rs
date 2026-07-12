@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::client::{ChatClient, FunctionInvokingChatClient};
 use crate::error::{Error, Result};
 use crate::memory::{AggregateContextProvider, ContextProvider};
-use crate::middleware::{AgentRunContext, ChatContext, MiddlewarePipeline, Terminal};
+use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
 use crate::tools::{AiFunction, ToolDefinition, ToolSource};
 use crate::types::{
@@ -307,7 +307,7 @@ pub struct ChatAgent {
     /// Factory for a new local thread's message store. When unset,
     /// [`InMemoryChatMessageStore`] is used.
     chat_message_store_factory: Option<ChatMessageStoreFactory>,
-    agent_middleware: MiddlewarePipeline<AgentRunContext>,
+    agent_middleware: MiddlewarePipeline<AgentContext>,
     /// Middleware run around the underlying chat-client call (mirrors
     /// Python's `use_chat_middleware`). See [`ChatAgent::call_chat_client`].
     chat_middleware: MiddlewarePipeline<ChatContext>,
@@ -615,7 +615,7 @@ impl ChatAgent {
     ) -> Result<AgentRunResponse> {
         let client = self.client.clone();
         let chat_middleware = self.chat_middleware.clone();
-        let terminal: Terminal<AgentRunContext> = Box::new(move |mut ctx: AgentRunContext| {
+        let terminal: Terminal<AgentContext> = Box::new(move |mut ctx: AgentContext| {
             let client = client.clone();
             let options = options.clone();
             let chat_middleware = chat_middleware.clone();
@@ -633,10 +633,10 @@ impl ChatAgent {
                 .await?;
                 ctx.result = Some(AgentRunResponse::from_chat_response(response));
                 Ok(ctx)
-            }) as crate::tools::BoxFuture<Result<AgentRunContext>>
+            }) as crate::tools::BoxFuture<Result<AgentContext>>
         });
 
-        let ctx = AgentRunContext::new(final_messages, is_streaming);
+        let ctx = AgentContext::new(final_messages, is_streaming);
         let ctx = self.agent_middleware.execute(ctx, terminal).await?;
         let mut response = ctx.result.ok_or_else(|| {
             crate::error::Error::AgentExecution("agent produced no result".into())

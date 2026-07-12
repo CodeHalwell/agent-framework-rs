@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use agent_framework_core::error::Result;
-use agent_framework_core::middleware::{AgentRunContext, ChatContext, Middleware, Next};
+use agent_framework_core::middleware::{AgentContext, ChatContext, Middleware, Next};
 use agent_framework_core::types::{AgentRunResponse, ChatMessage, ChatResponse, Role};
 
 use crate::auth::TokenProvider;
@@ -131,12 +131,12 @@ impl PurviewAgentMiddleware {
 }
 
 #[async_trait]
-impl Middleware<AgentRunContext> for PurviewAgentMiddleware {
+impl Middleware<AgentContext> for PurviewAgentMiddleware {
     async fn process(
         &self,
-        mut ctx: AgentRunContext,
-        next: Next<AgentRunContext>,
-    ) -> Result<AgentRunContext> {
+        mut ctx: AgentContext,
+        next: Next<AgentContext>,
+    ) -> Result<AgentContext> {
         let (should_block, resolved_user_id) = self.0.check(&ctx.messages, None, "prompt").await?;
         if should_block {
             ctx.result = Some(AgentRunResponse {
@@ -255,8 +255,8 @@ mod tests {
         PurviewChatMiddleware::new(StaticTokenProvider::new("token"), settings)
     }
 
-    fn agent_terminal(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentRunContext> {
-        Box::new(move |mut ctx: AgentRunContext| {
+    fn agent_terminal(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentContext> {
+        Box::new(move |mut ctx: AgentContext| {
             called.store(true, Ordering::SeqCst);
             Box::pin(async move {
                 ctx.result = Some(AgentRunResponse {
@@ -264,7 +264,7 @@ mod tests {
                     ..Default::default()
                 });
                 Ok(ctx)
-            }) as BoxFuture<Result<AgentRunContext>>
+            }) as BoxFuture<Result<AgentContext>>
         })
     }
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// `Result::unwrap_err` requires the `Ok` type to implement `Debug`,
-    /// which `AgentRunContext`/`ChatContext` deliberately don't (they carry
+    /// which `AgentContext`/`ChatContext` deliberately don't (they carry
     /// non-`Debug` middleware/result trait objects). Same shape, without
     /// that bound.
     fn expect_err<T>(result: Result<T>) -> agent_framework_core::error::Error {
@@ -297,7 +297,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![ChatMessage::user("hi")], false);
 
         let err = expect_err(
             pipeline
@@ -317,7 +317,7 @@ mod tests {
         let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(vec![ChatMessage::user("hi")], false);
+        let ctx = AgentContext::new(vec![ChatMessage::user("hi")], false);
 
         let result_ctx = pipeline
             .execute(ctx, agent_terminal(called.clone(), "real response"))
@@ -343,7 +343,7 @@ mod tests {
         let middleware = agent_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(
+        let ctx = AgentContext::new(
             vec![ChatMessage::user("hello, nothing identifying here")],
             false,
         );
@@ -364,7 +364,7 @@ mod tests {
         let middleware = agent_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentRunContext::new(
+        let ctx = AgentContext::new(
             vec![ChatMessage::user("hello, nothing identifying here")],
             true,
         );

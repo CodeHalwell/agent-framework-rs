@@ -93,7 +93,7 @@ impl<C: Send + 'static> MiddlewarePipeline<C> {
 }
 
 /// Context flowing through the agent middleware pipeline.
-pub struct AgentRunContext {
+pub struct AgentContext {
     pub messages: Vec<ChatMessage>,
     pub is_streaming: bool,
     pub metadata: HashMap<String, serde_json::Value>,
@@ -103,7 +103,7 @@ pub struct AgentRunContext {
     pub terminate: bool,
 }
 
-impl AgentRunContext {
+impl AgentContext {
     pub fn new(messages: Vec<ChatMessage>, is_streaming: bool) -> Self {
         Self {
             messages,
@@ -160,7 +160,7 @@ impl FunctionInvocationContext {
 }
 
 /// Convenience type aliases for each middleware category.
-pub type AgentMiddleware = dyn Middleware<AgentRunContext>;
+pub type AgentMiddleware = dyn Middleware<AgentContext>;
 /// Chat middleware operates on a [`ChatContext`].
 pub type ChatMiddleware = dyn Middleware<ChatContext>;
 /// Function middleware operates on a [`FunctionInvocationContext`].

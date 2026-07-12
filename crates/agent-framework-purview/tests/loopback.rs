@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_framework_core::middleware::{AgentRunContext, MiddlewarePipeline, Terminal};
+use agent_framework_core::middleware::{AgentContext, MiddlewarePipeline, Terminal};
 use agent_framework_core::tools::BoxFuture;
 use agent_framework_core::types::{AgentRunResponse, ChatMessage};
 use agent_framework_purview::{
@@ -167,8 +167,8 @@ fn user_message() -> ChatMessage {
     m
 }
 
-fn terminal_returning(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentRunContext> {
-    Box::new(move |mut ctx: AgentRunContext| {
+fn terminal_returning(called: Arc<AtomicBool>, text: &'static str) -> Terminal<AgentContext> {
+    Box::new(move |mut ctx: AgentContext| {
         called.store(true, Ordering::SeqCst);
         Box::pin(async move {
             ctx.result = Some(AgentRunResponse {
@@ -176,7 +176,7 @@ fn terminal_returning(called: Arc<AtomicBool>, text: &'static str) -> Terminal<A
                 ..Default::default()
             });
             Ok(ctx)
-        }) as BoxFuture<agent_framework_core::error::Result<AgentRunContext>>
+        }) as BoxFuture<agent_framework_core::error::Result<AgentContext>>
     })
 }
 
@@ -195,7 +195,7 @@ async fn allow_end_to_end_both_directions_pass() {
     );
     let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
     let called = Arc::new(AtomicBool::new(false));
-    let ctx = AgentRunContext::new(vec![user_message()], false);
+    let ctx = AgentContext::new(vec![user_message()], false);
 
     let result_ctx = pipeline
         .execute(
@@ -272,7 +272,7 @@ async fn block_on_prompt_short_circuits_before_next_and_before_any_response_chec
     );
     let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
     let called = Arc::new(AtomicBool::new(false));
-    let ctx = AgentRunContext::new(vec![user_message()], false);
+    let ctx = AgentContext::new(vec![user_message()], false);
 
     let result_ctx = pipeline
         .execute(
@@ -322,7 +322,7 @@ async fn block_on_response_replaces_result_without_terminating() {
     );
     let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
     let called = Arc::new(AtomicBool::new(false));
-    let ctx = AgentRunContext::new(vec![user_message()], false);
+    let ctx = AgentContext::new(vec![user_message()], false);
 
     let result_ctx = pipeline
         .execute(
@@ -367,7 +367,7 @@ async fn non_success_status_surfaces_as_service_error_and_stops_the_pipeline() {
     );
     let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
     let called = Arc::new(AtomicBool::new(false));
-    let ctx = AgentRunContext::new(vec![user_message()], false);
+    let ctx = AgentContext::new(vec![user_message()], false);
 
     let result = pipeline
         .execute(ctx, terminal_returning(called.clone(), "unreachable"))
