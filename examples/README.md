@@ -84,6 +84,10 @@ Studio.
 | `ollama` | `OllamaChatClient` against a local/remote Ollama server's OpenAI-compatible endpoint | `OLLAMA_HOST` (skips gracefully) |
 | `gemini` | `GeminiChatClient`: Google Gemini's `generateContent` REST API | `GEMINI_API_KEY` or `GOOGLE_API_KEY` (skips gracefully) |
 | `mistral` | `MistralChatClient`: Mistral AI's Chat Completions API | `MISTRAL_API_KEY` (skips gracefully) |
+| `bedrock` | `BedrockChatClient`: AWS Bedrock Converse API, SigV4-signed | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (skips gracefully) |
+| `github_copilot` | `GitHubCopilotChatClient`: GitHub Copilot's chat API (GitHub→Copilot token exchange) | `GITHUB_COPILOT_TOKEN` or `GH_COPILOT_TOKEN` (skips gracefully) |
+| `foundry_local` | `FoundryLocalChatClient`: Microsoft Foundry Local's on-device OpenAI-compatible endpoint | `FOUNDRY_LOCAL_ENDPOINT` (skips gracefully) |
+| `anthropic_multicloud` | Claude via `AnthropicBedrockClient` / `AnthropicVertexClient` (multi-cloud transports in the `anthropic` crate) | AWS creds or `GOOGLE_CLOUD_PROJECT` + `GOOGLE_ACCESS_TOKEN` (skips gracefully) |
 | `azure_openai` | Azure OpenAI with both api-key and Entra ID (`TokenCredential`) auth | `AZURE_OPENAI_*` |
 | `azure_openai_responses` | `AzureOpenAIResponsesClient`: the Responses API on Azure OpenAI | `AZURE_OPENAI_*` (skips gracefully) |
 | `azure_default_credential` | `DefaultAzureCredential`'s four-link Entra ID credential chain | `AZURE_OPENAI_ENDPOINT` (+ `az login`; skips gracefully) |

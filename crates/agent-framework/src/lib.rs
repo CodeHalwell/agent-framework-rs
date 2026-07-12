@@ -140,7 +140,9 @@ pub mod prelude {
     pub use agent_framework_openai::{OpenAIChatClient, OpenAIChatCompletionClient};
 
     #[cfg(feature = "anthropic")]
-    pub use agent_framework_anthropic::AnthropicClient;
+    pub use agent_framework_anthropic::{
+        AnthropicBedrockClient, AnthropicClient, AnthropicFoundryClient, AnthropicVertexClient,
+    };
 
     #[cfg(feature = "ollama")]
     pub use agent_framework_ollama::OllamaChatClient;
@@ -150,6 +152,15 @@ pub mod prelude {
 
     #[cfg(feature = "mistral")]
     pub use agent_framework_mistral::MistralChatClient;
+
+    #[cfg(feature = "foundry-local")]
+    pub use agent_framework_foundry_local::FoundryLocalChatClient;
+
+    #[cfg(feature = "bedrock")]
+    pub use agent_framework_bedrock::BedrockChatClient;
+
+    #[cfg(feature = "github-copilot")]
+    pub use agent_framework_github_copilot::GitHubCopilotChatClient;
 
     #[cfg(feature = "azure")]
     pub use agent_framework_azure::{AzureOpenAIClient, StaticTokenCredential, TokenCredential};

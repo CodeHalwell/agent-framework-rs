@@ -114,6 +114,22 @@ name = "mistral"
 path = "providers/mistral.rs"
 
 [[example]]
+name = "foundry_local"
+path = "providers/foundry_local.rs"
+
+[[example]]
+name = "bedrock"
+path = "providers/bedrock.rs"
+
+[[example]]
+name = "github_copilot"
+path = "providers/github_copilot.rs"
+
+[[example]]
+name = "anthropic_multicloud"
+path = "providers/anthropic_multicloud.rs"
+
+[[example]]
 name = "azure_openai"
 path = "providers/azure_openai.rs"
 
