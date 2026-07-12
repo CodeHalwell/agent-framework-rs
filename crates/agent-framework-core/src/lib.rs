@@ -13,6 +13,8 @@
 //! - [`memory`] — context / memory providers.
 //! - [`middleware`] — agent, chat, and function middleware pipelines.
 //! - [`observability`] — OpenTelemetry GenAI-style `tracing` instrumentation.
+//! - [`settings`] — secret-masking [`SecretString`](settings::SecretString)
+//!   and precedence-based setting resolution.
 //! - [`workflow`] — graph-based multi-agent workflow orchestration.
 //!
 //! ## Example
@@ -37,6 +39,7 @@ pub mod error;
 pub mod memory;
 pub mod middleware;
 pub mod observability;
+pub mod settings;
 pub mod streaming;
 pub mod threads;
 pub mod tools;
@@ -61,6 +64,7 @@ pub mod prelude {
         Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
+    pub use crate::settings::{load_setting, SecretString};
     pub use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
     pub use crate::tools::{
         hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, AiFunction,
