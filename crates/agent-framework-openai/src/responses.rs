@@ -349,6 +349,16 @@ pub fn messages_to_input(messages: &[ChatMessage]) -> Vec<Value> {
                         "arguments": function_arguments_to_string(&r.function_call.arguments),
                     }));
                 }
+                Content::TextReasoning(tr) => {
+                    // Re-emit the original reasoning item verbatim (store:false
+                    // replay). A summary-only reasoning content with no
+                    // preserved item has no valid input form (it lacks the
+                    // required id/encrypted_content), so it is dropped.
+                    if let Some(raw) = &tr.raw_representation {
+                        flush_text(&mut out, &mut buffered, role);
+                        out.push(raw.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -683,14 +693,38 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
             )));
         }
         Some("reasoning") => {
-            if let Some(summary) = item.get("summary").and_then(Value::as_array) {
-                for s in summary {
-                    if let Some(text) = s.get("text").and_then(Value::as_str) {
-                        contents.push(Content::TextReasoning(TextReasoningContent {
-                            text: text.to_string(),
-                            annotations: None,
-                        }));
-                    }
+            let summaries: Vec<String> = item
+                .get("summary")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.get("text").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Preserve the raw reasoning item so a store:false tool-loop replay
+            // can re-send it verbatim — reasoning models require the original
+            // item (id + encrypted_content), not just the summary, on the
+            // follow-up turn. `messages_to_input` re-emits it from
+            // `raw_representation`; it is attached to exactly one content so a
+            // multi-summary item yields exactly one reasoning input item.
+            let raw = Some(item.clone());
+            if summaries.is_empty() {
+                // No summary (e.g. encrypted reasoning) — still carry the item.
+                contents.push(Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    annotations: None,
+                    raw_representation: raw,
+                }));
+            } else {
+                let n = summaries.len();
+                for (i, text) in summaries.into_iter().enumerate() {
+                    contents.push(Content::TextReasoning(TextReasoningContent {
+                        text,
+                        annotations: None,
+                        raw_representation: (i == n - 1).then(|| raw.clone()).flatten(),
+                    }));
                 }
             }
         }
@@ -993,6 +1027,7 @@ fn reasoning_update(text: &str) -> EventOutcome {
         contents: vec![Content::TextReasoning(TextReasoningContent {
             text: text.to_string(),
             annotations: None,
+            ..Default::default()
         })],
         role: Some(Role::assistant()),
         ..Default::default()
@@ -1446,6 +1481,74 @@ mod tests {
         let contents = &resp.messages[0].contents;
         assert!(matches!(&contents[0], Content::TextReasoning(t) if t.text == "thinking..."));
         assert!(matches!(&contents[1], Content::Text(t) if t.text == "done"));
+    }
+
+    #[test]
+    fn reasoning_item_round_trips_through_input_for_store_false_replay() {
+        // A store:false tool-loop replay must re-send the original reasoning
+        // item (id + encrypted_content), not just its summary text.
+        let reasoning_item = json!({
+            "type": "reasoning",
+            "id": "rs_abc",
+            "encrypted_content": "ENC",
+            "summary": [{ "type": "summary_text", "text": "thinking..." }],
+        });
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                reasoning_item,
+                { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" },
+            ],
+        });
+        let resp = parse_response(&value, Some(false));
+        // The parsed reasoning content preserves the raw item.
+        let reasoning = resp.messages[0]
+            .contents
+            .iter()
+            .find_map(|c| match c {
+                Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .expect("reasoning content");
+        assert_eq!(
+            reasoning.raw_representation.as_ref().unwrap()["id"],
+            "rs_abc"
+        );
+
+        // Replaying that assistant message back through the input mapper
+        // re-emits the reasoning item verbatim, ahead of the function call.
+        let input = messages_to_input(&resp.messages);
+        let reasoning_pos = input
+            .iter()
+            .position(|i| i.get("type") == Some(&json!("reasoning")))
+            .expect("reasoning item re-emitted");
+        assert_eq!(input[reasoning_pos]["id"], "rs_abc");
+        assert_eq!(input[reasoning_pos]["encrypted_content"], "ENC");
+        let call_pos = input
+            .iter()
+            .position(|i| i.get("type") == Some(&json!("function_call")))
+            .expect("function call present");
+        assert!(reasoning_pos < call_pos, "reasoning must precede the call");
+    }
+
+    #[test]
+    fn summary_only_reasoning_is_not_re_emitted_as_input() {
+        // A reasoning content with no preserved raw item (e.g. from streaming
+        // display) has no valid input form and must be dropped, not sent as a
+        // bogus reasoning item lacking id/encrypted_content.
+        let msg = ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::TextReasoning(TextReasoningContent {
+                text: "just display".into(),
+                annotations: None,
+                raw_representation: None,
+            })],
+        );
+        let input = messages_to_input(&[msg]);
+        assert!(input
+            .iter()
+            .all(|i| i.get("type") != Some(&json!("reasoning"))));
     }
 
     // endregion

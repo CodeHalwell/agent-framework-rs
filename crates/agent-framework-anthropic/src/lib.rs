@@ -520,6 +520,7 @@ fn parse_stream_event(
                         .unwrap_or_default()
                         .to_string(),
                     annotations: None,
+                    ..Default::default()
                 }),
                 "input_json_delta" => {
                     let call_id = tool_use_ids.get(&index).cloned().unwrap_or_default();

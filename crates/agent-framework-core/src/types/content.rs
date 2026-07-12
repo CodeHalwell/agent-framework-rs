@@ -105,6 +105,13 @@ pub struct TextReasoningContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotations: Option<Vec<CitationAnnotation>>,
+    /// The raw provider reasoning item this was decoded from, when it must be
+    /// replayed verbatim. Reasoning models (OpenAI Responses with
+    /// `store: false`) require the original reasoning item — id and encrypted
+    /// content, not just the summary — on the follow-up tool-call turn; the
+    /// Responses input mapper re-emits it from here. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_representation: Option<Value>,
 }
 
 /// Inline binary data encoded as a `data:` URI.

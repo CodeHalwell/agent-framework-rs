@@ -465,6 +465,7 @@ mod tests {
             Content::TextReasoning(TextReasoningContent {
                 text: "secret".into(),
                 annotations: None,
+                ..Default::default()
             }),
         ]);
         assert_eq!(

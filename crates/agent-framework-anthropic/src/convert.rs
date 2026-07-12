@@ -647,6 +647,7 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                         .unwrap_or_default()
                         .to_string(),
                     annotations: None,
+                    ..Default::default()
                 }));
             }
             other => {

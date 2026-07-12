@@ -366,7 +366,7 @@ fn stream_event_to_updates(
             )
         }
     };
-    updates
+    let mut updates: Vec<Result<AgentRunResponseUpdate>> = updates
         .into_iter()
         .map(|u| {
             u.map(|mut update| {
@@ -374,7 +374,29 @@ fn stream_event_to_updates(
                 update
             })
         })
-        .collect()
+        .collect();
+
+    // A task-bearing event can carry no message content — a status-only
+    // transition, or a `Task` with no history/artifacts. Surface one
+    // metadata-only update so aggregating the stream still exposes the task id
+    // for polling/cancellation (the non-streaming `run()` likewise returns the
+    // task id even when the task carries no messages). Bare `Message` events
+    // are not task-bearing and get no such fallback.
+    let is_task_bearing = matches!(
+        event,
+        MessageStreamEvent::Task(_)
+            | MessageStreamEvent::StatusUpdate(_)
+            | MessageStreamEvent::ArtifactUpdate(_)
+    );
+    if updates.is_empty() && is_task_bearing {
+        if let Some(id) = response_id {
+            updates.push(Ok(AgentRunResponseUpdate {
+                response_id: Some(id),
+                ..Default::default()
+            }));
+        }
+    }
+    updates
 }
 
 fn wrap_message(
@@ -1159,7 +1181,12 @@ mod tests {
             metadata: None,
         });
         let updates = stream_event_to_updates(&ev, &mut state, None);
-        assert!(updates.is_empty(), "no status message → no update");
+        // A status-only transition still surfaces the task id via one
+        // metadata-only update, so aggregation can poll/cancel the task.
+        assert_eq!(updates.len(), 1);
+        let u = updates.into_iter().next().unwrap().unwrap();
+        assert!(u.contents.is_empty());
+        assert_eq!(u.response_id.as_deref(), Some("t3"));
         assert_eq!(state.task_id.as_deref(), Some("t3"));
     }
 
