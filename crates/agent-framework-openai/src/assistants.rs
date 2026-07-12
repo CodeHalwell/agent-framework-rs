@@ -354,7 +354,7 @@ impl OpenAIAssistantsClient {
             return Ok(None);
         };
         let status = run.get("status").and_then(Value::as_str).unwrap_or("");
-        if matches!(status, "completed" | "cancelled" | "failed" | "expired") {
+        if is_terminal_run_status(status) {
             return Ok(None);
         }
         Ok(Some(ActiveRun {
@@ -945,6 +945,18 @@ enum EventOutcome {
     None,
 }
 
+/// Whether an Assistants run `status` is terminal — a run that can no longer be
+/// cancelled, so a new run may be started on the thread. `incomplete` (e.g. a
+/// run that hit a token limit) is terminal alongside the obvious ones: trying
+/// to cancel it before starting a new run fails with an API error and makes an
+/// otherwise-recoverable thread unusable.
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "cancelled" | "failed" | "expired" | "incomplete"
+    )
+}
+
 /// Map one Assistants SSE event to updates, an error, or nothing, mirroring the
 /// event set Python's `_process_stream_events` handles
 /// (`_assistants_client.py:302-372`).
@@ -1187,6 +1199,19 @@ mod tests {
     // endregion
 
     // region: prepare_options -> run body
+
+    #[test]
+    fn incomplete_run_status_is_terminal() {
+        // A run that hit a token limit must not be treated as active, or the
+        // next request would try to cancel an already-terminal run.
+        assert!(is_terminal_run_status("incomplete"));
+        for s in ["completed", "cancelled", "failed", "expired"] {
+            assert!(is_terminal_run_status(s));
+        }
+        for s in ["queued", "in_progress", "requires_action", "cancelling"] {
+            assert!(!is_terminal_run_status(s));
+        }
+    }
 
     #[test]
     fn prepare_options_maps_scalars() {

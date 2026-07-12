@@ -533,6 +533,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
                 // Record the assistant message(s) that requested the calls.
                 carried.extend(response.messages.iter().cloned());
+                let response_conversation_id = response.conversation_id.clone();
 
                 // Execute all calls concurrently: the model may emit several
                 // parallel tool calls, and I/O-bound tools should not be serialized.
@@ -574,8 +575,26 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
                 let tool_message = ChatMessage::with_contents(Role::tool(), result_contents);
                 carried.push(tool_message.clone());
-                conversation.extend(response.messages);
-                conversation.push(tool_message);
+                match response_conversation_id {
+                    // A service-managed client that created (or continued) the
+                    // conversation now holds the history server-side. Propagate
+                    // its id so the follow-up tool-output submission targets the
+                    // right thread — without this, Assistants / Azure AI reject
+                    // the submission because `conversation_id` is still `None` —
+                    // and send ONLY the new tool results next turn rather than
+                    // re-sending the whole history (mirrors Python
+                    // `_tools.py:1635-1637, 1695-1699`).
+                    Some(cid) => {
+                        options.conversation_id = Some(cid);
+                        conversation = vec![tool_message];
+                    }
+                    // Stateless client (e.g. Chat Completions): accumulate and
+                    // re-send the full history each turn.
+                    None => {
+                        conversation.extend(response.messages);
+                        conversation.push(tool_message);
+                    }
+                }
             }
 
             // Failsafe: one final call with tools disabled.

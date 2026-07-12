@@ -33,6 +33,14 @@ impl MockClient {
     fn last_options(&self) -> Option<ChatOptions> {
         self.seen_options.lock().unwrap().last().cloned()
     }
+    /// Every call's `ChatOptions`, in order.
+    fn all_options(&self) -> Vec<ChatOptions> {
+        self.seen_options.lock().unwrap().clone()
+    }
+    /// Every call's message list, in order.
+    fn all_seen(&self) -> Vec<Vec<ChatMessage>> {
+        self.seen.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -589,6 +597,60 @@ async fn middleware_stream_replay_preserves_conversation_id_and_usage() {
             .expect("usage survives")
             .output_token_count,
         Some(3)
+    );
+}
+
+#[tokio::test]
+async fn service_created_conversation_id_propagates_into_tool_followup() {
+    // A service-managed client creates the thread on the first tool-call turn
+    // and returns its conversation_id. The follow-up submission (carrying the
+    // FunctionResultContent) must target that thread, and — since the service
+    // now holds the history — send only the new tool results.
+    let call =
+        FunctionCallContent::new("call_1", "noop", Some(FunctionArguments::Raw("{}".into())));
+    let first = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        conversation_id: Some("thread_new".into()),
+        ..Default::default()
+    };
+    let second = ChatResponse::from_text("done");
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("ok")) },
+    )
+    .into_definition();
+    let probe = MockClient::new(vec![first, second]);
+    let client = FunctionInvokingChatClient::new(probe.clone());
+
+    let options = ChatOptions {
+        tools: vec![noop],
+        ..Default::default()
+    };
+    let resp = client
+        .get_response(vec![ChatMessage::user("go")], options)
+        .await
+        .unwrap();
+    assert_eq!(resp.text(), "done");
+
+    let all_opts = probe.all_options();
+    assert_eq!(all_opts.len(), 2, "expected two underlying calls");
+    // First call had no conversation id; the follow-up carries the one the
+    // service created.
+    assert!(all_opts[0].conversation_id.is_none());
+    assert_eq!(all_opts[1].conversation_id.as_deref(), Some("thread_new"));
+
+    // The follow-up sends only the new tool results, not the re-accumulated
+    // history (the service holds it server-side).
+    let seen = probe.all_seen();
+    let followup = &seen[1];
+    assert!(
+        followup.iter().all(|m| m.role == Role::tool()),
+        "follow-up should carry only tool-result messages"
     );
 }
 
