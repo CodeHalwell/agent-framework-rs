@@ -9,6 +9,7 @@ members = [
     "crates/agent-framework-mistral",
     "crates/agent-framework-foundry-local",
     "crates/agent-framework-bedrock",
+    "crates/agent-framework-github-copilot",
     "crates/agent-framework-azure",
     "crates/agent-framework-mcp",
     "crates/agent-framework-a2a",
@@ -65,6 +66,7 @@ agent-framework-gemini = { path = "crates/agent-framework-gemini", version = "0.
 agent-framework-mistral = { path = "crates/agent-framework-mistral", version = "0.1.0" }
 agent-framework-foundry-local = { path = "crates/agent-framework-foundry-local", version = "0.1.0" }
 agent-framework-bedrock = { path = "crates/agent-framework-bedrock", version = "0.1.0" }
+agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot", version = "0.1.0" }
 agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.1.0" }
 agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.1.0" }
 agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.1.0" }

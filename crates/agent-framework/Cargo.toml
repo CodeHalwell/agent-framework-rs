@@ -17,6 +17,7 @@ gemini = ["dep:agent-framework-gemini"]
 mistral = ["dep:agent-framework-mistral"]
 foundry-local = ["dep:agent-framework-foundry-local"]
 bedrock = ["dep:agent-framework-bedrock"]
+github-copilot = ["dep:agent-framework-github-copilot"]
 azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
@@ -41,6 +42,7 @@ full = [
     "mistral",
     "foundry-local",
     "bedrock",
+    "github-copilot",
     "azure",
     "mcp",
     "a2a",
@@ -64,6 +66,7 @@ agent-framework-gemini = { workspace = true, optional = true }
 agent-framework-mistral = { workspace = true, optional = true }
 agent-framework-foundry-local = { workspace = true, optional = true }
 agent-framework-bedrock = { workspace = true, optional = true }
+agent-framework-github-copilot = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
 agent-framework-a2a = { workspace = true, optional = true }

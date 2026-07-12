@@ -44,6 +44,12 @@ green) before commit.
   GroupChat/Magentic builders.
 - Async edge conditions (`should_route`) with a backward-compatible sync API +
   `EdgeGroup::has_condition`.
+- **Handoff mesh topology**: `add_handoff(src).to(targets)` edges are now
+  enforced per-source (previously the adjacency map was built but discarded, so
+  every agent could reach every other). A source is restricted to its declared
+  outgoing edges; a source with no edges (when any edge is declared) is a leaf
+  that cannot initiate a handoff; an empty map preserves the full-mesh
+  back-compat. Rejected targets reuse the existing unknown-target feedback path.
 
 ### Providers & hosting (§13/§14)
 
@@ -51,9 +57,11 @@ green) before commit.
   (`OpenAIChatClient`=Responses, `OpenAIChatCompletionClient`=Chat Completions).
 - New provider crates: **ollama**, **gemini**, **mistral**, **foundry-local**
   (Microsoft Foundry Local's OpenAI-compatible localhost endpoint; reuses
-  `agent_framework_openai::convert`), and **bedrock** (AWS Bedrock Converse
+  `agent_framework_openai::convert`), **bedrock** (AWS Bedrock Converse
   API with a dependency-free **SigV4** signer verified against AWS's published
-  `get-vanilla` known-answer test vector) — full `ChatClient` impls, wired into
+  `get-vanilla` known-answer test vector), and **github-copilot**
+  (OpenAI-compatible chat endpoint behind the GitHub→Copilot short-lived-token
+  exchange, with token caching/refresh) — full `ChatClient` impls, wired into
   the umbrella crate + examples.
 - `CosmosCheckpointStorage`; DevUI security middleware (Host-header
   anti-DNS-rebinding guard + optional bearer auth, opt-in).
@@ -79,9 +87,9 @@ Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
    API (`FoundryAgent`/`to_prompt_agent`); Anthropic multi-cloud
    (Bedrock/Vertex/Foundry); Azure "routing mode" realignment; remaining new
    provider crates (claude, github-copilot).
-4. **Orchestration depth (§12)** — shared post-agent `AgentApprovalExecutor`
-   HITL (iterate-until-approved); terminal output shape (`AgentResponse` vs
-   transcript); Handoff mesh-topology rebuild.
+4. **Orchestration depth (§12)** — terminal output shape (`AgentResponse` vs
+   transcript). (`AgentApprovalExecutor` HITL and Handoff mesh-topology are
+   done.)
 5. **Hosting/DevUI (§14)** — remaining ~17 DevUI routes; Responses-conversion
    extraction; A2A server move.
 6. **Large ecosystem packages** — `durabletask`; the declarative-workflow

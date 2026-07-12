@@ -167,12 +167,43 @@ fn target_from_call(call: &FunctionCallContent) -> Option<String> {
     None
 }
 
+/// Whether `source` is permitted to hand off to `target` under the declared
+/// mesh edges. Rust analogue of the per-source target check upstream applies
+/// while building the active agent's handoff tool list.
+///
+/// Mesh topology rules (documented, not just implemented):
+/// - If `handoff_map` is **empty** (no `add_handoff(..).to(..)` edges were
+///   declared at all), every participant may hand off to every other
+///   participant — this preserves the pre-mesh full-mesh behavior so callers
+///   that never call `add_handoff` are unaffected.
+/// - If `handoff_map` is **non-empty**, it is authoritative: a source with a
+///   declared entry may hand off *only* to the targets listed for it, and a
+///   source with **no** entry in a non-empty map is a leaf — it has no
+///   outgoing edges and cannot initiate a handoff at all.
+fn is_permitted_target(
+    source: &str,
+    target: &str,
+    handoff_map: &HashMap<String, Vec<String>>,
+) -> bool {
+    if handoff_map.is_empty() {
+        return true;
+    }
+    match handoff_map.get(source) {
+        Some(targets) => targets.iter().any(|t| t == target),
+        None => false,
+    }
+}
+
 impl HandoffResolution {
-    /// Detect a handoff from an agent response. The first handoff-shaped call
-    /// wins; additional ones are warned about (Python: "first wins, warn").
+    /// Detect a handoff from an agent response, validating the target against
+    /// `source`'s declared outgoing edges (see [`is_permitted_target`]). The
+    /// first handoff-shaped call wins; additional ones are warned about
+    /// (Python: "first wins, warn").
     fn detect(
         response: &crate::types::AgentResponse,
+        source: &str,
         tool_targets: &HashMap<String, String>,
+        handoff_map: &HashMap<String, Vec<String>>,
     ) -> HandoffResolution {
         let mut calls: Vec<FunctionCallContent> = Vec::new();
         for msg in &response.messages {
@@ -199,11 +230,16 @@ impl HandoffResolution {
         }
         let (candidate, call) = handoff_calls.remove(0);
         match tool_targets.get(&candidate.to_lowercase()) {
-            Some(target) => HandoffResolution::Known {
-                target: target.clone(),
-                call,
-            },
-            None => HandoffResolution::Unknown {
+            Some(target) if is_permitted_target(source, target, handoff_map) => {
+                HandoffResolution::Known {
+                    target: target.clone(),
+                    call,
+                }
+            }
+            // Either not a registered participant at all, or resolved but not
+            // among `source`'s declared targets: both are rejected the same
+            // way (fed back to the agent as an unknown-target error).
+            _ => HandoffResolution::Unknown {
                 name: candidate,
                 call,
             },
@@ -303,6 +339,9 @@ struct HandoffCoordinator {
     agents: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     initial_agent: String,
     tool_targets: HashMap<String, String>,
+    /// Declared mesh edges (source participant name -> allowed target
+    /// participant names). Empty means full mesh; see [`is_permitted_target`].
+    handoff_map: HashMap<String, Vec<String>>,
     interaction_mode: HandoffInteractionMode,
     turn_limit: usize,
     termination: TerminationCondition,
@@ -384,7 +423,12 @@ impl HandoffCoordinator {
                 run_agent_and_emit(agent, conversation.clone(), &self.id, &current, ctx).await?;
             conversation.extend(response.messages.clone());
 
-            match HandoffResolution::detect(&response, &self.tool_targets) {
+            match HandoffResolution::detect(
+                &response,
+                &current,
+                &self.tool_targets,
+                &self.handoff_map,
+            ) {
                 HandoffResolution::Known { target, call } => {
                     Self::append_tool_ack(&mut conversation, &call, &target);
                     current = target;
@@ -465,6 +509,14 @@ pub struct HandoffEdgeBuilder {
 
 impl HandoffEdgeBuilder {
     /// Complete the edge: `source` may hand off to each of `targets`.
+    ///
+    /// Declaring *any* edge switches the whole workflow from full-mesh (every
+    /// participant reachable from every other, the default when no edges are
+    /// declared at all) into restricted mesh mode: from then on, a source
+    /// with declared edges may hand off only to its declared targets, and a
+    /// source with no declared edges is a leaf that cannot hand off at all.
+    /// See [`HandoffBuilder::build`] and `is_permitted_target` for the exact
+    /// rule.
     pub fn to<I, S>(mut self, targets: I) -> HandoffBuilder
     where
         I: IntoIterator<Item = S>,
@@ -501,6 +553,12 @@ impl HandoffEdgeBuilder {
 pub struct HandoffBuilder {
     participants: Vec<(String, Arc<dyn SupportsAgentRun>)>,
     initial_agent: Option<String>,
+    /// Declared mesh edges: source participant name -> allowed target
+    /// participant names, accumulated by `add_handoff(source).to([targets])`.
+    /// Consumed by [`HandoffBuilder::build`]; see [`is_permitted_target`] for
+    /// the enforcement rule (empty map = full mesh; non-empty map = each
+    /// source restricted to exactly its declared targets, and sources with no
+    /// entry are leaves that cannot hand off).
     handoff_map: HashMap<String, Vec<String>>,
     interaction_mode: HandoffInteractionMode,
     turn_limit: usize,
@@ -632,8 +690,10 @@ impl HandoffBuilder {
             )));
         }
 
-        // Build the resolution table: any registered participant is a valid
-        // handoff target, addressable by name or `handoff_to_<name>`.
+        // Build the name-resolution table: any registered participant is
+        // addressable by name or `handoff_to_<name>`. Whether a resolved
+        // target is actually *permitted* for the currently active source is
+        // enforced separately via `handoff_map` (see `is_permitted_target`).
         let mut tool_targets: HashMap<String, String> = HashMap::new();
         for (name, _) in &self.participants {
             let sanitized = sanitize_identifier(name);
@@ -642,11 +702,32 @@ impl HandoffBuilder {
             tool_targets.insert(name.to_lowercase(), name.clone());
         }
 
+        // Validate the declared mesh edges: every source and target named via
+        // `add_handoff(source).to([targets])` must be a registered
+        // participant.
+        let participant_names: std::collections::HashSet<&str> =
+            self.participants.iter().map(|(n, _)| n.as_str()).collect();
+        for (source, targets) in &self.handoff_map {
+            if !participant_names.contains(source.as_str()) {
+                return Err(Error::Workflow(format!(
+                    "handoff source '{source}' is not a registered participant"
+                )));
+            }
+            for target in targets {
+                if !participant_names.contains(target.as_str()) {
+                    return Err(Error::Workflow(format!(
+                        "handoff target '{target}' (declared from '{source}') is not a registered participant"
+                    )));
+                }
+            }
+        }
+
         let coordinator = HandoffCoordinator {
             id: "handoff_coordinator".to_string(),
             agents: self.participants,
             initial_agent,
             tool_targets,
+            handoff_map: self.handoff_map,
             interaction_mode: self.interaction_mode,
             turn_limit: self.turn_limit,
             termination: self
@@ -664,5 +745,95 @@ impl HandoffBuilder {
             builder = builder.name(name);
         }
         builder.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Empty `handoff_map` means full mesh: any source may reach any target,
+    /// matching pre-mesh-enforcement behavior for callers that never declare
+    /// edges.
+    #[test]
+    fn is_permitted_target_full_mesh_when_map_empty() {
+        let map: HashMap<String, Vec<String>> = HashMap::new();
+        assert!(is_permitted_target("triage", "billing", &map));
+        assert!(is_permitted_target("anyone", "anything", &map));
+    }
+
+    /// A source with declared edges is restricted to exactly those targets.
+    #[test]
+    fn is_permitted_target_restricts_to_declared_edges() {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        map.insert(
+            "triage".to_string(),
+            vec!["billing".to_string(), "refunds".to_string()],
+        );
+        assert!(is_permitted_target("triage", "billing", &map));
+        assert!(is_permitted_target("triage", "refunds", &map));
+        assert!(!is_permitted_target("triage", "shipping", &map));
+    }
+
+    /// Once the map is non-empty, a source with no declared entry is a leaf:
+    /// it has no outgoing edges and cannot initiate any handoff.
+    #[test]
+    fn is_permitted_target_leaf_source_cannot_handoff() {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        map.insert("triage".to_string(), vec!["billing".to_string()]);
+        // "billing" has no declared outgoing edges of its own.
+        assert!(!is_permitted_target("billing", "triage", &map));
+        assert!(!is_permitted_target("billing", "refunds", &map));
+    }
+
+    /// A dummy participant whose `run` is never invoked: `build()` fails
+    /// before any agent would run, so the body only needs to type-check.
+    struct Noop;
+
+    #[async_trait]
+    impl SupportsAgentRun for Noop {
+        async fn run(
+            &self,
+            _messages: Vec<Message>,
+            _session: Option<&mut crate::session::AgentSession>,
+        ) -> Result<crate::types::AgentResponse> {
+            unimplemented!("not exercised by this test")
+        }
+
+        fn id(&self) -> &str {
+            "noop"
+        }
+    }
+
+    /// `build()` rejects an edge whose source is not a registered participant.
+    #[test]
+    fn build_rejects_unknown_edge_source() {
+        let result = HandoffBuilder::new()
+            .participant("triage", Arc::new(Noop) as Arc<dyn SupportsAgentRun>)
+            .initial_agent("triage")
+            .add_handoff("ghost")
+            .to(["triage"])
+            .autonomous()
+            .build();
+        assert!(
+            result.is_err(),
+            "unregistered edge source must fail build()"
+        );
+    }
+
+    /// `build()` rejects an edge whose target is not a registered participant.
+    #[test]
+    fn build_rejects_unknown_edge_target() {
+        let result = HandoffBuilder::new()
+            .participant("triage", Arc::new(Noop) as Arc<dyn SupportsAgentRun>)
+            .initial_agent("triage")
+            .add_handoff("triage")
+            .to(["ghost"])
+            .autonomous()
+            .build();
+        assert!(
+            result.is_err(),
+            "unregistered edge target must fail build()"
+        );
     }
 }
