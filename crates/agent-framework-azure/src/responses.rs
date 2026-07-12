@@ -119,7 +119,7 @@ struct Inner {
     /// `base_url` parameter), taking precedence over `endpoint` when set.
     base_url: Option<String>,
     deployment: String,
-    api_version: String,
+    api_version: Option<String>,
     auth: Auth,
 }
 
@@ -163,7 +163,7 @@ impl AzureOpenAIResponsesClient {
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::ApiKey(api_key.into()),
             }),
         }
@@ -182,7 +182,7 @@ impl AzureOpenAIResponsesClient {
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::Credential(credential),
             }),
         }
@@ -222,8 +222,12 @@ impl AzureOpenAIResponsesClient {
             Error::Configuration("AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME is not set".into())
         })?;
         let mut client = Self::new(endpoint, deployment, api_key);
-        if let Some(v) = get("AZURE_OPENAI_API_VERSION") {
-            client = client.with_api_version(v);
+        match get("AZURE_OPENAI_API_VERSION") {
+            // Empty string opts out of the query parameter entirely (GA v1 /
+            // gateway targets); see `without_api_version`.
+            Some(v) if v.is_empty() => client = client.without_api_version(),
+            Some(v) => client = client.with_api_version(v),
+            None => {}
         }
         if let Some(b) = get("AZURE_OPENAI_BASE_URL") {
             client = client.with_base_url(b);
@@ -233,7 +237,23 @@ impl AzureOpenAIResponsesClient {
 
     /// Override the API version (default `"preview"`).
     pub fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
-        Arc::make_mut(&mut self.inner).api_version = api_version.into();
+        Arc::make_mut(&mut self.inner).api_version = Some(api_version.into());
+        self
+    }
+
+    /// Send no `api-version` query parameter at all.
+    ///
+    /// Microsoft's v1 Responses examples call the bare
+    /// `{endpoint}/openai/v1/responses` URL, and the v1 lifecycle removes
+    /// dated api-version parameters — GA v1 resources and some
+    /// OpenAI-compatible gateways reject or misroute requests carrying one.
+    /// The `"preview"` default mirrors upstream Python
+    /// (`_responses_client.py:112`); use this to produce the documented
+    /// query-less URL instead. (Also reachable by setting the
+    /// `AZURE_OPENAI_API_VERSION` env var to an empty string with
+    /// [`from_env`](Self::from_env).)
+    pub fn without_api_version(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).api_version = None;
         self
     }
 
@@ -253,9 +273,10 @@ impl AzureOpenAIResponsesClient {
         &self.inner.deployment
     }
 
-    /// The API version this client sends.
-    pub fn api_version(&self) -> &str {
-        &self.inner.api_version
+    /// The API version this client sends, or `None` when the query
+    /// parameter is omitted (see [`without_api_version`](Self::without_api_version)).
+    pub fn api_version(&self) -> Option<&str> {
+        self.inner.api_version.as_deref()
     }
 
     /// The effective base URL requests are built against: the explicit
@@ -271,7 +292,10 @@ impl AzureOpenAIResponsesClient {
             Some(explicit) => explicit.trim_end_matches('/').to_string(),
             None => format!("{}/openai/v1", self.inner.endpoint.trim_end_matches('/')),
         };
-        format!("{base}/responses?api-version={}", self.inner.api_version)
+        match &self.inner.api_version {
+            Some(v) => format!("{base}/responses?api-version={v}"),
+            None => format!("{base}/responses"),
+        }
     }
 
     /// Build the Responses API request body, reusing conversion from
@@ -502,6 +526,39 @@ mod tests {
     }
 
     #[test]
+    fn without_api_version_omits_the_query_parameter() {
+        // GA v1 resources / OpenAI-compatible gateways use the documented
+        // bare URL with no api-version query.
+        let c = client().without_api_version();
+        assert_eq!(
+            c.url(),
+            "https://my-resource.openai.azure.com/openai/v1/responses"
+        );
+        assert_eq!(c.api_version(), None);
+
+        let gateway = client()
+            .with_base_url("https://gateway.example.com/openai/v1/")
+            .without_api_version();
+        assert_eq!(
+            gateway.url(),
+            "https://gateway.example.com/openai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn from_env_empty_api_version_opts_out_of_the_query() {
+        let c = AzureOpenAIResponsesClient::from_env_vars(|k| match k {
+            "AZURE_OPENAI_ENDPOINT" => Some("https://my-resource.openai.azure.com".into()),
+            "AZURE_OPENAI_API_KEY" => Some("key".into()),
+            "AZURE_OPENAI_RESPONSES_DEPLOYMENT_NAME" => Some("dep".into()),
+            "AZURE_OPENAI_API_VERSION" => Some(String::new()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(!c.url().contains("api-version"));
+    }
+
+    #[test]
     fn with_base_url_overrides_derived_route() {
         let c = client().with_base_url("https://gateway.example.com/openai/v1/");
         assert_eq!(
@@ -515,7 +572,7 @@ mod tests {
     fn accessors_report_configured_deployment_and_api_version() {
         let c = client();
         assert_eq!(c.deployment(), "my-gpt4o-deployment");
-        assert_eq!(c.api_version(), "preview");
+        assert_eq!(c.api_version(), Some("preview"));
         assert_eq!(c.model_id(), Some("my-gpt4o-deployment"));
         assert_eq!(c.base_url(), None);
     }
@@ -774,7 +831,10 @@ mod tests {
                 .unwrap();
         assert_eq!(client.inner.endpoint, "https://res.openai.azure.com");
         assert_eq!(client.inner.deployment, "gpt-4o-responses-deployment");
-        assert_eq!(client.inner.api_version, "2025-05-01-preview");
+        assert_eq!(
+            client.inner.api_version.as_deref(),
+            Some("2025-05-01-preview")
+        );
         assert_eq!(
             client.inner.base_url.as_deref(),
             Some("https://gateway.example.com/openai/v1/")
@@ -798,7 +858,10 @@ mod tests {
         let client =
             AzureOpenAIResponsesClient::from_env_vars(|k| vars.get(k).map(|v| v.to_string()))
                 .unwrap();
-        assert_eq!(client.inner.api_version, DEFAULT_API_VERSION);
+        assert_eq!(
+            client.inner.api_version.as_deref(),
+            Some(DEFAULT_API_VERSION)
+        );
         assert_eq!(client.inner.base_url, None);
     }
 

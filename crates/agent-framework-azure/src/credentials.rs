@@ -453,8 +453,18 @@ impl ManagedIdentityCredential {
             .or_else(|_| std::env::var("MSI_ENDPOINT"))
             .unwrap_or_else(|_| DEFAULT_IMDS_ENDPOINT.to_string());
         let identity_header = std::env::var("IDENTITY_HEADER").ok();
+        // IMDS / App Service MSI endpoints are link-local and answer within
+        // milliseconds when present. Bound the request so a machine with no
+        // managed identity (e.g. local dev) fails this chain link quickly,
+        // instead of stalling `DefaultAzureCredential` for the OS TCP
+        // timeout before it can fall through to `AzureCliCredential`.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             endpoint,
             client_id: None,
             identity_header,

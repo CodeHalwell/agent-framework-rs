@@ -1142,7 +1142,14 @@ fn parse_responses_event(
                 .and_then(Value::as_str)
                 .unwrap_or("response failed")
                 .to_string();
-            EventOutcome::Error(Error::service(msg))
+            // Same classification as the non-streaming `response_failure_error`
+            // so callers branching on content filters see one behavior for
+            // streamed and non-streamed Responses.
+            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
+            EventOutcome::Error(match code {
+                Some("content_filter") => Error::service_content_filter(msg),
+                _ => Error::service(msg),
+            })
         }
         // Recognized but carry no additional content: the arguments are
         // already fully accumulated via `.delta` events, and item/part
@@ -1603,6 +1610,38 @@ mod tests {
             saw_error,
             "expected a response.failed event to surface an error"
         );
+    }
+
+    #[test]
+    fn stream_failed_event_classifies_content_filter() {
+        // Streamed and non-streamed Responses failures must classify alike
+        // (mirrors `response_failure_error`).
+        let mut call_ids = HashMap::new();
+        let filtered = parse_responses_event(
+            &json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "content_filter", "message": "blocked" } }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = filtered else {
+            panic!("expected an error outcome");
+        };
+        assert!(matches!(err, Error::ServiceContentFilter { .. }));
+
+        let generic = parse_responses_event(
+            &json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "server_error", "message": "boom" } }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = generic else {
+            panic!("expected an error outcome");
+        };
+        assert!(matches!(err, Error::Service(_)));
     }
 
     // endregion
