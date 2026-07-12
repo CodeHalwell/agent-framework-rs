@@ -579,13 +579,22 @@ fn prepare_options(
         run_options.insert("parallel_tool_calls".into(), json!(allow));
     }
 
-    // Tools + tool_choice are only emitted when a tool_choice is set, and tool
-    // definitions are dropped entirely for `tool_choice = "none"` — matching the
-    // Python gate (`_assistants_client.py:404-435`).
-    if let Some(tool_choice) = &options.tool_choice {
+    // Tool definitions are emitted whenever tools are configured, dropped only
+    // for an explicit `tool_choice = "none"`; the `tool_choice` field itself is
+    // sent only when set (the service defaults to auto). Deliberate divergence
+    // from Python's gate (`_assistants_client.py:404-435`), which drops ALL
+    // tool definitions whenever `tool_choice` is unset: in this port a request
+    // can legitimately arrive with tools but no explicit choice — a direct
+    // client call, or `ChatAgent::run_stream` with only hosted /
+    // declaration-only tools, which bypasses the tool loop's default-to-auto
+    // (that default only applies when executable local tools exist) — and
+    // those runs must not silently lose their code-interpreter / file-search /
+    // function declarations.
+    {
+        let tool_choice = &options.tool_choice;
         let mut tool_defs: Vec<Value> = Vec::new();
         let mut tool_resources = Map::new();
-        if *tool_choice != ToolMode::None {
+        if *tool_choice != Some(ToolMode::None) {
             for tool in &options.tools {
                 match &tool.kind {
                     ToolKind::Function => tool_defs.push(tool.to_openai_spec()),
@@ -630,21 +639,22 @@ fn prepare_options(
             run_options.insert("tool_resources".into(), Value::Object(tool_resources));
         }
         match tool_choice {
-            ToolMode::None => {
+            Some(ToolMode::None) => {
                 run_options.insert("tool_choice".into(), json!("none"));
             }
-            ToolMode::Auto => {
+            Some(ToolMode::Auto) => {
                 run_options.insert("tool_choice".into(), json!("auto"));
             }
-            ToolMode::Required(Some(name)) => {
+            Some(ToolMode::Required(Some(name))) => {
                 run_options.insert(
                     "tool_choice".into(),
                     json!({ "type": "function", "function": { "name": name } }),
                 );
             }
             // A bare "required" (no function name) is intentionally not sent,
-            // mirroring Python's `elif ... required_function_name is not None`.
-            ToolMode::Required(None) => {}
+            // mirroring Python's `elif ... required_function_name is not None`;
+            // an unset choice sends no field (service-side default: auto).
+            Some(ToolMode::Required(None)) | None => {}
         }
     }
 
@@ -1231,12 +1241,23 @@ mod tests {
     }
 
     #[test]
-    fn prepare_options_tools_omitted_without_tool_choice() {
-        // Python gates the whole tools block on `tool_choice is not None`.
+    fn prepare_options_tools_sent_without_tool_choice() {
+        // Deliberate divergence from Python (which gates the whole tools
+        // block on `tool_choice is not None`): configured tools must reach
+        // the run even when no explicit choice is set — the service defaults
+        // to auto — while the `tool_choice` field itself stays unsent.
         let mut options = ChatOptions::new();
-        options.tools = vec![function_tool("f")];
+        options.tools = vec![
+            function_tool("f"),
+            hosted_file_search(None).vector_store_ids(vec!["vs_1".into()]),
+        ];
         let (run, _) = prepare_options(&[ChatMessage::user("hi")], &options);
-        assert!(run.get("tools").is_none());
+        let tools = run["tools"].as_array().expect("tools sent");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            run["tool_resources"]["file_search"]["vector_store_ids"],
+            json!(["vs_1"])
+        );
         assert!(run.get("tool_choice").is_none());
     }
 

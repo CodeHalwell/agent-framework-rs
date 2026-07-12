@@ -435,11 +435,25 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     .inner_get_response(conversation.clone(), options.clone())
                     .await?;
 
+                // A call whose result is already present in the same response
+                // was executed by the provider (e.g. Anthropic server-side
+                // web-search/code-execution/MCP `server_tool_use` blocks,
+                // which arrive paired with their `*_tool_result`). Executing
+                // it locally would produce a bogus "tool not found" — only
+                // unresolved calls enter the local tool loop.
+                let resolved_call_ids: std::collections::HashSet<&str> = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .filter_map(Content::as_function_result)
+                    .map(|fr| fr.call_id.as_str())
+                    .collect();
                 let calls: Vec<_> = response
                     .messages
                     .iter()
                     .flat_map(|m| m.contents.iter())
                     .filter_map(Content::as_function_call)
+                    .filter(|fc| !resolved_call_ids.contains(fc.call_id.as_str()))
                     .cloned()
                     .collect();
 

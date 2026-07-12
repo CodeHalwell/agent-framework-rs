@@ -593,6 +593,56 @@ async fn middleware_stream_replay_preserves_conversation_id_and_usage() {
 }
 
 #[tokio::test]
+async fn provider_resolved_tool_calls_are_not_executed_locally() {
+    // A response carrying a function call WITH its matching result in the
+    // same response (e.g. Anthropic server-side web-search/MCP tool use) was
+    // executed by the provider: the call must not enter the local tool loop,
+    // which would emit a bogus "tool not found" and burn an extra iteration.
+    let call = FunctionCallContent::new(
+        "srv_1",
+        "hosted_web_search",
+        Some(FunctionArguments::Raw("{}".into())),
+    );
+    let resolved = ChatResponse {
+        messages: vec![ChatMessage::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionCall(call),
+                Content::FunctionResult(FunctionResultContent {
+                    call_id: "srv_1".into(),
+                    result: Some(json!({"hits": 3})),
+                    exception: None,
+                }),
+                Content::text("Found 3 results."),
+            ],
+        )],
+        ..Default::default()
+    };
+    let noop = AiFunction::new(
+        "noop",
+        "noop",
+        json!({"type":"object","properties":{}}),
+        |_a| async move { Ok(json!("x")) },
+    )
+    .into_definition();
+    // Exactly one scripted response: a second loop iteration would consume
+    // the "(no more scripted responses)" fallback and change the text.
+    let agent = ChatAgent::builder(MockClient::new(vec![resolved]))
+        .tool(noop)
+        .build();
+
+    let out = agent.run_once("go").await.unwrap();
+    assert_eq!(out.text(), "Found 3 results.");
+    // No synthetic error result was appended for the pre-resolved call.
+    assert!(out
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_result)
+        .all(|fr| fr.exception.is_none()));
+}
+
+#[tokio::test]
 async fn chat_level_tool_stream_replay_carries_finish_reason() {
     // AgentRunResponse has no finish_reason (matching upstream), so the
     // finish-reason half of the replay metadata is asserted at the
