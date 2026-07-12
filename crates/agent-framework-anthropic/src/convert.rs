@@ -5,10 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatOptions, ChatResponse, CitationAnnotation, Content, DataContent, FinishReason,
-    FunctionArguments, FunctionCallContent, FunctionResultContent, HostedFileContent, Message,
-    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
-    UsageContent, UsageDetails,
+    Annotation, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, HostedFileContent, Message, ResponseFormat, Role,
+    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
+    UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -668,7 +668,7 @@ fn tool_use_id(block: &Value) -> String {
 }
 
 /// Parse the `citations` array on a text content block into
-/// [`CitationAnnotation`]s. Mirrors upstream's `_parse_citations`
+/// [`Annotation`]s. Mirrors upstream's `_parse_citations`
 /// (`_chat_client.py` ~611-670), including which field feeds `title` for
 /// each citation type:
 ///
@@ -698,14 +698,14 @@ fn tool_use_id(block: &Value) -> String {
 /// in practice is always absent) rather than "corrected" to `document_title`,
 /// per this task's mandate to match upstream's exact behavior; flagged in
 /// the implementation report.
-pub(crate) fn parse_citations(block: &Value) -> Option<Vec<CitationAnnotation>> {
+pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
     let citations = block.get("citations").and_then(Value::as_array)?;
     if citations.is_empty() {
         return None;
     }
     let mut annotations = Vec::with_capacity(citations.len());
     for citation in citations {
-        let mut cit = CitationAnnotation::default();
+        let mut cit = Annotation::default();
         // Plain (possibly-absent) string field, assigned unconditionally --
         // mirrors upstream's bare `cit.title = citation.xxx` /
         // `cit.snippet = citation.cited_text` / `cit.url = citation.xxx`,
@@ -1865,7 +1865,7 @@ mod tests {
         });
         let annotations = parse_citations(&block).unwrap();
         assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0], CitationAnnotation::default());
+        assert_eq!(annotations[0], Annotation::default());
     }
 
     #[test]

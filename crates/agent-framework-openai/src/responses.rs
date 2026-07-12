@@ -29,10 +29,10 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, CitationAnnotation, Content, DataContent,
-    FinishReason, FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Message, ResponseFormat, Role, TextContent, TextReasoningContent,
-    TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
+    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
+    FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+    Message, ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode,
+    UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -818,11 +818,11 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
     }
 }
 
-/// Parse the `annotations` on an `output_text` part into [`CitationAnnotation`]s
+/// Parse the `annotations` on an `output_text` part into [`Annotation`]s
 /// (`_create_response_content:667-724`). The core annotation type has no free
 /// `additional_properties`, so upstream's `index`/`container_id` extras are
 /// dropped.
-fn parse_annotations(part: &Value) -> Option<Vec<CitationAnnotation>> {
+fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
     let arr = part.get("annotations").and_then(Value::as_array)?;
     let mut out = Vec::new();
     for ann in arr {
@@ -834,22 +834,22 @@ fn parse_annotations(part: &Value) -> Option<Vec<CitationAnnotation>> {
             }])
         };
         match ann.get("type").and_then(Value::as_str) {
-            Some("file_path") => out.push(CitationAnnotation {
+            Some("file_path") => out.push(Annotation {
                 file_id: str_field("file_id"),
                 ..Default::default()
             }),
-            Some("file_citation") => out.push(CitationAnnotation {
+            Some("file_citation") => out.push(Annotation {
                 url: str_field("filename"),
                 file_id: str_field("file_id"),
                 ..Default::default()
             }),
-            Some("url_citation") => out.push(CitationAnnotation {
+            Some("url_citation") => out.push(Annotation {
                 title: str_field("title"),
                 url: str_field("url"),
                 annotated_regions: regions(),
                 ..Default::default()
             }),
-            Some("container_file_citation") => out.push(CitationAnnotation {
+            Some("container_file_citation") => out.push(Annotation {
                 file_id: str_field("file_id"),
                 url: str_field("filename"),
                 annotated_regions: regions(),

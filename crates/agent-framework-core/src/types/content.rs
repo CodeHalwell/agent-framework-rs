@@ -88,7 +88,7 @@ pub struct TextSpanRegion {
 
 /// A citation annotation attached to content.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct CitationAnnotation {
+pub struct Annotation {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -108,7 +108,7 @@ pub struct CitationAnnotation {
 pub struct TextContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub annotations: Option<Vec<CitationAnnotation>>,
+    pub annotations: Option<Vec<Annotation>>,
 }
 
 impl TextContent {
@@ -125,7 +125,7 @@ impl TextContent {
 pub struct TextReasoningContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub annotations: Option<Vec<CitationAnnotation>>,
+    pub annotations: Option<Vec<Annotation>>,
     /// The raw provider reasoning item this was decoded from, when it must be
     /// replayed verbatim. Reasoning models (OpenAI Responses with
     /// `store: false`) require the original reasoning item — id and encrypted

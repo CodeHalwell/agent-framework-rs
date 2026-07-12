@@ -8,7 +8,7 @@ mod options;
 mod response;
 
 pub use content::{
-    prepare_function_call_results, CitationAnnotation, Content, DataContent, ErrorContent,
+    prepare_function_call_results, Annotation, Content, DataContent, ErrorContent,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,

@@ -13,8 +13,8 @@ use std::collections::VecDeque;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
-    ChatResponseUpdate, CitationAnnotation, Content, FinishReason, Role, TextContent,
-    TextSpanRegion, UsageContent,
+    Annotation, ChatResponseUpdate, Content, FinishReason, Role, TextContent, TextSpanRegion,
+    UsageContent,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -221,7 +221,7 @@ fn parse_message_delta(data: &Value) -> Vec<Content> {
     out
 }
 
-fn parse_annotations(annotations: Option<&Value>) -> Option<Vec<CitationAnnotation>> {
+fn parse_annotations(annotations: Option<&Value>) -> Option<Vec<Annotation>> {
     let annotations = annotations?.as_array()?;
     let mut out = Vec::new();
     for a in annotations {
@@ -238,7 +238,7 @@ fn parse_annotations(annotations: Option<&Value>) -> Option<Vec<CitationAnnotati
             }]),
             _ => None,
         };
-        out.push(CitationAnnotation {
+        out.push(Annotation {
             title: uc
                 .and_then(|u| u.get("title"))
                 .and_then(Value::as_str)
