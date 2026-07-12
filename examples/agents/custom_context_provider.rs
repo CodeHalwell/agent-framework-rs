@@ -51,7 +51,7 @@ impl ContextProvider for DemoProvider {
 }
 
 /// Echoes back whatever `conversation_id` it was given, keeping a
-/// service-managed thread valid across turns.
+/// service-managed session valid across turns.
 #[derive(Clone)]
 struct EchoingClient;
 
@@ -75,8 +75,8 @@ impl ChatClient for EchoingClient {
     }
 }
 
-/// Always mints a fresh conversation id, so a plain local thread adopts it as
-/// a service-managed thread.
+/// Always mints a fresh conversation id, so a plain local session adopts it as
+/// a service-managed session.
 #[derive(Clone)]
 struct AdoptingClient;
 
@@ -126,28 +126,28 @@ impl ChatClient for FailingClient {
 async fn main() -> Result<()> {
     let provider: Arc<dyn ContextProvider> = Arc::new(DemoProvider::default());
 
-    println!("-- scenario 1: an already service-managed thread --");
+    println!("-- scenario 1: an already service-managed session --");
     let agent1 = Agent::builder(EchoingClient)
         .context_provider(provider.clone())
         .build();
-    let mut thread1 = agent1.get_new_thread_with_service_id("demo-thread")?;
+    let mut session1 = agent1.create_session_with_service_id("demo-session");
     let r1 = agent1
-        .run(vec![Message::user("hi")], Some(&mut thread1))
+        .run(vec![Message::user("hi")], Some(&mut session1))
         .await?;
     println!("agent: {}\n", r1.text());
 
-    println!("-- scenario 2: a local thread adopts a service id from the response --");
+    println!("-- scenario 2: a local session adopts a service id from the response --");
     let agent2 = Agent::builder(AdoptingClient)
         .context_provider(provider.clone())
         .build();
-    let mut thread2 = agent2.get_new_thread();
+    let mut session2 = agent2.create_session();
     let r2 = agent2
-        .run(vec![Message::user("hi")], Some(&mut thread2))
+        .run(vec![Message::user("hi")], Some(&mut session2))
         .await?;
     println!(
-        "agent: {} (thread adopted id: {:?})\n",
+        "agent: {} (session adopted id: {:?})\n",
         r2.text(),
-        thread2.service_thread_id()
+        session2.service_session_id()
     );
 
     println!("-- scenario 3: after_run observes a failed run --");

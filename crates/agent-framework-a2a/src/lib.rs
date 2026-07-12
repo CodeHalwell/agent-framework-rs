@@ -38,7 +38,7 @@
 //! # }
 //! ```
 //!
-//! Reuse the same [`AgentThread`](agent_framework_core::threads::AgentThread)
+//! Reuse the same [`AgentSession`](agent_framework_core::session::AgentSession)
 //! across calls for a multi-turn conversation:
 //!
 //! ```no_run
@@ -47,11 +47,11 @@
 //!
 //! # async fn demo() -> Result<()> {
 //! let agent = A2AAgent::from_url("weather-agent", "https://weather.example.com/a2a");
-//! let mut thread = agent.get_new_thread();
-//! agent.run(vec![Message::user("What's the forecast for Seattle?")], Some(&mut thread)).await?;
-//! // The remote agent's contextId/taskId are now attached to `thread`, so
+//! let mut session = agent.create_session();
+//! agent.run(vec![Message::user("What's the forecast for Seattle?")], Some(&mut session)).await?;
+//! // The remote agent's contextId/taskId are now attached to `session`, so
 //! // this second call continues the same A2A conversation.
-//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut thread)).await?;
+//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut session)).await?;
 //! println!("{}", reply.text());
 //! # Ok(())
 //! # }
@@ -71,13 +71,11 @@
 //!   multi-turn continuity entirely up to whatever session affinity the
 //!   remote agent infers on its own. This port stores the last response's
 //!   `contextId`/`taskId` in
-//!   [`AgentThread::service_thread_id`](agent_framework_core::threads::AgentThread)
+//!   [`AgentSession::service_session_id`](agent_framework_core::session::AgentSession)
 //!   (JSON-encoded, since that field is a single string) and replays them on
-//!   the same thread's next [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
+//!   the same session's next [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   call, so a real multi-turn conversation works as long as the same
-//!   thread is reused (see the second example above) and doesn't already
-//!   have a local message store attached (e.g. one borrowed from a
-//!   `Agent`) — continuity is skipped, not an error, in that case.
+//!   session is reused (see the second example above).
 //! - **`input-required` surfaces the agent's question.** If a [`Task`] comes
 //!   back in [`TaskState::InputRequired`], this crate returns
 //!   `task.status.message` as the response text, so the caller has

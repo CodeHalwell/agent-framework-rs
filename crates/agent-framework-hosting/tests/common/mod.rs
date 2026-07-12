@@ -14,7 +14,7 @@ use tower::ServiceExt;
 
 use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::Result;
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
     AgentResponse, AgentResponseUpdate, Content, Message, Role, UsageDetails,
 };
@@ -46,7 +46,7 @@ impl SupportsAgentRun for StreamingAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse {
             messages: vec![Message::assistant(self.deltas.concat())],
@@ -57,7 +57,7 @@ impl SupportsAgentRun for StreamingAgent {
     async fn run_stream(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<AgentThread>,
+        _session: Option<AgentSession>,
         _options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         let updates: Vec<Result<AgentResponseUpdate>> = self
@@ -128,7 +128,7 @@ impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         let input = messages
             .iter()

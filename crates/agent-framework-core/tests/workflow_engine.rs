@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_framework_core::error::Result;
 use agent_framework_core::prelude::{AgentResponse, ChatResponse, Message, SupportsAgentRun};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::workflow::{
     get_checkpoint_summary, validate_workflow_graph, AgentExecutor, Case, CheckpointStorage,
     Default as SwitchDefault, EdgeGroup, Executor, FileCheckpointStorage, FunctionExecutor,
@@ -695,7 +695,7 @@ impl SupportsAgentRun for MockAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _thread: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse::from_chat_response(ChatResponse::from_text(
             &self.reply,
@@ -745,7 +745,7 @@ impl SupportsAgentRun for MultiMessageAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _thread: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         Ok(AgentResponse {
             messages: vec![

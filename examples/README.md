@@ -47,7 +47,7 @@ and exits on its own — no second terminal needed).
 
 ## Agents (`agents/`)
 
-Core `Agent` mechanics: building, running, streaming, tools, threads, and
+Core `Agent` mechanics: building, running, streaming, tools, sessions, and
 middleware.
 
 | Example | Shows | Requires |
@@ -61,8 +61,8 @@ middleware.
 | `agent_as_tool` | Compose agents: a specialist exposed as a tool via `Agent::as_tool` | `OPENAI_API_KEY` |
 | `retry_policy` | `RetryingChatClient` + `RetryPolicy` over a scripted flaky client | offline |
 | `per_run_options` | `AgentRunOptions` merges per-run `ChatOptions` overrides over the agent's defaults | offline |
-| `thread_persistence` | `thread.serialize()` / `Agent::deserialize_thread` round-trip a conversation | offline |
-| `multi_turn_conversation` | One `AgentThread` reused across calls accumulates history automatically | offline |
+| `thread_persistence` | `AgentSession::to_dict()` + `InMemoryHistoryProvider::to_dict()` round-trip a conversation | offline |
+| `multi_turn_conversation` | One `AgentSession` (with an `InMemoryHistoryProvider`) reused across calls accumulates history automatically | offline |
 | `image_input` | Attach an image via `Content::Uri` (URL) or `Content::Data` (inline bytes) | `OPENAI_API_KEY` (vision model; skips gracefully) |
 | `agent_middleware` | Wrap a whole agent run: logging plus early-termination middleware | offline |
 | `function_middleware` | Wrap every local tool call: rewrite arguments, observe/override results | offline |
@@ -164,7 +164,7 @@ Azure AI Search.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
-| `redis_memory` | Redis-backed thread history (`RedisChatMessageStore`) + long-term memory provider | a local Redis server (skips gracefully) |
+| `redis_memory` | Redis-backed session history (`RedisChatMessageStore`, a `HistoryProvider`) + long-term memory provider | a local Redis server (skips gracefully) |
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |

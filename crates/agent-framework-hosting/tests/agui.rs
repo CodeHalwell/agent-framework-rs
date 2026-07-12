@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use agent_framework_core::agent::{Agent, SupportsAgentRun};
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
     AgentResponse, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments,
     FunctionCallContent, FunctionResultContent, Message, Role,
@@ -117,7 +117,7 @@ impl SupportsAgentRun for FrontendToolAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_1",
@@ -188,7 +188,7 @@ impl SupportsAgentRun for ExecutedToolAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         let call = FunctionCallContent::new(
             "call_9",
@@ -256,7 +256,7 @@ impl SupportsAgentRun for FailingAgent {
     async fn run(
         &self,
         _messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         Err(Error::AgentExecution("kaboom".to_string()))
     }
@@ -305,7 +305,7 @@ impl SupportsAgentRun for InspectAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        _thread: Option<&mut AgentThread>,
+        _session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         let mut parts: Vec<String> = Vec::new();
         for m in &messages {

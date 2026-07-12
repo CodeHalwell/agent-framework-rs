@@ -1,7 +1,7 @@
 //! Human-in-the-loop tool approval: a tool marked `ApprovalMode::AlwaysRequire`
 //! makes the function-invocation loop pause instead of executing it -- the
 //! caller inspects the pending request, approves (or rejects) it, and
-//! resubmits on the same thread to continue.
+//! resubmits on the same session to continue.
 //!
 //! The flow (not the tool itself) is the point of this example: run -> look
 //! at `user_input_requests()` -> approve via `FunctionApprovalResponseContent`
@@ -43,13 +43,13 @@ async fn main() -> Result<()> {
         .tool(delete_file)
         .build();
 
-    let mut thread = agent.get_new_thread();
+    let mut session = agent.create_session();
     let mut input = vec![Message::user("Please delete scratch.txt")];
 
     // Drive the approve/resubmit loop until a final, non-approval answer
     // comes back (bounded so a misbehaving model can't spin forever).
     for _ in 0..5 {
-        let response = agent.run(input.clone(), Some(&mut thread)).await?;
+        let response = agent.run(input.clone(), Some(&mut session)).await?;
         let requests = response.user_input_requests();
 
         if requests.is_empty() {

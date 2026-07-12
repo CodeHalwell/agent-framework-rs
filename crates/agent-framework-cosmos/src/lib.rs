@@ -1,7 +1,7 @@
 //! # agent-framework-cosmos
 //!
 //! Azure Cosmos DB (NoSQL / SQL API)-backed
-//! [`ChatMessageStore`](agent_framework_core::threads::ChatMessageStore) for
+//! [`HistoryProvider`](agent_framework_core::history::HistoryProvider) for
 //! `agent-framework-rs`, porting `Microsoft.Agents.AI.CosmosNoSql` from the
 //! .NET Agent Framework.
 //!
@@ -17,7 +17,6 @@
 //!
 //! ```no_run
 //! use agent_framework_cosmos::CosmosChatMessageStore;
-//! use agent_framework_core::threads::ChatMessageStore;
 //! use agent_framework_core::types::Message;
 //!
 //! # async fn demo() -> agent_framework_core::error::Result<()> {

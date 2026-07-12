@@ -15,7 +15,6 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use agent_framework_core::threads::ChatMessageStore;
 use agent_framework_core::types::Message;
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
 use agent_framework_cosmos::{CosmosChatMessageStore, CosmosCheckpointStorage};

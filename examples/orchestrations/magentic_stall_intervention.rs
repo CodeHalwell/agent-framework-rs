@@ -98,7 +98,7 @@ fn placeholder() -> Arc<dyn SupportsAgentRun> {
         async fn run(
             &self,
             _messages: Vec<Message>,
-            _thread: Option<&mut AgentThread>,
+            _session: Option<&mut AgentSession>,
         ) -> Result<AgentResponse> {
             Ok(AgentResponse::default())
         }

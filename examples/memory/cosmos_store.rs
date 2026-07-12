@@ -1,6 +1,7 @@
 //! Azure Cosmos DB (NoSQL) as a conversation store: `CosmosChatMessageStore`
-//! persists a thread's messages as documents partitioned by thread id,
-//! authenticating with the account's master key (HMAC-signed REST -- no SDK).
+//! is a `HistoryProvider` that persists a session's messages as documents
+//! partitioned by thread id, authenticating with the account's master key
+//! (HMAC-signed REST -- no SDK).
 //!
 //! Skips gracefully unless configured (works against the Cosmos DB Emulator
 //! too -- its well-known endpoint/key work here):
@@ -45,8 +46,9 @@ async fn main() -> Result<()> {
     // treated as success). Partition key is /threadId.
     store.ensure_created().await?;
 
-    // Any ChatMessageStore works as an AgentThread backend; here we exercise
-    // the store directly so the example needs no model credentials.
+    // Any `HistoryProvider` can back an `AgentSession`'s conversation
+    // history; here we exercise the store directly so the example needs no
+    // model credentials.
     store
         .add_messages(vec![
             Message::user("What is the capital of France?"),
@@ -65,8 +67,9 @@ async fn main() -> Result<()> {
     }
 
     // To drive an agent with it instead:
-    //   let mut thread = AgentThread::local(store.clone());
-    //   agent.run(vec![Message::user("...")], Some(&mut thread)).await?;
+    //   let mut session = AgentSession::new()
+    //       .with_context_providers(vec![store.clone() as Arc<dyn ContextProvider>]);
+    //   agent.run(vec![Message::user("...")], Some(&mut session)).await?;
 
     Ok(())
 }

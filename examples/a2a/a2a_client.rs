@@ -1,6 +1,6 @@
 //! Talk to a remote Agent2Agent (A2A) server as if it were a local agent:
 //! `A2AAgent` implements the `SupportsAgentRun` trait over the A2A JSON-RPC protocol,
-//! and reusing one `AgentThread` carries the remote `contextId`/`taskId`
+//! and reusing one `AgentSession` carries the remote `contextId`/`taskId`
 //! across turns for a real multi-turn conversation.
 //!
 //! Point it at any A2A-compliant server -- for instance the one from the
@@ -33,14 +33,14 @@ async fn main() -> Result<()> {
     let response = agent.run_once("Hello! What can you do?").await?;
     println!("agent: {}", response.text());
 
-    // Multi-turn: reuse a thread so the remote contextId/taskId are replayed
+    // Multi-turn: reuse a session so the remote contextId/taskId are replayed
     // on the next call and the server sees one continuous conversation.
-    let mut thread = agent.get_new_thread();
+    let mut session = agent.create_session();
     agent
-        .run(vec![Message::user("My name is Ada.")], Some(&mut thread))
+        .run(vec![Message::user("My name is Ada.")], Some(&mut session))
         .await?;
     let reply = agent
-        .run(vec![Message::user("What is my name?")], Some(&mut thread))
+        .run(vec![Message::user("What is my name?")], Some(&mut session))
         .await?;
     println!("agent (same conversation): {}", reply.text());
 

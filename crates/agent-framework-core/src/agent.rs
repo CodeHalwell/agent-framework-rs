@@ -12,9 +12,10 @@ use uuid::Uuid;
 
 use crate::client::{ChatClient, FunctionInvokingChatClient};
 use crate::error::{Error, Result};
+use crate::history::ensure_history_provider;
 use crate::memory::{ContextProvider, SessionContext};
 use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
-use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
+use crate::session::AgentSession;
 use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
 use crate::types::{
     prepare_messages, AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, IntoMessages,
@@ -159,13 +160,6 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
     updates
 }
 
-/// A factory that builds a fresh [`ChatMessageStore`] for each new local
-/// thread, mirroring Python's `chat_message_store_factory`
-/// (`_agents.py:1088-1092`). Configured via
-/// [`AgentBuilder::chat_message_store_factory`] and used by
-/// [`Agent::get_new_thread`] / [`Agent::deserialize_thread`].
-pub type ChatMessageStoreFactory = Arc<dyn Fn() -> Arc<dyn ChatMessageStore> + Send + Sync>;
-
 /// Sanitize an agent name into a valid tool/function identifier, mirroring
 /// Python's `_sanitize_agent_name` (`_agents.py:53-87`).
 ///
@@ -217,7 +211,7 @@ pub trait SupportsAgentRun: Send + Sync {
     async fn run(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse>;
 
     /// Run the agent to completion, applying per-run [`AgentRunOptions`] over
@@ -231,7 +225,7 @@ pub trait SupportsAgentRun: Send + Sync {
     async fn run_with_options(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
         if !options.is_empty() {
@@ -240,7 +234,7 @@ pub trait SupportsAgentRun: Send + Sync {
                 "agent does not support per-run options; ignoring them"
             );
         }
-        self.run(messages, thread).await
+        self.run(messages, session).await
     }
 
     /// Run the agent and stream incremental [`AgentResponseUpdate`]s.
@@ -251,17 +245,18 @@ pub trait SupportsAgentRun: Send + Sync {
     /// [`Agent`], [`WorkflowAgent`](crate::workflow::WorkflowAgent), and the
     /// A2A client agent) override this to stream incrementally.
     ///
-    /// `thread` is taken **by value**: the returned stream owns it and writes
-    /// the conversation back once the stream is fully consumed. When the
-    /// thread's message store is shared (as [`Agent`]'s is, via `Arc`), the
-    /// write-back is observable through a clone taken before streaming.
+    /// `session` is taken **by value**: the returned stream owns it and
+    /// drives its context providers (including any history provider) once
+    /// the stream is fully consumed. When a provider's storage is shared (as
+    /// [`InMemoryHistoryProvider`]'s is, via `Arc`), the write-back is
+    /// observable through a clone taken before streaming.
     async fn run_stream(
         &self,
         messages: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        let mut owned = thread;
+        let mut owned = session;
         let response = self
             .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
             .await?;
@@ -283,9 +278,9 @@ pub trait SupportsAgentRun: Send + Sync {
             .unwrap_or_else(|| self.id().to_string())
     }
 
-    /// A fresh thread for a new conversation.
-    fn get_new_thread(&self) -> AgentThread {
-        AgentThread::new()
+    /// A fresh session for a new conversation.
+    fn create_session(&self) -> AgentSession {
+        AgentSession::new()
     }
 }
 
@@ -302,9 +297,6 @@ pub struct Agent {
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
     context_providers: Vec<Arc<dyn ContextProvider>>,
-    /// Factory for a new local thread's message store. When unset,
-    /// [`InMemoryChatMessageStore`] is used.
-    chat_message_store_factory: Option<ChatMessageStoreFactory>,
     agent_middleware: MiddlewarePipeline<AgentContext>,
     /// Middleware run around the underlying chat-client call (mirrors
     /// Python's `use_chat_middleware`). See [`Agent::call_chat_client`].
@@ -370,26 +362,27 @@ impl Agent {
     /// object-safe [`SupportsAgentRun::run_stream`] trait method (the real streaming
     /// implementation), accepting `impl IntoMessages`.
     ///
-    /// The thread's history is updated when the stream completes; because
-    /// message stores are shared via `Arc`, updates are visible on the original
-    /// thread once the returned stream is fully consumed. Pass per-run
-    /// [`AgentRunOptions`] to override the agent's defaults for this call only.
+    /// The session's context providers (including any history provider) are
+    /// driven when the stream completes; because provider storage is shared
+    /// via `Arc`, updates are visible on the original session once the
+    /// returned stream is fully consumed. Pass per-run [`AgentRunOptions`] to
+    /// override the agent's defaults for this call only.
     pub async fn run_stream(
         &self,
         messages: impl IntoMessages,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        SupportsAgentRun::run_stream(self, messages.into_messages(), thread, options).await
+        SupportsAgentRun::run_stream(self, messages.into_messages(), session, options).await
     }
 
-    /// Ergonomic streaming run with a fresh thread and no per-run options
+    /// Ergonomic streaming run with a fresh session and no per-run options
     /// (mirrors [`Agent::run_once`]).
     pub async fn run_stream_once(&self, messages: impl IntoMessages) -> Result<AgentRunStream> {
         SupportsAgentRun::run_stream(self, messages.into_messages(), None, None).await
     }
 
-    /// Ergonomic run without an explicit thread.
+    /// Ergonomic run without an explicit session.
     pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
     }
@@ -400,12 +393,12 @@ impl Agent {
     async fn run_stream_impl(
         &self,
         input: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         run_options: AgentRunOptions,
     ) -> Result<AgentRunStream> {
-        let mut thread = thread.unwrap_or_else(|| self.get_new_thread());
+        let mut session = session.unwrap_or_else(|| self.create_session());
         let (final_messages, options) = self
-            .prepare_request(&input, &mut thread, &run_options)
+            .prepare_request(&input, &mut session, &run_options)
             .await?;
 
         // When agent middleware is configured, route the run through the same
@@ -416,17 +409,14 @@ impl Agent {
             let response = match self.run_core(final_messages, options, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    for cp in self.combined_providers(&thread) {
+                    for cp in self.combined_providers(&session) {
                         let _ = cp.after_run(&input, &[], Some(&e)).await;
                     }
                     return Err(e);
                 }
             };
-            self.update_thread_conversation_id(&mut thread, response.conversation_id.as_deref())
-                .await?;
-            thread.on_new_messages(input.clone()).await?;
-            thread.on_new_messages(response.messages.clone()).await?;
-            for cp in self.combined_providers(&thread) {
+            self.update_session_conversation_id(&mut session, response.conversation_id.as_deref())?;
+            for cp in self.combined_providers(&session) {
                 cp.after_run(&input, &response.messages, None).await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
@@ -442,7 +432,7 @@ impl Agent {
         // the stream's terminal aggregation can auto-populate `value` (task 3).
         let response_format = options.response_format.clone();
         let agent_name = self.name.clone();
-        let providers = self.combined_providers(&thread);
+        let providers = self.combined_providers(&session);
         let inner = match self
             .client
             .get_streaming_response(final_messages, options)
@@ -458,21 +448,32 @@ impl Agent {
             }
         };
 
-        // Wrap the inner stream: forward mapped updates, then update the thread.
-        let stream =
-            async_stream_forward(inner, agent_name, thread, input, providers, response_format);
+        // Wrap the inner stream: forward mapped updates, then update the session.
+        let stream = async_stream_forward(
+            inner,
+            agent_name,
+            session,
+            input,
+            providers,
+            response_format,
+        );
         Ok(stream.boxed())
     }
 
     /// Assemble the final message list and options for a request, applying
-    /// thread history and context providers.
+    /// context providers (including history) over the session.
     async fn prepare_request(
         &self,
         input: &[Message],
-        thread: &mut AgentThread,
+        session: &mut AgentSession,
         run_options: &AgentRunOptions,
     ) -> Result<(Vec<Message>, ChatOptions)> {
-        let service_thread_id = thread.service_thread_id().map(str::to_string);
+        // Auto-attach a fresh `InMemoryHistoryProvider` to a non-service-managed
+        // session that doesn't already carry a history provider, so local
+        // multi-turn conversations keep accumulating history the way the old
+        // `AgentThread` message store used to.
+        ensure_history_provider(session);
+        let service_session_id = session.service_session_id().map(str::to_string);
 
         // Merge per-run chat-option overrides over the agent's defaults, with
         // the per-run side winning (mirrors Python's `run_chat_options &
@@ -482,24 +483,25 @@ impl Agent {
             Some(overrides) => self.chat_options.clone().merge(overrides.clone()),
             None => self.chat_options.clone(),
         };
-        // A service-managed thread's id drives continuity and wins; on a
-        // local thread, a per-run / agent-default `conversation_id` override
+        // A service-managed session's id drives continuity and wins; on a
+        // local session, a per-run / agent-default `conversation_id` override
         // survives (previously it was unconditionally cleared here, silently
         // starting a new service conversation despite the documented per-run
         // precedence).
-        options.conversation_id = service_thread_id.clone().or(options.conversation_id.take());
-
-        let thread_history = thread.list_messages().await?;
+        options.conversation_id = service_session_id
+            .clone()
+            .or(options.conversation_id.take());
 
         // Context provider injection: run every provider's `before_run` over a
         // shared `SessionContext`, then fold the result into the request
-        // (provider instructions AFTER the agent's own; provider messages
-        // PREPENDED ahead of thread history; provider tools appended,
-        // deduplicated by name).
-        let providers = self.combined_providers(thread);
+        // (provider instructions AFTER the agent's own; provider messages —
+        // including, via the auto-attached/explicit `HistoryProvider`, thread
+        // history — PREPENDED ahead of the run's own input; provider tools
+        // appended, deduplicated by name).
+        let providers = self.combined_providers(session);
         let mut ctx = SessionContext::new(input.to_vec());
-        ctx.session_id = service_thread_id.clone();
-        ctx.service_session_id = service_thread_id.clone();
+        ctx.session_id = Some(session.session_id().to_string());
+        ctx.service_session_id = service_session_id.clone();
         for provider in &providers {
             provider.before_run(&mut ctx).await?;
         }
@@ -510,7 +512,6 @@ impl Agent {
             });
         }
         let mut history = ctx.messages;
-        history.extend(thread_history);
 
         // Deduplicate by name: a tool may be defined on the agent and also
         // injected by a context provider. Providers rejecting duplicate
@@ -724,42 +725,33 @@ impl Agent {
         !self.agent_middleware.is_empty()
     }
 
-    /// The effective context providers for a run: the thread's, combined with
-    /// the agent's own. There is no aggregate wrapper any more — callers
+    /// The effective context providers for a run: the session's, combined
+    /// with the agent's own. There is no aggregate wrapper any more — callers
     /// iterate this list directly.
-    fn combined_providers(&self, thread: &AgentThread) -> Vec<Arc<dyn ContextProvider>> {
-        let mut providers = thread.context_providers.clone();
+    fn combined_providers(&self, session: &AgentSession) -> Vec<Arc<dyn ContextProvider>> {
+        let mut providers = session.context_providers.clone();
         providers.extend(self.context_providers.iter().cloned());
         providers
     }
 
-    /// Build a fresh message store from the configured factory, or an
-    /// [`InMemoryChatMessageStore`] when none is set.
-    fn new_message_store(&self) -> Arc<dyn ChatMessageStore> {
-        match &self.chat_message_store_factory {
-            Some(factory) => factory(),
-            None => Arc::new(InMemoryChatMessageStore::new()),
-        }
-    }
-
-    /// Reconcile a run's conversation id with the thread, mirroring Python's
+    /// Reconcile a run's conversation id with the session, mirroring Python's
     /// `_update_thread_with_type_and_conversation_id` (`_agents.py:1204-1234`).
     ///
-    /// * No id returned while the thread *is* service-managed → the service
-    ///   doesn't support service-managed threads for this request, so surface
+    /// * No id returned while the session *is* service-managed → the service
+    ///   doesn't support service-managed sessions for this request, so surface
     ///   an [`Error::AgentExecution`] (matches Python raising
     ///   `AgentExecutionException`, GAP item 14).
-    /// * An id returned that the thread newly adopts is simply recorded on the
-    ///   thread; there is no `thread_created` hook any more (upstream removed
-    ///   it — see [`crate::memory::ContextProvider`]).
-    async fn update_thread_conversation_id(
+    /// * An id returned that the session newly adopts is simply recorded on
+    ///   the session; there is no `thread_created` hook any more (upstream
+    ///   removed it — see [`crate::memory::ContextProvider`]).
+    fn update_session_conversation_id(
         &self,
-        thread: &mut AgentThread,
+        session: &mut AgentSession,
         response_conversation_id: Option<&str>,
     ) -> Result<()> {
         match response_conversation_id {
             None => {
-                if thread.service_thread_id().is_some() {
+                if session.service_session_id().is_some() {
                     return Err(Error::AgentExecution(
                         "Service did not return a valid conversation id when using a service \
                          managed thread."
@@ -769,7 +761,7 @@ impl Agent {
                 Ok(())
             }
             Some(cid) => {
-                thread.try_adopt_service_thread_id(cid).await?;
+                session.try_adopt_service_session_id(cid);
                 Ok(())
             }
         }
@@ -778,22 +770,22 @@ impl Agent {
 
 /// State carried while forwarding a chat stream as agent updates.
 type ForwardFinish = Option<(
-    AgentThread,
+    AgentSession,
     Vec<Message>,
     Vec<Arc<dyn ContextProvider>>,
     Option<ResponseFormat>,
 )>;
 
-/// Forward an inner chat stream as agent updates and update the thread on end.
+/// Forward an inner chat stream as agent updates and update the session on end.
 fn async_stream_forward(
     inner: crate::client::ChatStream,
     agent_name: Option<String>,
-    thread: AgentThread,
+    session: AgentSession,
     input: Vec<Message>,
     providers: Vec<Arc<dyn ContextProvider>>,
     response_format: Option<ResponseFormat>,
 ) -> impl Stream<Item = Result<AgentResponseUpdate>> + Send {
-    let finish: ForwardFinish = Some((thread, input, providers, response_format));
+    let finish: ForwardFinish = Some((session, input, providers, response_format));
     futures::stream::unfold(
         (
             inner,
@@ -820,7 +812,7 @@ fn async_stream_forward(
                         // Failure mid-stream: let context providers observe the
                         // error before surfacing it. The stream error takes
                         // precedence, so the hooks' results are discarded.
-                        if let Some((_thread, input, providers, _rf)) = finish.take() {
+                        if let Some((_session, input, providers, _rf)) = finish.take() {
                             for cp in &providers {
                                 let _ = cp.after_run(&input, &[], Some(&e)).await;
                             }
@@ -828,11 +820,12 @@ fn async_stream_forward(
                         Some((Err(e), (inner, collected, true, None)))
                     }
                     None => {
-                        // Stream finished: reconcile the conversation id, update
-                        // the thread history, and fire the completion hook.
-                        // Surface any failure as the final item rather than
-                        // dropping it.
-                        if let Some((mut thread, input, providers, response_format)) = finish.take()
+                        // Stream finished: reconcile the conversation id and fire
+                        // the context providers' completion hook (which records
+                        // history, for any attached `HistoryProvider`). Surface
+                        // any failure as the final item rather than dropping it.
+                        if let Some((mut session, input, providers, response_format)) =
+                            finish.take()
                         {
                             let response = ChatResponse::from_updates_with_format(
                                 collected.clone(),
@@ -840,7 +833,7 @@ fn async_stream_forward(
                             );
                             match response.conversation_id.as_deref() {
                                 None => {
-                                    if thread.service_thread_id().is_some() {
+                                    if session.service_session_id().is_some() {
                                         return Some((
                                             Err(Error::AgentExecution(
                                                 "Service did not return a valid conversation id \
@@ -852,17 +845,8 @@ fn async_stream_forward(
                                     }
                                 }
                                 Some(cid) => {
-                                    if let Err(e) = thread.try_adopt_service_thread_id(cid).await {
-                                        return Some((Err(e), (inner, collected, true, None)));
-                                    }
+                                    session.try_adopt_service_session_id(cid);
                                 }
-                            }
-                            if let Err(e) = thread.on_new_messages(input.clone()).await {
-                                return Some((Err(e), (inner, collected, true, None)));
-                            }
-                            if let Err(e) = thread.on_new_messages(response.messages.clone()).await
-                            {
-                                return Some((Err(e), (inner, collected, true, None)));
                             }
                             for cp in providers {
                                 if let Err(e) = cp.after_run(&input, &response.messages, None).await
@@ -884,36 +868,36 @@ impl SupportsAgentRun for Agent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
-        self.run_with_options(messages, thread, AgentRunOptions::default())
+        self.run_with_options(messages, session, AgentRunOptions::default())
             .await
     }
 
     async fn run_with_options(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
 
         let (final_messages, chat_options) =
-            self.prepare_request(&messages, thread, &options).await?;
+            self.prepare_request(&messages, session, &options).await?;
         let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
                 // Failure path: let context providers observe the error.
                 // The run's error takes precedence over any hook failure, so
                 // the hook result is intentionally discarded.
-                for cp in self.combined_providers(thread) {
+                for cp in self.combined_providers(session) {
                     let _ = cp.after_run(&messages, &[], Some(&e)).await;
                 }
                 return Err(e);
@@ -921,16 +905,13 @@ impl SupportsAgentRun for Agent {
         };
 
         // Persist / validate the service-managed conversation id before
-        // touching local history (tasks: service-thread adoption + missing-id
-        // error).
-        self.update_thread_conversation_id(thread, response.conversation_id.as_deref())
-            .await?;
-        // Update thread history.
-        thread.on_new_messages(messages.clone()).await?;
-        thread.on_new_messages(response.messages.clone()).await?;
+        // firing the completion hooks (tasks: service-session adoption +
+        // missing-id error).
+        self.update_session_conversation_id(session, response.conversation_id.as_deref())?;
 
-        // Fire the context providers' success completion hook.
-        for cp in self.combined_providers(thread) {
+        // Fire the context providers' success completion hook (this is what
+        // records history, for any attached `HistoryProvider`).
+        for cp in self.combined_providers(session) {
             cp.after_run(&messages, &response.messages, None).await?;
         }
 
@@ -940,10 +921,10 @@ impl SupportsAgentRun for Agent {
     async fn run_stream(
         &self,
         messages: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
-        self.run_stream_impl(messages, thread, options.unwrap_or_default())
+        self.run_stream_impl(messages, session, options.unwrap_or_default())
             .await
     }
 
@@ -954,20 +935,27 @@ impl SupportsAgentRun for Agent {
         self.name.as_deref()
     }
 
-    fn get_new_thread(&self) -> AgentThread {
-        // A service-managed conversation id yields a service thread; otherwise
-        // create a local thread with a shared store (from the configured
-        // factory, else in-memory) so history is observable across clones
-        // (e.g. during streaming).
+    fn create_session(&self) -> AgentSession {
+        // A service-managed conversation id yields a service session;
+        // otherwise eagerly attach a fresh `InMemoryHistoryProvider` (rather
+        // than relying solely on `prepare_request`'s auto-attach) so history
+        // is observable across clones (e.g. during streaming): the only way a
+        // caller observes the post-stream write-back through a clone taken
+        // beforehand is if the provider (and therefore its `Arc`) already
+        // exists at clone time.
         //
-        // The agent's own context providers are NOT copied onto the thread
-        // here: [`Agent::combined_providers`] merges the thread's providers
+        // The agent's own context providers are NOT copied onto the session
+        // here: [`Agent::combined_providers`] merges the session's providers
         // with the agent's own at request time, so copying them here would
         // double-invoke the agent's providers for every run against this
-        // thread.
+        // session.
         match &self.chat_options.conversation_id {
-            Some(id) => AgentThread::service(id.clone()),
-            None => AgentThread::local(self.new_message_store()),
+            Some(id) => AgentSession::service(id.clone()),
+            None => {
+                let mut session = AgentSession::new();
+                ensure_history_provider(&mut session);
+                session
+            }
         }
     }
 }
@@ -984,7 +972,6 @@ pub struct AgentBuilder {
     client: Arc<dyn ChatClient>,
     chat_options: ChatOptions,
     context_providers: Vec<Arc<dyn ContextProvider>>,
-    chat_message_store_factory: Option<ChatMessageStoreFactory>,
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
     chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
     function_middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
@@ -1001,7 +988,6 @@ impl AgentBuilder {
             client: Arc::new(client),
             chat_options: ChatOptions::new(),
             context_providers: Vec::new(),
-            chat_message_store_factory: None,
             agent_middleware: Vec::new(),
             chat_middleware: Vec::new(),
             function_middleware: Vec::new(),
@@ -1073,17 +1059,6 @@ impl AgentBuilder {
         self.context_providers = providers;
         self
     }
-    /// Set a factory for the message store of each new local thread, mirroring
-    /// Python's `chat_message_store_factory`. Used by
-    /// [`Agent::get_new_thread`] and [`Agent::deserialize_thread`]
-    /// instead of hardcoding [`InMemoryChatMessageStore`].
-    pub fn chat_message_store_factory<F>(mut self, factory: F) -> Self
-    where
-        F: Fn() -> Arc<dyn ChatMessageStore> + Send + Sync + 'static,
-    {
-        self.chat_message_store_factory = Some(Arc::new(factory));
-        self
-    }
     /// Add an agent middleware.
     pub fn middleware(mut self, mw: Arc<crate::middleware::AgentMiddleware>) -> Self {
         self.agent_middleware.push(mw);
@@ -1135,7 +1110,6 @@ impl AgentBuilder {
             client,
             chat_options: self.chat_options,
             context_providers: self.context_providers,
-            chat_message_store_factory: self.chat_message_store_factory,
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
             tool_sources: self.tool_sources,
@@ -1149,35 +1123,31 @@ impl Agent {
         self.description.as_deref()
     }
 
-    /// Create a new **service-managed** thread bound to `service_thread_id`,
+    /// Create a new **service-managed** session bound to `service_session_id`,
     /// mirroring Python's `get_new_thread(service_thread_id=…)`
     /// (`_agents.py:1078-1082`).
     ///
-    /// Returns an error if the requested combination is invalid (a service id
-    /// plus a local store); this constructor only sets the service id, so it
-    /// always succeeds, but routing through [`AgentThread::try_from_parts`]
-    /// keeps the service-xor-store invariant in one place.
-    ///
     /// The agent's own context providers are NOT copied onto the returned
-    /// thread; see the note on [`Agent::get_new_thread`].
-    pub fn get_new_thread_with_service_id(
+    /// session; see the note on [`Agent::create_session`].
+    pub fn create_session_with_service_id(
         &self,
-        service_thread_id: impl Into<String>,
-    ) -> Result<AgentThread> {
-        AgentThread::try_from_parts(Some(service_thread_id.into()), None)
+        service_session_id: impl Into<String>,
+    ) -> AgentSession {
+        AgentSession::service(service_session_id)
     }
 
-    /// Reconstruct a thread from serialized state (as produced by
-    /// [`AgentThread::serialize`]), mirroring Python's
+    /// Reconstruct a session from state (as produced by
+    /// [`AgentSession::to_dict`]), mirroring Python's
     /// `BaseAgent.deserialize_thread` (`_agents.py:378-392`).
     ///
-    /// A local thread's store is built via the agent's
-    /// `chat_message_store_factory` (or an [`InMemoryChatMessageStore`]) and
-    /// populated from the state. The agent's own context providers are NOT
-    /// copied onto the returned thread; see the note on
-    /// [`Agent::get_new_thread`].
-    pub async fn deserialize_thread(&self, serialized_thread: &Value) -> Result<AgentThread> {
-        AgentThread::deserialize(serialized_thread, Some(self.new_message_store())).await
+    /// Conversation history is **not** part of this state (see
+    /// [`AgentSession::to_dict`]); reattach a [`crate::history::HistoryProvider`]
+    /// (e.g. via [`crate::history::InMemoryHistoryProvider::from_dict`]) to
+    /// `context_providers` separately when restoring a conversation. The
+    /// agent's own context providers are NOT copied onto the returned
+    /// session; see the note on [`Agent::create_session`].
+    pub fn session_from_dict(&self, state: &Value) -> Result<AgentSession> {
+        AgentSession::from_dict(state)
     }
 
     /// Wrap this agent as a [`ToolDefinition`] usable by another agent's

@@ -72,23 +72,24 @@
 //! # }
 //! ```
 //!
-//! Reuse the same [`AgentThread`](agent_framework_core::threads::AgentThread)
+//! Reuse the same [`AgentSession`](agent_framework_core::session::AgentSession)
 //! across calls for a multi-turn conversation:
 //!
 //! ```no_run
 //! # use agent_framework_copilotstudio::{CopilotStudioAgent, CopilotStudioConnectionSettings, StaticTokenProvider};
 //! use agent_framework_core::prelude::*;
+//! use agent_framework_core::agent::SupportsAgentRun;
 //!
 //! # async fn demo() -> Result<()> {
 //! # let agent = CopilotStudioAgent::new(
 //! #     CopilotStudioConnectionSettings::new("env-id", "schema-name"),
 //! #     StaticTokenProvider::new("token"),
 //! # );
-//! let mut thread = agent.get_new_thread();
-//! agent.run(vec![Message::user("What's the weather in Seattle?")], Some(&mut thread)).await?;
-//! // The Direct-to-Engine conversation id is now attached to `thread`, so
+//! let mut session = agent.create_session();
+//! agent.run(vec![Message::user("What's the weather in Seattle?")], Some(&mut session)).await?;
+//! // The Direct-to-Engine conversation id is now attached to `session`, so
 //! // this second call continues the same conversation.
-//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut thread)).await?;
+//! let reply = agent.run(vec![Message::user("What about tomorrow?")], Some(&mut session)).await?;
 //! println!("{}", reply.text());
 //! # Ok(())
 //! # }
@@ -113,10 +114,10 @@
 //!   speaks Direct-to-Engine directly over `reqwest`, as described above.
 //! - **Real conversation-id continuity.** Python's `CopilotStudioAgent.run`
 //!   calls `self._start_new_conversation()` *unconditionally* on every
-//!   invocation — even when a `thread` with an existing
-//!   `service_thread_id` is passed in — discarding whatever conversation
+//!   invocation — even when a `session` with an existing
+//!   `service_session_id` is passed in — discarding whatever conversation
 //!   context existed before. This port instead starts a new Direct-to-Engine
-//!   conversation only the first time an [`AgentThread`](agent_framework_core::threads::AgentThread)
+//!   conversation only the first time an [`AgentSession`](agent_framework_core::session::AgentSession)
 //!   is used, and reuses its conversation id on subsequent calls (the same
 //!   fix `agent-framework-a2a`'s `A2AAgent` applies for `contextId`/`taskId`
 //!   continuity — see that crate's docs for the identical rationale).

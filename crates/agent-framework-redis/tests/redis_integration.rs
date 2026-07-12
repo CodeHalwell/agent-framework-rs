@@ -43,7 +43,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use agent_framework_core::memory::{ContextProvider, SessionContext};
-use agent_framework_core::threads::ChatMessageStore;
 use agent_framework_core::types::Message;
 use agent_framework_redis::{RedisChatMessageStore, RedisContextProvider};
 use uuid::Uuid;
@@ -234,7 +233,7 @@ async fn chat_message_store_auto_generated_thread_ids_are_isolated() {
     let store_b = RedisChatMessageStore::new(&url, None)
         .unwrap()
         .with_key_prefix(&key_prefix);
-    assert_ne!(store_a.thread_id(), store_b.thread_id());
+    assert_ne!(store_a.session_id(), store_b.session_id());
 
     store_a
         .add_messages(vec![Message::user("only in A")])
@@ -246,7 +245,7 @@ async fn chat_message_store_auto_generated_thread_ids_are_isolated() {
 }
 
 #[tokio::test]
-async fn chat_message_store_survives_from_state_round_trip_against_live_server() {
+async fn chat_message_store_survives_to_dict_round_trip_against_live_server() {
     let Some((url, _guard)) = test_server().await else {
         return;
     };
@@ -257,11 +256,57 @@ async fn chat_message_store_survives_from_state_round_trip_against_live_server()
         .await
         .unwrap();
 
-    let state = store.serialize().await.unwrap();
-    let restored = RedisChatMessageStore::from_state(&state).unwrap();
+    let state = store.to_dict();
+    let restored = RedisChatMessageStore::from_dict(&state).unwrap();
     let messages = restored.list_messages().await.unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text(), "persisted");
+}
+
+#[tokio::test]
+async fn chat_message_store_before_run_prepends_history_and_after_run_records_it() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread"))).unwrap();
+
+    // Nothing stored yet: before_run leaves the run's own messages untouched.
+    let mut ctx = SessionContext::new(vec![Message::user("first turn")]);
+    store.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.messages.is_empty());
+
+    // A successful run records the request + response messages.
+    store
+        .after_run(
+            &[Message::user("first turn")],
+            &[Message::assistant("first reply")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The next run sees the recorded turn prepended ahead of its own input.
+    let mut ctx2 = SessionContext::new(vec![Message::user("second turn")]);
+    store.before_run(&mut ctx2).await.unwrap();
+    let texts: Vec<String> = ctx2.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(
+        texts,
+        vec!["first turn".to_string(), "first reply".to_string()]
+    );
+
+    // A failed run must not record anything.
+    store
+        .after_run(
+            &[Message::user("second turn")],
+            &[],
+            Some(&agent_framework_core::error::Error::service("boom")),
+        )
+        .await
+        .unwrap();
+    let messages = store.list_messages().await.unwrap();
+    assert_eq!(messages.len(), 2);
+
+    assert!(store.is_history_provider());
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 
 use agent_framework_core::agent::SupportsAgentRun;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{AgentResponse, IntoMessages, Message, Role};
 
 use crate::activity::{
@@ -90,9 +90,9 @@ impl CopilotStudioAgent {
         &self.connection
     }
 
-    /// Ergonomic run without an explicit thread (mirrors
+    /// Ergonomic run without an explicit session (mirrors
     /// `Agent::run_once`): the conversation starts fresh every call,
-    /// since no [`AgentThread`] is carried across calls to persist the
+    /// since no [`AgentSession`] is carried across calls to persist the
     /// Direct-to-Engine conversation id.
     pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
@@ -158,7 +158,7 @@ impl SupportsAgentRun for CopilotStudioAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         // Mirrors agent-framework-a2a's A2AAgent: only the newest message is
         // sent — with real conversation-id continuity (see below and the
@@ -171,31 +171,28 @@ impl SupportsAgentRun for CopilotStudioAgent {
         })?;
         let question = last.text();
 
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
 
-        // Continuity: reuse an existing conversation id on this thread;
+        // Continuity: reuse an existing conversation id on this session;
         // only start a new Direct-to-Engine conversation the first time the
-        // thread is used. Python's CopilotStudioAgent.run unconditionally
+        // session is used. Python's CopilotStudioAgent.run unconditionally
         // calls `_start_new_conversation()` on *every* call, discarding any
-        // conversation id already on the thread — seemingly not intentional
+        // conversation id already on the session — seemingly not intentional
         // multi-turn support, since it throws away prior context every
         // time. This port fixes that the same way agent-framework-a2a's
         // A2AAgent does for contextId/taskId: persist and reuse.
-        let conversation_id = match thread.service_thread_id() {
+        let conversation_id = match session.service_session_id() {
             Some(id) => id.to_string(),
             None => {
                 let id = self.start_conversation().await?;
-                // Best-effort: only fails if `thread` already owns a local
-                // message store (mutually exclusive with a service thread
-                // id), which a freshly-created `AgentThread` never does.
-                let _ = thread.set_service_thread_id(id.clone());
+                session.set_service_session_id(id.clone());
                 id
             }
         };

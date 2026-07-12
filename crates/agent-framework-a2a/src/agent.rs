@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::AgentThread;
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
     AgentResponse, AgentResponseUpdate, Content, DataContent, IntoMessages, Message, Role,
     UriContent,
@@ -29,7 +29,7 @@ use crate::types::{
 /// Wraps an [`A2AClient`] so a remote, A2A-compliant agent can be used
 /// anywhere the framework expects a local [`SupportsAgentRun`]: [`Message`]s in,
 /// [`AgentResponse`] out, with `contextId`/`taskId` continuity tracked per
-/// [`AgentThread`]. See the crate docs for the exact mapping and how this
+/// [`AgentSession`]. See the crate docs for the exact mapping and how this
 /// diverges from the Python reference implementation.
 #[derive(Debug, Clone)]
 pub struct A2AAgent {
@@ -89,9 +89,9 @@ impl A2AAgent {
         &self.client
     }
 
-    /// Ergonomic run without an explicit thread (mirrors
+    /// Ergonomic run without an explicit session (mirrors
     /// `Agent::run_once`): the conversation starts fresh every call,
-    /// since no [`AgentThread`] is carried across calls to persist
+    /// since no [`AgentSession`] is carried across calls to persist
     /// `contextId`/`taskId`.
     pub async fn run_once(&self, messages: impl IntoMessages) -> Result<AgentResponse> {
         self.run(messages.into_messages(), None).await
@@ -116,15 +116,15 @@ impl A2AAgent {
     }
 }
 
-/// `contextId`/`taskId` continuity for one [`AgentThread`], packed into
-/// [`AgentThread::service_thread_id`] as JSON (that field is a single
+/// `contextId`/`taskId` continuity for one [`AgentSession`], packed into
+/// [`AgentSession::service_session_id`] as JSON (that field is a single
 /// string, and A2A conversation continuity needs both ids).
 ///
 /// The Python reference does not track this at all: `A2AAgent.run_stream`
 /// accepts a `thread` parameter but never reads or writes it, so every call
 /// sends a context-less message and relies entirely on whatever session
 /// affinity the remote agent infers on its own. Tracking it here lets a
-/// caller that reuses the same [`AgentThread`] across calls have a real
+/// caller that reuses the same [`AgentSession`] across calls have a real
 /// multi-turn A2A conversation, including resuming a task that is paused in
 /// [`TaskState::InputRequired`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -136,8 +136,8 @@ struct ThreadState {
 }
 
 impl ThreadState {
-    /// Decode from `AgentThread::service_thread_id()`; anything absent,
-    /// unparseable, or from an unrelated thread just yields an empty state,
+    /// Decode from `AgentSession::service_session_id()`; anything absent,
+    /// unparseable, or from an unrelated session just yields an empty state,
     /// i.e. "start a fresh A2A conversation".
     fn decode(raw: Option<&str>) -> Self {
         raw.and_then(|s| serde_json::from_str(s).ok())
@@ -159,7 +159,7 @@ impl SupportsAgentRun for A2AAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
         // Mirrors the Python reference: only the newest message is sent —
         // earlier turns are already known to the remote agent via its
@@ -170,16 +170,16 @@ impl SupportsAgentRun for A2AAgent {
 
         self.ensure_initialized().await;
 
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
 
-        let state = ThreadState::decode(thread.service_thread_id());
+        let state = ThreadState::decode(session.service_session_id());
         let outgoing = chat_message_to_a2a_message(
             last,
             state.context_id.as_deref(),
@@ -214,13 +214,8 @@ impl SupportsAgentRun for A2AAgent {
             }
         };
 
-        // Best effort: this only fails if `thread` already owns a local
-        // message store (mutually exclusive with a service thread id on
-        // `AgentThread`) — e.g. a thread borrowed from a `Agent`. In that
-        // case the run still succeeds; it just won't get contextId/taskId
-        // continuity on that particular thread.
         if let Some(encoded) = new_state.encode() {
-            let _ = thread.set_service_thread_id(encoded);
+            session.set_service_session_id(encoded);
         }
 
         let mut response = AgentResponse {
@@ -242,20 +237,20 @@ impl SupportsAgentRun for A2AAgent {
     /// `message/stream` SSE endpoint and maps each
     /// [`MessageStreamEvent`] to an [`AgentResponseUpdate`] as it arrives,
     /// accumulating `contextId`/`taskId` and writing the resulting
-    /// continuity state back onto the (owned) thread once the stream ends —
+    /// continuity state back onto the (owned) session once the stream ends —
     /// mirroring [`SupportsAgentRun::run`]'s bookkeeping on this type. Per-run
     /// [`AgentRunOptions`] have no A2A representation; non-empty options are
     /// ignored with a warning.
     ///
     /// Note: unlike [`Agent`](agent_framework_core::agent::Agent),
-    /// A2A continuity state lives in a plain (non-shared) thread field, so the
-    /// end-of-stream write-back is not observable through a thread clone taken
+    /// A2A continuity state lives in a plain (non-shared) session field, so the
+    /// end-of-stream write-back is not observable through a session clone taken
     /// before streaming — carry the returned continuity forward via
     /// [`SupportsAgentRun::run`] when you need multi-turn A2A conversations.
     async fn run_stream(
         &self,
         messages: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         if let Some(opts) = &options {
@@ -276,8 +271,8 @@ impl SupportsAgentRun for A2AAgent {
 
         self.ensure_initialized().await;
 
-        let thread = thread.unwrap_or_else(|| self.get_new_thread());
-        let state = ThreadState::decode(thread.service_thread_id());
+        let session = session.unwrap_or_else(|| self.create_session());
+        let state = ThreadState::decode(session.service_session_id());
         let outgoing = chat_message_to_a2a_message(
             &last,
             state.context_id.as_deref(),
@@ -291,8 +286,8 @@ impl SupportsAgentRun for A2AAgent {
 
         // `state` (decoded above) is threaded through the forwarder, which
         // accumulates `contextId`/`taskId` from the streamed events and writes
-        // the result back onto the thread once the stream ends.
-        let stream = a2a_forward_stream(inner, thread, state, self.name.clone());
+        // the result back onto the session once the stream ends.
+        let stream = a2a_forward_stream(inner, session, state, self.name.clone());
         Ok(stream.boxed())
     }
 
@@ -421,17 +416,17 @@ struct A2AForward {
     inner: A2AEventStream,
     queue: VecDeque<Result<AgentResponseUpdate>>,
     state: ThreadState,
-    thread: Option<AgentThread>,
+    session: Option<AgentSession>,
     name: Option<String>,
     done: bool,
 }
 
 /// Forward an A2A `message/stream` event stream as agent updates, writing the
-/// accumulated `contextId`/`taskId` continuity back onto `thread` once the
+/// accumulated `contextId`/`taskId` continuity back onto `session` once the
 /// stream is exhausted.
 fn a2a_forward_stream(
     inner: A2AEventStream,
-    thread: AgentThread,
+    session: AgentSession,
     state: ThreadState,
     name: Option<String>,
 ) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
@@ -440,7 +435,7 @@ fn a2a_forward_stream(
             inner,
             queue: VecDeque::new(),
             state,
-            thread: Some(thread),
+            session: Some(session),
             name,
             done: false,
         },
@@ -451,9 +446,9 @@ fn a2a_forward_stream(
                 }
                 if st.done {
                     // Stream exhausted: persist the accumulated continuity.
-                    if let Some(mut thread) = st.thread.take() {
+                    if let Some(mut session) = st.session.take() {
                         if let Some(encoded) = st.state.encode() {
-                            let _ = thread.set_service_thread_id(encoded);
+                            session.set_service_session_id(encoded);
                         }
                     }
                     return None;

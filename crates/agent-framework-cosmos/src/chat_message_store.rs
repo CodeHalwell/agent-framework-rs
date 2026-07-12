@@ -1,4 +1,4 @@
-//! A [`ChatMessageStore`] backed by Azure Cosmos DB (NoSQL / SQL API),
+//! A [`HistoryProvider`] backed by Azure Cosmos DB (NoSQL / SQL API),
 //! ported from .NET's `Microsoft.Agents.AI.CosmosNoSql.CosmosChatMessageStore`
 //! over the raw Cosmos REST API (see [`crate::client`] and [`crate::auth`])
 //! rather than the `Microsoft.Azure.Cosmos` SDK.
@@ -64,7 +64,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::threads::ChatMessageStore;
+use agent_framework_core::history::HistoryProvider;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::Message;
 
 use crate::client::CosmosRestClient;
@@ -94,7 +95,7 @@ fn build_message_document(thread_id: &str, seq: i64, message: &Message) -> Resul
 /// string `message` field (see the [module docs](self) for the
 /// double-encoded-string shape). Mirrors
 /// `agent_framework_redis::RedisChatMessageStore`'s strictness: a malformed
-/// or missing `message` field fails the whole [`ChatMessageStore::list_messages`]
+/// or missing `message` field fails the whole [`CosmosChatMessageStore::list_messages`]
 /// call rather than being silently skipped, so callers never see a
 /// silently-truncated history.
 fn parse_message_document(doc: &Value) -> Result<Message> {
@@ -119,14 +120,13 @@ fn seq_base() -> i64 {
     millis * 1000
 }
 
-/// Cosmos DB (NoSQL API)-backed [`ChatMessageStore`]: every thread's
+/// Cosmos DB (NoSQL API)-backed [`HistoryProvider`]: every thread's
 /// messages are documents in one container, partitioned by `threadId`. See
 /// the module docs for the wire shape and this port's divergences
 /// from .NET's `CosmosChatMessageStore`.
 ///
 /// ```no_run
 /// use agent_framework_cosmos::CosmosChatMessageStore;
-/// use agent_framework_core::threads::ChatMessageStore;
 /// use agent_framework_core::types::Message;
 ///
 /// # async fn demo() -> agent_framework_core::error::Result<()> {
@@ -220,7 +220,7 @@ impl CosmosChatMessageStore {
 
     /// Remove every message in this thread: query all document ids scoped
     /// to this thread's partition, then delete each one. Not part of the
-    /// [`ChatMessageStore`] trait (which has no `clear` hook) — an
+    /// [`HistoryProvider`] trait (which has no `clear` hook) — an
     /// additional utility method, matching the equivalent `ClearMessagesAsync`
     /// on the .NET store.
     pub async fn clear(&self) -> Result<()> {
@@ -245,7 +245,7 @@ impl CosmosChatMessageStore {
     }
 
     /// Reconstruct a store from a value previously produced by
-    /// [`ChatMessageStore::serialize`] (the `cosmos_store_state` shape).
+    /// [`CosmosChatMessageStore::serialize`] (the `cosmos_store_state` shape).
     /// Mirrors `RedisChatMessageStore::from_state`; the `ChatMessageStore`
     /// trait itself has no restore hook, so this is provided as an
     /// inherent associated function.
@@ -276,11 +276,9 @@ impl CosmosChatMessageStore {
             Some(thread_id),
         )
     }
-}
 
-#[async_trait]
-impl ChatMessageStore for CosmosChatMessageStore {
-    async fn list_messages(&self) -> Result<Vec<Message>> {
+    /// The stored messages, in chronological order (`ORDER BY c.seq`).
+    pub async fn list_messages(&self) -> Result<Vec<Message>> {
         let docs = self
             .client
             .query_documents(
@@ -294,7 +292,9 @@ impl ChatMessageStore for CosmosChatMessageStore {
         docs.iter().map(parse_message_document).collect()
     }
 
-    async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
+    /// Append `messages` as individual documents. A no-op for an empty
+    /// `messages`.
+    pub async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -317,10 +317,10 @@ impl ChatMessageStore for CosmosChatMessageStore {
     /// database/container/thread id) rather than the message contents —
     /// Cosmos DB already persists the messages durably, so only the
     /// pointer back to them needs to survive. Mirrors
-    /// `RedisChatMessageStore::serialize`, including the `"type"`
+    /// `RedisChatMessageStore::to_dict`, including the `"type"`
     /// discriminator field. See [`Self::from_state`] for the security note
     /// on the embedded master key.
-    async fn serialize(&self) -> Result<Value> {
+    pub async fn serialize(&self) -> Result<Value> {
         Ok(serde_json::json!({
             "type": "cosmos_store_state",
             "thread_id": self.thread_id,
@@ -331,6 +331,37 @@ impl ChatMessageStore for CosmosChatMessageStore {
         }))
     }
 }
+
+#[async_trait]
+impl ContextProvider for CosmosChatMessageStore {
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        let stored = self.list_messages().await?;
+        let existing = std::mem::take(&mut ctx.messages);
+        ctx.messages = stored.into_iter().chain(existing).collect();
+        Ok(())
+    }
+
+    async fn after_run(
+        &self,
+        request_messages: &[Message],
+        response_messages: &[Message],
+        error: Option<&Error>,
+    ) -> Result<()> {
+        if error.is_none() {
+            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
+            combined.extend(request_messages.iter().cloned());
+            combined.extend(response_messages.iter().cloned());
+            self.add_messages(combined).await?;
+        }
+        Ok(())
+    }
+
+    fn is_history_provider(&self) -> bool {
+        true
+    }
+}
+
+impl HistoryProvider for CosmosChatMessageStore {}
 
 #[cfg(test)]
 mod tests {

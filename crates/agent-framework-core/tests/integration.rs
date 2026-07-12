@@ -102,7 +102,12 @@ async fn agent_streaming_updates_thread() {
     let client = MockClient::new(vec![ChatResponse::from_text("streamed reply")]);
     let agent = Agent::builder(client).build();
 
-    let mut thread = agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it directly
+    // (its `Arc<Mutex<..>>` is shared with the clone passed into `run_stream`).
+    let history = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread.context_providers.push(Arc::new(history.clone()));
+
     let mut stream = agent
         .run_stream("hello", Some(thread.clone()), None)
         .await
@@ -112,9 +117,8 @@ async fn agent_streaming_updates_thread() {
         text.push_str(&update.unwrap().text());
     }
     assert_eq!(text, "streamed reply");
-    // The shared store should now contain the user + assistant messages.
-    let history = thread.list_messages().await.unwrap();
-    assert_eq!(history.len(), 2);
+    // The shared history provider should now contain the user + assistant messages.
+    assert_eq!(history.list_messages().len(), 2);
     let _ = &mut thread;
 }
 
@@ -358,7 +362,7 @@ async fn tool_loop_reports_invalid_arguments() {
 
 /// A context provider that records lifecycle-hook activity: whether
 /// `after_run` fired, the error (if any) the last `after_run` carried, and
-/// every `session_id` observed by `before_run` (upstream renamed
+/// every `service_session_id` observed by `before_run` (upstream renamed
 /// `invoking`/`invoked` to `before_run`/`after_run` and removed
 /// `thread_created` entirely). Also injects an instruction so `before_run`
 /// has an observable effect.
@@ -366,16 +370,20 @@ async fn tool_loop_reports_invalid_arguments() {
 struct RecordingProvider {
     invoked: Arc<Mutex<bool>>,
     invoked_error: Arc<Mutex<Option<String>>>,
-    session_ids: Arc<Mutex<Vec<Option<String>>>>,
+    service_session_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[async_trait]
 impl ContextProvider for RecordingProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
-        self.session_ids
+        // `session_id` is always `Some` (the session's own generated id);
+        // `service_session_id` is the interesting signal here, reflecting
+        // service-managed adoption.
+        assert!(ctx.session_id.is_some(), "session_id is always populated");
+        self.service_session_ids
             .lock()
             .unwrap()
-            .push(ctx.session_id.clone());
+            .push(ctx.service_session_id.clone());
         ctx.add_instructions("remember: be brief");
         Ok(())
     }
@@ -521,7 +529,7 @@ async fn per_run_conversation_id_survives_on_a_local_thread() {
     let client = MockClient::new(vec![ChatResponse::from_text("ok")]);
     let probe = client.clone();
     let agent = Agent::builder(client).build();
-    let mut thread = agent.get_new_thread();
+    let mut thread = agent.create_session();
     let options = AgentRunOptions::new().with_chat_options(ChatOptions {
         conversation_id: Some("conv-override".into()),
         ..Default::default()
@@ -537,7 +545,7 @@ async fn per_run_conversation_id_survives_on_a_local_thread() {
 }
 
 #[tokio::test]
-async fn service_thread_id_wins_over_per_run_conversation_id() {
+async fn service_session_id_wins_over_per_run_conversation_id() {
     // Continuity contract: a service-managed thread's id drives the call even
     // when a per-run override is supplied.
     let resp = ChatResponse {
@@ -547,7 +555,7 @@ async fn service_thread_id_wins_over_per_run_conversation_id() {
     let client = MockClient::new(vec![resp]);
     let probe = client.clone();
     let agent = Agent::builder(client).build();
-    let mut thread = AgentThread::service("svc-1");
+    let mut thread = AgentSession::service("svc-1");
     let options = AgentRunOptions::new().with_chat_options(ChatOptions {
         conversation_id: Some("conv-override".into()),
         ..Default::default()
@@ -1065,7 +1073,11 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     .tool(tool)
     .build();
 
-    let mut thread = agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it directly
+    // after the run.
+    let history = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread.context_providers.push(Arc::new(history.clone()));
 
     // First run pauses awaiting approval; the request is surfaced on the agent
     // response and persisted to the thread.
@@ -1091,8 +1103,8 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     assert_eq!(*counter.lock().unwrap(), 1);
 
     // The thread retains the full approval exchange.
-    let history = thread.list_messages().await.unwrap();
-    assert!(history.iter().any(|m| !m.user_input_requests().is_empty()));
+    let recorded = history.list_messages();
+    assert!(recorded.iter().any(|m| !m.user_input_requests().is_empty()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,13 +1505,13 @@ async fn service_conversation_id_is_adopted_by_thread() {
 
     // Fresh agent threads start with an (empty) local store; the returned
     // service conversation id must still be adopted.
-    let mut thread = agent.get_new_thread();
+    let mut thread = agent.create_session();
     let response = agent
         .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
     assert_eq!(response.conversation_id.as_deref(), Some("conv-1"));
-    assert_eq!(thread.service_thread_id(), Some("conv-1"));
+    assert_eq!(thread.service_session_id(), Some("conv-1"));
 
     // Turn two must carry the id back to the service.
     agent
@@ -1547,7 +1559,7 @@ async fn service_thread_without_conversation_id_errors() {
     // The client succeeds but returns no conversation id.
     let client = MockClient::new(vec![ChatResponse::from_text("hi")]);
     let agent = Agent::builder(client).name("svc").build();
-    let mut thread = agent.get_new_thread_with_service_id("svc-thread").unwrap();
+    let mut thread = agent.create_session_with_service_id("svc-thread");
     let err = agent
         .run(vec![Message::user("hi")], Some(&mut thread))
         .await
@@ -1617,39 +1629,39 @@ impl ChatClient for AdoptServiceClient {
 }
 
 #[tokio::test]
-async fn before_run_observes_session_id_for_service_thread() {
+async fn before_run_observes_service_session_id_for_service_thread() {
     let provider = RecordingProvider::default();
-    let ids = provider.session_ids.clone();
+    let ids = provider.service_session_ids.clone();
     let agent = Agent::builder(EchoServiceClient)
         .context_provider(Arc::new(provider))
         .build();
 
-    let mut thread = agent.get_new_thread_with_service_id("svc-1").unwrap();
+    let mut thread = agent.create_session_with_service_id("svc-1");
     agent
         .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
 
-    // `before_run` observes both `session_id` and `service_session_id` set to
-    // the thread's service id (no thread_created hook any more).
+    // `before_run` observes `service_session_id` set to the thread's service
+    // id (no thread_created hook any more).
     assert_eq!(ids.lock().unwrap().clone(), vec![Some("svc-1".to_string())]);
 }
 
 #[tokio::test]
-async fn before_run_session_id_reflects_service_id_adopted_on_a_prior_run() {
+async fn before_run_service_session_id_reflects_service_id_adopted_on_a_prior_run() {
     let provider = RecordingProvider::default();
-    let ids = provider.session_ids.clone();
+    let ids = provider.service_session_ids.clone();
     let agent = Agent::builder(AdoptServiceClient)
         .context_provider(Arc::new(provider))
         .build();
 
-    // First run: a fresh local thread has no session id yet.
-    let mut thread = agent.get_new_thread();
+    // First run: a fresh local thread has no service session id yet.
+    let mut thread = agent.create_session();
     agent
         .run(vec![Message::user("hi")], Some(&mut thread))
         .await
         .unwrap();
-    assert_eq!(thread.service_thread_id(), Some("adopted-1"));
+    assert_eq!(thread.service_session_id(), Some("adopted-1"));
 
     // Second run: the thread adopted a service id from the first run, so
     // `before_run` now observes it.
@@ -1769,46 +1781,62 @@ async fn structured_output_value_autofilled_on_bare_client() {
 }
 
 // ===========================================================================
-// Task 7: thread persistence (agent-level: factory, deserialize, service id)
+// Task 7: session + history-provider persistence (agent-level)
 // ===========================================================================
 
 #[tokio::test]
-async fn chat_message_store_factory_used_by_get_new_thread() {
-    // The factory seeds a marker so we can observe it was used.
-    let agent = Agent::builder(MockClient::new(vec![]))
-        .chat_message_store_factory(|| {
-            Arc::new(InMemoryChatMessageStore::with_messages(vec![
-                Message::system("MARKER"),
-            ]))
-        })
-        .build();
-    let thread = agent.get_new_thread();
-    let msgs = thread.list_messages().await.unwrap();
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0].text(), "MARKER");
+async fn create_session_eagerly_attaches_a_history_provider() {
+    // A fresh local session already carries a history provider (rather than
+    // deferring attachment to the first `run`), so that a clone taken before
+    // streaming observes the post-run write-back.
+    let agent = Agent::builder(MockClient::new(vec![])).build();
+    let session = agent.create_session();
+    assert_eq!(session.context_providers.len(), 1);
+    assert!(session.context_providers[0].is_history_provider());
+
+    // A service-managed session gets no history provider (the service owns
+    // history server-side).
+    let svc_session = agent.create_session_with_service_id("svc-1");
+    assert!(svc_session.context_providers.is_empty());
 }
 
 #[tokio::test]
-async fn agent_deserialize_thread_roundtrips_history() {
+async fn agent_session_and_history_provider_round_trip() {
+    // `AgentSession::to_dict` and `InMemoryHistoryProvider::to_dict` are
+    // serialized independently -- history is deliberately NOT part of the
+    // session's own wire shape any more.
     let agent = Agent::builder(MockClient::new(vec![])).build();
-    let store = Arc::new(InMemoryChatMessageStore::with_messages(vec![
+    let mut session = AgentSession::new();
+    let history = InMemoryHistoryProvider::with_messages(vec![
         Message::user("hi"),
         Message::assistant("hello"),
-    ]));
-    let state = AgentThread::local(store).serialize().await.unwrap();
+    ]);
+    session.context_providers.push(Arc::new(history.clone()));
 
-    let restored = agent.deserialize_thread(&state).await.unwrap();
-    let msgs = restored.list_messages().await.unwrap();
+    let session_state = session.to_dict();
+    let history_state = history.to_dict();
+
+    let restored_session = agent.session_from_dict(&session_state).unwrap();
+    assert_eq!(restored_session.session_id(), session.session_id());
+    // `context_providers` (including the history provider) are not restored
+    // by `AgentSession::from_dict`; callers reattach them explicitly.
+    assert!(restored_session.context_providers.is_empty());
+
+    let restored_history = InMemoryHistoryProvider::from_dict(&history_state).unwrap();
+    let msgs = restored_history.list_messages();
     assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].text(), "hi");
     assert_eq!(msgs[1].text(), "hello");
 }
 
 #[tokio::test]
-async fn agent_get_new_thread_with_service_id() {
+async fn agent_create_session_with_service_id() {
     let agent = Agent::builder(MockClient::new(vec![])).build();
-    let thread = agent.get_new_thread_with_service_id("svc-9").unwrap();
-    assert_eq!(thread.service_thread_id(), Some("svc-9"));
-    assert!(thread.message_store().is_none());
+    let thread = agent.create_session_with_service_id("svc-9");
+    assert_eq!(thread.service_session_id(), Some("svc-9"));
+    // A service-managed session has no auto-attached history provider (the
+    // service owns history server-side).
+    assert!(thread.context_providers.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,7 +1942,7 @@ async fn trait_default_run_stream_buffers_for_minimal_agent() {
         async fn run(
             &self,
             messages: Vec<Message>,
-            _thread: Option<&mut AgentThread>,
+            _thread: Option<&mut AgentSession>,
         ) -> Result<AgentResponse> {
             let text = messages.last().map(Message::text).unwrap_or_default();
             Ok(AgentResponse {

@@ -206,22 +206,22 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
     let agent = CopilotStudioAgent::new(connection, StaticTokenProvider::new("test-token"))
         .with_name("My Copilot");
 
-    let mut thread = agent.get_new_thread();
+    let mut session = agent.create_session();
     let first = agent
         .run(
             vec![Message::user("What is the capital of France?")],
-            Some(&mut thread),
+            Some(&mut session),
         )
         .await
         .unwrap();
     assert_eq!(first.text(), "Bonjour! The capital of France is Paris.");
     assert_eq!(first.response_id.as_deref(), Some("m1"));
-    assert_eq!(thread.service_thread_id(), Some("conv-42"));
+    assert_eq!(session.service_session_id(), Some("conv-42"));
 
     let second = agent
         .run(
             vec![Message::user("What about tomorrow?")],
-            Some(&mut thread),
+            Some(&mut session),
         )
         .await
         .unwrap();
@@ -229,7 +229,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
     // Conversation id is unchanged: no second `start_conversation` call was
     // made (the server only programmed 3 responses total; if a fourth
     // connection had been attempted, `handle.join()` below would hang/panic).
-    assert_eq!(thread.service_thread_id(), Some("conv-42"));
+    assert_eq!(session.service_session_id(), Some("conv-42"));
 
     let requests = handle.join().expect("server thread panicked");
     assert_eq!(requests.len(), 3);
@@ -271,7 +271,7 @@ async fn full_exchange_start_conversation_then_two_turns_with_continuity() {
     );
 
     // Request 3: second turn, same conversation id -- proves continuity was
-    // carried on the wire, not just in the in-memory thread state.
+    // carried on the wire, not just in the in-memory session state.
     assert_eq!(
         requests[2].path,
         "/conversations/conv-42?api-version=2022-03-01-preview"

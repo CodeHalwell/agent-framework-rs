@@ -9,12 +9,12 @@
 //! as `user_input_requests` on the response (mirroring Python, which maps
 //! `RequestInfoEvent` to a `request_info` function-approval request).
 //!
-//! Both `run` and `run_stream_with_thread` write the input and response
-//! messages back to the caller's [`AgentThread`] (mirroring
-//! [`Agent`](crate::agent::Agent) and, upstream, Python's
+//! Both `run` and `run_stream_with_thread` fire the session's context
+//! providers' `after_run` hook with the input and response messages
+//! (mirroring [`Agent`](crate::agent::Agent) and, upstream, Python's
 //! `WorkflowAgent._notify_thread_of_new_messages` calls) — a write-back only,
-//! not a read-back: prior thread history is not fed into the workflow's
-//! input, matching Python's behavior exactly.
+//! not a read-back: `before_run` is never invoked, so prior session history is
+//! not fed into the workflow's input, matching Python's behavior exactly.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +25,8 @@ use serde_json::Value;
 
 use crate::agent::{AgentRunOptions, AgentRunStream, SupportsAgentRun};
 use crate::error::Result;
-use crate::threads::AgentThread;
+use crate::history::ensure_history_provider;
+use crate::session::AgentSession;
 use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::{
     AgentResponse, AgentResponseUpdate, Content, FunctionApprovalRequestContent, FunctionArguments,
@@ -102,30 +103,32 @@ impl WorkflowAgent {
     }
 
     /// Stream the workflow's agent activity and, once the stream completes,
-    /// write back to `thread` the way
+    /// fire `session`'s context providers' `after_run` hook the way
     /// [`Agent::run_stream`](crate::agent::Agent::run_stream) does:
     /// `messages` and the response messages reconstructed from the emitted
-    /// updates are both persisted via [`AgentThread::on_new_messages`]. An
-    /// infallible inherent convenience; the object-safe [`SupportsAgentRun::run_stream`]
-    /// trait method wraps this in `Ok(..)`.
+    /// updates are passed through. An infallible inherent convenience; the
+    /// object-safe [`SupportsAgentRun::run_stream`] trait method wraps this in
+    /// `Ok(..)`.
     ///
     /// Mirrors Python's `WorkflowAgent.run_stream`, which likewise only
     /// notifies the thread of new messages after the stream is exhausted — it
-    /// does not feed the thread's prior history back into the workflow's own
+    /// does not feed the session's prior history back into the workflow's own
     /// input (see [`SupportsAgentRun::run`] on this type for the same convention on the
     /// non-streaming path).
     ///
-    /// Because message stores are shared via `Arc`, the write-back is
-    /// observable on the original thread through any clone of it once the
-    /// returned stream is fully consumed (same pattern as `Agent`'s).
+    /// Because a history provider's storage is shared via `Arc`, the
+    /// write-back is observable on the original session through any clone of
+    /// it once the returned stream is fully consumed (same pattern as
+    /// `Agent`'s).
     pub fn run_stream_with_thread(
         &self,
         messages: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
     ) -> AgentRunStream {
-        let thread = thread.unwrap_or_else(|| self.get_new_thread());
+        let mut session = session.unwrap_or_else(|| self.create_session());
+        ensure_history_provider(&mut session);
         let inner = self.stream_events(messages.clone());
-        Box::pin(forward_and_persist(inner, thread, messages))
+        Box::pin(forward_and_persist(inner, session, messages))
     }
 
     /// Wrap this workflow-agent as a [`ToolDefinition`] callable by another
@@ -234,17 +237,18 @@ fn convert_event(event: &WorkflowEvent, name: Option<&str>) -> Option<AgentRespo
     }
 }
 
-/// Forward `inner`'s updates unchanged, and once it completes, write both
-/// `input` and the reconstructed response messages back to `thread`. Used by
+/// Forward `inner`'s updates unchanged, and once it completes, fire
+/// `session`'s context providers' `after_run` hook with both `input` and the
+/// reconstructed response messages. Used by
 /// [`WorkflowAgent::run_stream_with_thread`]; mirrors
 /// [`Agent`](crate::agent::Agent)'s analogous internal stream
 /// forwarder.
 fn forward_and_persist(
     inner: AgentRunStream,
-    thread: AgentThread,
+    session: AgentSession,
     input: Vec<Message>,
 ) -> impl futures::Stream<Item = Result<AgentResponseUpdate>> + Send {
-    let finish: Option<(AgentThread, Vec<Message>)> = Some((thread, input));
+    let finish: Option<(AgentSession, Vec<Message>)> = Some((session, input));
     futures::stream::unfold(
         (inner, Vec::<AgentResponseUpdate>::new(), false, finish),
         move |(mut inner, mut collected, done, mut finish)| async move {
@@ -258,13 +262,12 @@ fn forward_and_persist(
                 }
                 Some(Err(e)) => Some((Err(e), (inner, collected, true, finish))),
                 None => {
-                    if let Some((mut thread, input)) = finish.take() {
+                    if let Some((session, input)) = finish.take() {
                         let response = AgentResponse::from_updates(collected.clone());
-                        if let Err(e) = thread.on_new_messages(input.clone()).await {
-                            return Some((Err(e), (inner, collected, true, None)));
-                        }
-                        if let Err(e) = thread.on_new_messages(response.messages.clone()).await {
-                            return Some((Err(e), (inner, collected, true, None)));
+                        for cp in session.context_providers {
+                            if let Err(e) = cp.after_run(&input, &response.messages, None).await {
+                                return Some((Err(e), (inner, collected, true, None)));
+                            }
                         }
                     }
                     None
@@ -279,16 +282,17 @@ impl SupportsAgentRun for WorkflowAgent {
     async fn run(
         &self,
         messages: Vec<Message>,
-        thread: Option<&mut AgentThread>,
+        session: Option<&mut AgentSession>,
     ) -> Result<AgentResponse> {
-        let mut owned_thread;
-        let thread: &mut AgentThread = match thread {
-            Some(t) => t,
+        let mut owned_session;
+        let session: &mut AgentSession = match session {
+            Some(s) => s,
             None => {
-                owned_thread = self.get_new_thread();
-                &mut owned_thread
+                owned_session = self.create_session();
+                &mut owned_session
             }
         };
+        ensure_history_provider(session);
 
         let input = serde_json::to_value(&messages).unwrap_or_else(|_| Value::Array(Vec::new()));
         let run = self.workflow.run(input).await?;
@@ -304,15 +308,17 @@ impl SupportsAgentRun for WorkflowAgent {
             ));
         }
 
-        // Notify the thread of the new messages (both the input and the
-        // response), exactly like `Agent::run`. Mirrors Python's
-        // `WorkflowAgent.run`, which calls `_notify_thread_of_new_messages`
-        // with the same two message sets after collecting the run's updates;
-        // like Python, this does not feed the thread's prior history back
-        // into the workflow's own input — it is a write-back, not a
+        // Fire the session's context providers' `after_run` hook with both
+        // the input and the response messages, exactly like `Agent::run`.
+        // Mirrors Python's `WorkflowAgent.run`, which calls
+        // `_notify_thread_of_new_messages` with the same two message sets
+        // after collecting the run's updates; like Python, `before_run` is
+        // never invoked here, so prior session history is not fed back into
+        // the workflow's own input — this is a write-back, not a
         // read-and-write.
-        thread.on_new_messages(messages.clone()).await?;
-        thread.on_new_messages(response_messages.clone()).await?;
+        for cp in session.context_providers.clone() {
+            cp.after_run(&messages, &response_messages, None).await?;
+        }
 
         Ok(AgentResponse {
             messages: response_messages,
@@ -321,13 +327,14 @@ impl SupportsAgentRun for WorkflowAgent {
     }
 
     /// Real streaming override: maps the workflow's live events to agent
-    /// updates as they happen, with thread write-back on completion. Per-run
-    /// [`AgentRunOptions`] are not supported (the wrapped workflow's executors
-    /// carry their own options); non-empty options are ignored with a warning.
+    /// updates as they happen, with the session's context providers notified
+    /// on completion. Per-run [`AgentRunOptions`] are not supported (the
+    /// wrapped workflow's executors carry their own options); non-empty
+    /// options are ignored with a warning.
     async fn run_stream(
         &self,
         messages: Vec<Message>,
-        thread: Option<AgentThread>,
+        session: Option<AgentSession>,
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         if let Some(opts) = &options {
@@ -338,7 +345,7 @@ impl SupportsAgentRun for WorkflowAgent {
                 );
             }
         }
-        Ok(self.run_stream_with_thread(messages, thread))
+        Ok(self.run_stream_with_thread(messages, session))
     }
 
     fn id(&self) -> &str {
@@ -349,16 +356,17 @@ impl SupportsAgentRun for WorkflowAgent {
         self.name.as_deref()
     }
 
-    fn get_new_thread(&self) -> AgentThread {
-        // Eagerly create a local in-memory store, rather than relying on the
-        // trait default `AgentThread::new()` (which defers store creation
-        // until the first `on_new_messages` call). `run_stream_with_thread`
-        // takes `Option<AgentThread>` *by value*, like `Agent::run_stream`
-        // does, so the only way a caller observes the post-stream write-back
-        // through a clone taken beforehand is if the store (and therefore its
-        // `Arc`) already exists at clone time. Mirrors
-        // `Agent::get_new_thread`.
-        AgentThread::local(Arc::new(crate::threads::InMemoryChatMessageStore::new()))
+    fn create_session(&self) -> AgentSession {
+        // Eagerly attach a fresh `InMemoryHistoryProvider`, rather than
+        // relying solely on `ensure_history_provider` being called later.
+        // `run_stream_with_thread` takes `Option<AgentSession>` *by value*,
+        // like `Agent::run_stream` does, so the only way a caller observes
+        // the post-stream write-back through a clone taken beforehand is if
+        // the provider (and therefore its `Arc`) already exists at clone
+        // time. Mirrors `Agent::create_session`.
+        let mut session = AgentSession::new();
+        ensure_history_provider(&mut session);
+        session
     }
 }
 

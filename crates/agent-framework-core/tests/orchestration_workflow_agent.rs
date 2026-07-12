@@ -163,15 +163,20 @@ async fn workflow_agent_streams_agent_updates() {
 async fn workflow_agent_run_persists_input_and_response_to_thread() {
     // A single-participant sequential workflow whose (mocked) agent answers
     // "reply-1" then "reply-2" across two separate `run` calls on the same
-    // thread.
+    // session.
     let a = agent("A", vec!["reply-1", "reply-2"]);
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "solo");
 
-    let mut thread = wf_agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it
+    // directly (`Agent::run`'s auto-attached one isn't downcastable from a
+    // `dyn ContextProvider`).
+    let history = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread.context_providers.push(Arc::new(history.clone()));
     assert!(
-        thread.list_messages().await.unwrap().is_empty(),
-        "a fresh thread starts empty"
+        history.list_messages().is_empty(),
+        "a fresh session starts empty"
     );
 
     // --- First run ---
@@ -185,21 +190,21 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
         resp1.messages
     );
 
-    let after_first = thread.list_messages().await.unwrap();
+    let after_first = history.list_messages();
     assert!(
         !after_first.is_empty(),
-        "the thread must be populated after the first run (input write-back missing)"
+        "the history provider must be populated after the first run (write-back missing)"
     );
     assert!(
         after_first.iter().any(|m| m.text() == "first"),
-        "input message set 1 missing from thread: {after_first:?}"
+        "input message set 1 missing from history: {after_first:?}"
     );
     assert!(
         after_first.iter().any(|m| m.text() == "reply-1"),
-        "response message set 1 missing from thread: {after_first:?}"
+        "response message set 1 missing from history: {after_first:?}"
     );
 
-    // --- Second run, same thread ---
+    // --- Second run, same session ---
     let resp2 = wf_agent
         .run(vec![Message::user("second")], Some(&mut thread))
         .await
@@ -210,15 +215,15 @@ async fn workflow_agent_run_persists_input_and_response_to_thread() {
         resp2.messages
     );
 
-    let after_second = thread.list_messages().await.unwrap();
+    let after_second = history.list_messages();
     assert!(
         after_second.len() > after_first.len(),
-        "the second run must append to, not replace, the thread history \
+        "the second run must append to, not replace, the history \
          (before: {after_first:?}, after: {after_second:?})"
     );
     // Matching `Agent`'s exact convention (see `agent_surfaces_and_resolves_approval_round_trip`
     // in `tests/integration.rs`): both runs' input and response message sets
-    // are all present in the thread store after two runs.
+    // are all present in the history provider after two runs.
     assert!(after_second.iter().any(|m| m.text() == "first"));
     assert!(after_second.iter().any(|m| m.text() == "reply-1"));
     assert!(after_second.iter().any(|m| m.text() == "second"));
@@ -243,7 +248,15 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
     let workflow = SequentialBuilder::new().add(a).build().unwrap();
     let wf_agent = WorkflowAgent::new(workflow, "streamer");
 
-    let thread = wf_agent.get_new_thread();
+    // Attach an explicit history provider so the test can inspect it
+    // directly; its `Arc<Mutex<..>>` is shared with the clone passed into
+    // `run_stream_with_thread`.
+    let history_provider = InMemoryHistoryProvider::new();
+    let mut thread = AgentSession::new();
+    thread
+        .context_providers
+        .push(Arc::new(history_provider.clone()));
+
     let mut stream =
         wf_agent.run_stream_with_thread(vec![Message::user("go")], Some(thread.clone()));
     let mut text = String::new();
@@ -252,17 +265,17 @@ async fn workflow_agent_run_stream_with_thread_persists_messages() {
     }
     assert!(text.contains("streamed-reply"), "streamed text: {text}");
 
-    // Because message stores are shared via `Arc`, the write-back that
-    // happened on the internal thread clone is visible through this clone
-    // too (same pattern as `Agent::run_stream`).
-    let history = thread.list_messages().await.unwrap();
+    // Because history-provider storage is shared via `Arc`, the write-back
+    // that happened on the internal session clone is visible through this
+    // clone too (same pattern as `Agent::run_stream`).
+    let history = history_provider.list_messages();
     assert!(
         history.iter().any(|m| m.text() == "go"),
-        "input missing from thread: {history:?}"
+        "input missing from history: {history:?}"
     );
     assert!(
         history.iter().any(|m| m.text() == "streamed-reply"),
-        "response missing from thread: {history:?}"
+        "response missing from history: {history:?}"
     );
 }
 

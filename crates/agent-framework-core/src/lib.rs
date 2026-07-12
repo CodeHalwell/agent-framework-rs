@@ -11,7 +11,10 @@
 //! - [`compaction`] — conversation-history compaction strategies and the
 //!   [`Tokenizer`](compaction::Tokenizer) abstraction.
 //! - [`tools`] — executable tools and hosted-tool markers.
-//! - [`threads`] — conversation threads and message stores.
+//! - [`session`] — [`AgentSession`](session::AgentSession), a lightweight
+//!   conversation identity + state container.
+//! - [`history`] — [`HistoryProvider`](history::HistoryProvider)s: conversation
+//!   history as a [`ContextProvider`](memory::ContextProvider).
 //! - [`memory`] — context / memory providers.
 //! - [`middleware`] — agent, chat, and function middleware pipelines.
 //! - [`observability`] — OpenTelemetry GenAI-style `tracing` instrumentation.
@@ -39,12 +42,13 @@ pub mod agent;
 pub mod client;
 pub mod compaction;
 pub mod error;
+pub mod history;
 pub mod memory;
 pub mod middleware;
 pub mod observability;
+pub mod session;
 pub mod settings;
 pub mod streaming;
-pub mod threads;
 pub mod tools;
 pub mod types;
 pub mod workflow;
@@ -65,13 +69,14 @@ pub mod prelude {
         TokenBudget, Tokenizer, Truncation,
     };
     pub use crate::error::{Error, Result};
+    pub use crate::history::{FileHistoryProvider, HistoryProvider, InMemoryHistoryProvider};
     pub use crate::memory::{ContextProvider, SessionContext};
     pub use crate::middleware::{
         AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
+    pub use crate::session::AgentSession;
     pub use crate::settings::{load_setting, SecretString};
-    pub use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
     pub use crate::tools::{
         hosted_code_interpreter, hosted_file_search, hosted_image_generation, hosted_mcp,
         hosted_web_search, ApprovalMode, FunctionInvocationConfig, FunctionTool, McpApprovalMode,

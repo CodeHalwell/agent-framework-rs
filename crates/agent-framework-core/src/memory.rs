@@ -72,6 +72,17 @@ pub trait ContextProvider: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Whether this provider manages conversation history (a
+    /// [`HistoryProvider`](crate::history::HistoryProvider)). [`Agent`](crate::agent::Agent)
+    /// and [`WorkflowAgent`](crate::workflow::WorkflowAgent) use this to
+    /// detect an already-attached history provider among a session's
+    /// `context_providers` and avoid auto-attaching a redundant
+    /// [`InMemoryHistoryProvider`](crate::history::InMemoryHistoryProvider).
+    /// Defaults to `false`; history providers override it to `true`.
+    fn is_history_provider(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
