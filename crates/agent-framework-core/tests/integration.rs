@@ -137,7 +137,7 @@ async fn tool_loop_executes_function() {
     let answer = ChatResponse::from_text("The sum is 5.");
     let client = MockClient::new(vec![ask, answer]);
 
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add two integers.",
         json!({
@@ -325,7 +325,7 @@ async fn tool_loop_reports_invalid_arguments() {
 
     let invoked = Arc::new(Mutex::new(false));
     let invoked_clone = invoked.clone();
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add.",
         json!({"type":"object","properties":{}}),
@@ -425,7 +425,7 @@ async fn streaming_tool_replay_preserves_message_boundaries() {
     };
     let answer = ChatResponse::from_text("final answer");
 
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -481,7 +481,7 @@ async fn streaming_tool_replay_preserves_usage_finish_reason_and_conversation_id
         ..ChatResponse::from_text("final answer")
     };
 
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -613,7 +613,7 @@ async fn service_created_conversation_id_propagates_into_tool_followup() {
         ..Default::default()
     };
     let second = ChatResponse::from_text("done");
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -672,7 +672,7 @@ async fn duplicate_provider_message_ids_do_not_merge_on_replay() {
         messages: vec![final_msg],
         ..Default::default()
     };
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -725,7 +725,7 @@ async fn provider_resolved_tool_calls_are_not_executed_locally() {
         )],
         ..Default::default()
     };
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -767,7 +767,7 @@ async fn chat_level_tool_stream_replay_carries_finish_reason() {
         finish_reason: Some(FinishReason::stop()),
         ..ChatResponse::from_text("done")
     };
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -958,7 +958,7 @@ fn agent_update_aggregation() {
 
 /// A tool requiring approval that records how many times it actually executed.
 fn approval_tool(counter: Arc<Mutex<u32>>) -> ToolDefinition {
-    AiFunction::new(
+    FunctionTool::new(
         "get_secret",
         "Return the secret value.",
         json!({ "type": "object", "properties": {} }),
@@ -1289,7 +1289,7 @@ async fn function_middleware_rewrites_arguments() {
 
     let seen_args: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let seen_args_clone = seen_args.clone();
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add two integers.",
         json!({"type":"object","properties":{}}),
@@ -1348,7 +1348,7 @@ async fn function_middleware_blocks_execution() {
 
     let invoked = Arc::new(Mutex::new(false));
     let invoked_clone = invoked.clone();
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add two integers.",
         json!({"type":"object","properties":{}}),
@@ -1433,7 +1433,7 @@ async fn function_middleware_order_is_onion_nested() {
         ChatResponse::from_text("done"),
     ]);
 
-    let noop = AiFunction::new(
+    let noop = FunctionTool::new(
         "noop",
         "noop",
         json!({"type":"object","properties":{}}),
@@ -2073,7 +2073,7 @@ async fn declaration_only_tool_call_is_returned_to_caller() {
     // A real executable tool is present so the invocation loop actually engages;
     // the model instead calls the declaration-only tool, which the loop must
     // return unexecuted rather than error on.
-    let real_tool = AiFunction::new(
+    let real_tool = FunctionTool::new(
         "real",
         "",
         json!({ "type": "object", "properties": {} }),
@@ -2115,7 +2115,7 @@ async fn unknown_tool_call_is_not_declaration_only() {
     let answer = ChatResponse::from_text("done");
     // A real executable tool is present so the loop engages, but the model calls
     // a different, unknown tool.
-    let real_tool = AiFunction::new(
+    let real_tool = FunctionTool::new(
         "real",
         "",
         json!({ "type": "object", "properties": {} }),
@@ -2389,7 +2389,7 @@ async fn tool_source_tool_is_invokable_by_the_function_loop() {
     let answer = ChatResponse::from_text("42");
     let client = MockClient::new(vec![ask, answer]);
 
-    let double = AiFunction::new(
+    let double = FunctionTool::new(
         "double",
         "Double a number.",
         json!({

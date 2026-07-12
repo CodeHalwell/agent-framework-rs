@@ -55,7 +55,7 @@ middleware.
 | `quickstart` | Minimal `ChatAgent` + OpenAI in a few lines | `OPENAI_API_KEY` |
 | `streaming` | Token-by-token agent streaming | `OPENAI_API_KEY` |
 | `tools` | Local tool calling via the automatic function-invocation loop | `OPENAI_API_KEY` |
-| `typed_tools` | `AiFunction::typed` derives a JSON Schema from a `#[derive(JsonSchema)]` struct | offline (live model optional, `OPENAI_API_KEY`) |
+| `typed_tools` | `FunctionTool::typed` derives a JSON Schema from a `#[derive(JsonSchema)]` struct | offline (live model optional, `OPENAI_API_KEY`) |
 | `structured_output` | `ResponseFormat::json_schema` + `response.parse_json::<T>()` | `OPENAI_API_KEY` |
 | `approvals` | Human-in-the-loop tool approval: pause, inspect, approve, resume | `OPENAI_API_KEY` |
 | `agent_as_tool` | Compose agents: a specialist exposed as a tool via `ChatAgent::as_tool` | `OPENAI_API_KEY` |

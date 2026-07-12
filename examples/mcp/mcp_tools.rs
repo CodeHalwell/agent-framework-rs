@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
 
     // Spawns the server subprocess (if not already connected), performs the
     // MCP `initialize` handshake, and lists its tools as `ToolDefinition`s --
-    // ready to hand to a `ChatAgent` exactly like a local `AiFunction`.
+    // ready to hand to a `ChatAgent` exactly like a local `FunctionTool`.
     let tools = mcp.tool_definitions().await?;
     println!("discovered {} MCP tool(s):", tools.len());
     for tool in &tools {

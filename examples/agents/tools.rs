@@ -13,7 +13,7 @@ use serde_json::json;
 async fn main() -> Result<()> {
     let client = OpenAIClient::from_env("gpt-4o-mini")?;
 
-    let get_weather = AiFunction::new(
+    let get_weather = FunctionTool::new(
         "get_weather",
         "Get the current weather for a city.",
         json!({

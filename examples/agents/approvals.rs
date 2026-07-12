@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     // A tool that always requires a human sign-off before it runs.
     // `ApprovalMode` lives on the tool itself; the function-invocation loop
     // checks it for every call before executing.
-    let delete_file = AiFunction::new(
+    let delete_file = FunctionTool::new(
         "delete_file",
         "Permanently delete a file by name.",
         json!({

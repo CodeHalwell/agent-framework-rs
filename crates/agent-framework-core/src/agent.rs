@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::memory::{AggregateContextProvider, ContextProvider};
 use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::threads::{AgentThread, ChatMessageStore, InMemoryChatMessageStore};
-use crate::tools::{AiFunction, ToolDefinition, ToolSource};
+use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
 use crate::types::{
     prepare_messages, AgentRunResponse, AgentRunResponseUpdate, ChatMessage, ChatOptions,
     ChatResponse, IntoMessages, ResponseFormat,
@@ -1235,7 +1235,7 @@ impl ChatAgent {
             "required": [arg_name.clone()],
         });
         let arg_key = arg_name;
-        AiFunction::new(tool_name, description, schema, move |args: Value| {
+        FunctionTool::new(tool_name, description, schema, move |args: Value| {
             let agent = agent.clone();
             let arg_key = arg_key.clone();
             async move {

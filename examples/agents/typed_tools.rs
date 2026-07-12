@@ -1,4 +1,4 @@
-//! Typed tools: `AiFunction::typed` derives a JSON Schema straight from a
+//! Typed tools: `FunctionTool::typed` derives a JSON Schema straight from a
 //! `#[derive(Deserialize, JsonSchema)]` struct instead of a hand-written
 //! `serde_json::Value` (compare with `agents/tools.rs`, which builds the
 //! schema by hand).
@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// The tool's arguments. `Deserialize` lets `Tool::invoke` parse the model's
-/// JSON arguments into this type; `JsonSchema` is what `AiFunction::typed`
+/// JSON arguments into this type; `JsonSchema` is what `FunctionTool::typed`
 /// uses to derive the parameters schema below -- no hand-written schema
 /// needed.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -33,10 +33,10 @@ struct WeatherArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `AiFunction::typed` derives the parameters schema from `WeatherArgs`
+    // `FunctionTool::typed` derives the parameters schema from `WeatherArgs`
     // via `schemars` at construction time, and deserializes the model's raw
     // JSON arguments into `WeatherArgs` before calling the closure.
-    let get_weather = AiFunction::typed(
+    let get_weather = FunctionTool::typed(
         "get_weather",
         "Get the current weather for a city.",
         |args: WeatherArgs| async move {

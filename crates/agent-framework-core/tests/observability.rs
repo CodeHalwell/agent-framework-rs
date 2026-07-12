@@ -409,7 +409,7 @@ fn chat_span_records_response_model() {
 // -- chat span: content-capture gating ---------------------------------
 
 fn options_with_tool() -> ChatOptions {
-    let tool = AiFunction::new(
+    let tool = FunctionTool::new(
         "get_weather",
         "gets the weather",
         serde_json::json!({"type": "object", "properties": {}}),

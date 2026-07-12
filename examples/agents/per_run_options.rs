@@ -54,7 +54,7 @@ impl ChatClient for ReportingClient {
 #[tokio::main]
 async fn main() -> Result<()> {
     // A tool available only for the second run below.
-    let scratch_note = AiFunction::new(
+    let scratch_note = FunctionTool::new(
         "scratch_note",
         "Jot down a scratch note (per-run-only tool).",
         json!({ "type": "object", "properties": {} }),

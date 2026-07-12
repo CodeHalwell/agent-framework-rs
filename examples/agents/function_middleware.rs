@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     let answer = ChatResponse::from_text("Done -- check the tool result above.");
     let client = MockClient::new(vec![ask, answer]);
 
-    let add = AiFunction::new(
+    let add = FunctionTool::new(
         "add",
         "Add two integers.",
         json!({

@@ -826,7 +826,7 @@ pub fn classify_last_error(run: &Value) -> Error {
 mod tests {
     use super::*;
     use agent_framework_core::tools::{
-        hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, AiFunction,
+        hosted_code_interpreter, hosted_file_search, hosted_mcp, hosted_web_search, FunctionTool,
     };
     use agent_framework_core::types::FunctionResultContent;
 
@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn run_body_includes_tools_only_when_choice_allows() {
-        let tool = AiFunction::new(
+        let tool = FunctionTool::new(
             "get_weather",
             "Get weather",
             json!({"type": "object", "properties": {}}),

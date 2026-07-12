@@ -87,7 +87,7 @@ async fn get_weather_binds_and_executes_native_tool() {
     // A native tool the spec's function tool binds to (via `bindings.get_weather`).
     let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let calls_for_tool = calls.clone();
-    let get_weather = AiFunction::new(
+    let get_weather = FunctionTool::new(
         "get_weather",
         "native get weather",
         json!({"type": "object", "properties": {"location": {"type": "string"}}}),

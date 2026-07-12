@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::agent::{Agent, AgentRunOptions, AgentRunStream};
 use crate::error::Result;
 use crate::threads::AgentThread;
-use crate::tools::{AiFunction, ToolDefinition};
+use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::{
     AgentRunResponse, AgentRunResponseUpdate, ChatMessage, Content, FunctionApprovalRequestContent,
     FunctionArguments, FunctionCallContent, Role,
@@ -140,7 +140,7 @@ impl WorkflowAgent {
             "properties": { "task": { "type": "string", "description": format!("Task for {tool_name}") } },
             "required": ["task"],
         });
-        AiFunction::new(tool_name, description, schema, move |args: Value| {
+        FunctionTool::new(tool_name, description, schema, move |args: Value| {
             let agent = agent.clone();
             async move {
                 let task = args
