@@ -637,14 +637,24 @@ impl Tool for AiFunction {
     /// [`AiFunction::invocation_count`] is bumped again, so calling an
     /// already-exhausted function any number of further times does not
     /// drift its counters.
+    ///
+    /// The invocation slot is *reserved atomically* (`fetch_update`), because
+    /// the function-invocation loop executes a model's parallel calls to the
+    /// same tool concurrently — a plain check-then-increment would let two
+    /// racing calls both slip under `max_invocations`.
     async fn invoke(&self, arguments: Value) -> Result<Value> {
+        let invocation_limit_error = || {
+            Error::tool(format!(
+                "Function '{}' has reached its maximum invocation limit, \
+                 you can no longer use this tool.",
+                self.name
+            ))
+        };
+        // Fast-path check first so the error precedence between the two
+        // limits matches Python's sequential check order.
         if let Some(max) = self.max_invocations {
             if self.invocation_count.load(Ordering::SeqCst) >= max {
-                return Err(Error::tool(format!(
-                    "Function '{}' has reached its maximum invocation limit, \
-                     you can no longer use this tool.",
-                    self.name
-                )));
+                return Err(invocation_limit_error());
             }
         }
         if let Some(max) = self.max_invocation_exceptions {
@@ -656,7 +666,24 @@ impl Tool for AiFunction {
                 )));
             }
         }
-        self.invocation_count.fetch_add(1, Ordering::SeqCst);
+        match self.max_invocations {
+            Some(max) => {
+                // Reserve or bail: a concurrent call may have consumed the
+                // last slot since the fast-path check above.
+                if self
+                    .invocation_count
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                        (c < max).then(|| c + 1)
+                    })
+                    .is_err()
+                {
+                    return Err(invocation_limit_error());
+                }
+            }
+            None => {
+                self.invocation_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let result = (self.func)(arguments).await;
         if result.is_err() {
             self.invocation_exception_count
@@ -995,6 +1022,45 @@ mod tests {
             "tool error: Function 'f' has reached its maximum invocation limit, \
              you can no longer use this tool."
         );
+    }
+
+    #[tokio::test]
+    async fn max_invocations_holds_under_concurrent_calls() {
+        // Two parallel calls race for a single invocation slot: exactly one
+        // may execute. The closure parks on a Notify so both tasks are
+        // genuinely in-flight together — with a check-then-add limit both
+        // would slip through; the atomic reservation admits only one.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (gate_c, calls_c) = (Arc::clone(&gate), Arc::clone(&calls));
+        let tool = Arc::new(
+            AiFunction::new("f", "d", empty_schema(), move |_args| {
+                let (gate, calls) = (Arc::clone(&gate_c), Arc::clone(&calls_c));
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    gate.notified().await;
+                    Ok(serde_json::Value::Null)
+                }
+            })
+            .max_invocations(1),
+        );
+
+        let (t1, t2) = (Arc::clone(&tool), Arc::clone(&tool));
+        let h1 = tokio::spawn(async move { t1.invoke(serde_json::json!({})).await });
+        let h2 = tokio::spawn(async move { t2.invoke(serde_json::json!({})).await });
+        // Let both tasks reach the limit check before releasing the gate.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        gate.notify_waiters();
+        gate.notify_waiters();
+        let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
+
+        let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(successes, 1, "exactly one call may claim the single slot");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the closure ran once");
+        assert_eq!(tool.invocation_count(), 1);
+        let err = [r1, r2].into_iter().find_map(|r| r.err()).unwrap();
+        assert!(err.to_string().contains("maximum invocation limit"));
     }
 
     #[tokio::test]

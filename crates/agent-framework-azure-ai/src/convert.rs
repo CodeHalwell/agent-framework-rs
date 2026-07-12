@@ -359,10 +359,20 @@ fn mcp_tool_resource(tool: &ToolDefinition) -> Value {
             resource.insert("require_approval".into(), json!(mapped));
         }
         Some(Value::Object(obj)) => {
+            // Both keys may be present: the service's `MCPApprovalPerTool`
+            // model carries `always` and `never` as optional siblings
+            // (verified in `azure-ai-agents` 1.2.0b5). Upstream Python's
+            // `elif` drops `never` whenever `always` is set — a deliberate
+            // divergence here so a PerTool config with both lists survives.
+            let mut approval = Map::new();
             if let Some(always) = obj.get("always") {
-                resource.insert("require_approval".into(), json!({ "always": always }));
-            } else if let Some(never) = obj.get("never") {
-                resource.insert("require_approval".into(), json!({ "never": never }));
+                approval.insert("always".into(), always.clone());
+            }
+            if let Some(never) = obj.get("never") {
+                approval.insert("never".into(), never.clone());
+            }
+            if !approval.is_empty() {
+                resource.insert("require_approval".into(), Value::Object(approval));
             }
         }
         _ => {}
@@ -1078,6 +1088,21 @@ mod tests {
         assert_eq!(
             prepared.mcp_resources.unwrap()[0]["require_approval"],
             json!({"never": ["safe_tool"]})
+        );
+    }
+
+    #[test]
+    fn mcp_resource_per_tool_approval_keeps_both_lists() {
+        // The service's MCPApprovalPerTool model carries `always` and `never`
+        // as optional siblings; a config with both must emit both (upstream
+        // Python's elif drops `never` here — deliberate divergence).
+        let mut tool = hosted_mcp("my_server", "https://mcp.example.com", None);
+        tool.parameters =
+            json!({"approval_mode": {"always": ["dangerous_tool"], "never": ["safe_tool"]}});
+        let prepared = tools_to_azure(std::slice::from_ref(&tool)).unwrap();
+        assert_eq!(
+            prepared.mcp_resources.unwrap()[0]["require_approval"],
+            json!({"always": ["dangerous_tool"], "never": ["safe_tool"]})
         );
     }
 
