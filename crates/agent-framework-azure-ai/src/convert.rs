@@ -10,8 +10,8 @@
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatMessage, ChatOptions, Content, FinishReason, FunctionArguments, FunctionCallContent, Role,
-    ToolMode, UsageDetails,
+    ChatMessage, ChatOptions, Content, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Role, ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -69,10 +69,15 @@ pub struct PreparedMessages {
     pub run_id: Option<String>,
 }
 
-/// Serialize a tool result value the way `submit_tool_outputs` expects: a bare
-/// string is sent verbatim, anything else is JSON-encoded.
-fn result_to_output(result: &Option<Value>) -> String {
-    match result {
+/// Serialize a tool result the way `submit_tool_outputs` expects: a failed
+/// invocation surfaces its error text (so the model can see the failure and
+/// retry/repair), a bare string is sent verbatim, anything else is
+/// JSON-encoded. Mirrors the OpenAI converters' `result_to_string`.
+fn result_to_output(fr: &FunctionResultContent) -> String {
+    if let Some(exc) = &fr.exception {
+        return format!("error: {exc}");
+    }
+    match &fr.result {
         Some(Value::String(s)) => s.clone(),
         Some(v) => v.to_string(),
         None => String::new(),
@@ -117,8 +122,7 @@ pub fn prepare_messages(messages: &[ChatMessage]) -> PreparedMessages {
                 Content::FunctionResult(fr) => {
                     if let Some((run_id, call_id)) = decode_call_id(&fr.call_id) {
                         out.run_id.get_or_insert(run_id);
-                        out.tool_outputs
-                            .push((call_id, result_to_output(&fr.result)));
+                        out.tool_outputs.push((call_id, result_to_output(fr)));
                     }
                 }
                 Content::FunctionApprovalResponse(ar) => {
@@ -868,6 +872,25 @@ mod tests {
         assert_eq!(
             prepared.tool_outputs,
             vec![("call_3".into(), "sunny".into())]
+        );
+    }
+
+    #[test]
+    fn failed_tool_result_submits_its_error_text() {
+        // A failed local tool (exception set, result None) must surface the
+        // error to the model via submit_tool_outputs, not an empty string.
+        let msg = ChatMessage::with_contents(
+            Role::tool(),
+            vec![Content::FunctionResult(FunctionResultContent {
+                call_id: encode_call_id("run_7", "call_3"),
+                result: None,
+                exception: Some("boom".into()),
+            })],
+        );
+        let prepared = prepare_messages(&[msg]);
+        assert_eq!(
+            prepared.tool_outputs,
+            vec![("call_3".into(), "error: boom".into())]
         );
     }
 

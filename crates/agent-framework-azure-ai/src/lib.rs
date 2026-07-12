@@ -134,6 +134,11 @@ struct Inner {
     /// The active agent id: pre-set for an existing agent, or filled in after
     /// auto-creating one.
     agent_id: Mutex<Option<String>>,
+    /// Serializes the auto-create path so concurrent first-use requests share
+    /// one `POST assistants` instead of each creating (and leaking) a transient
+    /// agent. Held across the create round trip, so it is an async mutex; the
+    /// sync `agent_id` mutex is only ever held briefly, never across `.await`.
+    agent_create_lock: tokio::sync::Mutex<()>,
     /// Whether this client created the agent (and so should delete it).
     agent_created: AtomicBool,
     /// Cached agent definition (`GET .../assistants/{id}`, or the body
@@ -202,6 +207,7 @@ impl AzureAIAgentClient {
                 default_thread_id: None,
                 should_cleanup_agent: true,
                 agent_id: Mutex::new(agent_id),
+                agent_create_lock: tokio::sync::Mutex::new(()),
                 agent_created: AtomicBool::new(false),
                 agent_definition: Mutex::new(None),
             }),
@@ -379,6 +385,17 @@ impl AzureAIAgentClient {
         options: &ChatOptions,
         instructions: Option<&str>,
     ) -> Result<String> {
+        {
+            let guard = self.inner.agent_id.lock().unwrap();
+            if let Some(id) = guard.as_ref() {
+                return Ok(id.clone());
+            }
+        }
+        // Serialize the create path: without this, two concurrent first-use
+        // requests both pass the check above and each POST a new agent,
+        // leaking one and leaving the two runs on different agent definitions.
+        let _create = self.inner.agent_create_lock.lock().await;
+        // Re-check: a racing task may have created the agent while we waited.
         {
             let guard = self.inner.agent_id.lock().unwrap();
             if let Some(id) = guard.as_ref() {
