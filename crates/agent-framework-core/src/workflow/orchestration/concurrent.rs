@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{parse_conversation, AgentExecutor};
+use super::{parse_conversation, AgentApprovalExecutor, AgentExecutor};
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::Message;
@@ -79,6 +79,7 @@ pub struct ConcurrentBuilder {
     name: Option<String>,
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
+    request_info: bool,
 }
 
 impl ConcurrentBuilder {
@@ -146,6 +147,21 @@ impl ConcurrentBuilder {
         self
     }
 
+    /// Opt in to post-agent human approval: **each** participant wraps in its
+    /// own [`AgentApprovalExecutor`], so every participant's reply pauses the
+    /// workflow individually (N per-agent pauses, all outstanding
+    /// concurrently) until a response is supplied for each. An empty
+    /// response approves that participant's reply and it fans into the
+    /// aggregator as usual; a non-empty response is treated as revision
+    /// feedback and re-invokes that participant alone, pausing again for its
+    /// new reply — repeating until approved. Rust analogue of upstream's
+    /// post-agent `.with_request_info()` (see `UPSTREAM_DRIFT.md` §12).
+    /// Default (not called): no pausing, matching prior behavior.
+    pub fn with_request_info(mut self) -> Self {
+        self.request_info = true;
+        self
+    }
+
     /// Validate and build the concurrent workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -191,13 +207,24 @@ impl ConcurrentBuilder {
         let mut agent_ids = Vec::new();
         for (i, agent) in self.participants.into_iter().enumerate() {
             let id = format!("agent_{i}");
-            let exec = AgentExecutor::new(id.clone(), agent)
-                .with_output(designated.contains(id.as_str()))
-                // Participants must always feed the fan-in barrier,
-                // regardless of designation — otherwise the aggregator (and
-                // the run) would hang waiting on a source that never sends.
-                .with_also_send(true);
-            builder = builder.add_executor(Arc::new(exec));
+            let emit = designated.contains(id.as_str());
+            // Participants must always feed the fan-in barrier, regardless of
+            // designation — otherwise the aggregator (and the run) would
+            // hang waiting on a source that never sends.
+            let exec: Arc<dyn Executor> = if self.request_info {
+                Arc::new(
+                    AgentApprovalExecutor::new(id.clone(), agent)
+                        .with_output(emit)
+                        .with_also_send(true),
+                )
+            } else {
+                Arc::new(
+                    AgentExecutor::new(id.clone(), agent)
+                        .with_output(emit)
+                        .with_also_send(true),
+                )
+            };
+            builder = builder.add_executor(exec);
             agent_ids.push(id);
         }
         builder = builder.add_fan_out("dispatch", agent_ids.clone());

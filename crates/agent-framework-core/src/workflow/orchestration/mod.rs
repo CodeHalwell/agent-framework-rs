@@ -41,6 +41,7 @@ use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::{AgentResponse, AgentResponseUpdate, Message};
 
+mod approval;
 mod concurrent;
 mod group_chat;
 mod handoff;
@@ -48,6 +49,7 @@ mod magentic;
 mod sequential;
 mod workflow_agent;
 
+pub use approval::{AgentApprovalExecutor, ApprovalRequest};
 pub use concurrent::ConcurrentBuilder;
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,

@@ -4,10 +4,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::AgentExecutor;
+use super::{AgentApprovalExecutor, AgentExecutor};
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
-use crate::workflow::{Workflow, WorkflowBuilder};
+use crate::workflow::{Executor, Workflow, WorkflowBuilder};
 
 /// Builder for a sequential pipeline of agents. Rust analogue of
 /// `SequentialBuilder`. Each participant sees the running conversation and
@@ -18,6 +18,7 @@ pub struct SequentialBuilder {
     name: Option<String>,
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
+    request_info: bool,
 }
 
 impl SequentialBuilder {
@@ -82,6 +83,21 @@ impl SequentialBuilder {
         self
     }
 
+    /// Opt in to post-agent human approval: every participant's turn pauses
+    /// the workflow (a [`WorkflowEvent::RequestInfo`](crate::workflow::WorkflowEvent::RequestInfo)
+    /// event, surfaced as a [`PendingRequest`](crate::workflow::PendingRequest))
+    /// until a response is supplied. An empty response approves the reply and
+    /// the pipeline continues to the next participant; a non-empty response is
+    /// treated as revision feedback and re-invokes that participant, pausing
+    /// again — repeating until approved. Rust analogue of upstream's
+    /// post-agent `.with_request_info()` (see `UPSTREAM_DRIFT.md` §12),
+    /// implemented via [`AgentApprovalExecutor`]. Default (not called): no
+    /// pausing, matching prior behavior.
+    pub fn with_request_info(mut self) -> Self {
+        self.request_info = true;
+        self
+    }
+
     /// Validate and build the sequential workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -130,10 +146,20 @@ impl SequentialBuilder {
             } else {
                 i == last
             };
-            let exec = AgentExecutor::new(exec_id.clone(), agent)
-                .with_output(emit)
-                .with_also_send(has_designation);
-            builder = builder.add_executor(Arc::new(exec));
+            let exec: Arc<dyn Executor> = if self.request_info {
+                Arc::new(
+                    AgentApprovalExecutor::new(exec_id.clone(), agent)
+                        .with_output(emit)
+                        .with_also_send(has_designation),
+                )
+            } else {
+                Arc::new(
+                    AgentExecutor::new(exec_id.clone(), agent)
+                        .with_output(emit)
+                        .with_also_send(has_designation),
+                )
+            };
+            builder = builder.add_executor(exec);
         }
         builder = builder.set_start(ids[0].clone()).add_chain(ids);
         if !output_exec_ids.is_empty() {
