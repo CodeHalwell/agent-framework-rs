@@ -46,7 +46,7 @@ pub trait ChatClient: Send + Sync {
     ) -> Result<ChatStream>;
 
     /// The default model id for this client, if any.
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         None
     }
 }
@@ -68,8 +68,8 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
     ) -> Result<ChatStream> {
         (**self).get_streaming_response(messages, options).await
     }
-    fn model_id(&self) -> Option<&str> {
-        (**self).model_id()
+    fn model(&self) -> Option<&str> {
+        (**self).model()
     }
 }
 
@@ -695,8 +695,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         Ok(stream::iter(updates).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }
 
@@ -1041,7 +1041,7 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
         }
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }

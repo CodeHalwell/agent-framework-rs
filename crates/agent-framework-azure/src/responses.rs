@@ -307,10 +307,10 @@ impl AzureOpenAIResponsesClient {
         // path), the `/openai/v1/responses` route carries no deployment
         // segment, so `model` is the *only* way to select it and is always
         // sent — mirroring `OpenAIResponsesClient::build_body` and upstream's
-        // `run_options["model"] = self.model_id` fallback
+        // `run_options["model"] = self.model` fallback
         // (`openai/_responses_client.py:432-435`).
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.deployment.clone());
         body.insert("model".into(), json!(model));
@@ -463,7 +463,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         )
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
     }
 }
@@ -573,7 +573,7 @@ mod tests {
         let c = client();
         assert_eq!(c.deployment(), "my-gpt4o-deployment");
         assert_eq!(c.api_version(), Some("preview"));
-        assert_eq!(c.model_id(), Some("my-gpt4o-deployment"));
+        assert_eq!(c.model(), Some("my-gpt4o-deployment"));
         assert_eq!(c.base_url(), None);
     }
 

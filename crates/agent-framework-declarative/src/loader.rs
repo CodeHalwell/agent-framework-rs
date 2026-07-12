@@ -136,7 +136,7 @@ impl DeclarativeLoader {
         let mut options = ChatOptions::new();
         if let Some(model) = &spec.model {
             if let Some(id) = &model.id {
-                options.model_id = Some(id.clone());
+                options.model = Some(id.clone());
             }
             if let Some(model_options) = &model.options {
                 apply_options(&mut options, model_options)?;

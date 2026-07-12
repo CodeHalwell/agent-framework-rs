@@ -36,7 +36,7 @@ impl ChatClient for CannedClient {
         _options: ChatOptions,
     ) -> Result<ChatResponse> {
         let mut resp = ChatResponse::from_text("The answer is 42.");
-        resp.model_id = Some("canned-model-v1".to_string());
+        resp.model = Some("canned-model-v1".to_string());
         resp.finish_reason = Some(FinishReason::stop());
         resp.usage_details = Some(UsageDetails {
             input_token_count: Some(12),
@@ -55,7 +55,7 @@ impl ChatClient for CannedClient {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some("canned-model-v1")
     }
 }

@@ -64,7 +64,7 @@ pub struct ChatResponse {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -204,8 +204,8 @@ impl ChatResponse {
         if let Some(c) = &update.conversation_id {
             self.conversation_id.get_or_insert_with(|| c.clone());
         }
-        if let Some(m) = &update.model_id {
-            self.model_id.get_or_insert_with(|| m.clone());
+        if let Some(m) = &update.model {
+            self.model.get_or_insert_with(|| m.clone());
         }
         if let Some(cr) = &update.created_at {
             self.created_at.get_or_insert_with(|| cr.clone());
@@ -320,7 +320,7 @@ pub struct ChatResponseUpdate {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

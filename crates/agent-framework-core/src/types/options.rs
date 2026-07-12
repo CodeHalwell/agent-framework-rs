@@ -206,7 +206,7 @@ impl<'de> Deserialize<'de> for ToolMode {
 /// `instructions` are newline-concatenated.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     pub allow_multiple_tool_calls: Option<bool>,
     pub conversation_id: Option<String>,
     pub frequency_penalty: Option<f32>,
@@ -240,8 +240,8 @@ impl ChatOptions {
     }
 
     /// Builder: set the model id.
-    pub fn with_model(mut self, model_id: impl Into<String>) -> Self {
-        self.model_id = Some(model_id.into());
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -285,7 +285,7 @@ impl ChatOptions {
                 }
             };
         }
-        take!(model_id);
+        take!(model);
         take!(allow_multiple_tool_calls);
         take!(conversation_id);
         take!(frequency_penalty);

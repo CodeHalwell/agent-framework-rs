@@ -156,9 +156,9 @@ pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHand
             })?;
 
             let model = response
-                .model_id
+                .model
                 .clone()
-                .or_else(|| client.model_id().map(str::to_string))
+                .or_else(|| client.model().map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string());
             let content = first_sampling_result_content(&response)?;
 
@@ -456,7 +456,7 @@ mod tests {
     /// [`chat_client_sampling_handler`] without any real provider.
     struct StubChatClient {
         text: &'static str,
-        model_id: &'static str,
+        model: &'static str,
     }
 
     #[async_trait]
@@ -472,7 +472,7 @@ mod tests {
             assert_eq!(options.max_tokens, Some(64));
             assert_eq!(options.instructions.as_deref(), Some("be terse"));
             Ok(ChatResponse {
-                model_id: Some(self.model_id.to_string()),
+                model: Some(self.model.to_string()),
                 ..ChatResponse::from_text(self.text)
             })
         }
@@ -483,8 +483,8 @@ mod tests {
         ) -> Result<agent_framework_core::client::ChatStream> {
             unreachable!("not exercised by these tests")
         }
-        fn model_id(&self) -> Option<&str> {
-            Some(self.model_id)
+        fn model(&self) -> Option<&str> {
+            Some(self.model)
         }
     }
 
@@ -492,7 +492,7 @@ mod tests {
     async fn chat_client_sampling_handler_round_trips_a_text_response() {
         let client: Arc<dyn ChatClient> = Arc::new(StubChatClient {
             text: "Paris is the capital of France.",
-            model_id: "stub-model",
+            model: "stub-model",
         });
         let handler = chat_client_sampling_handler(client);
         let params = CreateMessageParams {

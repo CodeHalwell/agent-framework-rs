@@ -1036,8 +1036,8 @@ impl AgentBuilder {
         self.instructions = Some(instructions.into());
         self
     }
-    pub fn model(mut self, model_id: impl Into<String>) -> Self {
-        self.chat_options.model_id = Some(model_id.into());
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.chat_options.model = Some(model.into());
         self
     }
     pub fn temperature(mut self, temperature: f32) -> Self {
@@ -1124,8 +1124,8 @@ impl AgentBuilder {
                 None => instr,
             });
         }
-        if self.chat_options.model_id.is_none() {
-            self.chat_options.model_id = self.client.model_id().map(str::to_string);
+        if self.chat_options.model.is_none() {
+            self.chat_options.model = self.client.model().map(str::to_string);
         }
         // Wrap the raw client in `FunctionInvokingChatClient` now that all
         // builder-collected function middleware is known.

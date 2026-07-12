@@ -114,7 +114,7 @@ impl OpenAIResponsesClient {
     fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.model.clone());
         body.insert("model".into(), json!(model));
@@ -233,7 +233,7 @@ impl ChatClient for OpenAIResponsesClient {
         Ok(parse_responses_sse_stream(resp, options.store).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
 }
@@ -621,7 +621,7 @@ pub fn response_failure_error(value: &Value) -> Option<Error> {
 pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 
@@ -1051,17 +1051,17 @@ fn parse_responses_event(
                 .and_then(|r| r.get("id"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            let model_id = resp
+            let model = resp
                 .and_then(|r| r.get("model"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            if response_id.is_none() && model_id.is_none() {
+            if response_id.is_none() && model.is_none() {
                 return EventOutcome::None;
             }
             EventOutcome::Update(ChatResponseUpdate {
                 role: Some(Role::assistant()),
                 response_id,
-                model_id,
+                model,
                 ..Default::default()
             })
         }
@@ -1144,7 +1144,7 @@ fn parse_responses_event(
                 .and_then(|r| r.get("id"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            let model_id = resp
+            let model = resp
                 .and_then(|r| r.get("model"))
                 .and_then(Value::as_str)
                 .map(String::from);
@@ -1164,7 +1164,7 @@ fn parse_responses_event(
                 contents,
                 role: Some(Role::assistant()),
                 response_id,
-                model_id,
+                model,
                 conversation_id,
                 finish_reason,
                 ..Default::default()

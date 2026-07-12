@@ -18,7 +18,7 @@ pub struct HealthResponse {
 /// Entity descriptor — mirrors DevUI's `EntityInfo`.
 ///
 /// Divergences from DevUI: `null`-valued optional fields are omitted rather than
-/// serialized as `null`; `tools`/`model_id` are populated only when cheaply
+/// serialized as `null`; `tools`/`model` are populated only when cheaply
 /// available from the concrete agent type (the core `SupportsAgentRun` trait exposes
 /// neither, so both are usually absent — see crate docs).
 #[derive(Debug, Clone, Serialize)]
@@ -38,7 +38,7 @@ pub struct EntityInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
+    pub model: Option<String>,
     // Workflow-specific.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executors: Option<Vec<String>>,

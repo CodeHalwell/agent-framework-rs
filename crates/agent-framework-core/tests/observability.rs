@@ -45,7 +45,7 @@ impl ChatClient for StubClient {
         }
         let mut resp = ChatResponse::from_text("hi");
         resp.finish_reason = Some(FinishReason::stop());
-        resp.model_id = self.response_model.clone();
+        resp.model = self.response_model.clone();
         resp.usage_details = Some(UsageDetails {
             input_token_count: Some(7),
             output_token_count: Some(3),
@@ -63,7 +63,7 @@ impl ChatClient for StubClient {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some("stub-model")
     }
 }

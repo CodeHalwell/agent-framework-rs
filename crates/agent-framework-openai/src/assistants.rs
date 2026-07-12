@@ -542,7 +542,7 @@ impl ChatClient for OpenAIAssistantsClient {
         Ok(assistants_sse_stream(byte_stream, final_thread_id).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.model)
     }
 }
@@ -570,7 +570,7 @@ fn prepare_options(
 ) -> (Map<String, Value>, Option<Vec<FunctionResultContent>>) {
     let mut run_options = Map::new();
 
-    if let Some(model) = &options.model_id {
+    if let Some(model) = &options.model {
         run_options.insert("model".into(), json!(model));
     }
     if let Some(t) = options.temperature {

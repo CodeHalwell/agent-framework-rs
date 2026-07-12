@@ -239,7 +239,7 @@ impl AzureOpenAIClient {
         let mut body = Map::new();
         // The deployment in the URL already selects the model; only send
         // `model` if the caller explicitly asked for a specific one.
-        if let Some(model) = &options.model_id {
+        if let Some(model) = &options.model {
             body.insert("model".into(), json!(model));
         }
         body.insert(
@@ -331,7 +331,7 @@ impl ChatClient for AzureOpenAIClient {
         Ok(agent_framework_openai::parse_sse_stream(resp).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
     }
 }

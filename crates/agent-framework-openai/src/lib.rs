@@ -208,7 +208,7 @@ impl OpenAIClient {
     fn build_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
         let mut body = Map::new();
         let model = options
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.model.clone());
         body.insert("model".into(), json!(model));
@@ -295,7 +295,7 @@ impl ChatClient for OpenAIClient {
         Ok(parse_sse_stream(resp).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
 }
@@ -400,7 +400,7 @@ fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseS
 fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<ChatResponseUpdate> {
     let mut update = ChatResponseUpdate {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 

@@ -300,7 +300,7 @@ pub fn apply_options(body: &mut Map<String, Value>, options: &ChatOptions) {
 pub fn parse_response(value: &Value) -> ChatResponse {
     let mut response = ChatResponse {
         response_id: value.get("id").and_then(Value::as_str).map(String::from),
-        model_id: value.get("model").and_then(Value::as_str).map(String::from),
+        model: value.get("model").and_then(Value::as_str).map(String::from),
         ..Default::default()
     };
 

@@ -126,7 +126,7 @@ struct Inner {
     api_version: String,
     credential: Arc<dyn TokenCredential>,
     scope: String,
-    model_id: Option<String>,
+    model: Option<String>,
     agent_name: Option<String>,
     agent_description: Option<String>,
     default_thread_id: Option<String>,
@@ -161,7 +161,7 @@ impl std::fmt::Debug for AzureAIAgentClient {
         f.debug_struct("AzureAIAgentClient")
             .field("endpoint", &self.inner.endpoint)
             .field("api_version", &self.inner.api_version)
-            .field("model_id", &self.inner.model_id)
+            .field("model", &self.inner.model)
             .field("agent_id", &*self.inner.agent_id.lock().unwrap())
             .finish_non_exhaustive()
     }
@@ -190,7 +190,7 @@ impl AzureAIAgentClient {
 
     fn build(
         endpoint: String,
-        model_id: Option<String>,
+        model: Option<String>,
         agent_id: Option<String>,
         credential: Arc<dyn TokenCredential>,
     ) -> Self {
@@ -201,7 +201,7 @@ impl AzureAIAgentClient {
                 api_version: DEFAULT_API_VERSION.to_string(),
                 credential,
                 scope: AI_FOUNDRY_SCOPE.to_string(),
-                model_id,
+                model,
                 agent_name: None,
                 agent_description: None,
                 default_thread_id: None,
@@ -403,9 +403,9 @@ impl AzureAIAgentClient {
             }
         }
         let model = options
-            .model_id
+            .model
             .as_deref()
-            .or(self.inner.model_id.as_deref())
+            .or(self.inner.model.as_deref())
             .ok_or_else(|| {
                 Error::Configuration(
                     "a model deployment name is required to auto-create an agent".into(),
@@ -532,10 +532,7 @@ impl AzureAIAgentClient {
     }
 
     fn model_for<'a>(&'a self, options: &'a ChatOptions) -> Option<&'a str> {
-        options
-            .model_id
-            .as_deref()
-            .or(self.inner.model_id.as_deref())
+        options.model.as_deref().or(self.inner.model.as_deref())
     }
 
     /// Build a completed/requires-action [`ChatResponse`] from a terminal run.
@@ -691,8 +688,8 @@ impl ChatClient for AzureAIAgentClient {
         Ok(sse::parse_agent_sse_stream(resp, thread_id).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id.as_deref()
+    fn model(&self) -> Option<&str> {
+        self.inner.model.as_deref()
     }
 }
 
@@ -742,7 +739,7 @@ mod tests {
 
     #[test]
     fn model_id_reflects_configured_deployment() {
-        assert_eq!(client().model_id(), Some("gpt-4o"));
+        assert_eq!(client().model(), Some("gpt-4o"));
     }
 
     #[test]

@@ -263,7 +263,7 @@ impl AnthropicClient {
         let mut effective = self.inner.default_options.clone().merge(options.clone());
         let betas = convert::compute_beta_flags(&mut effective, &self.inner.additional_beta_flags);
         let model = effective
-            .model_id
+            .model
             .clone()
             .unwrap_or_else(|| self.inner.model.clone());
         let max_tokens = effective.max_tokens.unwrap_or(self.inner.max_tokens);
@@ -328,7 +328,7 @@ impl ChatClient for AnthropicClient {
         Ok(parse_sse_stream(resp).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
 }
@@ -432,7 +432,7 @@ fn parse_stream_event(
         "message_start" => {
             let message = value.get("message")?;
             let response_id = message.get("id").and_then(Value::as_str).map(String::from);
-            let model_id = message
+            let model = message
                 .get("model")
                 .and_then(Value::as_str)
                 .map(String::from);
@@ -446,7 +446,7 @@ fn parse_stream_event(
                 contents,
                 role: Some(Role::assistant()),
                 response_id,
-                model_id,
+                model,
                 ..Default::default()
             })
         }

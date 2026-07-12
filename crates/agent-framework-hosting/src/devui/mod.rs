@@ -163,8 +163,8 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
             metadata: Map::new(),
             source: "in_memory",
             instructions: a.instructions.clone(),
-            // `model_id` is not accessible through the `SupportsAgentRun` trait.
-            model_id: None,
+            // `model` is not accessible through the `SupportsAgentRun` trait.
+            model: None,
             executors: None,
             input_schema: None,
             start_executor_id: None,
@@ -179,7 +179,7 @@ fn entity_info_for(record: &EntityRecord) -> EntityInfo {
             metadata: Map::new(),
             source: "in_memory",
             instructions: None,
-            model_id: None,
+            model: None,
             // The full executor set is not enumerable through the public
             // `Workflow` API; the start executor is.
             executors: Some(vec![w.workflow.start_executor_id().to_string()]),

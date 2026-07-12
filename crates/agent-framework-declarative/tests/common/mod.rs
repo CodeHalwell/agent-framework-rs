@@ -74,7 +74,7 @@ impl ChatClient for MockClient {
         Ok(futures::stream::iter(updates).boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
+    fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 }

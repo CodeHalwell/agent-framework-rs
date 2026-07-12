@@ -353,7 +353,7 @@ pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bo
     if let Some(id) = &response.response_id {
         span.record(attr::RESPONSE_ID, id.as_str());
     }
-    if let Some(model) = &response.model_id {
+    if let Some(model) = &response.model {
         span.record(attr::RESPONSE_MODEL, model.as_str());
     }
     if let Some(usage) = &response.usage_details {
@@ -530,9 +530,9 @@ impl<C: ChatClient> ObservableChatClient<C> {
 
     fn model_for(&self, options: &ChatOptions) -> String {
         options
-            .model_id
+            .model
             .clone()
-            .or_else(|| self.inner.model_id().map(str::to_string))
+            .or_else(|| self.inner.model().map(str::to_string))
             .unwrap_or_default()
     }
 }
@@ -569,7 +569,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                         metrics::record_chat_completion(
                             &self.system,
                             &request_model,
-                            response.model_id.as_deref(),
+                            response.model.as_deref(),
                             input_tokens,
                             output_tokens,
                             start.elapsed(),
@@ -659,7 +659,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                                 metrics::record_chat_completion(
                                     &telemetry.system,
                                     &telemetry.request_model,
-                                    agg.model_id.as_deref(),
+                                    agg.model.as_deref(),
                                     input_tokens,
                                     output_tokens,
                                     telemetry.start.elapsed(),
@@ -674,8 +674,8 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         Ok(stream.boxed())
     }
 
-    fn model_id(&self) -> Option<&str> {
-        self.inner.model_id()
+    fn model(&self) -> Option<&str> {
+        self.inner.model()
     }
 }
 

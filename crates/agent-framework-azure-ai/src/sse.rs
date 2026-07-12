@@ -139,7 +139,7 @@ impl AgentEventMapper {
                     self.response_id = Some(id.to_string());
                 }
                 let mut u = self.base_update();
-                u.model_id = data.get("model").and_then(Value::as_str).map(String::from);
+                u.model = data.get("model").and_then(Value::as_str).map(String::from);
                 EventOutcome::Updates(vec![u])
             }
             "thread.run.requires_action" => {
