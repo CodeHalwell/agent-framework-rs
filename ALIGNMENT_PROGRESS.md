@@ -49,10 +49,23 @@ green) before commit.
 
 - Removed the dead `OpenAIAssistantsClient`; flipped OpenAI client names
   (`OpenAIChatClient`=Responses, `OpenAIChatCompletionClient`=Chat Completions).
-- New provider crates: **ollama**, **gemini**, **mistral** (full `ChatClient`
-  impls, wired into the umbrella crate + examples).
+- New provider crates: **ollama**, **gemini**, **mistral**, **foundry-local**
+  (Microsoft Foundry Local's OpenAI-compatible localhost endpoint; reuses
+  `agent_framework_openai::convert`), and **bedrock** (AWS Bedrock Converse
+  API with a dependency-free **SigV4** signer verified against AWS's published
+  `get-vanilla` known-answer test vector) — full `ChatClient` impls, wired into
+  the umbrella crate + examples.
 - `CosmosCheckpointStorage`; DevUI security middleware (Host-header
   anti-DNS-rebinding guard + optional bearer auth, opt-in).
+
+### Streaming API shape — Theme B (satisfied idiomatically)
+
+Upstream's Python unifies buffered vs. streaming behind `run(stream=…)` /
+`get_response(stream=…)`. Rust can't cleanly return either a buffered value or
+a stream from one function keyed on a runtime bool, so the port already
+expresses this idiomatically as method **pairs** — `run`/`run_stream` and
+`ChatClient::get_response`/`get_streaming_response`. No further work: the
+capability is present, just spelled the Rust way.
 
 ## Remaining (roadmap)
 
@@ -62,11 +75,10 @@ Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
    `to_dict`/`from_dict`) and history out of the thread into a
    `HistoryProvider` (`InMemory`/`File`), rewiring the agent run loop. Broad
    ripple (a2a/copilotstudio/hosting/redis/examples).
-2. **Unified `run(stream=)` / `get_response(stream=)`** (Theme B) — cross-cutting.
-3. **Provider reworks** — `azure-ai`→`foundry` rename+rewrite onto the Responses
+2. **Provider reworks** — `azure-ai`→`foundry` rename+rewrite onto the Responses
    API (`FoundryAgent`/`to_prompt_agent`); Anthropic multi-cloud
    (Bedrock/Vertex/Foundry); Azure "routing mode" realignment; remaining new
-   provider crates (bedrock, foundry-local, claude, github-copilot).
+   provider crates (claude, github-copilot).
 4. **Orchestration depth (§12)** — shared post-agent `AgentApprovalExecutor`
    HITL (iterate-until-approved); terminal output shape (`AgentResponse` vs
    transcript); Handoff mesh-topology rebuild.

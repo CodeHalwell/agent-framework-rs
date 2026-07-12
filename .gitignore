@@ -13,3 +13,6 @@
 .vscode/
 *.swp
 .claude/worktrees/
+
+# Local workflow orchestration scripts (not part of the library)
+.claude/wf-*.js

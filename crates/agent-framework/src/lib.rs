@@ -13,6 +13,8 @@
 //! | `ollama` | [`agent_framework_ollama`] — Ollama (local/remote, OpenAI-compatible) | no |
 //! | `gemini` | [`agent_framework_gemini`] — Google Gemini `generateContent` API | no |
 //! | `mistral` | [`agent_framework_mistral`] — Mistral AI Chat Completions API | no |
+//! | `foundry-local` | [`agent_framework_foundry_local`] — Microsoft Foundry Local (OpenAI-compatible localhost endpoint) | no |
+//! | `bedrock` | [`agent_framework_bedrock`] — AWS Bedrock Converse API (SigV4-signed) | no |
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
@@ -67,6 +69,14 @@ pub use agent_framework_gemini as gemini;
 /// The Mistral AI provider (enable the `mistral` feature).
 #[cfg(feature = "mistral")]
 pub use agent_framework_mistral as mistral;
+
+/// The Microsoft Foundry Local provider (enable the `foundry-local` feature).
+#[cfg(feature = "foundry-local")]
+pub use agent_framework_foundry_local as foundry_local;
+
+/// The AWS Bedrock provider (enable the `bedrock` feature).
+#[cfg(feature = "bedrock")]
+pub use agent_framework_bedrock as bedrock;
 
 /// The Azure OpenAI provider (enable the `azure` feature).
 #[cfg(feature = "azure")]
