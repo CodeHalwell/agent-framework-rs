@@ -19,7 +19,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::devui::models::openai_error;
+use crate::responses::openai_error;
 
 /// The default `Host` allowlist: loopback only (by name and literal), any
 /// port. Used both by [`AllowedHosts::default_localhost`] and by

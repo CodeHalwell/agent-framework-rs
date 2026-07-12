@@ -18,6 +18,12 @@
 //!   (`RUN_STARTED` → `TEXT_MESSAGE_*` / `TOOL_CALL_*` → `RUN_FINISHED`),
 //!   mirroring the Python `agent_framework_ag_ui` package.
 //!
+//! The OpenAI-Responses request/response types and the
+//! [`responses::responses_to_run`]/[`responses::responses_from_run`]
+//! conversion functions that back the DevUI API are a standalone, reusable
+//! module ([`responses`]), mirroring the Python `hosting-responses` package;
+//! any host can depend on it without pulling in DevUI's routing/SSE layer.
+//!
 //! Each surface builds a plain [`axum::Router`] you can nest into your own app,
 //! or run directly with [`AgentHost::serve`].
 //!
@@ -55,6 +61,7 @@ pub mod agui;
 pub mod devui;
 pub mod openai_compat;
 pub mod registry;
+pub mod responses;
 pub mod security;
 
 mod sse;
@@ -65,3 +72,7 @@ pub use registry::{AgentHost, AgentRegistration, IntoAgentRegistration};
 
 // Re-export the DevUI model types for callers building responses/clients.
 pub use devui::models::{DiscoveryResponse, EntityInfo, HealthResponse};
+
+// Re-export the reusable OpenAI-Responses conversion surface (mirrors
+// upstream `hosting-responses`; UPSTREAM_DRIFT.md §14).
+pub use responses::{responses_from_run, responses_to_run, ResponseObject, ResponsesRequest};

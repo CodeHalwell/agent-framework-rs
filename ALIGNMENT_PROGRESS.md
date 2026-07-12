@@ -90,6 +90,12 @@ green) before commit.
   extension point). No dependency cycle (bedrock/azure don't depend back).
 - `CosmosCheckpointStorage`; DevUI security middleware (Host-header
   anti-DNS-rebinding guard + optional bearer auth, opt-in).
+- **Reusable Responses-conversion module** (`hosting::responses`): extracted the
+  OpenAI-Responses wire types + conversion (`responses_to_run` /
+  `responses_from_run`, `ResponsesRequest`, `ResponseObject`) out of the DevUI
+  internals into a public, framework-agnostic module — mirroring upstream's
+  `hosting-responses` package and resolving the crate's self-documented TODO.
+  Pure refactor; DevUI `/v1/responses` wire output unchanged.
 
 ### Streaming API shape — Theme B (satisfied idiomatically)
 
@@ -100,22 +106,40 @@ expresses this idiomatically as method **pairs** — `run`/`run_stream` and
 `ChatClient::get_response`/`get_streaming_response`. No further work: the
 capability is present, just spelled the Rust way.
 
-## Remaining (roadmap)
+## Remaining
 
-Larger, higher-risk or provider-API-specific efforts, roughly by leverage:
+The tractable, verifiable alignment is complete. Everything still open falls
+into one of three buckets — large-and-externally-blocked, or a deliberate,
+documented divergence, or low-verifiability without an upstream artifact this
+repo doesn't have. None is a straightforward port.
 
-1. **Sessions §2 completion** — `AgentThread`→`AgentSession` (state bag, sync
-   `to_dict`/`from_dict`) and history out of the thread into a
-   `HistoryProvider` (`InMemory`/`File`), rewiring the agent run loop. Broad
-   ripple (a2a/copilotstudio/hosting/redis/examples).
-2. **Provider reworks** — Azure "routing mode" realignment; the
-   `agent-framework-claude` agent crate (Claude Agent SDK subprocess, distinct
-   from the `anthropic` chat client). (`azure-ai`→`foundry`, github-copilot, and
-   Anthropic multi-cloud are done.)
-4. **Orchestration depth (§12)** — terminal output shape (`AgentResponse` vs
-   transcript). (`AgentApprovalExecutor` HITL and Handoff mesh-topology are
-   done.)
-5. **Hosting/DevUI (§14)** — remaining ~17 DevUI routes; Responses-conversion
-   extraction; A2A server move.
-6. **Large ecosystem packages** — `durabletask`; the declarative-workflow
-   execution engine; the `@experimental` harness / security / evaluation modules.
+**Deliberate / documented divergences (not gaps to "fix"):**
+- **Streaming API shape (Theme B)** — expressed as Rust method pairs
+  (`run`/`run_stream`); a single `stream=`-keyed function isn't idiomatic Rust.
+- **Declarative *workflow* DSL** — upstream's declarative workflow schema is the
+  Power Platform / Copilot Studio imperative DSL, which doesn't map onto this
+  port's graph engine; the crate defines a documented Rust-native `WorkflowSpec`
+  instead. Agents and Rust-native workflows already load **and execute**.
+- **Server-hosted control-plane bindings** left as documented extension points:
+  the Foundry Agents control plane (`FoundryAgent` realizes a Prompt Agent
+  client-side), and true incremental cloud-transport streaming (AWS
+  event-stream framing / Vertex `:streamRawPredict`).
+
+**Large, externally-blocked ecosystem packages (each a substantial new crate):**
+- **`durabletask`** — durable agent/workflow hosting over Microsoft's Durable
+  Task Framework via a gRPC sidecar (replay-safe orchestration + entity model).
+  Blocked on the sidecar protocol/SDK; second-largest ecosystem item.
+- **`@experimental` harness / security / evaluation** modules — upstream-unstable
+  surfaces, low value to pin before they settle.
+- **`agent-framework-claude`** — a `BaseAgent` that subprocesses the Claude
+  Agent SDK / CLI; there is no Rust Claude Agent SDK, so this is a subprocess
+  shim of speculative value (distinct from the `anthropic` chat client, which is
+  done).
+
+**Low-verifiability without the upstream frontend contract:**
+- **DevUI's remaining ~17 UI routes** (conversations / deployments API) — a
+  pre-existing gap that serves the bundled web UI; faithfully porting them needs
+  the frontend's request/response contract, which isn't in this repo. The
+  security-relevant middleware (Host-header guard + bearer auth) and the core
+  entity/responses routes are already in place; the reusable Responses
+  conversion (`hosting::responses`) is done.
