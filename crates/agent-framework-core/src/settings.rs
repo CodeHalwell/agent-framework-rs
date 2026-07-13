@@ -8,7 +8,7 @@
 //! reflection that has no idiomatic Rust equivalent), this module provides
 //! the two reusable primitives:
 //!
-//! - [`SecretString`] — a `String` newtype whose [`Debug`]/[`Display`] impls
+//! - [`SecretString`] — a `String` newtype whose [`Debug`]/[`Display`](std::fmt::Display) impls
 //!   mask the value so secrets never leak into logs, while still
 //!   (de)serializing to the real value and round-tripping through
 //!   `serde_json`.
@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 const MASK: &str = "***";
 
 /// A string wrapper that masks its value when printed via [`Debug`] or
-/// [`Display`], to prevent secrets (API keys, tokens, passwords, ...) from
+/// [`Display`](std::fmt::Display), to prevent secrets (API keys, tokens,
+/// passwords, ...) from
 /// accidentally ending up in logs or error messages.
 ///
 /// The real value is still accessible via [`SecretString::expose_secret`],

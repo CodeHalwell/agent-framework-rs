@@ -1,7 +1,7 @@
 //! # agent-framework-bedrock
 //!
 //! An [AWS Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html)
-//! [`ChatClient`](agent_framework_core::client::ChatClient) for
+//! [`ChatClient`] for
 //! `agent-framework-rs`, built on Bedrock's model-agnostic
 //! [Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html)
 //! (`POST https://bedrock-runtime.{region}.amazonaws.com/model/{model}/converse`).
@@ -204,12 +204,12 @@ impl BedrockChatClient {
     }
 
     /// Build a client from the standard AWS environment variables:
-    /// [`AWS_ACCESS_KEY_ID_ENV`] (`AWS_ACCESS_KEY_ID`) and
-    /// [`AWS_SECRET_ACCESS_KEY_ENV`] (`AWS_SECRET_ACCESS_KEY`) are required;
-    /// [`AWS_SESSION_TOKEN_ENV`] (`AWS_SESSION_TOKEN`) is read when present
-    /// (temporary/STS credentials); the region is [`AWS_REGION_ENV`]
-    /// (`AWS_REGION`), falling back to [`AWS_DEFAULT_REGION_ENV`]
-    /// (`AWS_DEFAULT_REGION`), falling back to [`DEFAULT_REGION`]
+    /// `AWS_ACCESS_KEY_ID_ENV` (`AWS_ACCESS_KEY_ID`) and
+    /// `AWS_SECRET_ACCESS_KEY_ENV` (`AWS_SECRET_ACCESS_KEY`) are required;
+    /// `AWS_SESSION_TOKEN_ENV` (`AWS_SESSION_TOKEN`) is read when present
+    /// (temporary/STS credentials); the region is `AWS_REGION_ENV`
+    /// (`AWS_REGION`), falling back to `AWS_DEFAULT_REGION_ENV`
+    /// (`AWS_DEFAULT_REGION`), falling back to `DEFAULT_REGION`
     /// (`us-east-1`) when neither is set.
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
         let access_key_id = std::env::var(AWS_ACCESS_KEY_ID_ENV)

@@ -1,6 +1,6 @@
 //! # agent-framework-ollama
 //!
-//! An [Ollama](https://ollama.com) [`ChatClient`](agent_framework_core::client::ChatClient)
+//! An [Ollama](https://ollama.com) [`ChatClient`]
 //! for `agent-framework-rs`.
 //!
 //! Talks to a local (or remote) Ollama server's OpenAI-compatible endpoint
@@ -41,6 +41,8 @@
 //! ```
 
 pub mod convert;
+pub mod embeddings;
+pub use embeddings::OllamaEmbeddingClient;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -53,14 +55,14 @@ use futures::StreamExt;
 use serde_json::Value;
 
 /// The default Ollama OpenAI-compatible base URL for a local install.
-const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 
 /// The environment variable Ollama's own tooling reads for the server
 /// address (e.g. `127.0.0.1:11434`, optionally with a scheme). If set,
 /// [`OllamaChatClient::from_env`] derives the OpenAI-compatible base URL from
 /// it; there is no API-key environment variable to require, since a stock
 /// Ollama server accepts unauthenticated requests.
-const OLLAMA_HOST_ENV: &str = "OLLAMA_HOST";
+pub(crate) const OLLAMA_HOST_ENV: &str = "OLLAMA_HOST";
 
 /// Turn an `OLLAMA_HOST` value into the OpenAI-compatible base URL Ollama
 /// serves under. `OLLAMA_HOST` (as read by Ollama's own CLI/server) is
@@ -68,7 +70,7 @@ const OLLAMA_HOST_ENV: &str = "OLLAMA_HOST";
 /// a full URL is tolerated too. Either way this appends the compatibility
 /// layer's `/v1` suffix (stripping any the caller already included, and any
 /// trailing slash, so the result never doubles up).
-fn base_url_from_host(host: &str) -> String {
+pub(crate) fn base_url_from_host(host: &str) -> String {
     let host = host.trim().trim_end_matches('/');
     let with_scheme = if host.contains("://") {
         host.to_string()
@@ -133,7 +135,7 @@ impl OllamaChatClient {
     /// Build a client from the environment. Ollama has no required
     /// credential env var (a stock server is unauthenticated), so this never
     /// fails on missing configuration; it only reads the optional
-    /// [`OLLAMA_HOST_ENV`] (`OLLAMA_HOST`) to override the default base URL,
+    /// `OLLAMA_HOST_ENV` (`OLLAMA_HOST`) to override the default base URL,
     /// same as Ollama's own CLI/SDKs.
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
         let mut client = Self::new(model);

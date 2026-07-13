@@ -64,10 +64,11 @@ pub use error::{Error, Result};
 /// Commonly used imports.
 pub mod prelude {
     pub use crate::agent::{
-        Agent, AgentBuilder, AgentRunOptions, AgentRunStream, AsToolOptions, SupportsAgentRun,
+        Agent, AgentBuilder, AgentRunOptions, AgentRunStream, AgentToolStreamCallback,
+        AsToolOptions, SupportsAgentRun,
     };
     pub use crate::client::{
-        ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
+        ChatClient, ChatStream, EmbeddingClient, FunctionInvokingChatClient, RetryOn, RetryPolicy,
         RetryingChatClient,
     };
     pub use crate::compaction::{
@@ -78,10 +79,11 @@ pub mod prelude {
     pub use crate::history::{FileHistoryProvider, HistoryProvider, InMemoryHistoryProvider};
     pub use crate::memory::{ContextProvider, SessionContext};
     pub use crate::middleware::{
-        AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
+        AgentContext, ChatContext, FunctionInvocationContext, LiveToolList, Middleware,
+        MiddlewarePipeline, Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
-    pub use crate::session::AgentSession;
+    pub use crate::session::{AgentSession, SessionState};
     pub use crate::settings::{load_setting, SecretString};
     pub use crate::skills::{Skill, SkillsProvider};
     pub use crate::tools::{
@@ -91,9 +93,9 @@ pub mod prelude {
     };
     pub use crate::types::{
         AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
-        FinishReason, FunctionApprovalRequestContent, FunctionApprovalResponseContent,
-        FunctionCallContent, FunctionResultContent, Message, ResponseFormat, Role, TextContent,
-        ToolMode, UsageDetails,
+        Embedding, EmbeddingGenerationOptions, FinishReason, FunctionApprovalRequestContent,
+        FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent,
+        GeneratedEmbeddings, Message, ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
         CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,

@@ -27,19 +27,41 @@ async fn main() -> Result<()> {
             .description("Ask the geography specialist a question."),
     );
 
-    // The orchestrator can now call the specialist exactly like any other
+    // A second specialist shares the orchestrator's session instead:
+    // `propagate_session` hands it a *child* of the caller's session — same
+    // identity and (shared) state bag, but an isolated server-side
+    // conversation pointer.
+    let historian = Agent::builder(client.clone())
+        .name("historian")
+        .description("Answers questions about world history.")
+        .instructions("Answer history questions in one short sentence.")
+        .build();
+    let history_tool = historian.as_tool(
+        AsToolOptions::new()
+            .name("ask_historian")
+            .description("Ask the history specialist a question.")
+            .propagate_session(true),
+    );
+
+    // The orchestrator can now call the specialists exactly like any other
     // tool -- the function-invocation loop handles the call/result round trip.
     let orchestrator = Agent::builder(client)
         .name("orchestrator")
         .instructions(
             "You answer user questions. For geography questions, delegate to \
-             the ask_geographer tool instead of answering directly.",
+             the ask_geographer tool; for history questions, delegate to the \
+             ask_historian tool.",
         )
         .tool(geography_tool)
+        .tool(history_tool)
         .build();
 
+    let mut session = AgentSession::new();
     let response = orchestrator
-        .run_once("What is the highest mountain in Africa?")
+        .run(
+            vec![Message::user("What is the highest mountain in Africa?")],
+            Some(&mut session),
+        )
         .await?;
     println!("{}", response.text());
 

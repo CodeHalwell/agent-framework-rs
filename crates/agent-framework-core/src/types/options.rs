@@ -226,6 +226,20 @@ pub struct ChatOptions {
     pub top_p: Option<f32>,
     pub user: Option<String>,
     pub additional_properties: HashMap<String, serde_json::Value>,
+    /// The [`AgentSession`](crate::session::AgentSession) of the agent run
+    /// this request belongs to, if any.
+    ///
+    /// This is a **framework-internal side channel**, not a wire field: the
+    /// agent sets it in `prepare_request`, and the function-invocation loop
+    /// pops it (before the inner provider client ever sees the options) and
+    /// hands it to invoked tools via
+    /// [`FunctionInvocationContext::session`](crate::middleware::FunctionInvocationContext) —
+    /// which is what lets `Agent::as_tool` with `propagate_session` forward
+    /// the parent's session to a sub-agent. Mirrors upstream, where the agent
+    /// passes `session=` through the chat-client kwargs and the
+    /// function-invocation layer pops it (`_middleware.py:1188`). Provider
+    /// converters must ignore it.
+    pub session: Option<crate::session::AgentSession>,
 }
 
 impl ChatOptions {
@@ -314,6 +328,7 @@ impl ChatOptions {
         take!(tool_choice);
         take!(top_p);
         take!(user);
+        take!(session);
 
         // instructions: newline-concatenate.
         self.instructions = match (self.instructions.take(), other.instructions) {

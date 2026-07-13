@@ -55,9 +55,9 @@
 //!   [`AgentResponseUpdate`]: agent_framework_core::types::AgentResponseUpdate
 //! - **Client `tools` are injected as declaration-only tools.** Client-declared
 //!   `tools` in the `RunAgentInput` are mapped to declaration-only
-//!   [`ToolDefinition`](agent_framework_core::tools::ToolDefinition)s (no
+//!   [`ToolDefinition`]s (no
 //!   executor) and passed to the agent via per-run
-//!   [`AgentRunOptions`](agent_framework_core::agent::AgentRunOptions). When the
+//!   [`AgentRunOptions`]. When the
 //!   model calls one, the function-invocation loop returns the call unexecuted
 //!   (see [`crate::agui`]'s frontend-tool note), and it is framed as
 //!   `TOOL_CALL_*` **without** a `TOOL_CALL_RESULT` — the browser runs it. An

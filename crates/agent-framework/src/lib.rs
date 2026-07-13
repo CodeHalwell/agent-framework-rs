@@ -137,7 +137,9 @@ pub mod prelude {
     pub use agent_framework_core::prelude::*;
 
     #[cfg(feature = "openai")]
-    pub use agent_framework_openai::{OpenAIChatClient, OpenAIChatCompletionClient};
+    pub use agent_framework_openai::{
+        OpenAIChatClient, OpenAIChatCompletionClient, OpenAIEmbeddingClient,
+    };
 
     #[cfg(feature = "anthropic")]
     pub use agent_framework_anthropic::{
@@ -145,13 +147,13 @@ pub mod prelude {
     };
 
     #[cfg(feature = "ollama")]
-    pub use agent_framework_ollama::OllamaChatClient;
+    pub use agent_framework_ollama::{OllamaChatClient, OllamaEmbeddingClient};
 
     #[cfg(feature = "gemini")]
     pub use agent_framework_gemini::GeminiChatClient;
 
     #[cfg(feature = "mistral")]
-    pub use agent_framework_mistral::MistralChatClient;
+    pub use agent_framework_mistral::{MistralChatClient, MistralEmbeddingClient};
 
     #[cfg(feature = "foundry-local")]
     pub use agent_framework_foundry_local::FoundryLocalChatClient;
@@ -163,7 +165,9 @@ pub mod prelude {
     pub use agent_framework_github_copilot::GitHubCopilotChatClient;
 
     #[cfg(feature = "azure")]
-    pub use agent_framework_azure::{AzureOpenAIClient, StaticTokenCredential, TokenCredential};
+    pub use agent_framework_azure::{
+        AzureOpenAIClient, AzureOpenAIEmbeddingClient, StaticTokenCredential, TokenCredential,
+    };
 
     #[cfg(feature = "mcp")]
     pub use agent_framework_mcp::{McpStdioTool, McpStreamableHttpTool, McpWebsocketTool};

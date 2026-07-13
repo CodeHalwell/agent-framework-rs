@@ -1,7 +1,7 @@
 //! # agent-framework-foundry-local
 //!
 //! A [Microsoft Foundry Local](https://learn.microsoft.com/en-us/azure/ai-foundry/foundry-local/what-is-foundry-local)
-//! [`ChatClient`](agent_framework_core::client::ChatClient) for `agent-framework-rs`.
+//! [`ChatClient`] for `agent-framework-rs`.
 //!
 //! Foundry Local runs models on-device and exposes them through an
 //! OpenAI-compatible REST endpoint (`POST {base_url}/chat/completions`,
@@ -45,7 +45,7 @@
 //! deployments (it varies by install and can change across restarts); this
 //! crate does not perform that discovery itself. Point
 //! [`FoundryLocalChatClient`] at the right base URL with
-//! [`FoundryLocalChatClient::with_base_url`] or the [`FOUNDRY_LOCAL_ENDPOINT_ENV`]
+//! [`FoundryLocalChatClient::with_base_url`] or the `FOUNDRY_LOCAL_ENDPOINT_ENV`
 //! (`FOUNDRY_LOCAL_ENDPOINT`) environment variable, using whatever port the
 //! Foundry Local SDK/CLI reports (`5273` above is just the common default).
 
@@ -128,8 +128,8 @@ impl FoundryLocalChatClient {
     /// Build a client from the environment. Foundry Local has no required
     /// credential env var (a stock instance is unauthenticated), so this
     /// never fails on missing configuration; it only reads the optional
-    /// [`FOUNDRY_LOCAL_ENDPOINT_ENV`] (`FOUNDRY_LOCAL_ENDPOINT`) to override
-    /// the default base URL and [`FOUNDRY_LOCAL_API_KEY_ENV`]
+    /// `FOUNDRY_LOCAL_ENDPOINT_ENV` (`FOUNDRY_LOCAL_ENDPOINT`) to override
+    /// the default base URL and `FOUNDRY_LOCAL_API_KEY_ENV`
     /// (`FOUNDRY_LOCAL_API_KEY`) to set a bearer token, if present.
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
         let mut client = Self::new(model);

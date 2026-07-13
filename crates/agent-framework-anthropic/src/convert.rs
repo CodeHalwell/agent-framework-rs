@@ -76,7 +76,7 @@ pub fn build_request(
 /// body in place of the direct API's top-level `model` field. Everything
 /// else — system prompt extraction, message conversion, sampling options,
 /// tools/tool_choice, and `additional_properties` passthrough — is identical
-/// to [`build_request`], via the same [`fill_request_body`] helper, so the
+/// to [`build_request`], via the same `fill_request_body` helper, so the
 /// two stay in lockstep by construction rather than by convention.
 pub fn build_cloud_request(
     messages: &[Message],

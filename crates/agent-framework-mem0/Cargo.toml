@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 description = "Mem0 context provider for long-term agent memory"
 
 [dependencies]

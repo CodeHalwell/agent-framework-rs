@@ -17,7 +17,7 @@ use crate::history::ensure_history_provider;
 use crate::memory::{ContextProvider, SessionContext};
 use crate::middleware::{AgentContext, ChatContext, MiddlewarePipeline, Terminal};
 use crate::session::AgentSession;
-use crate::tools::{FunctionTool, ToolDefinition, ToolSource};
+use crate::tools::{ToolDefinition, ToolSource};
 use crate::types::{
     prepare_messages, AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, IntoMessages,
     Message, ResponseFormat,
@@ -249,7 +249,8 @@ pub trait SupportsAgentRun: Send + Sync {
     /// `session` is taken **by value**: the returned stream owns it and
     /// drives its context providers (including any history provider) once
     /// the stream is fully consumed. When a provider's storage is shared (as
-    /// [`InMemoryHistoryProvider`]'s is, via `Arc`), the write-back is
+    /// [`InMemoryHistoryProvider`](crate::history::InMemoryHistoryProvider)'s
+    /// is, via `Arc`), the write-back is
     /// observable through a clone taken before streaming.
     async fn run_stream(
         &self,
@@ -308,8 +309,12 @@ pub struct Agent {
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
+/// A callback receiving each [`AgentResponseUpdate`] streamed by an agent
+/// running as a tool — see [`AsToolOptions::stream_callback`].
+pub type AgentToolStreamCallback = Arc<dyn Fn(&AgentResponseUpdate) + Send + Sync>;
+
 /// Options for [`Agent::as_tool`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AsToolOptions {
     /// The tool name. Defaults to the agent's name (else its id).
     pub name: Option<String>,
@@ -319,6 +324,40 @@ pub struct AsToolOptions {
     pub arg_name: Option<String>,
     /// The argument's description. Defaults to `"Task for {tool_name}"`.
     pub arg_description: Option<String>,
+    /// Whether calls to this delegated tool require human approval before
+    /// executing (default: no). Mirrors upstream `as_tool(approval_mode=…)`.
+    pub approval_mode: crate::tools::ApprovalMode,
+    /// Observe the sub-agent's streamed updates as they arrive. When set,
+    /// the wrapper runs the sub-agent via `run_stream` and invokes the
+    /// callback on every update before aggregating the final response.
+    /// Mirrors upstream `as_tool(stream_callback=…)`.
+    pub stream_callback: Option<AgentToolStreamCallback>,
+    /// Forward the **parent** agent's session to the sub-agent, so both
+    /// share the same session identity and state bag.
+    ///
+    /// The sub-agent receives a [`AgentSession::child`] of the parent's
+    /// session: same `session_id`, shared `state`, but an **isolated**
+    /// `service_session_id` — the parent's server-side conversation pointer
+    /// (whose tool call is still pending mid-run) must not leak into the
+    /// sub-agent's own service calls. Mirrors upstream
+    /// `as_tool(propagate_session=True)` with the child-session isolation
+    /// fix (microsoft/agent-framework#5875). Defaults to `false` (a fresh
+    /// session per call).
+    pub propagate_session: bool,
+}
+
+impl std::fmt::Debug for AsToolOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsToolOptions")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("arg_name", &self.arg_name)
+            .field("arg_description", &self.arg_description)
+            .field("approval_mode", &self.approval_mode)
+            .field("stream_callback", &self.stream_callback.is_some())
+            .field("propagate_session", &self.propagate_session)
+            .finish()
+    }
 }
 
 impl AsToolOptions {
@@ -343,6 +382,23 @@ impl AsToolOptions {
     /// Set the argument description.
     pub fn arg_description(mut self, arg_description: impl Into<String>) -> Self {
         self.arg_description = Some(arg_description.into());
+        self
+    }
+    /// Require human approval before every call to the delegated tool.
+    pub fn approval_mode(mut self, mode: crate::tools::ApprovalMode) -> Self {
+        self.approval_mode = mode;
+        self
+    }
+    /// Observe the sub-agent's streamed updates (see
+    /// [`AsToolOptions::stream_callback`]).
+    pub fn stream_callback(mut self, callback: AgentToolStreamCallback) -> Self {
+        self.stream_callback = Some(callback);
+        self
+    }
+    /// Forward the parent agent's session to the sub-agent (see
+    /// [`AsToolOptions::propagate_session`]).
+    pub fn propagate_session(mut self, propagate: bool) -> Self {
+        self.propagate_session = propagate;
         self
     }
 }
@@ -559,6 +615,13 @@ impl Agent {
         history.extend(input.iter().cloned());
         let instructions = options.instructions.take();
         let final_messages = prepare_messages(history, instructions.as_deref());
+
+        // Hand the run's session to the function-invocation loop (which pops
+        // it before the wire client sees the options), so invoked tools can
+        // read it from `FunctionInvocationContext::session` — the channel
+        // behind `as_tool` + `propagate_session`. The clone shares the
+        // session's state bag by reference (see `SessionState`).
+        options.session = Some(session.clone());
         Ok((final_messages, options))
     }
 
@@ -1061,14 +1124,14 @@ impl AgentBuilder {
         self
     }
     /// Attach conversation-history compaction, via a
-    /// [`CompactionProvider`](crate::compaction::CompactionProvider) wrapping
+    /// [`CompactionProvider`] wrapping
     /// `strategy` (with the default `ApproxTokenizer`; use
     /// [`AgentBuilder::context_provider`] with
     /// [`CompactionProvider::with_tokenizer`](crate::compaction::CompactionProvider::with_tokenizer)
     /// for a custom tokenizer).
     ///
     /// Registered as one of the agent's own context providers, which
-    /// [`Agent::combined_providers`] always runs *after* the session's —
+    /// `Agent::combined_providers` always runs *after* the session's —
     /// including the auto-attached (or explicitly attached)
     /// [`HistoryProvider`](crate::history::HistoryProvider), which lives on
     /// the session — so compaction sees, and can shrink, the full
@@ -1171,9 +1234,19 @@ impl Agent {
     /// Wrap this agent as a [`ToolDefinition`] usable by another agent's
     /// `.tool(...)`. Mirrors Python `BaseAgent.as_tool`.
     ///
-    /// The tool takes a single string argument (default name `"task"`) and, on
-    /// each call, runs this agent **statelessly** (a fresh thread per call),
-    /// returning the response text.
+    /// The tool takes a single string argument (default name `"task"`) and,
+    /// on each call, runs this agent and returns the response text. By
+    /// default each call runs **statelessly** (a fresh session per call);
+    /// with [`AsToolOptions::propagate_session`] the parent agent's session
+    /// is forwarded instead (as an [`AgentSession::child`]). Set
+    /// [`AsToolOptions::stream_callback`] to observe the sub-agent's
+    /// streamed updates, and [`AsToolOptions::approval_mode`] to gate calls
+    /// behind human approval.
+    ///
+    /// A run that ends with pending user-input requests (function-approval
+    /// requests from the sub-agent's own tools) cannot be satisfied from
+    /// within a tool call and surfaces as a tool error — mirroring
+    /// upstream's `UserInputRequiredException`.
     ///
     /// ```no_run
     /// # use agent_framework_core::prelude::*;
@@ -1187,7 +1260,6 @@ impl Agent {
     /// # }
     /// ```
     pub fn as_tool(&self, options: AsToolOptions) -> ToolDefinition {
-        let agent = Arc::new(self.clone());
         // Mirror Python `name or _sanitize_agent_name(self.name)`: an explicit
         // name is used verbatim; a derived name is sanitized into a valid tool
         // identifier. Falls back to the agent id when no name is available.
@@ -1209,22 +1281,124 @@ impl Agent {
                 arg_name.clone(): { "type": "string", "description": arg_description }
             },
             "required": [arg_name.clone()],
+            "additionalProperties": false,
         });
-        let arg_key = arg_name;
-        FunctionTool::new(tool_name, description, schema, move |args: Value| {
-            let agent = agent.clone();
-            let arg_key = arg_key.clone();
-            async move {
-                let task = args
-                    .get(&arg_key)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let response = agent.run_once(task).await?;
-                Ok(Value::String(response.text()))
+        ToolDefinition {
+            name: tool_name.clone(),
+            description: description.clone(),
+            parameters: schema.clone(),
+            kind: crate::tools::ToolKind::Function,
+            approval_mode: options.approval_mode,
+            executor: Some(Arc::new(AgentAsTool {
+                agent: Arc::new(self.clone()),
+                name: tool_name,
+                description,
+                parameters: schema,
+                arg_key: arg_name,
+                propagate_session: options.propagate_session,
+                stream_callback: options.stream_callback,
+            })),
+        }
+    }
+}
+
+/// The [`Tool`] behind [`Agent::as_tool`]: delegates each call to the wrapped
+/// agent. Reads the parent run's session from the invocation context (via
+/// [`Tool::invoke_in_context`]) when `propagate_session` is enabled.
+///
+/// [`Tool`]: crate::tools::Tool
+struct AgentAsTool {
+    agent: Arc<Agent>,
+    name: String,
+    description: String,
+    parameters: Value,
+    arg_key: String,
+    propagate_session: bool,
+    stream_callback: Option<AgentToolStreamCallback>,
+}
+
+impl AgentAsTool {
+    async fn run_task(
+        &self,
+        arguments: Value,
+        parent_session: Option<&AgentSession>,
+    ) -> Result<Value> {
+        let task = arguments
+            .get(&self.arg_key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        // With `propagate_session`, run the sub-agent on a *child* of the
+        // parent's session: shared identity + state, isolated server-side
+        // conversation pointer (see `AgentSession::child`). Without it (or
+        // when the call arrives without a session — e.g. a direct
+        // `Tool::invoke`), the sub-agent runs on a fresh session per call.
+        let mut child = if self.propagate_session {
+            parent_session.map(AgentSession::child)
+        } else {
+            None
+        };
+
+        let response = match &self.stream_callback {
+            Some(callback) => {
+                let mut stream = SupportsAgentRun::run_stream(
+                    self.agent.as_ref(),
+                    task.into_messages(),
+                    child.clone(),
+                    None,
+                )
+                .await?;
+                let mut updates = Vec::new();
+                while let Some(update) = stream.next().await {
+                    let update = update?;
+                    callback(&update);
+                    updates.push(update);
+                }
+                AgentResponse::from_updates(updates)
             }
-        })
-        .into_definition()
+            None => {
+                SupportsAgentRun::run(self.agent.as_ref(), task.into_messages(), child.as_mut())
+                    .await?
+            }
+        };
+
+        // Pending user-input (approval) requests cannot be answered from
+        // within a tool call; surface them as a tool error (upstream raises
+        // `UserInputRequiredException` here).
+        if !response.user_input_requests().is_empty() {
+            return Err(Error::tool(format!(
+                "agent tool '{}' ended its run with pending user-input requests, \
+                 which cannot be satisfied from within a tool call",
+                self.name
+            )));
+        }
+        Ok(Value::String(response.text()))
+    }
+}
+
+#[async_trait]
+impl crate::tools::Tool for AgentAsTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn parameters_schema(&self) -> Value {
+        self.parameters.clone()
+    }
+
+    async fn invoke(&self, arguments: Value) -> Result<Value> {
+        self.run_task(arguments, None).await
+    }
+
+    async fn invoke_in_context(
+        &self,
+        arguments: Value,
+        ctx: &crate::middleware::FunctionInvocationContext,
+    ) -> Result<Value> {
+        self.run_task(arguments, ctx.session.as_ref()).await
     }
 }
 

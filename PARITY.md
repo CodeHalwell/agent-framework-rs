@@ -53,6 +53,17 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | `response.parse_json::<T>()` helper | ✅ (`response.value`) | ✅ | ✅ done | on both `ChatResponse` and `AgentRunResponse` |
 | Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ✅ done | `client::RetryingChatClient` wraps any `ChatClient` with a `RetryPolicy` (max_retries, exponential backoff, max_delay cap, jitter, `RetryOn` predicate). Default retries HTTP 408/429/5xx (`Error::ServiceStatus`) and transport-ish `Error::Service` failures; honors a server `Retry-After` (OpenAI + Anthropic now emit it on `ServiceStatus`) over computed backoff. Streaming retries only the initial connection |
 
+## Embeddings
+
+| Feature | Python | .NET | Rust | Notes |
+| --- | --- | --- | --- | --- |
+| `SupportsGetEmbeddings` / embedding types | ✅ | ✅ | ✅ done | `client::EmbeddingClient` + `types::{Embedding, GeneratedEmbeddings, EmbeddingGenerationOptions}` (vectors fixed to `Vec<f32>` vs upstream's genericity — documented) |
+| OpenAI embeddings | ✅ | ✅ | ✅ done | `OpenAIEmbeddingClient` (`POST /v1/embeddings`, dimensions/encoding_format/user, index-order restore, usage; loopback-tested) |
+| Azure OpenAI embeddings | ✅ | ✅ | ✅ done | `AzureOpenAIEmbeddingClient` (deployment-scoped, api-key or Entra `TokenCredential`) |
+| Ollama embeddings | ✅ | — | ✅ done | `OllamaEmbeddingClient` — OpenAI-compatible `/v1/embeddings` surface (upstream drives native `/api/embed`; documented) |
+| Mistral embeddings | ✅ (embeddings-only package) | — | ✅ done | `MistralEmbeddingClient`, default `mistral-embed`, `output_dimension`/`output_dtype` mapping |
+| Bedrock / Foundry / Gemini embeddings | ✅ | 🚧 | ❌ not yet | small independent additions; see ALIGNMENT_PROGRESS.md |
+
 ## Agents
 
 | Feature | Python | .NET | Rust | Notes |
@@ -61,7 +72,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | `ChatAgent` (+ builder) | ✅ | ✅ | ✅ done | instructions, default options, tools, context providers, agent/chat/function middleware |
 | `AgentThread` (service-managed XOR local) | ✅ | ✅ | ✅ done | `threads::AgentThread` |
 | `ChatMessageStore` / `InMemoryChatMessageStore` | ✅ | ✅ | ✅ done | |
-| `agent.as_tool()` | ✅ | ✅ | ✅ done | `ChatAgent::as_tool` + `AsToolOptions`; runs the wrapped agent statelessly |
+| `agent.as_tool()` | ✅ | ✅ | ✅ done | `Agent::as_tool` + `AsToolOptions`; stateless by default, or `propagate_session` (child session: shared id/state, isolated `service_session_id` — upstream #5875 semantics), plus `stream_callback` and `approval_mode` |
 | Workflow-as-agent | ✅ | ✅ | ✅ done | `orchestration::workflow_agent::WorkflowAgent`, `WorkflowAgentExt::as_agent` |
 | WorkflowAgent thread-history updates | ✅ | ✅ | ✅ done | `run` / `run_stream_with_thread` write input + response back to the thread (mirrors Python's `_notify_thread_of_new_messages`); like Python, write-back only — prior history is not fed into the workflow input |
 | A2A remote agent (`A2AAgent`) | ✅ (`a2a` package) | ✅ (`Microsoft.Agents.AI.A2A`) | ✅ done | `agent-framework-a2a::A2AAgent` — JSON-RPC 2.0 over HTTP + `.well-known` card discovery; thread-based `contextId`/`taskId` continuity (which the Python client actually lacks) |

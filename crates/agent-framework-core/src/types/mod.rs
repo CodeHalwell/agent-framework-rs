@@ -3,6 +3,7 @@
 //! This is the Rust equivalent of `agent_framework._types`.
 
 mod content;
+mod embedding;
 mod message;
 mod options;
 mod response;
@@ -13,6 +14,7 @@ pub use content::{
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
 };
+pub use embedding::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{

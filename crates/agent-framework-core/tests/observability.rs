@@ -155,6 +155,9 @@ fn observable_chat_client_emits_chat_span() {
 struct CapturedSpan {
     name: &'static str,
     fields: HashMap<String, String>,
+    /// The span id of this span's parent — explicit, or the contextually
+    /// current span at creation — if any.
+    parent: Option<u64>,
 }
 
 /// A `tracing` layer that records every field (by stringified value) set on
@@ -176,6 +179,27 @@ impl FieldCapture {
             .values()
             .find(|s| s.name == name)
             .cloned()
+    }
+
+    /// Every captured span with the given (static metadata) name.
+    fn all_by_name(&self, name: &str) -> Vec<CapturedSpan> {
+        self.spans
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.name == name)
+            .cloned()
+            .collect()
+    }
+
+    /// The span id of the (single) captured span with the given name.
+    fn id_by_name(&self, name: &str) -> Option<u64> {
+        self.spans
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, s)| s.name == name)
+            .map(|(id, _)| *id)
     }
 }
 
@@ -208,15 +232,30 @@ impl<S: tracing::Subscriber> Layer<S> for FieldCapture {
         &self,
         attrs: &tracing::span::Attributes<'_>,
         id: &tracing::span::Id,
-        _ctx: Context<'_, S>,
+        ctx: Context<'_, S>,
     ) {
         let mut fields = HashMap::new();
         attrs.record(&mut Recorder(&mut fields));
+        // Parent resolution mirrors tracing's own: an explicitly assigned
+        // parent wins; a contextual (non-root) span parents onto whatever
+        // span is current on this thread at creation time.
+        let parent = attrs
+            .parent()
+            .cloned()
+            .or_else(|| {
+                if attrs.is_contextual() {
+                    ctx.current_span().id().cloned()
+                } else {
+                    None
+                }
+            })
+            .map(|p| p.into_u64());
         self.spans.lock().unwrap().insert(
             id.into_u64(),
             CapturedSpan {
                 name: attrs.metadata().name(),
                 fields,
+                parent,
             },
         );
     }
@@ -612,4 +651,118 @@ fn tool_span_records_error_status() {
         .get(attr::OTEL_STATUS_MESSAGE)
         .expect("status message present");
     assert!(message.contains("kaboom"), "got: {message}");
+}
+
+// ---------------------------------------------------------------------
+// Parallel tool calls: every execute_tool span keeps the surrounding span
+// as its parent. Regression guard mirroring upstream's "preserve tool span
+// context for parallel calls" fix (microsoft/agent-framework#6512): Python
+// lost the ambient span when fanning tool calls out via asyncio.create_task
+// without copying contextvars; the Rust loop polls all invocations in-task
+// under the instrumented future, so the parent must always propagate.
+// ---------------------------------------------------------------------
+
+/// A scripted client whose first response requests TWO parallel tool calls
+/// and whose second response is the final answer.
+#[derive(Clone)]
+struct ParallelCallsClient {
+    responses: Arc<Mutex<Vec<ChatResponse>>>,
+}
+
+impl ParallelCallsClient {
+    fn new() -> Self {
+        use agent_framework_core::types::FunctionArguments;
+        let calls = vec![
+            Content::FunctionCall(FunctionCallContent::new(
+                "call_a",
+                "alpha",
+                Some(FunctionArguments::Raw("{}".into())),
+            )),
+            Content::FunctionCall(FunctionCallContent::new(
+                "call_b",
+                "beta",
+                Some(FunctionArguments::Raw("{}".into())),
+            )),
+        ];
+        let ask = ChatResponse {
+            messages: vec![Message::with_contents(Role::assistant(), calls)],
+            finish_reason: Some(FinishReason::tool_calls()),
+            ..Default::default()
+        };
+        Self {
+            responses: Arc::new(Mutex::new(vec![ask, ChatResponse::from_text("done")])),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatClient for ParallelCallsClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+#[test]
+fn parallel_tool_call_spans_keep_the_surrounding_span_as_parent() {
+    let capture = run_captured(|| async {
+        // A tool that yields before answering, so the two invocations
+        // genuinely interleave rather than completing back-to-back.
+        let yielding_tool = |name: &str| {
+            FunctionTool::new(
+                name,
+                "yields then answers",
+                serde_json::json!({ "type": "object", "properties": {} }),
+                |_args| async move {
+                    tokio::task::yield_now().await;
+                    Ok(serde_json::Value::String("ok".into()))
+                },
+            )
+            .into_definition()
+        };
+        let client = FunctionInvokingChatClient::new(ParallelCallsClient::new());
+        let options = ChatOptions {
+            tools: vec![yielding_tool("alpha"), yielding_tool("beta")],
+            ..Default::default()
+        };
+        let outer = tracing::info_span!("outer_agent_span");
+        async {
+            let resp = client
+                .get_response(vec![Message::user("go")], options)
+                .await
+                .unwrap();
+            assert_eq!(resp.text(), "done");
+        }
+        .instrument(outer)
+        .await;
+    });
+
+    let outer_id = capture
+        .id_by_name("outer_agent_span")
+        .expect("expected the outer span to be captured");
+    let tool_spans = capture.all_by_name("execute_tool");
+    assert_eq!(
+        tool_spans.len(),
+        2,
+        "expected one execute_tool span per parallel call"
+    );
+    for span in &tool_spans {
+        assert_eq!(
+            span.parent,
+            Some(outer_id),
+            "an execute_tool span lost its surrounding span (parent: {:?})",
+            span.parent
+        );
+    }
 }

@@ -31,6 +31,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/codehalwell/agent-framework-rs"
 authors = ["agent-framework-rs contributors"]
 description = "A Rust implementation of the Microsoft Agent Framework for building AI agents and multi-agent workflows"

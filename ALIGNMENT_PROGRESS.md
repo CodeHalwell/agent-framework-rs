@@ -7,6 +7,54 @@ refer to that document. Everything under "Done" is landed on
 (full workspace build + `cargo test` + clippy `--all-targets` + rustfmt, all
 green) before commit.
 
+## Post-`68136ee` drift (checked against `beb65b21`, 2026-07-13)
+
+Upstream moved 4 Python commits past the `68136ee` baseline; all four are
+accounted for:
+
+- **`as_tool` session propagation** (`f3057ef2`, fixing a feature already in
+  `68136ee` that the port had not yet carried): `AsToolOptions` gained
+  `propagate_session` (plus the previously missing `stream_callback` and
+  `approval_mode`). Implemented with upstream's *fixed* child-session
+  semantics: the sub-agent runs on an `AgentSession::child` of the parent —
+  same `session_id`, **shared** `state` bag, **isolated** (cleared)
+  `service_session_id`, so the parent's pending server-side conversation
+  pointer never leaks into the sub-agent's own service calls. Plumbing:
+  `AgentSession.state` became a `SessionState` handle (shared by reference
+  across clones, matching Python's dict-reference semantics), the agent hands
+  its session to the function-invocation loop via a non-wire
+  `ChatOptions::session` side channel (popped before the provider client sees
+  the options, exactly like upstream's client-kwargs `pop("session")`), and
+  tools can read it through `FunctionInvocationContext::session` /
+  `Tool::invoke_in_context`.
+- **Parallel tool-span context** (`7f4cc296`): Python lost the ambient span
+  when fanning parallel tool calls out via `asyncio.create_task` without
+  copying contextvars. The Rust loop polls all invocations in-task under the
+  instrumented future, so the parent span always propagates — no code change
+  needed; a regression test now pins the behavior
+  (`observability.rs::parallel_tool_call_spans_keep_the_surrounding_span_as_parent`).
+- **Harness compaction fix** (`b3d523ee`): `@experimental` harness module —
+  out of scope (see "Remaining").
+- **OTel Distro sample** (`8e74360d`): Python-only sample — no Rust action.
+
+A subsequent example-gallery audit against upstream's `python/samples` closed
+two further gaps that predated the re-baseline:
+
+- **Embeddings** (UPSTREAM_DRIFT §4/§5's "if in scope" item — now in scope):
+  `Embedding`/`GeneratedEmbeddings`/`EmbeddingGenerationOptions` types + the
+  `EmbeddingClient` trait in core, with provider clients for **OpenAI**
+  (`/v1/embeddings`, loopback-tested), **Azure OpenAI** (deployment-scoped,
+  api-key/Entra), **Ollama** (OpenAI-compatible surface), and **Mistral**
+  (`mistral-embed` default — upstream's mistral package is embeddings-only).
+  Bedrock/Foundry/Gemini embedding clients remain open (small, independent
+  additions).
+- **Progressive tool exposure** (upstream `FunctionInvocationContext.tools`):
+  a `LiveToolList` handle on the invocation context with
+  `add_tools`/`remove_tools` (duplicate-name rejection, batch-validated);
+  the function-calling loop re-snapshots it at the top of every model
+  iteration, so mutations take effect on the next iteration, never the
+  in-flight batch.
+
 ## Done
 
 ### Naming / type-system cascade — Theme A + Theme F (complete)

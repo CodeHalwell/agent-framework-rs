@@ -1,6 +1,6 @@
 //! # agent-framework-mistral
 //!
-//! A [Mistral AI](https://mistral.ai) [`ChatClient`](agent_framework_core::client::ChatClient)
+//! A [Mistral AI](https://mistral.ai) [`ChatClient`]
 //! for `agent-framework-rs`.
 //!
 //! Talks to the Mistral Chat Completions API (`POST /v1/chat/completions`),
@@ -39,6 +39,8 @@
 //! ```
 
 pub mod convert;
+pub mod embeddings;
+pub use embeddings::{MistralEmbeddingClient, DEFAULT_EMBEDDING_MODEL};
 
 use std::sync::Arc;
 
@@ -48,7 +50,7 @@ use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::Value;
 
-const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
 
 /// Parse a `Retry-After` header into a delay in seconds.
 ///

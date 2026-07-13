@@ -39,6 +39,25 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given JSON arguments.
     async fn invoke(&self, arguments: Value) -> Result<Value>;
+
+    /// Execute the tool with access to the surrounding
+    /// [`FunctionInvocationContext`](crate::middleware::FunctionInvocationContext)
+    /// (the agent session, middleware metadata, …).
+    ///
+    /// The function-invocation loop calls **this** method; the default
+    /// implementation ignores the context and delegates to [`Tool::invoke`],
+    /// so ordinary tools need not care. Override it for tools that read the
+    /// invocation context — the Rust analogue of an upstream `FunctionTool`
+    /// whose function declares a `ctx: FunctionInvocationContext` parameter
+    /// (e.g. the `Agent::as_tool` wrapper, which forwards `ctx.session` to
+    /// the sub-agent when `propagate_session` is enabled).
+    async fn invoke_in_context(
+        &self,
+        arguments: Value,
+        _ctx: &crate::middleware::FunctionInvocationContext,
+    ) -> Result<Value> {
+        self.invoke(arguments).await
+    }
 }
 
 /// A dynamic source of tools, resolved fresh on every agent run instead of

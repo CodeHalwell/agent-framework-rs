@@ -1459,7 +1459,8 @@ impl MagenticBuilder {
     /// [`Self::participant`]/[`Self::participant_described`]) as a workflow
     /// output source, forwarded to [`WorkflowBuilder::output_from`].
     ///
-    /// **Divergence from Sequential/Concurrent:** like [`GroupChatBuilder`],
+    /// **Divergence from Sequential/Concurrent:** like
+    /// [`GroupChatBuilder`](crate::workflow::GroupChatBuilder),
     /// Magentic compiles to a *single* orchestrator [`Executor`] that drives
     /// the whole plan/round loop internally (see the module-level design
     /// note) rather than one executor per participant, so there is no

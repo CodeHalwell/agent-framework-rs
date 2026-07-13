@@ -13,12 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
-use crate::middleware::{FunctionInvocationContext, MiddlewarePipeline, Terminal};
+use crate::middleware::{FunctionInvocationContext, LiveToolList, MiddlewarePipeline, Terminal};
 use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionApprovalRequestContent,
-    FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent, Message, Role,
-    ToolMode, UsageContent,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, EmbeddingGenerationOptions,
+    FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
+    FunctionResultContent, GeneratedEmbeddings, Message, Role, ToolMode, UsageContent,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -67,6 +67,43 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
         options: ChatOptions,
     ) -> Result<ChatStream> {
         (**self).get_streaming_response(messages, options).await
+    }
+    fn model(&self) -> Option<&str> {
+        (**self).model()
+    }
+}
+
+/// The interface every embedding client implements.
+///
+/// Rust equivalent of upstream's `SupportsGetEmbeddings` protocol /
+/// `BaseEmbeddingClient` (`_clients.py`): generate one embedding per input
+/// string, batched in a single request. Vectors are `Vec<f32>` — see the
+/// note on [`crate::types::Embedding`] about upstream's genericity.
+#[async_trait]
+pub trait EmbeddingClient: Send + Sync {
+    /// Generate embeddings for the given values (one per value, in order).
+    async fn get_embeddings(
+        &self,
+        values: Vec<String>,
+        options: Option<EmbeddingGenerationOptions>,
+    ) -> Result<GeneratedEmbeddings>;
+
+    /// The default embedding model id for this client, if any.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Blanket impl so `Arc<dyn EmbeddingClient>` and wrappers are usable as
+/// clients.
+#[async_trait]
+impl<T: EmbeddingClient + ?Sized> EmbeddingClient for Arc<T> {
+    async fn get_embeddings(
+        &self,
+        values: Vec<String>,
+        options: Option<EmbeddingGenerationOptions>,
+    ) -> Result<GeneratedEmbeddings> {
+        (**self).get_embeddings(values, options).await
     }
     fn model(&self) -> Option<&str> {
         (**self).model()
@@ -173,6 +210,8 @@ async fn execute_tool_call(
     include_detailed_errors: bool,
     terminate_on_unknown: bool,
     function_middleware: &MiddlewarePipeline<FunctionInvocationContext>,
+    session: Option<&crate::session::AgentSession>,
+    live_tools: Option<&LiveToolList>,
 ) -> Result<(bool, FunctionResultContent)> {
     match tool {
         None => {
@@ -229,7 +268,7 @@ async fn execute_tool_call(
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
-                        let result = exec.invoke(ctx.arguments.clone()).await;
+                        let result = exec.invoke_in_context(ctx.arguments.clone(), &ctx).await;
                         if let Err(e) = &result {
                             crate::observability::record_error(&tracing::Span::current(), e);
                         }
@@ -255,7 +294,9 @@ async fn execute_tool_call(
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
 
-            let ctx = FunctionInvocationContext::new(call.name.clone(), args);
+            let ctx = FunctionInvocationContext::new(call.name.clone(), args)
+                .with_session(session.cloned())
+                .with_tools(live_tools.cloned());
             match function_middleware.execute(ctx, terminal).await {
                 Ok(ctx) => Ok((
                     false,
@@ -380,22 +421,37 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         let response_format = options.response_format.clone();
         let mut response: ChatResponse = async move {
             self.config.validate()?;
-            let tools = executable_tools(&options);
+            // Pop the agent-session side channel before the inner provider
+            // client ever sees the options (mirrors upstream's
+            // `effective_client_kwargs.pop("session")`); it is handed to
+            // invoked tools via `FunctionInvocationContext::session`.
+            let session = options.session.take();
 
             // Default tool choice to auto when tools are present and unset.
             if !options.tools.is_empty() && options.tool_choice.is_none() {
                 options.tool_choice = Some(ToolMode::Auto);
             }
 
-            if tools.is_empty() || !self.config.enabled {
+            if executable_tools(&options).is_empty() || !self.config.enabled {
                 return self.inner_get_response(messages, options).await;
             }
+
+            // The run's live tool list (progressive tool exposure): handed to
+            // every invocation via `FunctionInvocationContext::tools`, and
+            // re-snapshotted into the wire options at the top of every model
+            // iteration — so `add_tools`/`remove_tools` from middleware or
+            // tools take effect on the NEXT iteration, never the in-flight
+            // batch (mirrors upstream `_middleware.py` add_tools/remove_tools
+            // semantics).
+            let live_tools = LiveToolList::new(std::mem::take(&mut options.tools));
 
             let mut conversation = messages;
             let mut carried: Vec<Message> = Vec::new();
             let mut consecutive_errors = 0usize;
 
             for _ in 0..self.config.max_iterations {
+                options.tools = live_tools.snapshot();
+                let tools = executable_tools(&options);
                 // Process any function-approval responses supplied in the input:
                 // execute the approved calls and splice their results into the
                 // conversation (mirrors Python's `_collect_approval_responses` +
@@ -417,6 +473,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             self.config.include_detailed_errors,
                             self.config.terminate_on_unknown_calls,
                             &self.function_middleware,
+                            session.as_ref(),
+                            Some(&live_tools),
                         )
                         .await?;
                         had_error |= is_error;
@@ -541,6 +599,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let include_detailed_errors = self.config.include_detailed_errors;
                     let terminate_on_unknown = self.config.terminate_on_unknown_calls;
                     let function_middleware = self.function_middleware.clone();
+                    let session = session.clone();
+                    let live_tools = live_tools.clone();
                     async move {
                         execute_tool_call(
                             tool,
@@ -548,6 +608,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             include_detailed_errors,
                             terminate_on_unknown,
                             &function_middleware,
+                            session.as_ref(),
+                            Some(&live_tools),
                         )
                         .await
                     }
