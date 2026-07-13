@@ -68,6 +68,7 @@
 
 mod credential;
 mod credentials;
+pub mod embeddings;
 pub mod responses;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
@@ -76,6 +77,7 @@ pub use credentials::{
     EnvironmentCredential, ManagedIdentityCredential, WorkloadIdentityCredential,
     DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
 };
+pub use embeddings::AzureOpenAIEmbeddingClient;
 pub use responses::AzureOpenAIResponsesClient;
 
 use std::sync::Arc;
@@ -86,7 +88,7 @@ use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-const DEFAULT_API_VERSION: &str = "2024-10-21";
+pub(crate) const DEFAULT_API_VERSION: &str = "2024-10-21";
 
 /// Parse a `Retry-After` header into a delay in seconds.
 ///
@@ -95,7 +97,7 @@ const DEFAULT_API_VERSION: &str = "2024-10-21";
 /// [`RetryingChatClient`](agent_framework_core::client::RetryingChatClient) can
 /// wait exactly as long as the server asks. A date-form or unparseable value is
 /// treated as absent.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())

@@ -53,6 +53,17 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | `response.parse_json::<T>()` helper | ✅ (`response.value`) | ✅ | ✅ done | on both `ChatResponse` and `AgentRunResponse` |
 | Retry / backoff policy layer | 🚧 (middleware pattern shown in docs, not built in) | not verified | ✅ done | `client::RetryingChatClient` wraps any `ChatClient` with a `RetryPolicy` (max_retries, exponential backoff, max_delay cap, jitter, `RetryOn` predicate). Default retries HTTP 408/429/5xx (`Error::ServiceStatus`) and transport-ish `Error::Service` failures; honors a server `Retry-After` (OpenAI + Anthropic now emit it on `ServiceStatus`) over computed backoff. Streaming retries only the initial connection |
 
+## Embeddings
+
+| Feature | Python | .NET | Rust | Notes |
+| --- | --- | --- | --- | --- |
+| `SupportsGetEmbeddings` / embedding types | ✅ | ✅ | ✅ done | `client::EmbeddingClient` + `types::{Embedding, GeneratedEmbeddings, EmbeddingGenerationOptions}` (vectors fixed to `Vec<f32>` vs upstream's genericity — documented) |
+| OpenAI embeddings | ✅ | ✅ | ✅ done | `OpenAIEmbeddingClient` (`POST /v1/embeddings`, dimensions/encoding_format/user, index-order restore, usage; loopback-tested) |
+| Azure OpenAI embeddings | ✅ | ✅ | ✅ done | `AzureOpenAIEmbeddingClient` (deployment-scoped, api-key or Entra `TokenCredential`) |
+| Ollama embeddings | ✅ | — | ✅ done | `OllamaEmbeddingClient` — OpenAI-compatible `/v1/embeddings` surface (upstream drives native `/api/embed`; documented) |
+| Mistral embeddings | ✅ (embeddings-only package) | — | ✅ done | `MistralEmbeddingClient`, default `mistral-embed`, `output_dimension`/`output_dtype` mapping |
+| Bedrock / Foundry / Gemini embeddings | ✅ | 🚧 | ❌ not yet | small independent additions; see ALIGNMENT_PROGRESS.md |
+
 ## Agents
 
 | Feature | Python | .NET | Rust | Notes |

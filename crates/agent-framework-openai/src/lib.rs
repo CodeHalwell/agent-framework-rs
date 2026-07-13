@@ -30,8 +30,10 @@
 /// duplicating it. It is not intended as a stable external API.
 #[doc(hidden)]
 pub mod convert;
+pub mod embeddings;
 
 pub mod responses;
+pub use embeddings::OpenAIEmbeddingClient;
 pub use responses::OpenAIChatClient;
 
 use std::collections::{HashMap, VecDeque};
@@ -47,7 +49,7 @@ use agent_framework_core::types::{
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Parse a `Retry-After` header into a delay in seconds.
 ///

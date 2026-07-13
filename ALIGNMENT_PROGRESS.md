@@ -37,6 +37,24 @@ accounted for:
   out of scope (see "Remaining").
 - **OTel Distro sample** (`8e74360d`): Python-only sample — no Rust action.
 
+A subsequent example-gallery audit against upstream's `python/samples` closed
+two further gaps that predated the re-baseline:
+
+- **Embeddings** (UPSTREAM_DRIFT §4/§5's "if in scope" item — now in scope):
+  `Embedding`/`GeneratedEmbeddings`/`EmbeddingGenerationOptions` types + the
+  `EmbeddingClient` trait in core, with provider clients for **OpenAI**
+  (`/v1/embeddings`, loopback-tested), **Azure OpenAI** (deployment-scoped,
+  api-key/Entra), **Ollama** (OpenAI-compatible surface), and **Mistral**
+  (`mistral-embed` default — upstream's mistral package is embeddings-only).
+  Bedrock/Foundry/Gemini embedding clients remain open (small, independent
+  additions).
+- **Progressive tool exposure** (upstream `FunctionInvocationContext.tools`):
+  a `LiveToolList` handle on the invocation context with
+  `add_tools`/`remove_tools` (duplicate-name rejection, batch-validated);
+  the function-calling loop re-snapshots it at the top of every model
+  iteration, so mutations take effect on the next iteration, never the
+  in-flight batch.
+
 ## Done
 
 ### Naming / type-system cascade — Theme A + Theme F (complete)

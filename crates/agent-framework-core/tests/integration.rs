@@ -2654,3 +2654,150 @@ async fn as_tool_approval_mode_gates_the_delegated_call() {
 }
 
 // endregion
+
+// region: progressive tool exposure (upstream FunctionInvocationContext.tools)
+
+/// A tool that mutates the run's live tool list from inside its invocation.
+struct ToolListMutator {
+    name: String,
+    add: Option<ToolDefinition>,
+    remove: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for ToolListMutator {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "mutates the live tool list"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn invoke(&self, _arguments: Value) -> Result<Value> {
+        Ok(Value::Null)
+    }
+    async fn invoke_in_context(
+        &self,
+        _arguments: Value,
+        ctx: &FunctionInvocationContext,
+    ) -> Result<Value> {
+        if let Some(tool) = &self.add {
+            ctx.add_tools([tool.clone()])?;
+        }
+        ctx.remove_tools(self.remove.iter().map(String::as_str))?;
+        Ok(json!("mutated"))
+    }
+}
+
+fn noop_tool(name: &str) -> ToolDefinition {
+    FunctionTool::new(
+        name,
+        "does nothing",
+        json!({ "type": "object", "properties": {} }),
+        |_args| async move { Ok(Value::Null) },
+    )
+    .into_definition()
+}
+
+fn tool_call_response(tool: &str) -> ChatResponse {
+    let call = FunctionCallContent::new(
+        format!("call_{tool}"),
+        tool,
+        Some(FunctionArguments::Raw("{}".into())),
+    );
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn tool_added_mid_run_is_exposed_on_the_next_iteration() {
+    // Iteration 1 calls `unlock`, whose execution adds `secret`; iteration 2
+    // must see `secret` in the wire tool list (and not before).
+    let client = MockClient::new(vec![
+        tool_call_response("unlock"),
+        ChatResponse::from_text("done"),
+    ]);
+    let options_seen = client.seen_options.clone();
+
+    let unlock = ToolDefinition::from_tool(Arc::new(ToolListMutator {
+        name: "unlock".into(),
+        add: Some(noop_tool("secret")),
+        remove: vec![],
+    }));
+    let agent = Agent::builder(client).tool(unlock).build();
+    let response = agent.run_once("go").await.unwrap();
+    assert_eq!(response.text(), "done");
+
+    let seen = options_seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let names =
+        |o: &ChatOptions| -> Vec<String> { o.tools.iter().map(|t| t.name.clone()).collect() };
+    assert!(
+        !names(&seen[0]).contains(&"secret".to_string()),
+        "iteration 1 must not yet see the added tool: {:?}",
+        names(&seen[0])
+    );
+    assert!(
+        names(&seen[1]).contains(&"secret".to_string()),
+        "iteration 2 must see the added tool: {:?}",
+        names(&seen[1])
+    );
+}
+
+#[tokio::test]
+async fn tool_removed_mid_run_disappears_from_the_next_iteration() {
+    let client = MockClient::new(vec![
+        tool_call_response("cleanup"),
+        ChatResponse::from_text("done"),
+    ]);
+    let options_seen = client.seen_options.clone();
+
+    let cleanup = ToolDefinition::from_tool(Arc::new(ToolListMutator {
+        name: "cleanup".into(),
+        add: None,
+        remove: vec!["obsolete".into()],
+    }));
+    let agent = Agent::builder(client)
+        .tool(cleanup)
+        .tool(noop_tool("obsolete"))
+        .build();
+    agent.run_once("go").await.unwrap();
+
+    let seen = options_seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].tools.iter().any(|t| t.name == "obsolete"));
+    assert!(
+        !seen[1].tools.iter().any(|t| t.name == "obsolete"),
+        "iteration 2 must not see the removed tool"
+    );
+}
+
+#[tokio::test]
+async fn adding_a_duplicate_tool_name_errors_and_leaves_the_list_unchanged() {
+    let list = agent_framework_core::middleware::LiveToolList::new(vec![noop_tool("existing")]);
+    let err = list
+        .add_tools([noop_tool("existing"), noop_tool("fresh")])
+        .unwrap_err();
+    assert!(err.to_string().contains("existing"), "got: {err}");
+    // Validation happens before mutation: the non-duplicate was not added.
+    assert!(!list.contains("fresh"));
+    assert!(list.contains("existing"));
+}
+
+#[tokio::test]
+async fn tool_context_outside_a_run_has_no_live_tools() {
+    let ctx = FunctionInvocationContext::new("f", json!({}));
+    assert!(ctx.tools.is_none());
+    assert!(ctx.add_tools([noop_tool("x")]).is_err());
+    assert!(ctx.remove_tools(["x"]).is_err());
+}
+
+// endregion
