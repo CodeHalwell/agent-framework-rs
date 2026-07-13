@@ -52,13 +52,26 @@ cargo publish -p agent-framework
 
 ## Before the first publish
 
-- **Check the names are free.** `agent-framework*` names may be taken or
-  reserved on crates.io; search first and pick a prefix (e.g. `maf-rs-*`) if
-  needed — a rename only touches `[package] name`, the workspace dependency
-  table, and `use`/doc references.
+- **Names are free** ✅ — checked against the crates.io API on 2026-07-13:
+  all 22 `agent-framework*` names in this workspace returned 404 (not
+  registered). Re-check just before publishing (`https://crates.io/api/v1/crates/<name>`
+  with a User-Agent header); names are first-come-first-served.
 - **Trademark note.** This is an independent port, not affiliated with or
   endorsed by Microsoft; keep the crate descriptions/README saying so.
 - `cargo publish` requires a crates.io API token (`cargo login`).
 - Consider `cargo publish --dry-run -p agent-framework-core` as a final
   smoke check; dry runs of dependent crates fail by design until their
   dependencies are actually published.
+
+## Release checklist (per release)
+
+1. Update `CHANGELOG.md`: move the Unreleased section to the release
+   version + date.
+2. Bump `[workspace.package] version` in the root `Cargo.toml` (all crates
+   inherit it and are released in lockstep) and refresh the versions in the
+   `[workspace.dependencies]` table to match.
+3. Full verification at the release commit:
+   `cargo build --workspace --all-features && cargo test --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo fmt --all -- --check && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features && cargo build -p agent-framework-examples --examples`
+4. Commit, tag `v<version>`, push the tag.
+5. Publish tier by tier (see above).
+6. Create the GitHub release from the tag, pasting the changelog section.
