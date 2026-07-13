@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 description = "A Rust implementation of the Microsoft Agent Framework: build AI agents and multi-agent workflows. Meta-crate re-exporting core and providers."
 
 [features]
