@@ -85,6 +85,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Validate CRATE_TOKEN is set
+        env:
+          CRATE_TOKEN: ${{ secrets.CRATE_TOKEN }}
+        run: |
+          if [[ -z "${CRATE_TOKEN}" ]]; then
+            echo "::error::The CRATE_TOKEN GitHub repository secret is not set. Add a crates.io API token with publish scope under Settings > Secrets > Actions, named CRATE_TOKEN, before releasing."
+            exit 1
+          fi
+
       - name: Tag v${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
