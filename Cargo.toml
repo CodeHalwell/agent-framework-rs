@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -59,27 +59,27 @@ pin-project-lite = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
-agent-framework-core = { path = "crates/agent-framework-core", version = "0.1.0" }
-agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.1.0" }
-agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.1.0" }
-agent-framework-ollama = { path = "crates/agent-framework-ollama", version = "0.1.0" }
-agent-framework-gemini = { path = "crates/agent-framework-gemini", version = "0.1.0" }
-agent-framework-mistral = { path = "crates/agent-framework-mistral", version = "0.1.0" }
-agent-framework-foundry-local = { path = "crates/agent-framework-foundry-local", version = "0.1.0" }
-agent-framework-bedrock = { path = "crates/agent-framework-bedrock", version = "0.1.0" }
-agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot", version = "0.1.0" }
-agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.1.0" }
-agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.1.0" }
-agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.1.0" }
-agent-framework-declarative = { path = "crates/agent-framework-declarative", version = "0.1.0" }
-agent-framework-hosting = { path = "crates/agent-framework-hosting", version = "0.1.0" }
-agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.1.0" }
-agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.1.0" }
-agent-framework-foundry = { path = "crates/agent-framework-foundry", version = "0.1.0" }
-agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.1.0" }
-agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.1.0" }
-agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.1.0" }
-agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.1.0" }
+agent-framework-core = { path = "crates/agent-framework-core", version = "0.1.1" }
+agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.1.1" }
+agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.1.1" }
+agent-framework-ollama = { path = "crates/agent-framework-ollama", version = "0.1.1" }
+agent-framework-gemini = { path = "crates/agent-framework-gemini", version = "0.1.1" }
+agent-framework-mistral = { path = "crates/agent-framework-mistral", version = "0.1.1" }
+agent-framework-foundry-local = { path = "crates/agent-framework-foundry-local", version = "0.1.1" }
+agent-framework-bedrock = { path = "crates/agent-framework-bedrock", version = "0.1.1" }
+agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot", version = "0.1.1" }
+agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.1.1" }
+agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.1.1" }
+agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.1.1" }
+agent-framework-declarative = { path = "crates/agent-framework-declarative", version = "0.1.1" }
+agent-framework-hosting = { path = "crates/agent-framework-hosting", version = "0.1.1" }
+agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.1.1" }
+agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.1.1" }
+agent-framework-foundry = { path = "crates/agent-framework-foundry", version = "0.1.1" }
+agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.1.1" }
+agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.1.1" }
+agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.1.1" }
+agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.1.1" }
 
 [profile.release]
 opt-level = 3
