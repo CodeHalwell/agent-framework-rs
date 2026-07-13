@@ -86,6 +86,30 @@ name = "custom_context_provider"
 path = "agents/custom_context_provider.rs"
 
 [[example]]
+name = "compaction_basics"
+path = "agents/compaction_basics.rs"
+
+[[example]]
+name = "compaction_provider"
+path = "agents/compaction_provider.rs"
+
+[[example]]
+name = "skills"
+path = "agents/skills.rs"
+
+[[example]]
+name = "file_history_provider"
+path = "agents/file_history_provider.rs"
+
+[[example]]
+name = "suspend_resume_session"
+path = "agents/suspend_resume_session.rs"
+
+[[example]]
+name = "middleware_patterns"
+path = "agents/middleware_patterns.rs"
+
+[[example]]
 name = "observability"
 path = "observability/observability.rs"
 
@@ -96,6 +120,10 @@ path = "observability/otel_metrics.rs"
 [[example]]
 name = "openai_responses"
 path = "providers/openai_responses.rs"
+
+[[example]]
+name = "openai_embeddings"
+path = "providers/openai_embeddings.rs"
 
 [[example]]
 name = "anthropic"
@@ -248,6 +276,10 @@ path = "orchestrations/concurrent.rs"
 [[example]]
 name = "streaming_updates"
 path = "orchestrations/streaming_updates.rs"
+
+[[example]]
+name = "agent_approval"
+path = "orchestrations/agent_approval.rs"
 
 [[example]]
 name = "mcp_tools"

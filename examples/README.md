@@ -62,12 +62,18 @@ middleware.
 | `retry_policy` | `RetryingChatClient` + `RetryPolicy` over a scripted flaky client | offline |
 | `per_run_options` | `AgentRunOptions` merges per-run `ChatOptions` overrides over the agent's defaults | offline |
 | `thread_persistence` | `AgentSession::to_dict()` + `InMemoryHistoryProvider::to_dict()` round-trip a conversation | offline |
+| `suspend_resume_session` | Suspend to one JSON envelope (session state bag + history) and resume via `Agent::session_from_dict` | offline |
+| `file_history_provider` | `FileHistoryProvider`: conversation history persisted to a JSON file survives a "process restart" | offline |
 | `multi_turn_conversation` | One `AgentSession` (with an `InMemoryHistoryProvider`) reused across calls accumulates history automatically | offline |
 | `image_input` | Attach an image via `Content::Uri` (URL) or `Content::Data` (inline bytes) | `OPENAI_API_KEY` (vision model; skips gracefully) |
 | `agent_middleware` | Wrap a whole agent run: logging plus early-termination middleware | offline |
 | `function_middleware` | Wrap every local tool call: rewrite arguments, observe/override results | offline |
 | `chat_middleware` | Wrap the underlying `ChatClient` call itself, one level below agent middleware | offline |
+| `middleware_patterns` | Four middleware patterns in one pipeline: termination, result override (cache), exception fallback, usage tracking | offline |
 | `custom_context_provider` | A `ContextProvider` with `before_run` / `after_run` hooks | offline |
+| `compaction_basics` | Compaction strategies (`Truncation`, `SlidingWindow`, `TokenBudget`, `SelectiveToolResult`) applied to a message list | offline |
+| `compaction_provider` | `AgentBuilder::with_compaction` shrinks the history sent to the model on every run | offline |
+| `skills` | `Skill` + `SkillsProvider`: progressive disclosure via `load_skill` / `read_skill_resource` tools | offline |
 
 ## Providers (`providers/`)
 
@@ -78,6 +84,7 @@ Studio.
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `openai_responses` | OpenAI Responses API + `conversation_id` (`previous_response_id`) reuse | `OPENAI_API_KEY` |
+| `openai_embeddings` | `OpenAIEmbeddingClient`: batch text embeddings + cosine similarity (same trait: Azure/Ollama/Mistral) | `OPENAI_API_KEY` |
 | `openai_compatible_endpoint` | `OpenAIChatCompletionClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
 | `anthropic` | The Anthropic (Claude) Messages API client | `ANTHROPIC_API_KEY` |
 | `anthropic_hosted_tools` | Anthropic hosted web-search / code-execution tools (server-side, no local wiring) | `ANTHROPIC_API_KEY` (skips gracefully) |
@@ -127,6 +134,7 @@ stall-intervention).
 | --- | --- | --- |
 | `sequential` | A writer drafts, then an editor revises (`SequentialBuilder`) | `OPENAI_API_KEY` |
 | `concurrent` | `ConcurrentBuilder` fans one prompt out to several agents and aggregates replies | offline |
+| `agent_approval` | `.with_request_info()` post-agent approval: inspect each reply, approve or send revision feedback | offline |
 | `group_chat` | Multi-agent group chat: round-robin turn-taking or an LLM "manager" | `OPENAI_API_KEY` |
 | `handoff` | A triage agent hands off to specialists via a synthetic tool call | `OPENAI_API_KEY` |
 | `magentic` | `StandardMagenticManager` plans, assigns work each round, drafts a final answer | `OPENAI_API_KEY` |
@@ -208,5 +216,5 @@ calls.
 
 ---
 
-69 examples total. See the root [`README.md`](../README.md) for the
+83 examples total. See the root [`README.md`](../README.md) for the
 project-level overview, feature-flag table, and workspace layout.
