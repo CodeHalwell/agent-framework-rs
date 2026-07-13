@@ -121,7 +121,7 @@ jobs:
             # after <date>" from the error and sleep until then; retry until
             # published. (Version bumps of existing crates have a much
             # higher limit, so this mostly matters for the first release.)
-            local attempt out when wait
+            local attempt out when ts wait plain_failures=0
             for attempt in $(seq 1 12); do
               if out=$(cargo publish -p "$1" 2>&1); then
                 echo "$out" | tail -n 3
@@ -131,14 +131,21 @@ jobs:
               if grep -q "429 Too Many Requests" <<<"$out"; then
                 when=$(sed -n 's/.*try again after \(.*GMT\).*/\1/p' <<<"$out" | head -n1)
                 wait=610
-                if [[ -n "$when" ]]; then
-                  wait=$(( $(date -d "$when" +%s) - $(date +%s) + 15 ))
+                if [[ -n "$when" ]] && ts=$(date -d "$when" +%s 2>/dev/null); then
+                  wait=$(( ts - $(date +%s) + 15 ))
                   (( wait < 15 )) && wait=15
                 fi
                 echo "$1: rate limited — sleeping ${wait}s (until ${when:-unknown}), attempt $attempt/12"
                 sleep "$wait"
               else
-                echo "$1: publish failed (not rate-limited) — retrying in 30s, attempt $attempt/12"
+                # Real failures (auth, manifest, ...) fail fast: one retry
+                # covers a just-published dependency not being indexed yet.
+                plain_failures=$(( plain_failures + 1 ))
+                if (( plain_failures >= 2 )); then
+                  echo "::error::$1 failed twice with a non-rate-limit error — giving up"
+                  return 1
+                fi
+                echo "$1: publish failed (not rate-limited) — one retry in 30s"
                 sleep 30
               fi
             done
