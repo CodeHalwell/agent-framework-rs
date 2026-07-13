@@ -249,7 +249,8 @@ pub trait SupportsAgentRun: Send + Sync {
     /// `session` is taken **by value**: the returned stream owns it and
     /// drives its context providers (including any history provider) once
     /// the stream is fully consumed. When a provider's storage is shared (as
-    /// [`InMemoryHistoryProvider`]'s is, via `Arc`), the write-back is
+    /// [`InMemoryHistoryProvider`](crate::history::InMemoryHistoryProvider)'s
+    /// is, via `Arc`), the write-back is
     /// observable through a clone taken before streaming.
     async fn run_stream(
         &self,
@@ -1123,14 +1124,14 @@ impl AgentBuilder {
         self
     }
     /// Attach conversation-history compaction, via a
-    /// [`CompactionProvider`](crate::compaction::CompactionProvider) wrapping
+    /// [`CompactionProvider`] wrapping
     /// `strategy` (with the default `ApproxTokenizer`; use
     /// [`AgentBuilder::context_provider`] with
     /// [`CompactionProvider::with_tokenizer`](crate::compaction::CompactionProvider::with_tokenizer)
     /// for a custom tokenizer).
     ///
     /// Registered as one of the agent's own context providers, which
-    /// [`Agent::combined_providers`] always runs *after* the session's —
+    /// `Agent::combined_providers` always runs *after* the session's —
     /// including the auto-attached (or explicitly attached)
     /// [`HistoryProvider`](crate::history::HistoryProvider), which lives on
     /// the session — so compaction sees, and can shrink, the full

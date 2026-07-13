@@ -1,6 +1,6 @@
 //! # agent-framework-mistral
 //!
-//! A [Mistral AI](https://mistral.ai) [`ChatClient`](agent_framework_core::client::ChatClient)
+//! A [Mistral AI](https://mistral.ai) [`ChatClient`]
 //! for `agent-framework-rs`.
 //!
 //! Talks to the Mistral Chat Completions API (`POST /v1/chat/completions`),

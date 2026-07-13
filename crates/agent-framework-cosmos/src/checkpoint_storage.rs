@@ -63,7 +63,7 @@ use crate::client::CosmosRestClient;
 
 /// Cosmos DB container partition key path used by
 /// [`CosmosCheckpointStorage`]: `/id` — every checkpoint document is its
-/// own partition. See the [module docs](self) for why this differs from
+/// own partition. See the module docs for why this differs from
 /// [`crate::DEFAULT_PARTITION_KEY_PATH`]'s `/threadId`.
 pub const DEFAULT_PARTITION_KEY_PATH: &str = "/id";
 
@@ -102,9 +102,9 @@ fn parse_checkpoint_document(doc: &Value) -> Result<WorkflowCheckpoint> {
 }
 
 /// Cosmos DB (NoSQL API)-backed [`CheckpointStorage`]: every checkpoint is
-/// its own document, partitioned by its own `id` (see the [module
-/// docs](self)). Sibling of [`crate::CosmosChatMessageStore`], reusing the
-/// same [`crate::client::CosmosRestClient`] HTTP/auth plumbing.
+/// its own document, partitioned by its own `id` (see the module
+/// docs). Sibling of [`crate::CosmosChatMessageStore`], reusing the
+/// same `CosmosRestClient` HTTP/auth plumbing.
 ///
 /// ```no_run
 /// use agent_framework_cosmos::CosmosCheckpointStorage;

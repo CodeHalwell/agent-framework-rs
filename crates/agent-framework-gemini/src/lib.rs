@@ -1,6 +1,6 @@
 //! # agent-framework-gemini
 //!
-//! A Google Gemini [`ChatClient`](agent_framework_core::client::ChatClient) for
+//! A Google Gemini [`ChatClient`] for
 //! `agent-framework-rs`.
 //!
 //! Talks directly to the Gemini `generateContent` REST API
@@ -14,7 +14,7 @@
 //! generationConfig:{temperature,maxOutputTokens},
 //! systemInstruction:{parts:[{text}]}}` in, `{candidates:[{content:{parts}}],
 //! usageMetadata:{promptTokenCount,candidatesTokenCount,totalTokenCount}}`
-//! out. See [`convert`] for the full mapping.
+//! out. See `convert` for the full mapping.
 //!
 //! ```no_run
 //! use agent_framework_gemini::GeminiChatClient;

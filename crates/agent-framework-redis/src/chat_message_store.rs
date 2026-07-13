@@ -10,12 +10,13 @@
 //! Python store's `Message.to_json()` / `Message.from_json()` round trip).
 //!
 //! Upstream folded the standalone `ChatMessageStore` abstraction into
-//! [`HistoryProvider`](agent_framework_core::history::HistoryProvider) — a
+//! [`HistoryProvider`] — a
 //! `ContextProvider` that prepends its stored messages ahead of a run
 //! (`before_run`) and records the run's request + response messages after a
 //! successful run (`after_run`). [`RedisChatMessageStore`] follows suit
-//! directly (rather than wrapping an [`InMemoryHistoryProvider`]) so history
-//! actually persists to Redis, the same way
+//! directly (rather than wrapping an
+//! [`InMemoryHistoryProvider`](agent_framework_core::history::InMemoryHistoryProvider))
+//! so history actually persists to Redis, the same way
 //! [`FileHistoryProvider`](agent_framework_core::history::FileHistoryProvider)
 //! persists to disk.
 

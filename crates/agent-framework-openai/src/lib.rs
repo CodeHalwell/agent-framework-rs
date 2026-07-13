@@ -68,7 +68,7 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 /// response into a granular [`Error`].
 ///
 /// The single point of truth for status/body interpretation, used by every
-/// endpoint in this crate ([`OpenAIChatCompletionClient::post`] and [`responses`]) and reused
+/// endpoint in this crate (`OpenAIChatCompletionClient::post` and [`responses`]) and reused
 /// by `agent-framework-azure` (Azure OpenAI is
 /// wire-compatible for Chat Completions and Responses), so the two stay
 /// identical rather than drifting.

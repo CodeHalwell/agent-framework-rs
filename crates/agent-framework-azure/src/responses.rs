@@ -65,7 +65,7 @@
 //! ```
 //!
 //! Entra ID (bearer token) authentication instead of a static key — the same
-//! [`TokenCredential`](crate::TokenCredential) plumbing
+//! [`TokenCredential`] plumbing
 //! [`AzureOpenAIClient`](crate::AzureOpenAIClient) uses (e.g. the
 //! `"https://cognitiveservices.azure.com/.default"` scope):
 //!
@@ -282,7 +282,7 @@ impl AzureOpenAIResponsesClient {
     /// The effective base URL requests are built against: the explicit
     /// [`with_base_url`](Self::with_base_url) override when set, otherwise
     /// `None` (the endpoint-derived `/openai/v1/` route is computed lazily by
-    /// [`url`](Self::url)).
+    /// `url`).
     pub fn base_url(&self) -> Option<&str> {
         self.inner.base_url.as_deref()
     }

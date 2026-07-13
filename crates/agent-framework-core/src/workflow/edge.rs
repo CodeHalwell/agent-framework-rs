@@ -11,8 +11,8 @@ use crate::tools::BoxFuture;
 /// Evaluated **asynchronously**, mirroring upstream's `Edge.should_route`
 /// becoming `async` (see `UPSTREAM_DRIFT.md` §10, `EdgeCondition = Callable[[Any],
 /// bool | Awaitable[bool]]`). Callers normally build one via
-/// [`wrap_sync_condition`] (from an existing sync predicate — used by the sync
-/// builder methods to stay backward compatible) or [`wrap_async_condition`]
+/// `wrap_sync_condition` (from an existing sync predicate — used by the sync
+/// builder methods to stay backward compatible) or `wrap_async_condition`
 /// (from a genuinely async predicate — used by the `*_async` builder methods)
 /// rather than constructing the `Arc` directly.
 pub type Condition = Arc<dyn Fn(&Value) -> BoxFuture<bool> + Send + Sync>;

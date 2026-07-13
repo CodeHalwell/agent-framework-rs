@@ -212,10 +212,10 @@ impl GitHubCopilotChatClient {
     }
 
     /// Build a client from the environment: the GitHub OAuth token / PAT is
-    /// read from [`GITHUB_TOKEN_ENV`] (`GITHUB_COPILOT_TOKEN`), falling back
-    /// to [`GITHUB_TOKEN_ENV_ALT`] (`GH_COPILOT_TOKEN`) if unset; an
+    /// read from `GITHUB_TOKEN_ENV` (`GITHUB_COPILOT_TOKEN`), falling back
+    /// to `GITHUB_TOKEN_ENV_ALT` (`GH_COPILOT_TOKEN`) if unset; an
     /// [`Error::Configuration`] is returned if neither is set. The optional
-    /// [`BASE_URL_ENV`] (`GITHUB_COPILOT_BASE_URL`) overrides the default
+    /// `BASE_URL_ENV` (`GITHUB_COPILOT_BASE_URL`) overrides the default
     /// base URL when present.
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
         let token = std::env::var(GITHUB_TOKEN_ENV)

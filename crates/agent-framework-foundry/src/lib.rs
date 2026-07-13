@@ -268,7 +268,7 @@ impl ChatClient for FoundryChatClient {
 /// function tool carries a `dyn Tool` local executor, which isn't
 /// serializable), so `tools` round-trips through a private wire shape
 /// capturing only the declarative fields a definition needs — see
-/// [`tool_definition_wire`](crate::tool_definition_wire). A tool
+/// `tool_definition_wire`. A tool
 /// deserialized back out of a `PromptAgentDefinition` always has
 /// `executor: None`: a definition describes what a tool *is*, not a live
 /// local implementation to call it.

@@ -1,6 +1,6 @@
 //! # agent-framework-ollama
 //!
-//! An [Ollama](https://ollama.com) [`ChatClient`](agent_framework_core::client::ChatClient)
+//! An [Ollama](https://ollama.com) [`ChatClient`]
 //! for `agent-framework-rs`.
 //!
 //! Talks to a local (or remote) Ollama server's OpenAI-compatible endpoint
@@ -133,7 +133,7 @@ impl OllamaChatClient {
     /// Build a client from the environment. Ollama has no required
     /// credential env var (a stock server is unauthenticated), so this never
     /// fails on missing configuration; it only reads the optional
-    /// [`OLLAMA_HOST_ENV`] (`OLLAMA_HOST`) to override the default base URL,
+    /// `OLLAMA_HOST_ENV` (`OLLAMA_HOST`) to override the default base URL,
     /// same as Ollama's own CLI/SDKs.
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
         let mut client = Self::new(model);
