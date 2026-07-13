@@ -2396,3 +2396,261 @@ async fn tool_source_tool_is_invokable_by_the_function_loop() {
             .iter()
             .any(|c| matches!(c, Content::FunctionResult(_)))));
 }
+
+// region: as_tool session propagation (upstream `propagate_session`, with the
+// child-session isolation semantics of microsoft/agent-framework#5875)
+
+/// A context provider that records the session identity (`session_id` +
+/// `service_session_id`) of every run it participates in.
+/// `(session_id, service_session_id)` as observed by a run.
+type SeenSessionIdentity = (Option<String>, Option<String>);
+
+#[derive(Default, Clone)]
+struct SessionIdentityRecorder {
+    seen: Arc<Mutex<Vec<SeenSessionIdentity>>>,
+}
+
+#[async_trait]
+impl ContextProvider for SessionIdentityRecorder {
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((ctx.session_id.clone(), ctx.service_session_id.clone()));
+        Ok(())
+    }
+}
+
+/// A scripted coordinator client whose first response calls the `sub` tool
+/// and whose second response is the final answer. `conversation_id` is echoed
+/// on both responses (a service-managed session requires the service to
+/// return one).
+fn coordinator_client_calling_sub(conversation_id: Option<&str>) -> MockClient {
+    let call = FunctionCallContent::new(
+        "call_1",
+        "sub",
+        Some(FunctionArguments::Raw("{\"task\":\"do the thing\"}".into())),
+    );
+    let ask = ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        conversation_id: conversation_id.map(str::to_string),
+        ..Default::default()
+    };
+    let done = ChatResponse {
+        conversation_id: conversation_id.map(str::to_string),
+        ..ChatResponse::from_text("done")
+    };
+    MockClient::new(vec![ask, done])
+}
+
+#[tokio::test]
+async fn as_tool_propagate_session_shares_identity_and_isolates_service_pointer() {
+    let sub_recorder = SessionIdentityRecorder::default();
+    let sub_seen = sub_recorder.seen.clone();
+    let sub_client = MockClient::new(vec![ChatResponse::from_text("sub answer")]);
+    let sub_options = sub_client.seen_options.clone();
+    let sub = Agent::builder(sub_client)
+        .name("sub")
+        .context_provider(Arc::new(sub_recorder))
+        .build();
+
+    let coordinator_client = coordinator_client_calling_sub(Some("svc-parent"));
+    let coordinator_options = coordinator_client.seen_options.clone();
+    let coordinator = Agent::builder(coordinator_client)
+        .tool(sub.as_tool(AsToolOptions::new().name("sub").propagate_session(true)))
+        .build();
+
+    // A service-managed parent session: its server-side conversation pointer
+    // must NOT leak into the sub-agent's own service calls.
+    let mut parent = AgentSession::service("svc-parent");
+    let parent_id = parent.session_id().to_string();
+
+    let response = coordinator
+        .run(vec![Message::user("go")], Some(&mut parent))
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "done");
+
+    // The sub-agent ran on a *child* of the parent session: same session_id…
+    let seen = sub_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the sub-agent ran exactly once");
+    assert_eq!(
+        seen[0].0.as_deref(),
+        Some(parent_id.as_str()),
+        "the parent's session identity must propagate to the sub-agent"
+    );
+    // …but an isolated (cleared) service_session_id.
+    assert_eq!(
+        seen[0].1, None,
+        "the parent's service conversation pointer must not leak to the sub-agent"
+    );
+    // Confirmed at the wire level too: the sub-agent's provider client saw no
+    // conversation id, while the coordinator's did.
+    let sub_convs: Vec<Option<String>> = sub_options
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|o| o.conversation_id.clone())
+        .collect();
+    assert!(sub_convs.iter().all(Option::is_none), "got: {sub_convs:?}");
+    assert_eq!(
+        coordinator_options.lock().unwrap()[0]
+            .conversation_id
+            .as_deref(),
+        Some("svc-parent")
+    );
+    // The parent's own pointer is untouched.
+    assert_eq!(parent.service_session_id(), Some("svc-parent"));
+}
+
+#[tokio::test]
+async fn as_tool_without_propagate_session_runs_on_a_fresh_session() {
+    let sub_recorder = SessionIdentityRecorder::default();
+    let sub_seen = sub_recorder.seen.clone();
+    let sub = Agent::builder(MockClient::new(vec![ChatResponse::from_text("sub answer")]))
+        .name("sub")
+        .context_provider(Arc::new(sub_recorder))
+        .build();
+
+    let coordinator = Agent::builder(coordinator_client_calling_sub(None))
+        .tool(sub.as_tool(AsToolOptions::new().name("sub")))
+        .build();
+
+    let mut parent = AgentSession::new();
+    let parent_id = parent.session_id().to_string();
+    coordinator
+        .run(vec![Message::user("go")], Some(&mut parent))
+        .await
+        .unwrap();
+
+    let seen = sub_seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_ne!(
+        seen[0].0.as_deref(),
+        Some(parent_id.as_str()),
+        "without propagate_session the sub-agent must get a fresh session"
+    );
+}
+
+#[tokio::test]
+async fn as_tool_state_written_by_the_sub_agent_run_is_visible_on_the_parent() {
+    // The sub-agent's own tool writes into the (propagated) session state via
+    // the invocation context; the parent must observe the write, because the
+    // child session shares the parent's state bag by reference.
+    struct StateWriter;
+    #[async_trait]
+    impl Tool for StateWriter {
+        fn name(&self) -> &str {
+            "remember"
+        }
+        fn description(&self) -> &str {
+            "remember a fact"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        async fn invoke(&self, _arguments: Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        async fn invoke_in_context(
+            &self,
+            _arguments: Value,
+            ctx: &FunctionInvocationContext,
+        ) -> Result<Value> {
+            let session = ctx.session.as_ref().expect("session propagated to tool");
+            session.state.insert("fact", json!("blue"));
+            Ok(json!("remembered"))
+        }
+    }
+
+    let sub_call = FunctionCallContent::new(
+        "call_sub_1",
+        "remember",
+        Some(FunctionArguments::Raw("{}".into())),
+    );
+    let sub_ask = ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(sub_call)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    };
+    let sub = Agent::builder(MockClient::new(vec![
+        sub_ask,
+        ChatResponse::from_text("sub done"),
+    ]))
+    .name("sub")
+    .tool(ToolDefinition::from_tool(Arc::new(StateWriter)))
+    .build();
+
+    let coordinator = Agent::builder(coordinator_client_calling_sub(None))
+        .tool(sub.as_tool(AsToolOptions::new().name("sub").propagate_session(true)))
+        .build();
+
+    let mut parent = AgentSession::new();
+    coordinator
+        .run(vec![Message::user("go")], Some(&mut parent))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        parent.state.get("fact"),
+        Some(json!("blue")),
+        "state written during the sub-agent's run must be visible on the parent session"
+    );
+}
+
+#[tokio::test]
+async fn as_tool_stream_callback_observes_sub_agent_updates() {
+    let sub = Agent::builder(MockClient::new(vec![ChatResponse::from_text(
+        "sub streamed answer",
+    )]))
+    .name("sub")
+    .build();
+
+    let streamed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = streamed.clone();
+    let coordinator = Agent::builder(coordinator_client_calling_sub(None))
+        .tool(
+            sub.as_tool(AsToolOptions::new().name("sub").stream_callback(Arc::new(
+                move |update: &AgentResponseUpdate| {
+                    sink.lock().unwrap().push(update.text());
+                },
+            ))),
+        )
+        .build();
+
+    let response = coordinator.run_once("go").await.unwrap();
+    assert_eq!(response.text(), "done");
+    let streamed = streamed.lock().unwrap();
+    assert!(!streamed.is_empty(), "the stream callback never fired");
+    assert_eq!(streamed.concat(), "sub streamed answer");
+}
+
+#[tokio::test]
+async fn as_tool_approval_mode_gates_the_delegated_call() {
+    let sub = Agent::builder(MockClient::new(vec![])).name("sub").build();
+    let tool = sub.as_tool(
+        AsToolOptions::new()
+            .name("sub")
+            .approval_mode(ApprovalMode::AlwaysRequire),
+    );
+    assert!(tool.requires_approval());
+
+    // The coordinator's run surfaces an approval request instead of executing.
+    let coordinator = Agent::builder(coordinator_client_calling_sub(None))
+        .tool(tool)
+        .build();
+    let response = coordinator.run_once("go").await.unwrap();
+    assert!(
+        !response.user_input_requests().is_empty(),
+        "an approval-gated agent tool must surface an approval request"
+    );
+}
+
+// endregion

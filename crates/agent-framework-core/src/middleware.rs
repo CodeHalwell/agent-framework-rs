@@ -142,6 +142,13 @@ impl ChatContext {
 pub struct FunctionInvocationContext {
     pub function_name: String,
     pub arguments: serde_json::Value,
+    /// The [`AgentSession`](crate::session::AgentSession) of the agent run
+    /// this invocation belongs to, if the call originated from an agent run
+    /// with a session. Middleware may read it; tools receive it via
+    /// [`Tool::invoke_in_context`](crate::tools::Tool::invoke_in_context)
+    /// (the hook behind `Agent::as_tool` with `propagate_session`). Mirrors
+    /// upstream's `FunctionInvocationContext.session`.
+    pub session: Option<crate::session::AgentSession>,
     pub metadata: HashMap<String, serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub terminate: bool,
@@ -152,10 +159,17 @@ impl FunctionInvocationContext {
         Self {
             function_name: function_name.into(),
             arguments,
+            session: None,
             metadata: HashMap::new(),
             result: None,
             terminate: false,
         }
+    }
+
+    /// Builder: attach the agent session this invocation belongs to.
+    pub fn with_session(mut self, session: Option<crate::session::AgentSession>) -> Self {
+        self.session = session;
+        self
     }
 }
 

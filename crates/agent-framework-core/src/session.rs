@@ -14,13 +14,90 @@
 //! free-form `state`, and the `context_providers` that run on every use.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::memory::ContextProvider;
+
+/// The free-form state bag of an [`AgentSession`], shared **by reference**
+/// across clones.
+///
+/// Upstream's `AgentSession.state` is a plain Python dict, and Python
+/// sessions are reference types: every holder of the session sees the same
+/// dict, including the *child* session `as_tool(propagate_session=True)`
+/// hands a sub-agent (upstream shares the dict by reference while isolating
+/// `service_session_id`). A by-value `HashMap` cannot express that, so the
+/// state bag is an `Arc<Mutex<..>>` handle: cloning an [`AgentSession`]
+/// (or a `SessionState`) yields a view onto the *same* bag, and mutations
+/// through any clone are visible to all of them.
+#[derive(Clone, Default)]
+pub struct SessionState {
+    inner: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+impl SessionState {
+    /// A fresh, empty state bag.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `value` at `key`, returning the previous value if any.
+    pub fn insert(&self, key: impl Into<String>, value: Value) -> Option<Value> {
+        self.inner.lock().unwrap().insert(key.into(), value)
+    }
+
+    /// A clone of the value at `key`, if present.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.inner.lock().unwrap().get(key).cloned()
+    }
+
+    /// Remove and return the value at `key`, if present.
+    pub fn remove(&self, key: &str) -> Option<Value> {
+        self.inner.lock().unwrap().remove(key)
+    }
+
+    /// Whether `key` is present.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.lock().unwrap().contains_key(key)
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// Whether the bag is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    /// A point-in-time copy of the whole bag (e.g. for serialization).
+    pub fn snapshot(&self) -> HashMap<String, Value> {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// Whether `other` is a view onto the same underlying bag.
+    pub fn shares_storage_with(&self, other: &SessionState) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl From<HashMap<String, Value>> for SessionState {
+    fn from(map: HashMap<String, Value>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(map)),
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.snapshot()).finish()
+    }
+}
 
 /// A conversation session: a lightweight identity + state container.
 ///
@@ -32,12 +109,24 @@ pub struct AgentSession {
     session_id: String,
     service_session_id: Option<String>,
     /// Free-form session state (for context providers to persist per-session
-    /// data across runs).
-    pub state: HashMap<String, Value>,
+    /// data across runs). Shared by reference across clones of this session —
+    /// see [`SessionState`].
+    pub state: SessionState,
     /// Context providers associated with this session (memory/RAG/history
     /// injection). Combined with an agent's own providers at request time —
     /// see [`Agent::combined_providers`](crate::agent::Agent).
     pub context_providers: Vec<Arc<dyn ContextProvider>>,
+}
+
+impl std::fmt::Debug for AgentSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSession")
+            .field("session_id", &self.session_id)
+            .field("service_session_id", &self.service_session_id)
+            .field("state", &self.state)
+            .field("context_providers", &self.context_providers.len())
+            .finish()
+    }
 }
 
 impl Default for AgentSession {
@@ -53,7 +142,31 @@ impl AgentSession {
         Self {
             session_id: Uuid::new_v4().to_string(),
             service_session_id: None,
-            state: HashMap::new(),
+            state: SessionState::new(),
+            context_providers: Vec::new(),
+        }
+    }
+
+    /// A **child** session for delegating part of this conversation to a
+    /// sub-agent (the `as_tool(propagate_session)` path).
+    ///
+    /// The child keeps this session's `session_id` and shares its [`state`]
+    /// bag by reference, but gets an **isolated** (cleared)
+    /// `service_session_id` and no context providers. Isolating the
+    /// server-side conversation pointer matters: after the parent's first
+    /// model call, a service-managed session carries the parent conversation
+    /// id (e.g. an OpenAI Responses `previous_response_id`); a child that
+    /// inherited it would submit a follow-up onto a conversation whose
+    /// tool call is still pending, which the server rejects. Mirrors
+    /// upstream's `_agent_wrapper` child-session construction
+    /// (`_agents.py`, microsoft/agent-framework#5875).
+    ///
+    /// [`state`]: AgentSession::state
+    pub fn child(&self) -> AgentSession {
+        AgentSession {
+            session_id: self.session_id.clone(),
+            service_session_id: None,
+            state: self.state.clone(),
             context_providers: Vec::new(),
         }
     }
@@ -110,7 +223,7 @@ impl AgentSession {
         serde_json::json!({
             "session_id": self.session_id,
             "service_session_id": self.service_session_id,
-            "state": self.state,
+            "state": self.state.snapshot(),
         })
     }
 
@@ -129,7 +242,7 @@ impl AgentSession {
             .get("service_session_id")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let session_state = match state.get("state") {
+        let session_state: HashMap<String, Value> = match state.get("state") {
             Some(v) if !v.is_null() => serde_json::from_value(v.clone()).map_err(|e| {
                 Error::Serialization(format!("failed to restore session state: {e}"))
             })?,
@@ -138,7 +251,7 @@ impl AgentSession {
         Ok(Self {
             session_id,
             service_session_id,
-            state: session_state,
+            state: SessionState::from(session_state),
             context_providers: Vec::new(),
         })
     }
@@ -177,10 +290,8 @@ mod tests {
 
     #[test]
     fn to_dict_from_dict_round_trips_session_id_service_id_and_state() {
-        let mut session = AgentSession::service("svc-9");
-        session
-            .state
-            .insert("key".to_string(), serde_json::json!("value"));
+        let session = AgentSession::service("svc-9");
+        session.state.insert("key", serde_json::json!("value"));
         let original_id = session.session_id().to_string();
 
         let state = session.to_dict();
@@ -194,8 +305,49 @@ mod tests {
         let restored = AgentSession::from_dict(&state).unwrap();
         assert_eq!(restored.session_id(), original_id);
         assert_eq!(restored.service_session_id(), Some("svc-9"));
-        assert_eq!(restored.state.get("key"), Some(&serde_json::json!("value")));
+        assert_eq!(restored.state.get("key"), Some(serde_json::json!("value")));
         assert!(restored.context_providers.is_empty());
+    }
+
+    #[test]
+    fn clones_share_the_state_bag_by_reference() {
+        let session = AgentSession::new();
+        let clone = session.clone();
+        clone
+            .state
+            .insert("written-via-clone", serde_json::json!(1));
+        assert_eq!(
+            session.state.get("written-via-clone"),
+            Some(serde_json::json!(1)),
+            "a clone must be a view onto the same state bag"
+        );
+        assert!(session.state.shares_storage_with(&clone.state));
+    }
+
+    #[test]
+    fn child_shares_id_and_state_but_isolates_the_service_pointer() {
+        let parent = AgentSession::service("svc-parent");
+        parent.state.insert("k", serde_json::json!("v"));
+
+        let child = parent.child();
+        assert_eq!(child.session_id(), parent.session_id());
+        assert_eq!(
+            child.service_session_id(),
+            None,
+            "the parent's server-side conversation pointer must not leak to the child"
+        );
+        assert!(child.context_providers.is_empty());
+
+        // State is shared both ways.
+        assert_eq!(child.state.get("k"), Some(serde_json::json!("v")));
+        child.state.insert("from-child", serde_json::json!(2));
+        assert_eq!(parent.state.get("from-child"), Some(serde_json::json!(2)));
+
+        // And a service id the child adopts during its own run stays local
+        // to the child rather than clobbering the parent's.
+        let mut child = child;
+        child.set_service_session_id("svc-child");
+        assert_eq!(parent.service_session_id(), Some("svc-parent"));
     }
 
     #[test]

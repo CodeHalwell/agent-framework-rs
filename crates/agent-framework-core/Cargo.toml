@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 description = "Core abstractions for agent-framework-rs: messages, chat clients, agents, tools, threads, middleware, memory, and workflows"
 
 [dependencies]

@@ -64,7 +64,8 @@ pub use error::{Error, Result};
 /// Commonly used imports.
 pub mod prelude {
     pub use crate::agent::{
-        Agent, AgentBuilder, AgentRunOptions, AgentRunStream, AsToolOptions, SupportsAgentRun,
+        Agent, AgentBuilder, AgentRunOptions, AgentRunStream, AgentToolStreamCallback,
+        AsToolOptions, SupportsAgentRun,
     };
     pub use crate::client::{
         ChatClient, ChatStream, FunctionInvokingChatClient, RetryOn, RetryPolicy,
@@ -81,7 +82,7 @@ pub mod prelude {
         AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
-    pub use crate::session::AgentSession;
+    pub use crate::session::{AgentSession, SessionState};
     pub use crate::settings::{load_setting, SecretString};
     pub use crate::skills::{Skill, SkillsProvider};
     pub use crate::tools::{

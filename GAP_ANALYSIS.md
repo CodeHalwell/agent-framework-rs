@@ -432,7 +432,7 @@ stall-intervention HITL, checkpoint graph-signature validation,
 | Anthropic (L39) | ✅ | 🚧 | no beta headers; hosted tools filtered; citations dropped |
 | Hosted tool markers (L62) | 🚧 "pass-through" | 🚧 (reword) | not passed through on Chat Completions (mis-emitted as function) or Anthropic (dropped) |
 | `AgentThread`/store (L50-51) | ✅ | 🚧 | no serialize/deserialize/resume |
-| `agent.as_tool()` (L52) | ✅ | 🚧 | no stream_callback/kwargs/name sanitization |
+| `agent.as_tool()` (L52) | ✅ | 🚧 | no stream_callback/kwargs/name sanitization — *since resolved:* name sanitization, `stream_callback`, `approval_mode`, and `propagate_session` (with upstream #5875's child-session isolation) all implemented; only runtime-kwargs forwarding remains (the port has no run-kwargs concept) |
 | `ContextProvider` (L79) | ✅ | 🚧 | `thread_created` never fired; no `invoke_exception` |
 | `Tool`/`AiFunction` (L61) | ✅ | 🚧 | no schema derivation from types |
 | Middleware pipelines (L76-78) | ✅ | 🚧 | impoverished contexts; no unified/run-level registration |

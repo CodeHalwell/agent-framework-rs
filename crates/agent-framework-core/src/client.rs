@@ -173,6 +173,7 @@ async fn execute_tool_call(
     include_detailed_errors: bool,
     terminate_on_unknown: bool,
     function_middleware: &MiddlewarePipeline<FunctionInvocationContext>,
+    session: Option<&crate::session::AgentSession>,
 ) -> Result<(bool, FunctionResultContent)> {
     match tool {
         None => {
@@ -229,7 +230,7 @@ async fn execute_tool_call(
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
-                        let result = exec.invoke(ctx.arguments.clone()).await;
+                        let result = exec.invoke_in_context(ctx.arguments.clone(), &ctx).await;
                         if let Err(e) = &result {
                             crate::observability::record_error(&tracing::Span::current(), e);
                         }
@@ -255,7 +256,8 @@ async fn execute_tool_call(
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
 
-            let ctx = FunctionInvocationContext::new(call.name.clone(), args);
+            let ctx = FunctionInvocationContext::new(call.name.clone(), args)
+                .with_session(session.cloned());
             match function_middleware.execute(ctx, terminal).await {
                 Ok(ctx) => Ok((
                     false,
@@ -380,6 +382,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         let response_format = options.response_format.clone();
         let mut response: ChatResponse = async move {
             self.config.validate()?;
+            // Pop the agent-session side channel before the inner provider
+            // client ever sees the options (mirrors upstream's
+            // `effective_client_kwargs.pop("session")`); it is handed to
+            // invoked tools via `FunctionInvocationContext::session`.
+            let session = options.session.take();
             let tools = executable_tools(&options);
 
             // Default tool choice to auto when tools are present and unset.
@@ -417,6 +424,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             self.config.include_detailed_errors,
                             self.config.terminate_on_unknown_calls,
                             &self.function_middleware,
+                            session.as_ref(),
                         )
                         .await?;
                         had_error |= is_error;
@@ -541,6 +549,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let include_detailed_errors = self.config.include_detailed_errors;
                     let terminate_on_unknown = self.config.terminate_on_unknown_calls;
                     let function_middleware = self.function_middleware.clone();
+                    let session = session.clone();
                     async move {
                         execute_tool_call(
                             tool,
@@ -548,6 +557,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             include_detailed_errors,
                             terminate_on_unknown,
                             &function_middleware,
+                            session.as_ref(),
                         )
                         .await
                     }
