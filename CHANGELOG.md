@@ -5,7 +5,7 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [0.1.0] — Unreleased
+## [0.1.0] — 2026-07-13
 
 First release: a Rust implementation of the Microsoft Agent Framework at
 structural parity with upstream (`microsoft/agent-framework`) as of upstream

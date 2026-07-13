@@ -65,13 +65,24 @@ cargo publish -p agent-framework
 
 ## Release checklist (per release)
 
-1. Update `CHANGELOG.md`: move the Unreleased section to the release
-   version + date.
-2. Bump `[workspace.package] version` in the root `Cargo.toml` (all crates
-   inherit it and are released in lockstep) and refresh the versions in the
-   `[workspace.dependencies]` table to match.
-3. Full verification at the release commit:
-   `cargo build --workspace --all-features && cargo test --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo fmt --all -- --check && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features && cargo build -p agent-framework-examples --examples`
-4. Commit, tag `v<version>`, push the tag.
-5. Publish tier by tier (see above).
-6. Create the GitHub release from the tag, pasting the changelog section.
+Releases are **automated on merge to `main`**
+(`.github/workflows/release.yml`): when `main`'s `[workspace.package]
+version` has no `v<version>` tag yet, the workflow verifies the merge
+commit (build/test/clippy/fmt/doc/examples), pushes the tag, creates the
+GitHub Release with that version's `CHANGELOG.md` section as notes, and
+publishes all 22 crates tier by tier using the `CRATE_TOKEN` secret.
+Publishes are idempotent (already-published crate versions are skipped), so
+a partially failed run can be re-run via workflow_dispatch. Merges that
+don't change the version release nothing.
+
+So, to cut a release:
+
+1. Add the release section to `CHANGELOG.md` (heading `## [x.y.z] — date`).
+2. Bump `[workspace.package] version` in the root `Cargo.toml` and the
+   matching versions in the `[workspace.dependencies]` table (all crates
+   release in lockstep).
+3. Merge to `main`. The workflow does the rest.
+
+The tier list lives in the workflow; keep it in sync with the dependency
+tiers above when adding crates. Manual fallback: the tier-by-tier
+`cargo publish` sequence above still works from a checkout of the tag.
