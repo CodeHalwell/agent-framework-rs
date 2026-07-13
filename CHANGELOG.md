@@ -5,6 +5,17 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [0.1.1] — 2026-07-13
+
+First published release on crates.io — identical in content to 0.1.0.
+
+- The v0.1.0 release-pipeline run failed at the publish step (the crates.io
+  token secret was misnamed), after the `v0.1.0` tag had already been
+  pushed, so 0.1.0 was never published and its version number is burned.
+- Release workflow: publish to crates.io **before** tagging and creating
+  the GitHub Release, so a failed publish no longer burns the version —
+  the run can simply be retried after fixing the cause.
+
 ## [0.1.0] — 2026-07-13
 
 First release: a Rust implementation of the Microsoft Agent Framework at

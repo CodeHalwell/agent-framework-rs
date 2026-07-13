@@ -68,12 +68,13 @@ cargo publish -p agent-framework
 Releases are **automated on merge to `main`**
 (`.github/workflows/release.yml`): when `main`'s `[workspace.package]
 version` has no `v<version>` tag yet, the workflow verifies the merge
-commit (build/test/clippy/fmt/doc/examples), pushes the tag, creates the
-GitHub Release with that version's `CHANGELOG.md` section as notes, and
-publishes all 22 crates tier by tier using the `CRATE_TOKEN` secret.
-Publishes are idempotent (already-published crate versions are skipped), so
-a partially failed run can be re-run via workflow_dispatch. Merges that
-don't change the version release nothing.
+commit (build/test/clippy/fmt/doc/examples), publishes all 22 crates tier
+by tier using the `CRATES_TOKEN` secret, then pushes the tag and creates
+the GitHub Release with that version's `CHANGELOG.md` section as notes.
+Publishing comes before tagging so a failed publish does not burn the
+version. Publishes are idempotent (already-published crate versions are
+skipped), so a partially failed run can be re-run via workflow_dispatch.
+Merges that don't change the version release nothing.
 
 So, to cut a release:
 
