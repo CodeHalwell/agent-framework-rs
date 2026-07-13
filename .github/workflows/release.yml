@@ -84,6 +84,9 @@ jobs:
     needs: [version, verify]
     if: needs.version.outputs.is_new == 'true'
     runs-on: ubuntu-latest
+    # A first-time release of many new crate names spends most of its time
+    # sleeping out crates.io's new-crate rate limit (~1 per 10 min).
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,9 +116,41 @@ jobs:
               echo "$1@$VERSION already on crates.io — skipping"
               return
             fi
-            # Retry once after a pause: a just-published dependency may not
-            # be indexed yet when the next tier starts.
-            cargo publish -p "$1" || { sleep 30; cargo publish -p "$1"; }
+            # crates.io rate-limits NEW crate names hard: a small burst, then
+            # ~1 new crate per 10 minutes. On 429, parse the "try again
+            # after <date>" from the error and sleep until then; retry until
+            # published. (Version bumps of existing crates have a much
+            # higher limit, so this mostly matters for the first release.)
+            local attempt out when ts wait plain_failures=0
+            for attempt in $(seq 1 12); do
+              if out=$(cargo publish -p "$1" 2>&1); then
+                echo "$out" | tail -n 3
+                return
+              fi
+              echo "$out" | tail -n 6
+              if grep -q "429 Too Many Requests" <<<"$out"; then
+                when=$(sed -n 's/.*try again after \(.*GMT\).*/\1/p' <<<"$out" | head -n1)
+                wait=610
+                if [[ -n "$when" ]] && ts=$(date -d "$when" +%s 2>/dev/null); then
+                  wait=$(( ts - $(date +%s) + 15 ))
+                  (( wait < 15 )) && wait=15
+                fi
+                echo "$1: rate limited — sleeping ${wait}s (until ${when:-unknown}), attempt $attempt/12"
+                sleep "$wait"
+              else
+                # Real failures (auth, manifest, ...) fail fast: one retry
+                # covers a just-published dependency not being indexed yet.
+                plain_failures=$(( plain_failures + 1 ))
+                if (( plain_failures >= 2 )); then
+                  echo "::error::$1 failed twice with a non-rate-limit error — giving up"
+                  return 1
+                fi
+                echo "$1: publish failed (not rate-limited) — one retry in 30s"
+                sleep 30
+              fi
+            done
+            echo "::error::giving up on $1 after 12 attempts"
+            return 1
           }
           publish agent-framework-core
           for c in a2a bedrock copilotstudio cosmos declarative gemini hosting mcp mem0 openai purview redis; do
