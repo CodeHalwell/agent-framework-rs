@@ -150,6 +150,99 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// A reusable hosting-security layer for a **composed** router.
+///
+/// [`crate::AgentHost::into_router`] applies its bearer/host middleware only to
+/// the DevUI routes it builds — routers `merge`d or `nest`ed onto it afterwards
+/// (an [`OpenAiRouter`](crate::openai_compat::OpenAiRouter), an
+/// [`A2ARouter`](crate::a2a::A2ARouter), an
+/// [`AgUiRouter`](crate::agui::AgUiRouter)) are **not** covered. When you serve
+/// more than one protocol surface, build the whole app first, then wrap the
+/// final router with this so every execution endpoint is guarded uniformly:
+///
+/// ```no_run
+/// # use agent_framework_core::agent::Agent;
+/// use agent_framework_hosting::{
+///     a2a::A2ARouter, openai_compat::OpenAiRouter, security::HostingSecurity, AgentHost,
+/// };
+///
+/// # async fn demo(assistant: Agent) -> std::io::Result<()> {
+/// let app = AgentHost::new()
+///     .agent("assistant", assistant.clone())
+///     .into_router()
+///     .merge(OpenAiRouter::for_agent("assistant", assistant.clone()).into_router())
+///     .nest(
+///         "/a2a",
+///         A2ARouter::for_agent("assistant", assistant, "http://localhost:8080/a2a").into_router(),
+///     );
+///
+/// // Apply auth + host allowlist to the ENTIRE composed app, after all merges.
+/// let app = HostingSecurity::new()
+///     .with_bearer_token("secret")
+///     .with_default_localhost_hosts()
+///     .apply(app);
+///
+/// let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8080)).await?;
+/// axum::serve(listener, app).await
+/// # }
+/// ```
+#[derive(Clone, Default)]
+pub struct HostingSecurity {
+    bearer_token: Option<String>,
+    allowed_hosts: Option<Vec<String>>,
+}
+
+impl HostingSecurity {
+    /// An unconfigured layer (applying it is a no-op until you set a guard).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require `Authorization: Bearer <token>` on every request.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Reject requests whose `Host` header is not in `hosts` (anti-DNS-
+    /// rebinding; ports ignored).
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = Some(hosts);
+        self
+    }
+
+    /// Apply the default loopback `Host` allowlist (`localhost`, `127.0.0.1`,
+    /// `[::1]`, any port).
+    pub fn with_default_localhost_hosts(mut self) -> Self {
+        self.allowed_hosts = Some(default_hosts());
+        self
+    }
+
+    /// Whether any guard is configured (applying an empty layer is a no-op).
+    pub fn is_configured(&self) -> bool {
+        self.bearer_token.is_some() || self.allowed_hosts.is_some()
+    }
+
+    /// Wrap `router` with the configured guards. Layers apply outermost-last-
+    /// added-first, so the host guard is added after (and thus runs before) the
+    /// bearer check: a rebinding attempt is rejected before token comparison.
+    pub fn apply(&self, mut router: axum::Router) -> axum::Router {
+        if let Some(token) = &self.bearer_token {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                BearerToken::new(token.clone()),
+                bearer_auth,
+            ));
+        }
+        if let Some(hosts) = &self.allowed_hosts {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                AllowedHosts::new(hosts.clone()),
+                host_guard,
+            ));
+        }
+        router
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

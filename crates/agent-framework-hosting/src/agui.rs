@@ -228,47 +228,61 @@ async fn run_agent(State(state): State<Arc<AgUiState>>, body: String) -> Respons
 
     // Live streaming: drive `run_stream` and frame each update into AG-UI
     // events as it arrives (one `TEXT_MESSAGE_CONTENT` per text delta, etc.).
+    // Bounded channel: a slow client applies backpressure and a disconnected
+    // client cancels the run (see `crate::sse`).
     let agent = state.agent.clone();
-    let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+    let (tx, rx) = crate::sse::bounded_sse_channel();
+    let disconnect = tx.clone();
     tokio::spawn(async move {
-        let _ = tx.unbounded_send(run_started(&thread_id, &run_id));
-        match agent.run_stream(messages, None, run_options).await {
-            Ok(mut stream) => {
-                let mut framing = AgUiFraming::new();
-                let mut errored = false;
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(update) => {
-                            let mut events = Vec::new();
-                            framing.push_contents(&update.contents, &mut events);
-                            for ev in events {
-                                let _ = tx.unbounded_send(ev);
+        let produce = async move {
+            if tx.send(run_started(&thread_id, &run_id)).await.is_err() {
+                return;
+            }
+            match agent.run_stream(messages, None, run_options).await {
+                Ok(mut stream) => {
+                    let mut framing = AgUiFraming::new();
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(update) => {
+                                let mut events = Vec::new();
+                                framing.push_contents(&update.contents, &mut events);
+                                for ev in events {
+                                    if tx.send(ev).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            // SupportsAgentRun failure mid-stream → RUN_ERROR in
+                            // place of RUN_FINISHED (still a 200 SSE stream;
+                            // error in-band).
+                            Err(e) => {
+                                let _ = tx
+                                    .send(json!({ "type": "RUN_ERROR", "message": e.to_string() }))
+                                    .await;
+                                return;
                             }
                         }
-                        // SupportsAgentRun failure mid-stream → RUN_ERROR in place of
-                        // RUN_FINISHED (still a 200 SSE stream; error in-band).
-                        Err(e) => {
-                            let _ = tx.unbounded_send(
-                                json!({ "type": "RUN_ERROR", "message": e.to_string() }),
-                            );
-                            errored = true;
-                            break;
-                        }
                     }
-                }
-                if !errored {
                     let mut events = Vec::new();
                     framing.finalize(&mut events);
                     events.push(run_finished(&thread_id, &run_id));
                     for ev in events {
-                        let _ = tx.unbounded_send(ev);
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
                     }
                 }
+                // Failure before the stream even opens.
+                Err(e) => {
+                    let _ = tx
+                        .send(json!({ "type": "RUN_ERROR", "message": e.to_string() }))
+                        .await;
+                }
             }
-            // Failure before the stream even opens.
-            Err(e) => {
-                let _ = tx.unbounded_send(json!({ "type": "RUN_ERROR", "message": e.to_string() }));
-            }
+        };
+        tokio::select! {
+            _ = disconnect.closed() => {}
+            _ = produce => {}
         }
     });
 

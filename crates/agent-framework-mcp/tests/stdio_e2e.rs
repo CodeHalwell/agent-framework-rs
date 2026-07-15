@@ -12,7 +12,7 @@ use agent_framework_core::error::Error;
 use agent_framework_core::tools::ToolSource;
 use agent_framework_mcp::{
     CreateMessageParams, CreateMessageResult, McpClient, McpStdioTool, McpStdioTransport,
-    McpTransport as _, SamplingHandler,
+    McpTransport as _, SamplingHandler, StdioEnv,
 };
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
@@ -222,7 +222,7 @@ async fn stdio_client_initialize_list_and_call() {
         let transport = McpStdioTransport::spawn(
             "python3",
             &[script.to_string_lossy().to_string()],
-            None,
+            &StdioEnv::new(),
             None,
         )
         .await
@@ -472,10 +472,11 @@ async fn stdio_tool_source_resolve_tools_lazily_connects_and_returns_tools() {
 #[tokio::test]
 async fn stdio_request_timeout_cuts_off_a_call_that_never_responds() {
     let outcome = tokio::time::timeout(Duration::from_secs(20), async {
-        let transport = McpStdioTransport::spawn("sleep", &["100".to_string()], None, None)
-            .await
-            .expect("spawn sleep as a stand-in for a hung MCP server")
-            .with_request_timeout(Duration::from_millis(150));
+        let transport =
+            McpStdioTransport::spawn("sleep", &["100".to_string()], &StdioEnv::new(), None)
+                .await
+                .expect("spawn sleep as a stand-in for a hung MCP server")
+                .with_request_timeout(Duration::from_millis(150));
 
         let started = std::time::Instant::now();
         let err = transport

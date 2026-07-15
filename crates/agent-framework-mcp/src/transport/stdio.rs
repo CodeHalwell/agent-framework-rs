@@ -26,6 +26,167 @@ use crate::transport::McpTransport;
 
 type PendingMap = StdMutex<HashMap<i64, oneshot::Sender<std::result::Result<Value, RpcError>>>>;
 
+/// The minimal baseline of parent environment variables passed through to a
+/// spawned MCP stdio server when *not* inheriting the full parent environment
+/// (the default). This is deliberately small: just what a child typically needs
+/// to start and behave (executable lookup, temp dir, locale) — not application
+/// secrets. Names cover both Unix and Windows so spawning works on either.
+const BASELINE_ENV_NAMES: &[&str] = &[
+    // Executable/library lookup and user home.
+    "PATH",
+    "HOME",
+    // Temporary directory (POSIX + Windows).
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Locale.
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    // Windows essentials so a child process can even be created / find its DLLs.
+    "SystemRoot",
+    "SYSTEMROOT",
+    "windir",
+    "USERPROFILE",
+    "PATHEXT",
+    "ComSpec",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+/// The environment policy for a spawned MCP stdio server.
+///
+/// **Secure by default:** unless [`StdioEnv::inherit_parent_environment`] is
+/// enabled, the child does **not** inherit the parent process's environment.
+/// It starts from a minimal baseline allowlist ([`BASELINE_ENV_NAMES`] — PATH,
+/// temp-dir, and locale variables) plus any explicitly configured variables.
+/// This follows least privilege: an MCP package launched through `npx`,
+/// `python`, or another package runner does not automatically receive unrelated
+/// secrets (OpenAI/Anthropic keys, AWS/Azure credentials, GitHub tokens,
+/// database URLs, tracing-exporter secrets) that happen to be present in the
+/// host environment.
+///
+/// Escape hatches:
+/// - [`StdioEnv::inherit_parent_environment(true)`](StdioEnv::inherit_parent_environment)
+///   restores full inheritance (the old behavior).
+/// - [`StdioEnv::inherit_var`] / [`StdioEnv::inherit_vars`] pass through
+///   selected named variables by value without inheriting everything.
+#[derive(Debug, Clone, Default)]
+pub struct StdioEnv {
+    /// Explicit key/value pairs, applied last (highest precedence).
+    vars: HashMap<String, String>,
+    /// Inherit the full parent environment (legacy behavior). Off by default.
+    inherit_all: bool,
+    /// Additional parent variable names to pass through by value when not
+    /// inheriting the whole parent environment.
+    inherit_names: Vec<String>,
+}
+
+impl StdioEnv {
+    /// A secure-by-default policy: minimal baseline only, no parent secrets.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add/override an explicit environment variable on the child.
+    pub fn var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.vars.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add/override several explicit environment variables on the child.
+    pub fn vars<I, K, V>(mut self, vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (k, v) in vars {
+            self.vars.insert(k.into(), v.into());
+        }
+        self
+    }
+
+    /// Inherit the full parent process environment (default `false`).
+    ///
+    /// Enabling this reverts to inheriting every parent variable — convenient,
+    /// but it re-exposes all host secrets to the child. Prefer
+    /// [`Self::inherit_var`] for the specific variables the server needs.
+    pub fn inherit_parent_environment(mut self, inherit: bool) -> Self {
+        self.inherit_all = inherit;
+        self
+    }
+
+    /// Pass through a single named parent variable by value (no effect when
+    /// [`Self::inherit_parent_environment`] is enabled, which already inherits
+    /// everything).
+    pub fn inherit_var(mut self, name: impl Into<String>) -> Self {
+        self.inherit_names.push(name.into());
+        self
+    }
+
+    /// Pass through several named parent variables by value.
+    pub fn inherit_vars<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inherit_names.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Compute the explicit variables to set on the child in the (default)
+    /// non-inheriting case: the baseline allowlist and any explicitly-named
+    /// inherited variables resolved through `lookup`, then the configured
+    /// `vars` layered on top (highest precedence). Pure, so it is unit-testable
+    /// without touching the real process environment.
+    fn baseline_resolved(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for name in BASELINE_ENV_NAMES {
+            if let Some(v) = lookup(name) {
+                out.insert((*name).to_string(), v);
+            }
+        }
+        for name in &self.inherit_names {
+            if let Some(v) = lookup(name) {
+                out.insert(name.clone(), v);
+            }
+        }
+        for (k, v) in &self.vars {
+            out.insert(k.clone(), v.clone());
+        }
+        out
+    }
+
+    /// Apply this policy to `cmd`.
+    fn apply(&self, cmd: &mut Command) {
+        if self.inherit_all {
+            // Keep the inherited parent environment; layer explicit overrides.
+            cmd.envs(&self.vars);
+        } else {
+            // Drop the parent environment entirely, then set only the resolved
+            // baseline/allowlisted/explicit variables.
+            cmd.env_clear();
+            let resolved = self.baseline_resolved(|n| std::env::var(n).ok());
+            cmd.envs(&resolved);
+        }
+    }
+}
+
+impl From<HashMap<String, String>> for StdioEnv {
+    fn from(vars: HashMap<String, String>) -> Self {
+        Self {
+            vars,
+            ..Self::default()
+        }
+    }
+}
+
 /// An MCP transport backed by a child process's stdin/stdout.
 ///
 /// The child is spawned with `kill_on_drop`, and is additionally killed
@@ -58,13 +219,16 @@ impl McpStdioTransport {
     /// tasks that route responses back to their callers and drain
     /// notifications/stderr to `tracing`.
     ///
-    /// `env`, if provided, adds/overrides variables on top of the inherited
-    /// parent environment. `cwd`, if provided, sets the child's working
-    /// directory.
+    /// `env` controls the child's environment. By default ([`StdioEnv::new`])
+    /// the child does **not** inherit the parent process environment — it sees
+    /// only a minimal baseline allowlist plus any explicitly configured
+    /// variables, so host secrets are not automatically disclosed to the
+    /// server. See [`StdioEnv`] for the escape hatches. `cwd`, if provided,
+    /// sets the child's working directory.
     pub async fn spawn(
         command: impl AsRef<OsStr>,
         args: &[String],
-        env: Option<&HashMap<String, String>>,
+        env: &StdioEnv,
         cwd: Option<&Path>,
     ) -> Result<Self> {
         let command_ref = command.as_ref();
@@ -74,9 +238,7 @@ impl McpStdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(env) = env {
-            cmd.envs(env);
-        }
+        env.apply(&mut cmd);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -371,4 +533,81 @@ fn spawn_stderr_drain(stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake parent environment for exercising the (pure) resolution logic
+    /// without depending on the real process environment.
+    fn fake_parent(name: &str) -> Option<String> {
+        match name {
+            "PATH" => Some("/usr/bin:/bin".to_string()),
+            "LANG" => Some("en_US.UTF-8".to_string()),
+            // Secrets that must NOT leak into the child by default.
+            "OPENAI_API_KEY" => Some("sk-secret".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("aws-secret".to_string()),
+            "GITHUB_TOKEN" => Some("ghp_secret".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_policy_keeps_baseline_and_drops_secrets() {
+        let env = StdioEnv::new();
+        let resolved = env.baseline_resolved(fake_parent);
+        // Baseline present variables pass through.
+        assert_eq!(
+            resolved.get("PATH").map(String::as_str),
+            Some("/usr/bin:/bin")
+        );
+        assert_eq!(
+            resolved.get("LANG").map(String::as_str),
+            Some("en_US.UTF-8")
+        );
+        // Secrets are not inherited.
+        assert!(!resolved.contains_key("OPENAI_API_KEY"));
+        assert!(!resolved.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!resolved.contains_key("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn explicit_vars_are_applied_and_override() {
+        let env = StdioEnv::new()
+            .var("MCP_CONFIG", "value")
+            .var("PATH", "/custom/bin");
+        let resolved = env.baseline_resolved(fake_parent);
+        assert_eq!(
+            resolved.get("MCP_CONFIG").map(String::as_str),
+            Some("value")
+        );
+        // Explicit vars win over the inherited baseline.
+        assert_eq!(
+            resolved.get("PATH").map(String::as_str),
+            Some("/custom/bin")
+        );
+    }
+
+    #[test]
+    fn inherit_named_var_passes_one_secret_through_opt_in() {
+        let env = StdioEnv::new().inherit_var("GITHUB_TOKEN");
+        let resolved = env.baseline_resolved(fake_parent);
+        // Only the explicitly named variable is inherited; others still dropped.
+        assert_eq!(
+            resolved.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp_secret")
+        );
+        assert!(!resolved.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn from_hashmap_produces_a_vars_only_policy() {
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), "1".to_string());
+        let env = StdioEnv::from(map);
+        assert!(!env.inherit_all);
+        let resolved = env.baseline_resolved(|_| None);
+        assert_eq!(resolved.get("A").map(String::as_str), Some("1"));
+    }
 }

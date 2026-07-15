@@ -187,3 +187,106 @@ async fn both_layers_compose() {
         .status();
     assert_eq!(status, StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Composed multi-surface security (HostingSecurity applied to the final app)
+// ---------------------------------------------------------------------------
+
+use agent_framework_hosting::a2a::A2ARouter;
+use agent_framework_hosting::agui::AgUiRouter;
+use agent_framework_hosting::openai_compat::OpenAiRouter;
+use agent_framework_hosting::HostingSecurity;
+
+/// Build an app that merges/nests all four hosting surfaces, guarded by a
+/// single outer [`HostingSecurity`] bearer layer.
+fn composed_secured_app() -> Router {
+    let agent = MockAgent::new("assistant-1").arc();
+    let app = AgentHost::new()
+        .agent("assistant", agent.clone())
+        .into_router()
+        .merge(OpenAiRouter::for_agent("assistant", agent.clone()).into_router())
+        .merge(
+            AgUiRouter::for_agent("assistant", agent.clone())
+                .path("/agui")
+                .into_router(),
+        )
+        .nest(
+            "/a2a",
+            A2ARouter::for_agent("assistant", agent, "http://localhost:8080/a2a").into_router(),
+        );
+    HostingSecurity::new()
+        .with_bearer_token("secret")
+        .apply(app)
+}
+
+async fn post_status(app: Router, uri: &str, token: Option<&str>, body: &str) -> StatusCode {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(t) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+    }
+    let request = builder
+        .body(Body::from(body.to_string()))
+        .expect("request builds");
+    app.oneshot(request)
+        .await
+        .expect("router responds")
+        .status()
+}
+
+/// Every execution endpoint across all four surfaces must reject a request with
+/// no bearer token once the composed app is wrapped with `HostingSecurity` —
+/// not just the DevUI routes `AgentHost` builds directly.
+#[tokio::test]
+async fn composed_security_rejects_missing_credentials_on_every_surface() {
+    let endpoints = [
+        ("/v1/responses", r#"{"model":"assistant","input":"hi"}"#),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/agui", r#"{"messages":[]}"#),
+        (
+            "/a2a/",
+            r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"m1","parts":[{"kind":"text","text":"hi"}]}}}"#,
+        ),
+    ];
+
+    for (uri, body) in endpoints {
+        let status = post_status(composed_secured_app(), uri, None, body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "endpoint {uri} must reject a missing bearer token"
+        );
+    }
+}
+
+/// With the correct token, the same endpoints pass the auth layer (they do not
+/// return 401 — the handler runs).
+#[tokio::test]
+async fn composed_security_admits_valid_credentials_on_every_surface() {
+    let endpoints = [
+        ("/v1/responses", r#"{"model":"assistant","input":"hi"}"#),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"assistant","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/agui", r#"{"messages":[]}"#),
+        (
+            "/a2a/",
+            r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","messageId":"m1","parts":[{"kind":"text","text":"hi"}]}}}"#,
+        ),
+    ];
+
+    for (uri, body) in endpoints {
+        let status = post_status(composed_secured_app(), uri, Some("secret"), body).await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "endpoint {uri} must admit a valid bearer token"
+        );
+    }
+}

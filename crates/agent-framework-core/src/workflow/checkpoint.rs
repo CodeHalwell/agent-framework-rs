@@ -29,6 +29,31 @@ fn default_version() -> String {
     "1.0".to_string()
 }
 
+/// Reject any checkpoint id that is not a strict filename-safe token, so it can
+/// never be used to traverse outside a [`FileCheckpointStorage`] directory.
+///
+/// Allowed: a non-empty string of ASCII alphanumerics, `-`, and `_` (which
+/// admits UUIDs — the ids [`WorkflowCheckpoint::new`] generates — and any
+/// reasonable custom id). Everything else is rejected, including path
+/// separators (`/`, `\`), `.`/`..` traversal, absolute paths, drive prefixes
+/// (`C:`), and the empty string.
+fn validate_checkpoint_id(checkpoint_id: &str) -> Result<()> {
+    if checkpoint_id.is_empty() {
+        return Err(Error::Workflow(
+            "checkpoint id must not be empty".to_string(),
+        ));
+    }
+    if !checkpoint_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::Workflow(format!(
+            "invalid checkpoint id {checkpoint_id:?}: only ASCII alphanumerics, '-', and '_' are allowed"
+        )));
+    }
+    Ok(())
+}
+
 /// A complete snapshot of a workflow's execution state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowCheckpoint {
@@ -252,8 +277,27 @@ impl FileCheckpointStorage {
         Ok(Self { dir })
     }
 
-    fn path_for(&self, checkpoint_id: &str) -> PathBuf {
-        self.dir.join(format!("{checkpoint_id}.json"))
+    /// Resolve the on-disk path for `checkpoint_id`, after validating that the
+    /// id cannot escape the configured checkpoint directory.
+    ///
+    /// Checkpoint ids reach [`CheckpointStorage::load`]/[`CheckpointStorage::delete`]
+    /// from callers, so a value like `../secret` or an absolute path must never
+    /// be joined onto `self.dir` verbatim: `PathBuf::join` with an absolute
+    /// second component silently discards the root entirely. We reject anything
+    /// that is not a strict filename-safe token (see [`validate_checkpoint_id`]),
+    /// which forbids path separators, `.`/`..`, drive prefixes, and empty ids.
+    fn path_for(&self, checkpoint_id: &str) -> Result<PathBuf> {
+        validate_checkpoint_id(checkpoint_id)?;
+        let path = self.dir.join(format!("{checkpoint_id}.json"));
+        // Defense in depth: after joining, the parent must still be exactly the
+        // configured directory. With the strict grammar above this always holds,
+        // but the check keeps the invariant explicit and local to path building.
+        if path.parent() != Some(self.dir.as_path()) {
+            return Err(Error::Workflow(format!(
+                "checkpoint id {checkpoint_id:?} escapes the checkpoint directory"
+            )));
+        }
+        Ok(path)
     }
 
     async fn read_file(path: &Path) -> Result<WorkflowCheckpoint> {
@@ -269,7 +313,9 @@ impl FileCheckpointStorage {
 impl CheckpointStorage for FileCheckpointStorage {
     async fn save(&self, checkpoint: WorkflowCheckpoint) -> Result<String> {
         let id = checkpoint.checkpoint_id.clone();
-        let path = self.path_for(&id);
+        // Validate even on save: a caller can construct a checkpoint with an
+        // arbitrary id, and we must not write outside the configured directory.
+        let path = self.path_for(&id)?;
         let json = serde_json::to_vec_pretty(&checkpoint)
             .map_err(|e| Error::Workflow(format!("failed to serialize checkpoint: {e}")))?;
         // Write atomically via a temp file + rename.
@@ -284,7 +330,7 @@ impl CheckpointStorage for FileCheckpointStorage {
     }
 
     async fn load(&self, checkpoint_id: &str) -> Result<Option<WorkflowCheckpoint>> {
-        let path = self.path_for(checkpoint_id);
+        let path = self.path_for(checkpoint_id)?;
         match Self::read_file(&path).await {
             Ok(cp) => Ok(Some(cp)),
             Err(_) if !path.exists() => Ok(None),
@@ -313,11 +359,107 @@ impl CheckpointStorage for FileCheckpointStorage {
     }
 
     async fn delete(&self, checkpoint_id: &str) -> Result<bool> {
-        let path = self.path_for(checkpoint_id);
+        let path = self.path_for(checkpoint_id)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(Error::Workflow(format!("failed to delete checkpoint: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("afr-checkpoint-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn validate_checkpoint_id_accepts_uuids_and_safe_tokens() {
+        assert!(validate_checkpoint_id(&uuid::Uuid::new_v4().to_string()).is_ok());
+        assert!(validate_checkpoint_id("my-checkpoint_01").is_ok());
+        assert!(validate_checkpoint_id("abc123").is_ok());
+    }
+
+    #[test]
+    fn validate_checkpoint_id_rejects_traversal_and_absolute_ids() {
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../other-file",
+            "../../etc/passwd",
+            "sub/dir",
+            "a/b",
+            "with space",
+            "with.dot",
+            // Unix absolute.
+            "/etc/passwd",
+            // Windows-style traversal and drive prefixes.
+            "..\\other",
+            "C:\\Windows\\System32\\config",
+            "\\\\server\\share",
+        ] {
+            assert!(
+                validate_checkpoint_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_storage_rejects_traversal_on_load_and_delete() {
+        let dir = tmp_dir();
+        let storage = FileCheckpointStorage::new(&dir).unwrap();
+
+        // Plant a sibling file outside the checkpoint dir that a traversal id
+        // would otherwise reach.
+        let outside = dir.parent().unwrap().join("afr-checkpoint-secret.json");
+        std::fs::write(&outside, "{}").unwrap();
+
+        let escape_id = format!("../{}", outside.file_stem().unwrap().to_string_lossy());
+        assert!(storage.load(&escape_id).await.is_err());
+        assert!(storage.delete(&escape_id).await.is_err());
+        // The outside file must still be present — delete never reached it.
+        assert!(
+            outside.exists(),
+            "traversal delete must not touch outside files"
+        );
+
+        // An absolute id must not replace the storage root either.
+        let abs = outside.to_string_lossy().replace(".json", "");
+        assert!(storage.load(&abs).await.is_err());
+        assert!(storage.delete(&abs).await.is_err());
+
+        std::fs::remove_file(&outside).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_storage_round_trips_a_valid_checkpoint() {
+        let dir = tmp_dir();
+        let storage = FileCheckpointStorage::new(&dir).unwrap();
+        let cp = WorkflowCheckpoint::new(
+            "wf-1".to_string(),
+            None,
+            0,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            String::new(),
+        );
+        let id = storage.save(cp).await.unwrap();
+        assert!(storage.load(&id).await.unwrap().is_some());
+        assert!(storage.delete(&id).await.unwrap());
+        assert!(storage.load(&id).await.unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
