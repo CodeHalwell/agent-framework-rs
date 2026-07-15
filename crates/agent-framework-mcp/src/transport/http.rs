@@ -376,8 +376,8 @@ impl SseDecoder {
 
     /// Push a decoded UTF-8 `chunk`, returning any event blocks it completed
     /// (the text between delimiters, delimiters removed), drained from the
-    /// buffer. Errors if the total or a single un-terminated event exceeds the
-    /// configured caps.
+    /// buffer. Errors if the total, or a single event (completed *or* still
+    /// un-terminated), exceeds the configured caps.
     fn push(&mut self, chunk: &str) -> Result<Vec<String>> {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
         if self.total_bytes > self.max_total_bytes {
@@ -389,12 +389,22 @@ impl SseDecoder {
         self.buf.push_str(chunk);
         let mut events = Vec::new();
         while let Some((idx, len)) = find_delimiter(&self.buf) {
+            // Enforce the per-event cap *before* allocating/draining, so a
+            // single complete-but-oversized event (under the total cap) can't
+            // slip past the limit by being consumed first.
+            if idx > self.max_event_bytes {
+                return Err(Error::service(format!(
+                    "MCP SSE event exceeded the maximum size ({} bytes)",
+                    self.max_event_bytes
+                )));
+            }
             let event: String = self.buf[..idx].to_string();
             // Drop the event text and its delimiter from the front of the
             // buffer so we never rescan already-consumed bytes.
             self.buf.drain(..idx + len);
             events.push(event);
         }
+        // Also bound an in-progress event that has not yet seen its delimiter.
         if self.buf.len() > self.max_event_bytes {
             return Err(Error::service(format!(
                 "MCP SSE event exceeded the maximum size ({} bytes)",
@@ -639,6 +649,18 @@ mod tests {
         let mut decoder = SseDecoder::with_limits(8, 1024);
         let err = decoder
             .push("data: never-ending event with no delimiter")
+            .unwrap_err();
+        assert!(err.to_string().contains("event exceeded"), "{err}");
+    }
+
+    #[test]
+    fn decoder_enforces_per_event_cap_on_completed_event() {
+        // A *complete* (delimiter-terminated) event larger than the per-event
+        // cap but under the total cap must be rejected before it is drained,
+        // not consumed and slipped past the limit.
+        let mut decoder = SseDecoder::with_limits(8, 4096);
+        let err = decoder
+            .push("data: this complete event is far longer than eight bytes\n\n")
             .unwrap_err();
         assert!(err.to_string().contains("event exceeded"), "{err}");
     }

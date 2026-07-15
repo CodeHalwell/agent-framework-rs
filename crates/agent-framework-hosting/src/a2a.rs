@@ -219,7 +219,9 @@ impl A2ATaskStore {
             let expired = inner
                 .tasks
                 .get(&id)
-                .map(|s| now.duration_since(s.inserted_at) >= ttl)
+                // `saturating_duration_since` avoids a panic if the clock
+                // appears to move backwards (NTP steps, VM time anomalies).
+                .map(|s| now.saturating_duration_since(s.inserted_at) >= ttl)
                 // A stale id with no entry is always "prunable".
                 .unwrap_or(true);
             if !expired {
@@ -233,8 +235,23 @@ impl A2ATaskStore {
     }
 
     /// Insert (or replace) a task, then enforce the TTL, count, and size caps.
+    ///
+    /// A single task whose own serialized size exceeds the total byte budget is
+    /// **not retained**: retaining it would pin memory above the configured cap
+    /// (the eviction loop can't drop the sole/newest entry), defeating the very
+    /// bound meant to guard against a remote-DoS oversized response. Dropping it
+    /// only means a later `tasks/get` won't find it — the response was already
+    /// returned to the caller synchronously.
     fn insert(&self, id: String, task: A2ATask) {
         let size = serde_json::to_vec(&task).map(|v| v.len()).unwrap_or(0);
+        if size > self.max_total_bytes {
+            tracing::warn!(
+                task_bytes = size,
+                cap = self.max_total_bytes,
+                "A2A task exceeds the retention size cap; not retained"
+            );
+            return;
+        }
         let mut inner = self.inner.lock().expect("task store mutex poisoned");
         self.prune_expired(&mut inner, Instant::now());
 
@@ -257,8 +274,9 @@ impl A2ATaskStore {
             },
         );
 
-        // Enforce caps (never evict the just-inserted task below into nothing:
-        // there is always at least the newest entry, so these loops terminate).
+        // Enforce caps. Oversized single tasks were already rejected above, so
+        // once the store is down to the newest entry it is guaranteed to be
+        // within the byte budget — both loops terminate.
         while inner.tasks.len() > self.max_tasks {
             Self::evict_front(&mut inner);
         }
@@ -652,8 +670,9 @@ mod task_store_tests {
 
     #[test]
     fn total_size_cap_evicts_oldest() {
-        // A tiny byte budget forces eviction down to roughly one task.
-        let store = A2ATaskStore::new(1000, None, 64);
+        // Budget for roughly two tasks forces eviction down toward two.
+        let one = serde_json::to_vec(&dummy_task("t0")).unwrap().len();
+        let store = A2ATaskStore::new(1000, None, one * 2 + 1);
         for i in 0..10 {
             store.insert(format!("t{i}"), dummy_task(&format!("t{i}")));
         }
@@ -665,6 +684,17 @@ mod task_store_tests {
             store.len()
         );
         assert!(store.get("t9").is_some(), "newest task is always retained");
+    }
+
+    #[test]
+    fn oversized_single_task_is_not_retained() {
+        // A task larger than the entire byte budget must be rejected, not
+        // exempted — otherwise a lone oversized task pins memory above the cap.
+        let one = serde_json::to_vec(&dummy_task("t0")).unwrap().len();
+        let store = A2ATaskStore::new(1000, None, one.saturating_sub(1));
+        store.insert("t0".to_string(), dummy_task("t0"));
+        assert_eq!(store.len(), 0, "oversized task must not be retained");
+        assert!(store.get("t0").is_none());
     }
 
     #[test]

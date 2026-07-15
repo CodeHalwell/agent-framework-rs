@@ -602,7 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn from_hashmap_produces_a_vars_only_policy() {
+    fn from_hashmap_sets_explicit_vars_and_keeps_inherit_all_false() {
+        // `From<HashMap>` only seeds the explicit `vars`; it does not enable
+        // full parent inheritance, and the baseline allowlist still applies
+        // when resolved against a real parent environment.
         let mut map = HashMap::new();
         map.insert("A".to_string(), "1".to_string());
         let env = StdioEnv::from(map);

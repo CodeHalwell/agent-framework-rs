@@ -46,18 +46,18 @@ jobs:
         run: cargo test --workspace --all-features --verbose
 
   msrv:
-    name: MSRV (Rust 1.82)
+    name: MSRV (Rust 1.85)
     runs-on: ubuntu-latest
     # `-D warnings` is a lint gate for stable; the MSRV job only needs to prove
     # the workspace still *compiles* on the advertised minimum compiler, so
-    # don't fail it on benign lint differences between 1.82 and stable.
+    # don't fail it on benign lint differences between 1.85 and stable.
     env:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.82 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.82
+      - name: Install Rust 1.85 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.85
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -68,8 +68,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
 
-      # Verify the advertised `rust-version = "1.82"` compatibility promise: a
+      # Verify the advertised `rust-version = "1.85"` compatibility promise: a
       # change that accidentally uses a newer language/std feature fails here
-      # even though it compiles on current stable.
+      # even though it compiles on current stable. 1.85 is the real floor: the
+      # dependency tree pulls in edition-2024 crates (zeroize, hashbrown,
+      # indexmap, getrandom, ...) that require Cargo 1.85+.
       - name: Check on MSRV (all features)
         run: cargo check --workspace --all-targets --all-features --verbose

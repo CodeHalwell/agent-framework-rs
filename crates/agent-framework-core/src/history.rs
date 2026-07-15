@@ -194,10 +194,18 @@ impl FileHistoryProvider {
         serde_json::json!({ "messages": self.list_messages() })
     }
 
-    /// Atomically write `messages` as `{"messages": [...]}`: serialize, write to
-    /// a uniquely named temporary sibling file, flush, then rename it over the
-    /// destination. The rename is atomic on a POSIX filesystem, so a crash mid-
-    /// write leaves either the old file or the new one, never a truncated file.
+    /// Write `messages` as `{"messages": [...]}` via a temp-file-plus-rename so
+    /// the destination is replaced **atomically**: serialize, write to a
+    /// uniquely named temporary sibling file, then rename it over the
+    /// destination. The rename is atomic on a POSIX filesystem, so a reader
+    /// (or a crash) sees either the old file or the fully-written new one,
+    /// never a truncated file.
+    ///
+    /// This guarantees atomic *replacement*, not fsync-level crash durability:
+    /// like the sibling checkpoint writer, it does not `sync_all` the file or
+    /// its directory, so a power loss immediately after the rename may still
+    /// lose the last write. That is an intentional trade-off for these small,
+    /// frequently-rewritten history files.
     async fn persist(&self, messages: &[Message]) -> Result<()> {
         let dict = serde_json::json!({ "messages": messages });
         let json = serde_json::to_string_pretty(&dict)
@@ -213,9 +221,13 @@ impl FileHistoryProvider {
         let tmp = self
             .path
             .with_file_name(format!("{file_name}.tmp.{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp, json)
-            .await
-            .map_err(|e| Error::other(format!("failed to write history temp file {tmp:?}: {e}")))?;
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            // Don't leave the partial temp file behind on a failed write.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(Error::other(format!(
+                "failed to write history temp file {tmp:?}: {e}"
+            )));
+        }
         tokio::fs::rename(&tmp, &self.path).await.map_err(|e| {
             // Best-effort cleanup of the temp file on a failed rename.
             let tmp = tmp.clone();
