@@ -29,7 +29,7 @@ members = [
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/codehalwell/agent-framework-rs"
