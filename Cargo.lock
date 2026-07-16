@@ -300,6 +300,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
  "uuid",

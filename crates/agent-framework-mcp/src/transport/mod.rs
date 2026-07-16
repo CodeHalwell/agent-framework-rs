@@ -68,5 +68,5 @@ pub trait McpTransport: Send + Sync {
 }
 
 pub use http::McpStreamableHttpTransport;
-pub use stdio::McpStdioTransport;
+pub use stdio::{McpStdioTransport, StdioEnv};
 pub use websocket::McpWebsocketTransport;

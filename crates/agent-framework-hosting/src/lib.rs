@@ -49,6 +49,16 @@
 //! # }
 //! ```
 //!
+//! ## Securing a multi-surface app
+//!
+//! [`AgentHost::with_bearer_token`]/[`AgentHost::with_allowed_hosts`] guard only
+//! the DevUI routes built by [`AgentHost::into_router`] — **not** any
+//! [`OpenAiRouter`](openai_compat::OpenAiRouter),
+//! [`A2ARouter`](a2a::A2ARouter), or [`AgUiRouter`](agui::AgUiRouter) merged or
+//! nested onto it. To protect every execution endpoint in a composed app, build
+//! the whole router first and wrap it with [`HostingSecurity`] (see its docs for
+//! a full example).
+//!
 //! ## Divergences from the reference
 //! Per-surface divergences (stateless runs, streaming realized by run-to-
 //! completion, metadata-derived A2A skills, omitted fields) are documented on
@@ -69,6 +79,9 @@ mod ui;
 mod util;
 
 pub use registry::{AgentHost, AgentRegistration, IntoAgentRegistration};
+
+// Re-export the reusable composed-router security layer.
+pub use security::HostingSecurity;
 
 // Re-export the DevUI model types for callers building responses/clients.
 pub use devui::models::{DiscoveryResponse, EntityInfo, HealthResponse};

@@ -127,10 +127,23 @@ impl HistoryProvider for InMemoryHistoryProvider {}
 /// A [`HistoryProvider`] that persists to a JSON file on disk, loading any
 /// existing history from `path` on construction and rewriting the whole file
 /// after every successful run.
+///
+/// Persistence is **atomic and concurrency-safe**: `after_run` serializes the
+/// whole append→snapshot→write sequence behind an async `write_lock` (shared
+/// across clones), writes to a temporary sibling file, and atomically renames
+/// it into place. The in-memory history is only updated *after* the on-disk
+/// write succeeds, so a failed write never diverges memory from disk, and two
+/// concurrent runs sharing cloned providers can't lose each other's messages
+/// via a snapshot/overwrite race.
 #[derive(Clone)]
 pub struct FileHistoryProvider {
     path: PathBuf,
     messages: Arc<Mutex<Vec<Message>>>,
+    /// Serializes the append+snapshot+persist critical section across all
+    /// clones so concurrent `after_run` calls can't interleave into a lost
+    /// update. Held only in `after_run`; reads (`before_run`/`list_messages`)
+    /// take the fast in-memory `messages` lock and never block on this.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FileHistoryProvider {
@@ -162,6 +175,7 @@ impl FileHistoryProvider {
         Ok(Self {
             path,
             messages: Arc::new(Mutex::new(messages)),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -180,11 +194,51 @@ impl FileHistoryProvider {
         serde_json::json!({ "messages": self.list_messages() })
     }
 
-    fn persist(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.to_dict())
+    /// Write `messages` as `{"messages": [...]}` via a temp-file-plus-rename so
+    /// the destination is replaced **atomically**: serialize, write to a
+    /// uniquely named temporary sibling file, then rename it over the
+    /// destination. The rename is atomic on a POSIX filesystem, so a reader
+    /// (or a crash) sees either the old file or the fully-written new one,
+    /// never a truncated file.
+    ///
+    /// This guarantees atomic *replacement*, not fsync-level crash durability:
+    /// like the sibling checkpoint writer, it does not `sync_all` the file or
+    /// its directory, so a power loss immediately after the rename may still
+    /// lose the last write. That is an intentional trade-off for these small,
+    /// frequently-rewritten history files.
+    async fn persist(&self, messages: &[Message]) -> Result<()> {
+        let dict = serde_json::json!({ "messages": messages });
+        let json = serde_json::to_string_pretty(&dict)
             .map_err(|e| Error::Serialization(format!("failed to serialize history: {e}")))?;
-        std::fs::write(&self.path, json)
-            .map_err(|e| Error::other(format!("failed to write history file {:?}: {e}", self.path)))
+        // Temp file in the same directory so `rename` stays on one filesystem.
+        // A uuid suffix keeps two providers on the same path from clobbering
+        // each other's temp file.
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("history.json");
+        let tmp = self
+            .path
+            .with_file_name(format!("{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            // Don't leave the partial temp file behind on a failed write.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(Error::other(format!(
+                "failed to write history temp file {tmp:?}: {e}"
+            )));
+        }
+        tokio::fs::rename(&tmp, &self.path).await.map_err(|e| {
+            // Best-effort cleanup of the temp file on a failed rename.
+            let tmp = tmp.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(&tmp).await;
+            });
+            Error::other(format!(
+                "failed to finalize history file {:?}: {e}",
+                self.path
+            ))
+        })
     }
 }
 
@@ -203,14 +257,28 @@ impl ContextProvider for FileHistoryProvider {
         response_messages: &[Message],
         error: Option<&Error>,
     ) -> Result<()> {
-        if error.is_none() {
-            {
-                let mut guard = self.messages.lock().unwrap();
-                guard.extend(request_messages.iter().cloned());
-                guard.extend(response_messages.iter().cloned());
-            }
-            self.persist()?;
+        if error.is_some() {
+            return Ok(());
         }
+        // Serialize the whole append→snapshot→persist sequence so two
+        // concurrent runs (sharing cloned providers) can't interleave a
+        // snapshot and an overwrite into a lost update.
+        let _write = self.write_lock.lock().await;
+
+        // Compute the next full history WITHOUT committing it to shared memory
+        // yet: disk is the source of truth. We persist first and only update
+        // the in-memory copy on success, so a failed write leaves memory and
+        // disk consistent (the run's `after_run` returns the error and the
+        // caller can retry) rather than diverging.
+        let snapshot = {
+            let guard = self.messages.lock().unwrap();
+            let mut next = guard.clone();
+            next.extend(request_messages.iter().cloned());
+            next.extend(response_messages.iter().cloned());
+            next
+        };
+        self.persist(&snapshot).await?;
+        *self.messages.lock().unwrap() = snapshot;
         Ok(())
     }
 
@@ -324,6 +392,53 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text(), "hi");
         assert_eq!(msgs[1].text(), "hello");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_history_provider_concurrent_runs_do_not_lose_messages() {
+        // Regression for the snapshot/overwrite race: many concurrent
+        // `after_run` calls on cloned providers must all be durably recorded,
+        // and the on-disk file must always be valid JSON (atomic rename).
+        let dir = std::env::temp_dir().join(format!("afr-history-conc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+
+        let provider = FileHistoryProvider::new(&path).unwrap();
+        const N: usize = 50;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let p = provider.clone();
+            handles.push(tokio::spawn(async move {
+                p.after_run(
+                    &[Message::user(format!("q{i}"))],
+                    &[Message::assistant(format!("a{i}"))],
+                    None,
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Every run contributed a request + response message; none lost.
+        assert_eq!(provider.list_messages().len(), N * 2);
+
+        // The on-disk file is valid and holds the full history (atomic rename
+        // means it is never a torn/partial write).
+        let reloaded = FileHistoryProvider::new(&path).unwrap();
+        assert_eq!(reloaded.list_messages().len(), N * 2);
+
+        // No temp files left behind.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "temp files leaked: {leftover:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

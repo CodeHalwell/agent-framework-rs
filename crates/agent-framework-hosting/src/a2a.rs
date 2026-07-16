@@ -22,8 +22,9 @@
 //!   `tasks/cancel` on a known task returns `TaskNotCancelableError` (-32002).
 //! - `TaskStatus.timestamp` (optional in the spec) is omitted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -146,19 +147,190 @@ struct A2AArtifact {
 }
 
 // ---------------------------------------------------------------------------
+// Task store
+// ---------------------------------------------------------------------------
+
+/// Default maximum number of retained tasks before oldest-first eviction.
+const DEFAULT_MAX_TASKS: usize = 1024;
+/// Default time-to-live for a retained task.
+const DEFAULT_TASK_TTL: Duration = Duration::from_secs(60 * 60);
+/// Default cap on the total serialized size of retained tasks (16 MiB).
+const DEFAULT_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// One retained task plus the bookkeeping used for TTL and size eviction.
+struct StoredTask {
+    task: A2ATask,
+    inserted_at: Instant,
+    /// Serialized byte size, tracked so the store can bound total memory.
+    size: usize,
+}
+
+struct TaskStoreInner {
+    tasks: HashMap<String, StoredTask>,
+    /// Task ids in insertion order (oldest at the front) for FIFO eviction.
+    order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+/// A bounded, self-pruning in-memory store for A2A tasks.
+///
+/// Without bounds, `message/send` would accumulate every task's full request,
+/// response artifact, and history forever — an unbounded memory leak and a
+/// straightforward remote-DoS vector on an exposed endpoint. This store caps
+/// the retained task **count** and **total serialized size**, and expires
+/// tasks after a **TTL**, pruning on every access. Eviction is oldest-first.
+struct A2ATaskStore {
+    inner: Mutex<TaskStoreInner>,
+    max_tasks: usize,
+    ttl: Option<Duration>,
+    max_total_bytes: usize,
+}
+
+impl A2ATaskStore {
+    fn new(max_tasks: usize, ttl: Option<Duration>, max_total_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(TaskStoreInner {
+                tasks: HashMap::new(),
+                order: VecDeque::new(),
+                total_bytes: 0,
+            }),
+            max_tasks: max_tasks.max(1),
+            ttl,
+            max_total_bytes: max_total_bytes.max(1),
+        }
+    }
+
+    /// Drop the front (oldest) entry, keeping `order`/`total_bytes` consistent.
+    fn evict_front(inner: &mut TaskStoreInner) {
+        while let Some(id) = inner.order.pop_front() {
+            if let Some(stored) = inner.tasks.remove(&id) {
+                inner.total_bytes = inner.total_bytes.saturating_sub(stored.size);
+                return;
+            }
+            // `id` was already removed (e.g. via `remove`); skip the stale entry.
+        }
+    }
+
+    /// Remove any entries older than the TTL (front-to-back; insertion order is
+    /// age order). `now` is passed in so the logic is testable.
+    fn prune_expired(&self, inner: &mut TaskStoreInner, now: Instant) {
+        let Some(ttl) = self.ttl else { return };
+        while let Some(id) = inner.order.front().cloned() {
+            let expired = inner
+                .tasks
+                .get(&id)
+                // `saturating_duration_since` avoids a panic if the clock
+                // appears to move backwards (NTP steps, VM time anomalies).
+                .map(|s| now.saturating_duration_since(s.inserted_at) >= ttl)
+                // A stale id with no entry is always "prunable".
+                .unwrap_or(true);
+            if !expired {
+                break;
+            }
+            inner.order.pop_front();
+            if let Some(stored) = inner.tasks.remove(&id) {
+                inner.total_bytes = inner.total_bytes.saturating_sub(stored.size);
+            }
+        }
+    }
+
+    /// Insert (or replace) a task, then enforce the TTL, count, and size caps.
+    ///
+    /// A single task whose own serialized size exceeds the total byte budget is
+    /// **not retained**: retaining it would pin memory above the configured cap
+    /// (the eviction loop can't drop the sole/newest entry), defeating the very
+    /// bound meant to guard against a remote-DoS oversized response. Dropping it
+    /// only means a later `tasks/get` won't find it — the response was already
+    /// returned to the caller synchronously.
+    fn insert(&self, id: String, task: A2ATask) {
+        let size = serde_json::to_vec(&task).map(|v| v.len()).unwrap_or(0);
+        if size > self.max_total_bytes {
+            tracing::warn!(
+                task_bytes = size,
+                cap = self.max_total_bytes,
+                "A2A task exceeds the retention size cap; not retained"
+            );
+            return;
+        }
+        let mut inner = self.inner.lock().expect("task store mutex poisoned");
+        self.prune_expired(&mut inner, Instant::now());
+
+        // Replacing an existing id: drop its old size/order entry first.
+        if let Some(old) = inner.tasks.remove(&id) {
+            inner.total_bytes = inner.total_bytes.saturating_sub(old.size);
+            if let Some(pos) = inner.order.iter().position(|x| x == &id) {
+                inner.order.remove(pos);
+            }
+        }
+
+        inner.total_bytes = inner.total_bytes.saturating_add(size);
+        inner.order.push_back(id.clone());
+        inner.tasks.insert(
+            id,
+            StoredTask {
+                task,
+                inserted_at: Instant::now(),
+                size,
+            },
+        );
+
+        // Enforce caps. Oversized single tasks were already rejected above, so
+        // once the store is down to the newest entry it is guaranteed to be
+        // within the byte budget — both loops terminate.
+        while inner.tasks.len() > self.max_tasks {
+            Self::evict_front(&mut inner);
+        }
+        while inner.total_bytes > self.max_total_bytes && inner.order.len() > 1 {
+            Self::evict_front(&mut inner);
+        }
+    }
+
+    /// Fetch a task by id, pruning expired entries first (so an expired task
+    /// reads as absent).
+    fn get(&self, id: &str) -> Option<A2ATask> {
+        let mut inner = self.inner.lock().expect("task store mutex poisoned");
+        self.prune_expired(&mut inner, Instant::now());
+        inner.tasks.get(id).map(|s| s.task.clone())
+    }
+
+    /// Whether a (non-expired) task with `id` is retained.
+    fn contains(&self, id: &str) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Current retained task count (after pruning). Test/inspection helper.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        let mut inner = self.inner.lock().expect("task store mutex poisoned");
+        self.prune_expired(&mut inner, Instant::now());
+        inner.tasks.len()
+    }
+
+    /// Prune as of an explicit `now`, for deterministic TTL tests.
+    #[cfg(test)]
+    fn force_prune(&self, now: Instant) {
+        let mut inner = self.inner.lock().expect("task store mutex poisoned");
+        self.prune_expired(&mut inner, now);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 struct A2AState {
     card: AgentCard,
     agent: Arc<dyn SupportsAgentRun>,
-    tasks: Mutex<HashMap<String, A2ATask>>,
+    tasks: A2ATaskStore,
 }
 
 /// Serves one agent over the A2A protocol.
 pub struct A2ARouter {
     card: AgentCard,
     agent: Arc<dyn SupportsAgentRun>,
+    max_tasks: usize,
+    task_ttl: Option<Duration>,
+    max_task_bytes: usize,
 }
 
 impl A2ARouter {
@@ -202,12 +374,42 @@ impl A2ARouter {
         Self {
             card,
             agent: reg.agent,
+            max_tasks: DEFAULT_MAX_TASKS,
+            task_ttl: Some(DEFAULT_TASK_TTL),
+            max_task_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 
     /// Override the advertised card version.
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.card.version = version.into();
+        self
+    }
+
+    /// Cap the number of retained tasks (oldest-first eviction beyond this).
+    /// Defaults to 1024.
+    pub fn max_tasks(mut self, max_tasks: usize) -> Self {
+        self.max_tasks = max_tasks;
+        self
+    }
+
+    /// Expire a retained task after `ttl`. Defaults to one hour; pass a large
+    /// value (or use [`Self::no_task_ttl`]) to disable time-based expiry.
+    pub fn task_ttl(mut self, ttl: Duration) -> Self {
+        self.task_ttl = Some(ttl);
+        self
+    }
+
+    /// Disable TTL-based task expiry (tasks are still bounded by count/size).
+    pub fn no_task_ttl(mut self) -> Self {
+        self.task_ttl = None;
+        self
+    }
+
+    /// Cap the total serialized size (bytes) of retained tasks. Defaults to
+    /// 16 MiB; oldest tasks are evicted to stay under the cap.
+    pub fn max_task_bytes(mut self, bytes: usize) -> Self {
+        self.max_task_bytes = bytes;
         self
     }
 
@@ -233,7 +435,7 @@ impl A2ARouter {
         let state = Arc::new(A2AState {
             card: self.card,
             agent: self.agent,
-            tasks: Mutex::new(HashMap::new()),
+            tasks: A2ATaskStore::new(self.max_tasks, self.task_ttl, self.max_task_bytes),
         });
         Router::new()
             .route("/.well-known/agent-card.json", get(agent_card))
@@ -352,17 +554,13 @@ async fn handle_message_send(state: &A2AState, params: Value) -> Result<Value, R
     };
 
     let value = serde_json::to_value(&task).unwrap_or(Value::Null);
-    state
-        .tasks
-        .lock()
-        .expect("tasks mutex poisoned")
-        .insert(task_id, task);
+    state.tasks.insert(task_id, task);
     Ok(value)
 }
 
 fn handle_tasks_get(state: &A2AState, params: Value) -> Result<Value, RpcErr> {
     let id = task_id_param(&params)?;
-    match state.tasks.lock().expect("tasks mutex poisoned").get(&id) {
+    match state.tasks.get(&id) {
         Some(task) => Ok(serde_json::to_value(task).unwrap_or(Value::Null)),
         None => Err(RpcErr::new(TASK_NOT_FOUND, format!("Task not found: {id}"))),
     }
@@ -370,11 +568,7 @@ fn handle_tasks_get(state: &A2AState, params: Value) -> Result<Value, RpcErr> {
 
 fn handle_tasks_cancel(state: &A2AState, params: Value) -> Result<Value, RpcErr> {
     let id = task_id_param(&params)?;
-    let exists = state
-        .tasks
-        .lock()
-        .expect("tasks mutex poisoned")
-        .contains_key(&id);
+    let exists = state.tasks.contains(&id);
     if exists {
         // Tasks complete synchronously and are terminal, so they cannot be
         // canceled.
@@ -425,4 +619,89 @@ fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
         "id": id,
         "error": { "code": code, "message": message.into() },
     })
+}
+
+#[cfg(test)]
+mod task_store_tests {
+    use super::*;
+
+    fn dummy_task(id: &str) -> A2ATask {
+        A2ATask {
+            id: id.to_string(),
+            context_id: "ctx".to_string(),
+            status: A2ATaskStatus {
+                state: "completed".to_string(),
+            },
+            artifacts: vec![A2AArtifact {
+                artifact_id: "art".to_string(),
+                name: Some("response".to_string()),
+                parts: vec![A2APart::text("hello world")],
+            }],
+            history: Vec::new(),
+            kind: "task".to_string(),
+        }
+    }
+
+    #[test]
+    fn evicts_oldest_beyond_capacity() {
+        let store = A2ATaskStore::new(3, None, DEFAULT_MAX_TOTAL_BYTES);
+        for i in 0..5 {
+            store.insert(format!("t{i}"), dummy_task(&format!("t{i}")));
+        }
+        assert_eq!(store.len(), 3, "count must stay capped");
+        // The two oldest were evicted; the three newest remain.
+        assert!(store.get("t0").is_none());
+        assert!(store.get("t1").is_none());
+        assert!(store.get("t2").is_some());
+        assert!(store.get("t4").is_some());
+    }
+
+    #[test]
+    fn ttl_expires_old_tasks() {
+        let ttl = Duration::from_secs(30);
+        let store = A2ATaskStore::new(100, Some(ttl), DEFAULT_MAX_TOTAL_BYTES);
+        store.insert("t0".to_string(), dummy_task("t0"));
+        assert_eq!(store.len(), 1);
+        // Prune as if the TTL had elapsed.
+        store.force_prune(Instant::now() + ttl + Duration::from_secs(1));
+        assert_eq!(store.len(), 0, "expired task must be pruned");
+        assert!(store.get("t0").is_none());
+    }
+
+    #[test]
+    fn total_size_cap_evicts_oldest() {
+        // Budget for roughly two tasks forces eviction down toward two.
+        let one = serde_json::to_vec(&dummy_task("t0")).unwrap().len();
+        let store = A2ATaskStore::new(1000, None, one * 2 + 1);
+        for i in 0..10 {
+            store.insert(format!("t{i}"), dummy_task(&format!("t{i}")));
+        }
+        // The store never grows without bound: only the most recent handful of
+        // tasks (bounded by the byte budget) are retained.
+        assert!(
+            store.len() <= 2,
+            "size cap must bound retention: {}",
+            store.len()
+        );
+        assert!(store.get("t9").is_some(), "newest task is always retained");
+    }
+
+    #[test]
+    fn oversized_single_task_is_not_retained() {
+        // A task larger than the entire byte budget must be rejected, not
+        // exempted — otherwise a lone oversized task pins memory above the cap.
+        let one = serde_json::to_vec(&dummy_task("t0")).unwrap().len();
+        let store = A2ATaskStore::new(1000, None, one.saturating_sub(1));
+        store.insert("t0".to_string(), dummy_task("t0"));
+        assert_eq!(store.len(), 0, "oversized task must not be retained");
+        assert!(store.get("t0").is_none());
+    }
+
+    #[test]
+    fn replacing_same_id_does_not_double_count() {
+        let store = A2ATaskStore::new(1000, None, DEFAULT_MAX_TOTAL_BYTES);
+        store.insert("t0".to_string(), dummy_task("t0"));
+        store.insert("t0".to_string(), dummy_task("t0"));
+        assert_eq!(store.len(), 1);
+    }
 }

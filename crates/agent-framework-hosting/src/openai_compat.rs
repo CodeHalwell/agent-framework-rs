@@ -101,56 +101,79 @@ async fn chat_completions(
 
     if request.stream {
         // Live streaming: drive `run_stream` and frame each update as a
-        // `chat.completion.chunk` as it arrives.
+        // `chat.completion.chunk` as it arrives. The channel is bounded, so a
+        // slow client applies backpressure (the producer's `send().await`
+        // suspends) and a disconnected client cancels the run: `disconnect`'s
+        // `closed()` fires — or a `send` fails — and the producer future is
+        // dropped, dropping the agent `stream` with it.
         let agent = state.agent.clone();
-        let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+        let (tx, rx) = crate::sse::bounded_sse_channel();
+        let disconnect = tx.clone();
         tokio::spawn(async move {
-            // First chunk carries the assistant role.
-            let _ = tx.unbounded_send(chunk(
-                &id,
-                created,
-                &model,
-                json!({ "role": "assistant" }),
-                Value::Null,
-            ));
-            match agent.run_stream(messages, None, None).await {
-                Ok(mut stream) => {
-                    let mut had_error = false;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(update) => {
-                                let text = update.text();
-                                if !text.is_empty() {
-                                    let _ = tx.unbounded_send(chunk(
-                                        &id,
-                                        created,
-                                        &model,
-                                        json!({ "content": text }),
-                                        Value::Null,
-                                    ));
+            let produce = async move {
+                // First chunk carries the assistant role.
+                if tx
+                    .send(chunk(
+                        &id,
+                        created,
+                        &model,
+                        json!({ "role": "assistant" }),
+                        Value::Null,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match agent.run_stream(messages, None, None).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            match item {
+                                Ok(update) => {
+                                    let text = update.text();
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(chunk(
+                                                &id,
+                                                created,
+                                                &model,
+                                                json!({ "content": text }),
+                                                Value::Null,
+                                            ))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(stream_error(&e.to_string())).await;
+                                    return;
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.unbounded_send(stream_error(&e.to_string()));
-                                had_error = true;
-                                break;
-                            }
                         }
-                    }
-                    if !had_error {
                         // Terminal chunk.
-                        let _ = tx.unbounded_send(chunk(
-                            &id,
-                            created,
-                            &model,
-                            json!({}),
-                            Value::String("stop".to_string()),
-                        ));
+                        let _ = tx
+                            .send(chunk(
+                                &id,
+                                created,
+                                &model,
+                                json!({}),
+                                Value::String("stop".to_string()),
+                            ))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(stream_error(&e.to_string())).await;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.unbounded_send(stream_error(&e.to_string()));
-                }
+            };
+            // Whichever finishes first wins; if the client disconnects,
+            // `closed()` completes and `produce` (holding the agent stream) is
+            // dropped, cancelling the underlying run.
+            tokio::select! {
+                _ = disconnect.closed() => {}
+                _ = produce => {}
             }
         });
         sse_response_stream(rx)

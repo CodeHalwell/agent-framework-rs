@@ -79,6 +79,101 @@ impl SupportsAgentRun for StreamingAgent {
     }
 }
 
+/// An agent whose `run_stream` yields an effectively unbounded sequence of
+/// text deltas, tracking how many it produced and flipping a `cancelled` flag
+/// when the stream is dropped. Lets a test assert that a disconnected client
+/// stops the underlying run (cancellation) and that a slow/absent consumer
+/// bounds production (backpressure) instead of running away.
+pub struct CancelTrackingAgent {
+    id: String,
+    produced: Arc<std::sync::atomic::AtomicUsize>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CancelTrackingAgent {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            produced: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Count of deltas the agent's stream has yielded so far.
+    pub fn produced(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.produced.clone()
+    }
+
+    /// Set to `true` once the streaming task drops the agent stream.
+    pub fn cancelled(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for CancelTrackingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
+            messages: vec![Message::assistant("done")],
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        use std::sync::atomic::Ordering;
+
+        /// Flips `cancelled` when the stream (and thus this guard) is dropped.
+        struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let guard = CancelGuard(self.cancelled.clone());
+        let produced = self.produced.clone();
+        // A large-but-finite stream: far more than any channel capacity, so a
+        // working cancellation/backpressure path stops it early, but it never
+        // truly spins forever if something regresses.
+        let stream = futures::stream::unfold(
+            (0usize, guard, produced),
+            |(n, guard, produced)| async move {
+                if n >= 1_000_000 {
+                    return None;
+                }
+                // Yield so the producer task can be preempted (and cancelled)
+                // between deltas.
+                tokio::task::yield_now().await;
+                produced.fetch_add(1, Ordering::SeqCst);
+                let update = Ok(AgentResponseUpdate {
+                    contents: vec![Content::text(format!("tok{n}"))],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+                Some((update, (n + 1, guard, produced)))
+            },
+        );
+        Ok(stream.boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// A scripted agent: echoes the concatenated input text behind a fixed prefix,
 /// so tests can verify both routing and input parsing. Optionally reports usage.
 pub struct MockAgent {

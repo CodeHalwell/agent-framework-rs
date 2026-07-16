@@ -37,7 +37,41 @@ jobs:
         run: cargo clippy --all-targets --all-features
 
       - name: Build
-        run: cargo build --all-targets --verbose
+        run: cargo build --workspace --all-targets --all-features --verbose
 
-      - name: Test
-        run: cargo test --verbose
+      # Run the full behavior suite with every feature enabled, in normal PR CI
+      # (not deferred to the release workflow), so feature-specific regressions
+      # are caught before merge.
+      - name: Test (all features)
+        run: cargo test --workspace --all-features --verbose
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    # `-D warnings` is a lint gate for stable; the MSRV job only needs to prove
+    # the workspace still *compiles* on the advertised minimum compiler, so
+    # don't fail it on benign lint differences between 1.88 and stable.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+
+      # Verify the advertised `rust-version = "1.88"` compatibility promise: a
+      # change that accidentally uses a newer language/std feature fails here
+      # even though it compiles on current stable. 1.88 is the real floor of the
+      # dependency tree: edition-2024 crates (zeroize/hashbrown/indexmap/...)
+      # need 1.85+, the icu/idna chain needs 1.86, and redis 1.3.0 needs 1.88.
+      - name: Check on MSRV (all features)
+        run: cargo check --workspace --all-targets --all-features --verbose

@@ -149,5 +149,5 @@ pub use sampling::{
 };
 pub use tool::{McpApprovalMode, McpStdioTool, McpStreamableHttpTool, McpWebsocketTool};
 pub use transport::{
-    McpStdioTransport, McpStreamableHttpTransport, McpTransport, McpWebsocketTransport,
+    McpStdioTransport, McpStreamableHttpTransport, McpTransport, McpWebsocketTransport, StdioEnv,
 };

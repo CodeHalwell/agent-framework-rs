@@ -200,37 +200,46 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
         // Live streaming: drive `run_stream` and frame each update as OpenAI
         // Responses SSE events (one `response.output_text.delta` per update)
         // as they arrive, then a final `response.completed`.
+        // Bounded channel: a slow client applies backpressure and a
+        // disconnected client cancels the run (see `crate::sse`).
         let agent = agent.agent.clone();
-        let (tx, rx) = futures::channel::mpsc::unbounded::<Value>();
+        let (tx, rx) = crate::sse::bounded_sse_channel();
+        let disconnect = tx.clone();
         tokio::spawn(async move {
-            let mut framing = AgentStreamFraming::new(model, input_len);
-            for ev in framing.preamble() {
-                let _ = tx.unbounded_send(ev);
-            }
-            match agent.run_stream(messages, None, None).await {
-                Ok(mut stream) => {
-                    let mut had_error = false;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(update) => {
-                                for ev in framing.push_update(&update) {
-                                    let _ = tx.unbounded_send(ev);
+            let produce = async move {
+                let mut framing = AgentStreamFraming::new(model, input_len);
+                for ev in framing.preamble() {
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+                match agent.run_stream(messages, None, None).await {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.next().await {
+                            match item {
+                                Ok(update) => {
+                                    for ev in framing.push_update(&update) {
+                                        if tx.send(ev).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(framing.error_event(&e.to_string())).await;
+                                    return;
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.unbounded_send(framing.error_event(&e.to_string()));
-                                had_error = true;
-                                break;
-                            }
                         }
+                        let _ = tx.send(framing.completed()).await;
                     }
-                    if !had_error {
-                        let _ = tx.unbounded_send(framing.completed());
+                    Err(e) => {
+                        let _ = tx.send(framing.error_event(&e.to_string())).await;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.unbounded_send(framing.error_event(&e.to_string()));
-                }
+            };
+            tokio::select! {
+                _ = disconnect.closed() => {}
+                _ = produce => {}
             }
         });
         sse_response_stream(rx)

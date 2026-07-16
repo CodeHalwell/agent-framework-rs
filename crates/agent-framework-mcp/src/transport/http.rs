@@ -3,7 +3,6 @@
 //! response) or a `text/event-stream` body (SSE frames scanned for the
 //! response whose `id` matches the request).
 
-use std::collections::HashSet;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -209,42 +208,58 @@ fn extract_json_response(value: &Value, expected_id: i64) -> Result<Value> {
 
 impl McpStreamableHttpTransport {
     /// Incrementally read a `text/event-stream` response body, returning as
-    /// soon as the JSON-RPC response matching `expected_id` is seen. Re-scans
-    /// the accumulated buffer via [`parse_sse_buffer`] as each chunk
-    /// arrives — simple and plenty fast for the small, infrequent bodies
-    /// MCP responses produce. Any server-initiated request seen along the
-    /// way is dispatched via [`Self::dispatch_buffered_server_requests`], and
-    /// any notification (e.g. `notifications/tools/list_changed`) via
-    /// [`Self::dispatch_buffered_notifications`]; both are deduplicated so a
-    /// message appearing in an earlier, still-buffered scan is only ever
-    /// dispatched once.
+    /// soon as the JSON-RPC response matching `expected_id` is seen.
     ///
-    /// Dispatch always runs against the latest buffer content *before* the
-    /// "did we find our answer yet" check on each iteration — including the
-    /// answer's own chunk — so a server-initiated message landing in the
-    /// same chunk as the expected response is not skipped just because that
-    /// chunk also happens to satisfy the early return.
+    /// Uses an [`SseDecoder`] that frames events on any SSE line-delimiter
+    /// (`\n\n`, `\r\n\r\n`, or `\r\r`), emits each complete event exactly once,
+    /// and drains consumed bytes so the working buffer stays small (no
+    /// full-buffer rescans, no unbounded growth, and hard caps on event/total
+    /// size). Every event is dispatched exactly once as it completes, so no
+    /// separate dedup bookkeeping is needed.
+    ///
+    /// All events produced by a single chunk are processed *before* returning,
+    /// so a server-initiated request or notification landing in the same chunk
+    /// as the expected response is still dispatched — the response is only
+    /// returned after that chunk's events have all been handled.
     async fn read_sse_for_id(&self, resp: reqwest::Response, expected_id: i64) -> Result<Value> {
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
         let mut utf8 = Utf8StreamDecoder::new();
-        let mut handled_server_request_ids: HashSet<String> = HashSet::new();
-        let mut handled_notifications: HashSet<usize> = HashSet::new();
+        let mut decoder = SseDecoder::new();
         loop {
             match stream.next().await {
                 Some(Ok(bytes)) => {
                     let decoded = utf8.push(&bytes);
-                    buf.push_str(&decoded);
+                    // Process every event this chunk completed, dispatching
+                    // server-requests/notifications, and remember the first
+                    // matching response — but keep processing the rest of the
+                    // chunk's events before returning it.
+                    let mut answer: Option<Result<Value>> = None;
+                    for event_text in decoder.push(&decoded)? {
+                        if let Some(result) =
+                            self.classify_sse_event(&event_text, expected_id).await
+                        {
+                            if answer.is_none() {
+                                answer = Some(result);
+                            }
+                        }
+                    }
+                    if let Some(result) = answer {
+                        return result;
+                    }
                 }
                 Some(Err(e)) => return Err(Error::service(format!("MCP SSE stream error: {e}"))),
-                None => break,
-            }
-            self.dispatch_buffered_server_requests(&buf, &mut handled_server_request_ids)
-                .await;
-            self.dispatch_buffered_notifications(&buf, &mut handled_notifications)
-                .await;
-            if let Some(result) = parse_sse_buffer(&buf, expected_id) {
-                return result;
+                None => {
+                    // Flush any trailing event not terminated by a final blank
+                    // line (some servers omit it), then stop.
+                    for event_text in decoder.flush() {
+                        if let Some(result) =
+                            self.classify_sse_event(&event_text, expected_id).await
+                        {
+                            return result;
+                        }
+                    }
+                    break;
+                }
             }
         }
         Err(Error::service(format!(
@@ -252,55 +267,34 @@ impl McpStreamableHttpTransport {
         )))
     }
 
-    /// Scan `buf` for server-initiated request events and answer each one
-    /// not already present in `handled` exactly once. `buf` only grows
-    /// during one `read_sse_for_id` call, so `handled` (keyed by the
-    /// request's JSON-RPC id) is what keeps a full-buffer rescan from
-    /// re-dispatching the same request on every new chunk.
-    async fn dispatch_buffered_server_requests(&self, buf: &str, handled: &mut HashSet<String>) {
-        for event_text in buf.split("\n\n") {
-            if event_text.trim().is_empty() {
-                continue;
+    /// Parse one complete SSE event block and route it: dispatch a
+    /// server-initiated request (best-effort follow-up POST) or a notification
+    /// to their handlers, and return `Some(result)` only for the JSON-RPC
+    /// response matching `expected_id`.
+    async fn classify_sse_event(
+        &self,
+        event_text: &str,
+        expected_id: i64,
+    ) -> Option<Result<Value>> {
+        let value = sse_event_json(event_text)?;
+        match protocol::parse_incoming(value) {
+            IncomingMessage::Response { id, result } if id == expected_id => Some(match result {
+                Ok(v) => Ok(v),
+                Err(e) => Err(Error::service(e.to_string())),
+            }),
+            IncomingMessage::Response { .. } => None,
+            IncomingMessage::ServerRequest { id, method, params } => {
+                self.respond_to_server_request(id, method, params).await;
+                None
             }
-            let Some(value) = sse_event_json(event_text) else {
-                continue;
-            };
-            if let IncomingMessage::ServerRequest { id, method, params } =
-                protocol::parse_incoming(value)
-            {
-                if handled.insert(id.to_string()) {
-                    self.respond_to_server_request(id, method, params).await;
+            IncomingMessage::Notification { method, params } => {
+                let handler = self.notification_handler.lock().unwrap().clone();
+                if let Some(handler) = handler {
+                    handler(method, params).await;
                 }
+                None
             }
-        }
-    }
-
-    /// Scan `buf` for notification events (no `id`, e.g.
-    /// `notifications/tools/list_changed`) and dispatch each one not already
-    /// present in `handled` exactly once, to whatever handler
-    /// [`McpTransport::set_notification_handler`] installed. `handled` is
-    /// keyed by the event's split index — stable because `buf` only grows
-    /// during one `read_sse_for_id` call — since notifications carry no id;
-    /// keying by index (not raw text) keeps two byte-identical notifications
-    /// distinct and avoids per-rescan string allocations.
-    async fn dispatch_buffered_notifications(&self, buf: &str, handled: &mut HashSet<usize>) {
-        for (idx, event_text) in buf.split("\n\n").enumerate() {
-            if event_text.trim().is_empty() {
-                continue;
-            }
-            let Some(value) = sse_event_json(event_text) else {
-                continue;
-            };
-            if let IncomingMessage::Notification { method, params } =
-                protocol::parse_incoming(value)
-            {
-                if handled.insert(idx) {
-                    let handler = self.notification_handler.lock().unwrap().clone();
-                    if let Some(handler) = handler {
-                        handler(method, params).await;
-                    }
-                }
-            }
+            IncomingMessage::Malformed(_) => None,
         }
     }
 
@@ -342,20 +336,110 @@ impl McpStreamableHttpTransport {
     }
 }
 
-/// Parse a buffer of `text/event-stream` bytes (one or more `\n\n`-separated
-/// events) for the JSON-RPC response matching `expected_id`. Pure/sync, so it
-/// doubles as the incremental scanner above and as something unit-testable
-/// against fixture strings without any I/O.
-pub(crate) fn parse_sse_buffer(buf: &str, expected_id: i64) -> Option<Result<Value>> {
-    for event_text in buf.split("\n\n") {
-        if event_text.trim().is_empty() {
-            continue;
-        }
-        if let Some(result) = extract_sse_event(event_text, expected_id) {
-            return Some(result);
+/// Default cap on the working (undelimited) buffer: a single event that never
+/// completes must not grow without bound.
+const DEFAULT_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Default cap on the total decoded bytes for one response body, so a
+/// long-lived / adversarial stream cannot exhaust memory.
+const DEFAULT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// An incremental `text/event-stream` decoder.
+///
+/// Frames events on any SSE line-delimiter — `\n\n`, `\r\n\r\n`, or `\r\r` —
+/// (fixing the previous `split("\n\n")`-only framing that dropped CRLF-framed
+/// events), emits each completed event exactly once, and **drains** consumed
+/// bytes from the working buffer so it never rescans or accumulates the whole
+/// response (the old approach was near-quadratic on fragmented streams). Total
+/// and per-event byte caps bound memory against slow or hostile servers.
+pub(crate) struct SseDecoder {
+    /// Bytes received but not yet framed into a complete event.
+    buf: String,
+    /// Total decoded bytes seen across the whole response.
+    total_bytes: usize,
+    max_event_bytes: usize,
+    max_total_bytes: usize,
+}
+
+impl SseDecoder {
+    fn new() -> Self {
+        Self::with_limits(DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_TOTAL_BYTES)
+    }
+
+    fn with_limits(max_event_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            buf: String::new(),
+            total_bytes: 0,
+            max_event_bytes,
+            max_total_bytes,
         }
     }
-    None
+
+    /// Push a decoded UTF-8 `chunk`, returning any event blocks it completed
+    /// (the text between delimiters, delimiters removed), drained from the
+    /// buffer. Errors if the total, or a single event (completed *or* still
+    /// un-terminated), exceeds the configured caps.
+    fn push(&mut self, chunk: &str) -> Result<Vec<String>> {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.total_bytes > self.max_total_bytes {
+            return Err(Error::service(format!(
+                "MCP SSE response exceeded the maximum size ({} bytes)",
+                self.max_total_bytes
+            )));
+        }
+        self.buf.push_str(chunk);
+        let mut events = Vec::new();
+        while let Some((idx, len)) = find_delimiter(&self.buf) {
+            // Enforce the per-event cap *before* allocating/draining, so a
+            // single complete-but-oversized event (under the total cap) can't
+            // slip past the limit by being consumed first.
+            if idx > self.max_event_bytes {
+                return Err(Error::service(format!(
+                    "MCP SSE event exceeded the maximum size ({} bytes)",
+                    self.max_event_bytes
+                )));
+            }
+            let event: String = self.buf[..idx].to_string();
+            // Drop the event text and its delimiter from the front of the
+            // buffer so we never rescan already-consumed bytes.
+            self.buf.drain(..idx + len);
+            events.push(event);
+        }
+        // Also bound an in-progress event that has not yet seen its delimiter.
+        if self.buf.len() > self.max_event_bytes {
+            return Err(Error::service(format!(
+                "MCP SSE event exceeded the maximum size ({} bytes)",
+                self.max_event_bytes
+            )));
+        }
+        Ok(events)
+    }
+
+    /// Return any trailing buffered event not terminated by a final blank line,
+    /// draining the buffer. Called once at end-of-stream.
+    fn flush(&mut self) -> Vec<String> {
+        if self.buf.trim().is_empty() {
+            self.buf.clear();
+            return Vec::new();
+        }
+        vec![std::mem::take(&mut self.buf)]
+    }
+}
+
+/// Find the earliest SSE event delimiter in `buf`, returning its byte offset
+/// and length. Recognizes `\r\n\r\n` (4), `\n\n` (2), and `\r\r` (2). The three
+/// patterns never begin at the same offset (their first bytes differ where they
+/// could collide), so the smallest start offset is unambiguous.
+fn find_delimiter(buf: &str) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (pat, len) in [("\r\n\r\n", 4usize), ("\n\n", 2), ("\r\r", 2)] {
+        if let Some(idx) = buf.find(pat) {
+            best = match best {
+                Some((b, _)) if b <= idx => best,
+                _ => Some((idx, len)),
+            };
+        }
+    }
+    best
 }
 
 /// Join an SSE event block's `data:` line(s) (per the SSE spec) and parse
@@ -387,36 +471,6 @@ fn sse_event_json(event_text: &str) -> Option<Value> {
     }
 }
 
-/// Parse one SSE event block as a JSON-RPC message; returns `Some` only if
-/// it is the response matching `expected_id`. A server-initiated request is
-/// logged here (this function has no way to answer it — see
-/// [`McpStreamableHttpTransport::dispatch_buffered_server_requests`], which
-/// scans the same buffer separately for those).
-fn extract_sse_event(event_text: &str, expected_id: i64) -> Option<Result<Value>> {
-    let value = sse_event_json(event_text)?;
-    match protocol::parse_incoming(value) {
-        IncomingMessage::Response { id, result } if id == expected_id => Some(match result {
-            Ok(v) => Ok(v),
-            Err(e) => Err(Error::service(e.to_string())),
-        }),
-        IncomingMessage::Response { .. } => None,
-        IncomingMessage::Notification { method, params } => {
-            tracing::debug!(method = %method, params = %params, "MCP SSE: server notification");
-            None
-        }
-        IncomingMessage::ServerRequest { id, method, .. } => {
-            tracing::debug!(
-                id = %id,
-                method = %method,
-                "MCP SSE: server-initiated request seen while scanning for a response; \
-                 handled separately via dispatch_buffered_server_requests"
-            );
-            None
-        }
-        IncomingMessage::Malformed(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,85 +497,180 @@ mod tests {
         assert!(err.to_string().contains("bad params"));
     }
 
-    #[tokio::test]
-    async fn identical_notifications_each_dispatch_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+    // -- Incremental SSE decoder ----------------------------------------
 
-        let transport =
-            McpStreamableHttpTransport::new("http://localhost:0/mcp", HeaderMap::new(), None);
-        let count = Arc::new(AtomicUsize::new(0));
-        let seen = count.clone();
-        transport.set_notification_handler(Arc::new(move |_method, _params| {
-            let seen = seen.clone();
-            Box::pin(async move {
-                seen.fetch_add(1, Ordering::SeqCst);
-            })
-        }));
+    /// Feed `chunks` through a fresh decoder and collect every event it emits
+    /// (including any trailing event surfaced by `flush`).
+    fn decode_events(chunks: &[&str]) -> Vec<String> {
+        let mut decoder = SseDecoder::new();
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(decoder.push(c).expect("decode chunk"));
+        }
+        out.extend(decoder.flush());
+        out
+    }
 
-        // Two byte-identical notification events: index-keyed dedup must
-        // dispatch BOTH (text-keyed dedup would collapse them into one),
-        // while a rescan of the same grown buffer must not re-dispatch.
-        let notif = concat!(
-            "event: message\n",
-            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
-            "\n",
-        );
-        let buf = format!("{notif}{notif}");
-        let mut handled = HashSet::new();
-        transport
-            .dispatch_buffered_notifications(&buf, &mut handled)
-            .await;
-        assert_eq!(count.load(Ordering::SeqCst), 2);
-        transport
-            .dispatch_buffered_notifications(&buf, &mut handled)
-            .await;
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            2,
-            "a rescan must not re-dispatch already-handled events"
-        );
+    /// Find the JSON-RPC response matching `expected_id` among decoded events.
+    fn find_response(events: &[String], expected_id: i64) -> Option<Result<Value>> {
+        for e in events {
+            let Some(value) = sse_event_json(e) else {
+                continue;
+            };
+            if let IncomingMessage::Response { id, result } = protocol::parse_incoming(value) {
+                if id == expected_id {
+                    return Some(result.map_err(|e| Error::service(e.to_string())));
+                }
+            }
+        }
+        None
     }
 
     #[test]
-    fn sse_buffer_finds_response_after_a_notification() {
-        let buf = concat!(
+    fn decoder_finds_response_after_a_notification() {
+        let events = decode_events(&[concat!(
             "event: message\n",
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\"}}\n",
             "\n",
             "event: message\n",
             "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}\n",
             "\n",
-        );
-        let result = parse_sse_buffer(buf, 5)
+        )]);
+        let result = find_response(&events, 5)
             .expect("should find response")
             .unwrap();
         assert_eq!(result, json!({"ok": true}));
     }
 
     #[test]
-    fn sse_buffer_handles_multiline_data_fields() {
-        // Per the SSE spec, multiple `data:` lines in one event are joined with `\n`.
-        let buf = "data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":9,\"result\":{}}\n\n";
-        let result = parse_sse_buffer(buf, 9)
+    fn decoder_handles_crlf_framing() {
+        // A stream framed with `\r\n\r\n` must split into separate events (the
+        // old `split("\n\n")` framing missed this entirely).
+        let events = decode_events(&[concat!(
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\r\n",
+            "\r\n",
+            "event: message\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\r\n",
+            "\r\n",
+        )]);
+        assert_eq!(events.len(), 2, "CRLF-framed events must split: {events:?}");
+        let result = find_response(&events, 7)
             .expect("should find response")
             .unwrap();
-        assert_eq!(result, json!({}));
+        assert_eq!(result, json!({"ok": true}));
     }
 
     #[test]
-    fn sse_buffer_returns_none_when_id_never_appears() {
-        let buf = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
-        assert!(parse_sse_buffer(buf, 999).is_none());
+    fn decoder_handles_bare_cr_framing() {
+        let events = decode_events(&["data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\r\r"]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(find_response(&events, 1).unwrap().unwrap(), json!({}));
     }
 
     #[test]
-    fn sse_buffer_surfaces_error_response() {
-        let buf =
-            "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-1,\"message\":\"nope\"}}\n\n";
-        let result = parse_sse_buffer(buf, 4).expect("should find response");
-        let err = result.unwrap_err();
+    fn decoder_handles_delimiter_split_across_chunks() {
+        // The `\r\n\r\n` delimiter arrives split across two network chunks.
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder
+            .push("data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\r\n")
+            .unwrap();
+        assert!(events.is_empty(), "event not complete until delimiter seen");
+        events.extend(decoder.push("\r\ntrailing").unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(find_response(&events, 3).unwrap().unwrap(), json!({}));
+    }
+
+    #[test]
+    fn decoder_skips_comments_and_reads_multiline_data() {
+        // A leading comment line (starts with ':') is ignored; multiple `data:`
+        // lines in one event are joined with `\n`.
+        let events = decode_events(&[
+            ": this is a comment\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":9,\"result\":{}}\n\n",
+        ]);
+        assert_eq!(find_response(&events, 9).unwrap().unwrap(), json!({}));
+    }
+
+    #[test]
+    fn decoder_finds_response_even_with_an_interleaved_server_request() {
+        let events = decode_events(&[concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        )]);
+        let result = find_response(&events, 1)
+            .expect("should find response")
+            .unwrap();
+        assert_eq!(result, json!({"ok": true}));
+    }
+
+    #[test]
+    fn decoder_surfaces_error_response() {
+        let events = decode_events(&[
+            "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-1,\"message\":\"nope\"}}\n\n",
+        ]);
+        let err = find_response(&events, 4)
+            .expect("should find response")
+            .unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn decoder_returns_none_when_id_never_appears() {
+        let events = decode_events(&["data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"]);
+        assert!(find_response(&events, 999).is_none());
+    }
+
+    #[test]
+    fn decoder_drains_consumed_bytes() {
+        // After emitting an event, the working buffer must not retain it (so a
+        // long stream never grows without bound / rescans).
+        let mut decoder = SseDecoder::new();
+        let _ = decoder
+            .push("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n")
+            .unwrap();
+        assert!(
+            decoder.buf.is_empty(),
+            "buffer must be drained after an event"
+        );
+    }
+
+    #[test]
+    fn decoder_enforces_total_size_cap() {
+        let mut decoder = SseDecoder::with_limits(1024, 16);
+        let err = decoder
+            .push("data: aaaaaaaaaaaaaaaaaaaaaaaa\n\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("maximum size"), "{err}");
+    }
+
+    #[test]
+    fn decoder_enforces_per_event_size_cap() {
+        // A single event that never terminates must not grow past the cap.
+        let mut decoder = SseDecoder::with_limits(8, 1024);
+        let err = decoder
+            .push("data: never-ending event with no delimiter")
+            .unwrap_err();
+        assert!(err.to_string().contains("event exceeded"), "{err}");
+    }
+
+    #[test]
+    fn decoder_enforces_per_event_cap_on_completed_event() {
+        // A *complete* (delimiter-terminated) event larger than the per-event
+        // cap but under the total cap must be rejected before it is drained,
+        // not consumed and slipped past the limit.
+        let mut decoder = SseDecoder::with_limits(8, 4096);
+        let err = decoder
+            .push("data: this complete event is far longer than eight bytes\n\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("event exceeded"), "{err}");
+    }
+
+    #[test]
+    fn find_delimiter_prefers_earliest_delimiter() {
+        assert_eq!(find_delimiter("ab\r\n\r\ncd"), Some((2, 4)));
+        assert_eq!(find_delimiter("ab\n\ncd"), Some((2, 2)));
+        assert_eq!(find_delimiter("ab\r\rcd"), Some((2, 2)));
+        assert_eq!(find_delimiter("no delimiter here"), None);
     }
 
     #[test]
@@ -568,52 +717,5 @@ mod tests {
     #[test]
     fn sse_event_json_returns_none_for_non_data_event() {
         assert!(sse_event_json("event: ping\nretry: 1000").is_none());
-    }
-
-    #[test]
-    fn extract_sse_event_ignores_server_initiated_requests() {
-        // `extract_sse_event` only ever resolves the expected *response*; a
-        // server-initiated request frame is logged and skipped here (real
-        // dispatch happens via `dispatch_buffered_server_requests`, scanning
-        // the same buffer separately).
-        let event = "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}";
-        assert!(extract_sse_event(event, 1).is_none());
-    }
-
-    #[test]
-    fn parse_sse_buffer_finds_response_even_with_an_interleaved_server_request() {
-        let buf = concat!(
-            "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n",
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
-        );
-        let result = parse_sse_buffer(buf, 1)
-            .expect("should find response")
-            .unwrap();
-        assert_eq!(result, json!({"ok": true}));
-    }
-
-    #[tokio::test]
-    async fn dispatch_buffered_server_requests_answers_once_and_dedupes_on_rescan() {
-        let transport = McpStreamableHttpTransport::new(
-            "http://127.0.0.1:0/unused".to_string(),
-            Default::default(),
-            None,
-        );
-        let buf = "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n";
-        let mut handled = HashSet::new();
-        // No live server behind this transport's URL, so `respond_to_server_request`'s
-        // best-effort POST will fail — that failure is swallowed, which is
-        // exactly the point: this only asserts dedup bookkeeping.
-        transport
-            .dispatch_buffered_server_requests(buf, &mut handled)
-            .await;
-        assert_eq!(handled.len(), 1);
-        // Re-scanning the same (unchanged) buffer must not add a duplicate
-        // dispatch — the HashSet-based bookkeeping the whole point of this
-        // test.
-        transport
-            .dispatch_buffered_server_requests(buf, &mut handled)
-            .await;
-        assert_eq!(handled.len(), 1);
     }
 }

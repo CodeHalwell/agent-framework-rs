@@ -276,25 +276,18 @@ impl AgentHost {
     /// [`AgentHost::into_secure_router`] for a secure-by-default router — to
     /// have the corresponding middleware applied here.
     pub fn into_router(self) -> axum::Router {
-        let bearer_token = self.bearer_token.clone();
-        let allowed_hosts = self.allowed_hosts.clone();
-        let mut router = crate::devui::router(self.into_state());
-
-        // Layers apply outermost-last-added-first; auth after the host guard
-        // so a rebinding attempt is rejected before token comparison.
-        if let Some(token) = bearer_token {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                crate::security::BearerToken::new(token),
-                crate::security::bearer_auth,
-            ));
+        let mut security = crate::security::HostingSecurity::new();
+        if let Some(token) = self.bearer_token.clone() {
+            security = security.with_bearer_token(token);
         }
-        if let Some(hosts) = allowed_hosts {
-            router = router.layer(axum::middleware::from_fn_with_state(
-                crate::security::AllowedHosts::new(hosts),
-                crate::security::host_guard,
-            ));
+        if let Some(hosts) = self.allowed_hosts.clone() {
+            security = security.with_allowed_hosts(hosts);
         }
-        router
+        // NOTE: this guards only the DevUI routes built here. To secure a
+        // multi-surface app (merged/nested OpenAI/A2A/AG-UI routers), apply
+        // [`crate::security::HostingSecurity`] to the final composed router
+        // instead — see that type's docs.
+        security.apply(crate::devui::router(self.into_state()))
     }
 
     /// [`AgentHost::into_router`], but secure by default: if

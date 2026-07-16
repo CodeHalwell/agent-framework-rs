@@ -761,7 +761,7 @@ impl WorkflowRun {
             let deliveries = std::mem::take(&mut self.queue);
             let mut by_target: HashMap<String, Vec<WorkflowMessage>> = HashMap::new();
             for msg in deliveries {
-                for target in self.resolve_targets(&msg).await {
+                for target in self.resolve_targets(&msg).await? {
                     by_target.entry(target).or_default().push(msg.clone());
                 }
             }
@@ -1100,10 +1100,20 @@ impl WorkflowRun {
     ///
     /// Awaits each matching group's condition/selection (see
     /// `UPSTREAM_DRIFT.md` §10 — upstream's `Edge.should_route` is async).
-    async fn resolve_targets(&self, msg: &WorkflowMessage) -> Vec<String> {
-        // Explicit target wins (direct sends and routed responses).
+    async fn resolve_targets(&self, msg: &WorkflowMessage) -> Result<Vec<String>> {
+        // Explicit target wins (direct sends and routed responses). An explicit
+        // target that names no registered executor is a routing error, not a
+        // silent drop: without this check the message would be quietly discarded
+        // (the planning loop's `executors.get(...)` miss) and the run would still
+        // report `Idle`, masking a typo'd `send_to` target.
         if let Some(t) = &msg.target_id {
-            return vec![t.clone()];
+            if !self.shared.executors.contains_key(t) {
+                return Err(Error::Workflow(format!(
+                    "executor '{}' sent a message to unknown target executor '{}'",
+                    msg.source_id, t
+                )));
+            }
+            return Ok(vec![t.clone()]);
         }
         let mut targets = Vec::new();
         for group in &self.shared.edge_groups {
@@ -1136,7 +1146,7 @@ impl WorkflowRun {
                 _ => {}
             }
         }
-        targets
+        Ok(targets)
     }
 
     /// If `target` is the sink of a fan-in group, return its source ids.
@@ -1227,6 +1237,7 @@ mod async_condition_tests {
 
     use super::*;
     use crate::workflow::executor::FunctionExecutor;
+    use futures::StreamExt;
     use serde_json::json;
 
     /// An executor that immediately yields whatever message it receives as a
@@ -1319,5 +1330,61 @@ mod async_condition_tests {
 
         let run = workflow.run(json!("stop")).await.unwrap();
         assert_eq!(run.outputs(), vec![json!("stop")]);
+    }
+
+    #[tokio::test]
+    async fn send_to_unknown_target_fails_the_run() {
+        // A dynamic `send_to` naming an executor that does not exist must fail
+        // the run loudly rather than silently dropping the message and reporting
+        // a clean `Idle` completion.
+        let start = Arc::new(FunctionExecutor::new("start", |_msg, ctx| async move {
+            ctx.send_to("ghost", json!("payload")).await
+        }));
+        let workflow = WorkflowBuilder::new()
+            .add_executor(start)
+            .add_executor(echo("sink"))
+            .set_start("start")
+            .add_edge("start", "sink")
+            .build()
+            .unwrap();
+
+        let err = match workflow.run(json!("input")).await {
+            Ok(_) => panic!("expected the run to fail on an unknown send_to target"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost"),
+            "error should name the unknown target executor: {msg}"
+        );
+        assert!(
+            msg.contains("start"),
+            "error should name the source executor: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_unknown_target_emits_failed_event() {
+        // The failing routing must surface as a terminal `Failed` event on the
+        // event stream, not just a returned `Err`.
+        let start = Arc::new(FunctionExecutor::new("start", |_msg, ctx| async move {
+            ctx.send_to("ghost", json!("payload")).await
+        }));
+        let workflow = WorkflowBuilder::new()
+            .add_executor(start)
+            .add_executor(echo("sink"))
+            .set_start("start")
+            .add_edge("start", "sink")
+            .build()
+            .unwrap();
+
+        let stream = workflow.run_stream(json!("input"));
+        let events: Vec<WorkflowEvent> = stream.collect().await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::Failed { error } if error.contains("ghost"))),
+            "expected a Failed event naming the unknown target, got {events:?}"
+        );
     }
 }

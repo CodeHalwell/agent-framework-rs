@@ -14,6 +14,7 @@ description = "Host agents over HTTP: OpenAI-compatible, A2A, and DevUI-style AP
 [dependencies]
 agent-framework-core = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

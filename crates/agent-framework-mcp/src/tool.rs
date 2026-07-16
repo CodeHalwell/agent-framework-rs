@@ -35,7 +35,9 @@ use crate::protocol::{
     normalize_mcp_name, role_and_content_to_chat_message, PromptDescriptor, ToolDescriptor,
 };
 use crate::sampling::{Root, SamplingHandler};
-use crate::transport::{McpStdioTransport, McpStreamableHttpTransport, McpWebsocketTransport};
+use crate::transport::{
+    McpStdioTransport, McpStreamableHttpTransport, McpWebsocketTransport, StdioEnv,
+};
 
 /// The `clientInfo.name` this crate sends during `initialize`.
 const CLIENT_NAME: &str = "agent-framework-rs";
@@ -236,6 +238,12 @@ pub struct McpStdioTool {
     command: String,
     args: Vec<String>,
     env: Option<HashMap<String, String>>,
+    /// Inherit the full parent process environment (default `false`, i.e. the
+    /// child sees only a minimal baseline plus [`Self::env`]). See [`StdioEnv`].
+    inherit_parent_env: bool,
+    /// Named parent variables to pass through to the child by value when not
+    /// inheriting the whole parent environment.
+    inherit_env_vars: Vec<String>,
     cwd: Option<PathBuf>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
@@ -257,6 +265,8 @@ impl McpStdioTool {
             command: command.into(),
             args: Vec::new(),
             env: None,
+            inherit_parent_env: false,
+            inherit_env_vars: Vec::new(),
             cwd: None,
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
@@ -279,8 +289,14 @@ impl McpStdioTool {
         self
     }
 
-    /// Add environment variables for the server process (on top of the
-    /// inherited parent environment).
+    /// Add environment variables for the server process.
+    ///
+    /// **Secure by default:** the child does *not* inherit the parent process
+    /// environment unless [`Self::inherit_parent_environment`] is enabled — it
+    /// sees only a minimal baseline (PATH, temp-dir, locale) plus these
+    /// explicit variables. This keeps host secrets (API keys, cloud
+    /// credentials, tokens) from being disclosed to the MCP server. To pass a
+    /// specific parent variable through, use [`Self::inherit_env_var`].
     pub fn env<I, K, V>(mut self, env: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -288,6 +304,33 @@ impl McpStdioTool {
         V: Into<String>,
     {
         self.env = Some(env.into_iter().map(|(k, v)| (k.into(), v.into())).collect());
+        self
+    }
+
+    /// Inherit the **full** parent process environment (default `false`).
+    ///
+    /// Convenient but re-exposes every host secret to the server; prefer
+    /// [`Self::inherit_env_var`] for the specific variables the server needs.
+    pub fn inherit_parent_environment(mut self, inherit: bool) -> Self {
+        self.inherit_parent_env = inherit;
+        self
+    }
+
+    /// Pass a single named parent environment variable through to the child by
+    /// value (opt-in; ignored when [`Self::inherit_parent_environment`] is on).
+    pub fn inherit_env_var(mut self, name: impl Into<String>) -> Self {
+        self.inherit_env_vars.push(name.into());
+        self
+    }
+
+    /// Pass several named parent environment variables through to the child.
+    pub fn inherit_env_vars<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inherit_env_vars
+            .extend(names.into_iter().map(Into::into));
         self
     }
 
@@ -375,10 +418,16 @@ impl McpStdioTool {
     pub async fn connect(&self) -> Result<()> {
         self.session
             .get_or_try_init(|| async {
+                let mut stdio_env = StdioEnv::new()
+                    .inherit_parent_environment(self.inherit_parent_env)
+                    .inherit_vars(self.inherit_env_vars.clone());
+                if let Some(vars) = &self.env {
+                    stdio_env = stdio_env.vars(vars.clone());
+                }
                 let mut transport = McpStdioTransport::spawn(
                     &self.command,
                     &self.args,
-                    self.env.as_ref(),
+                    &stdio_env,
                     self.cwd.as_deref(),
                 )
                 .await?;
