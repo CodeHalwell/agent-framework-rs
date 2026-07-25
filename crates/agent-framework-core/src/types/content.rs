@@ -122,6 +122,15 @@ pub struct TextContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotations: Option<Vec<Annotation>>,
+    /// Provider-specific extras carried alongside this content item.
+    ///
+    /// Mirrors upstream's `Content.additional_properties`. Providers read
+    /// well-known keys off it when building a request part — OpenAI reads
+    /// `detail` on an image and `prompt_cache_breakpoint` on any cacheable
+    /// part. Unknown keys are inert: they are round-tripped, never forwarded
+    /// blindly to a provider.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub additional_properties: HashMap<String, Value>,
 }
 
 impl TextContent {
@@ -129,6 +138,7 @@ impl TextContent {
         Self {
             text: text.into(),
             annotations: None,
+            additional_properties: HashMap::new(),
         }
     }
 }
@@ -159,11 +169,20 @@ pub struct TextReasoningContent {
 }
 
 /// Inline binary data encoded as a `data:` URI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DataContent {
     pub uri: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub media_type: Option<String>,
+    /// Provider-specific extras carried alongside this content item.
+    ///
+    /// Mirrors upstream's `Content.additional_properties`. Providers read
+    /// well-known keys off it when building a request part — OpenAI reads
+    /// `detail` on an image and `prompt_cache_breakpoint` on any cacheable
+    /// part. Unknown keys are inert: they are round-tripped, never forwarded
+    /// blindly to a provider.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub additional_properties: HashMap<String, Value>,
 }
 
 impl DataContent {
@@ -175,15 +194,25 @@ impl DataContent {
         Self {
             uri,
             media_type: Some(media_type),
+            additional_properties: HashMap::new(),
         }
     }
 }
 
 /// A reference to a remote resource by URI (not inline data).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UriContent {
     pub uri: String,
     pub media_type: String,
+    /// Provider-specific extras carried alongside this content item.
+    ///
+    /// Mirrors upstream's `Content.additional_properties`. Providers read
+    /// well-known keys off it when building a request part — OpenAI reads
+    /// `detail` on an image and `prompt_cache_breakpoint` on any cacheable
+    /// part. Unknown keys are inert: they are round-tripped, never forwarded
+    /// blindly to a provider.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub additional_properties: HashMap<String, Value>,
 }
 
 /// A non-fatal error surfaced as content.
@@ -531,7 +560,27 @@ impl Content {
         Content::Text(TextContent::new(text))
     }
 
-    /// The text of this item, if it is text or reasoning content.
+    /// The text of this item **only if it is user-facing text**, excluding
+    /// reasoning.
+    ///
+    /// This is the accessor every `.text()` on a message, response or update
+    /// uses, matching upstream's `content.type == "text"` filter. Use
+    /// [`Content::as_text`] instead when reasoning should count too — token
+    /// accounting, for instance.
+    pub fn as_plain_text(&self) -> Option<&str> {
+        match self {
+            Content::Text(t) => Some(&t.text),
+            _ => None,
+        }
+    }
+
+    /// The text of this item, if it is text **or reasoning** content.
+    ///
+    /// Deliberately inclusive: this backs size/token accounting, where a
+    /// reasoning block costs real tokens and upstream likewise serializes every
+    /// content item before counting. For anything user-facing — `.text()`,
+    /// structured-output parsing — use [`Content::as_plain_text`], or a model's
+    /// chain-of-thought ends up concatenated into its answer.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Content::Text(t) => Some(&t.text),

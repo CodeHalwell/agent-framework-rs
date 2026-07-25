@@ -610,6 +610,7 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                 out.push(Content::Text(TextContent {
                     text: text.to_string(),
                     annotations: parse_citations(block),
+                    ..Default::default()
                 }));
             }
             "tool_use" | "mcp_tool_use" | "server_tool_use" => {
@@ -1017,6 +1018,7 @@ mod tests {
         let uc = UriContent {
             uri: "https://example.com/cat.png".into(),
             media_type: "image/png".into(),
+            ..Default::default()
         };
         let msg = Message::with_contents(Role::user(), vec![Content::Uri(uc)]);
         let body = build_request(&[msg], &ChatOptions::new(), "claude-x", 4096, false);

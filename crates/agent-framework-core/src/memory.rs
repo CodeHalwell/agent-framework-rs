@@ -34,6 +34,65 @@ pub struct SessionContext {
     pub tools: Vec<ToolDefinition>,
 }
 
+/// Identifies the provider contributing context messages, for attribution.
+///
+/// Mirrors the `source: str | object` parameter of upstream's
+/// `SessionContext.extend_messages`: a bare id, or an id plus the provider's
+/// type name. Rust has no stable runtime type name for an
+/// `Arc<dyn ContextProvider>`, so a provider that wants `source_type` recorded
+/// supplies it explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextSource {
+    pub source_id: String,
+    pub source_type: Option<String>,
+}
+
+impl ContextSource {
+    pub fn new(source_id: impl Into<String>) -> Self {
+        Self {
+            source_id: source_id.into(),
+            source_type: None,
+        }
+    }
+
+    /// Also record the provider's type name, matching what upstream derives
+    /// from `type(source).__name__`.
+    pub fn with_type(mut self, source_type: impl Into<String>) -> Self {
+        self.source_type = Some(source_type.into());
+        self
+    }
+}
+
+impl From<&str> for ContextSource {
+    fn from(id: &str) -> Self {
+        ContextSource::new(id)
+    }
+}
+
+impl From<String> for ContextSource {
+    fn from(id: String) -> Self {
+        ContextSource::new(id)
+    }
+}
+
+/// The `additional_properties` key attribution is recorded under. Matches
+/// upstream's `_attribution` exactly — it is a cross-language wire contract,
+/// read by downstream context observers.
+pub const ATTRIBUTION_KEY: &str = "_attribution";
+
+/// Return `ids` in first-seen order with duplicates removed. Mirrors upstream's
+/// `_deduplicate_origin_session_ids`.
+fn deduplicate_origin_session_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids {
+        if seen.insert(id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
 impl SessionContext {
     pub fn new(input_messages: Vec<Message>) -> Self {
         Self {
@@ -48,6 +107,92 @@ impl SessionContext {
             Some(existing) => Some(format!("{existing}\n{s}")),
             None => Some(s),
         };
+    }
+
+    /// Add context messages attributed to `source`.
+    ///
+    /// Each message is stamped with an `_attribution` entry in its
+    /// `additional_properties` recording which provider contributed it, then
+    /// appended to [`SessionContext::messages`]. Mirrors upstream's
+    /// `SessionContext.extend_messages`.
+    ///
+    /// Prefer this over pushing onto `messages` directly: an unattributed
+    /// context message is indistinguishable from the user's own input once it
+    /// reaches history.
+    pub fn extend_messages(
+        &mut self,
+        source: impl Into<ContextSource>,
+        messages: impl IntoIterator<Item = Message>,
+    ) {
+        self.extend_messages_from_sessions(source, messages, &[]);
+    }
+
+    /// Add context messages attributed to `source` and to the sessions that
+    /// originally produced them.
+    ///
+    /// `origin_session_ids` is for providers injecting content stored under
+    /// *other* sessions — cross-session memory. The ids describe the
+    /// contributing sessions for the whole call rather than pairing
+    /// positionally with messages, since one composed message can have several
+    /// origins. They surface under
+    /// `additional_properties["_attribution"]["origin_session_ids"]` so
+    /// downstream observers can detect cross-session content for governance or
+    /// audit. Pass an empty slice when content originates in the current
+    /// session: an absent field means no origin information was supplied,
+    /// which is distinct from "originated here" (upstream #7041).
+    pub fn extend_messages_from_sessions(
+        &mut self,
+        source: impl Into<ContextSource>,
+        messages: impl IntoIterator<Item = Message>,
+        origin_session_ids: &[String],
+    ) {
+        let source = source.into();
+        let origins = deduplicate_origin_session_ids(origin_session_ids.iter().map(String::as_str));
+
+        for mut message in messages {
+            let attribution = message
+                .additional_properties
+                .entry(ATTRIBUTION_KEY.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+
+            let Some(map) = attribution.as_object_mut() else {
+                // A non-object `_attribution` is someone else's data; leave it
+                // rather than clobbering it.
+                self.messages.push(message);
+                continue;
+            };
+
+            // Existing keys win — the first provider to attribute a message
+            // owns it, matching upstream's `setdefault`.
+            map.entry("source_id")
+                .or_insert_with(|| serde_json::json!(source.source_id));
+            if let Some(source_type) = &source.source_type {
+                map.entry("source_type")
+                    .or_insert_with(|| serde_json::json!(source_type));
+            }
+            // Origins are the exception: they accumulate across providers, so a
+            // message composed from several sessions lists all of them.
+            if !origins.is_empty() {
+                let existing: Vec<String> = map
+                    .get("origin_session_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let merged = deduplicate_origin_session_ids(
+                    existing
+                        .iter()
+                        .map(String::as_str)
+                        .chain(origins.iter().map(String::as_str)),
+                );
+                map.insert("origin_session_ids".into(), serde_json::json!(merged));
+            }
+
+            self.messages.push(message);
+        }
     }
 }
 
@@ -117,5 +262,118 @@ mod tests {
         assert!(ctx.instructions.is_none());
         assert!(ctx.messages.is_empty());
         assert!(ctx.tools.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::types::Role;
+
+    fn attribution(msg: &Message) -> &serde_json::Value {
+        msg.additional_properties
+            .get(ATTRIBUTION_KEY)
+            .expect("message must carry attribution")
+    }
+
+    fn origins(msg: &Message) -> Vec<String> {
+        attribution(msg)
+            .get("origin_session_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn extend_messages_stamps_the_source_id() {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.extend_messages("rag", [Message::user("recalled")]);
+
+        assert_eq!(ctx.messages.len(), 1);
+        assert_eq!(attribution(&ctx.messages[0])["source_id"], "rag");
+        assert_eq!(ctx.messages[0].role, Role::user());
+    }
+
+    #[test]
+    fn extend_messages_records_source_type_when_supplied() {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.extend_messages(
+            ContextSource::new("rag").with_type("VectorMemoryProvider"),
+            [Message::user("recalled")],
+        );
+
+        let attr = attribution(&ctx.messages[0]);
+        assert_eq!(attr["source_id"], "rag");
+        assert_eq!(attr["source_type"], "VectorMemoryProvider");
+    }
+
+    /// Upstream #7041: content pulled from other sessions is marked with the
+    /// sessions it came from, so an observer can tell cross-session content
+    /// apart from content that originated here.
+    #[test]
+    fn origin_session_ids_are_recorded_and_deduplicated() {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.extend_messages_from_sessions(
+            "cross-session-memory",
+            [Message::user("from elsewhere")],
+            &["sess-a".into(), "sess-b".into(), "sess-a".into()],
+        );
+
+        // First-seen order, no duplicates.
+        assert_eq!(origins(&ctx.messages[0]), vec!["sess-a", "sess-b"]);
+    }
+
+    /// An absent field means "no origin information supplied", which is
+    /// deliberately distinct from "originated in this session".
+    #[test]
+    fn no_origins_leaves_the_field_absent() {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.extend_messages("rag", [Message::user("local")]);
+
+        assert!(attribution(&ctx.messages[0])
+            .get("origin_session_ids")
+            .is_none());
+    }
+
+    /// A message composed from several sessions accumulates every origin, so
+    /// origins merge where the other attribution keys are first-writer-wins.
+    #[test]
+    fn origins_accumulate_while_source_id_is_first_writer_wins() {
+        let mut msg = Message::user("composed");
+        let mut ctx = SessionContext::new(vec![]);
+
+        ctx.extend_messages_from_sessions("first", [msg.clone()], &["sess-a".into()]);
+        msg = ctx.messages.pop().unwrap();
+
+        ctx.extend_messages_from_sessions("second", [msg], &["sess-b".into(), "sess-a".into()]);
+
+        let out = &ctx.messages[0];
+        assert_eq!(
+            attribution(out)["source_id"],
+            "first",
+            "the first provider to attribute a message keeps ownership"
+        );
+        assert_eq!(origins(out), vec!["sess-a", "sess-b"]);
+    }
+
+    /// A pre-existing non-object `_attribution` belongs to someone else and is
+    /// left intact rather than overwritten.
+    #[test]
+    fn non_object_attribution_is_left_untouched() {
+        let mut msg = Message::user("odd");
+        msg.additional_properties
+            .insert(ATTRIBUTION_KEY.into(), serde_json::json!("not-a-map"));
+
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.extend_messages("rag", [msg]);
+
+        assert_eq!(
+            *attribution(&ctx.messages[0]),
+            serde_json::json!("not-a-map")
+        );
     }
 }

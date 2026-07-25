@@ -302,7 +302,10 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                     } else {
                         "input_text"
                     };
-                    buffered.push(json!({ "type": text_type, "text": t.text }));
+                    buffered.push(crate::convert::attach_prompt_cache_breakpoint(
+                        json!({ "type": text_type, "text": t.text }),
+                        &t.additional_properties,
+                    ));
                 }
                 Content::Uri(u) => {
                     if let Some(part) = content_to_input_part(&u.uri, Some(&u.media_type)) {
@@ -765,6 +768,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                                 contents.push(Content::Uri(UriContent {
                                     uri: url.to_string(),
                                     media_type: "image".to_string(),
+                                    ..Default::default()
                                 }));
                             }
                         }
@@ -797,7 +801,11 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                         Some("image/png".to_string()),
                     )
                 };
-                contents.push(Content::Data(DataContent { uri, media_type }));
+                contents.push(Content::Data(DataContent {
+                    uri,
+                    media_type,
+                    ..Default::default()
+                }));
             }
         }
         // An MCP approval request round-trips its `id` as the call id so a
@@ -1950,6 +1958,7 @@ mod tests {
         let msg = user_with(vec![Content::Uri(UriContent {
             uri: "https://example.com/cat.png".into(),
             media_type: "image/png".into(),
+            ..Default::default()
         })]);
         let input = messages_to_input(&[msg]);
         assert_eq!(
@@ -1966,10 +1975,12 @@ mod tests {
             Content::Data(DataContent {
                 uri: "data:audio/wav;base64,QQ".into(),
                 media_type: Some("audio/wav".into()),
+                ..Default::default()
             }),
             Content::Data(DataContent {
                 uri: "data:application/pdf;base64,JV".into(),
                 media_type: Some("application/pdf".into()),
+                ..Default::default()
             }),
             Content::HostedFile(HostedFileContent {
                 file_id: "file-123".into(),

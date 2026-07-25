@@ -33,6 +33,25 @@ follows is every Python-side change that could plausibly touch this port.
 | #7267 `d98ac29` | Approval-replay duplicate check widened from per-message to conversation-wide, excluding already-answered call ids | `core/src/client.rs` — `replace_approval_contents_with_results` |
 | #7105 `3604ba7` | Finish-reason normalization: `incomplete_details` precedence, no reason for non-terminal responses, `response.incomplete` treated as terminal; OTel gated to convention values | `openai/src/responses.rs` (Azure + Foundry inherit by delegation), `core/src/observability.rs` — new `otel_finish_reason` |
 | #7095 `83ba938` | Gemini 3 `thoughtSignature` preserved across function-call replays | `core/src/types/content.rs` — new `TextReasoningContent::protected_data`; `gemini/src/convert.rs` — parse + replay |
+| #7041 `c35a63e` | Cross-session origin attribution on context messages | `core/src/memory.rs` — new `ContextSource`, `SessionContext::extend_messages{,_from_sessions}`, `ATTRIBUTION_KEY` |
+| #7189 `9e836f7` | MCP tool-use sampling results | `mcp/src/sampling.rs` — `sampling_result_content` returns `tool_use` blocks + `stopReason: "toolUse"` |
+| #7163 `6180272` | OpenAI prompt cache breakpoints for GPT-5.6 | `core/src/types/content.rs` — new `additional_properties` on text/data/URI content; `openai/src/convert.rs` — `attach_prompt_cache_breakpoint` + image `detail`; `openai/src/responses.rs` — `input_text` parts |
+
+Two of these needed groundwork the port did not have:
+
+- **#7041** required the attribution model itself. Upstream keys context
+  messages by contributing provider and stamps `_attribution` into each
+  message; this port had a flat, unattributed `SessionContext::messages`.
+  `extend_messages` now stamps `source_id` / `source_type` /
+  `origin_session_ids`, with origins accumulating across providers where the
+  other keys are first-writer-wins.
+- **#7163** required `Content.additional_properties`, absent from every Rust
+  content struct. Adding it to `TextContent` / `DataContent` / `UriContent`
+  (additive, serde-optional) also closed a *pre-existing* gap: OpenAI's image
+  `detail` option, which upstream reads from the same bag and this port
+  silently dropped. The request-wide half of #7163,
+  `prompt_cache_options`, already worked — `ChatOptions::additional_properties`
+  is forwarded verbatim into the body — and now has a test pinning it.
 
 ### Already at parity — verified, no change needed
 
@@ -65,11 +84,8 @@ than rediscovered.
 
 | Upstream | Change | Notes |
 |---|---|---|
-| #7163 `6180272` | OpenAI prompt cache breakpoints for GPT-5.6 (`prompt_cache_options` request option plus a per-content `prompt_cache_breakpoint`) | New feature, not a bug fix. Needs a request-option surface and a content-level annotation |
-| #7189 `9e836f7` | MCP tool-use sampling results | Requires a `ToolUseContent` block in `mcp/src/protocol.rs` before the conversion in `sampling.rs` can return one |
 | #7097 `0df184e` | Sub-workflow checkpoint restore preserving sub-workflow state | Substantial upstream refactor (+604/−245 across the runner, runner context and workflow executor). Wants its own change |
-| #6579 `18b03ea` | Checkpoint encoding handling | Pairs naturally with the sub-workflow checkpoint work above |
-| #7041 `c35a63e` | Cross-session origin attribution on context messages | New capability on sessions + context providers |
+| #6579 `18b03ea` | Checkpoint encoding handling | Largely Python-specific — the upstream change hardens *pickle* decoding, which has no Rust analogue (checkpoints here are serde/JSON). Worth a look alongside the sub-workflow work above to confirm nothing else is in it |
 | #7234 `a70fe21` | Responses conversation-ID helper | Lives in `hosting-responses`, a package with only partial coverage here |
 
 ### Out of scope
@@ -87,17 +103,34 @@ than rediscovered.
 
 ---
 
-## Open finding, not from this window
+## Findings from outside the commit window
+
+Divergences this sync surfaced that predate the 0.1.1 baseline. They are not
+upstream *changes*, so they belong to no commit — but they are real parity
+gaps, and both were fixed here.
+
+### `.text()` included reasoning — fixed
 
 `Content::as_text` matches both `Content::Text` **and**
-`Content::TextReasoning`, so `Message::text()` includes reasoning text.
-Upstream's `Message.text` filters on `content.type == "text"` only. Any
-provider that emits reasoning therefore yields a `text()` in this port that
-concatenates chain-of-thought with the answer.
+`Content::TextReasoning`, so every `.text()` built on it — `Message::text`,
+`ChatResponseUpdate::text_content`, `AgentResponseUpdate::text` — spliced a
+model's chain-of-thought into its own answer. Upstream's five `.text`
+properties all filter on `content.type == "text"`.
 
-This predates the 0.1.1 baseline, so it is not part of this sync. It is
-recorded here because the structured-output fix above sits on the same code
-path and deliberately does *not* rely on `as_text`: `structured_output_text`
-matches `Content::Text` directly. Closing the wider divergence means
-changing `Message::text()`, which also feeds compaction token counts and
-several provider request builders — worth doing, worth doing on its own.
+Fixed by adding `Content::as_plain_text` (text only) and routing every
+`.text()` and `structured_output_text` through it. `as_text` stays inclusive
+and keeps its one remaining caller, `compaction::count_message_tokens` —
+that is the deliberate exception, because a reasoning block costs real tokens
+and upstream likewise serializes *every* content item before counting.
+
+### `Content.additional_properties` was missing — fixed
+
+Upstream's unified `Content` carries an `additional_properties` bag that
+providers read well-known keys from. No Rust content struct had one, so
+per-content provider extras had nowhere to live. Beyond blocking #7163, this
+silently dropped OpenAI's image `detail` option.
+
+Added to `TextContent`, `DataContent` and `UriContent` — the three that carry
+wire-level extras — as `#[serde(default, skip_serializing_if = ...)]`, so
+existing serialized content deserializes unchanged. The remaining content
+variants can gain it if and when a provider needs it.

@@ -625,6 +625,7 @@ fn part_to_content(part: &Part) -> Result<Content> {
             FileData::Uri(u) => Ok(Content::Uri(UriContent {
                 uri: u.uri.clone(),
                 media_type: u.mime_type.clone().unwrap_or_default(),
+                ..Default::default()
             })),
             FileData::Bytes(b) => Ok(Content::Data(DataContent {
                 uri: format!(
@@ -633,6 +634,7 @@ fn part_to_content(part: &Part) -> Result<Content> {
                     b.bytes
                 ),
                 media_type: b.mime_type.clone(),
+                ..Default::default()
             })),
         },
         Part::Data(d) => {
@@ -764,6 +766,7 @@ mod tests {
             vec![Content::Uri(UriContent {
                 uri: "http://example.com/file.pdf".into(),
                 media_type: "application/pdf".into(),
+                ..Default::default()
             })],
         );
         let a2a = chat_message_to_a2a_message(&msg, None, None).unwrap();
@@ -865,6 +868,7 @@ mod tests {
                 Content::Uri(UriContent {
                     uri: "https://example.com/image.png".into(),
                     media_type: "image/png".into(),
+                    ..Default::default()
                 }),
             ],
         );

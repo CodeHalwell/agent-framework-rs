@@ -1,6 +1,8 @@
 //! Conversion between framework types and the OpenAI chat-completions wire
 //! format.
 
+use std::collections::HashMap;
+
 use agent_framework_core::tools::ToolKind;
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
@@ -71,21 +73,36 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
             match content {
                 Content::Text(t) => {
                     text.push_str(&t.text);
-                    parts.push(json!({ "type": "text", "text": t.text }));
+                    parts.push(attach_prompt_cache_breakpoint(
+                        json!({ "type": "text", "text": t.text }),
+                        &t.additional_properties,
+                    ));
                 }
                 Content::FunctionCall(fc) => tool_calls.push(function_call_to_openai(fc)),
                 Content::FunctionResult(fr) => tool_results.push(fr),
                 Content::Uri(u) => {
-                    if let Some(part) = content_part_to_openai(&u.uri, Some(&u.media_type)) {
-                        parts.push(part);
+                    if let Some(part) = content_part_to_openai(
+                        &u.uri,
+                        Some(&u.media_type),
+                        &u.additional_properties,
+                    ) {
+                        parts.push(attach_prompt_cache_breakpoint(
+                            part,
+                            &u.additional_properties,
+                        ));
                         has_media_part = true;
                     }
                 }
                 Content::Data(d) => {
-                    if let Some(part) =
-                        content_part_to_openai(&d.uri, data_content_media_type(d).as_deref())
-                    {
-                        parts.push(part);
+                    if let Some(part) = content_part_to_openai(
+                        &d.uri,
+                        data_content_media_type(d).as_deref(),
+                        &d.additional_properties,
+                    ) {
+                        parts.push(attach_prompt_cache_breakpoint(
+                            part,
+                            &d.additional_properties,
+                        ));
                         has_media_part = true;
                     }
                 }
@@ -110,7 +127,14 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         // When a non-text (image/audio/file) part is present, emit a typed
         // content-parts array with text folded in as `{"type":"text",...}`
         // parts; otherwise keep the plain-string form for wire stability.
-        if has_media_part {
+        //
+        // A prompt-cache breakpoint forces the array form too: a plain string
+        // has nowhere to carry one, so flattening would silently drop it
+        // (upstream #7163 makes the same exception).
+        let has_cache_breakpoint = parts
+            .iter()
+            .any(|p| p.get(PROMPT_CACHE_BREAKPOINT_KEY).is_some());
+        if has_media_part || has_cache_breakpoint {
             obj.insert("content".into(), Value::Array(parts));
         } else if !text.is_empty() || tool_calls.is_empty() {
             obj.insert("content".into(), json!(text));
@@ -129,14 +153,54 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
     out
 }
 
+/// The content-extras key holding an explicit prompt-cache breakpoint.
+pub(crate) const PROMPT_CACHE_BREAKPOINT_KEY: &str = "prompt_cache_breakpoint";
+
+/// Copy an explicit prompt-cache breakpoint from a content item's extras onto
+/// the outgoing request part.
+///
+/// GPT-5.6 and later accept a cache breakpoint on supported content blocks;
+/// callers opt in per part via
+/// `Content::additional_properties["prompt_cache_breakpoint"]`, and pair it
+/// with a request-wide `prompt_cache_options` (`{"mode": "explicit"}`) set
+/// through [`ChatOptions::additional_properties`], which is forwarded verbatim.
+/// Mirrors upstream's `_attach_prompt_cache_breakpoint` (#7163): only an object
+/// value is forwarded, so a stray scalar under that key is ignored rather than
+/// sent as a malformed breakpoint.
+pub(crate) fn attach_prompt_cache_breakpoint(
+    mut part: Value,
+    extras: &HashMap<String, Value>,
+) -> Value {
+    if let Some(bp) = extras.get(PROMPT_CACHE_BREAKPOINT_KEY) {
+        if bp.is_object() {
+            if let Some(obj) = part.as_object_mut() {
+                obj.insert(PROMPT_CACHE_BREAKPOINT_KEY.to_string(), bp.clone());
+            }
+        }
+    }
+    part
+}
+
 /// Map a URI/data content item to a Chat Completions content part, or `None`
 /// when it has no wire mapping (skipped, mirroring upstream
 /// `_openai_content_parser`). Handles images (`image_url`), audio
 /// (`input_audio`), and `application/*` data URIs (`file`).
-fn content_part_to_openai(uri: &str, media_type: Option<&str>) -> Option<Value> {
+fn content_part_to_openai(
+    uri: &str,
+    media_type: Option<&str>,
+    extras: &HashMap<String, Value>,
+) -> Option<Value> {
     let media_type = media_type?;
     match top_level_media_type(media_type).as_str() {
-        "image" => Some(json!({ "type": "image_url", "image_url": { "url": uri } })),
+        "image" => {
+            let mut image_url = json!({ "url": uri });
+            // `detail` ("low" / "high" / "auto") controls image tokenization
+            // cost; upstream reads it off the same content extras bag.
+            if let Some(detail) = extras.get("detail").and_then(Value::as_str) {
+                image_url["detail"] = json!(detail);
+            }
+            Some(json!({ "type": "image_url", "image_url": image_url }))
+        }
         "audio" => {
             let format = audio_format(media_type)?;
             Some(json!({
@@ -486,6 +550,7 @@ mod tests {
             Content::Uri(UriContent {
                 uri: "https://example.com/cat.png".into(),
                 media_type: "image/png".into(),
+                ..Default::default()
             }),
         ]);
         assert_eq!(
@@ -506,6 +571,7 @@ mod tests {
         let msg = user_with(vec![Content::Data(DataContent {
             uri: "data:image/png;base64,AAAA".into(),
             media_type: None,
+            ..Default::default()
         })]);
         assert_eq!(
             messages_to_openai(&[msg])[0],
@@ -523,6 +589,7 @@ mod tests {
         let msg = user_with(vec![Content::Data(DataContent {
             uri: "data:audio/wav;base64,QQQQ".into(),
             media_type: Some("audio/wav".into()),
+            ..Default::default()
         })]);
         assert_eq!(
             messages_to_openai(&[msg])[0],
@@ -540,6 +607,7 @@ mod tests {
         let msg = user_with(vec![Content::Data(DataContent {
             uri: "data:audio/mpeg;base64,SUQz".into(),
             media_type: Some("audio/mpeg".into()),
+            ..Default::default()
         })]);
         let out = messages_to_openai(&[msg]);
         assert_eq!(out[0]["content"][0]["input_audio"]["format"], json!("mp3"));
@@ -554,6 +622,7 @@ mod tests {
             Content::Data(DataContent {
                 uri: "data:audio/ogg;base64,T2dn".into(),
                 media_type: Some("audio/ogg".into()),
+                ..Default::default()
             }),
         ]);
         assert_eq!(
@@ -567,6 +636,7 @@ mod tests {
         let msg = user_with(vec![Content::Data(DataContent {
             uri: "data:application/pdf;base64,JVBERi0x".into(),
             media_type: Some("application/pdf".into()),
+            ..Default::default()
         })]);
         assert_eq!(
             messages_to_openai(&[msg])[0],
@@ -753,4 +823,157 @@ mod tests {
     }
 
     // endregion
+}
+
+#[cfg(test)]
+mod prompt_cache_tests {
+    use super::*;
+    use agent_framework_core::types::{DataContent, Message, Role, UriContent};
+    use serde_json::json;
+
+    fn with_extras<T>(mut value: T, set: impl FnOnce(&mut HashMap<String, Value>)) -> T
+    where
+        T: AsMutExtras,
+    {
+        set(value.extras_mut());
+        value
+    }
+
+    trait AsMutExtras {
+        fn extras_mut(&mut self) -> &mut HashMap<String, Value>;
+    }
+    impl AsMutExtras for TextContent {
+        fn extras_mut(&mut self) -> &mut HashMap<String, Value> {
+            &mut self.additional_properties
+        }
+    }
+    impl AsMutExtras for UriContent {
+        fn extras_mut(&mut self) -> &mut HashMap<String, Value> {
+            &mut self.additional_properties
+        }
+    }
+    impl AsMutExtras for DataContent {
+        fn extras_mut(&mut self) -> &mut HashMap<String, Value> {
+            &mut self.additional_properties
+        }
+    }
+
+    fn breakpoint() -> Value {
+        json!({ "type": "manual" })
+    }
+
+    /// Upstream #7163: GPT-5.6 and later accept an explicit cache breakpoint on
+    /// a content block, opted into per part via the content's extras.
+    #[test]
+    fn text_part_carries_a_prompt_cache_breakpoint() {
+        let text = with_extras(TextContent::new("cache me"), |e| {
+            e.insert(PROMPT_CACHE_BREAKPOINT_KEY.into(), breakpoint());
+        });
+        let msg = Message::with_contents(Role::user(), vec![Content::Text(text)]);
+        let out = messages_to_openai(&[msg]);
+
+        assert_eq!(
+            out[0]["content"][0][PROMPT_CACHE_BREAKPOINT_KEY],
+            breakpoint()
+        );
+    }
+
+    #[test]
+    fn image_part_carries_a_prompt_cache_breakpoint() {
+        let uri = with_extras(
+            UriContent {
+                uri: "https://example.com/cat.png".into(),
+                media_type: "image/png".into(),
+                ..Default::default()
+            },
+            |e| {
+                e.insert(PROMPT_CACHE_BREAKPOINT_KEY.into(), breakpoint());
+            },
+        );
+        let msg = Message::with_contents(Role::user(), vec![Content::Uri(uri)]);
+        let out = messages_to_openai(&[msg]);
+
+        let part = &out[0]["content"][0];
+        assert_eq!(part["type"], "image_url");
+        assert_eq!(part[PROMPT_CACHE_BREAKPOINT_KEY], breakpoint());
+    }
+
+    #[test]
+    fn file_part_carries_a_prompt_cache_breakpoint() {
+        let data = with_extras(
+            DataContent {
+                uri: "data:application/pdf;base64,JV".into(),
+                media_type: Some("application/pdf".into()),
+                ..Default::default()
+            },
+            |e| {
+                e.insert(PROMPT_CACHE_BREAKPOINT_KEY.into(), breakpoint());
+            },
+        );
+        let msg = Message::with_contents(Role::user(), vec![Content::Data(data)]);
+        let out = messages_to_openai(&[msg]);
+
+        let part = &out[0]["content"][0];
+        assert_eq!(part["type"], "file");
+        assert_eq!(part[PROMPT_CACHE_BREAKPOINT_KEY], breakpoint());
+    }
+
+    /// A scalar under the breakpoint key is not a breakpoint. Forwarding it
+    /// would send a malformed field; upstream drops it the same way.
+    #[test]
+    fn non_object_breakpoint_value_is_ignored() {
+        let text = with_extras(TextContent::new("hi"), |e| {
+            e.insert(PROMPT_CACHE_BREAKPOINT_KEY.into(), json!("yes"));
+        });
+        let msg = Message::with_contents(Role::user(), vec![Content::Text(text)]);
+        let out = messages_to_openai(&[msg]);
+
+        assert!(out[0]["content"][0]
+            .get(PROMPT_CACHE_BREAKPOINT_KEY)
+            .is_none());
+    }
+
+    /// Content without extras is unchanged — no stray key on the common path.
+    #[test]
+    fn parts_without_extras_are_unchanged() {
+        let msg = Message::user("plain");
+        let out = messages_to_openai(&[msg]);
+        assert!(out[0]["content"].as_str().is_some_and(|s| s == "plain"));
+    }
+
+    /// `detail` controls image tokenization cost; upstream reads it off the
+    /// same extras bag, and this port previously dropped it entirely.
+    #[test]
+    fn image_detail_is_forwarded_from_content_extras() {
+        let uri = with_extras(
+            UriContent {
+                uri: "https://example.com/cat.png".into(),
+                media_type: "image/png".into(),
+                ..Default::default()
+            },
+            |e| {
+                e.insert("detail".into(), json!("low"));
+            },
+        );
+        let msg = Message::with_contents(Role::user(), vec![Content::Uri(uri)]);
+        let out = messages_to_openai(&[msg]);
+
+        assert_eq!(out[0]["content"][0]["image_url"]["detail"], "low");
+    }
+
+    /// The request-wide policy rides on `ChatOptions::additional_properties`,
+    /// which is forwarded verbatim into the body — no special-casing needed.
+    #[test]
+    fn prompt_cache_options_pass_through_chat_options() {
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "prompt_cache_options".into(),
+            json!({ "mode": "explicit", "ttl": "30m" }),
+        );
+        let mut body = Map::new();
+        apply_options(&mut body, &options);
+
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+    }
 }

@@ -77,7 +77,7 @@ pub mod prelude {
     };
     pub use crate::error::{Error, Result};
     pub use crate::history::{FileHistoryProvider, HistoryProvider, InMemoryHistoryProvider};
-    pub use crate::memory::{ContextProvider, SessionContext};
+    pub use crate::memory::{ContextProvider, ContextSource, SessionContext, ATTRIBUTION_KEY};
     pub use crate::middleware::{
         AgentContext, ChatContext, FunctionInvocationContext, LiveToolList, Middleware,
         MiddlewarePipeline, Next,

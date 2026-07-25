@@ -33,10 +33,7 @@ pub fn structured_output_text(messages: &[Message]) -> String {
         let text: String = message
             .contents
             .iter()
-            .filter_map(|c| match c {
-                Content::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
+            .filter_map(Content::as_plain_text)
             .collect();
         if !text.trim().is_empty() {
             return text;
@@ -383,11 +380,12 @@ impl ChatResponseUpdate {
         }
     }
 
-    /// The concatenated text of this update.
+    /// The concatenated text of this update (no separator), excluding
+    /// reasoning — mirrors Python's `ChatResponseUpdate.text`.
     pub fn text_content(&self) -> String {
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 }
@@ -520,11 +518,12 @@ pub struct AgentResponseUpdate {
 }
 
 impl AgentResponseUpdate {
-    /// The concatenated text of this update.
+    /// The concatenated text of this update (no separator), excluding
+    /// reasoning — mirrors Python's `AgentResponseUpdate.text`.
     pub fn text(&self) -> String {
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 
@@ -653,6 +652,58 @@ mod tests {
         let resp =
             ChatResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
         assert_eq!(resp.value, Some(json!({"name": "x"})));
+    }
+
+    /// Every `.text()` in the framework excludes reasoning, matching upstream's
+    /// `content.type == "text"` filter. Including it spliced a model's
+    /// chain-of-thought into its own answer everywhere text surfaced.
+    #[test]
+    fn text_accessors_exclude_reasoning_content() {
+        let reasoning = Content::TextReasoning(super::super::content::TextReasoningContent {
+            text: "let me think...".into(),
+            ..Default::default()
+        });
+
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![reasoning.clone(), Content::text("the answer")],
+        );
+        assert_eq!(msg.text(), "the answer");
+
+        let resp = ChatResponse {
+            messages: vec![msg],
+            ..Default::default()
+        };
+        assert_eq!(resp.text(), "the answer");
+        assert_eq!(AgentResponse::from_chat_response(resp).text(), "the answer");
+
+        let chat_update = ChatResponseUpdate {
+            contents: vec![reasoning.clone(), Content::text("the answer")],
+            ..Default::default()
+        };
+        assert_eq!(chat_update.text_content(), "the answer");
+
+        let agent_update = AgentResponseUpdate {
+            contents: vec![reasoning, Content::text("the answer")],
+            ..Default::default()
+        };
+        assert_eq!(agent_update.text(), "the answer");
+    }
+
+    /// Token accounting is the deliberate exception: reasoning costs real
+    /// tokens, so `as_text` stays inclusive and compaction keeps using it.
+    #[test]
+    fn as_text_stays_inclusive_while_as_plain_text_does_not() {
+        let reasoning = Content::TextReasoning(super::super::content::TextReasoningContent {
+            text: "thinking".into(),
+            ..Default::default()
+        });
+        assert_eq!(reasoning.as_text(), Some("thinking"));
+        assert_eq!(reasoning.as_plain_text(), None);
+
+        let plain = Content::text("answer");
+        assert_eq!(plain.as_text(), Some("answer"));
+        assert_eq!(plain.as_plain_text(), Some("answer"));
     }
 
     #[test]

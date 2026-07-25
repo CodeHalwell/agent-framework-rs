@@ -47,6 +47,18 @@ what was already at parity and what is deliberately deferred.
   `thought` part of its own. Without the signature Gemini 3 rejects the
   follow-up turn of a tool-calling exchange (upstream #7095).
 
+- **`.text()` no longer includes reasoning.** `Message::text`,
+  `ChatResponseUpdate::text_content` and `AgentResponseUpdate::text` returned
+  a model's chain-of-thought concatenated with its answer, because
+  `Content::as_text` matches reasoning as well as text. They now use the new
+  `Content::as_plain_text`, matching upstream's `content.type == "text"`
+  filter on all five of its `.text` properties. `as_text` stays inclusive for
+  its one remaining caller, compaction's token counting, where a reasoning
+  block genuinely costs tokens.
+- **OpenAI image `detail` is no longer dropped.** It is read from the image
+  content's `additional_properties`, as upstream does, and forwarded on the
+  `image_url` part.
+
 ### Changed
 
 - `gen_ai.response.finish_reasons` is now only recorded for the four values
@@ -57,12 +69,39 @@ what was already at parity and what is deliberately deferred.
 
 ### Added
 
+- **Context-message attribution.** `SessionContext::extend_messages` stamps
+  each injected context message with the provider that contributed it, and
+  `extend_messages_from_sessions` additionally records the sessions the
+  content came from under
+  `additional_properties["_attribution"]["origin_session_ids"]`, so
+  downstream observers can tell cross-session content apart for governance or
+  audit. Origins accumulate across providers; the other attribution keys are
+  first-writer-wins (upstream #7041).
+- **MCP tool-use sampling results.** When a sampled model asks for tools, the
+  `sampling/createMessage` reply is now MCP's tool-result shape — an array of
+  `tool_use` blocks with `stopReason: "toolUse"` — instead of being scanned
+  only for text and erroring out as having nothing to return. The scan also
+  spans every message in the response rather than only the first (upstream
+  #7189).
+- **OpenAI prompt cache breakpoints** for GPT-5.6 and later. Set
+  `prompt_cache_breakpoint` in a content item's `additional_properties` to
+  mark a cache breakpoint on its request part (text, image, audio or file);
+  pair it with a request-wide `prompt_cache_options` via
+  `ChatOptions::additional_properties`, which is forwarded verbatim. A
+  message carrying a breakpoint is emitted in typed content-part form even
+  when it is text-only, since a plain-string `content` has nowhere to carry
+  one (upstream #7163).
 - `types::structured_output_text(&[Message]) -> String` — the
   structured-output text-extraction helper described above.
+- `Content::as_plain_text()` — text content only, excluding reasoning.
 - `TextReasoningContent::protected_data: Option<String>` — opaque
   provider-signed data for a reasoning step that must be echoed back on the
   next turn, mirroring upstream's `Content.protected_data`. Additive and
   serde-optional, so existing serialized content deserializes unchanged.
+- `additional_properties` on `TextContent`, `DataContent` and `UriContent` —
+  provider-specific per-content extras, mirroring upstream's
+  `Content.additional_properties`. Additive and serde-optional.
+  `DataContent` and `UriContent` now also derive `Default`.
 
 ## [0.1.1] — 2026-07-13
 

@@ -476,6 +476,7 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
                 out.push(Content::Data(DataContent {
                     uri: format!("data:{mime};base64,{data}"),
                     media_type: Some(mime.to_string()),
+                    ..Default::default()
                 }));
             }
             continue;
@@ -765,6 +766,7 @@ mod tests {
         let uc = UriContent {
             uri: "https://example.com/cat.png".into(),
             media_type: "image/png".into(),
+            ..Default::default()
         };
         let msg = Message::with_contents(Role::user(), vec![Content::Uri(uc)]);
         let body = build_request(&[msg], &ChatOptions::new());

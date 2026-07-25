@@ -324,6 +324,7 @@ impl ContentBlock {
                 Content::Data(DataContent {
                     uri: format!("data:{mime_type};base64,{data}"),
                     media_type: Some(mime_type.clone()),
+                    ..Default::default()
                 })
             }
             ContentBlock::ResourceLink { uri, mime_type, .. } => Content::Uri(UriContent {
@@ -331,6 +332,7 @@ impl ContentBlock {
                 media_type: mime_type
                     .clone()
                     .unwrap_or_else(|| "application/json".to_string()),
+                ..Default::default()
             }),
             ContentBlock::Resource(resource) => {
                 if let Some(text) = resource.get("text").and_then(Value::as_str) {
@@ -343,6 +345,7 @@ impl ContentBlock {
                     Content::Data(DataContent {
                         uri: format!("data:{mime};base64,{blob}"),
                         media_type: Some(mime.to_string()),
+                        ..Default::default()
                     })
                 } else {
                     Content::text(resource.to_string())

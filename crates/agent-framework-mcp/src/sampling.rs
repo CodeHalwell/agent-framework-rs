@@ -102,7 +102,11 @@ pub struct CreateMessageParams {
 #[serde(rename_all = "camelCase")]
 pub struct CreateMessageResult {
     pub role: String,
-    /// A single content block, same shape as [`SamplingMessage::content`].
+    /// Either a single content block (same shape as
+    /// [`SamplingMessage::content`]) or, when the sampled model asked for
+    /// tools, an *array* of `tool_use` blocks — MCP's
+    /// `CreateMessageResultWithTools` shape, which pairs with
+    /// `stop_reason: "toolUse"`.
     pub content: Value,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,10 +135,11 @@ impl CreateMessageResult {
 /// onto [`ChatOptions`]), calls [`ChatClient::get_response`], and maps the
 /// reply back into a [`CreateMessageResult`].
 ///
-/// Mirrors the Python reference's `MCPTool.sampling_callback`: prefers the
-/// first text (or, failing that, image/audio) content item of the
-/// response's first message, and never sets `stopReason` — Python's own
-/// callback doesn't either, relying on the field's `None` default.
+/// Mirrors the Python reference's `MCPTool.sampling_callback`. Tool calls in
+/// the response win: they are returned as an array of `tool_use` blocks with
+/// `stopReason: "toolUse"` so the server can act on them (upstream #7189).
+/// Failing that, the first text (or image/audio) content item across the
+/// response's messages is returned as a single block with no `stopReason`.
 pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHandler {
     Arc::new(move |params: CreateMessageParams| {
         let client = client.clone();
@@ -160,29 +165,64 @@ pub fn chat_client_sampling_handler(client: Arc<dyn ChatClient>) -> SamplingHand
                 .clone()
                 .or_else(|| client.model().map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string());
-            let content = first_sampling_result_content(&response)?;
+            let (content, stop_reason) = sampling_result_content(&response)?;
 
             Ok(CreateMessageResult {
                 role: "assistant".to_string(),
                 content,
                 model,
-                stop_reason: None,
+                stop_reason,
             })
         })
     })
 }
 
-/// Extract a result content block (preferring text, falling back to
-/// image/audio) from a chat response's messages, in order — mirrors
-/// Python's `next(content for content in mcp_contents if isinstance(content, (TextContent, ImageContent)))`.
-fn first_sampling_result_content(response: &ChatResponse) -> Result<Value> {
+/// Build the `content` (and `stopReason`) for a `sampling/createMessage`
+/// result from a chat response.
+///
+/// Tool calls take precedence, mirroring upstream #7189: when the sampled model
+/// asked for tools, the result is MCP's `CreateMessageResultWithTools` shape —
+/// an *array* of `tool_use` blocks with `stopReason: "toolUse"` — so the server
+/// can act on the request. Previously those calls were invisible: the response
+/// was scanned only for text/image, and a tool-only response errored out as
+/// having nothing to return.
+///
+/// Otherwise the first text (preferred) or image/audio block is returned as a
+/// single block, matching Python's
+/// `next(content for content in mcp_contents if isinstance(content, (TextContent, ImageContent)))`.
+///
+/// Both scans span *all* messages in the response, not just the first.
+fn sampling_result_content(response: &ChatResponse) -> Result<(Value, Option<String>)> {
+    let tool_uses: Vec<Value> = response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_call)
+        // A tool_use block without an id or name is unusable to the server.
+        .filter(|fc| !fc.call_id.is_empty() && !fc.name.is_empty())
+        .map(|fc| {
+            json!({
+                "type": "tool_use",
+                "id": fc.call_id,
+                "name": fc.name,
+                "input": fc.parse_arguments().unwrap_or_default(),
+            })
+        })
+        .collect();
+    if !tool_uses.is_empty() {
+        return Ok((Value::Array(tool_uses), Some("toolUse".to_string())));
+    }
+
     for message in &response.messages {
         for content in &message.contents {
             match content {
-                Content::Text(t) => return Ok(json!({ "type": "text", "text": t.text })),
+                Content::Text(t) => return Ok((json!({ "type": "text", "text": t.text }), None)),
                 Content::Data(d) => {
                     if let Some((kind, mime, data)) = image_or_audio_block(d) {
-                        return Ok(json!({ "type": kind, "data": data, "mimeType": mime }));
+                        return Ok((
+                            json!({ "type": kind, "data": data, "mimeType": mime }),
+                            None,
+                        ));
                     }
                 }
                 _ => {}
@@ -190,7 +230,7 @@ fn first_sampling_result_content(response: &ChatResponse) -> Result<Value> {
         }
     }
     Err(Error::service(
-        "sampling handler: chat client response had no text or image/audio content to return",
+        "sampling handler: chat client response had no tool-call, text or image/audio content to return",
     ))
 }
 
@@ -570,5 +610,113 @@ mod tests {
     fn create_message_result_text_helper() {
         let result = CreateMessageResult::text("assistant", "hi", "m1");
         assert_eq!(result.content, json!({"type": "text", "text": "hi"}));
+    }
+}
+
+#[cfg(test)]
+mod tool_use_sampling_tests {
+    use super::*;
+    use agent_framework_core::types::{
+        ChatResponse, Content, FunctionArguments, FunctionCallContent, Message, Role,
+    };
+
+    fn call(id: &str, name: &str, args: &str) -> Content {
+        Content::FunctionCall(FunctionCallContent::new(
+            id,
+            name,
+            Some(FunctionArguments::Raw(args.into())),
+        ))
+    }
+
+    /// Upstream #7189: a sampled model that asks for tools must reach the
+    /// server as MCP's tool-result shape — an array of `tool_use` blocks with
+    /// `stopReason: "toolUse"`. Before this, tool calls were invisible to the
+    /// scan and a tool-only response errored as having nothing to return.
+    #[test]
+    fn tool_calls_become_tool_use_blocks_with_tool_use_stop_reason() {
+        let response = ChatResponse {
+            messages: vec![Message::with_contents(
+                Role::assistant(),
+                vec![call("call_1", "get_weather", r#"{"city":"Paris"}"#)],
+            )],
+            ..Default::default()
+        };
+
+        let (content, stop_reason) = sampling_result_content(&response).unwrap();
+
+        assert_eq!(stop_reason.as_deref(), Some("toolUse"));
+        let blocks = content.as_array().expect("tool results are an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"], json!({"city": "Paris"}));
+    }
+
+    /// Tool calls outrank text: a model that narrates before calling a tool
+    /// still needs the call delivered, not the narration.
+    #[test]
+    fn tool_calls_take_precedence_over_text() {
+        let response = ChatResponse {
+            messages: vec![Message::with_contents(
+                Role::assistant(),
+                vec![
+                    Content::text("Let me look that up."),
+                    call("call_1", "get_weather", "{}"),
+                ],
+            )],
+            ..Default::default()
+        };
+
+        let (content, stop_reason) = sampling_result_content(&response).unwrap();
+        assert_eq!(stop_reason.as_deref(), Some("toolUse"));
+        assert_eq!(content.as_array().unwrap().len(), 1);
+    }
+
+    /// The scan spans every message, not just the first — upstream widened
+    /// this in the same change.
+    #[test]
+    fn tool_calls_are_collected_across_all_messages() {
+        let response = ChatResponse {
+            messages: vec![
+                Message::with_contents(Role::assistant(), vec![Content::text("thinking")]),
+                Message::with_contents(Role::assistant(), vec![call("call_1", "a", "{}")]),
+                Message::with_contents(Role::assistant(), vec![call("call_2", "b", "{}")]),
+            ],
+            ..Default::default()
+        };
+
+        let (content, _) = sampling_result_content(&response).unwrap();
+        let blocks = content.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[1]["id"], "call_2");
+    }
+
+    /// A call missing an id or name is unusable to the server, so it is not
+    /// emitted — and if nothing else is usable, that is an error rather than a
+    /// malformed block.
+    #[test]
+    fn unusable_tool_calls_are_skipped() {
+        let response = ChatResponse {
+            messages: vec![Message::with_contents(
+                Role::assistant(),
+                vec![call("", "get_weather", "{}"), call("call_2", "", "{}")],
+            )],
+            ..Default::default()
+        };
+
+        assert!(sampling_result_content(&response).is_err());
+    }
+
+    /// Without tool calls the single-block text path is unchanged.
+    #[test]
+    fn text_response_still_returns_a_single_block_and_no_stop_reason() {
+        let response = ChatResponse::from_text("Paris.");
+        let (content, stop_reason) = sampling_result_content(&response).unwrap();
+
+        assert!(stop_reason.is_none());
+        assert_eq!(content["type"], "text");
+        assert_eq!(content["text"], "Paris.");
     }
 }

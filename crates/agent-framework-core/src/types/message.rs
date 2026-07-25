@@ -121,10 +121,14 @@ impl Message {
     }
 
     /// The concatenated text of all text content items (space-joined).
+    ///
+    /// Reasoning content is excluded, matching upstream's `Message.text`
+    /// (`" ".join(c.text for c in contents if c.type == "text")`). Including it
+    /// would splice a model's chain-of-thought into its own answer.
     pub fn text(&self) -> String {
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<Vec<_>>()
             .join(" ")
     }

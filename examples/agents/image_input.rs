@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
     let remote = Content::Uri(UriContent {
         uri: "https://upload.wikimedia.org/wikipedia/commons/d/d3/Ferris.png".to_string(),
         media_type: "image/png".to_string(),
+        ..Default::default()
     });
 
     // ...and an inline image, base64-encoded into a `data:` URI from raw
