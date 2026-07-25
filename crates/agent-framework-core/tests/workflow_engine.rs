@@ -1229,3 +1229,198 @@ fn workflow_builder_rejects_overlapping_output_designation_at_build() {
     };
     assert!(err.to_string().contains("OUTPUT_VALIDATION"));
 }
+
+// ----------------------------------------------------------------------------
+// Sub-workflow checkpoint/restore (upstream #7097)
+// ----------------------------------------------------------------------------
+
+/// A child workflow that accumulates state in a stateful executor, asks a
+/// question, and yields the accumulated state joined with the answer. The
+/// accumulator proves the child's *executor state* survives the round trip —
+/// not just its pending request.
+fn stateful_child() -> Workflow {
+    /// Records every message it sees, and snapshots that history.
+    struct Accumulator {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for Accumulator {
+        fn id(&self) -> &str {
+            "acc"
+        }
+        async fn execute(
+            &self,
+            msg: Value,
+            ctx: WorkflowContext,
+        ) -> agent_framework_core::Result<()> {
+            if let Some(resp) = RequestResponse::from_message(&msg) {
+                let seen = self.seen.lock().unwrap().join(",");
+                ctx.yield_output(json!(format!(
+                    "{seen}|{}",
+                    resp.data.as_str().unwrap_or("")
+                )))
+                .await?;
+            } else {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(msg.as_str().unwrap_or("?").to_string());
+                ctx.send_message(msg).await?;
+            }
+            Ok(())
+        }
+        async fn snapshot_state(&self) -> Option<Value> {
+            Some(json!(*self.seen.lock().unwrap()))
+        }
+        async fn restore_state(&self, state: Value) -> agent_framework_core::Result<()> {
+            let restored: Vec<String> = serde_json::from_value(state).unwrap_or_default();
+            *self.seen.lock().unwrap() = restored;
+            Ok(())
+        }
+    }
+
+    WorkflowBuilder::new()
+        .add_executor(Arc::new(Accumulator {
+            seen: std::sync::Mutex::new(Vec::new()),
+        }))
+        .add_executor(Arc::new(RequestInfoExecutor::new("creq")))
+        .set_start("acc")
+        .add_edge("acc", "creq")
+        .build()
+        .unwrap()
+}
+
+/// Upstream #7097. A parent's checkpoint recorded nothing about its
+/// sub-workflows, so a resumed parent met a child that had forgotten its
+/// executor state, its in-flight messages and its place in the superstep loop.
+/// Answering a forwarded request after resume had no run to route back into.
+#[tokio::test]
+async fn sub_workflow_state_survives_parent_checkpoint_and_resume() {
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+
+    let build_parent = || {
+        WorkflowBuilder::new()
+            .add_executor(Arc::new(WorkflowExecutor::new("wrapper", stateful_child())))
+            .add_executor(Arc::new(FunctionExecutor::new(
+                "psink",
+                |msg, ctx| async move {
+                    ctx.yield_output(msg).await?;
+                    Ok(())
+                },
+            )))
+            .set_start("wrapper")
+            .add_edge("wrapper", "psink")
+            .with_checkpointing(storage.clone())
+            .build()
+            .unwrap()
+    };
+
+    // Run until the child's request surfaces through the parent, then stop.
+    let run = build_parent().run(json!("alpha")).await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::IdleWithPendingRequests);
+    let request_id = run.pending_requests()[0].request_id.clone();
+    drop(run);
+
+    // Resume from the checkpoint into a *fresh* parent — and therefore a fresh,
+    // empty child — so anything that survives came from the checkpoint.
+    let checkpoints = storage.list(None).await.unwrap();
+    let latest = checkpoints
+        .iter()
+        .max_by_key(|c| c.iteration_count)
+        .expect("a checkpoint was written");
+    let mut resumed = build_parent()
+        .run_from_checkpoint(&latest.checkpoint_id, storage.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.state(), WorkflowRunState::IdleWithPendingRequests);
+    assert_eq!(
+        resumed.pending_requests()[0].request_id,
+        request_id,
+        "the forwarded request survives with its id, so the caller's outstanding \
+         request is still answerable"
+    );
+
+    // Answering routes back into the restored child, which still remembers
+    // "alpha" — the state that used to be lost.
+    resumed
+        .send_response(request_id, json!("the-answer"))
+        .await
+        .unwrap();
+    assert_eq!(resumed.state(), WorkflowRunState::Idle);
+    assert_eq!(
+        resumed.last_output(),
+        Some(json!("alpha|the-answer")),
+        "the child's accumulated executor state survived the round trip"
+    );
+}
+
+/// A sub-workflow is checkpointed by its parent, so its own storage would write
+/// a second series of checkpoints nothing resumes from. It is detached.
+#[tokio::test]
+async fn sub_workflow_own_checkpoint_storage_is_detached() {
+    let child_storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let child = WorkflowBuilder::new()
+        .add_executor(Arc::new(FunctionExecutor::new(
+            "echo",
+            |msg, ctx| async move {
+                ctx.yield_output(msg).await?;
+                Ok(())
+            },
+        )))
+        .set_start("echo")
+        .with_checkpointing(child_storage.clone())
+        .build()
+        .unwrap();
+    assert!(child.has_checkpoint_storage());
+
+    let wrapper = WorkflowExecutor::new("wrapper", child);
+    assert!(
+        !wrapper.workflow().has_checkpoint_storage(),
+        "the child's own storage is detached"
+    );
+
+    let parent = WorkflowBuilder::new()
+        .add_executor(Arc::new(wrapper))
+        .set_start("wrapper")
+        .build()
+        .unwrap();
+    parent.run(json!("hi")).await.unwrap();
+
+    assert!(
+        child_storage.list(None).await.unwrap().is_empty(),
+        "the detached storage receives nothing"
+    );
+}
+
+/// Capturing a checkpoint of a run that is mid-superstep would snapshot a
+/// half-delivered queue, so it is refused rather than silently producing an
+/// unresumable checkpoint.
+#[tokio::test]
+async fn capture_checkpoint_object_requires_a_quiescent_run() {
+    let wf = WorkflowBuilder::new()
+        .add_executor(Arc::new(FunctionExecutor::new(
+            "echo",
+            |msg, ctx| async move {
+                ctx.yield_output(msg).await?;
+                Ok(())
+            },
+        )))
+        .set_start("echo")
+        .build()
+        .unwrap();
+
+    // A completed run is quiescent, so capture succeeds and round-trips.
+    let run = wf.run(json!("hi")).await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    let captured = run.capture_checkpoint_object().await.unwrap();
+    assert_eq!(captured.workflow_id, wf.id());
+
+    // Restoring it yields a paused run that has not been driven again.
+    let restored = wf
+        .restore_run_from_checkpoint_object(captured)
+        .await
+        .unwrap();
+    assert_eq!(restored.state(), WorkflowRunState::Idle);
+}

@@ -88,4 +88,8 @@ pub use devui::models::{DiscoveryResponse, EntityInfo, HealthResponse};
 
 // Re-export the reusable OpenAI-Responses conversion surface (mirrors
 // upstream `hosting-responses`; UPSTREAM_DRIFT.md §14).
-pub use responses::{responses_from_run, responses_to_run, ResponseObject, ResponsesRequest};
+pub use responses::{
+    responses_from_run, responses_to_run, ConversationRef, ResponseObject, ResponsesRequest,
+    SessionId,
+};
+pub use util::conversation_id;

@@ -39,6 +39,45 @@ pub struct ResponsesRequest {
     /// Advanced routing; `extra_body.entity_id` is accepted as a fallback.
     #[serde(default)]
     pub extra_body: Option<Map<String, Value>>,
+    /// Continue from a prior single response (`resp_…`).
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    /// Continue a multi-response conversation (`conv_…`).
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+}
+
+/// Where a request's session id came from, and therefore how the response
+/// should render it.
+///
+/// Mirrors the `tuple[str, bool]` upstream's `responses_session_id` returns
+/// (#7234), as a named type rather than a positional bool: only a *conversation*
+/// id is echoed back in the response's `conversation` field, so conflating the
+/// two silently drops conversation continuity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionId {
+    /// A `previous_response_id` — continuation of one prior response.
+    PreviousResponse(String),
+    /// A `conversation_id` — a conversation spanning many responses.
+    Conversation(String),
+}
+
+impl SessionId {
+    /// The id itself, whichever kind it is.
+    pub fn as_str(&self) -> &str {
+        match self {
+            SessionId::PreviousResponse(id) | SessionId::Conversation(id) => id,
+        }
+    }
+
+    /// The id if it is a conversation id, else `None` — what
+    /// [`responses_from_run`] renders in the `conversation` field.
+    pub fn conversation(&self) -> Option<&str> {
+        match self {
+            SessionId::Conversation(id) => Some(id),
+            SessionId::PreviousResponse(_) => None,
+        }
+    }
 }
 
 impl ResponsesRequest {
@@ -56,6 +95,46 @@ impl ResponsesRequest {
             .or_else(|| get(&self.extra_body, "entity_id"))
             .map(str::to_string)
             .or_else(|| self.model.clone())
+    }
+
+    /// The session id this request continues, if any.
+    ///
+    /// `previous_response_id` wins over `conversation_id` when both are
+    /// supplied, matching upstream's precedence (#7234). An id that does not
+    /// carry its conventional prefix (`resp_` / `conv_`) is *accepted* — hosts
+    /// legitimately mint their own — but warns, since a swapped pair is
+    /// otherwise silent and costs conversation continuity.
+    ///
+    /// The value is request-derived and therefore caller-controlled: whether to
+    /// trust it for a given route is the host's decision, not this helper's.
+    pub fn session_id(&self) -> Option<SessionId> {
+        fn non_empty(v: &Option<String>) -> Option<&str> {
+            v.as_deref().filter(|s| !s.is_empty())
+        }
+
+        let previous = non_empty(&self.previous_response_id);
+        let conversation = non_empty(&self.conversation_id);
+
+        if let Some(id) = previous {
+            if !id.starts_with("resp_") {
+                tracing::warn!(
+                    "`previous_response_id` does not use the OpenAI Responses `resp_` prefix; \
+                     continuing with the supplied value"
+                );
+            }
+        }
+        if let Some(id) = conversation {
+            if !id.starts_with("conv_") {
+                tracing::warn!(
+                    "`conversation_id` does not use the OpenAI Responses `conv_` prefix; \
+                     continuing with the supplied value"
+                );
+            }
+        }
+
+        previous
+            .map(|id| SessionId::PreviousResponse(id.to_string()))
+            .or_else(|| conversation.map(|id| SessionId::Conversation(id.to_string())))
     }
 }
 
@@ -146,6 +225,17 @@ pub struct ResponseObject {
     pub parallel_tool_calls: bool,
     pub tool_choice: &'static str,
     pub tools: Vec<Value>,
+    /// The conversation this response belongs to, when the request continued
+    /// one. Omitted entirely otherwise — a `previous_response_id` continuation
+    /// is not a conversation and must not be rendered as one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationRef>,
+}
+
+/// The `conversation` field of a response: `{"id": "conv_…"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRef {
+    pub id: String,
 }
 
 impl ResponseObject {
@@ -166,7 +256,22 @@ impl ResponseObject {
             parallel_tool_calls: false,
             tool_choice: "none",
             tools: Vec::new(),
+            conversation: None,
         }
+    }
+
+    /// Render `session` in the response's `conversation` field, when it is a
+    /// conversation id.
+    ///
+    /// A [`SessionId::PreviousResponse`] leaves the field absent: it continues
+    /// one prior response, not a conversation, and OpenAI's shape distinguishes
+    /// the two. Mirrors upstream's `responses_from_run(..., conversation_id=)`
+    /// (#7234), which likewise renders only a conversation id.
+    pub fn with_conversation(mut self, session: Option<&SessionId>) -> Self {
+        self.conversation = session
+            .and_then(SessionId::conversation)
+            .map(|id| ConversationRef { id: id.to_string() });
+        self
     }
 }
 
@@ -292,6 +397,7 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
         parallel_tool_calls: false,
         tool_choice: "none",
         tools: Vec::new(),
+        conversation: None,
     }
 }
 
@@ -411,5 +517,120 @@ mod tests {
         };
         let obj = responses_from_run(&resp, "resp_1", "m");
         assert!(obj.usage.is_none());
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+    use agent_framework_core::types::AgentResponse;
+
+    fn req(previous: Option<&str>, conversation: Option<&str>) -> ResponsesRequest {
+        ResponsesRequest {
+            previous_response_id: previous.map(str::to_string),
+            conversation_id: conversation.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_session_fields_yields_no_session_id() {
+        assert_eq!(req(None, None).session_id(), None);
+    }
+
+    /// Empty strings are absent, not ids — an empty `conversation_id` must not
+    /// produce a `conversation: {"id": ""}` on the response.
+    #[test]
+    fn empty_session_fields_are_treated_as_absent() {
+        assert_eq!(req(Some(""), Some("")).session_id(), None);
+    }
+
+    #[test]
+    fn previous_response_id_is_recognised() {
+        assert_eq!(
+            req(Some("resp_abc"), None).session_id(),
+            Some(SessionId::PreviousResponse("resp_abc".into()))
+        );
+    }
+
+    #[test]
+    fn conversation_id_is_recognised() {
+        assert_eq!(
+            req(None, Some("conv_abc")).session_id(),
+            Some(SessionId::Conversation("conv_abc".into()))
+        );
+    }
+
+    /// Upstream #7234's precedence: `previous_response_id` wins when both are
+    /// supplied.
+    #[test]
+    fn previous_response_id_wins_over_conversation_id() {
+        assert_eq!(
+            req(Some("resp_abc"), Some("conv_abc")).session_id(),
+            Some(SessionId::PreviousResponse("resp_abc".into()))
+        );
+    }
+
+    /// A non-conventional prefix warns but is still accepted — hosts do mint
+    /// their own ids.
+    #[test]
+    fn unconventional_prefixes_are_still_accepted() {
+        assert_eq!(
+            req(Some("custom-1"), None).session_id(),
+            Some(SessionId::PreviousResponse("custom-1".into()))
+        );
+        assert_eq!(
+            req(None, Some("custom-2")).session_id(),
+            Some(SessionId::Conversation("custom-2".into()))
+        );
+    }
+
+    /// Only a conversation id is echoed back. Rendering a
+    /// `previous_response_id` as a conversation would claim a continuity the
+    /// request never asked for.
+    #[test]
+    fn only_a_conversation_id_is_rendered_on_the_response() {
+        let resp = AgentResponse::from_chat_response(
+            agent_framework_core::types::ChatResponse::from_text("hi"),
+        );
+
+        let conversation = responses_from_run(&resp, "resp_1", "m")
+            .with_conversation(Some(&SessionId::Conversation("conv_x".into())));
+        assert_eq!(
+            conversation.conversation,
+            Some(ConversationRef {
+                id: "conv_x".into()
+            })
+        );
+
+        let previous = responses_from_run(&resp, "resp_1", "m")
+            .with_conversation(Some(&SessionId::PreviousResponse("resp_x".into())));
+        assert_eq!(previous.conversation, None);
+
+        let none = responses_from_run(&resp, "resp_1", "m").with_conversation(None);
+        assert_eq!(none.conversation, None);
+    }
+
+    /// The field is omitted from the wire shape entirely when absent, rather
+    /// than serialized as `null`.
+    #[test]
+    fn absent_conversation_is_omitted_from_the_payload() {
+        let resp = AgentResponse::from_chat_response(
+            agent_framework_core::types::ChatResponse::from_text("hi"),
+        );
+        let obj = responses_from_run(&resp, "resp_1", "m");
+        let json = serde_json::to_value(&obj).unwrap();
+        assert!(json.get("conversation").is_none());
+
+        let with = obj.with_conversation(Some(&SessionId::Conversation("conv_x".into())));
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["conversation"]["id"], "conv_x");
+    }
+
+    #[test]
+    fn generated_conversation_ids_use_the_conv_prefix() {
+        let id = crate::util::conversation_id();
+        assert!(id.starts_with("conv_"), "got {id}");
+        assert_ne!(id, crate::util::conversation_id(), "ids are unique");
     }
 }

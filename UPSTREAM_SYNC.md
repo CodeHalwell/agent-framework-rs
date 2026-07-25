@@ -36,8 +36,10 @@ follows is every Python-side change that could plausibly touch this port.
 | #7041 `c35a63e` | Cross-session origin attribution on context messages | `core/src/memory.rs` — new `ContextSource`, `SessionContext::extend_messages{,_from_sessions}`, `ATTRIBUTION_KEY` |
 | #7189 `9e836f7` | MCP tool-use sampling results | `mcp/src/sampling.rs` — `sampling_result_content` returns `tool_use` blocks + `stopReason: "toolUse"` |
 | #7163 `6180272` | OpenAI prompt cache breakpoints for GPT-5.6 | `core/src/types/content.rs` — new `additional_properties` on text/data/URI content; `openai/src/convert.rs` — `attach_prompt_cache_breakpoint` + image `detail`; `openai/src/responses.rs` — `input_text` parts |
+| #7097 `0df184e` | Sub-workflow checkpoint restore preserving sub-workflow state | `core/src/workflow/runner.rs` — `capture_checkpoint_object` / `restore_run_from_checkpoint_object` / `without_checkpoint_storage`; `core/src/workflow/sub_workflow.rs` — `WorkflowExecutor` now implements `snapshot_state` / `restore_state` |
+| #7234 `a70fe21` | Responses conversation-ID helper | `hosting/src/responses.rs` — `SessionId`, `ResponsesRequest::session_id`, `ConversationRef`, `ResponseObject::with_conversation`; `hosting/src/util.rs` — `conversation_id()` |
 
-Two of these needed groundwork the port did not have:
+Four of these needed groundwork the port did not have:
 
 - **#7041** required the attribution model itself. Upstream keys context
   messages by contributing provider and stamps `_attribution` into each
@@ -52,6 +54,24 @@ Two of these needed groundwork the port did not have:
   silently dropped. The request-wide half of #7163,
   `prompt_cache_options`, already worked — `ChatOptions::additional_properties`
   is forwarded verbatim into the body — and now has a test pinning it.
+- **#7097** required nested-checkpoint primitives. This port's
+  `WorkflowExecutor` did not participate in checkpointing at all, so a
+  parent's checkpoint recorded *nothing* about its sub-workflows — worse than
+  the upstream bug, which at least replayed pending request-info events. The
+  runner gained `capture_checkpoint_object` (quiescent-only, non-destructive)
+  and `restore_run_from_checkpoint_object` (restores without driving, so the
+  parent decides when the child runs again), and `WorkflowExecutor` embeds each
+  paused child's checkpoint in its own executor state. A sub-workflow's own
+  checkpoint storage is now detached rather than left to write a second series
+  of checkpoints nothing resumes from.
+- **#7234** required the session-continuity surface. `ResponsesRequest` had
+  neither `previous_response_id` nor `conversation_id`, and `ResponseObject`
+  had no `conversation` field. Upstream returns `tuple[str, bool]` from
+  `responses_session_id`; this port models it as a `SessionId` enum instead,
+  since the whole point of the change is that the two kinds are not
+  interchangeable — only a conversation id is echoed back. DevUI's
+  non-streaming agent route is wired through it, so the field is reachable
+  rather than dead API surface.
 
 ### Already at parity — verified, no change needed
 
@@ -76,17 +96,12 @@ against the Rust source rather than assumed.
 | #6916 `6afae2f` | `ValueError` for malformed data URIs in `detect_media_type_from_base64` | There is no Rust counterpart to that helper. `DataContent::from_bytes` *constructs* data URIs; the only parsing is `openai::convert::{strip_data_uri_prefix, data_content_media_type}`, which are deliberately lenient pass-throughs |
 | #7300, #7155 | GitHub Copilot input attachments as inline blobs; `GitHubCopilotOptions` forwarded verbatim to `create_session` | Both are plumbing for the Python `copilot` SDK's `create_session` / `send_and_wait` signatures. This port's Copilot crate does not wrap that SDK |
 | #7218 `a4f02aa` | MCP `header_provider` headers not reaching the streamable-HTTP transport | The bug is a Python `ContextVar`-vs-task-context issue: the transport sends from tasks whose context predates `call_tool`. Rust threads headers through the request explicitly; there is no ambient-context path to miss |
+| #6579 `18b03ea` | Checkpoint encoding handling | Both halves are artefacts of Python's pickle envelope. The bulk hardens `_RestrictedUnpickler.find_class` against reaching helper callables through an allowed module prefix — Rust decodes checkpoints with serde, which resolves no types and executes no code. The remainder stops a user dict containing `__pickled__` / `__type__` from being mistaken for an encoded envelope; Rust uses no marker envelope (all workflow data is already `serde_json::Value`), so there is no collision surface. `checkpoint.rs`'s module docs state this |
 
 ### Deferred
 
-Real gaps, not yet closed. Listed so they are picked up deliberately rather
-than rediscovered.
-
-| Upstream | Change | Notes |
-|---|---|---|
-| #7097 `0df184e` | Sub-workflow checkpoint restore preserving sub-workflow state | Substantial upstream refactor (+604/−245 across the runner, runner context and workflow executor). Wants its own change |
-| #6579 `18b03ea` | Checkpoint encoding handling | Largely Python-specific — the upstream change hardens *pickle* decoding, which has no Rust analogue (checkpoints here are serde/JSON). Worth a look alongside the sub-workflow work above to confirm nothing else is in it |
-| #7234 `a70fe21` | Responses conversation-ID helper | Lives in `hosting-responses`, a package with only partial coverage here |
+Nothing from this window remains deferred. Everything above is either ported,
+already at parity, or not applicable — each with the reasoning recorded.
 
 ### Out of scope
 

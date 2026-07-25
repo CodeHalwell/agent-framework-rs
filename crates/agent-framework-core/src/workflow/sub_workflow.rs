@@ -16,10 +16,12 @@
 //! run id, matching Python's per-execution isolation.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use super::checkpoint::WorkflowCheckpoint;
 use super::context::WorkflowContext;
 use super::executor::Executor;
 use super::request_info::RequestResponse;
@@ -57,9 +59,23 @@ impl WorkflowExecutor {
     /// node. Use [`WorkflowExecutor::with_direct_output`] to instead yield them
     /// directly as parent workflow outputs.
     pub fn new(id: impl Into<String>, workflow: Workflow) -> Self {
+        let id = id.into();
+        // A sub-workflow's state is checkpointed *by its parent*, embedded in
+        // the parent's checkpoint (see `snapshot_state`). Its own storage would
+        // write a second, independent series of checkpoints that nothing ever
+        // resumes from — two sources of truth for one run. Upstream refuses the
+        // configuration outright (#7097); detaching reaches the same outcome
+        // without failing a constructor.
+        if workflow.has_checkpoint_storage() {
+            tracing::warn!(
+                executor_id = %id,
+                "detaching the sub-workflow's own checkpoint storage: a sub-workflow is \
+                 checkpointed by its parent, embedded in the parent's checkpoint"
+            );
+        }
         Self {
-            id: id.into(),
-            child: workflow,
+            id,
+            child: workflow.without_checkpoint_storage(),
             allow_direct_output: false,
             state: Mutex::new(WrapperState::default()),
         }
@@ -146,10 +162,132 @@ impl WorkflowExecutor {
     }
 }
 
+/// One entry of [`WorkflowExecutor`]'s checkpointed state: a child run's
+/// captured checkpoint plus how many of its outputs the parent already
+/// forwarded.
+#[derive(Serialize, Deserialize)]
+struct CheckpointedChild {
+    checkpoint: WorkflowCheckpoint,
+    forwarded_outputs: usize,
+}
+
+/// [`WorkflowExecutor`]'s full checkpoint payload.
+#[derive(Default, Serialize, Deserialize)]
+struct CheckpointedState {
+    /// run_id -> the child execution paused under it.
+    runs: HashMap<String, CheckpointedChild>,
+    /// forwarded child request_id -> run_id.
+    request_map: HashMap<String, String>,
+}
+
 #[async_trait]
 impl Executor for WorkflowExecutor {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Embed each paused child run's own checkpoint in the parent's.
+    ///
+    /// Without this the parent's checkpoint recorded nothing about its
+    /// sub-workflows, so a resumed parent met a child that had forgotten
+    /// everything: its executors' state, its in-flight messages, its position
+    /// in the superstep loop. Anything mid-progress was silently lost, and a
+    /// response arriving for a forwarded request had no run to route back to.
+    /// Mirrors upstream's `WorkflowExecutor.on_checkpoint_save` (#7097).
+    async fn snapshot_state(&self) -> Option<Value> {
+        // `capture_checkpoint_object` is async and the guard is not `Send`, so
+        // the paused runs are moved out of the lock, captured, then moved back.
+        // Taking ownership also means no borrow of `self.state` spans an await.
+        let (mut owned_runs, request_map) = {
+            let mut state = self.state.lock().unwrap();
+            if state.runs.is_empty() && state.request_map.is_empty() {
+                return None;
+            }
+            (std::mem::take(&mut state.runs), state.request_map.clone())
+        };
+
+        let mut runs = HashMap::new();
+        for (run_id, child) in &owned_runs {
+            match child.run.capture_checkpoint_object().await {
+                Ok(checkpoint) => {
+                    runs.insert(
+                        run_id.clone(),
+                        CheckpointedChild {
+                            checkpoint,
+                            forwarded_outputs: child.forwarded_outputs,
+                        },
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    executor_id = %self.id,
+                    run_id = %run_id,
+                    "skipping sub-workflow run in checkpoint: {e}"
+                ),
+            }
+        }
+
+        // Put the runs back. Anything inserted meanwhile wins — dropping a
+        // newer run to restore a stale snapshot of it would lose work.
+        {
+            let mut state = self.state.lock().unwrap();
+            for (run_id, child) in owned_runs.drain() {
+                state.runs.entry(run_id).or_insert(child);
+            }
+        }
+
+        serde_json::to_value(CheckpointedState { runs, request_map }).ok()
+    }
+
+    /// Rebuild each paused child run from its embedded checkpoint.
+    ///
+    /// A run whose checkpoint no longer matches the child graph is dropped with
+    /// a warning rather than failing the whole restore: the rest of the parent
+    /// is still resumable, and a mismatched child would misroute messages.
+    /// Mirrors upstream's `WorkflowExecutor.on_checkpoint_restore` (#7097).
+    async fn restore_state(&self, state: Value) -> Result<()> {
+        let saved: CheckpointedState = serde_json::from_value(state).map_err(|e| {
+            crate::error::Error::Workflow(format!(
+                "sub-workflow executor '{}': malformed checkpoint state: {e}",
+                self.id
+            ))
+        })?;
+
+        let mut restored = WrapperState {
+            runs: HashMap::new(),
+            request_map: saved.request_map,
+        };
+        for (run_id, child) in saved.runs {
+            match self
+                .child
+                .restore_run_from_checkpoint_object(child.checkpoint)
+                .await
+            {
+                Ok(run) => {
+                    restored.runs.insert(
+                        run_id,
+                        ChildExecution {
+                            run,
+                            forwarded_outputs: child.forwarded_outputs,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        executor_id = %self.id,
+                        run_id = %run_id,
+                        "dropping unrestorable sub-workflow run: {e}"
+                    );
+                }
+            }
+        }
+        // Requests whose run did not survive can never be answered; drop them
+        // so a later response is ignored rather than routed into nothing.
+        restored
+            .request_map
+            .retain(|_, run_id| restored.runs.contains_key(run_id));
+
+        *self.state.lock().unwrap() = restored;
+        Ok(())
     }
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {

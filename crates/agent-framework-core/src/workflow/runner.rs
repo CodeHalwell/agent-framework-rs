@@ -455,6 +455,48 @@ impl Workflow {
         &self.shared.start
     }
 
+    /// Whether this workflow was built with its own checkpoint storage
+    /// ([`WorkflowBuilder::with_checkpointing`]).
+    ///
+    /// Used by [`WorkflowExecutor`](super::sub_workflow::WorkflowExecutor) to
+    /// detect a sub-workflow that would write checkpoints of its own.
+    pub fn has_checkpoint_storage(&self) -> bool {
+        self.shared.checkpoint_storage.is_some()
+    }
+
+    /// Return this workflow with its own checkpoint storage detached.
+    ///
+    /// A sub-workflow is checkpointed *by its parent*, embedded in the parent's
+    /// checkpoint. Leaving its own storage attached would write a second,
+    /// independent series of checkpoints that nothing ever resumes from — two
+    /// sources of truth for one run. Upstream refuses the configuration
+    /// outright (#7097); detaching is the same outcome without failing a
+    /// constructor.
+    ///
+    /// Cheap: the graph itself is shared behind `Arc`s and only the outer
+    /// definition is rebuilt.
+    pub(crate) fn without_checkpoint_storage(self) -> Workflow {
+        if self.shared.checkpoint_storage.is_none() {
+            return self;
+        }
+        let s = &*self.shared;
+        Workflow {
+            shared: Arc::new(WorkflowShared {
+                executors: s.executors.clone(),
+                edge_groups: s.edge_groups.clone(),
+                start: s.start.clone(),
+                max_iterations: s.max_iterations,
+                name: s.name.clone(),
+                description: s.description.clone(),
+                checkpoint_storage: None,
+                id: s.id.clone(),
+                graph_signature: s.graph_signature.clone(),
+                output_executors: s.output_executors.clone(),
+                intermediate_executors: s.intermediate_executors.clone(),
+            }),
+        }
+    }
+
     /// This workflow's deterministic graph signature (see
     /// [`WorkflowBuilder::build`]). Checkpoints record the signature of the
     /// graph that produced them; [`Workflow::run_from_checkpoint`] refuses to
@@ -468,6 +510,27 @@ impl Workflow {
     pub async fn run(&self, input: impl Into<Value>) -> Result<WorkflowRun> {
         let mut run = WorkflowRun::new(self.shared.clone(), None);
         run.start(input.into()).await?;
+        Ok(run)
+    }
+
+    /// Rebuild a paused run from an in-memory checkpoint, without resuming it.
+    ///
+    /// The counterpart of [`WorkflowRun::capture_checkpoint_object`], and the
+    /// mechanism a parent workflow uses to bring a sub-workflow back to its
+    /// mid-progress state on resume (upstream #7097). Unlike
+    /// [`Workflow::run_from_checkpoint`], nothing is driven: the returned run
+    /// sits exactly where it was captured until the caller feeds it a response.
+    ///
+    /// The checkpoint's graph signature is verified against this workflow, so a
+    /// child whose graph changed since capture is rejected rather than resumed
+    /// into a mismatched topology.
+    pub async fn restore_run_from_checkpoint_object(
+        &self,
+        checkpoint: WorkflowCheckpoint,
+    ) -> Result<WorkflowRun> {
+        self.check_graph_signature(&checkpoint, true)?;
+        let mut run = WorkflowRun::new(self.shared.clone(), None);
+        run.restore_quiescent(checkpoint).await?;
         Ok(run)
     }
 
@@ -1005,10 +1068,15 @@ impl WorkflowRun {
         (id, result)
     }
 
-    async fn maybe_checkpoint(&self, step: usize) {
-        let Some(storage) = self.shared.checkpoint_storage.clone() else {
-            return;
-        };
+    /// Build a checkpoint of this run's current state **without persisting it**.
+    ///
+    /// Mirrors upstream's `RunnerContext.create_checkpoint_object` (#7097): the
+    /// same snapshot `maybe_checkpoint` would store, returned as a value so a
+    /// caller can embed it somewhere else — which is exactly what a parent
+    /// workflow does with a sub-workflow's state. In-flight messages and fan-in
+    /// buffers are cloned, never drained, so building one does not disturb the
+    /// run.
+    async fn build_checkpoint(&self, metadata: HashMap<String, Value>) -> WorkflowCheckpoint {
         let mut executor_states: HashMap<String, Value> = HashMap::new();
         for (id, ex) in &self.shared.executors {
             if let Some(state) = ex.snapshot_state().await {
@@ -1016,13 +1084,7 @@ impl WorkflowRun {
             }
         }
         let shared_state = self.shared_state.export().await;
-        let mut metadata: HashMap<String, Value> = HashMap::new();
-        metadata.insert("superstep".to_string(), Value::from(self.iteration as u64));
-        metadata.insert(
-            "checkpoint_type".to_string(),
-            Value::from(format!("superstep_{step}")),
-        );
-        let checkpoint = WorkflowCheckpoint::new(
+        WorkflowCheckpoint::new(
             self.shared.id.clone(),
             self.shared.name.clone(),
             self.iteration,
@@ -1033,10 +1095,79 @@ impl WorkflowRun {
             self.fanin.clone(),
             metadata,
             self.shared.graph_signature.clone(),
+        )
+    }
+
+    /// Capture this run's state as an in-memory checkpoint, for embedding in
+    /// another workflow's checkpoint.
+    ///
+    /// Mirrors upstream's `Runner.capture_checkpoint_object` (#7097). Only a
+    /// **quiescent** run can be captured: one that has finished its superstep
+    /// loop and is either idle or paused awaiting responses. Capturing a run
+    /// that is mid-superstep would snapshot a half-delivered message queue, so
+    /// it is refused rather than silently producing an unresumable checkpoint.
+    pub async fn capture_checkpoint_object(&self) -> Result<WorkflowCheckpoint> {
+        match self.state {
+            WorkflowRunState::Idle
+            | WorkflowRunState::IdleWithPendingRequests
+            | WorkflowRunState::Started => {}
+            other => {
+                return Err(Error::Workflow(format!(
+                    "cannot capture a checkpoint of a non-quiescent run (state: {other:?}); \
+                     only an idle or awaiting-response run can be captured"
+                )));
+            }
+        }
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert("superstep".to_string(), Value::from(self.iteration as u64));
+        metadata.insert("checkpoint_type".to_string(), Value::from("captured"));
+        Ok(self.build_checkpoint(metadata).await)
+    }
+
+    async fn maybe_checkpoint(&self, step: usize) {
+        let Some(storage) = self.shared.checkpoint_storage.clone() else {
+            return;
+        };
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert("superstep".to_string(), Value::from(self.iteration as u64));
+        metadata.insert(
+            "checkpoint_type".to_string(),
+            Value::from(format!("superstep_{step}")),
         );
+        let checkpoint = self.build_checkpoint(metadata).await;
         if let Err(e) = storage.save(checkpoint).await {
             tracing::warn!("failed to save checkpoint: {e}");
         }
+    }
+
+    /// Restore state from `cp` **without driving** the superstep loop.
+    ///
+    /// The counterpart of [`WorkflowRun::capture_checkpoint_object`]: it rebuilds
+    /// a paused run so a later `send_response` resumes it exactly where it left
+    /// off. [`WorkflowRun::restore`] instead resumes immediately, which is right
+    /// for a top-level resume but wrong for a nested one — the parent decides
+    /// when the child runs again.
+    async fn restore_quiescent(&mut self, cp: WorkflowCheckpoint) -> Result<()> {
+        self.shared_state.import(cp.shared_state).await;
+        self.iteration = cp.iteration_count;
+        self.queue = cp.messages;
+        self.fanin = cp.fanin_state;
+        self.pending_requests = cp
+            .pending_requests
+            .into_iter()
+            .map(|p| (p.request_id.clone(), p))
+            .collect();
+        for (id, state) in cp.executor_states {
+            if let Some(ex) = self.shared.executors.get(&id) {
+                ex.restore_state(state).await?;
+            }
+        }
+        self.state = if self.pending_requests.is_empty() {
+            WorkflowRunState::Idle
+        } else {
+            WorkflowRunState::IdleWithPendingRequests
+        };
+        Ok(())
     }
 
     /// Deliver a single response, resuming execution.

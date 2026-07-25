@@ -248,7 +248,11 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
             Ok(r) => r,
             Err(e) => return execution_error(e.to_string()),
         };
-        Json(agent_response_object(&response, &model, input_len)).into_response()
+        Json(
+            agent_response_object(&response, &model, input_len)
+                .with_conversation(request.session_id().as_ref()),
+        )
+        .into_response()
     }
 }
 
@@ -439,6 +443,7 @@ fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str)
         parallel_tool_calls: false,
         tool_choice: "none",
         tools: Vec::new(),
+        conversation: None,
     }
 }
 
@@ -508,6 +513,7 @@ fn workflow_stream_events(
         parallel_tool_calls: false,
         tool_choice: "none",
         tools: Vec::new(),
+        conversation: None,
     };
     events.push(json!({
         "type": "response.completed",

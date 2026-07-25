@@ -26,3 +26,11 @@ pub(crate) fn resp_id() -> String {
 pub(crate) fn msg_id() -> String {
     format!("msg_{}", short_hex())
 }
+
+/// A `conv_…` id (OpenAI Responses conversation id convention).
+///
+/// Mirrors upstream's `create_conversation_id` (#7234). A conversation id
+/// spans many responses, where a `resp_…` id identifies exactly one.
+pub fn conversation_id() -> String {
+    format!("conv_{}", short_hex())
+}

@@ -9,9 +9,10 @@ may break APIs).
 
 Upstream parity sync. 0.1.1 was cut against `microsoft/agent-framework`
 `beb65b21` (2026-07-13); this re-pins the port to **`c6442de`
-(2026-07-24)**. All 102 upstream commits in that window were triaged — see
-[UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) for the full disposition, including
-what was already at parity and what is deliberately deferred.
+(2026-07-24)**. All 102 upstream commits in that window were triaged and
+nothing is left outstanding: every change is ported, already at parity, or
+not applicable, each with its reasoning recorded in
+[UPSTREAM_SYNC.md](UPSTREAM_SYNC.md).
 
 ### Fixed
 
@@ -58,6 +59,17 @@ what was already at parity and what is deliberately deferred.
 - **OpenAI image `detail` is no longer dropped.** It is read from the image
   content's `additional_properties`, as upstream does, and forwarded on the
   `image_url` part.
+- **Sub-workflow state survives a parent checkpoint/resume.** A parent's
+  checkpoint recorded nothing about its sub-workflows, so a resumed parent met
+  a child that had forgotten its executor state, its in-flight messages and
+  its place in the superstep loop — and a response to a forwarded request had
+  no run to route back into. `WorkflowExecutor` now embeds each paused child
+  run's own checkpoint in its executor state and rebuilds it on restore. A
+  child whose graph no longer matches its checkpoint is dropped with a warning
+  rather than failing the whole parent restore (upstream #7097).
+- **A sub-workflow's own checkpoint storage is detached.** A sub-workflow is
+  checkpointed by its parent; its own storage wrote a second, independent
+  series of checkpoints that nothing ever resumed from (upstream #7097).
 
 ### Changed
 
@@ -91,6 +103,20 @@ what was already at parity and what is deliberately deferred.
   message carrying a breakpoint is emitted in typed content-part form even
   when it is text-only, since a plain-string `content` has nowhere to carry
   one (upstream #7163).
+- **Responses session continuity in the hosting crate.**
+  `ResponsesRequest` gained `previous_response_id` / `conversation_id` and a
+  `session_id()` helper returning a `SessionId` — `PreviousResponse` or
+  `Conversation`, since only a conversation id is echoed back to the client.
+  An id without its conventional `resp_` / `conv_` prefix is accepted but
+  warns. `ResponseObject::with_conversation` renders the `conversation` field,
+  and `hosting::conversation_id()` mints `conv_…` ids. DevUI's non-streaming
+  agent route is wired through it (upstream #7234).
+- **Nested workflow checkpoint primitives.**
+  `WorkflowRun::capture_checkpoint_object` snapshots a quiescent run without
+  persisting it, and `Workflow::restore_run_from_checkpoint_object` rebuilds a
+  paused run without resuming it, so a caller decides when it runs again.
+  These back the sub-workflow fix above and are public for anyone embedding a
+  workflow's state elsewhere (upstream #7097).
 - `types::structured_output_text(&[Message]) -> String` — the
   structured-output text-extraction helper described above.
 - `Content::as_plain_text()` — text content only, excluding reasoning.
