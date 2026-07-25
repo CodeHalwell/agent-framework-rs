@@ -343,26 +343,47 @@ fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalRespo
 /// `_replace_approval_contents_with_results`.
 ///
 /// * A [`FunctionApprovalRequestContent`] becomes its embedded
-///   [`FunctionCallContent`], unless that call already exists in the same
-///   message (a duplicate), in which case the request is removed.
+///   [`FunctionCallContent`], unless that call is already pending elsewhere in
+///   the conversation (a duplicate), in which case the request is removed.
 /// * An approved [`FunctionApprovalResponseContent`] becomes the corresponding
 ///   result (correlated strictly by call id) and the message role becomes
 ///   `tool`.
 /// * A rejected response becomes a [`FunctionResultContent`] carrying the
 ///   rejection payload, and the message role becomes `tool`.
+///
+/// The duplicate check is **conversation-wide**, not per-message (upstream
+/// #7267). A function call and its approval request routinely live in separate
+/// messages — a hosting layer replaying an approval round trip emits them as
+/// separate items — so scoping the check to one message let the same `call_id`
+/// be restored twice, leaving the copy without a result unanswered and the
+/// provider seeing a duplicate call.
+///
+/// Call ids that already carry a *real* result are excluded from the pending
+/// set: reusing a `call_id` for a later invocation is legal, and treating the
+/// completed pair as pending would suppress the fresh request — dropping the
+/// new call and attaching its result to the old one.
 fn replace_approval_contents_with_results(
     messages: &mut [Message],
     approved_results: &HashMap<String, FunctionResultContent>,
 ) {
-    for msg in messages.iter_mut() {
-        let existing_call_ids: std::collections::HashSet<String> = msg
-            .contents
-            .iter()
-            .filter_map(Content::as_function_call)
-            .filter(|fc| !fc.call_id.is_empty())
-            .map(|fc| fc.call_id.clone())
-            .collect();
+    let answered_call_ids: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_result)
+        .map(|fr| fr.call_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
 
+    let mut existing_call_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_call)
+        .map(|fc| fc.call_id.as_str())
+        .filter(|id| !id.is_empty() && !answered_call_ids.contains(id))
+        .map(String::from)
+        .collect();
+
+    for msg in messages.iter_mut() {
         let mut to_remove: Vec<usize> = Vec::new();
         let mut set_role_tool = false;
 
@@ -372,7 +393,14 @@ fn replace_approval_contents_with_results(
                     if existing_call_ids.contains(&req.function_call.call_id) {
                         to_remove.push(idx);
                     } else {
-                        *content = Content::FunctionCall(req.function_call.clone());
+                        let call = req.function_call.clone();
+                        // Register the restored call so a second approval
+                        // request for the same id later in the conversation is
+                        // dropped rather than restored a second time.
+                        if !call.call_id.is_empty() {
+                            existing_call_ids.insert(call.call_id.clone());
+                        }
+                        *content = Content::FunctionCall(call);
                     }
                 }
                 Content::FunctionApprovalResponse(resp) => {
@@ -1105,5 +1133,112 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+}
+
+#[cfg(test)]
+mod approval_replay_tests {
+    use super::*;
+    use crate::types::FunctionArguments;
+
+    fn call(id: &str) -> FunctionCallContent {
+        FunctionCallContent::new(id, "get_secret", Some(FunctionArguments::Raw("{}".into())))
+    }
+
+    fn request(id: &str) -> Content {
+        Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+            id: format!("approval-{id}"),
+            function_call: call(id),
+        })
+    }
+
+    fn count_calls(messages: &[Message], call_id: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_call)
+            .filter(|fc| fc.call_id == call_id)
+            .count()
+    }
+
+    /// Upstream #7267. A hosting layer replaying an approval round trip emits
+    /// the original function call and its approval request as *separate*
+    /// messages. Scoping the duplicate check per-message restored the call a
+    /// second time, so the provider saw two identical calls and only one got a
+    /// result.
+    #[test]
+    fn approval_request_in_a_later_message_is_not_restored_twice() {
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            Message::with_contents(Role::assistant(), vec![request("c1")]),
+        ];
+
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+
+        assert_eq!(
+            count_calls(&messages, "c1"),
+            1,
+            "the duplicate approval request must be dropped, not restored"
+        );
+        assert!(
+            messages[1].contents.is_empty(),
+            "the duplicate request is removed from its message"
+        );
+    }
+
+    /// A call id that already carries a real result is *answered*, so it must
+    /// not suppress a fresh request that reuses the same id — otherwise the new
+    /// call is dropped and its result attached to the completed one.
+    #[test]
+    fn answered_call_does_not_suppress_a_reused_call_id() {
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    "c1",
+                    Some(Value::String("42".into())),
+                ))],
+            ),
+            Message::with_contents(Role::assistant(), vec![request("c1")]),
+        ];
+
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+
+        assert_eq!(
+            count_calls(&messages, "c1"),
+            2,
+            "the fresh request is restored because the earlier call was answered"
+        );
+    }
+
+    /// Two pending requests for the same id collapse to a single call: the
+    /// first is restored and registered, the second is recognised as a
+    /// duplicate of it.
+    #[test]
+    fn repeated_approval_requests_collapse_to_one_call() {
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![request("c1")]),
+            Message::with_contents(Role::assistant(), vec![request("c1")]),
+        ];
+
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+
+        assert_eq!(count_calls(&messages, "c1"), 1);
+    }
+
+    /// Distinct call ids are independent — the conversation-wide set must not
+    /// over-collapse parallel tool calls.
+    #[test]
+    fn distinct_call_ids_are_each_restored() {
+        let mut messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![request("c1"), request("c2")],
+        )];
+
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+
+        assert_eq!(count_calls(&messages, "c1"), 1);
+        assert_eq!(count_calls(&messages, "c2"), 1);
     }
 }

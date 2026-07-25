@@ -262,7 +262,10 @@ types (`FunctionInvokingChatClient`, `RetryingChatClient`,
 
 See [PARITY.md](PARITY.md) for the feature matrix and
 [GAP_ANALYSIS.md](GAP_ANALYSIS.md) for the audited gap list and its status
-section (the current source of truth). The remaining gaps:
+section (the current source of truth).
+[UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) carries the current upstream pin and
+the per-sync record of what has been ported since the last release. The
+remaining gaps:
 
 - [ ] Workflow depth: typed executor routing / multiple handlers,
       `AgentExecutorRequest`-style envelopes, sub-workflow request

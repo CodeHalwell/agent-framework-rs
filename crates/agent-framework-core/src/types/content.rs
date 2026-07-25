@@ -146,6 +146,16 @@ pub struct TextReasoningContent {
     /// Responses input mapper re-emits it from here. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_representation: Option<Value>,
+    /// Opaque provider-signed data attached to this reasoning step that must be
+    /// echoed back on the next turn, base64-encoded.
+    ///
+    /// Mirrors upstream's `Content.protected_data`. Gemini 3 is the current
+    /// user: it signs each reasoning step with a `thoughtSignature` and rejects
+    /// a later function-call replay that does not carry it back. The value is
+    /// deliberately opaque — providers may sign different things, and it is
+    /// never interpreted here, only round-tripped.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub protected_data: Option<String>,
 }
 
 /// Inline binary data encoded as a `data:` URI.

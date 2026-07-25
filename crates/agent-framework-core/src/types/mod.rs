@@ -18,6 +18,6 @@ pub use embedding::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
-    AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate, ContinuationToken,
-    FinishReason,
+    structured_output_text, AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate,
+    ContinuationToken, FinishReason,
 };

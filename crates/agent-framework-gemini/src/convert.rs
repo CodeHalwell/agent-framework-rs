@@ -100,11 +100,29 @@ pub fn messages_to_gemini(messages: &[Message]) -> Vec<Value> {
         } else {
             "user"
         };
-        let parts: Vec<Value> = msg
-            .contents
-            .iter()
-            .filter_map(|c| content_to_part(c, &call_names))
-            .collect();
+        // Reasoning is never sent back to Gemini as a part of its own. Instead
+        // its `thoughtSignature` is held and stamped onto the function call it
+        // precedes, which is the form Gemini 3 requires on replay (upstream
+        // #7095). A signature applies only to an immediately-following function
+        // call: any other content clears it.
+        let mut pending_signature: Option<&str> = None;
+        let mut parts: Vec<Value> = Vec::with_capacity(msg.contents.len());
+        for content in &msg.contents {
+            if let Content::TextReasoning(t) = content {
+                pending_signature = t.protected_data.as_deref().filter(|s| !s.is_empty());
+                continue;
+            }
+            let signature = pending_signature.take();
+            let Some(mut part) = content_to_part(content, &call_names) else {
+                continue;
+            };
+            if let (Content::FunctionCall(_), Some(sig)) = (content, signature) {
+                if let Some(obj) = part.as_object_mut() {
+                    obj.insert("thoughtSignature".to_string(), json!(sig));
+                }
+            }
+            parts.push(part);
+        }
         if parts.is_empty() {
             // Gemini rejects a content entry with an empty `parts` array.
             continue;
@@ -137,7 +155,10 @@ fn collect_call_names(messages: &[Message]) -> HashMap<String, String> {
 fn content_to_part(content: &Content, call_names: &HashMap<String, String>) -> Option<Value> {
     match content {
         Content::Text(t) => Some(json!({ "text": t.text })),
-        Content::TextReasoning(t) => Some(json!({ "text": t.text, "thought": true })),
+        // Reasoning is not replayed as a part — `messages_to_gemini` consumes
+        // it for its `thoughtSignature` before reaching here. Echoing a
+        // `thought` part back is what upstream stopped doing in #7095.
+        Content::TextReasoning(_) => None,
         Content::FunctionCall(fc) => Some(function_call_part(fc)),
         Content::FunctionResult(fr) => Some(function_response_part(fr, call_names)),
         Content::Data(dc) => data_part(dc),
@@ -433,6 +454,13 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
                 out.push(Content::TextReasoning(TextReasoningContent {
                     text: text.to_string(),
                     annotations: None,
+                    // Gemini 3 signs each reasoning step; the signature has to
+                    // ride back out on the function call this reasoning
+                    // precedes or the replay is rejected (upstream #7095).
+                    protected_data: part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                     ..Default::default()
                 }));
             } else {
@@ -1093,4 +1121,136 @@ mod tests {
     }
 
     // endregion
+}
+
+#[cfg(test)]
+mod thought_signature_tests {
+    use super::*;
+    use agent_framework_core::types::{FunctionArguments, TextReasoningContent};
+
+    fn reasoning(text: &str, signature: Option<&str>) -> Content {
+        Content::TextReasoning(TextReasoningContent {
+            text: text.into(),
+            annotations: None,
+            protected_data: signature.map(String::from),
+            ..Default::default()
+        })
+    }
+
+    fn call(name: &str) -> Content {
+        Content::FunctionCall(FunctionCallContent::new(
+            "call_1",
+            name,
+            Some(FunctionArguments::Raw("{}".into())),
+        ))
+    }
+
+    fn parts_of(messages: &[Message]) -> Vec<Value> {
+        messages_to_gemini(messages)
+            .first()
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Upstream #7095: Gemini 3 signs each reasoning step and rejects a
+    /// function-call replay that does not echo the signature back.
+    #[test]
+    fn thought_signature_is_parsed_off_the_reasoning_part() {
+        let value = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "text": "thinking...", "thought": true, "thoughtSignature": "c2ln" }
+                ] },
+            }],
+        });
+        let resp = parse_response(&value);
+        let Content::TextReasoning(r) = &resp.messages[0].contents[0] else {
+            panic!("expected reasoning content");
+        };
+        assert_eq!(r.protected_data.as_deref(), Some("c2ln"));
+    }
+
+    #[test]
+    fn thought_signature_rides_out_on_the_following_function_call() {
+        let messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![reasoning("thinking...", Some("c2ln")), call("get_weather")],
+        )];
+        let parts = parts_of(&messages);
+
+        // Reasoning is not replayed as a part of its own.
+        assert_eq!(parts.len(), 1, "got: {parts:?}");
+        assert!(parts[0].get("functionCall").is_some());
+        assert_eq!(parts[0].get("thoughtSignature"), Some(&json!("c2ln")));
+    }
+
+    /// A signature applies only to an *immediately* following function call.
+    /// Intervening content clears it, so it is never stamped onto an unrelated
+    /// call further down the message.
+    #[test]
+    fn intervening_content_clears_the_pending_signature() {
+        let messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![
+                reasoning("thinking...", Some("c2ln")),
+                Content::text("here goes"),
+                call("get_weather"),
+            ],
+        )];
+        let parts = parts_of(&messages);
+
+        assert_eq!(parts.len(), 2, "got: {parts:?}");
+        assert!(parts[0].get("text").is_some());
+        assert_eq!(
+            parts[1].get("thoughtSignature"),
+            None,
+            "the text part consumed the signature slot"
+        );
+    }
+
+    /// Reasoning without a signature (Gemini 2, or a summary-only step) still
+    /// must not be replayed, and must not stamp an empty signature.
+    #[test]
+    fn unsigned_reasoning_leaves_the_function_call_untouched() {
+        let messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![reasoning("thinking...", None), call("get_weather")],
+        )];
+        let parts = parts_of(&messages);
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get("thoughtSignature"), None);
+    }
+
+    /// A message that is *only* reasoning produces no Gemini content entry at
+    /// all — Gemini rejects an entry with an empty `parts` array.
+    #[test]
+    fn reasoning_only_message_is_dropped_entirely() {
+        let messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![reasoning("thinking...", Some("c2ln"))],
+        )];
+        assert!(messages_to_gemini(&messages).is_empty());
+    }
+
+    /// The signature survives a parse → replay round trip, which is the actual
+    /// sequence Gemini 3 requires during multi-turn tool calling.
+    #[test]
+    fn signature_survives_a_parse_then_replay_round_trip() {
+        let value = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "text": "thinking...", "thought": true, "thoughtSignature": "c2ln" },
+                    { "functionCall": { "name": "get_weather", "args": {} } }
+                ] },
+            }],
+        });
+        let parsed = parse_response(&value);
+        let parts = parts_of(&parsed.messages);
+
+        assert_eq!(parts.len(), 1, "got: {parts:?}");
+        assert_eq!(parts[0].get("thoughtSignature"), Some(&json!("c2ln")));
+    }
 }

@@ -730,6 +730,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                     text: String::new(),
                     annotations: None,
                     raw_representation: raw,
+                    protected_data: None,
                 }));
             } else {
                 let n = summaries.len();
@@ -738,6 +739,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                         text,
                         annotations: None,
                         raw_representation: (i == n - 1).then(|| raw.clone()).flatten(),
+                        protected_data: None,
                     }));
                 }
             }
@@ -879,7 +881,33 @@ fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
     }
 }
 
+/// Derive the framework finish reason from a terminal Responses API payload.
+///
+/// Mirrors upstream's `_get_finish_reason_from_openai_response` (#7105). The
+/// ordering is load-bearing:
+///
+/// 1. `incomplete_details.reason` wins, so a truncated or filtered response
+///    reports `length` / `content_filter` even though its `output` may already
+///    carry a partial `function_call` item.
+/// 2. A response that is not yet terminal (`in_progress`, `queued` — the
+///    background/continuation-token path) reports **no** finish reason. It
+///    previously reported the raw status as if it were one, putting values like
+///    `in_progress` into a field whose domain is `stop` / `tool_calls` /
+///    `length` / `content_filter`.
+/// 3. Only then does a `function_call` output item mean `tool_calls`.
 fn finish_reason_from_response(value: &Value) -> Option<FinishReason> {
+    match value
+        .get("incomplete_details")
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("content_filter") => return Some(FinishReason::new(FinishReason::CONTENT_FILTER)),
+        Some("max_output_tokens") => return Some(FinishReason::new(FinishReason::LENGTH)),
+        _ => {}
+    }
+    if value.get("status").and_then(Value::as_str)? != "completed" {
+        return None;
+    }
     let has_function_call = value
         .get("output")
         .and_then(Value::as_array)
@@ -889,23 +917,10 @@ fn finish_reason_from_response(value: &Value) -> Option<FinishReason> {
                 .any(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
         })
         .unwrap_or(false);
-    if has_function_call {
-        return Some(FinishReason::tool_calls());
-    }
-    let status = value.get("status").and_then(Value::as_str)?;
-    Some(match status {
-        "completed" => FinishReason::stop(),
-        "incomplete" => match value
-            .get("incomplete_details")
-            .and_then(|d| d.get("reason"))
-            .and_then(Value::as_str)
-        {
-            Some("max_output_tokens") => FinishReason::new(FinishReason::LENGTH),
-            Some("content_filter") => FinishReason::new(FinishReason::CONTENT_FILTER),
-            Some(other) => FinishReason::new(other),
-            None => FinishReason::new("incomplete"),
-        },
-        other => FinishReason::new(other),
+    Some(if has_function_call {
+        FinishReason::tool_calls()
+    } else {
+        FinishReason::stop()
     })
 }
 
@@ -1152,7 +1167,11 @@ fn parse_responses_event(
                 None => EventOutcome::None,
             }
         }
-        "response.completed" => {
+        // `response.incomplete` is terminal too: it carries the usage and the
+        // `incomplete_details.reason` that becomes `length` / `content_filter`
+        // (upstream #7105). Without it a truncated stream ended with no finish
+        // reason at all. `response.failed` stays on the error path below.
+        "response.completed" | "response.incomplete" => {
             let resp = value.get("response");
             let response_id = resp
                 .and_then(|r| r.get("id"))
@@ -1484,6 +1503,63 @@ mod tests {
         );
     }
 
+    /// Upstream #7105. A background response that is still running is not
+    /// terminal, so it has no finish reason. Reporting the raw status put
+    /// `in_progress` / `queued` into a field whose domain is
+    /// stop/tool_calls/length/content_filter.
+    #[test]
+    fn parse_response_non_terminal_status_has_no_finish_reason() {
+        for status in ["in_progress", "queued"] {
+            let value = json!({ "id": "resp_123", "status": status, "output": [] });
+            assert_eq!(
+                parse_response(&value, None).finish_reason,
+                None,
+                "status {status} must not produce a finish reason"
+            );
+        }
+    }
+
+    /// `incomplete_details` outranks a partial `function_call` item: a response
+    /// truncated mid-tool-call finished because it hit the token cap, not
+    /// because it wanted tools.
+    #[test]
+    fn parse_response_incomplete_details_outrank_partial_function_call() {
+        let value = json!({
+            "id": "resp_123",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [
+                { "type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{" }
+            ],
+        });
+        assert_eq!(
+            parse_response(&value, None).finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+    }
+
+    #[test]
+    fn parse_response_incomplete_content_filter_is_content_filter() {
+        let value = json!({
+            "id": "resp_123",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "output": [],
+        });
+        assert_eq!(
+            parse_response(&value, None).finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+    }
+
+    /// An unrecognised terminal status yields no finish reason rather than
+    /// being echoed verbatim.
+    #[test]
+    fn parse_response_unknown_status_has_no_finish_reason() {
+        let value = json!({ "id": "resp_123", "status": "cancelled", "output": [] });
+        assert_eq!(parse_response(&value, None).finish_reason, None);
+    }
+
     #[test]
     fn parse_response_reasoning_becomes_text_reasoning() {
         let value = json!({
@@ -1560,6 +1636,7 @@ mod tests {
                 text: "just display".into(),
                 annotations: None,
                 raw_representation: None,
+                protected_data: None,
             })],
         );
         let input = messages_to_input(&[msg]);
@@ -1651,6 +1728,35 @@ mod tests {
         let usage = resp.usage_details.unwrap();
         assert_eq!(usage.input_token_count, Some(3));
         assert_eq!(usage.output_token_count, Some(2));
+    }
+
+    /// Upstream #7105 added `response.incomplete` to the terminal events that
+    /// carry a finish reason. Without it a truncated stream ended with no
+    /// finish reason and no usage at all.
+    #[tokio::test]
+    async fn stream_incomplete_event_is_terminal_and_reports_length() {
+        let text = sse_body(&[
+            (
+                "response.created",
+                json!({ "type": "response.created", "response": { "id": "resp_3", "model": "gpt-4o-mini" } }),
+            ),
+            (
+                "response.output_text.delta",
+                json!({ "type": "response.output_text.delta", "delta": "truncated" }),
+            ),
+            (
+                "response.incomplete",
+                json!({ "type": "response.incomplete", "response": { "id": "resp_3", "model": "gpt-4o-mini", "status": "incomplete", "incomplete_details": { "reason": "max_output_tokens" }, "output": [], "usage": { "input_tokens": 3, "output_tokens": 9 } } }),
+            ),
+        ]);
+        let updates = collect_updates(text).await;
+        let resp = ChatResponse::from_updates(updates);
+        assert_eq!(resp.text(), "truncated");
+        assert_eq!(
+            resp.finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+        assert_eq!(resp.usage_details.unwrap().output_token_count, Some(9));
     }
 
     #[tokio::test]

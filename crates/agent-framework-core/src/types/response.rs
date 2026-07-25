@@ -10,6 +10,41 @@ use super::message::{Message, Role};
 use super::options::ResponseFormat;
 use crate::error::{Error, Result};
 
+/// The text a structured-output value is parsed from: the text contents of the
+/// last non-empty **assistant** message, concatenated with *no* separator.
+///
+/// Mirrors Python's `_last_non_empty_assistant_message_text` (`_types.py`,
+/// upstream #6990). Two details matter and neither is incidental:
+///
+/// * **No separator.** A JSON payload the model streams as several text chunks
+///   (`{"na` + `me":"x"}`) is reassembled verbatim. The space-joined
+///   [`Message::text`] would yield `{"na me":"x"}` — either a parse failure or,
+///   worse, silently wrong keys.
+/// * **Only `Content::Text`.** Reasoning content is excluded, matching Python's
+///   `content.type == "text"` filter, so a model's chain-of-thought never leaks
+///   into the parsed value.
+///
+/// Returns an empty string when no assistant message carries non-blank text.
+pub fn structured_output_text(messages: &[Message]) -> String {
+    for message in messages.iter().rev() {
+        if message.role.0 != Role::ASSISTANT {
+            continue;
+        }
+        let text: String = message
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// Reason a chat response finished. Open value wrapper, like `FinishReason`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -123,12 +158,13 @@ impl ChatResponse {
             .collect()
     }
 
-    /// Parse the response's concatenated text into a structured value.
+    /// Parse the response's structured-output text into a value.
     ///
-    /// Mirrors Python's `response.value`: the message text is treated as JSON
+    /// Mirrors Python's `response.value`: the text of the last non-empty
+    /// assistant message (see [`structured_output_text`]) is treated as JSON
     /// and deserialized into `T`.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.text())
+        serde_json::from_str(&structured_output_text(&self.messages))
             .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
     }
 
@@ -185,7 +221,10 @@ impl ChatResponse {
         if !wants_json {
             return;
         }
-        let text = self.text();
+        let text = structured_output_text(&self.messages);
+        if text.trim().is_empty() {
+            return;
+        }
         match serde_json::from_str::<Value>(&text) {
             Ok(v) => self.value = Some(v),
             Err(e) => tracing::debug!("failed to parse structured-output value from text: {e}"),
@@ -396,12 +435,13 @@ impl AgentResponse {
             .collect()
     }
 
-    /// Parse the run's concatenated text into a structured value.
+    /// Parse the run's structured-output text into a value.
     ///
-    /// Mirrors Python's `response.value`: the message text is treated as JSON
+    /// Mirrors Python's `response.value`: the text of the last non-empty
+    /// assistant message (see [`structured_output_text`]) is treated as JSON
     /// and deserialized into `T`.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.text())
+        serde_json::from_str(&structured_output_text(&self.messages))
             .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
     }
 
@@ -601,6 +641,68 @@ mod tests {
             resp.value, None,
             "parse failure leaves value None, no panic/err"
         );
+    }
+
+    // Upstream #6990: a JSON payload split mid-token across streaming chunks
+    // must be reassembled verbatim. The old space-joined `text()` turned
+    // `{"na` + `me":"x"}` into `{"na me":"x"}` — which parses, but yields the
+    // wrong key, so this is a silent-corruption regression, not a parse error.
+    #[test]
+    fn from_updates_with_format_reassembles_chunks_split_mid_token() {
+        let updates = vec![text_update("{\"na"), text_update("me\":\"x\"}")];
+        let resp =
+            ChatResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
+        assert_eq!(resp.value, Some(json!({"name": "x"})));
+    }
+
+    #[test]
+    fn structured_output_text_ignores_reasoning_content() {
+        // Reasoning is `text_reasoning`, not `text`: Python filters it out of
+        // the structured-output text, so chain-of-thought never reaches the
+        // parsed value.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(super::super::content::TextReasoningContent {
+                    text: "let me think...".into(),
+                    ..Default::default()
+                }),
+                Content::text("{\"a\": 1}"),
+            ],
+        );
+        assert_eq!(structured_output_text(&[msg]), "{\"a\": 1}");
+    }
+
+    #[test]
+    fn structured_output_text_uses_last_non_empty_assistant_message() {
+        let messages = vec![
+            Message::assistant("{\"first\": true}"),
+            Message::user("ignore me"),
+            Message::assistant("   "), // blank: skipped
+            Message::assistant("{\"last\": true}"),
+        ];
+        assert_eq!(structured_output_text(&messages), "{\"last\": true}");
+    }
+
+    #[test]
+    fn structured_output_text_skips_non_assistant_messages() {
+        // A user message that happens to hold JSON must not be parsed as the
+        // response value.
+        let messages = vec![Message::user("{\"from_user\": true}")];
+        assert_eq!(structured_output_text(&messages), "");
+    }
+
+    #[test]
+    fn parse_json_reads_only_the_final_assistant_message() {
+        let resp = ChatResponse {
+            messages: vec![
+                Message::assistant("{\"n\": 1}"),
+                Message::assistant("{\"n\": 2}"),
+            ],
+            ..Default::default()
+        };
+        let v: Value = resp.parse_json().unwrap();
+        assert_eq!(v, json!({"n": 2}));
     }
 
     #[test]

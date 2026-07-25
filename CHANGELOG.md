@@ -5,6 +5,65 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+Upstream parity sync. 0.1.1 was cut against `microsoft/agent-framework`
+`beb65b21` (2026-07-13); this re-pins the port to **`c6442de`
+(2026-07-24)**. All 102 upstream commits in that window were triaged — see
+[UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) for the full disposition, including
+what was already at parity and what is deliberately deferred.
+
+### Fixed
+
+- **Structured output no longer corrupts JSON split across streaming
+  chunks.** `ChatResponse::parse_json`, `AgentResponse::parse_json` and the
+  `value` auto-fill read the text of the *last non-empty assistant message*,
+  concatenated with no separator. They previously used `text()`, which
+  space-joins content items and newline-joins messages: a payload streamed
+  as `{"na` + `me":"x"}` became `{"na me":"x"}` — valid JSON with the wrong
+  key, so it failed silently rather than loudly. Reasoning content is now
+  also excluded, so chain-of-thought can no longer leak into a parsed value
+  (upstream #6990). See `types::structured_output_text`.
+- **Approval round trips no longer duplicate a function call.** The
+  duplicate check in the approval-replay rewrite is conversation-wide
+  instead of per-message. A function call and its approval request routinely
+  arrive in *separate* messages, so the per-message check restored the same
+  `call_id` twice, leaving one copy permanently unanswered. Call ids that
+  already carry a real result are excluded from the pending set, so reusing
+  a `call_id` for a later invocation still works (upstream #7267).
+- **OpenAI Responses finish reasons follow the upstream precedence.**
+  `incomplete_details.reason` now outranks a partial `function_call` output
+  item (a response truncated mid-tool-call reports `length`, not
+  `tool_calls`), and a non-terminal response — the background /
+  continuation-token path — reports no finish reason at all instead of
+  surfacing `in_progress` / `queued` as if they were ones. The
+  `response.incomplete` streaming event is now terminal, so a truncated
+  stream carries its finish reason and usage. Azure OpenAI and Foundry
+  inherit this by delegation (upstream #7105).
+- **Gemini 3 function-call replays keep their thought signature.**
+  `thoughtSignature` is parsed off a reasoning part into the new
+  `TextReasoningContent::protected_data` and stamped back onto the function
+  call that reasoning precedes. Reasoning is no longer replayed as a
+  `thought` part of its own. Without the signature Gemini 3 rejects the
+  follow-up turn of a tool-calling exchange (upstream #7095).
+
+### Changed
+
+- `gen_ai.response.finish_reasons` is now only recorded for the four values
+  the OpenTelemetry GenAI convention defines, and `tool_calls` is emitted
+  under the convention's name `tool_call`. `FinishReason` is an open string
+  enum, so provider-specific values previously landed on spans verbatim
+  (upstream #7105).
+
+### Added
+
+- `types::structured_output_text(&[Message]) -> String` — the
+  structured-output text-extraction helper described above.
+- `TextReasoningContent::protected_data: Option<String>` — opaque
+  provider-signed data for a reasoning step that must be echoed back on the
+  next turn, mirroring upstream's `Content.protected_data`. Additive and
+  serde-optional, so existing serialized content deserializes unchanged.
+
 ## [0.1.1] — 2026-07-13
 
 First published release on crates.io — identical in content to 0.1.0.

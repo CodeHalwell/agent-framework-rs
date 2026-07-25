@@ -51,6 +51,12 @@ from the two pinned revisions and will drift as files are edited.
 - **`GAP_ANALYSIS.md`** — the independent audit, also at `638fbb5f`. It is
   corrected separately (see the companion re-baseline pass); this document is
   the input to that correction.
+- **`UPSTREAM_SYNC.md`** — the running sync log, added after this document.
+  Where this document is a one-off re-baseline, the sync log records each
+  incremental sync since the 0.1.1 release: the upstream commit range, what
+  was ported, what was already at parity, and what is deferred. **It carries
+  the current upstream pin** — check it first to find out how stale the port
+  is before trusting any baseline quoted here.
 
 ### Change classification
 

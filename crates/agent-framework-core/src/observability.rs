@@ -97,7 +97,7 @@ use tracing::{Instrument, Span};
 use crate::client::{ChatClient, ChatStream};
 use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
-use crate::types::{ChatOptions, ChatResponse, Message};
+use crate::types::{ChatOptions, ChatResponse, FinishReason, Message};
 
 /// OpenTelemetry GenAI semantic-convention attribute keys.
 pub mod attr {
@@ -344,11 +344,35 @@ pub fn record_error(span: &Span, err: &Error) {
     span.record(attr::OTEL_STATUS_MESSAGE, err.to_string().as_str());
 }
 
+/// Map a framework finish reason onto the GenAI semantic-convention value, or
+/// `None` when it is not one the convention defines.
+///
+/// Mirrors upstream's `FINISH_REASON_MAP` gate (`observability.py`, #7105).
+/// [`crate::types::FinishReason`] is an open string enum, so providers can and
+/// do surface values outside the convention (a raw provider status, a
+/// `refusal`, a vendor-specific stop code). Those are dropped rather than
+/// written verbatim into `gen_ai.response.finish_reasons`, which would put
+/// non-conforming values on the span and break downstream aggregation. Note the
+/// name change: `tool_calls` is reported as the convention's `tool_call`.
+fn otel_finish_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        FinishReason::STOP => Some("stop"),
+        FinishReason::CONTENT_FILTER => Some("content_filter"),
+        FinishReason::TOOL_CALLS => Some("tool_call"),
+        FinishReason::LENGTH => Some("length"),
+        _ => None,
+    }
+}
+
 /// Record the response-side attributes (finish reason, usage, id, model) onto
 /// `span`, mirroring `_get_response_attributes` (`observability.py:1488-1512`).
 pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bool) {
-    if let Some(reason) = &response.finish_reason {
-        span.record(attr::FINISH_REASONS, reason.as_str());
+    if let Some(reason) = response
+        .finish_reason
+        .as_ref()
+        .and_then(|r| otel_finish_reason(r.as_str()))
+    {
+        span.record(attr::FINISH_REASONS, reason);
     }
     if let Some(id) = &response.response_id {
         span.record(attr::RESPONSE_ID, id.as_str());
@@ -903,6 +927,33 @@ pub mod metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Finish-reason gating (upstream #7105) ---------------------------
+
+    /// The GenAI convention names the tool-call reason `tool_call`, singular,
+    /// while the framework's own value is `tool_calls`. Upstream's
+    /// `FINISH_REASON_MAP` performs exactly this rename.
+    #[test]
+    fn otel_finish_reason_maps_convention_values() {
+        assert_eq!(otel_finish_reason("stop"), Some("stop"));
+        assert_eq!(otel_finish_reason("length"), Some("length"));
+        assert_eq!(otel_finish_reason("content_filter"), Some("content_filter"));
+        assert_eq!(otel_finish_reason("tool_calls"), Some("tool_call"));
+    }
+
+    /// `FinishReason` is an open string enum, so providers surface values the
+    /// convention does not define. Those are dropped rather than written to
+    /// `gen_ai.response.finish_reasons` verbatim.
+    #[test]
+    fn otel_finish_reason_drops_values_outside_the_convention() {
+        for reason in ["in_progress", "queued", "refusal", "", "Stop", "tool_call"] {
+            assert_eq!(
+                otel_finish_reason(reason),
+                None,
+                "{reason:?} is not a convention value and must not be recorded"
+            );
+        }
+    }
 
     // -- Attribute string values (cross-language wire contract) ----------
 
