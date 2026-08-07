@@ -72,6 +72,31 @@ Not applicable in this cluster:
   before the provider call) — both govern the LLM-backed `Summarization`
   strategy, which this port does not have.
 
+### mem0 storage/retrieval scope separation (#7531)
+
+The port had the same cross-user memory leak upstream fixed: `before_run`
+searched with `self.user_id` / `self.agent_id` — the *storage* scope. A provider
+configured with a shared `agent_id` (one agent serving many users, the ordinary
+deployment shape) therefore retrieved memories written by **every** user of that
+agent and injected them into the current user's conversation.
+
+`Mem0Provider` now separates the two scopes exactly as upstream does:
+
+- **Storage** — `with_application_id` / `with_agent_id` / `with_user_id`, stamped
+  onto memories written by `after_run`, never used to retrieve.
+- **Retrieval** — `with_search_application_id` / `with_search_agent_id` /
+  `with_search_user_id`, used only by `before_run`, and never inheriting from
+  the storage scope. With no retrieval scope set, `before_run` retrieves nothing
+  and warns once. `search_application_id` narrows a search only as a fallback
+  when neither user nor agent retrieval scope is set, matching upstream.
+
+This is a deliberate **behavior change**, as it was upstream: code that
+retrieved memories via `with_user_id` alone must now also set
+`with_search_user_id`. Agent-wide retrieval has to be requested explicitly,
+which is the entire point — the leak came from it being implicit. Seven
+loopback tests configured only a storage scope and were updated; three new tests
+pin the isolation.
+
 ### Verified already satisfied — no action (the port was level or ahead)
 
 - **#6809** function-call name lost when a streaming delta carries it late —
@@ -124,9 +149,8 @@ roughly in descending value order:
   GPT-5.6 prompt-cache breakpoints (#7163), Responses conversation-ID helper
   (#7234, BREAKING), Foundry agent inheriting `OPENAI_CHAT_MODEL` (#7283),
   GitHub Copilot options forwarding (#7155) and inline-blob attachments
-  (#7300), CopilotStudio `LineTooLong` on large activities (#7417), mem0
-  storage/search scope separation (#7531), Azure AI Search query-source
-  identity (#7278).
+  (#7300), CopilotStudio `LineTooLong` on large activities (#7417), Azure AI
+  Search query-source identity (#7278).
 - **MCP**: `header_provider` headers on the initialize handshake and ambient
   requests (#7305, #7218), tool-use sampling results (#7189).
 - **New package**: `azure-cosmos-memory` context provider (#6719).

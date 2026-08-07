@@ -46,6 +46,14 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
 
 ### Changed
 
+- **BREAKING: mem0 retrieval scope no longer inherits the storage scope.**
+  `Mem0Provider::before_run` searched with the storage `user_id`/`agent_id`, so
+  a provider configured with a shared `agent_id` retrieved memories written by
+  every user of that agent and injected them into the current user's
+  conversation. Retrieval now uses only `with_search_user_id` /
+  `with_search_agent_id` / `with_search_application_id`; with none set, nothing
+  is retrieved and a warning is logged once. Code that retrieved via
+  `with_user_id` alone must add `with_search_user_id`. (upstream #7531)
 - **`SelectiveToolResult` now replaces a stale tool result's payload with
   `OMITTED_TOOL_RESULT` instead of deleting the result content.** Deleting it
   orphaned the matching function call; replacing the payload sheds the same

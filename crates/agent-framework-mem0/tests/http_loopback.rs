@@ -230,7 +230,8 @@ async fn before_run_posts_to_v2_search_and_injects_hits_into_ctx_messages() {
 
     let provider = Mem0Provider::new("test-api-key")
         .with_api_base(base_url)
-        .with_user_id("user-42");
+        .with_user_id("user-42")
+        .with_search_user_id("user-42");
 
     let mut ctx = SessionContext::new(vec![Message::user("What's the weather like where I live?")]);
     provider.before_run(&mut ctx).await.unwrap();
@@ -265,7 +266,8 @@ async fn before_run_handles_results_wrapper_response_shape() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_agent_id("agent-1");
+        .with_agent_id("agent-1")
+        .with_search_agent_id("agent-1");
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages[0]
@@ -281,7 +283,8 @@ async fn before_run_empty_results_injects_no_messages() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages.is_empty());
@@ -300,7 +303,8 @@ async fn before_run_surfaces_non_2xx_status_as_service_error() {
 
     let provider = Mem0Provider::new("bad-key")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hi")]);
     let err = provider.before_run(&mut ctx).await.unwrap_err();
     let msg = err.to_string();
@@ -321,7 +325,8 @@ async fn after_run_surfaces_non_2xx_status_as_service_error() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let err = provider
         .after_run(&[Message::user("hi")], &[], None)
         .await
@@ -348,7 +353,8 @@ async fn before_run_surfaces_malformed_json_response_as_error() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hi")]);
     let err = provider.before_run(&mut ctx).await.unwrap_err();
     assert!(err.to_string().contains("invalid Mem0 API response JSON"));
@@ -363,7 +369,8 @@ async fn before_run_scopes_search_to_agent_and_run_id() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_agent_id("agent-1")
-        .with_thread_id("thread-1");
+        .with_thread_id("thread-1")
+        .with_search_agent_id("agent-1");
 
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
@@ -374,4 +381,62 @@ async fn before_run_scopes_search_to_agent_and_run_id() {
         body["filters"],
         json!({"agent_id": "agent-1", "run_id": "thread-1"})
     );
+}
+
+// region: storage vs. retrieval scope isolation (upstream #7531)
+
+#[tokio::test]
+async fn before_run_retrieves_nothing_without_a_retrieval_scope() {
+    // The storage scope must not double as the retrieval scope: a provider
+    // configured with a shared agent_id would otherwise read back memories
+    // written by every user of that agent. No search scope => no request at
+    // all, so no server is started here — a request would fail to connect.
+    let provider = Mem0Provider::new("k")
+        .with_api_base("http://127.0.0.1:1".to_string())
+        .with_user_id("u1")
+        .with_agent_id("shared-agent");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.messages.is_empty());
+}
+
+#[tokio::test]
+async fn before_run_searches_the_retrieval_scope_not_the_storage_scope() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": [{"memory": "m"}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("storage-user")
+        .with_agent_id("storage-agent")
+        .with_search_user_id("retrieval-user");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["filters"]["user_id"], json!("retrieval-user"));
+    // The storage-only agent scope must not widen the search.
+    assert!(body["filters"].get("agent_id").is_none());
+}
+
+#[tokio::test]
+async fn application_id_scopes_a_search_only_as_a_fallback() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": []}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        // A storage scope is still required (the provider validates it for
+        // writes); the search must key off the *search* application id.
+        .with_application_id("app-1")
+        .with_search_application_id("app-1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["filters"]["app_id"], json!("app-1"));
 }

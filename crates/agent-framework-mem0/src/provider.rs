@@ -39,13 +39,17 @@
 //!   hosted API. If you're integrating against a Mem0 deployment that has
 //!   dropped `/v1/`/`/v2/` support, override the base URL and adjust, or
 //!   treat this crate as a template.
-//! - `application_id` here is **write-only**: it rides along as
-//!   `metadata.application_id` on `after_run()` but is never sent as a search
-//!   constraint on `before_run()`, matching the Python provider (whose
-//!   `invoking()` only ever forwards `user_id`/`agent_id`/`run_id` to
-//!   `.search()`). This is unlike the sibling `agent-framework-redis`
-//!   crate's `RedisContextProvider`, where `application_id` participates in
-//!   the scope filter on both reads and writes.
+//! - The **storage** scope (`application_id`/`agent_id`/`user_id`) and the
+//!   **retrieval** scope (`search_application_id`/`search_agent_id`/
+//!   `search_user_id`) are separate, and retrieval never inherits from
+//!   storage — see [`Mem0Provider`] for why (a shared `agent_id` would
+//!   otherwise leak one user's memories into another's conversation).
+//!   `application_id` remains write-only as a *storage* field; its retrieval
+//!   counterpart `search_application_id` narrows a search only when no
+//!   user/agent retrieval scope is set. This differs from the sibling
+//!   `agent-framework-redis` crate's `RedisContextProvider`, where a single
+//!   `application_id` participates in the scope filter on both reads and
+//!   writes.
 //! - Response parsing defensively accepts either a bare JSON array (the
 //!   `v2`/list-style response) or `{"results": [...]}` (the historical
 //!   `v1.1`-style response), exactly like the Python provider's
@@ -122,6 +126,7 @@ fn build_search_body(
     user_id: Option<&str>,
     agent_id: Option<&str>,
     run_id: Option<&str>,
+    application_id: Option<&str>,
 ) -> Value {
     let mut filters = serde_json::Map::new();
     if let Some(v) = user_id {
@@ -132,6 +137,14 @@ fn build_search_body(
     }
     if let Some(v) = run_id {
         filters.insert("run_id".to_string(), Value::String(v.to_string()));
+    }
+    // Mirrors upstream's app-scoped fallback: `application_id` narrows a search
+    // only when no user/agent retrieval scope is set, since an app id is far
+    // broader than either.
+    if filters.is_empty() {
+        if let Some(v) = application_id {
+            filters.insert("app_id".to_string(), Value::String(v.to_string()));
+        }
     }
     serde_json::json!({
         "query": query,
@@ -206,6 +219,24 @@ fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
 /// # Ok(())
 /// # }
 /// ```
+/// # Memory scoping
+///
+/// The **storage** scope ([`Self::with_application_id`], [`Self::with_agent_id`],
+/// [`Self::with_user_id`]) stamps memories written by `after_run`. The
+/// **retrieval** scope ([`Self::with_search_application_id`],
+/// [`Self::with_search_agent_id`], [`Self::with_search_user_id`]) selects which
+/// memories `before_run` reads back.
+///
+/// Retrieval values **never inherit** from the storage scope. When no
+/// `search_*` value is set, `before_run` retrieves nothing and logs a warning
+/// once. This is deliberate: a provider configured with a shared `agent_id` —
+/// one agent serving many users — would otherwise read back memories written by
+/// *every* user of that agent, leaking one user's memories into another user's
+/// conversation. Agent-wide retrieval has to be asked for explicitly.
+///
+/// Mirrors upstream's separation of the two scopes (#7531). It is a behavior
+/// change: a provider that previously retrieved memories via `with_user_id`
+/// alone now needs `with_search_user_id` as well.
 pub struct Mem0Provider {
     http: reqwest::Client,
     api_key: String,
@@ -213,10 +244,16 @@ pub struct Mem0Provider {
     application_id: Option<String>,
     agent_id: Option<String>,
     user_id: Option<String>,
+    search_application_id: Option<String>,
+    search_agent_id: Option<String>,
+    search_user_id: Option<String>,
     thread_id: Option<String>,
     scope_to_per_operation_thread_id: bool,
     context_prompt: String,
     per_operation_session_id: Mutex<Option<String>>,
+    /// Latches so the "no retrieval scope" warning is logged once, not once
+    /// per run.
+    warned_no_search_scope: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Mem0Provider {
@@ -226,6 +263,9 @@ impl std::fmt::Debug for Mem0Provider {
             .field("application_id", &self.application_id)
             .field("agent_id", &self.agent_id)
             .field("user_id", &self.user_id)
+            .field("search_application_id", &self.search_application_id)
+            .field("search_agent_id", &self.search_agent_id)
+            .field("search_user_id", &self.search_user_id)
             .field("thread_id", &self.thread_id)
             .field(
                 "scope_to_per_operation_thread_id",
@@ -248,10 +288,14 @@ impl Mem0Provider {
             application_id: None,
             agent_id: None,
             user_id: None,
+            search_application_id: None,
+            search_agent_id: None,
+            search_user_id: None,
             thread_id: None,
             scope_to_per_operation_thread_id: false,
             context_prompt: DEFAULT_CONTEXT_PROMPT.to_string(),
             per_operation_session_id: Mutex::new(None),
+            warned_no_search_scope: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -290,8 +334,40 @@ impl Mem0Provider {
     }
 
     /// Scope memories to a user id (builder style).
+    ///
+    /// This is the **storage** scope: it stamps memories written by
+    /// `after_run` and is never used to retrieve them. Pair it with
+    /// [`Self::with_search_user_id`] to read those memories back.
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
+        self
+    }
+
+    /// Retrieve memories stored under `user_id` (builder style).
+    ///
+    /// Part of the **retrieval** scope, which is deliberately separate from
+    /// the storage scope and never inherits from it — see the type-level docs.
+    pub fn with_search_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.search_user_id = Some(user_id.into());
+        self
+    }
+
+    /// Retrieve memories stored under `agent_id` (builder style).
+    ///
+    /// This retrieves memories written by **any** user under that agent, so
+    /// set it only for agent-wide knowledge that is safe to share across every
+    /// user of the agent.
+    pub fn with_search_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.search_agent_id = Some(agent_id.into());
+        self
+    }
+
+    /// Retrieve memories stored under `application_id` (builder style).
+    ///
+    /// Narrows a search only when neither [`Self::with_search_user_id`] nor
+    /// [`Self::with_search_agent_id`] is set.
+    pub fn with_search_application_id(mut self, application_id: impl Into<String>) -> Self {
+        self.search_application_id = Some(application_id.into());
         self
     }
 
@@ -396,12 +472,31 @@ impl ContextProvider for Mem0Provider {
             return Ok(());
         }
 
+        // Retrieval scope only — never the storage scope. See the type docs.
+        if self.search_user_id.is_none()
+            && self.search_agent_id.is_none()
+            && self.search_application_id.is_none()
+        {
+            if !self
+                .warned_no_search_scope
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "Mem0Provider has no retrieval scope configured, so no memories will be \
+                     retrieved. Set search_user_id, search_agent_id and/or \
+                     search_application_id."
+                );
+            }
+            return Ok(());
+        }
+
         let run_id = self.effective_run_id().await;
         let body = build_search_body(
             &input_text,
-            self.user_id.as_deref(),
-            self.agent_id.as_deref(),
+            self.search_user_id.as_deref(),
+            self.search_agent_id.as_deref(),
             run_id.as_deref(),
+            self.search_application_id.as_deref(),
         );
         let value = self.post(SEARCH_PATH, &body).await?;
         let memory_texts = parse_search_response(&value);
@@ -558,19 +653,19 @@ mod tests {
 
     #[test]
     fn build_search_body_includes_query() {
-        let body = build_search_body("What's the weather?", Some("user123"), None, None);
+        let body = build_search_body("What's the weather?", Some("user123"), None, None, None);
         assert_eq!(body["query"], serde_json::json!("What's the weather?"));
     }
 
     #[test]
     fn build_search_body_filters_include_only_set_scope_fields() {
-        let body = build_search_body("q", Some("user123"), None, None);
+        let body = build_search_body("q", Some("user123"), None, None, None);
         assert_eq!(body["filters"], serde_json::json!({"user_id": "user123"}));
 
-        let body = build_search_body("q", None, Some("agent123"), None);
+        let body = build_search_body("q", None, Some("agent123"), None, None);
         assert_eq!(body["filters"], serde_json::json!({"agent_id": "agent123"}));
 
-        let body = build_search_body("q", None, None, Some("operation_thread"));
+        let body = build_search_body("q", None, None, Some("operation_thread"), None);
         assert_eq!(
             body["filters"],
             serde_json::json!({"run_id": "operation_thread"})
@@ -579,7 +674,7 @@ mod tests {
 
     #[test]
     fn build_search_body_filters_combine_all_scope_fields() {
-        let body = build_search_body("q", Some("u"), Some("a"), Some("r"));
+        let body = build_search_body("q", Some("u"), Some("a"), Some("r"), None);
         assert_eq!(
             body["filters"],
             serde_json::json!({"user_id": "u", "agent_id": "a", "run_id": "r"})
@@ -588,7 +683,7 @@ mod tests {
 
     #[test]
     fn build_search_body_filters_empty_when_no_scope() {
-        let body = build_search_body("q", None, None, None);
+        let body = build_search_body("q", None, None, None, None);
         assert_eq!(body["filters"], serde_json::json!({}));
     }
 
@@ -597,7 +692,7 @@ mod tests {
         // application_id is not a parameter of build_search_body at all —
         // this is a structural assertion that the function signature keeps
         // it out, matching Python's invoking() never forwarding it.
-        let body = build_search_body("q", Some("u"), Some("a"), Some("r"));
+        let body = build_search_body("q", Some("u"), Some("a"), Some("r"), None);
         assert!(body["filters"].get("application_id").is_none());
     }
 
