@@ -31,6 +31,47 @@ Verified: full workspace build, `cargo test --workspace --all-features`
 (**1508 passing**, 24 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean.
 
+### Compaction cluster (follow-up pass)
+
+Upstream's `_compaction.py` is an annotation-driven system that groups messages
+into spans and flags them `_excluded`; this port deliberately implements a
+smaller "return a reduced list" model (see the module docs). So the cluster was
+triaged by *invariant* rather than by patch — what does upstream's fix
+guarantee, and does this port's much simpler design guarantee it too? Two did
+not, and both produced conversations providers reject outright:
+
+| Upstream | Invariant | What was wrong here |
+|---|---|---|
+| #7406 | A function call and its result are retained or dropped **together**. | Confirmed broken two ways by probe. `TokenBudget` dropped an expensive call-bearing message while keeping its cheap result — a tool message answering nothing. `SelectiveToolResult` deleted stale results outright while their assistant `tool_calls` entries stayed — an unanswered call. Either half alone is a 400 on the next request, not merely a worse completion. Upstream enforces this by linking call and result into one indivisible span *before* any strategy runs; with no span model here, `drop_orphaned_tool_exchanges` enforces the identical observable guarantee as a repair pass over the retained set. |
+| #7219 | Compaction never yields a projection with nothing for the model to answer. | `Truncation::new(1)` / `SlidingWindow::new(0)` over a conversation with a system prefix returned system messages *only*. `ensure_non_system_message` reinstates the most recent non-system turn, accepting a result over the limit exactly as upstream does. |
+
+`SelectiveToolResult` changed shape as a result: it now **replaces** a stale
+result's payload with `OMITTED_TOOL_RESULT` instead of deleting the content.
+That keeps the exchange paired (no orphan to repair) while still shedding the
+bulk, and matches the intent of upstream's `ToolResultCompactionStrategy`,
+which likewise replaces stale tool groups with a compact stand-in rather than
+removing them — upstream summarizes the group with an LLM; this port, having no
+summarizing strategy, substitutes a fixed marker. Three existing tests asserted
+the old delete-and-drop behavior over fixtures with unpaired results; they were
+rebuilt on realistic paired conversations.
+
+Ordering is load-bearing and documented at the call site: the orphan repair runs
+*first*, because it can itself strip a conversation down to system-only (when
+the sole non-system message was an orphaned result), which the minimum-retention
+pass then catches.
+
+Not applicable in this cluster:
+
+- **#7124** (token counts inflated by `\uXXXX` escapes on non-ASCII text) —
+  upstream counted tokens off a JSON serialization with `ensure_ascii=True`;
+  this port counts message text directly, so the inflation never existed.
+  Pinned with a regression test rather than changed.
+- **#7391** (ignore `_excluded` tool results) — depends on upstream's
+  exclusion-marking model, which this port does not implement.
+- **#7396 / #7375** (bound tool-result summaries; bound summarization input
+  before the provider call) — both govern the LLM-backed `Summarization`
+  strategy, which this port does not have.
+
 ### Verified already satisfied — no action (the port was level or ahead)
 
 - **#6809** function-call name lost when a streaming delta carries it late —
@@ -62,10 +103,6 @@ clean, `cargo fmt --check` clean.
 Carried forward as the next pass's work — none is closed, and the list is
 roughly in descending value order:
 
-- **Compaction cluster** (#7396, #7391, #7406, #7219, #7124, #7375): bound
-  tool-result summaries, ignore excluded tool results, keep call/result
-  occurrences atomic, suppress empty projections, fix token counts inflating on
-  non-ASCII text, bound summarization input before the provider call.
 - **Approvals cluster** (#7462, #7407, #7408, #7410, #7345, #7271, #7090):
   orphaned local approval responses, decisions preserved under OpenAI
   continuation, tool content returned after invocation limits, provider-injected

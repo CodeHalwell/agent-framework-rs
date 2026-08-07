@@ -33,6 +33,25 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
   the signature from a thought part to be echoed on the function call that
   reasoning produced. Reasoning content is also no longer sent back as a part,
   matching upstream. (upstream #7095)
+- **Compaction could emit conversations providers reject.** A function call and
+  its result are now retained or dropped together — previously `TokenBudget`
+  could keep a tool result whose call fell outside the budget (a tool message
+  answering nothing), and `SelectiveToolResult` deleted stale results while
+  their assistant `tool_calls` entries remained (an unanswered call). Either
+  half alone is a 400 on the next request. (upstream #7406)
+- **Compaction could reduce a conversation to system messages only.**
+  `Truncation`/`SlidingWindow` with a budget at or below the system prefix left
+  no turn for the model to answer; the most recent non-system message is now
+  retained even when that exceeds the limit. (upstream #7219)
+
+### Changed
+
+- **`SelectiveToolResult` now replaces a stale tool result's payload with
+  `OMITTED_TOOL_RESULT` instead of deleting the result content.** Deleting it
+  orphaned the matching function call; replacing the payload sheds the same
+  bulk while keeping the exchange valid. Mirrors the intent of upstream's
+  `ToolResultCompactionStrategy`, which replaces stale tool groups with a
+  compact stand-in rather than removing them.
 
 ### Added
 

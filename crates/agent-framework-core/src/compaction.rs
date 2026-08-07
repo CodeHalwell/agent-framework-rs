@@ -200,11 +200,18 @@ fn has_tool_result(message: &Message) -> bool {
         .any(|c| matches!(c, Content::FunctionResult(_)))
 }
 
-/// Drop `Content::FunctionResult` (tool-result) content from all but the last
-/// `keep_last` messages that carry tool results — they are the bulkiest and
-/// least useful once stale. Text and other content is left intact. Messages
-/// that become empty after stripping are dropped entirely. Mirrors upstream's
-/// `ToolResult` strategy.
+/// Replace the payload of `Content::FunctionResult` (tool-result) content in
+/// all but the last `keep_last` messages that carry tool results — they are the
+/// bulkiest and least useful once stale. Text and other content is left intact.
+///
+/// The result content itself is **kept**, with its payload swapped for
+/// [`OMITTED_TOOL_RESULT`], rather than deleted. Deleting it would leave the
+/// matching assistant `tool_calls` entry unanswered, which providers reject
+/// outright — so the size win would come at the cost of a 400 on the next
+/// request. Mirrors the intent of upstream's `ToolResultCompactionStrategy`,
+/// which likewise *replaces* stale tool groups with a compact stand-in instead
+/// of removing them; upstream summarizes the group with an LLM, while this
+/// port (which has no summarizing strategy) substitutes a fixed marker.
 #[derive(Debug, Clone, Copy)]
 pub struct SelectiveToolResult {
     pub keep_last: usize,
@@ -216,6 +223,12 @@ impl SelectiveToolResult {
     }
 }
 
+/// Stand-in payload left in place of a tool result this strategy compacts.
+///
+/// The result *content* is kept (only its payload is replaced) so the exchange
+/// stays paired with its function call — see [`SelectiveToolResult`].
+pub const OMITTED_TOOL_RESULT: &str = "[tool result omitted by compaction]";
+
 impl CompactionStrategy for SelectiveToolResult {
     fn compact(&self, messages: &[Message], _tokenizer: &dyn Tokenizer) -> Vec<Message> {
         let tool_result_count = messages.iter().filter(|m| has_tool_result(m)).count();
@@ -225,18 +238,14 @@ impl CompactionStrategy for SelectiveToolResult {
         for message in messages {
             if has_tool_result(message) && strip_budget > 0 {
                 strip_budget -= 1;
-                let contents: Vec<Content> = message
-                    .contents
-                    .iter()
-                    .filter(|c| !matches!(c, Content::FunctionResult(_)))
-                    .cloned()
-                    .collect();
-                if contents.is_empty() {
-                    continue;
+                let mut compacted = message.clone();
+                for content in &mut compacted.contents {
+                    if let Content::FunctionResult(fr) = content {
+                        fr.result =
+                            Some(serde_json::Value::String(OMITTED_TOOL_RESULT.to_string()));
+                    }
                 }
-                let mut stripped = message.clone();
-                stripped.contents = contents;
-                out.push(stripped);
+                out.push(compacted);
             } else {
                 out.push(message.clone());
             }
@@ -245,14 +254,138 @@ impl CompactionStrategy for SelectiveToolResult {
     }
 }
 
-/// Convenience free function: compact `messages` with `strategy` and
-/// `tokenizer`.
+/// Strip function-call / function-result contents that lost their counterpart,
+/// dropping any message left empty by the strip.
+///
+/// Compaction cuts a message list at an arbitrary point, so a strategy can
+/// easily retain one half of a tool exchange: [`TokenBudget`] drops an
+/// expensive call-bearing message while keeping its cheap result, and
+/// [`SelectiveToolResult`] strips old results while their calls stay put.
+/// Either half alone is not merely wasteful — it is *invalid*. Providers
+/// require every assistant `tool_calls` entry to be answered by a matching
+/// tool message and reject a tool message that answers nothing, so an orphan
+/// turns the next request into a 400 rather than a slightly worse completion.
+///
+/// Mirrors the invariant upstream added in "Keep call and result occurrences
+/// atomic in compaction" (#7406). Upstream enforces it by linking call and
+/// result into one indivisible span before any strategy runs; this port has no
+/// span/group model, so it enforces the same invariant as a repair pass over
+/// the retained set — the observable guarantee (never emit a half-exchange) is
+/// identical.
+///
+/// Note this *drops* an unmatched call rather than replacing it with a summary
+/// the way upstream's `ToolResultCompactionStrategy` does; this port has no
+/// LLM-summarizing compaction strategy to build that summary with.
+fn drop_orphaned_tool_exchanges(messages: Vec<Message>) -> Vec<Message> {
+    use std::collections::HashSet;
+
+    // Borrow `messages` only long enough to decide which ids are paired; the
+    // repair loop below consumes it.
+    let paired: HashSet<String> = {
+        let mut call_ids: HashSet<&str> = HashSet::new();
+        let mut result_ids: HashSet<&str> = HashSet::new();
+        for content in messages.iter().flat_map(|m| m.contents.iter()) {
+            match content {
+                Content::FunctionCall(fc) => {
+                    call_ids.insert(fc.call_id.as_str());
+                }
+                Content::FunctionResult(fr) => {
+                    result_ids.insert(fr.call_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        // Nothing is orphaned when every id appears on both sides — the common
+        // case, and the only one that skips the rebuild entirely.
+        if call_ids == result_ids {
+            return messages;
+        }
+        call_ids
+            .intersection(&result_ids)
+            .map(|id| (*id).to_string())
+            .collect()
+    };
+
+    let mut out = Vec::with_capacity(messages.len());
+    for mut message in messages {
+        let had_contents = !message.contents.is_empty();
+        message.contents.retain(|content| match content {
+            Content::FunctionCall(fc) => paired.contains(&fc.call_id),
+            Content::FunctionResult(fr) => paired.contains(&fr.call_id),
+            _ => true,
+        });
+        // A message that carried only an orphaned half is dropped outright; one
+        // that was already empty is left alone (not this pass's business).
+        if had_contents && message.contents.is_empty() {
+            continue;
+        }
+        out.push(message);
+    }
+    out
+}
+
+/// Ensure compaction never reduces a conversation to system messages alone.
+///
+/// A budget smaller than the system prefix leaves [`Truncation`] and
+/// [`SlidingWindow`] returning only system messages — a "conversation" with no
+/// turn for the model to answer, which is useless rather than merely short.
+/// Mirrors upstream's `_minimum_retained_group_ids` (#7219): the most recent
+/// non-system message is retained even when that pushes the result back over
+/// the limit.
+///
+/// The fallback is stripped of function-call/result contents before being
+/// reinstated, since its counterpart is by definition not in the retained set —
+/// so this can never manufacture the orphan
+/// [`drop_orphaned_tool_exchanges`] exists to remove.
+fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -> Vec<Message> {
+    let has_non_system = retained.iter().any(|m| m.role != Role::system());
+    if has_non_system {
+        return retained;
+    }
+    let fallback = original
+        .iter()
+        .rev()
+        .filter(|m| m.role != Role::system())
+        .find_map(|m| {
+            let mut candidate = m.clone();
+            candidate
+                .contents
+                .retain(|c| !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_)));
+            (!candidate.contents.is_empty()).then_some(candidate)
+        });
+    if let Some(fallback) = fallback {
+        retained.push(fallback);
+    }
+    retained
+}
+
+/// Apply the invariants every compaction result must satisfy, whatever
+/// strategy produced it: no half tool exchanges, and never system-only.
+///
+/// Order matters: the orphan repair runs *first*, because it can itself strip
+/// a conversation down to system messages only (a retained tool result whose
+/// call fell outside the budget is removed, and it may have been the sole
+/// non-system message). Running the minimum-retention check afterwards catches
+/// that case too. The reverse order silently leaves a system-only result.
+/// Neither pass can undo the other: the repair is a no-op on the orphan-free
+/// message the fallback reinstates.
+fn finalize_compaction(original: &[Message], retained: Vec<Message>) -> Vec<Message> {
+    let retained = drop_orphaned_tool_exchanges(retained);
+    ensure_non_system_message(original, retained)
+}
+
+/// Compact `messages` with `strategy` and `tokenizer`.
+///
+/// This is the supported entry point: it runs the strategy and then enforces
+/// the invariants in [`finalize_compaction`]. Calling
+/// [`CompactionStrategy::compact`] directly gives the strategy's raw output
+/// without them.
 pub fn compact(
     messages: &[Message],
     strategy: &dyn CompactionStrategy,
     tokenizer: &dyn Tokenizer,
 ) -> Vec<Message> {
-    strategy.compact(messages, tokenizer)
+    finalize_compaction(messages, strategy.compact(messages, tokenizer))
 }
 
 /// A [`ContextProvider`] that compacts the accumulated message list —
@@ -297,7 +430,8 @@ impl ContextProvider for CompactionProvider {
     /// Replace `ctx.messages` (the accumulated history + any earlier
     /// provider-injected messages) with the strategy's compacted subset.
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
-        ctx.messages = self.strategy.compact(&ctx.messages, &*self.tokenizer);
+        let retained = self.strategy.compact(&ctx.messages, &*self.tokenizer);
+        ctx.messages = finalize_compaction(&ctx.messages, retained);
         Ok(())
     }
 
@@ -326,6 +460,157 @@ mod tests {
         )
     }
 
+    fn tool_call_message(call_id: &str, name: &str) -> Message {
+        Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(
+                crate::types::FunctionCallContent::new(call_id, name, None),
+            )],
+        )
+    }
+
+    fn call_ids_in(messages: &[Message], f: fn(&Content) -> bool) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter(|c| f(c))
+            .filter_map(|c| match c {
+                Content::FunctionCall(fc) => Some(fc.call_id.clone()),
+                Content::FunctionResult(fr) => Some(fr.call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ---- compaction invariants (upstream #7406 / #7219) --------------------
+
+    #[test]
+    fn selective_tool_result_compacts_the_payload_without_orphaning_the_call() {
+        // Deleting the stale result would leave call_1's assistant `tool_calls`
+        // entry unanswered, which providers reject with a 400. The result
+        // content stays; only its payload is replaced.
+        let messages = vec![
+            tool_call_message("call_1", "get_weather"),
+            tool_result_message("call_1", "a very long stale payload"),
+            tool_call_message("call_2", "get_time"),
+            tool_result_message("call_2", "noon"),
+        ];
+        let out = compact(&messages, &SelectiveToolResult::new(1), &ApproxTokenizer);
+
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["call_1", "call_2"]
+        );
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+            vec!["call_1", "call_2"]
+        );
+        assert_eq!(
+            out[1].function_results()[0].result,
+            Some(json!(OMITTED_TOOL_RESULT))
+        );
+        // The most recent exchange keeps its real payload.
+        assert_eq!(out[3].function_results()[0].result, Some(json!("noon")));
+    }
+
+    #[test]
+    fn a_budget_cut_between_call_and_result_orphans_neither() {
+        let mut call_msg = tool_call_message("call_1", "get_weather");
+        call_msg
+            .contents
+            .push(Content::text("let me look that up for you right now"));
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "hi"),
+            call_msg,
+            tool_result_message("call_1", "sunny"),
+        ];
+        let out = compact(&messages, &TokenBudget::new(4), &ApproxTokenizer);
+        // The expensive call-bearing message fell outside the budget, so its
+        // cheap result must not survive alone answering nothing.
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn an_intact_tool_exchange_is_left_alone() {
+        let messages = vec![
+            tool_call_message("call_1", "get_weather"),
+            tool_result_message("call_1", "sunny"),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(10), &ApproxTokenizer);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["call_1"]
+        );
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+            vec!["call_1"]
+        );
+    }
+
+    #[test]
+    fn an_orphan_strip_keeps_the_rest_of_its_message() {
+        // Only the orphaned call content is removed; sibling text survives and
+        // the message itself is not dropped.
+        let mut call_msg = tool_call_message("call_1", "get_weather");
+        call_msg.contents.push(Content::text("checking now"));
+        let out = compact(&[call_msg], &SlidingWindow::new(10), &ApproxTokenizer);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text(), "checking now");
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn compaction_never_returns_system_messages_only() {
+        // A budget smaller than the system prefix used to leave a
+        // "conversation" with no turn for the model to answer.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "hello"),
+            text(Role::assistant(), "hi"),
+        ];
+        for out in [
+            compact(&messages, &Truncation::new(1), &ApproxTokenizer),
+            compact(&messages, &SlidingWindow::new(0), &ApproxTokenizer),
+        ] {
+            assert!(
+                out.iter().any(|m| m.role != Role::system()),
+                "expected a non-system message to be retained, got {:?}",
+                out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+            // Upstream accepts exceeding the limit rather than emitting a
+            // useless projection; the retained turn is the most recent one.
+            assert_eq!(out.last().unwrap().text(), "hi");
+        }
+    }
+
+    #[test]
+    fn the_minimum_retained_message_is_never_a_half_exchange() {
+        // The only non-system messages are a tool exchange, so the fallback
+        // must reinstate the call-bearing message's *text*, not the orphan.
+        let mut call_msg = tool_call_message("call_1", "get_weather");
+        call_msg.contents.push(Content::text("checking now"));
+        let messages = vec![
+            text(Role::system(), "sys"),
+            call_msg,
+            tool_result_message("call_1", "sunny"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert!(out.iter().any(|m| m.role != Role::system()));
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn an_all_system_conversation_stays_all_system() {
+        // Nothing to reinstate: the fallback must not invent a turn.
+        let messages = vec![text(Role::system(), "a"), text(Role::system(), "b")];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert!(out.iter().all(|m| m.role == Role::system()));
+    }
+
     // ---- ApproxTokenizer -------------------------------------------------
 
     #[test]
@@ -336,6 +621,20 @@ mod tests {
         assert_eq!(t.count_tokens("abcde"), 2); // ceil(5/4) = 2
         assert_eq!(t.count_tokens("abcdefgh"), 2);
         assert_eq!(t.count_tokens("abcdefghi"), 3); // ceil(9/4) = 3
+    }
+
+    #[test]
+    fn approx_tokenizer_does_not_inflate_non_ascii_text() {
+        // Upstream counted tokens off a JSON serialization with ensure_ascii=True,
+        // so CJK text was measured as inflated `\uXXXX` escapes rather than the
+        // characters the model actually sees (#7124). This port counts the
+        // characters directly, so the escape inflation never existed here — pin
+        // that: 4 CJK characters cost the same as 4 ASCII ones, not 6x more.
+        let t = ApproxTokenizer;
+        assert_eq!(t.count_tokens("日本語訳"), t.count_tokens("abcd"));
+
+        let msg = Message::with_contents(Role::user(), vec![Content::text("日本語訳")]);
+        assert_eq!(count_message_tokens(&t, &msg), 1);
     }
 
     #[test]
@@ -508,24 +807,28 @@ mod tests {
     #[test]
     fn selective_tool_result_strips_stale_results_and_keeps_recent_ones() {
         let messages = vec![
-            text(Role::user(), "ask 1"),
+            tool_call_message("c1", "t1"),
             tool_result_message("c1", "result 1"),
-            text(Role::user(), "ask 2"),
+            tool_call_message("c2", "t2"),
             tool_result_message("c2", "result 2"),
-            text(Role::user(), "ask 3"),
+            tool_call_message("c3", "t3"),
             tool_result_message("c3", "result 3"),
         ];
         let strategy = SelectiveToolResult::new(1);
         let out = compact(&messages, &strategy, &ApproxTokenizer);
 
-        // The two oldest tool-result messages become empty and are dropped;
-        // the newest tool-result message is kept intact.
-        assert_eq!(out.len(), 4);
-        assert_eq!(out[0].text(), "ask 1");
-        assert_eq!(out[1].text(), "ask 2");
-        assert_eq!(out[2].text(), "ask 3");
-        assert!(has_tool_result(&out[3]));
-        assert_eq!(out[3].function_results()[0].call_id, "c3");
+        // Every message survives — the two oldest results keep their content
+        // (so their calls stay answered) with only the payload replaced.
+        assert_eq!(out.len(), 6);
+        assert_eq!(
+            out[1].function_results()[0].result,
+            Some(json!(OMITTED_TOOL_RESULT))
+        );
+        assert_eq!(
+            out[3].function_results()[0].result,
+            Some(json!(OMITTED_TOOL_RESULT))
+        );
+        assert_eq!(out[5].function_results()[0].result, Some(json!("result 3")));
     }
 
     #[test]
@@ -538,26 +841,35 @@ mod tests {
             ],
         );
         let messages = vec![
+            tool_call_message("c1", "t1"),
             mixed,
+            tool_call_message("c2", "t2"),
             tool_result_message("c2", "result 2"),
+            tool_call_message("c3", "t3"),
             tool_result_message("c3", "result 3"),
         ];
         let strategy = SelectiveToolResult::new(2);
         let out = compact(&messages, &strategy, &ApproxTokenizer);
 
-        // First message's tool result is stripped (only the two most recent
-        // tool-result-bearing messages are kept intact), but its text survives.
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].text(), "some accompanying text");
-        assert!(!has_tool_result(&out[0]));
-        assert!(has_tool_result(&out[1]));
-        assert!(has_tool_result(&out[2]));
+        // The first message's tool-result payload is compacted (only the two
+        // most recent tool-result-bearing messages keep theirs), but its
+        // accompanying text survives untouched alongside it.
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[1].text(), "some accompanying text");
+        assert_eq!(
+            out[1].function_results()[0].result,
+            Some(json!(OMITTED_TOOL_RESULT))
+        );
+        assert_eq!(out[3].function_results()[0].result, Some(json!("result 2")));
+        assert_eq!(out[5].function_results()[0].result, Some(json!("result 3")));
     }
 
     #[test]
     fn selective_tool_result_noop_when_keep_last_covers_all() {
         let messages = vec![
+            tool_call_message("c1", "t1"),
             tool_result_message("c1", "result 1"),
+            tool_call_message("c2", "t2"),
             tool_result_message("c2", "result 2"),
         ];
         let strategy = SelectiveToolResult::new(5);
