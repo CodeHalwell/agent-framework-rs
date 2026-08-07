@@ -316,9 +316,14 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> 
                             .push_back((mi, ci));
                     }
                     Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                        // Nearest *preceding* outstanding call, not the oldest.
+                        // With FIFO a result in `pending` paired with a stale
+                        // historical call instead of the pending call directly
+                        // before it, leaving that one unanswered while the
+                        // historical one was kept — two calls, one result.
                         if let Some(call_site) = unanswered
                             .get_mut(fr.call_id.as_str())
-                            .and_then(VecDeque::pop_front)
+                            .and_then(VecDeque::pop_back)
                         {
                             paired.insert(call_site);
                             paired.insert((mi, ci));
@@ -546,9 +551,40 @@ fn reinstate_calls_answered_by_pending(
     // Append in original order so several recovered calls keep their sequence.
     chosen.sort_unstable();
     for (mi, ci) in chosen {
-        retained.push(reduced_to(&original[mi], &[ci]));
+        let mut message = reduced_to(&original[mi], &[ci]);
+        // Carry the Gemini-style replay signature across with the call. When it
+        // sits on the preceding reasoning content — the supported fallback
+        // placement — reducing to the call alone would strip the only copy, and
+        // the reasoning message the request builder backfills from is not in
+        // the retained set either.
+        if let Some(Content::FunctionCall(fc)) = message.contents.first_mut() {
+            if fc.protected_data.is_none() {
+                fc.protected_data = preceding_reasoning_signature(&original[mi], ci);
+            }
+        }
+        retained.push(message);
     }
     retained
+}
+
+/// The replay signature of the reasoning content immediately preceding the
+/// content at `index`, if any.
+///
+/// Only a *contiguous* run of reasoning content counts, matching the request
+/// builder's rule that a backfilled signature applies solely to a call directly
+/// following its reasoning — any other content in between clears it.
+fn preceding_reasoning_signature(message: &Message, index: usize) -> Option<String> {
+    for content in message.contents[..index].iter().rev() {
+        match content {
+            Content::TextReasoning(t) => {
+                if let Some(signature) = t.protected_data.as_deref().filter(|s| !s.is_empty()) {
+                    return Some(signature.to_string());
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// How many function results in `messages` no preceding call in `messages`
@@ -600,7 +636,9 @@ fn unanswered_call_sites(messages: &[Message]) -> Vec<(usize, usize, &str)> {
                 }
                 Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
                     if let Some(sites) = unanswered.get_mut(fr.call_id.as_str()) {
-                        sites.pop_front();
+                        // Same nearest-preceding rule as the orphan repair, so
+                        // both agree on which occurrence a result answers.
+                        sites.pop_back();
                     }
                 }
                 _ => {}
@@ -1105,6 +1143,88 @@ mod tests {
             call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
             vec!["c1"]
         );
+    }
+
+    #[test]
+    fn a_pending_exchange_pairs_with_its_own_call_not_a_historical_one() {
+        // Retained history holds an unanswered c1 call and the input carries its
+        // own c1 call + result. Pairing with the *oldest* matching call attached
+        // the pending result to the historical call, kept that call, and left
+        // the pending call unanswered — two calls, one result.
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+        ];
+        let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty(),
+            "the unanswered historical call must be stripped, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_reinstated_call_keeps_its_reasoning_signature() {
+        // The signature sits on the preceding reasoning content (the supported
+        // fallback placement). Reducing to the call alone stripped the only
+        // copy, and the reasoning message is not retained either, so the
+        // request builder had nothing left to backfill from.
+        let signed = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    None,
+                )),
+            ],
+        );
+        let history = vec![signed];
+        let input = vec![tool_result_message("c1", "sunny")];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let call = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_call)
+            .expect("the call is reinstated");
+        assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
+    }
+
+    #[test]
+    fn a_reinstated_call_gains_no_signature_from_unrelated_content() {
+        let mut msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::text("intervening"),
+            ],
+        );
+        msg.contents.push(Content::FunctionCall(
+            crate::types::FunctionCallContent::new("c1", "get_weather", None),
+        ));
+        let history = vec![msg];
+        let input = vec![tool_result_message("c1", "sunny")];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let call = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_call)
+            .expect("the call is reinstated");
+        assert!(call.protected_data.is_none());
     }
 
     #[test]
