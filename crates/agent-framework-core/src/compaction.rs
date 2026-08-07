@@ -405,9 +405,21 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
         .filter(|m| m.role != Role::system() && m.role != Role::tool())
         .find_map(|m| {
             let mut candidate = m.clone();
-            candidate
-                .contents
-                .retain(|c| !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_)));
+            // Reasoning is dropped alongside the exchange halves, not kept as
+            // standalone content. It renders nothing on its own — Gemini's
+            // request builder deliberately skips reasoning parts, and the
+            // OpenAI converter has no mapping for it — so a message reduced to
+            // reasoning alone would qualify here, return early, and leave the
+            // request effectively system-only while bypassing the
+            // complete-exchange fallback below.
+            candidate.contents.retain(|c| {
+                !matches!(
+                    c,
+                    Content::FunctionCall(_)
+                        | Content::FunctionResult(_)
+                        | Content::TextReasoning(_)
+                )
+            });
             (!candidate.contents.is_empty()).then_some(candidate)
         });
     if let Some(plain) = plain {
@@ -1390,6 +1402,61 @@ mod tests {
         ];
         let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
         assert!(out.iter().all(|m| m.role == Role::system()));
+    }
+
+    #[test]
+    fn reasoning_alone_does_not_qualify_as_the_minimum_retained_message() {
+        // `[TextReasoning, FunctionCall]` + its result: stripping the call left
+        // reasoning behind, which passed the non-empty check and returned early,
+        // bypassing the complete-exchange fallback. Reasoning renders nothing
+        // standalone, so the request was effectively system-only anyway.
+        let signed = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    None,
+                )),
+            ],
+        );
+        let messages = vec![
+            text(Role::system(), "sys"),
+            signed,
+            tool_result_message("c1", "sunny"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"],
+            "the complete exchange must be restored, got {out:?}"
+        );
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+            vec!["c1"]
+        );
+    }
+
+    #[test]
+    fn text_beside_reasoning_still_qualifies() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    ..Default::default()
+                }),
+                Content::text("the answer"),
+            ],
+        );
+        let messages = vec![text(Role::system(), "sys"), msg];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert_eq!(out.last().unwrap().text(), "the answer");
     }
 
     #[test]
