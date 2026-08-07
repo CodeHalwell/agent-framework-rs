@@ -327,6 +327,13 @@ impl FunctionCallContent {
         if self.call_id.is_empty() {
             self.call_id = other.call_id.clone();
         }
+        // A provider-opaque replay token is emitted once, on whichever fragment
+        // the provider chooses — often the last. Taking the later non-empty
+        // value keeps it; ignoring it here would silently drop the signature a
+        // streamed Gemini 3 tool call needs on replay.
+        if let Some(token) = other.protected_data.as_ref().filter(|t| !t.is_empty()) {
+            self.protected_data = Some(token.clone());
+        }
         // The function name is not fragmented by real providers: it arrives once
         // in the first chunk. Set it if we don't have one yet; otherwise only
         // append a genuinely different fragment so a repeated full name does not

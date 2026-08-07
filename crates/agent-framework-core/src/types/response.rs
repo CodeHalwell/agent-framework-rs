@@ -330,13 +330,33 @@ impl ChatResponse {
     }
 }
 
+/// Merge adjacent text / reasoning fragments produced by streaming into single
+/// content items.
+///
+/// Text is concatenated, but the *opaque* fields on reasoning content are not
+/// text and cannot be concatenated: a provider emits each once, on whichever
+/// fragment it chooses — typically the last of a block. Appending only the text
+/// and keeping the first fragment's fields therefore discards them. Both are
+/// carried over from the later fragment when it has one:
+///
+/// * `protected_data` — the replay token (Gemini 3's `thoughtSignature`); losing
+///   it means a replayed tool turn is rejected.
+/// * `raw_representation` — the verbatim provider reasoning item (OpenAI
+///   Responses with `store: false` attaches it to the last summary); losing it
+///   means the item cannot be re-emitted on the follow-up turn.
 fn coalesce_text(contents: &mut Vec<Content>) {
     let mut out: Vec<Content> = Vec::with_capacity(contents.len());
     for c in contents.drain(..) {
         match (out.last_mut(), &c) {
             (Some(Content::Text(prev)), Content::Text(cur)) => prev.text.push_str(&cur.text),
             (Some(Content::TextReasoning(prev)), Content::TextReasoning(cur)) => {
-                prev.text.push_str(&cur.text)
+                prev.text.push_str(&cur.text);
+                if let Some(token) = cur.protected_data.as_ref().filter(|t| !t.is_empty()) {
+                    prev.protected_data = Some(token.clone());
+                }
+                if let Some(raw) = cur.raw_representation.as_ref() {
+                    prev.raw_representation = Some(raw.clone());
+                }
             }
             _ => out.push(c),
         }
@@ -628,6 +648,90 @@ mod tests {
     fn from_updates_without_format_leaves_value_none() {
         let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
         assert_eq!(resp.value, None);
+    }
+
+    // region: opaque fields survive streaming coalescence (PR #12 review)
+
+    #[test]
+    fn coalescing_reasoning_keeps_a_signature_from_a_later_fragment() {
+        // A provider emits the replay token once, on whichever fragment it
+        // chooses — often the last. Appending only the text kept the *first*
+        // fragment's (absent) token and dropped it.
+        let mut contents = vec![
+            Content::TextReasoning(TextReasoningContent {
+                text: "think".into(),
+                ..Default::default()
+            }),
+            Content::TextReasoning(TextReasoningContent {
+                text: "ing...".into(),
+                protected_data: Some("c2ln".into()),
+                ..Default::default()
+            }),
+        ];
+        coalesce_text(&mut contents);
+        assert_eq!(contents.len(), 1);
+        match &contents[0] {
+            Content::TextReasoning(t) => {
+                assert_eq!(t.text, "thinking...");
+                assert_eq!(t.protected_data.as_deref(), Some("c2ln"));
+            }
+            other => panic!("expected reasoning content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalescing_reasoning_keeps_a_raw_item_from_a_later_fragment() {
+        // OpenAI Responses attaches the verbatim reasoning item to the *last*
+        // summary; losing it means it cannot be re-emitted on the follow-up turn.
+        let mut contents = vec![
+            Content::TextReasoning(TextReasoningContent {
+                text: "a".into(),
+                ..Default::default()
+            }),
+            Content::TextReasoning(TextReasoningContent {
+                text: "b".into(),
+                raw_representation: Some(json!({"id": "rs_1"})),
+                ..Default::default()
+            }),
+        ];
+        coalesce_text(&mut contents);
+        match &contents[0] {
+            Content::TextReasoning(t) => {
+                assert_eq!(t.raw_representation, Some(json!({"id": "rs_1"})));
+            }
+            other => panic!("expected reasoning content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalescing_reasoning_does_not_clobber_an_earlier_signature() {
+        let mut contents = vec![
+            Content::TextReasoning(TextReasoningContent {
+                text: "a".into(),
+                protected_data: Some("c2ln".into()),
+                ..Default::default()
+            }),
+            Content::TextReasoning(TextReasoningContent {
+                text: "b".into(),
+                ..Default::default()
+            }),
+        ];
+        coalesce_text(&mut contents);
+        match &contents[0] {
+            Content::TextReasoning(t) => assert_eq!(t.protected_data.as_deref(), Some("c2ln")),
+            other => panic!("expected reasoning content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merging_a_streamed_call_keeps_a_signature_from_a_later_fragment() {
+        // The primary Gemini 3 placement is on the call itself; argument
+        // fragments must not drop it.
+        let mut call = FunctionCallContent::new("c1", "get_weather", None);
+        let later = FunctionCallContent::new("c1", "get_weather", None)
+            .with_protected_data(Some("c2ln".into()));
+        call.merge(&later).unwrap();
+        assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
     }
 
     // region: structured-output text selection (upstream #6990)
