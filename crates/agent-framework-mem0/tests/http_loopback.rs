@@ -155,20 +155,36 @@ where
 /// request per configured scope.
 fn serve_n<F>(n: usize, respond: F) -> (String, std::thread::JoinHandle<Vec<CapturedRequest>>)
 where
-    F: Fn(&mut TcpStream, usize) + Send + 'static,
+    F: Fn(&mut TcpStream, &CapturedRequest) + Send + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
         let mut requests = Vec::with_capacity(n);
-        for i in 0..n {
+        for _ in 0..n {
             let mut stream = accept_with_timeout(&listener);
-            requests.push(read_http_request(&mut stream));
-            respond(&mut stream, i);
+            let request = read_http_request(&mut stream);
+            respond(&mut stream, &request);
+            requests.push(request);
         }
         requests
     });
     (format!("http://{addr}"), handle)
+}
+
+/// The single scope key a search request filters on (`user_id` / `agent_id` /
+/// `app_id`), ignoring `run_id`. Lets a mock answer based on *content* rather
+/// than arrival position — the fan-out is concurrent, so arrival order is
+/// nondeterministic and any assertion keyed on it is flaky.
+fn scope_of(request: &CapturedRequest) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    body["filters"]
+        .as_object()
+        .expect("filters object")
+        .keys()
+        .find(|k| *k != "run_id")
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -470,11 +486,11 @@ async fn user_and_agent_scopes_are_queried_independently_and_merged() {
     // agent_id into one request asks for memories tagged with *both* — silently
     // dropping the agent-wide memories written by other users that
     // search_agent_id exists to retrieve.
-    let (base_url, handle) = serve_n(2, |stream, i| {
-        let memory = if i == 0 {
-            "user memory"
-        } else {
-            "agent memory"
+    // Keyed on the requested scope, not arrival order.
+    let (base_url, handle) = serve_n(2, |stream, request| {
+        let memory = match scope_of(request).as_str() {
+            "user_id" => "user memory",
+            _ => "agent memory",
         };
         write_json_response(stream, &json!({"results": [{"memory": memory}]}));
     });
@@ -497,8 +513,15 @@ async fn user_and_agent_scopes_are_queried_independently_and_merged() {
             body["filters"].clone()
         })
         .collect();
-    assert_eq!(filters[0], json!({"user_id": "u1"}));
-    assert_eq!(filters[1], json!({"agent_id": "shared-agent"}));
+    // Compared as a set — arrival order is not part of the contract.
+    let mut filters = filters;
+    filters.sort_by_key(|f| f.to_string());
+    let mut expected = vec![
+        json!({"user_id": "u1"}),
+        json!({"agent_id": "shared-agent"}),
+    ];
+    expected.sort_by_key(|f| f.to_string());
+    assert_eq!(filters, expected);
 
     // Both partitions' memories reach the model.
     let injected = ctx.messages[0].text();
@@ -508,7 +531,7 @@ async fn user_and_agent_scopes_are_queried_independently_and_merged() {
 
 #[tokio::test]
 async fn duplicate_memories_across_scopes_are_merged_once() {
-    let (base_url, handle) = serve_n(2, |stream, _| {
+    let (base_url, handle) = serve_n(2, |stream, _request| {
         write_json_response(stream, &json!({"results": [{"memory": "shared"}]}));
     });
 
@@ -527,8 +550,9 @@ async fn duplicate_memories_across_scopes_are_merged_once() {
 
 #[tokio::test]
 async fn one_failing_scope_does_not_lose_the_other_scopes_memories() {
-    let (base_url, handle) = serve_n(2, |stream, i| {
-        if i == 0 {
+    // Fail the user scope specifically, not "whichever arrives first".
+    let (base_url, handle) = serve_n(2, |stream, request| {
+        if scope_of(request) == "user_id" {
             write_status_response(
                 stream,
                 500,
@@ -556,7 +580,7 @@ async fn one_failing_scope_does_not_lose_the_other_scopes_memories() {
 async fn every_scope_failing_surfaces_the_error() {
     // An empty result here would be indistinguishable from "this user has no
     // memories", so a total failure must not be swallowed.
-    let (base_url, handle) = serve_n(2, |stream, _| {
+    let (base_url, handle) = serve_n(2, |stream, _request| {
         write_status_response(
             stream,
             500,

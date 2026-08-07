@@ -428,13 +428,24 @@ impl Mem0Provider {
             }
         }
 
+        // Issue every partition's request together rather than awaiting each in
+        // turn: the scopes are independent, so serializing them makes latency
+        // the *sum* of the partitions and lets one slow scope delay a healthy
+        // one from even starting. `join_all` preserves input order in its
+        // output, so the merge below stays deterministic (scope order, not
+        // completion order) regardless of which partition returns first.
+        let responses = futures::future::join_all(scopes.iter().map(|scope| {
+            let body = build_search_body(input_text, *scope, run_id);
+            async move { self.post(SEARCH_PATH, &body).await }
+        }))
+        .await;
+
         let mut merged: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut last_error: Option<Error> = None;
         let mut failures = 0usize;
-        for scope in &scopes {
-            let body = build_search_body(input_text, *scope, run_id);
-            match self.post(SEARCH_PATH, &body).await {
+        for (scope, response) in scopes.iter().zip(responses) {
+            match response {
                 Ok(value) => {
                     for text in parse_search_response(&value) {
                         if seen.insert(text.clone()) {
