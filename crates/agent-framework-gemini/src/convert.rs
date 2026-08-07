@@ -132,15 +132,22 @@ fn collect_call_names(messages: &[Message]) -> HashMap<String, String> {
 
 /// Convert one message's contents into Gemini `Part`s.
 ///
-/// Reasoning content is **not** sent back as a part. Gemini 3 instead pairs a
-/// thought with a `thoughtSignature` that must be echoed on the function call
-/// that reasoning produced, so a reasoning item is consumed here purely to
-/// carry its signature forward to the next function call. Mirrors upstream's
-/// `_convert_message_contents` (`_chat_client.py:660`).
+/// Reasoning content is **not** sent back as a part. Gemini 3 instead uses a
+/// `thoughtSignature` that must be echoed when a function call is replayed, or
+/// the follow-up turn is rejected. Two placements exist and both are handled:
 ///
-/// A signature applies only to a function call *immediately* following its
-/// reasoning content: any other content in between clears it, so a stale
-/// signature is never stamped onto an unrelated call.
+/// * **On the function-call part itself** — Gemini 3's usual placement, carried
+///   through on [`FunctionCallContent::protected_data`]. This wins.
+/// * **On a preceding thought part** — carried on
+///   [`TextReasoningContent::protected_data`] and used only to *backfill* a
+///   call that has none of its own, mirroring upstream's "backfill only when
+///   the raw Part lacks one".
+///
+/// A backfilled signature applies only to a function call *immediately*
+/// following its reasoning content: any other content in between clears it, so
+/// a stale signature is never stamped onto an unrelated call.
+///
+/// Mirrors upstream's `_convert_message_contents` (`_chat_client.py:660`).
 fn message_contents_to_parts(
     contents: &[Content],
     call_names: &HashMap<String, String>,
@@ -152,14 +159,22 @@ fn message_contents_to_parts(
             pending_signature = t.protected_data.as_deref().filter(|s| !s.is_empty());
             continue;
         }
-        let thought_signature = pending_signature.take();
+        let pending = pending_signature.take();
         let Some(mut part) = content_to_part(content, call_names) else {
             continue;
         };
-        if let (Content::FunctionCall(_), Some(sig), Some(obj)) =
-            (content, thought_signature, part.as_object_mut())
-        {
-            obj.insert("thoughtSignature".into(), json!(sig));
+        if let Content::FunctionCall(fc) = content {
+            // The call's own signature wins; the preceding reasoning content's
+            // only backfills when the call carries none (mirroring upstream's
+            // "backfill only when the raw Part lacks one").
+            let signature = fc
+                .protected_data
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(pending);
+            if let (Some(signature), Some(obj)) = (signature, part.as_object_mut()) {
+                obj.insert("thoughtSignature".into(), json!(signature));
+            }
         }
         parts.push(part);
     }
@@ -434,11 +449,17 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
             // key on. `messages_to_gemini` recovers the name from this id
             // via `collect_call_names` when the call is answered.
             let call_id = format!("call_{}", uuid::Uuid::new_v4());
-            out.push(Content::FunctionCall(FunctionCallContent::new(
-                call_id,
-                name,
-                Some(FunctionArguments::Object(args)),
-            )));
+            out.push(Content::FunctionCall(
+                FunctionCallContent::new(call_id, name, Some(FunctionArguments::Object(args)))
+                    // Gemini 3's usual placement for `thoughtSignature` is the
+                    // part carrying the call itself; a signature on a preceding
+                    // thought part is the fallback, not the norm.
+                    .with_protected_data(
+                        part.get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
+            ));
             continue;
         }
         if let Some(fr) = part.get("functionResponse") {
@@ -632,6 +653,78 @@ mod tests {
             }
             other => panic!("expected reasoning content, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_response_captures_a_signature_on_the_function_call_part() {
+        // Gemini 3's usual placement: the signature rides on the part carrying
+        // the call, not on a preceding thought part.
+        let value = json!({
+            "candidates": [{ "content": { "parts": [
+                {
+                    "functionCall": { "name": "get_weather", "args": { "city": "SF" } },
+                    "thoughtSignature": "c2ln"
+                },
+            ] } }]
+        });
+        let resp = parse_response(&value);
+        match &resp.messages[0].contents[0] {
+            Content::FunctionCall(fc) => {
+                assert_eq!(fc.protected_data.as_deref(), Some("c2ln"));
+            }
+            other => panic!("expected a function call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_replays_its_own_signature_without_any_reasoning_content() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(
+                FunctionCallContent::new("call_1", "get_weather", None)
+                    .with_protected_data(Some("c2ln".into())),
+            )],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    #[test]
+    fn a_calls_own_signature_wins_over_the_preceding_reasoning_one() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("from-reasoning".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(
+                    FunctionCallContent::new("call_1", "get_weather", None)
+                        .with_protected_data(Some("from-call".into())),
+                ),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("from-call"));
+    }
+
+    #[test]
+    fn a_round_trip_preserves_a_part_level_signature() {
+        // The whole point: parse a Gemini 3 tool-call response and replay it.
+        let value = json!({
+            "candidates": [{ "content": { "parts": [
+                {
+                    "functionCall": { "name": "get_weather", "args": {} },
+                    "thoughtSignature": "c2ln"
+                },
+            ] } }]
+        });
+        let resp = parse_response(&value);
+        let parts = message_contents_to_parts(&resp.messages[0].contents, &HashMap::new());
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
     }
 
     #[test]

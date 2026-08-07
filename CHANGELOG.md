@@ -29,10 +29,11 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
   request with a 400; one containing a space was silently dropped. Names are
   now sanitized to `[a-zA-Z0-9_]` and truncated to 64 characters, matching the
   Python and .NET clients. (upstream #7126)
-- **Gemini 3 function-call replays lost `thought_signature`.** Gemini requires
-  the signature from a thought part to be echoed on the function call that
-  reasoning produced. Reasoning content is also no longer sent back as a part,
-  matching upstream. (upstream #7095)
+- **Gemini 3 function-call replays lost `thought_signature`.** Gemini 3
+  requires the signature echoed when a call is replayed. Both placements are
+  handled: on the function-call part itself (the usual one) and on a preceding
+  thought part (backfill only). Reasoning content is no longer sent back as a
+  part, matching upstream. (upstream #7095)
 - **Approval round-trips could duplicate a function call.** The restored call
   was deduped against only the message being scanned, but a hosting layer
   replays the stored call and its approval request as two separate messages, so

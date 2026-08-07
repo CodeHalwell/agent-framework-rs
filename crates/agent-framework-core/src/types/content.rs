@@ -253,6 +253,15 @@ pub struct FunctionCallContent {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub arguments: Option<FunctionArguments>,
+    /// Provider-opaque replay token attached to this call, base64.
+    ///
+    /// The counterpart of [`TextReasoningContent::protected_data`]. Gemini 3
+    /// returns a `thoughtSignature` on the part carrying the function call —
+    /// the *usual* placement — and requires it echoed when the call is
+    /// replayed; a signature on a preceding thought part is the fallback.
+    /// Absent for providers that do not use one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub protected_data: Option<String>,
 }
 
 /// Arguments to a function call: either a raw (possibly partial) string, or a
@@ -274,7 +283,15 @@ impl FunctionCallContent {
             call_id: call_id.into(),
             name: name.into(),
             arguments,
+            protected_data: None,
         }
+    }
+
+    /// Attach a provider-opaque replay token (see
+    /// [`Self::protected_data`]).
+    pub fn with_protected_data(mut self, protected_data: Option<String>) -> Self {
+        self.protected_data = protected_data;
+        self
     }
 
     /// Parse the arguments into a JSON object map.
