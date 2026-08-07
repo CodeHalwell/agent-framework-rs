@@ -565,6 +565,27 @@ mod tests {
     // region: cache-write tokens (upstream #7369)
 
     #[test]
+    fn additional_properties_carry_request_wide_options_verbatim() {
+        // Request-wide options this port has no typed field for — e.g.
+        // GPT-5.6's `prompt_cache_options` (upstream #7163) — reach the wire
+        // through `ChatOptions::additional_properties`, so no typed surface is
+        // needed for them. (The *per-content* `prompt_cache_breakpoint` half of
+        // that upstream change is not expressible: it needs
+        // `additional_properties` on content items, which this port lacks.)
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "prompt_cache_options".into(),
+            json!({ "mode": "explicit", "ttl": "30m" }),
+        );
+        let mut body = Map::new();
+        apply_options(&mut body, &options);
+        assert_eq!(
+            body["prompt_cache_options"],
+            json!({ "mode": "explicit", "ttl": "30m" })
+        );
+    }
+
+    #[test]
     fn usage_parses_cache_write_tokens() {
         let usage = json!({
             "prompt_tokens": 2000,

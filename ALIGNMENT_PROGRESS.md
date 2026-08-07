@@ -138,6 +138,29 @@ as `mcp_approval_response {approve: false}`. Closing either needs
 `additional_properties` on `FunctionCallContent` first — a core type change
 worth doing deliberately rather than as a side effect.
 
+### Provider cluster — triaged, six of seven not applicable
+
+Worked through the provider fixes as a batch. Only one turned out to need code,
+and it needed none: the rest do not apply to this port's architecture. Recorded
+individually so the next pass does not re-derive them.
+
+| Upstream | Verdict |
+|---|---|
+| #7199 — raw JSON-Schema `response_format` passed through unwrapped | **Structurally impossible here.** Upstream's bug needs a raw dict in the `response_format` slot; this port's `ResponseFormat` is a closed typed enum (`Text` / `JsonObject` / `JsonSchema{..}`) whose `Serialize` impl always builds the correct envelope. |
+| #7163 — GPT-5.6 prompt-cache breakpoints | **Half already available, half blocked.** The request-wide `prompt_cache_options` reaches the wire today through `ChatOptions::additional_properties`, which `apply_options` merges into the body — no typed field needed, now pinned by a test. The *per-content* `prompt_cache_breakpoint` marker is blocked: it lives on `Content.additional_properties`, which this port's content types do not have. |
+| #7283 — Foundry agent inheriting `OPENAI_CHAT_MODEL` | **N/A.** This port reads `FOUNDRY_MODEL` and never consults `OPENAI_CHAT_MODEL`, and the agent-*reference* request path the bug lives on is a documented unimplemented extension point here (`FoundryAgent` realizes a Prompt Agent client-side, where sending a model is correct). |
+| #7417 — CopilotStudio `LineTooLong` on large activities | **N/A.** aiohttp's 512 KB per-line read buffer is the cause; this port speaks Direct-to-Engine over `reqwest`, which has no equivalent per-line cap. |
+| #7155 — forward `GitHubCopilotOptions` verbatim to `create_session` | **N/A.** Different surface: this port's GitHub Copilot client is the OpenAI-compatible `POST /chat/completions` endpoint, not the Copilot Agent SDK's session API. |
+| #7300 — forward Copilot input attachments as inline blobs | **N/A**, same reason as #7155 (`copilot_session.send(..., attachments=...)`). |
+| #7278 — Azure AI Search query-source identity | **N/A for now.** The `x-ms-query-source-authorization` header applies to *agentic* Knowledge Base retrieval; this port's provider implements classic index search (hybrid/semantic/vector) only. Agentic retrieval is a feature gap, not a bug — worth its own decision. |
+
+The recurring blocker is worth calling out on its own: **three separate items
+now hinge on this port's content types lacking `additional_properties`** —
+#7462 (hosted vs. local approvals), the rejected-hosted-approval divergence
+found alongside it, and #7163's per-content cache breakpoints. Adding
+`additional_properties` to `Content` / `FunctionCallContent` would unblock all
+three at once and is the highest-leverage next piece of work in this area.
+
 ### Verified already satisfied — no action (the port was level or ahead)
 
 - **#6809** function-call name lost when a streaming delta carries it late —
@@ -186,12 +209,8 @@ roughly in descending value order:
   (#7420), tool-def JSON for observability (#7029), restricting an unknown
   `finish_reason` from the OTel attribute (#7105).
 - **Orchestration**: Magentic manager duplicating conversation history (#6297).
-- **Providers**: OpenAI raw JSON-Schema `response_format` passthrough (#7199),
-  GPT-5.6 prompt-cache breakpoints (#7163), Responses conversation-ID helper
-  (#7234, BREAKING), Foundry agent inheriting `OPENAI_CHAT_MODEL` (#7283),
-  GitHub Copilot options forwarding (#7155) and inline-blob attachments
-  (#7300), CopilotStudio `LineTooLong` on large activities (#7417), Azure AI
-  Search query-source identity (#7278).
+- **Providers**: Responses conversation-ID helper (#7234, BREAKING). The rest
+  of this cluster was triaged and is not applicable — see below.
 - **MCP**: `header_provider` headers on the initialize handshake and ambient
   requests (#7305, #7218), tool-use sampling results (#7189).
 - **New package**: `azure-cosmos-memory` context provider (#6719).
