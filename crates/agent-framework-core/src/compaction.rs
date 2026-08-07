@@ -512,41 +512,78 @@ fn reinstate_calls_answered_by_pending(
     if wanted.is_empty() {
         return retained;
     }
-    // Subtract the calls already retained and unanswered within `retained`.
-    for content in retained.iter().flat_map(|m| m.contents.iter()) {
-        match content {
-            Content::FunctionCall(fc) => {
-                if let Some(count) = wanted.get_mut(fc.call_id.as_str()) {
-                    *count = count.saturating_sub(1);
-                }
-            }
-            Content::FunctionResult(fr) => {
-                if let Some(count) = wanted.get_mut(fr.call_id.as_str()) {
-                    *count += 1;
-                }
-            }
-            _ => {}
+    // Subtract the calls the retained set can already answer with. Counted by
+    // *occurrence*, not id membership — a completed pair in `retained` answers
+    // nothing further.
+    for (_, _, call_id) in unanswered_call_sites(&retained) {
+        if let Some(count) = wanted.get_mut(call_id) {
+            *count = count.saturating_sub(1);
         }
     }
 
-    // Reinstate in original order so several recovered calls keep their
-    // relative sequence.
-    for message in original.iter() {
-        for (ci, content) in message.contents.iter().enumerate() {
-            let Content::FunctionCall(fc) = content else {
-                continue;
-            };
-            let Some(count) = wanted.get_mut(fc.call_id.as_str()) else {
-                continue;
-            };
-            if *count == 0 {
-                continue;
-            }
-            *count -= 1;
-            retained.push(reduced_to(message, &[ci]));
+    // Choose from the calls left unanswered *in the original history*, not from
+    // every call sharing the id. Ids are reused: in
+    // `call(c1, old) -> result(c1) -> call(c1, new)` the first occurrence is
+    // already answered, and an incoming result answers the *new* call. Picking
+    // the first id match would replay the old call's name and arguments and
+    // attach the new result to it, corrupting the tool history.
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    let mut unanswered_by_id: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (mi, ci, call_id) in unanswered_call_sites(original) {
+        unanswered_by_id.entry(call_id).or_default().push((mi, ci));
+    }
+    for (call_id, count) in &wanted {
+        if *count == 0 {
+            continue;
+        }
+        if let Some(sites) = unanswered_by_id.get(call_id) {
+            // The most recent unanswered occurrences are the ones an incoming
+            // result answers.
+            let take_from = sites.len().saturating_sub(*count);
+            chosen.extend_from_slice(&sites[take_from..]);
         }
     }
+    // Append in original order so several recovered calls keep their sequence.
+    chosen.sort_unstable();
+    for (mi, ci) in chosen {
+        retained.push(reduced_to(&original[mi], &[ci]));
+    }
     retained
+}
+
+/// The `(message index, content index, call id)` of every function call in
+/// `messages` that no later result answers.
+///
+/// Pairs by occurrence — each result consumes the oldest still-unanswered call
+/// sharing its id — because ids are not unique across a conversation.
+fn unanswered_call_sites(messages: &[Message]) -> Vec<(usize, usize, &str)> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for (ci, content) in message.contents.iter().enumerate() {
+            match content {
+                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                    unanswered
+                        .entry(fc.call_id.as_str())
+                        .or_default()
+                        .push_back((mi, ci));
+                }
+                Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                    if let Some(sites) = unanswered.get_mut(fr.call_id.as_str()) {
+                        sites.pop_front();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<(usize, usize, &str)> = unanswered
+        .into_iter()
+        .flat_map(|(id, sites)| sites.into_iter().map(move |(mi, ci)| (mi, ci, id)))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// Apply the invariants every compaction result must satisfy, whatever
@@ -955,6 +992,66 @@ mod tests {
             vec!["c1"],
             "the call must be put back so the incoming result answers something"
         );
+    }
+
+    #[test]
+    fn a_reused_call_id_reinstates_the_unanswered_occurrence() {
+        // `call(c1, old) -> result(c1) -> call(c1, new)`: the first occurrence
+        // is already answered, so an incoming result answers the *new* call.
+        // Picking the first id match replayed the old call's name and arguments
+        // and attached the new result to it.
+        let mut old_call = tool_call_message("c1", "get_weather");
+        old_call.contents = vec![Content::FunctionCall(
+            crate::types::FunctionCallContent::new(
+                "c1",
+                "get_weather",
+                Some(crate::types::FunctionArguments::Raw(
+                    "{\"city\":\"old\"}".into(),
+                )),
+            ),
+        )];
+        let mut new_call = tool_call_message("c1", "get_weather");
+        new_call.contents = vec![Content::FunctionCall(
+            crate::types::FunctionCallContent::new(
+                "c1",
+                "get_weather",
+                Some(crate::types::FunctionArguments::Raw(
+                    "{\"city\":\"new\"}".into(),
+                )),
+            ),
+        )];
+        let history = vec![old_call, tool_result_message("c1", "old answer"), new_call];
+        let input = vec![tool_result_message("c1", "new answer")];
+
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let calls: Vec<&crate::types::FunctionCallContent> = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_call)
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let args = calls[0].parse_arguments().unwrap();
+        assert_eq!(
+            args.get("city").and_then(|v| v.as_str()),
+            Some("new"),
+            "the unanswered (new) occurrence must be the one reinstated"
+        );
+    }
+
+    #[test]
+    fn a_completed_exchange_in_history_is_not_reinstated() {
+        // Nothing is outstanding, so an incoming result for a *fresh* call id
+        // pulls back nothing.
+        let history = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+        ];
+        let input = vec![tool_result_message("c2", "noon")];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
     }
 
     #[test]
