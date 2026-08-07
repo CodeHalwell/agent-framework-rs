@@ -277,42 +277,68 @@ impl CompactionStrategy for SelectiveToolResult {
 /// the way upstream's `ToolResultCompactionStrategy` does; this port has no
 /// LLM-summarizing compaction strategy to build that summary with.
 fn drop_orphaned_tool_exchanges(messages: Vec<Message>) -> Vec<Message> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet, VecDeque};
 
-    // Borrow `messages` only long enough to decide which ids are paired; the
-    // repair loop below consumes it.
-    let paired: HashSet<String> = {
-        let mut call_ids: HashSet<&str> = HashSet::new();
-        let mut result_ids: HashSet<&str> = HashSet::new();
-        for content in messages.iter().flat_map(|m| m.contents.iter()) {
-            match content {
-                Content::FunctionCall(fc) => {
-                    call_ids.insert(fc.call_id.as_str());
+    // Pair by *occurrence*, not by id membership. Call ids are not guaranteed
+    // unique across a conversation — providers may reuse one for a later
+    // invocation, and some surfaces derive the id from the tool name — so
+    // comparing sets of ids would call `[call(c1), result(c1), call(c1)]`
+    // balanced and leave the second call unanswered. Each result is instead
+    // matched to the oldest still-unanswered call sharing its id; whatever is
+    // left unmatched on either side is an orphan.
+    let paired: HashSet<(usize, usize)> = {
+        let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
+        let mut paired = HashSet::new();
+        for (mi, message) in messages.iter().enumerate() {
+            for (ci, content) in message.contents.iter().enumerate() {
+                match content {
+                    Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                        unanswered
+                            .entry(fc.call_id.as_str())
+                            .or_default()
+                            .push_back((mi, ci));
+                    }
+                    Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                        if let Some(call_site) = unanswered
+                            .get_mut(fr.call_id.as_str())
+                            .and_then(VecDeque::pop_front)
+                        {
+                            paired.insert(call_site);
+                            paired.insert((mi, ci));
+                        }
+                    }
+                    _ => {}
                 }
-                Content::FunctionResult(fr) => {
-                    result_ids.insert(fr.call_id.as_str());
-                }
-                _ => {}
             }
         }
-        // Nothing is orphaned when every id appears on both sides — the common
-        // case, and the only one that skips the rebuild entirely.
-        if call_ids == result_ids {
-            return messages;
-        }
-        call_ids
-            .intersection(&result_ids)
-            .map(|id| (*id).to_string())
-            .collect()
+        paired
     };
 
+    // Fast path: nothing is orphaned, so the (common) balanced conversation is
+    // returned without rebuilding it.
+    let has_orphan = messages.iter().enumerate().any(|(mi, message)| {
+        message.contents.iter().enumerate().any(|(ci, content)| {
+            matches!(
+                content,
+                Content::FunctionCall(_) | Content::FunctionResult(_)
+            ) && !paired.contains(&(mi, ci))
+        })
+    });
+    if !has_orphan {
+        return messages;
+    }
+
     let mut out = Vec::with_capacity(messages.len());
-    for mut message in messages {
+    for (mi, mut message) in messages.into_iter().enumerate() {
         let had_contents = !message.contents.is_empty();
-        message.contents.retain(|content| match content {
-            Content::FunctionCall(fc) => paired.contains(&fc.call_id),
-            Content::FunctionResult(fr) => paired.contains(&fr.call_id),
-            _ => true,
+        let mut ci = 0;
+        message.contents.retain(|content| {
+            let keep = !matches!(
+                content,
+                Content::FunctionCall(_) | Content::FunctionResult(_)
+            ) || paired.contains(&(mi, ci));
+            ci += 1;
+            keep
         });
         // A message that carried only an orphaned half is dropped outright; one
         // that was already empty is left alone (not this pass's business).
@@ -530,6 +556,51 @@ mod tests {
         // cheap result must not survive alone answering nothing.
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn a_reused_call_id_is_paired_by_occurrence_not_by_id() {
+        // Call ids are not guaranteed unique across a conversation. Comparing
+        // *sets* of ids called this balanced (both sides are {c1}) and returned
+        // early, leaving the second call unanswered.
+        let messages = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+            tool_call_message("c1", "get_weather"),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(10), &ApproxTokenizer);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"],
+            "the second, unanswered c1 call must be dropped"
+        );
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+            vec!["c1"]
+        );
+    }
+
+    #[test]
+    fn two_full_exchanges_reusing_one_call_id_both_survive() {
+        let messages = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "rainy"),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(10), &ApproxTokenizer);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn a_result_preceding_its_call_is_not_treated_as_paired() {
+        // A result can only answer a call that came before it.
+        let messages = vec![
+            tool_result_message("c1", "sunny"),
+            tool_call_message("c1", "get_weather"),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(10), &ApproxTokenizer);
+        assert!(out.is_empty(), "both halves are orphans, got {out:?}");
     }
 
     #[test]

@@ -355,34 +355,40 @@ fn replace_approval_contents_with_results(
     messages: &mut [Message],
     approved_results: &HashMap<String, FunctionResultContent>,
 ) {
-    // Collect *pending* call ids across every message, not just the one being
-    // scanned. A function call and its approval request are frequently carried
-    // in separate messages — a hosting layer replaying them as separate items
-    // on an approval round trip does exactly this — so a per-message check
-    // never fires, the request restores a second copy of the call, and only one
-    // copy receives the result. The unanswered copy is then rejected by the
-    // provider ("No tool output found for function call ..."). Mirrors
-    // upstream's fix in `_replace_approval_contents_with_results` (#7267).
+    // Collect ids that still have an *unanswered* call, across every message —
+    // not just the one being scanned. A function call and its approval request
+    // are frequently carried in separate messages (a hosting layer replaying
+    // them as separate items on an approval round trip does exactly this), so a
+    // per-message check never fires: the request restores a second copy of the
+    // call, only one copy receives the result, and the provider rejects the
+    // orphan ("No tool output found for function call ..."). Mirrors upstream's
+    // fix in `_replace_approval_contents_with_results` (#7267).
     //
-    // Calls that already carry a result are excluded: reusing a call id for a
-    // later invocation is supported, and a completed pair must not suppress the
-    // fresh request — that would drop the new call and leave its result
-    // attached to the old one.
-    let answered_call_ids: std::collections::HashSet<&str> = messages
-        .iter()
-        .flat_map(|m| m.contents.iter())
-        .filter_map(Content::as_function_result)
-        .map(|fr| fr.call_id.as_str())
-        .filter(|id| !id.is_empty())
-        .collect();
-    let mut existing_call_ids: std::collections::HashSet<String> = messages
-        .iter()
-        .flat_map(|m| m.contents.iter())
-        .filter_map(Content::as_function_call)
-        .filter(|fc| !fc.call_id.is_empty() && !answered_call_ids.contains(fc.call_id.as_str()))
-        .map(|fc| fc.call_id.clone())
-        .collect();
-    drop(answered_call_ids);
+    // Counted per occurrence rather than by id membership, because call ids are
+    // not guaranteed unique: reusing one for a later invocation is supported. A
+    // completed pair must not suppress a fresh request (that would drop the new
+    // call and leave its result attached to the old one), but a *second*,
+    // still-unanswered call sharing that id must — which "any result exists for
+    // this id" cannot distinguish and a call/result count can.
+    let mut existing_call_ids: std::collections::HashSet<String> = {
+        let mut unanswered: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for content in messages.iter().flat_map(|m| m.contents.iter()) {
+            match content {
+                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                    *unanswered.entry(fc.call_id.as_str()).or_insert(0) += 1;
+                }
+                Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                    *unanswered.entry(fr.call_id.as_str()).or_insert(0) -= 1;
+                }
+                _ => {}
+            }
+        }
+        unanswered
+            .into_iter()
+            .filter(|(_, outstanding)| *outstanding > 0)
+            .map(|(id, _)| id.to_string())
+            .collect()
+    };
 
     for msg in messages.iter_mut() {
         let mut to_remove: Vec<usize> = Vec::new();
@@ -1192,6 +1198,30 @@ mod approval_replacement_tests {
         let mut messages = vec![approval_request("c1")];
         replace_approval_contents_with_results(&mut messages, &HashMap::new());
         assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn a_second_unanswered_call_reusing_an_id_still_suppresses_the_request() {
+        // The completed c1 pair must not mask the *second*, still-unanswered c1
+        // call: expanding the replayed request here would hand the provider two
+        // unanswered copies. "Any result exists for this id" cannot tell these
+        // apart from the reuse-after-completion case above; a call/result count
+        // can.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(FunctionResultContent {
+                    call_id: "c1".into(),
+                    result: Some(Value::String("sunny".into())),
+                    exception: None,
+                })],
+            ),
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            approval_request("c1"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1", "c1"]);
     }
 
     #[test]

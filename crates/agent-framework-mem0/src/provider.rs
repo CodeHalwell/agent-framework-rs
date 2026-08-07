@@ -138,10 +138,15 @@ fn build_search_body(
     if let Some(v) = run_id {
         filters.insert("run_id".to_string(), Value::String(v.to_string()));
     }
-    // Mirrors upstream's app-scoped fallback: `application_id` narrows a search
-    // only when no user/agent retrieval scope is set, since an app id is far
-    // broader than either.
-    if filters.is_empty() {
+    // Mirrors upstream's app-scoped fallback (`if not search_tasks and
+    // self.search_application_id`): `application_id` narrows a search only when
+    // no user/agent retrieval scope is set, since an app id is far broader than
+    // either. The condition is deliberately *not* "no filters yet" — `run_id`
+    // is a filter too, so keying off emptiness would drop the app scope
+    // whenever a thread id is present and leave an app-only retrieval scoped
+    // solely by run id, matching memories from any other application sharing
+    // it.
+    if user_id.is_none() && agent_id.is_none() {
         if let Some(v) = application_id {
             filters.insert("app_id".to_string(), Value::String(v.to_string()));
         }
@@ -688,12 +693,35 @@ mod tests {
     }
 
     #[test]
-    fn build_search_body_never_includes_application_id() {
-        // application_id is not a parameter of build_search_body at all —
-        // this is a structural assertion that the function signature keeps
-        // it out, matching Python's invoking() never forwarding it.
-        let body = build_search_body("q", Some("u"), Some("a"), Some("r"), None);
+    fn build_search_body_never_emits_the_legacy_application_id_key() {
+        // The wire key for application scope is `app_id`; `application_id` is
+        // the *storage*-side metadata key and must never appear in a search
+        // filter. Passing an application id here still must not produce it.
+        let body = build_search_body("q", None, None, None, Some("app-1"));
         assert!(body["filters"].get("application_id").is_none());
+        assert_eq!(body["filters"]["app_id"], serde_json::json!("app-1"));
+    }
+
+    #[test]
+    fn application_scope_applies_whenever_no_user_or_agent_scope_is_set() {
+        // A run id must not suppress the app-scoped fallback: keying the
+        // fallback off "no filters yet" left an app-only retrieval scoped
+        // solely by run id, matching memories from any other application that
+        // shares it.
+        let body = build_search_body("q", None, None, Some("run-1"), Some("app-1"));
+        assert_eq!(body["filters"]["app_id"], serde_json::json!("app-1"));
+        assert_eq!(body["filters"]["run_id"], serde_json::json!("run-1"));
+    }
+
+    #[test]
+    fn a_user_or_agent_scope_suppresses_the_application_fallback() {
+        for (user, agent) in [(Some("u"), None), (None, Some("a"))] {
+            let body = build_search_body("q", user, agent, None, Some("app-1"));
+            assert!(
+                body["filters"].get("app_id").is_none(),
+                "app_id must not widen a narrower user/agent scope"
+            );
+        }
     }
 
     // endregion
