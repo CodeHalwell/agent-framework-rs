@@ -915,10 +915,14 @@ impl StreamUsageAccumulator {
     pub(crate) fn increment(&mut self, cumulative: &UsageDetails) -> UsageDetails {
         fn delta(emitted: &mut Option<u64>, cumulative: Option<u64>) -> Option<u64> {
             let total = cumulative?;
+            let previous = emitted.unwrap_or(0);
             // `saturating_sub` guards a provider that reports a *decreasing*
-            // cumulative count: clamp to 0 rather than underflowing u64.
-            let increment = total.saturating_sub(emitted.unwrap_or(0));
-            *emitted = Some(total);
+            // cumulative count: clamp to 0 rather than underflowing u64. The
+            // baseline must then stay at the high-water mark rather than follow
+            // the lower total — otherwise 30 -> 20 -> 25 emits 30 + 0 + 5 = 35,
+            // inventing 5 tokens the provider never reported.
+            let increment = total.saturating_sub(previous);
+            *emitted = Some(total.max(previous));
             Some(increment)
         }
 
@@ -953,7 +957,8 @@ impl StreamUsageAccumulator {
                 .or_insert(0);
             out.additional_counts
                 .insert(key.clone(), total.saturating_sub(*emitted));
-            *emitted = *total;
+            // High-water mark, as above.
+            *emitted = (*total).max(*emitted);
         }
         // `total_token_count` is derived, not reported: recompute it from the
         // increments so it stays consistent with them rather than carrying a
@@ -1036,6 +1041,32 @@ mod tests {
         })));
         assert_eq!(inc.input_token_count, Some(0));
         assert_eq!(inc.output_token_count, Some(2));
+    }
+
+    #[test]
+    fn stream_usage_accumulator_holds_its_high_water_mark() {
+        // A decreasing snapshot must not lower the baseline: 30 -> 20 -> 25
+        // otherwise emits 30 + 0 + 5 = 35, inventing tokens the provider never
+        // reported.
+        let mut acc = StreamUsageAccumulator::default();
+        let mut aggregated = UsageDetails::default();
+        for output in [30u64, 20, 25] {
+            let inc = acc.increment(&parse_usage(&json!({ "output_tokens": output })));
+            aggregated.add_assign(&inc);
+        }
+        assert_eq!(aggregated.output_token_count, Some(30));
+    }
+
+    #[test]
+    fn stream_usage_accumulator_holds_its_high_water_mark_for_extra_counts() {
+        let mut acc = StreamUsageAccumulator::default();
+        let mut aggregated = UsageDetails::default();
+        for value in [30u64, 20, 25] {
+            let mut cumulative = UsageDetails::default();
+            cumulative.additional_counts.insert("extra".into(), value);
+            aggregated.add_assign(&acc.increment(&cumulative));
+        }
+        assert_eq!(aggregated.additional_counts.get("extra"), Some(&30));
     }
 
     #[test]

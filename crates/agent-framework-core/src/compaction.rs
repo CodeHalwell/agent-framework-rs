@@ -391,7 +391,13 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     let plain = original
         .iter()
         .rev()
-        .filter(|m| m.role != Role::system())
+        // A tool-role message is never standalone content: its text belongs to
+        // the exchange. Stripping its result and keeping the text yields a tool
+        // message with no `tool_call_id`, which the OpenAI converter drops
+        // entirely (leaving the conversation system-only after all) and which
+        // Gemini emits as a bare text part under its `function` role. The
+        // complete-exchange fallback below handles these properly.
+        .filter(|m| m.role != Role::system() && m.role != Role::tool())
         .find_map(|m| {
             let mut candidate = m.clone();
             candidate
@@ -473,6 +479,76 @@ fn reduced_to(message: &Message, keep: &[usize]) -> Message {
     out
 }
 
+/// Put back a call that the *strategy* dropped but that an incoming result
+/// answers.
+///
+/// Pairing against `pending` stops the repair from stripping a **retained**
+/// call, but the strategy runs first and may have excluded the call from
+/// `retained` altogether — `SlidingWindow::new(0)` over a history holding
+/// `call(c1)` while the run's input holds `result(c1)`, for instance. Nothing
+/// downstream can fix that: the call is gone from the retained set, and
+/// `pending` is the caller's input, which is not ours to edit. The request
+/// would go out with a result answering nothing.
+///
+/// So the call is reinstated from `original` — reduced to just that content, so
+/// no unrelated payload rides back in with it — and appended after the retained
+/// messages, which keeps it ahead of the `pending` result that follows.
+fn reinstate_calls_answered_by_pending(
+    original: &[Message],
+    mut retained: Vec<Message>,
+    pending: &[Message],
+) -> Vec<Message> {
+    use std::collections::HashMap;
+
+    // How many results in `pending` want a call, per id.
+    let mut wanted: HashMap<&str, usize> = HashMap::new();
+    for content in pending.iter().flat_map(|m| m.contents.iter()) {
+        if let Content::FunctionResult(fr) = content {
+            if !fr.call_id.is_empty() {
+                *wanted.entry(fr.call_id.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return retained;
+    }
+    // Subtract the calls already retained and unanswered within `retained`.
+    for content in retained.iter().flat_map(|m| m.contents.iter()) {
+        match content {
+            Content::FunctionCall(fc) => {
+                if let Some(count) = wanted.get_mut(fc.call_id.as_str()) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            Content::FunctionResult(fr) => {
+                if let Some(count) = wanted.get_mut(fr.call_id.as_str()) {
+                    *count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Reinstate in original order so several recovered calls keep their
+    // relative sequence.
+    for message in original.iter() {
+        for (ci, content) in message.contents.iter().enumerate() {
+            let Content::FunctionCall(fc) = content else {
+                continue;
+            };
+            let Some(count) = wanted.get_mut(fc.call_id.as_str()) else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            *count -= 1;
+            retained.push(reduced_to(message, &[ci]));
+        }
+    }
+    retained
+}
+
 /// Apply the invariants every compaction result must satisfy, whatever
 /// strategy produced it: no half tool exchanges, and never system-only.
 ///
@@ -493,6 +569,7 @@ fn finalize_compaction(
     retained: Vec<Message>,
     pending: &[Message],
 ) -> Vec<Message> {
+    let retained = reinstate_calls_answered_by_pending(original, retained, pending);
     let retained = drop_orphaned_tool_exchanges(retained, pending);
     // A non-system message in `pending` already gives the model something to
     // answer, so the minimum-retention rule has nothing to enforce.
@@ -853,6 +930,103 @@ mod tests {
         let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
         let blind = finalize_compaction(&history, retained, &[]);
         assert!(call_ids_in(&blind, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn a_call_the_strategy_dropped_is_reinstated_when_the_input_answers_it() {
+        // Pairing against pending stops a *retained* call being stripped, but
+        // the strategy runs first: SlidingWindow(0) excludes the call from
+        // history entirely, and the incoming result then answers nothing.
+        let history = vec![
+            text(Role::user(), "what's the weather?"),
+            tool_call_message("c1", "get_weather"),
+        ];
+        let input = vec![tool_result_message("c1", "sunny")];
+
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        assert!(
+            call_ids_in(&retained, |c| matches!(c, Content::FunctionCall(_))).is_empty(),
+            "precondition: the strategy really did drop the call"
+        );
+
+        let out = finalize_compaction(&history, retained, &input);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"],
+            "the call must be put back so the incoming result answers something"
+        );
+    }
+
+    #[test]
+    fn a_reinstated_call_carries_nothing_else_from_its_message() {
+        let mut call_msg = tool_call_message("c1", "get_weather");
+        call_msg
+            .contents
+            .push(Content::text("a large unrelated payload"));
+        let history = vec![call_msg];
+        let input = vec![tool_result_message("c1", "sunny")];
+
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].contents.len(), 1, "only the call rides back in");
+        assert!(out[0].text().is_empty());
+    }
+
+    #[test]
+    fn nothing_is_reinstated_when_the_input_carries_no_results() {
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![text(Role::user(), "hello")];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn an_already_retained_call_is_not_reinstated_twice() {
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![tool_result_message("c1", "sunny")];
+        let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"]
+        );
+    }
+
+    #[test]
+    fn the_minimum_retention_fallback_never_picks_a_tool_role_message() {
+        // A tool message's text belongs to its exchange. Keeping it without the
+        // result yields a tool message with no tool_call_id, which the OpenAI
+        // converter drops outright (system-only after all) and which Gemini
+        // emits as a bare text part under its `function` role.
+        let mut result_msg = tool_result_message("c1", "sunny");
+        result_msg.contents.push(Content::text("explanatory text"));
+        let messages = vec![
+            text(Role::system(), "sys"),
+            tool_call_message("c1", "get_weather"),
+            result_msg,
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        // The complete exchange comes back instead of a bare tool-role text.
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"]
+        );
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+            vec!["c1"]
+        );
+        for m in &out {
+            if m.role == Role::tool() {
+                assert!(
+                    m.contents
+                        .iter()
+                        .any(|c| matches!(c, Content::FunctionResult(_))),
+                    "a tool-role message must carry its result"
+                );
+            }
+        }
     }
 
     #[test]
