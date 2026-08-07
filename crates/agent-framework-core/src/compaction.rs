@@ -205,7 +205,10 @@ fn has_tool_result(message: &Message) -> bool {
 /// bulkiest and least useful once stale. Text and other content is left intact.
 ///
 /// The result content itself is **kept**, with its payload swapped for
-/// [`OMITTED_TOOL_RESULT`], rather than deleted. Deleting it would leave the
+/// [`OMITTED_TOOL_RESULT`] — on `result` and, for a failed call, on
+/// `exception` too, since provider converters render `exception` *instead of*
+/// `result` and leaving it would send the original error verbatim — rather
+/// than deleted. Deleting it would leave the
 /// matching assistant `tool_calls` entry unanswered, which providers reject
 /// outright — so the size win would come at the cost of a 400 on the next
 /// request. Mirrors the intent of upstream's `ToolResultCompactionStrategy`,
@@ -243,6 +246,17 @@ impl CompactionStrategy for SelectiveToolResult {
                     if let Content::FunctionResult(fr) = content {
                         fr.result =
                             Some(serde_json::Value::String(OMITTED_TOOL_RESULT.to_string()));
+                        // A failed call carries its payload — often a stack
+                        // trace, the bulkiest thing here — in `exception`, and
+                        // every provider converter renders `exception` *instead
+                        // of* `result`. Replacing only `result` would leave the
+                        // original error sent verbatim and the marker ignored,
+                        // making this a no-op for exactly the results most worth
+                        // compacting. Replaced rather than cleared, so the model
+                        // still sees that the call failed.
+                        if fr.exception.is_some() {
+                            fr.exception = Some(OMITTED_TOOL_RESULT.to_string());
+                        }
                     }
                 }
                 out.push(compacted);
@@ -580,6 +594,46 @@ mod tests {
     }
 
     // ---- compaction invariants (upstream #7406 / #7219) --------------------
+
+    #[test]
+    fn selective_tool_result_compacts_a_failed_calls_exception_too() {
+        // Every provider converter renders `exception` instead of `result`, so
+        // replacing only `result` left the original stack trace sent verbatim —
+        // a no-op for exactly the results most worth compacting.
+        let failed = Message::with_contents(
+            Role::tool(),
+            vec![Content::FunctionResult(FunctionResultContent {
+                call_id: "c1".into(),
+                result: None,
+                exception: Some("Traceback: ...a very long stack trace...".into()),
+            })],
+        );
+        let messages = vec![
+            tool_call_message("c1", "t1"),
+            failed,
+            tool_call_message("c2", "t2"),
+            tool_result_message("c2", "fresh"),
+        ];
+        let out = compact(&messages, &SelectiveToolResult::new(1), &ApproxTokenizer);
+
+        let compacted = &out[1].function_results()[0];
+        // Still visibly a failure, just without the payload.
+        assert_eq!(compacted.exception.as_deref(), Some(OMITTED_TOOL_RESULT));
+        // The most recent exchange is untouched.
+        assert_eq!(out[3].function_results()[0].result, Some(json!("fresh")));
+    }
+
+    #[test]
+    fn selective_tool_result_does_not_invent_an_exception_on_a_successful_result() {
+        let messages = vec![
+            tool_call_message("c1", "t1"),
+            tool_result_message("c1", "stale"),
+            tool_call_message("c2", "t2"),
+            tool_result_message("c2", "fresh"),
+        ];
+        let out = compact(&messages, &SelectiveToolResult::new(1), &ApproxTokenizer);
+        assert!(out[1].function_results()[0].exception.is_none());
+    }
 
     #[test]
     fn selective_tool_result_compacts_the_payload_without_orphaning_the_call() {
