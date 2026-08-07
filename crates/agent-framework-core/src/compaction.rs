@@ -290,7 +290,7 @@ impl CompactionStrategy for SelectiveToolResult {
 /// Note this *drops* an unmatched call rather than replacing it with a summary
 /// the way upstream's `ToolResultCompactionStrategy` does; this port has no
 /// LLM-summarizing compaction strategy to build that summary with.
-fn drop_orphaned_tool_exchanges(messages: Vec<Message>) -> Vec<Message> {
+fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> Vec<Message> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // Pair by *occurrence*, not by id membership. Call ids are not guaranteed
@@ -303,7 +303,10 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>) -> Vec<Message> {
     let paired: HashSet<(usize, usize)> = {
         let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
         let mut paired = HashSet::new();
-        for (mi, message) in messages.iter().enumerate() {
+        // `pending` is scanned as a continuation of `messages` (its indices
+        // start past the end) so a call here can pair with a result that only
+        // arrives later, but it is never itself modified.
+        for (mi, message) in messages.iter().chain(pending.iter()).enumerate() {
             for (ci, content) in message.contents.iter().enumerate() {
                 match content {
                     Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
@@ -473,6 +476,11 @@ fn reduced_to(message: &Message, keep: &[usize]) -> Message {
 /// Apply the invariants every compaction result must satisfy, whatever
 /// strategy produced it: no half tool exchanges, and never system-only.
 ///
+/// `pending` is a list that will be appended *after* this runs and is not ours
+/// to modify — for [`CompactionProvider`] that is the run's own input. It
+/// participates in pairing so a retained call answered by an incoming result is
+/// not mistaken for an orphan, but is never stripped or returned.
+///
 /// Order matters: the orphan repair runs *first*, because it can itself strip
 /// a conversation down to system messages only (a retained tool result whose
 /// call fell outside the budget is removed, and it may have been the sole
@@ -480,8 +488,17 @@ fn reduced_to(message: &Message, keep: &[usize]) -> Message {
 /// that case too. The reverse order silently leaves a system-only result.
 /// Neither pass can undo the other: the repair is a no-op on the orphan-free
 /// message the fallback reinstates.
-fn finalize_compaction(original: &[Message], retained: Vec<Message>) -> Vec<Message> {
-    let retained = drop_orphaned_tool_exchanges(retained);
+fn finalize_compaction(
+    original: &[Message],
+    retained: Vec<Message>,
+    pending: &[Message],
+) -> Vec<Message> {
+    let retained = drop_orphaned_tool_exchanges(retained, pending);
+    // A non-system message in `pending` already gives the model something to
+    // answer, so the minimum-retention rule has nothing to enforce.
+    if pending.iter().any(|m| m.role != Role::system()) {
+        return retained;
+    }
     ensure_non_system_message(original, retained)
 }
 
@@ -496,7 +513,7 @@ pub fn compact(
     strategy: &dyn CompactionStrategy,
     tokenizer: &dyn Tokenizer,
 ) -> Vec<Message> {
-    finalize_compaction(messages, strategy.compact(messages, tokenizer))
+    finalize_compaction(messages, strategy.compact(messages, tokenizer), &[])
 }
 
 /// A [`ContextProvider`] that compacts the accumulated message list —
@@ -542,7 +559,14 @@ impl ContextProvider for CompactionProvider {
     /// provider-injected messages) with the strategy's compacted subset.
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let retained = self.strategy.compact(&ctx.messages, &*self.tokenizer);
-        ctx.messages = finalize_compaction(&ctx.messages, retained);
+        // Pair against the run's input as well as history. `prepare_request`
+        // appends `input_messages` *after* every provider has run, so a
+        // declaration-only (frontend) tool call sitting in history is routinely
+        // answered by a result that arrives in this run's input. Repairing
+        // history alone would see that call as unanswered, drop it, and leave
+        // the incoming result unmatched — manufacturing exactly the invalid
+        // conversation this pass exists to prevent.
+        ctx.messages = finalize_compaction(&ctx.messages, retained, &ctx.input_messages);
         Ok(())
     }
 
@@ -797,6 +821,58 @@ mod tests {
         assert!(out.iter().any(|m| m.role != Role::system()));
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn a_call_answered_by_the_runs_input_is_not_dropped_as_an_orphan() {
+        // The frontend/declaration-only tool flow: the model's call sits in
+        // history, and the caller supplies its result in the *next* run's
+        // input. `prepare_request` appends that input after every provider has
+        // run, so a repair that only sees history would drop the call and leave
+        // the incoming result unmatched — the exact invalid conversation this
+        // pass exists to prevent.
+        let history = vec![
+            text(Role::user(), "what's the weather?"),
+            tool_call_message("c1", "get_weather"),
+        ];
+        let input = vec![tool_result_message("c1", "sunny")];
+
+        let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"],
+            "the call must survive: its result arrives in this run's input"
+        );
+        // The input itself is never returned or modified by the repair.
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
+
+        // Contrast, pinning the bug this fixes: without visibility of the
+        // pending input the same call *is* dropped as an orphan.
+        let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
+        let blind = finalize_compaction(&history, retained, &[]);
+        assert!(call_ids_in(&blind, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn a_call_with_no_answer_anywhere_is_still_dropped() {
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![text(Role::user(), "never mind")];
+        let retained = SlidingWindow::new(10).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn pending_input_satisfies_the_minimum_retention_rule() {
+        // The run's own input already gives the model something to answer, so
+        // no history turn needs reinstating over the limit.
+        let history = vec![text(Role::system(), "sys"), text(Role::user(), "older")];
+        let input = vec![text(Role::user(), "current question")];
+        let retained = Truncation::new(1).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(out.iter().all(|m| m.role == Role::system()));
     }
 
     #[test]
