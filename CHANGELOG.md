@@ -5,6 +5,47 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
+(2026-08-07), re-baselining from `beb65b21` (2026-07-13). See
+[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md) for the full triage of the
+112 intervening upstream commits, including the items deliberately left open.
+
+### Fixed
+
+- **Structured output was parsed from the wrong text.** The JSON value was
+  built from every message joined with separators and included reasoning
+  content, so a tool result could be mistaken for the answer, chain-of-thought
+  was folded into the payload, and a JSON document split across streaming text
+  chunks had separators injected into it. Now taken from the last non-empty
+  assistant message's `text` contents, concatenated with no separator.
+  (upstream #6990)
+- **Anthropic streaming double-counted tokens.** Anthropic streams cumulative
+  usage snapshots and the port summed them as if they were increments, so a
+  response reporting 25 input tokens aggregated to 50. (upstream #7162)
+- **OpenAI Chat Completions rejected some author names.** A `author_name`
+  containing `/`, `|`, `\`, `<` or `>` was sent verbatim and failed the whole
+  request with a 400; one containing a space was silently dropped. Names are
+  now sanitized to `[a-zA-Z0-9_]` and truncated to 64 characters, matching the
+  Python and .NET clients. (upstream #7126)
+- **Gemini 3 function-call replays lost `thought_signature`.** Gemini requires
+  the signature from a thought part to be echoed on the function call that
+  reasoning produced. Reasoning content is also no longer sent back as a part,
+  matching upstream. (upstream #7095)
+
+### Added
+
+- `DataContent::from_uri` / `DataContent::media_type_from_uri`: validating
+  construction from a `data:` URI, rejecting a missing scheme, missing `,`, or
+  non-base64 declaration instead of silently mis-slicing it. (upstream #6916)
+- `TextReasoningContent::protected_data`, mirroring upstream's
+  `Content.protected_data`, for provider-opaque reasoning replay tokens.
+- OpenAI cache-**write** token counts on both the Chat Completions and
+  Responses surfaces, populating `UsageDetails::cache_creation_input_token_count`
+  and so the `gen_ai.usage.cache_creation.input_tokens` OTel attribute.
+  (upstream #7369)
+
 ## [0.1.1] — 2026-07-13
 
 First published release on crates.io — identical in content to 0.1.0.

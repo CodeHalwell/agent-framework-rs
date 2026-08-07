@@ -54,6 +54,30 @@ pub(crate) fn data_content_media_type(data: &DataContent) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Maximum length of a sanitized Chat Completions message `name`.
+const MAX_AUTHOR_NAME_LENGTH: usize = 64;
+
+/// Sanitize an author name for the Chat Completions message `name` field.
+///
+/// The API validates `name` against `^[^\s<|\\/>]+$`, so an agent display name
+/// containing a space (or any of `< | \ / >`) fails the whole request with a
+/// 400. Mirrors upstream's `_sanitize_author_name`
+/// (`_chat_completion_client.py`), which in turn mirrors `SanitizeAuthorName`
+/// in the .NET client: drop every character outside `[a-zA-Z0-9_]`, return
+/// `None` when nothing remains, and truncate to 64 characters.
+///
+/// Note this is stricter than the API's own regex on purpose — matching
+/// upstream keeps a name that round-trips identically across the Python, .NET,
+/// and Rust clients.
+pub(crate) fn sanitize_author_name(name: &str) -> Option<String> {
+    let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(MAX_AUTHOR_NAME_LENGTH)
+        .collect();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 /// Convert framework messages into the OpenAI `messages` array.
 pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
@@ -115,11 +139,8 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         } else if !text.is_empty() || tool_calls.is_empty() {
             obj.insert("content".into(), json!(text));
         }
-        if let Some(name) = &msg.author_name {
-            // OpenAI `name` must be a simple token; skip if it has spaces.
-            if !name.contains(char::is_whitespace) {
-                obj.insert("name".into(), json!(name));
-            }
+        if let Some(name) = msg.author_name.as_deref().and_then(sanitize_author_name) {
+            obj.insert("name".into(), json!(name));
         }
         if !tool_calls.is_empty() {
             obj.insert("tool_calls".into(), json!(tool_calls));
@@ -414,6 +435,15 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
         add_usage_detail(&mut details, ptd, "cached_tokens", "prompt/cached_tokens");
         // Mirror upstream: cached prompt tokens also populate the typed field.
         details.cache_read_input_token_count = ptd.get("cached_tokens").and_then(Value::as_u64);
+        // Cache *writes* are reported separately from cache reads; surface both
+        // the provider-prefixed extra and the typed cross-language field. Absent
+        // when the provider does not report it (older API versions).
+        if let Some(cache_write) = ptd.get("cache_write_tokens").and_then(Value::as_u64) {
+            details
+                .additional_counts
+                .insert("prompt/cache_write_tokens".into(), cache_write);
+            details.cache_creation_input_token_count = Some(cache_write);
+        }
     }
     details
 }
@@ -498,6 +528,70 @@ mod tests {
                 ],
             })
         );
+    }
+
+    // region: author-name sanitization (upstream #7127)
+
+    #[test]
+    fn author_name_is_sanitized_for_the_name_field() {
+        // The API validates `name` against `^[^\s<|\\/>]+$`, so a display name
+        // with a space used to fail the whole request with a 400.
+        assert_eq!(sanitize_author_name("My Agent").as_deref(), Some("MyAgent"));
+        assert_eq!(sanitize_author_name("agent_1").as_deref(), Some("agent_1"));
+        // Characters the API rejects but that are not whitespace — the previous
+        // whitespace-only guard let these through into a 400.
+        assert_eq!(sanitize_author_name("a/b|c").as_deref(), Some("abc"));
+        // Nothing survives sanitization -> omit the field entirely.
+        assert_eq!(sanitize_author_name("***"), None);
+        assert_eq!(sanitize_author_name(""), None);
+        // Truncated to the 64-character limit.
+        assert_eq!(sanitize_author_name(&"a".repeat(100)).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn messages_to_openai_emits_a_sanitized_name() {
+        let mut msg = Message::assistant("hi");
+        msg.author_name = Some("My Agent".into());
+        let out = messages_to_openai(&[msg]);
+        assert_eq!(out[0]["name"], json!("MyAgent"));
+
+        // A name that sanitizes to nothing is omitted rather than sent empty.
+        let mut msg = Message::assistant("hi");
+        msg.author_name = Some("!!!".into());
+        let out = messages_to_openai(&[msg]);
+        assert!(out[0].get("name").is_none());
+    }
+
+    // region: cache-write tokens (upstream #7369)
+
+    #[test]
+    fn usage_parses_cache_write_tokens() {
+        let usage = json!({
+            "prompt_tokens": 2000,
+            "completion_tokens": 60,
+            "prompt_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 1024 },
+        });
+        let d = parse_usage(&usage);
+        assert_eq!(d.cache_creation_input_token_count, Some(1024));
+        assert_eq!(d.cache_read_input_token_count, Some(0));
+        assert_eq!(
+            d.additional_counts.get("prompt/cache_write_tokens"),
+            Some(&1024)
+        );
+    }
+
+    #[test]
+    fn usage_omits_cache_write_tokens_when_not_reported() {
+        let usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_tokens_details": { "cached_tokens": 40 },
+        });
+        let d = parse_usage(&usage);
+        assert_eq!(d.cache_creation_input_token_count, None);
+        assert!(!d
+            .additional_counts
+            .contains_key("prompt/cache_write_tokens"));
     }
 
     #[test]

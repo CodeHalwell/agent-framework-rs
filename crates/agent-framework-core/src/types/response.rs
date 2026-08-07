@@ -83,6 +83,45 @@ pub struct ChatResponse {
     pub additional_properties: HashMap<String, Value>,
 }
 
+/// The text a structured (JSON) response value should be parsed from.
+///
+/// Mirrors upstream's `_last_non_empty_assistant_message_text`
+/// (`_types.py:2204`): scan the messages newest-first, and return the text of
+/// the last **assistant** message that has any. Three details matter and each
+/// is load-bearing for correctness:
+///
+/// * **Assistant messages only.** A tool result or a user echo carrying JSON
+///   must not be mistaken for the model's structured answer.
+/// * **`text` contents only** — not [`Content::TextReasoning`]. A reasoning
+///   model emits its chain-of-thought as reasoning content; folding that in
+///   ahead of the answer makes the JSON unparseable.
+/// * **Joined with no separator.** Providers split a single JSON payload
+///   across text chunks at arbitrary byte offsets, so any separator corrupts
+///   the payload — `{"na` + `me":1}` joined with a space yields
+///   `{"na me":1}`, a different (or invalid) document.
+///
+/// This deliberately differs from [`ChatResponse::text`], which joins every
+/// message for display and is not safe to parse.
+pub fn structured_output_text(messages: &[Message]) -> String {
+    for message in messages.iter().rev() {
+        if message.role.as_str() != Role::ASSISTANT {
+            continue;
+        }
+        let text: String = message
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
 impl ChatResponse {
     /// Build a response from a single assistant text message.
     pub fn from_text(text: impl Into<String>) -> Self {
@@ -128,7 +167,7 @@ impl ChatResponse {
     /// Mirrors Python's `response.value`: the message text is treated as JSON
     /// and deserialized into `T`.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.text())
+        serde_json::from_str(&structured_output_text(&self.messages))
             .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
     }
 
@@ -185,7 +224,7 @@ impl ChatResponse {
         if !wants_json {
             return;
         }
-        let text = self.text();
+        let text = structured_output_text(&self.messages);
         match serde_json::from_str::<Value>(&text) {
             Ok(v) => self.value = Some(v),
             Err(e) => tracing::debug!("failed to parse structured-output value from text: {e}"),
@@ -401,7 +440,7 @@ impl AgentResponse {
     /// Mirrors Python's `response.value`: the message text is treated as JSON
     /// and deserialized into `T`.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_str(&self.text())
+        serde_json::from_str(&structured_output_text(&self.messages))
             .map_err(|e| Error::Serialization(format!("failed to parse structured output: {e}")))
     }
 
@@ -532,7 +571,7 @@ impl AgentResponseUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ResponseFormat;
+    use crate::types::{ResponseFormat, TextReasoningContent};
     use serde_json::json;
 
     fn text_update(text: &str) -> ChatResponseUpdate {
@@ -589,6 +628,76 @@ mod tests {
     fn from_updates_without_format_leaves_value_none() {
         let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
         assert_eq!(resp.value, None);
+    }
+
+    // region: structured-output text selection (upstream #6990)
+
+    #[test]
+    fn structured_output_text_joins_split_chunks_without_a_separator() {
+        // Providers split one JSON payload at arbitrary offsets. Joining with a
+        // space would yield `{"na me": 1}` — a different document.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![Content::text("{\"na"), Content::text("me\": 1}")],
+        );
+        assert_eq!(structured_output_text(&[msg]), "{\"name\": 1}");
+    }
+
+    #[test]
+    fn structured_output_text_excludes_reasoning_content() {
+        // A reasoning model emits chain-of-thought as reasoning content; folding
+        // it in ahead of the answer makes the JSON unparseable.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "Let me think about this...".into(),
+                    ..Default::default()
+                }),
+                Content::text("{\"answer\": 42}"),
+            ],
+        );
+        assert_eq!(
+            structured_output_text(std::slice::from_ref(&msg)),
+            "{\"answer\": 42}"
+        );
+
+        let mut resp = ChatResponse {
+            messages: vec![msg],
+            ..Default::default()
+        };
+        resp.try_parse_value(Some(&ResponseFormat::JsonObject));
+        assert_eq!(resp.value, Some(json!({"answer": 42})));
+    }
+
+    #[test]
+    fn structured_output_text_uses_the_last_non_empty_assistant_message() {
+        let messages = vec![
+            Message::with_contents(Role::user(), vec![Content::text("{\"from\": \"user\"}")]),
+            Message::with_contents(Role::assistant(), vec![Content::text("{\"n\": 1}")]),
+            // Empty assistant message is skipped, not treated as the answer.
+            Message::with_contents(Role::assistant(), vec![Content::text("   ")]),
+        ];
+        assert_eq!(structured_output_text(&messages), "{\"n\": 1}");
+    }
+
+    #[test]
+    fn structured_output_text_ignores_tool_results_carrying_json() {
+        // A tool result must never be mistaken for the model's structured answer.
+        let messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::text("{\"answer\": 1}")]),
+            Message::with_contents(Role::tool(), vec![Content::text("{\"tool\": \"output\"}")]),
+        ];
+        assert_eq!(structured_output_text(&messages), "{\"answer\": 1}");
+    }
+
+    #[test]
+    fn structured_output_text_is_empty_without_an_assistant_message() {
+        let messages = vec![Message::with_contents(
+            Role::user(),
+            vec![Content::text("{\"a\": 1}")],
+        )];
+        assert_eq!(structured_output_text(&messages), "");
     }
 
     #[test]

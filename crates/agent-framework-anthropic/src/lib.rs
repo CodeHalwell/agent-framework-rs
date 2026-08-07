@@ -380,6 +380,7 @@ fn parse_sse_stream(
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
+            usage: convert::StreamUsageAccumulator::default(),
             done: false,
         },
         |mut state| async move {
@@ -422,9 +423,11 @@ fn parse_sse_stream(
                                 state.done = true;
                                 return Some((Err(Error::service(msg)), state));
                             }
-                            if let Some(update) =
-                                parse_stream_event(&value, &mut state.tool_use_ids)
-                            {
+                            if let Some(update) = parse_stream_event(
+                                &value,
+                                &mut state.tool_use_ids,
+                                &mut state.usage,
+                            ) {
                                 state.queued.push_back(update);
                             }
                         }
@@ -449,6 +452,8 @@ struct SseState {
     /// `content_block` index -> `tool_use` call id, so `input_json_delta`
     /// fragments (which carry only the index) resolve to the right call.
     tool_use_ids: HashMap<i64, String>,
+    /// Turns Anthropic's cumulative usage snapshots into per-update increments.
+    usage: convert::StreamUsageAccumulator,
     done: bool,
 }
 
@@ -458,6 +463,7 @@ struct SseState {
 fn parse_stream_event(
     value: &Value,
     tool_use_ids: &mut HashMap<i64, String>,
+    usage_acc: &mut convert::StreamUsageAccumulator,
 ) -> Option<ChatResponseUpdate> {
     match value.get("type").and_then(Value::as_str)? {
         "message_start" => {
@@ -470,7 +476,11 @@ fn parse_stream_event(
             let mut contents = Vec::new();
             if let Some(usage) = message.get("usage") {
                 if let Some(usage_content) = convert::parse_message_start_usage(usage) {
-                    contents.push(Content::Usage(usage_content));
+                    // Seed the accumulator: `message_start`'s counts are the
+                    // first cumulative snapshot, so the increment equals it.
+                    contents.push(Content::Usage(UsageContent {
+                        details: usage_acc.increment(&usage_content.details),
+                    }));
                 }
             }
             Some(ChatResponseUpdate {
@@ -576,8 +586,10 @@ fn parse_stream_event(
         "message_delta" => {
             let mut contents = Vec::new();
             if let Some(usage) = value.get("usage") {
+                // `message_delta.usage` is the running total for the message,
+                // not a per-delta increment: emit only what it adds.
                 contents.push(Content::Usage(UsageContent {
-                    details: convert::parse_usage(usage),
+                    details: usage_acc.increment(&convert::parse_usage(usage)),
                 }));
             }
             let finish_reason = value
@@ -615,6 +627,7 @@ mod tests {
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
+            usage: convert::StreamUsageAccumulator::default(),
             done: false,
         };
         let mut updates = Vec::new();
@@ -632,7 +645,9 @@ mod tests {
                     continue;
                 }
                 let value: Value = serde_json::from_str(data).unwrap();
-                if let Some(update) = parse_stream_event(&value, &mut state.tool_use_ids) {
+                if let Some(update) =
+                    parse_stream_event(&value, &mut state.tool_use_ids, &mut state.usage)
+                {
                     updates.push(update);
                 }
             }
@@ -688,6 +703,48 @@ mod tests {
         // message_delta only (not doubled with message_start's placeholder).
         assert_eq!(usage.input_token_count, Some(25));
         assert_eq!(usage.output_token_count, Some(15));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_is_not_double_counted_when_deltas_repeat_input_tokens() {
+        // Anthropic streams *cumulative* usage: `message_delta` repeats the
+        // input/cache counts already reported by `message_start`. Emitting the
+        // raw snapshots aggregated input_tokens to 2x the real figure.
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4",
+                    "usage": {
+                        "input_tokens": 25,
+                        "cache_read_input_tokens": 8,
+                        "output_tokens": 1
+                    }
+                }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": {
+                    "input_tokens": 25,
+                    "cache_read_input_tokens": 8,
+                    "output_tokens": 15
+                }
+            }),
+        ));
+
+        let updates = collect_updates(text).await;
+        let resp = ChatResponse::from_updates(updates);
+        let usage = resp.usage_details.unwrap();
+        assert_eq!(usage.input_token_count, Some(25));
+        assert_eq!(usage.output_token_count, Some(15));
+        assert_eq!(usage.cache_read_input_token_count, Some(8));
     }
 
     #[tokio::test]
@@ -837,6 +894,7 @@ mod tests {
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_use_ids: HashMap::new(),
+            usage: convert::StreamUsageAccumulator::default(),
             done: false,
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();

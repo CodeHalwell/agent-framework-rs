@@ -884,9 +884,169 @@ pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
     Some(UsageContent { details })
 }
 
+/// Per-stream accumulator that turns Anthropic's *cumulative* usage snapshots
+/// into the *increments* the framework's additive aggregation expects.
+///
+/// Anthropic streams cumulative usage: `message_start` seeds it and every
+/// `message_delta` reports the running total for the message, not a per-delta
+/// increment. [`ChatResponse::absorb_update`] sums every usage `Content`, so
+/// emitting the raw snapshots inflates the total by all the earlier ones — a
+/// stream whose `message_start` reports `input_tokens: 10` and whose
+/// `message_delta` reports the cumulative `{input_tokens: 10, output_tokens:
+/// 25}` aggregates to 20 input tokens instead of 10.
+///
+/// Emitting the increment over what has already been emitted makes that
+/// summation reconstruct the final cumulative usage instead. Mirrors upstream's
+/// `_incremental_usage` (`_chat_client.py`), threaded across a single stream.
+///
+/// Counts absent from a snapshot leave their accumulated value untouched, so a
+/// partial delta carrying only `output_tokens` does not reset the input side.
+/// (Upstream's Python clears its whole accumulator on each snapshot, which
+/// drops the running total for any key the snapshot omits; this implementation
+/// follows the documented partial-delta intent instead.)
+#[derive(Debug, Default)]
+pub(crate) struct StreamUsageAccumulator {
+    emitted: UsageDetails,
+}
+
+impl StreamUsageAccumulator {
+    /// Convert a cumulative snapshot into the increment since the last one,
+    /// recording the snapshot as the new high-water mark.
+    pub(crate) fn increment(&mut self, cumulative: &UsageDetails) -> UsageDetails {
+        fn delta(emitted: &mut Option<u64>, cumulative: Option<u64>) -> Option<u64> {
+            let total = cumulative?;
+            // `saturating_sub` guards a provider that reports a *decreasing*
+            // cumulative count: clamp to 0 rather than underflowing u64.
+            let increment = total.saturating_sub(emitted.unwrap_or(0));
+            *emitted = Some(total);
+            Some(increment)
+        }
+
+        let mut out = UsageDetails {
+            input_token_count: delta(
+                &mut self.emitted.input_token_count,
+                cumulative.input_token_count,
+            ),
+            output_token_count: delta(
+                &mut self.emitted.output_token_count,
+                cumulative.output_token_count,
+            ),
+            cache_creation_input_token_count: delta(
+                &mut self.emitted.cache_creation_input_token_count,
+                cumulative.cache_creation_input_token_count,
+            ),
+            cache_read_input_token_count: delta(
+                &mut self.emitted.cache_read_input_token_count,
+                cumulative.cache_read_input_token_count,
+            ),
+            reasoning_output_token_count: delta(
+                &mut self.emitted.reasoning_output_token_count,
+                cumulative.reasoning_output_token_count,
+            ),
+            ..Default::default()
+        };
+        for (key, total) in &cumulative.additional_counts {
+            let emitted = self
+                .emitted
+                .additional_counts
+                .entry(key.clone())
+                .or_insert(0);
+            out.additional_counts
+                .insert(key.clone(), total.saturating_sub(*emitted));
+            *emitted = *total;
+        }
+        // `total_token_count` is derived, not reported: recompute it from the
+        // increments so it stays consistent with them rather than carrying a
+        // stale cumulative sum.
+        out.total_token_count = match (out.input_token_count, out.output_token_count) {
+            (None, None) => None,
+            (i, o) => Some(i.unwrap_or(0) + o.unwrap_or(0)),
+        };
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: cumulative -> incremental streaming usage (upstream #7162)
+
+    #[test]
+    fn stream_usage_accumulator_emits_increments_not_cumulative_totals() {
+        let mut acc = StreamUsageAccumulator::default();
+
+        // `message_start`: the first cumulative snapshot (input + cache only).
+        let start = parse_message_start_usage(&json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 4,
+        }))
+        .unwrap();
+        let first = acc.increment(&start.details);
+        assert_eq!(first.input_token_count, Some(10));
+        assert_eq!(first.cache_read_input_token_count, Some(4));
+
+        // `message_delta`: the *running total*, which repeats input_tokens.
+        // Emitting it raw would aggregate to 20 input tokens instead of 10.
+        let delta = acc.increment(&parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 25,
+            "cache_read_input_tokens": 4,
+        })));
+        assert_eq!(delta.input_token_count, Some(0));
+        assert_eq!(delta.output_token_count, Some(25));
+        assert_eq!(delta.cache_read_input_token_count, Some(0));
+
+        // Summing the emitted increments reconstructs the true cumulative usage.
+        let mut aggregated = first;
+        aggregated.add_assign(&delta);
+        assert_eq!(aggregated.input_token_count, Some(10));
+        assert_eq!(aggregated.output_token_count, Some(25));
+        assert_eq!(aggregated.cache_read_input_token_count, Some(4));
+    }
+
+    #[test]
+    fn stream_usage_accumulator_handles_several_deltas() {
+        let mut acc = StreamUsageAccumulator::default();
+        let mut aggregated = UsageDetails::default();
+        // Three cumulative snapshots of a growing output count.
+        for output in [5u64, 17, 25] {
+            let inc = acc.increment(&parse_usage(&json!({
+                "input_tokens": 10,
+                "output_tokens": output,
+            })));
+            aggregated.add_assign(&inc);
+        }
+        assert_eq!(aggregated.input_token_count, Some(10));
+        assert_eq!(aggregated.output_token_count, Some(25));
+    }
+
+    #[test]
+    fn stream_usage_accumulator_leaves_absent_counts_untouched() {
+        let mut acc = StreamUsageAccumulator::default();
+        acc.increment(&parse_usage(&json!({ "input_tokens": 10 })));
+        // A partial delta reporting only output must not reset the input side.
+        let inc = acc.increment(&parse_usage(&json!({ "output_tokens": 7 })));
+        assert_eq!(inc.input_token_count, None);
+        assert_eq!(inc.output_token_count, Some(7));
+        // ...and the input high-water mark survives for the next full snapshot.
+        let inc = acc.increment(&parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 9,
+        })));
+        assert_eq!(inc.input_token_count, Some(0));
+        assert_eq!(inc.output_token_count, Some(2));
+    }
+
+    #[test]
+    fn stream_usage_accumulator_clamps_a_decreasing_snapshot() {
+        let mut acc = StreamUsageAccumulator::default();
+        acc.increment(&parse_usage(&json!({ "output_tokens": 30 })));
+        // A provider reporting a lower total must clamp to 0, not underflow.
+        let inc = acc.increment(&parse_usage(&json!({ "output_tokens": 20 })));
+        assert_eq!(inc.output_token_count, Some(0));
+    }
+
     use agent_framework_core::tools::ApprovalMode;
 
     fn user(text: &str) -> Message {

@@ -146,6 +146,15 @@ pub struct TextReasoningContent {
     /// Responses input mapper re-emits it from here. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_representation: Option<Value>,
+    /// Provider-opaque replay token attached to this reasoning step, base64.
+    ///
+    /// Mirrors upstream's `Content.protected_data`. Gemini 3 returns a
+    /// `thoughtSignature` alongside a thought part and requires it echoed on
+    /// the function call that reasoning produced; dropping it makes the model
+    /// reject the replayed turn. Distinct from [`Self::raw_representation`],
+    /// which carries a whole provider item rather than a single opaque token.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub protected_data: Option<String>,
 }
 
 /// Inline binary data encoded as a `data:` URI.
@@ -166,6 +175,53 @@ impl DataContent {
             uri,
             media_type: Some(media_type),
         }
+    }
+
+    /// Build from an existing `data:` URI, validating its shape and inferring
+    /// the media type from it.
+    ///
+    /// Mirrors upstream's `detect_media_type_from_base64` (`_types.py:124`),
+    /// which rejects a malformed data URI instead of silently mis-slicing it.
+    /// The prior lenient `split(";base64,")[1]` would panic or yield garbage on
+    /// input that merely looked close enough.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Content`] when `uri` does not start with `data:`, has
+    /// no `,` separating the header from the payload, or is not declared
+    /// `;base64`.
+    pub fn from_uri(uri: impl Into<String>) -> Result<Self> {
+        let uri = uri.into();
+        let media_type = Self::media_type_from_uri(&uri)?;
+        Ok(Self {
+            uri,
+            media_type: Some(media_type),
+        })
+    }
+
+    /// Validate a `data:` URI and return the media type it declares.
+    ///
+    /// An empty media type (`data:;base64,...`) is permitted — the URI is
+    /// well-formed and the type is simply unstated — and yields an empty
+    /// string, matching upstream, which only rejects structural problems.
+    pub fn media_type_from_uri(uri: &str) -> Result<String> {
+        let Some(rest) = uri.strip_prefix("data:") else {
+            return Err(Error::Content(format!(
+                "invalid data URI: expected a `data:` prefix, got {uri:.32?}"
+            )));
+        };
+        let Some((header, _payload)) = rest.split_once(',') else {
+            return Err(Error::Content(
+                "invalid data URI: missing the `,` separating the header from the payload"
+                    .to_string(),
+            ));
+        };
+        let Some(media_type) = header.strip_suffix(";base64") else {
+            return Err(Error::Content(
+                "invalid data URI: must declare `;base64` encoding".to_string(),
+            ));
+        };
+        Ok(media_type.to_string())
     }
 }
 
@@ -635,6 +691,51 @@ mod base64_lite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: data-URI validation (upstream #6916)
+
+    #[test]
+    fn data_content_from_uri_infers_media_type() {
+        let dc = DataContent::from_uri("data:image/png;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some("image/png"));
+        assert_eq!(dc.uri, "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn data_content_from_uri_allows_an_unstated_media_type() {
+        // `data:;base64,...` is structurally well-formed; the type is simply
+        // unstated. Upstream rejects only structural problems.
+        let dc = DataContent::from_uri("data:;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn data_content_from_uri_rejects_malformed_uris() {
+        // Each of these previously fell through a lenient
+        // `split(";base64,")[1]` that silently produced garbage.
+        for bad in [
+            "image/png;base64,AAAA",     // no `data:` scheme
+            "data:image/png;base64AAAA", // no `,` separator
+            "data:image/png,AAAA",       // not declared base64
+            "data:",                     // truncated
+            "",                          // empty
+        ] {
+            assert!(
+                DataContent::from_uri(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn data_content_from_bytes_round_trips_through_validation() {
+        let dc = DataContent::from_bytes(b"hello", "text/plain");
+        assert_eq!(
+            DataContent::media_type_from_uri(&dc.uri).unwrap(),
+            "text/plain"
+        );
+    }
+
     use crate::types::Message;
 
     #[test]
