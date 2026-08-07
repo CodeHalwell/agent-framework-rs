@@ -364,11 +364,14 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>) -> Vec<Message> {
 /// so this can never manufacture the orphan
 /// [`drop_orphaned_tool_exchanges`] exists to remove.
 fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -> Vec<Message> {
-    let has_non_system = retained.iter().any(|m| m.role != Role::system());
-    if has_non_system {
+    if retained.iter().any(|m| m.role != Role::system()) {
         return retained;
     }
-    let fallback = original
+    // Prefer ordinary content: the latest non-system message with something in
+    // it besides a tool exchange. Its call/result contents are stripped, since
+    // their counterparts are by definition not in the retained set — so this
+    // can never manufacture the orphan `drop_orphaned_tool_exchanges` removes.
+    let plain = original
         .iter()
         .rev()
         .filter(|m| m.role != Role::system())
@@ -379,10 +382,78 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
                 .retain(|c| !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_)));
             (!candidate.contents.is_empty()).then_some(candidate)
         });
-    if let Some(fallback) = fallback {
-        retained.push(fallback);
+    if let Some(plain) = plain {
+        retained.push(plain);
+        return retained;
     }
+    // Nothing but a tool exchange, then — a conversation whose only non-system
+    // content is a call and its result. Stripping both halves (as the branch
+    // above does) would leave the result system-only after all, so retain the
+    // latest *complete* exchange instead: both halves together are valid, and
+    // they give the model something to answer.
+    retained.extend(latest_complete_tool_exchange(original));
     retained
+}
+
+/// The most recent complete call/result pair, as one or two messages reduced to
+/// just that pair's contents (one when both halves share a message).
+///
+/// Returns empty when no result has a preceding unanswered call — there is no
+/// complete exchange to reinstate, and a half is worse than nothing.
+fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
+    let mut last_pair: Option<((usize, usize), (usize, usize))> = None;
+    for (mi, message) in messages.iter().enumerate() {
+        if message.role == Role::system() {
+            continue;
+        }
+        for (ci, content) in message.contents.iter().enumerate() {
+            match content {
+                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                    unanswered
+                        .entry(fc.call_id.as_str())
+                        .or_default()
+                        .push_back((mi, ci));
+                }
+                Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                    if let Some(call_site) = unanswered
+                        .get_mut(fr.call_id.as_str())
+                        .and_then(VecDeque::pop_front)
+                    {
+                        last_pair = Some((call_site, (mi, ci)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(((call_mi, call_ci), (result_mi, result_ci))) = last_pair else {
+        return Vec::new();
+    };
+    // A result always pairs with a call that came before it, so emitting the
+    // call's message first preserves the original order.
+    if call_mi == result_mi {
+        vec![reduced_to(&messages[call_mi], &[call_ci, result_ci])]
+    } else {
+        vec![
+            reduced_to(&messages[call_mi], &[call_ci]),
+            reduced_to(&messages[result_mi], &[result_ci]),
+        ]
+    }
+}
+
+/// Clone `message` keeping only the contents at `keep` (content indices).
+fn reduced_to(message: &Message, keep: &[usize]) -> Message {
+    let mut out = message.clone();
+    let mut index = 0;
+    out.contents.retain(|_| {
+        let keep_this = keep.contains(&index);
+        index += 1;
+        keep_this
+    });
+    out
 }
 
 /// Apply the invariants every compaction result must satisfy, whatever
@@ -672,6 +743,65 @@ mod tests {
         assert!(out.iter().any(|m| m.role != Role::system()));
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))).is_empty());
         assert!(call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty());
+    }
+
+    #[test]
+    fn a_conversation_of_only_a_tool_exchange_retains_it_whole() {
+        // Stripping both halves (the ordinary-content fallback) would leave the
+        // result system-only after all, so the complete exchange is reinstated
+        // atomically instead.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+        ];
+        for out in [
+            compact(&messages, &Truncation::new(1), &ApproxTokenizer),
+            compact(&messages, &SlidingWindow::new(0), &ApproxTokenizer),
+        ] {
+            assert!(
+                out.iter().any(|m| m.role != Role::system()),
+                "expected the tool exchange to be retained, got {:?}",
+                out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+                vec!["c1"]
+            );
+            assert_eq!(
+                call_ids_in(&out, |c| matches!(c, Content::FunctionResult(_))),
+                vec!["c1"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_latest_complete_exchange_is_the_one_reinstated() {
+        let messages = vec![
+            text(Role::system(), "sys"),
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+            tool_call_message("c2", "get_time"),
+            tool_result_message("c2", "noon"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c2"]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_tool_exchange_is_not_reinstated() {
+        // A half exchange is worse than nothing: there is no complete pair to
+        // fall back to, so the result stays system-only rather than becoming
+        // invalid.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            tool_call_message("c1", "get_weather"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert!(out.iter().all(|m| m.role == Role::system()));
     }
 
     #[test]

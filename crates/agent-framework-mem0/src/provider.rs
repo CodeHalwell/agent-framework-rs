@@ -118,38 +118,24 @@ fn build_add_body(
     }))
 }
 
-/// Build the `/v2/memories/search/` request body. Unlike [`build_add_body`],
-/// scope fields that are `None` are *omitted* from `filters` rather than
-/// sent as `null` — see the module docs for why.
-fn build_search_body(
-    query: &str,
-    user_id: Option<&str>,
-    agent_id: Option<&str>,
-    run_id: Option<&str>,
-    application_id: Option<&str>,
-) -> Value {
+/// Build the `/v2/memories/search/` request body for **one** retrieval scope.
+///
+/// Unlike [`build_add_body`], scope fields that are `None` are *omitted* from
+/// `filters` rather than sent as `null` — see the module docs for why.
+///
+/// Deliberately takes a single scope key/value rather than all of them at once.
+/// Mem0 combines the entries of one `filters` object with logical AND, so
+/// packing `user_id` and `agent_id` into a single request asks for memories
+/// tagged with *both* — which silently excludes the agent-wide memories written
+/// by other users that `search_agent_id` exists to retrieve. Upstream queries
+/// each partition independently for exactly this reason ("Query entity
+/// partitions independently to bypass strict logical AND limitations"); see
+/// [`Mem0Provider::search_scopes`].
+fn build_search_body(query: &str, scope: (&str, &str), run_id: Option<&str>) -> Value {
     let mut filters = serde_json::Map::new();
-    if let Some(v) = user_id {
-        filters.insert("user_id".to_string(), Value::String(v.to_string()));
-    }
-    if let Some(v) = agent_id {
-        filters.insert("agent_id".to_string(), Value::String(v.to_string()));
-    }
+    filters.insert(scope.0.to_string(), Value::String(scope.1.to_string()));
     if let Some(v) = run_id {
         filters.insert("run_id".to_string(), Value::String(v.to_string()));
-    }
-    // Mirrors upstream's app-scoped fallback (`if not search_tasks and
-    // self.search_application_id`): `application_id` narrows a search only when
-    // no user/agent retrieval scope is set, since an app id is far broader than
-    // either. The condition is deliberately *not* "no filters yet" — `run_id`
-    // is a filter too, so keying off emptiness would drop the app scope
-    // whenever a thread id is present and leave an app-only retrieval scoped
-    // solely by run id, matching memories from any other application sharing
-    // it.
-    if user_id.is_none() && agent_id.is_none() {
-        if let Some(v) = application_id {
-            filters.insert("app_id".to_string(), Value::String(v.to_string()));
-        }
     }
     serde_json::json!({
         "query": query,
@@ -412,6 +398,69 @@ impl Mem0Provider {
         Ok(())
     }
 
+    /// Query each configured retrieval scope **independently** and merge the
+    /// results, preserving order and dropping duplicates.
+    ///
+    /// Mem0 ANDs the entries of a single `filters` object, so one combined
+    /// query for `user_id` + `agent_id` returns only memories tagged with both
+    /// — omitting precisely the agent-wide memories written by other users that
+    /// `search_agent_id` is for, and this user's memories not tagged with the
+    /// agent. Mirrors upstream, which fans the partitions out concurrently for
+    /// the same reason.
+    ///
+    /// A partition that fails is logged and skipped rather than failing the
+    /// run, matching upstream's `return_exceptions=True` gather; if *every*
+    /// partition fails, the error is surfaced, since silently returning no
+    /// memories would look identical to "this user has none".
+    async fn search_scopes(&self, input_text: &str, run_id: Option<&str>) -> Result<Vec<String>> {
+        let mut scopes: Vec<(&str, &str)> = Vec::new();
+        if let Some(user_id) = self.search_user_id.as_deref() {
+            scopes.push(("user_id", user_id));
+        }
+        if let Some(agent_id) = self.search_agent_id.as_deref() {
+            scopes.push(("agent_id", agent_id));
+        }
+        // App scope is a fallback only: it is far broader than either of the
+        // above, so it narrows a search only when neither is configured.
+        if scopes.is_empty() {
+            if let Some(application_id) = self.search_application_id.as_deref() {
+                scopes.push(("app_id", application_id));
+            }
+        }
+
+        let mut merged: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_error: Option<Error> = None;
+        let mut failures = 0usize;
+        for scope in &scopes {
+            let body = build_search_body(input_text, *scope, run_id);
+            match self.post(SEARCH_PATH, &body).await {
+                Ok(value) => {
+                    for text in parse_search_response(&value) {
+                        if seen.insert(text.clone()) {
+                            merged.push(text);
+                        }
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    tracing::error!(
+                        scope = scope.0,
+                        error = %e,
+                        "Mem0 partition search failed; continuing with the remaining scopes"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+        if failures > 0 && failures == scopes.len() {
+            // Every partition failed: an empty result here is indistinguishable
+            // from "no memories exist", so surface it instead.
+            return Err(last_error.expect("a failure recorded an error"));
+        }
+        Ok(merged)
+    }
+
     async fn effective_run_id(&self) -> Option<String> {
         if self.scope_to_per_operation_thread_id {
             self.per_operation_session_id.lock().await.clone()
@@ -496,15 +545,7 @@ impl ContextProvider for Mem0Provider {
         }
 
         let run_id = self.effective_run_id().await;
-        let body = build_search_body(
-            &input_text,
-            self.search_user_id.as_deref(),
-            self.search_agent_id.as_deref(),
-            run_id.as_deref(),
-            self.search_application_id.as_deref(),
-        );
-        let value = self.post(SEARCH_PATH, &body).await?;
-        let memory_texts = parse_search_response(&value);
+        let memory_texts = self.search_scopes(&input_text, run_id.as_deref()).await?;
         ctx.messages
             .extend(format_context(&self.context_prompt, &memory_texts));
         Ok(())
@@ -657,71 +698,40 @@ mod tests {
     // region: build_search_body
 
     #[test]
-    fn build_search_body_includes_query() {
-        let body = build_search_body("What's the weather?", Some("user123"), None, None, None);
+    fn build_search_body_includes_query_and_its_single_scope() {
+        let body = build_search_body("What's the weather?", ("user_id", "user123"), None);
         assert_eq!(body["query"], serde_json::json!("What's the weather?"));
-    }
-
-    #[test]
-    fn build_search_body_filters_include_only_set_scope_fields() {
-        let body = build_search_body("q", Some("user123"), None, None, None);
         assert_eq!(body["filters"], serde_json::json!({"user_id": "user123"}));
-
-        let body = build_search_body("q", None, Some("agent123"), None, None);
-        assert_eq!(body["filters"], serde_json::json!({"agent_id": "agent123"}));
-
-        let body = build_search_body("q", None, None, Some("operation_thread"), None);
-        assert_eq!(
-            body["filters"],
-            serde_json::json!({"run_id": "operation_thread"})
-        );
     }
 
     #[test]
-    fn build_search_body_filters_combine_all_scope_fields() {
-        let body = build_search_body("q", Some("u"), Some("a"), Some("r"), None);
+    fn build_search_body_adds_the_run_id_alongside_the_scope() {
+        let body = build_search_body("q", ("agent_id", "agent123"), Some("operation_thread"));
         assert_eq!(
             body["filters"],
-            serde_json::json!({"user_id": "u", "agent_id": "a", "run_id": "r"})
+            serde_json::json!({"agent_id": "agent123", "run_id": "operation_thread"})
         );
-    }
-
-    #[test]
-    fn build_search_body_filters_empty_when_no_scope() {
-        let body = build_search_body("q", None, None, None, None);
-        assert_eq!(body["filters"], serde_json::json!({}));
     }
 
     #[test]
     fn build_search_body_never_emits_the_legacy_application_id_key() {
         // The wire key for application scope is `app_id`; `application_id` is
         // the *storage*-side metadata key and must never appear in a search
-        // filter. Passing an application id here still must not produce it.
-        let body = build_search_body("q", None, None, None, Some("app-1"));
+        // filter.
+        let body = build_search_body("q", ("app_id", "app-1"), None);
         assert!(body["filters"].get("application_id").is_none());
         assert_eq!(body["filters"]["app_id"], serde_json::json!("app-1"));
     }
 
     #[test]
-    fn application_scope_applies_whenever_no_user_or_agent_scope_is_set() {
-        // A run id must not suppress the app-scoped fallback: keying the
-        // fallback off "no filters yet" left an app-only retrieval scoped
-        // solely by run id, matching memories from any other application that
-        // shares it.
-        let body = build_search_body("q", None, None, Some("run-1"), Some("app-1"));
-        assert_eq!(body["filters"]["app_id"], serde_json::json!("app-1"));
-        assert_eq!(body["filters"]["run_id"], serde_json::json!("run-1"));
-    }
-
-    #[test]
-    fn a_user_or_agent_scope_suppresses_the_application_fallback() {
-        for (user, agent) in [(Some("u"), None), (None, Some("a"))] {
-            let body = build_search_body("q", user, agent, None, Some("app-1"));
-            assert!(
-                body["filters"].get("app_id").is_none(),
-                "app_id must not widen a narrower user/agent scope"
-            );
-        }
+    fn build_search_body_carries_exactly_one_scope() {
+        // Mem0 ANDs the entries of one filters object, so a scope must never
+        // share a request with another scope — only with the run id.
+        let body = build_search_body("q", ("user_id", "u"), Some("r"));
+        let filters = body["filters"].as_object().unwrap();
+        assert_eq!(filters.len(), 2);
+        assert!(filters.contains_key("user_id"));
+        assert!(filters.contains_key("run_id"));
     }
 
     // endregion

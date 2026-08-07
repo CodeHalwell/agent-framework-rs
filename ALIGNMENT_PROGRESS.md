@@ -85,7 +85,12 @@ agent and injected them into the current user's conversation.
 - **Storage** — `with_application_id` / `with_agent_id` / `with_user_id`, stamped
   onto memories written by `after_run`, never used to retrieve.
 - **Retrieval** — `with_search_application_id` / `with_search_agent_id` /
-  `with_search_user_id`, used only by `before_run`, and never inheriting from
+  `with_search_user_id`, each queried as its **own** request and the results
+  merged (Mem0 ANDs the entries of a single `filters` object, so one combined
+  query would return only memories tagged with *both* — dropping exactly the
+  agent-wide memories written by other users that `search_agent_id` exists for;
+  upstream fans the partitions out for the same reason). Used only by
+  `before_run`, and never inheriting from
   the storage scope. With no retrieval scope set, `before_run` retrieves nothing
   and warns once. `search_application_id` narrows a search only as a fallback
   when neither user nor agent retrieval scope is set, matching upstream.
