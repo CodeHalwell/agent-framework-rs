@@ -343,8 +343,9 @@ fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalRespo
 /// `_replace_approval_contents_with_results`.
 ///
 /// * A [`FunctionApprovalRequestContent`] becomes its embedded
-///   [`FunctionCallContent`], unless that call already exists in the same
-///   message (a duplicate), in which case the request is removed.
+///   [`FunctionCallContent`], unless an unanswered copy of that call already
+///   exists in *any* message (a duplicate), in which case the request is
+///   removed instead.
 /// * An approved [`FunctionApprovalResponseContent`] becomes the corresponding
 ///   result (correlated strictly by call id) and the message role becomes
 ///   `tool`.
@@ -354,15 +355,36 @@ fn replace_approval_contents_with_results(
     messages: &mut [Message],
     approved_results: &HashMap<String, FunctionResultContent>,
 ) {
-    for msg in messages.iter_mut() {
-        let existing_call_ids: std::collections::HashSet<String> = msg
-            .contents
-            .iter()
-            .filter_map(Content::as_function_call)
-            .filter(|fc| !fc.call_id.is_empty())
-            .map(|fc| fc.call_id.clone())
-            .collect();
+    // Collect *pending* call ids across every message, not just the one being
+    // scanned. A function call and its approval request are frequently carried
+    // in separate messages — a hosting layer replaying them as separate items
+    // on an approval round trip does exactly this — so a per-message check
+    // never fires, the request restores a second copy of the call, and only one
+    // copy receives the result. The unanswered copy is then rejected by the
+    // provider ("No tool output found for function call ..."). Mirrors
+    // upstream's fix in `_replace_approval_contents_with_results` (#7267).
+    //
+    // Calls that already carry a result are excluded: reusing a call id for a
+    // later invocation is supported, and a completed pair must not suppress the
+    // fresh request — that would drop the new call and leave its result
+    // attached to the old one.
+    let answered_call_ids: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_result)
+        .map(|fr| fr.call_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut existing_call_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_call)
+        .filter(|fc| !fc.call_id.is_empty() && !answered_call_ids.contains(fc.call_id.as_str()))
+        .map(|fc| fc.call_id.clone())
+        .collect();
+    drop(answered_call_ids);
 
+    for msg in messages.iter_mut() {
         let mut to_remove: Vec<usize> = Vec::new();
         let mut set_role_tool = false;
 
@@ -372,6 +394,11 @@ fn replace_approval_contents_with_results(
                     if existing_call_ids.contains(&req.function_call.call_id) {
                         to_remove.push(idx);
                     } else {
+                        // Record the restored id so a second approval request
+                        // for the same call cannot expand into a duplicate.
+                        if !req.function_call.call_id.is_empty() {
+                            existing_call_ids.insert(req.function_call.call_id.clone());
+                        }
                         *content = Content::FunctionCall(req.function_call.clone());
                     }
                 }
@@ -1105,5 +1132,87 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+}
+
+#[cfg(test)]
+mod approval_replacement_tests {
+    use super::*;
+    use crate::types::FunctionApprovalRequestContent;
+
+    fn call(call_id: &str) -> FunctionCallContent {
+        FunctionCallContent::new(call_id, "get_weather", None)
+    }
+
+    fn approval_request(call_id: &str) -> Message {
+        Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionApprovalRequest(
+                FunctionApprovalRequestContent {
+                    id: format!("req_{call_id}"),
+                    function_call: call(call_id),
+                },
+            )],
+        )
+    }
+
+    fn function_calls(messages: &[Message]) -> Vec<&str> {
+        messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_call)
+            .map(|fc| fc.call_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_approval_request_in_a_separate_message_does_not_duplicate_the_call() {
+        // The round-trip shape: a hosting layer replays the stored function
+        // call and its approval request as two *separate* assistant messages.
+        // Deduping per-message never fired, so the request restored a second
+        // copy of the call and only one copy received a result — the provider
+        // then rejects the unanswered one.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            approval_request("c1"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn two_approval_requests_for_one_call_expand_only_once() {
+        let mut messages = vec![approval_request("c1"), approval_request("c1")];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn a_single_approval_request_still_expands() {
+        let mut messages = vec![approval_request("c1")];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn an_already_answered_call_does_not_suppress_a_reused_call_id() {
+        // Reusing a call id for a later invocation is supported: the completed
+        // pair must not suppress the fresh request, which would drop the new
+        // call and leave its result attached to the old one.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(FunctionResultContent {
+                    call_id: "c1".into(),
+                    result: Some(Value::String("sunny".into())),
+                    exception: None,
+                })],
+            ),
+            approval_request("c1"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        // Both the completed call and the freshly restored one are present.
+        assert_eq!(function_calls(&messages), vec!["c1", "c1"]);
     }
 }

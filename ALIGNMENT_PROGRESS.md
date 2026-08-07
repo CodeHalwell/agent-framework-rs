@@ -97,6 +97,47 @@ which is the entire point — the leak came from it being implicit. Seven
 loopback tests configured only a storage scope and were updated; three new tests
 pin the isolation.
 
+### Approvals: duplicate call on round-trip (#7271) — fixed
+
+`replace_approval_contents_with_results` deduped a restored function call
+against **only the message being scanned**. On an approval round trip a hosting
+layer replays the stored `function_call` item and its approval request as two
+*separate* assistant messages, so the per-message check never fired and the
+approval request restored a second copy of the call. Only one copy received the
+function result; the provider then rejects the orphan with "No tool output
+found for function call ...".
+
+Now collects pending call ids across all messages, excludes ids that already
+carry a result (reusing a call id for a later invocation is supported, and a
+completed pair must not suppress a fresh request), and records each restored id
+so two approval requests for the same call cannot both expand. Four regression
+tests cover the round-trip shape, the double-request case, the single-request
+case that must still expand, and the reused-id case.
+
+### Approvals: blocked on a missing core field (#7462)
+
+Upstream stopped serializing **local** function approvals as MCP input items on
+the OpenAI Responses path — local approvals are resolved in-process, and only
+*hosted* (MCP) decisions have a matching approval request on the provider. It
+distinguishes the two with `_is_hosted_tool_approval`, which tests
+`function_call.additional_properties["server_label"]`.
+
+This port cannot express that test: `FunctionCallContent` has only
+`call_id` / `name` / `arguments` — no `additional_properties` — so hosted and
+local approvals are indistinguishable, and `messages_to_input` serializes every
+approval content as `mcp_approval_request` / `mcp_approval_response`.
+
+In practice the local case is mostly shielded by layering, since
+`FunctionInvokingChatClient` converts local approvals into calls and results
+*before* the Responses client serializes anything, and an approved hosted
+approval survives untouched (no local tool produces a result for it, so the
+conversion is skipped). One narrower divergence is real and shares the same
+blocker: a **rejected** approval is unconditionally converted into a local
+rejection result, so a rejected *hosted* MCP approval never reaches the provider
+as `mcp_approval_response {approve: false}`. Closing either needs
+`additional_properties` on `FunctionCallContent` first — a core type change
+worth doing deliberately rather than as a side effect.
+
 ### Verified already satisfied — no action (the port was level or ahead)
 
 - **#6809** function-call name lost when a streaming delta carries it late —
@@ -128,11 +169,11 @@ pin the isolation.
 Carried forward as the next pass's work — none is closed, and the list is
 roughly in descending value order:
 
-- **Approvals cluster** (#7462, #7407, #7408, #7410, #7345, #7271, #7090):
-  orphaned local approval responses, decisions preserved under OpenAI
-  continuation, tool content returned after invocation limits, provider-injected
-  approvals deferred to in-run execution, resume/replay, duplicate call on
-  round-trip, auto-approval name-collision warnings.
+- **Approvals cluster** (#7407, #7408, #7410, #7345, #7090): decisions
+  preserved under OpenAI continuation, tool content returned after invocation
+  limits, provider-injected approvals deferred to in-run execution,
+  resume/replay, auto-approval name-collision warnings. (#7271 is done — see
+  above; #7462 is blocked — see below.)
 - **Workflow checkpointing**: full replayability (#7374, BREAKING), sub-workflow
   restore preserving sub-workflow state (#7097), checkpoint encoding (#6579).
 - **Sessions**: `SessionStore` moved into core + Foundry Responses session

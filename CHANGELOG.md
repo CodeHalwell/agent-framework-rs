@@ -33,6 +33,11 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
   the signature from a thought part to be echoed on the function call that
   reasoning produced. Reasoning content is also no longer sent back as a part,
   matching upstream. (upstream #7095)
+- **Approval round-trips could duplicate a function call.** The restored call
+  was deduped against only the message being scanned, but a hosting layer
+  replays the stored call and its approval request as two separate messages, so
+  a second copy was restored and left unanswered — which the Responses API
+  rejects with "No tool output found for function call ...". (upstream #7271)
 - **Compaction could emit conversations providers reject.** A function call and
   its result are now retained or dropped together — previously `TokenBudget`
   could keep a tool result whose call fell outside the budget (a tool message
