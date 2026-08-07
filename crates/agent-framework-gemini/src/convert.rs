@@ -156,7 +156,16 @@ fn message_contents_to_parts(
     let mut pending_signature: Option<&str> = None;
     for content in contents {
         if let Content::TextReasoning(t) = content {
-            pending_signature = t.protected_data.as_deref().filter(|s| !s.is_empty());
+            // Keep the last non-empty signature across a run of consecutive
+            // reasoning parts: they are one thought block, and only some carry
+            // a signature. Overwriting unconditionally let an unsigned part
+            // that merely follows a signed one erase it. Non-reasoning content
+            // still clears it below, so a signature never reaches an unrelated
+            // call. This matters because `parse_response` does not coalesce
+            // adjacent reasoning content the way streaming aggregation does.
+            if let Some(signature) = t.protected_data.as_deref().filter(|s| !s.is_empty()) {
+                pending_signature = Some(signature);
+            }
             continue;
         }
         let pending = pending_signature.take();
@@ -746,6 +755,53 @@ mod tests {
         assert_eq!(parts.len(), 1, "reasoning must not be sent back as a part");
         assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
         assert_eq!(parts[0]["functionCall"]["name"], json!("get_weather"));
+    }
+
+    #[test]
+    fn a_signature_survives_a_later_unsigned_reasoning_part() {
+        // Gemini can return several adjacent thought parts with the signature
+        // on an earlier one. `parse_response` does not coalesce them, so an
+        // unsigned part that merely follows a signed one used to erase it.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "first".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::TextReasoning(TextReasoningContent {
+                    text: "second".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    #[test]
+    fn a_later_reasoning_signature_wins_over_an_earlier_one() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "first".into(),
+                    protected_data: Some("older".into()),
+                    ..Default::default()
+                }),
+                Content::TextReasoning(TextReasoningContent {
+                    text: "second".into(),
+                    protected_data: Some("newer".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts[0]["thoughtSignature"], json!("newer"));
     }
 
     #[test]
