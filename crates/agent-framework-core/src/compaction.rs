@@ -386,7 +386,13 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> 
 /// so this can never manufacture the orphan
 /// [`drop_orphaned_tool_exchanges`] exists to remove.
 fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -> Vec<Message> {
-    if retained.iter().any(|m| m.role != Role::system()) {
+    // A non-system message that renders nothing does not satisfy this: the
+    // orphan repair can strip a message down to reasoning alone, which reaches
+    // the model as nothing and leaves the request effectively system-only.
+    if retained
+        .iter()
+        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_the_wire))
+    {
         return retained;
     }
     // Prefer ordinary content: the latest non-system message with something in
@@ -413,12 +419,8 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
             // request effectively system-only while bypassing the
             // complete-exchange fallback below.
             candidate.contents.retain(|c| {
-                !matches!(
-                    c,
-                    Content::FunctionCall(_)
-                        | Content::FunctionResult(_)
-                        | Content::TextReasoning(_)
-                )
+                renders_on_the_wire(c)
+                    && !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_))
             });
             (!candidate.contents.is_empty()).then_some(candidate)
         });
@@ -475,13 +477,54 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
     // A result always pairs with a call that came before it, so emitting the
     // call's message first preserves the original order.
     if call_mi == result_mi {
-        vec![reduced_to(&messages[call_mi], &[call_ci, result_ci])]
+        vec![reduced_call_with_signature(
+            &messages[call_mi],
+            call_ci,
+            &[result_ci],
+        )]
     } else {
         vec![
-            reduced_to(&messages[call_mi], &[call_ci]),
+            reduced_call_with_signature(&messages[call_mi], call_ci, &[]),
             reduced_to(&messages[result_mi], &[result_ci]),
         ]
     }
+}
+
+/// Whether this content produces anything in a provider request.
+///
+/// Reasoning is replay metadata, not payload: Gemini's request builder
+/// deliberately skips reasoning parts and the OpenAI converter has no mapping
+/// for it, so a message consisting only of reasoning reaches the model as
+/// nothing at all. Every "is there still something here?" decision in this
+/// module asks through this predicate, so they cannot disagree — each has
+/// separately had to learn that reasoning does not count.
+fn renders_on_the_wire(content: &Content) -> bool {
+    !matches!(content, Content::TextReasoning(_))
+}
+
+/// Clone `message` keeping the function call at `call_ci` (plus any
+/// `also_keep` indices), carrying the call's replay signature across.
+///
+/// Reducing to the call alone drops a Gemini signature sitting on the preceding
+/// reasoning content — the supported fallback placement — and that reasoning is
+/// not retained either, so the request builder would have nothing to backfill
+/// from. Shared by both paths that resurrect a call, which otherwise learn this
+/// separately (and one of them hadn't).
+fn reduced_call_with_signature(message: &Message, call_ci: usize, also_keep: &[usize]) -> Message {
+    let mut keep = vec![call_ci];
+    keep.extend_from_slice(also_keep);
+    keep.sort_unstable();
+    let mut out = reduced_to(message, &keep);
+    if let Some(Content::FunctionCall(fc)) = out
+        .contents
+        .iter_mut()
+        .find(|c| matches!(c, Content::FunctionCall(_)))
+    {
+        if fc.protected_data.is_none() {
+            fc.protected_data = preceding_reasoning_signature(message, call_ci);
+        }
+    }
+    out
 }
 
 /// Clone `message` keeping only the contents at `keep` (content indices).
@@ -563,18 +606,7 @@ fn reinstate_calls_answered_by_pending(
     // Append in original order so several recovered calls keep their sequence.
     chosen.sort_unstable();
     for (mi, ci) in chosen {
-        let mut message = reduced_to(&original[mi], &[ci]);
-        // Carry the Gemini-style replay signature across with the call. When it
-        // sits on the preceding reasoning content — the supported fallback
-        // placement — reducing to the call alone would strip the only copy, and
-        // the reasoning message the request builder backfills from is not in
-        // the retained set either.
-        if let Some(Content::FunctionCall(fc)) = message.contents.first_mut() {
-            if fc.protected_data.is_none() {
-                fc.protected_data = preceding_reasoning_signature(&original[mi], ci);
-            }
-        }
-        retained.push(message);
+        retained.push(reduced_call_with_signature(&original[mi], ci, &[]));
     }
     retained
 }
@@ -1457,6 +1489,75 @@ mod tests {
         let messages = vec![text(Role::system(), "sys"), msg];
         let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
         assert_eq!(out.last().unwrap().text(), "the answer");
+    }
+
+    #[test]
+    fn the_complete_exchange_fallback_carries_the_reasoning_signature() {
+        // The reinstatement path copied the signature; this one did not.
+        let signed = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    None,
+                )),
+            ],
+        );
+        let messages = vec![
+            text(Role::system(), "sys"),
+            signed,
+            tool_result_message("c1", "sunny"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+
+        let call = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_call)
+            .expect("the exchange is restored");
+        assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
+    }
+
+    #[test]
+    fn a_retained_message_that_renders_nothing_does_not_satisfy_retention() {
+        // The orphan repair strips the call and leaves reasoning behind. That
+        // message is non-system but reaches the model as nothing, so the
+        // fallback must still run and restore the older complete exchange.
+        let reasoning_plus_orphan = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "orphan",
+                    "get_weather",
+                    None,
+                )),
+            ],
+        );
+        let messages = vec![
+            text(Role::system(), "sys"),
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+            reasoning_plus_orphan,
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents
+                    .iter()
+                    .any(|c| !matches!(c, Content::TextReasoning(_)))),
+            "expected something that actually renders, got {out:?}"
+        );
     }
 
     #[test]
