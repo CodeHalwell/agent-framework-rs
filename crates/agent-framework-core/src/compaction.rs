@@ -501,17 +501,17 @@ fn reinstate_calls_answered_by_pending(
     use std::collections::HashMap;
 
     // How many results in `pending` want a call, per id.
-    let mut wanted: HashMap<&str, usize> = HashMap::new();
-    for content in pending.iter().flat_map(|m| m.contents.iter()) {
-        if let Content::FunctionResult(fr) = content {
-            if !fr.call_id.is_empty() {
-                *wanted.entry(fr.call_id.as_str()).or_insert(0) += 1;
-            }
-        }
-    }
+    // Only results that `pending` does not answer *itself*. A run's input can
+    // carry a complete exchange of its own, and it may reuse an id that an
+    // older unanswered call also used. Counting every result would reinstate
+    // that stale historical call, and the FIFO repair would then pair the
+    // pending result with it and leave the pending call unanswered — an
+    // invalid exchange assembled out of two valid halves.
+    let wanted = unanswered_result_counts(pending);
     if wanted.is_empty() {
         return retained;
     }
+    let mut wanted = wanted;
     // Subtract the calls the retained set can already answer with. Counted by
     // *occurrence*, not id membership — a completed pair in `retained` answers
     // nothing further.
@@ -549,6 +549,35 @@ fn reinstate_calls_answered_by_pending(
         retained.push(reduced_to(&original[mi], &[ci]));
     }
     retained
+}
+
+/// How many function results in `messages` no preceding call in `messages`
+/// answers, per call id.
+///
+/// The mirror of [`unanswered_call_sites`], pairing by occurrence for the same
+/// reason: ids are reused, so membership alone cannot tell a self-contained
+/// exchange from one that reaches back into history.
+fn unanswered_result_counts(messages: &[Message]) -> std::collections::HashMap<&str, usize> {
+    use std::collections::HashMap;
+
+    let mut available_calls: HashMap<&str, usize> = HashMap::new();
+    let mut unanswered: HashMap<&str, usize> = HashMap::new();
+    for content in messages.iter().flat_map(|m| m.contents.iter()) {
+        match content {
+            Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                *available_calls.entry(fc.call_id.as_str()).or_insert(0) += 1;
+            }
+            Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
+                match available_calls.get_mut(fr.call_id.as_str()) {
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => *unanswered.entry(fr.call_id.as_str()).or_insert(0) += 1,
+                }
+            }
+            _ => {}
+        }
+    }
+    unanswered.retain(|_, count| *count > 0);
+    unanswered
 }
 
 /// The `(message index, content index, call id)` of every function call in
@@ -1037,6 +1066,44 @@ mod tests {
             args.get("city").and_then(|v| v.as_str()),
             Some("new"),
             "the unanswered (new) occurrence must be the one reinstated"
+        );
+    }
+
+    #[test]
+    fn a_self_contained_pending_exchange_reinstates_nothing() {
+        // The run's input carries its own call *and* result, reusing an id that
+        // an older unanswered call also used. Counting every pending result
+        // pulled the stale historical call back, and the FIFO repair then
+        // paired the pending result with it, leaving the pending call
+        // unanswered — an invalid exchange assembled from two valid halves.
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+        ];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))).is_empty(),
+            "pending answers itself; nothing should be reinstated, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_result_beyond_what_pending_answers_still_reinstates() {
+        // Two results, only one answered within pending: the extra one reaches
+        // back into history and must still recover its call.
+        let history = vec![tool_call_message("c1", "get_weather")];
+        let input = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "first"),
+            tool_result_message("c1", "second"),
+        ];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert_eq!(
+            call_ids_in(&out, |c| matches!(c, Content::FunctionCall(_))),
+            vec!["c1"]
         );
     }
 
