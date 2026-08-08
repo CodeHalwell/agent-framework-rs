@@ -364,30 +364,32 @@ fn replace_approval_contents_with_results(
     // orphan ("No tool output found for function call ..."). Mirrors upstream's
     // fix in `_replace_approval_contents_with_results` (#7267).
     //
-    // Counted per occurrence rather than by id membership, because call ids are
-    // not guaranteed unique: reusing one for a later invocation is supported. A
-    // completed pair must not suppress a fresh request (that would drop the new
-    // call and leave its result attached to the old one), but a *second*,
-    // still-unanswered call sharing that id must — which "any result exists for
-    // this id" cannot distinguish and a call/result count can.
-    let mut existing_call_ids: std::collections::HashSet<String> = {
-        let mut unanswered: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    // Matched per occurrence *and* per invocation, not by id membership. Call
+    // ids are not guaranteed unique — reusing one for a later invocation is
+    // supported — so the decision needs the call itself, not its id: a fresh
+    // request whose call differs in name or arguments is a different
+    // invocation, and suppressing it as a duplicate drops the new call while
+    // its approval response still executes, attaching that result to the older
+    // call on the wire.
+    let mut unanswered_calls: Vec<FunctionCallContent> = {
+        let mut by_id: std::collections::HashMap<&str, Vec<&FunctionCallContent>> =
+            std::collections::HashMap::new();
         for content in messages.iter().flat_map(|m| m.contents.iter()) {
             match content {
                 Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
-                    *unanswered.entry(fc.call_id.as_str()).or_insert(0) += 1;
+                    by_id.entry(fc.call_id.as_str()).or_default().push(fc);
                 }
                 Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
-                    *unanswered.entry(fr.call_id.as_str()).or_insert(0) -= 1;
+                    // Nearest preceding outstanding call, matching the rule the
+                    // compaction module settled on.
+                    if let Some(calls) = by_id.get_mut(fr.call_id.as_str()) {
+                        calls.pop();
+                    }
                 }
                 _ => {}
             }
         }
-        unanswered
-            .into_iter()
-            .filter(|(_, outstanding)| *outstanding > 0)
-            .map(|(id, _)| id.to_string())
-            .collect()
+        by_id.into_values().flatten().cloned().collect()
     };
 
     for msg in messages.iter_mut() {
@@ -397,15 +399,25 @@ fn replace_approval_contents_with_results(
         for (idx, content) in msg.contents.iter_mut().enumerate() {
             match content {
                 Content::FunctionApprovalRequest(req) => {
-                    if existing_call_ids.contains(&req.function_call.call_id) {
-                        to_remove.push(idx);
-                    } else {
-                        // Record the restored id so a second approval request
-                        // for the same call cannot expand into a duplicate.
-                        if !req.function_call.call_id.is_empty() {
-                            existing_call_ids.insert(req.function_call.call_id.clone());
+                    match unanswered_calls
+                        .iter()
+                        .position(|call| *call == req.function_call)
+                    {
+                        // The same invocation is already present and unanswered:
+                        // this request would restore a second copy. Consume the
+                        // match so a further identical request is judged against
+                        // what remains.
+                        Some(position) => {
+                            unanswered_calls.remove(position);
+                            to_remove.push(idx);
                         }
-                        *content = Content::FunctionCall(req.function_call.clone());
+                        // A different invocation (or none): restore it, and
+                        // record it as now-unanswered so a second identical
+                        // request cannot expand into a duplicate.
+                        None => {
+                            unanswered_calls.push(req.function_call.clone());
+                            *content = Content::FunctionCall(req.function_call.clone());
+                        }
                     }
                 }
                 Content::FunctionApprovalResponse(resp) => {
@@ -1144,7 +1156,7 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 #[cfg(test)]
 mod approval_replacement_tests {
     use super::*;
-    use crate::types::FunctionApprovalRequestContent;
+    use crate::types::{FunctionApprovalRequestContent, FunctionArguments};
 
     fn call(call_id: &str) -> FunctionCallContent {
         FunctionCallContent::new(call_id, "get_weather", None)
@@ -1222,6 +1234,53 @@ mod approval_replacement_tests {
         ];
         replace_approval_contents_with_results(&mut messages, &HashMap::new());
         assert_eq!(function_calls(&messages), vec!["c1", "c1"]);
+    }
+
+    #[test]
+    fn a_different_invocation_reusing_an_id_is_not_suppressed() {
+        // Same call_id, different arguments — a distinct invocation. Judging by
+        // id alone dropped the new call while its approval response still
+        // executed, attaching that result to the older call on the wire.
+        let older = FunctionCallContent::new(
+            "c1",
+            "get_weather",
+            Some(FunctionArguments::Raw("{\"city\":\"old\"}".into())),
+        );
+        let newer = FunctionCallContent::new(
+            "c1",
+            "get_weather",
+            Some(FunctionArguments::Raw("{\"city\":\"new\"}".into())),
+        );
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(older)]),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionApprovalRequest(
+                    FunctionApprovalRequestContent {
+                        id: "req_1".into(),
+                        function_call: newer,
+                    },
+                )],
+            ),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+
+        let cities: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_call)
+            .filter_map(|c| {
+                c.parse_arguments()
+                    .ok()?
+                    .get("city")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            cities.contains(&"new".to_string()),
+            "the new invocation must survive, got {cities:?}"
+        );
     }
 
     #[test]
