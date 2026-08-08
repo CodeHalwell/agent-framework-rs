@@ -658,15 +658,15 @@ fn renders_on_every_provider(content: &Content) -> bool {
         // fallback then appends a stale turn, changing the prompt and
         // defeating the window the caller asked for. Other media stays out:
         // Anthropic's `image_block_from_*` return `None` for anything else.
-        Content::Data(dc) => dc
-            .media_type
-            .as_deref()
-            .map(is_image_media_type)
-            .unwrap_or_else(|| {
-                DataContent::media_type_from_uri(&dc.uri)
-                    .map(|parsed| is_image_media_type(&parsed))
-                    .unwrap_or(false)
-            }),
+        // The URI is validated even when an explicit media type is present:
+        // both Anthropic and Gemini parse the data URI before emitting
+        // anything and drop the content when it does not, so
+        // `media_type: Some("image/png")` on a malformed URI renders nowhere.
+        // Declaring a type is not the same as carrying one.
+        Content::Data(dc) => match DataContent::media_type_from_uri(&dc.uri) {
+            Ok(parsed) => is_image_media_type(dc.media_type.as_deref().unwrap_or(&parsed)),
+            Err(_) => false,
+        },
         Content::Uri(uc) => is_image_media_type(&uc.media_type),
         _ => false,
     }
@@ -2254,6 +2254,31 @@ mod tests {
             .expect("c2 is reinstated");
         assert_eq!(call.call_id, "c2");
         assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
+    }
+
+    #[test]
+    fn an_image_type_on_a_malformed_uri_does_not_satisfy_retention() {
+        // Anthropic and Gemini both parse the data URI before emitting, so a
+        // declared image media type over a broken URI reaches neither.
+        for uri in ["not-a-data-uri", "data:image/png,AAAA", ""] {
+            let messages = vec![
+                text(Role::system(), "sys"),
+                text(Role::user(), "a real earlier turn"),
+                Message::with_contents(
+                    Role::user(),
+                    vec![Content::Data(crate::types::DataContent {
+                        uri: uri.into(),
+                        media_type: Some("image/png".into()),
+                    })],
+                ),
+            ];
+            let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+            assert!(
+                out.iter().any(|m| m.role != Role::system()
+                    && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+                "expected a real turn restored for {uri:?}, got {out:?}"
+            );
+        }
     }
 
     #[test]
