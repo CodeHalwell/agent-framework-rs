@@ -403,14 +403,14 @@ fn replace_approval_contents_with_results(
                         .iter()
                         .position(|call| *call == req.function_call)
                     {
-                        // The same invocation is already present and unanswered:
-                        // this request would restore a second copy. Consume the
-                        // match so a further identical request is judged against
-                        // what remains.
-                        Some(position) => {
-                            unanswered_calls.remove(position);
-                            to_remove.push(idx);
-                        }
+                        // The same invocation is already present and
+                        // unanswered: this request would restore a second copy,
+                        // so drop the request. The call itself stays
+                        // outstanding — removing the *request* answers nothing —
+                        // so a further replayed copy is suppressed too. Consuming
+                        // the entry here let the second copy expand into a
+                        // duplicate declaration.
+                        Some(_) => to_remove.push(idx),
                         // A different invocation (or none): restore it, and
                         // record it as now-unanswered so a second identical
                         // request cannot expand into a duplicate.
@@ -421,11 +421,16 @@ fn replace_approval_contents_with_results(
                     }
                 }
                 Content::FunctionApprovalResponse(resp) => {
-                    let call_id = resp.function_call.call_id.clone();
-                    if resp.approved {
+                    // Captured before `*content` is overwritten below.
+                    let answered_call = resp.function_call.clone();
+                    let call_id = answered_call.call_id.clone();
+                    let approved = resp.approved;
+
+                    let mut answered = false;
+                    if approved {
                         if let Some(result) = approved_results.get(&call_id) {
                             *content = Content::FunctionResult(result.clone());
-                            set_role_tool = true;
+                            answered = true;
                         }
                     } else {
                         *content = Content::FunctionResult(FunctionResultContent {
@@ -433,7 +438,22 @@ fn replace_approval_contents_with_results(
                             result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                             exception: None,
                         });
+                        answered = true;
+                    }
+                    if answered {
                         set_role_tool = true;
+                        // A response becoming a result *answers* its call, so
+                        // retire it from the outstanding set. Leaving it there
+                        // let a stale entry suppress a later, legitimate request
+                        // for the same invocation — whose own response still
+                        // converted, giving the old call two results and the new
+                        // one no declaration.
+                        if let Some(position) = unanswered_calls
+                            .iter()
+                            .position(|call| *call == answered_call)
+                        {
+                            unanswered_calls.remove(position);
+                        }
                     }
                 }
                 _ => {}
@@ -1280,6 +1300,47 @@ mod approval_replacement_tests {
         assert!(
             cities.contains(&"new".to_string()),
             "the new invocation must survive, got {cities:?}"
+        );
+    }
+
+    #[test]
+    fn two_replayed_requests_for_one_outstanding_call_both_collapse() {
+        // Removing the *request* answers nothing, so the call stays
+        // outstanding. Consuming the anchor let the second replayed copy expand
+        // into a duplicate declaration with only one result to answer it.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            approval_request("c1"),
+            approval_request("c1"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn a_completed_approval_cycle_does_not_suppress_the_next_one() {
+        // The first request expands and its response answers it. A later cycle
+        // reusing the same invocation must still expand: a stale outstanding
+        // entry suppressed it while its own response still converted, leaving
+        // two results for the old call and no declaration for the new one.
+        let approved = FunctionApprovalRequestContent {
+            id: "req_1".into(),
+            function_call: call("c1"),
+        }
+        .create_response(false);
+        let mut messages = vec![
+            approval_request("c1"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionApprovalResponse(approved)],
+            ),
+            approval_request("c1"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(
+            function_calls(&messages),
+            vec!["c1", "c1"],
+            "the second cycle needs its own declaration"
         );
     }
 
