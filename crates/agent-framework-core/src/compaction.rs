@@ -520,14 +520,20 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
 ///
 /// [`TextReasoningContent::raw_representation`]: crate::types::TextReasoningContent::raw_representation
 fn renders_on_every_provider(content: &Content) -> bool {
-    !matches!(
+    // An explicit allowlist, deliberately not `!matches!(...)` over the few
+    // known-inert variants. `Content` has 25 of them and the narrowest
+    // converter — Gemini's `content_to_part` — has arms for exactly these five;
+    // everything else falls through its catch-all and vanishes. A negative list
+    // silently classifies each *new* variant as universally renderable, which
+    // is how `HostedFile` and the hosted tool-call variants came to count as
+    // usable content here.
+    matches!(
         content,
-        // Reasoning: see above.
-        Content::TextReasoning(_)
-            // A forward-compatibility placeholder for a content type this build
-            // does not know. It carries no data and no converter has an arm for
-            // it, so it is inert everywhere.
-            | Content::Unknown
+        Content::Text(_)
+            | Content::FunctionCall(_)
+            | Content::FunctionResult(_)
+            | Content::Data(_)
+            | Content::Uri(_)
     )
 }
 
@@ -587,50 +593,50 @@ fn reinstate_calls_answered_by_pending(
     mut retained: Vec<Message>,
     pending: &[Message],
 ) -> Vec<Message> {
-    use std::collections::HashMap;
-
-    // How many results in `pending` want a call, per id.
     // Only results that `pending` does not answer *itself*. A run's input can
     // carry a complete exchange of its own, and it may reuse an id that an
     // older unanswered call also used. Counting every result would reinstate
     // that stale historical call, and the FIFO repair would then pair the
     // pending result with it and leave the pending call unanswered — an
     // invalid exchange assembled out of two valid halves.
-    let wanted = unanswered_result_counts(pending);
+    let mut wanted = unanswered_result_counts(pending);
     if wanted.is_empty() {
         return retained;
     }
-    let mut wanted = wanted;
-    // Subtract the calls the retained set can already answer with. Counted by
-    // *occurrence*, not id membership — a completed pair in `retained` answers
-    // nothing further.
-    for (_, _, call_id) in unanswered_call_sites(&retained) {
-        if let Some(count) = wanted.get_mut(call_id) {
-            *count = count.saturating_sub(1);
-        }
-    }
+    // Which of the original's unanswered calls does `retained` already supply?
+    // Compared by *content*, not counted by id: a strategy may retain an older
+    // unanswered occurrence while dropping the newer one an incoming result
+    // answers, and counting by id would treat the old one as sufficient —
+    // reinstating nothing, and letting the nearest-preceding pairing attach the
+    // result to the wrong call's name and arguments.
+    let (_, retained_unanswered) = pair_tool_exchanges(retained.iter().enumerate());
+    let mut supplied: Vec<&crate::types::FunctionCallContent> = retained_unanswered
+        .iter()
+        .filter_map(|((mi, ci), _)| retained[*mi].contents[*ci].as_function_call())
+        .collect();
 
-    // Choose from the calls left unanswered *in the original history*, not from
-    // every call sharing the id. Ids are reused: in
-    // `call(c1, old) -> result(c1) -> call(c1, new)` the first occurrence is
-    // already answered, and an incoming result answers the *new* call. Picking
-    // the first id match would replay the old call's name and arguments and
-    // attach the new result to it, corrupting the tool history.
-    let mut chosen: Vec<(usize, usize)> = Vec::new();
-    let mut unanswered_by_id: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
-    for (mi, ci, call_id) in unanswered_call_sites(original) {
-        unanswered_by_id.entry(call_id).or_default().push((mi, ci));
-    }
-    for (call_id, count) in &wanted {
+    // Candidates newest-first: the most recent unanswered occurrence is the one
+    // an incoming result answers.
+    let (_, original_unanswered) = pair_tool_exchanges(original.iter().enumerate());
+    let mut chosen: Vec<Site> = Vec::new();
+    for (site, call_id) in original_unanswered.into_iter().rev() {
+        let Some(call) = original[site.0].contents[site.1].as_function_call() else {
+            continue;
+        };
+        if let Some(position) = supplied.iter().position(|supplied| *supplied == call) {
+            // Already present in the retained set; consume it so a second
+            // identical occurrence is still eligible.
+            supplied.remove(position);
+            continue;
+        }
+        let Some(count) = wanted.get_mut(call_id) else {
+            continue;
+        };
         if *count == 0 {
             continue;
         }
-        if let Some(sites) = unanswered_by_id.get(call_id) {
-            // The most recent unanswered occurrences are the ones an incoming
-            // result answers.
-            let take_from = sites.len().saturating_sub(*count);
-            chosen.extend_from_slice(&sites[take_from..]);
-        }
+        *count -= 1;
+        chosen.push(site);
     }
     // Append in original order so several recovered calls keep their sequence.
     chosen.sort_unstable();
@@ -687,19 +693,6 @@ fn unanswered_result_counts(messages: &[Message]) -> std::collections::HashMap<&
     }
     unanswered.retain(|_, count| *count > 0);
     unanswered
-}
-
-/// The `(message index, content index, call id)` of every function call in
-/// `messages` that no later result answers.
-///
-/// Pairs by occurrence — each result consumes the oldest still-unanswered call
-/// sharing its id — because ids are not unique across a conversation.
-fn unanswered_call_sites(messages: &[Message]) -> Vec<(usize, usize, &str)> {
-    let (_, leftover) = pair_tool_exchanges(messages.iter().enumerate());
-    leftover
-        .into_iter()
-        .map(|((mi, ci), id)| (mi, ci, id))
-        .collect()
 }
 
 /// Apply the invariants every compaction result must satisfy, whatever
@@ -1333,6 +1326,88 @@ mod tests {
             out.iter()
                 .any(|m| m.contents.iter().any(|c| matches!(c, Content::Text(_)))
                     && m.role != Role::system()),
+            "expected a real turn to be restored, got {out:?}"
+        );
+    }
+
+    /// A strategy that keeps only the messages at the given indices — used to
+    /// reach retention shapes the built-in strategies cannot produce.
+    struct KeepIndices(Vec<usize>);
+    impl CompactionStrategy for KeepIndices {
+        fn compact(&self, messages: &[Message], _t: &dyn Tokenizer) -> Vec<Message> {
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.0.contains(i))
+                .map(|(_, m)| m.clone())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn an_older_retained_occurrence_does_not_suppress_reinstating_the_newer() {
+        // A custom strategy keeps the *older* unanswered c1 call and drops the
+        // newer one. Counting retained calls by id treated the old one as
+        // sufficient, reinstated nothing, and let the incoming result attach to
+        // the old call's name and arguments.
+        let mk = |city: &str| {
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(
+                    crate::types::FunctionCallContent::new(
+                        "c1",
+                        "get_weather",
+                        Some(crate::types::FunctionArguments::Raw(format!(
+                            "{{\"city\":\"{city}\"}}"
+                        ))),
+                    ),
+                )],
+            )
+        };
+        let history = vec![mk("old"), mk("new")];
+        let input = vec![tool_result_message("c1", "sunny")];
+
+        let retained = KeepIndices(vec![0]).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let cities: Vec<String> = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_call)
+            .filter_map(|c| {
+                c.parse_arguments()
+                    .ok()?
+                    .get("city")?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            cities.contains(&"new".to_string()),
+            "the newer occurrence the result answers must be present, got {cities:?}"
+        );
+    }
+
+    #[test]
+    fn a_hosted_file_alone_does_not_satisfy_the_retention_check() {
+        // Gemini's content_to_part has no HostedFile arm, so a message carrying
+        // only one reaches it as nothing. A negative-list predicate counted
+        // every non-reasoning variant as renderable.
+        let hosted = Message::with_contents(
+            Role::assistant(),
+            vec![Content::HostedFile(crate::types::HostedFileContent {
+                file_id: "file_1".into(),
+            })],
+        );
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "a real earlier turn"),
+            hosted,
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
             "expected a real turn to be restored, got {out:?}"
         );
     }
