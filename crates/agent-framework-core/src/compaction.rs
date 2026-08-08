@@ -376,6 +376,7 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     // can never manufacture the orphan `drop_orphaned_tool_exchanges` removes.
     let plain = original
         .iter()
+        .enumerate()
         .rev()
         // A tool-role message is never standalone content: its text belongs to
         // the exchange. Stripping its result and keeping the text yields a tool
@@ -383,8 +384,8 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
         // entirely (leaving the conversation system-only after all) and which
         // Gemini emits as a bare text part under its `function` role. The
         // complete-exchange fallback below handles these properly.
-        .filter(|m| m.role != Role::system() && m.role != Role::tool())
-        .find_map(|m| {
+        .filter(|(_, m)| m.role != Role::system() && m.role != Role::tool())
+        .find_map(|(index, m)| {
             let mut candidate = m.clone();
             // Reasoning is dropped alongside the exchange halves, not kept as
             // standalone content. It renders nothing on its own — Gemini's
@@ -397,10 +398,10 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
                 renders_on_every_provider(c)
                     && !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_))
             });
-            (!candidate.contents.is_empty()).then_some(candidate)
+            (!candidate.contents.is_empty()).then_some((index, candidate))
         });
-    if let Some(plain) = plain {
-        retained.push(plain);
+    if let Some((index, plain)) = plain {
+        insert_chronologically(&mut retained, original, index, plain);
         return retained;
     }
     // Nothing but a tool exchange, then — a conversation whose only non-system
@@ -463,6 +464,44 @@ fn pair_tool_exchanges<'a>(
         .collect();
     leftover.sort_unstable_by_key(|(site, _)| *site);
     (pairs, leftover)
+}
+
+/// Insert `message` — which sits at `origin_index` in `original` — into
+/// `retained` at its chronological position.
+///
+/// Appending unconditionally reverses the conversation when the retained set
+/// holds a *newer* message that failed the rendering check: with
+/// `[user("old"), assistant(reasoning)]` the reasoning is kept and the old user
+/// turn lands after it, so a provider that does render reasoning (Anthropic)
+/// sees a stale request as the latest turn and can answer it a second time.
+///
+/// `retained` is a subsequence of `original` for every strategy in this module,
+/// so positions are recovered by walking both in step. A strategy that rewrites
+/// messages rather than selecting them breaks that match, and the message is
+/// appended — the previous behaviour, and the best available without an origin
+/// to compare against.
+fn insert_chronologically(
+    retained: &mut Vec<Message>,
+    original: &[Message],
+    origin_index: usize,
+    message: Message,
+) {
+    let mut next_origin = 0usize;
+    for (position, kept) in retained.iter().enumerate() {
+        let Some(found) = original[next_origin..]
+            .iter()
+            .position(|candidate| candidate == kept)
+            .map(|offset| next_origin + offset)
+        else {
+            break;
+        };
+        if found > origin_index {
+            retained.insert(position, message);
+            return;
+        }
+        next_origin = found + 1;
+    }
+    retained.push(message);
 }
 
 /// The most recent complete call/result pair, as one or two messages reduced to
@@ -720,9 +759,16 @@ fn finalize_compaction(
 ) -> Vec<Message> {
     let retained = reinstate_calls_answered_by_pending(original, retained, pending);
     let retained = drop_orphaned_tool_exchanges(retained, pending);
-    // A non-system message in `pending` already gives the model something to
-    // answer, so the minimum-retention rule has nothing to enforce.
-    if pending.iter().any(|m| m.role != Role::system()) {
+    // A non-system message in `pending` gives the model something to answer —
+    // but only if it actually reaches the provider. An input carrying just an
+    // audio attachment (dropped by Anthropic) or a hosted-file reference
+    // (dropped by Gemini) contributes nothing on the wire, so the rule still
+    // has work to do. Same predicate as the retained-side check, for the same
+    // reason.
+    if pending
+        .iter()
+        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_every_provider))
+    {
         return retained;
     }
     ensure_non_system_message(original, retained)
@@ -1752,6 +1798,67 @@ mod tests {
             .flat_map(|m| m.contents.iter())
             .any(|c| matches!(c, Content::TextReasoning(_)));
         assert!(kept, "reasoning must survive, got {out:?}");
+    }
+
+    #[test]
+    fn the_fallback_is_inserted_in_chronological_order() {
+        // The retained message is newer but renders nothing universally, so a
+        // fallback is added. Appending it put a stale user turn *after* the
+        // assistant's reply — on Anthropic, which does render reasoning, the
+        // model then sees the old request as the latest turn.
+        let messages = vec![
+            text(Role::user(), "old question"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "newer thinking".into(),
+                    ..Default::default()
+                })],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text(), "old question", "got {out:?}");
+        assert!(matches!(out[1].contents[0], Content::TextReasoning(_)));
+    }
+
+    #[test]
+    fn a_fallback_newer_than_the_retained_message_is_appended() {
+        let messages = vec![
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "older thinking".into(),
+                    ..Default::default()
+                })],
+            ),
+            text(Role::user(), "newer question"),
+        ];
+        let retained = KeepIndices(vec![0]).compact(&messages, &ApproxTokenizer);
+        let out = finalize_compaction(&messages, retained, &[]);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].contents[0], Content::TextReasoning(_)));
+        assert_eq!(out[1].text(), "newer question");
+    }
+
+    #[test]
+    fn wire_empty_pending_input_does_not_satisfy_retention() {
+        // The run's input is a hosted-file reference, which Gemini drops; it
+        // contributes nothing, so the older real turn must still be restored.
+        let history = vec![text(Role::system(), "sys"), text(Role::user(), "real turn")];
+        let input = vec![Message::with_contents(
+            Role::user(),
+            vec![Content::HostedFile(crate::types::HostedFileContent {
+                file_id: "file_1".into(),
+            })],
+        )];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+            "expected the real turn to be restored, got {out:?}"
+        );
     }
 
     #[test]
