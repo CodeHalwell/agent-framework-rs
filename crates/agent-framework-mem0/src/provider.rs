@@ -44,9 +44,13 @@
 //!   `search_user_id`) are separate, and retrieval never inherits from
 //!   storage — see [`Mem0Provider`] for why (a shared `agent_id` would
 //!   otherwise leak one user's memories into another's conversation).
-//!   `application_id` remains write-only as a *storage* field; its retrieval
-//!   counterpart `search_application_id` narrows a search only when no
-//!   user/agent retrieval scope is set. This differs from the sibling
+//!   `application_id` is stamped on writes as the first-class `app_id` (the
+//!   Platform entity key `search_application_id` filters on) and, for
+//!   continuity with earlier versions of this crate, also as
+//!   `metadata.application_id`; its retrieval counterpart
+//!   `search_application_id` narrows a search only when no user/agent
+//!   retrieval scope is set. Memories written by versions that stamped only
+//!   the metadata key are not matched by the `app_id` filter. This differs from the sibling
 //!   `agent-framework-redis` crate's `RedisContextProvider`, where a single
 //!   `application_id` participates in the scope filter on both reads and
 //!   writes.
@@ -114,6 +118,13 @@ fn build_add_body(
         "user_id": user_id,
         "agent_id": agent_id,
         "run_id": run_id,
+        // First-class `app_id` is what the Platform API scopes by and what the
+        // `search_application_id` fallback filters on — writing the value only
+        // into metadata (as this crate previously did) left app-scoped
+        // retrieval unable to find this crate's own writes, since a metadata
+        // key and a top-level entity key never match. The metadata copy is
+        // kept for continuity with memories written by earlier versions.
+        "app_id": application_id,
         "metadata": { "application_id": application_id },
     }))
 }
@@ -598,6 +609,20 @@ mod tests {
     }
 
     // region: build_add_body
+
+    #[test]
+    fn build_add_body_stamps_first_class_app_id() {
+        // The `search_application_id` fallback filters on the Platform entity
+        // key `app_id`; a metadata-only write is invisible to it, so an
+        // app-scoped provider could never read back its own writes.
+        let m = msg(Role::user(), "Hello!");
+        let body = build_add_body(&[&m], None, None, None, Some("app-1")).unwrap();
+        assert_eq!(body["app_id"], serde_json::json!("app-1"));
+        assert_eq!(
+            body["metadata"]["application_id"],
+            serde_json::json!("app-1")
+        );
+    }
 
     #[test]
     fn build_add_body_single_message() {
