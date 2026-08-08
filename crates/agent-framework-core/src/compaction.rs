@@ -34,7 +34,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::memory::{ContextProvider, SessionContext};
-use crate::types::{Content, Message, Role};
+use crate::types::{Content, DataContent, Message, Role};
 
 /// Counts tokens for a piece of text. Rust equivalent of upstream
 /// `TokenizerProtocol`.
@@ -650,10 +650,37 @@ fn renders_on_every_provider(content: &Content) -> bool {
     // variant, and this predicate answers a variant-level question — so they
     // are excluded rather than media-type-analysed here. The cost is only a
     // possibly-redundant fallback message; see the doc comment above.
-    matches!(
-        content,
-        Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_)
-    )
+    match content {
+        Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_) => true,
+        // Images do render everywhere — Anthropic accepts them, Gemini emits
+        // `inlineData`/`fileData`, and both OpenAI converters map them — so
+        // excluding all media was too blunt. It is not free either: the
+        // fallback then appends a stale turn, changing the prompt and
+        // defeating the window the caller asked for. Other media stays out:
+        // Anthropic's `image_block_from_*` return `None` for anything else.
+        Content::Data(dc) => dc
+            .media_type
+            .as_deref()
+            .map(is_image_media_type)
+            .unwrap_or_else(|| {
+                DataContent::media_type_from_uri(&dc.uri)
+                    .map(|parsed| is_image_media_type(&parsed))
+                    .unwrap_or(false)
+            }),
+        Content::Uri(uc) => is_image_media_type(&uc.media_type),
+        _ => false,
+    }
+}
+
+/// Whether `media_type` names an image, ignoring any parameters after `;`.
+fn is_image_media_type(media_type: &str) -> bool {
+    media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/")
 }
 
 /// Clone `message` keeping the function call at `call_ci` (plus any
@@ -793,6 +820,10 @@ fn preceding_reasoning_signature(message: &Message, index: usize) -> Option<Stri
                     return Some(signature.to_string());
                 }
             }
+            // Sibling calls in the same parallel group do not break the chain:
+            // Gemini declares them together after one thought, so the reasoning
+            // that signed the group still applies to a later member.
+            Content::FunctionCall(_) => {}
             _ => return None,
         }
     }
@@ -2144,6 +2175,85 @@ mod tests {
             "old question",
             "the fallback must precede the retained (rewritten) message, got {out:?}"
         );
+    }
+
+    #[test]
+    fn an_image_turn_satisfies_the_retention_check() {
+        // Images render on every converter, so a latest image-only turn needs no
+        // fallback — appending a stale text turn changes the prompt and
+        // defeats the window the caller asked for.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "an older turn"),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::Data(crate::types::DataContent::from_bytes(
+                    b"img",
+                    "image/png",
+                ))],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert_eq!(out.len(), 2, "no fallback should be added, got {out:?}");
+        assert!(out[1]
+            .contents
+            .iter()
+            .any(|c| matches!(c, Content::Data(_))));
+    }
+
+    #[test]
+    fn an_image_uri_turn_also_satisfies_it() {
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "an older turn"),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::Uri(crate::types::UriContent {
+                    uri: "https://example.com/a.png".into(),
+                    media_type: "image/png".into(),
+                })],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert_eq!(out.len(), 2, "no fallback should be added, got {out:?}");
+    }
+
+    #[test]
+    fn a_reinstated_parallel_call_inherits_the_groups_reasoning_signature() {
+        // The signature sits on the reasoning that precedes a parallel group;
+        // restoring only the second call used to stop at its sibling and find
+        // nothing.
+        let group = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    None,
+                )),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c2", "get_time", None,
+                )),
+            ],
+        );
+        let history = vec![group];
+        // Only c2 is answered by the incoming input.
+        let input = vec![tool_result_message("c2", "noon")];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let call = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_call)
+            .expect("c2 is reinstated");
+        assert_eq!(call.call_id, "c2");
+        assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
     }
 
     #[test]
