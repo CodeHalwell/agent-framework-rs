@@ -5,7 +5,7 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-08
 
 Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
 (2026-08-07), re-baselining from `beb65b21` (2026-07-13). See
