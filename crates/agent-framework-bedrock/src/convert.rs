@@ -76,7 +76,12 @@ pub fn messages_to_bedrock(messages: &[Message]) -> (Option<Value>, Vec<Value>) 
         } else {
             "user"
         };
-        let blocks: Vec<Value> = msg.contents.iter().filter_map(content_to_block).collect();
+        let in_user_turn = role == "user";
+        let blocks: Vec<Value> = msg
+            .contents
+            .iter()
+            .filter_map(|c| content_to_block(c, in_user_turn))
+            .collect();
         if blocks.is_empty() {
             // Converse rejects a turn with an empty `content` array.
             continue;
@@ -150,12 +155,16 @@ fn normalize_role_alternation(turns: Vec<Value>) -> Vec<Value> {
 /// Map a single [`Content`] item to a Converse content block, or `None` for
 /// a variant Converse has no representation for (skipped, mirroring the
 /// other non-OpenAI-shaped providers in this workspace).
-fn content_to_block(content: &Content) -> Option<Value> {
+fn content_to_block(content: &Content, in_user_turn: bool) -> Option<Value> {
     match content {
         Content::Text(t) => Some(json!({ "text": t.text })),
         Content::FunctionCall(fc) => Some(tool_use_block(fc)),
         Content::FunctionResult(fr) => Some(tool_result_block(fr)),
-        Content::Data(dc) => image_block_from_data(dc),
+        // Converse accepts image blocks only inside `user` turns; emitting one
+        // in an `assistant` turn fails the whole request rather than dropping
+        // the block, so assistant-authored image content is skipped like other
+        // unmappable content.
+        Content::Data(dc) if in_user_turn => image_block_from_data(dc),
         // `Content::Uri` has no Converse mapping: image sources are inline
         // `bytes` or an S3 location — there is no remote-URL source — so a
         // hosted image reference cannot be rendered here.
@@ -457,10 +466,22 @@ mod tests {
         for content in universal_content_samples() {
             assert!(content.renders_on_every_provider(), "sample not universal");
             assert!(
-                content_to_block(&content).is_some(),
+                content_to_block(&content, true).is_some(),
                 "core claims this renders everywhere but Converse emits nothing: {content:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_assistant_turn_never_carries_an_image_block() {
+        // Converse rejects the whole request for an assistant image block —
+        // worse than dropping it — so assistant-authored image data is skipped.
+        let image = Content::Data(agent_framework_core::types::DataContent::from_bytes(
+            b"png",
+            "image/png",
+        ));
+        assert!(content_to_block(&image, false).is_none());
+        assert!(content_to_block(&image, true).is_some());
     }
 
     #[test]
@@ -472,7 +493,7 @@ mod tests {
             uri: "https://example.com/a.png".into(),
             media_type: "image/png".into(),
         });
-        assert!(content_to_block(&uri).is_none());
+        assert!(content_to_block(&uri, true).is_none());
         assert!(!uri.renders_on_every_provider());
     }
 

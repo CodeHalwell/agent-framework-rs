@@ -428,7 +428,7 @@ fn ensure_non_system_message(
     // the model as nothing and leaves the request effectively system-only.
     if retained
         .iter()
-        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_every_provider))
+        .any(|m| m.role != Role::system() && message_renders_on_every_provider(m))
     {
         return retained;
     }
@@ -456,9 +456,14 @@ fn ensure_non_system_message(
             // reasoning alone would qualify here, return early, and leave the
             // request effectively system-only while bypassing the
             // complete-exchange fallback below.
+            let role = candidate.role.clone();
             candidate.contents.retain(|c| {
                 renders_on_every_provider(c)
                     && !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_))
+                    // Same role qualifier as message_renders_on_every_provider:
+                    // an assistant image renders nowhere, so it must not make
+                    // this candidate look substantive either.
+                    && !(matches!(c, Content::Data(_)) && role == Role::assistant())
             });
             (!candidate.contents.is_empty()).then_some((index, candidate))
         });
@@ -620,6 +625,21 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Option<(usize, Vec<Mes
 /// only asks.
 fn renders_on_every_provider(content: &Content) -> bool {
     content.renders_on_every_provider()
+}
+
+/// Whether `message` carries anything that reaches the model on every
+/// provider, **in this message's role**.
+///
+/// The role qualifier exists for images: providers accept image blocks only in
+/// user turns (Bedrock's Converse and Anthropic both reject an assistant image
+/// block outright, and the Bedrock converter accordingly skips them), so an
+/// assistant message whose only universal content is image data renders
+/// nowhere and must not satisfy retention.
+fn message_renders_on_every_provider(message: &Message) -> bool {
+    message.contents.iter().any(|content| {
+        content.renders_on_every_provider()
+            && !(matches!(content, Content::Data(_)) && message.role == Role::assistant())
+    })
 }
 
 /// Clone `message` keeping the function call at `call_ci` (plus any
@@ -831,7 +851,7 @@ fn finalize_compaction(
     // reason.
     if pending
         .iter()
-        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_every_provider))
+        .any(|m| m.role != Role::system() && message_renders_on_every_provider(m))
     {
         return retained;
     }
@@ -841,7 +861,7 @@ fn finalize_compaction(
 /// Compact `messages` with `strategy` and `tokenizer`.
 ///
 /// This is the supported entry point: it runs the strategy and then enforces
-/// the invariants in [`finalize_compaction`]. Calling
+/// the retention and pairing invariants (`finalize_compaction`). Calling
 /// [`CompactionStrategy::compact`] directly gives the strategy's raw output
 /// without them.
 pub fn compact(
@@ -2113,6 +2133,31 @@ mod tests {
             out[0].text(),
             "old question",
             "the fallback must precede the retained (rewritten) message, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_assistant_image_turn_does_not_satisfy_retention() {
+        // Image blocks are user-turn content everywhere: Converse and
+        // Anthropic reject an assistant image block outright, and the Bedrock
+        // converter skips it — so an assistant message whose only content is
+        // image data renders nowhere.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "a real earlier turn"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::Data(crate::types::DataContent::from_bytes(
+                    b"img",
+                    "image/png",
+                ))],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+            "expected the real turn restored, got {out:?}"
         );
     }
 

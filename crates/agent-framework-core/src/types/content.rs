@@ -640,7 +640,10 @@ impl Content {
     /// * `FunctionCall`, `FunctionResult` — mapped by every converter.
     /// * `Data` — only a valid `data:` URI carrying an image in a format
     ///   Bedrock's Converse API accepts (`png`/`jpeg`/`gif`/`webp`, the
-    ///   narrowest image set in the workspace; Anthropic requires images too).
+    ///   narrowest image set in the workspace; Anthropic requires images too),
+    ///   and only as **user-turn** content — Converse and Anthropic reject an
+    ///   assistant image block outright, so role-aware callers (compaction's
+    ///   retention check) must not count image data in assistant messages.
     ///   The URI is validated even when `media_type` is set: declaring a type
     ///   is not the same as carrying one, and Anthropic/Gemini parse the URI
     ///   before emitting anything.
