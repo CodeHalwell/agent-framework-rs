@@ -447,7 +447,8 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
             (!candidate.contents.is_empty()).then_some((index, candidate))
         });
     if let Some((index, plain)) = plain {
-        insert_chronologically(&mut retained, original, index, plain);
+        let position = chronological_position(&retained, original, index);
+        retained.insert(position, plain);
         return retained;
     }
     // Nothing but a tool exchange, then — a conversation whose only non-system
@@ -455,7 +456,12 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     // above does) would leave the result system-only after all, so retain the
     // latest *complete* exchange instead: both halves together are valid, and
     // they give the model something to answer.
-    retained.extend(latest_complete_tool_exchange(original));
+    if let Some((origin_index, exchange)) = latest_complete_tool_exchange(original) {
+        let position = chronological_position(&retained, original, origin_index);
+        for (offset, message) in exchange.into_iter().enumerate() {
+            retained.insert(position + offset, message);
+        }
+    }
     retained
 }
 
@@ -512,8 +518,8 @@ fn pair_tool_exchanges<'a>(
     (pairs, leftover)
 }
 
-/// Insert `message` — which sits at `origin_index` in `original` — into
-/// `retained` at its chronological position.
+/// The index in `retained` at which content originating at `origin_index` in
+/// `original` belongs chronologically.
 ///
 /// Appending unconditionally reverses the conversation when the retained set
 /// holds a *newer* message that failed the rendering check: with
@@ -522,16 +528,19 @@ fn pair_tool_exchanges<'a>(
 /// sees a stale request as the latest turn and can answer it a second time.
 ///
 /// `retained` is a subsequence of `original` for every strategy in this module,
-/// so positions are recovered by walking both in step. A strategy that rewrites
-/// messages rather than selecting them breaks that match, and the message is
-/// appended — the previous behaviour, and the best available without an origin
-/// to compare against.
-fn insert_chronologically(
-    retained: &mut Vec<Message>,
+/// so positions are recovered by matching the two. A strategy that rewrites
+/// messages rather than selecting them breaks that match, and the result is
+/// `retained.len()` — appending, the best available without an origin to
+/// compare against.
+///
+/// Both fallback paths go through this. They previously did not: only the
+/// plain-content one was made chronological, and the complete-exchange one kept
+/// appending.
+fn chronological_position(
+    retained: &[Message],
     original: &[Message],
     origin_index: usize,
-    message: Message,
-) {
+) -> usize {
     // Assign each retained message an original position, matching from the end
     // backwards. Equal messages recur — two identical reasoning steps around an
     // older user turn, say — and a forward greedy match aliases a retained
@@ -553,13 +562,10 @@ fn insert_chronologically(
             None => break,
         }
     }
-    match assigned
+    assigned
         .iter()
         .position(|slot| matches!(slot, Some(index) if *index > origin_index))
-    {
-        Some(position) => retained.insert(position, message),
-        None => retained.push(message),
-    }
+        .unwrap_or(retained.len())
 }
 
 /// The most recent complete call/result pair, as one or two messages reduced to
@@ -567,19 +573,17 @@ fn insert_chronologically(
 ///
 /// Returns empty when no result has a preceding unanswered call — there is no
 /// complete exchange to reinstate, and a half is worse than nothing.
-fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
+fn latest_complete_tool_exchange(messages: &[Message]) -> Option<(usize, Vec<Message>)> {
     let (pairs, _) = pair_tool_exchanges(
         messages
             .iter()
             .enumerate()
             .filter(|(_, m)| m.role != Role::system()),
     );
-    let Some(((call_mi, call_ci), (result_mi, result_ci))) = pairs.last().copied() else {
-        return Vec::new();
-    };
+    let ((call_mi, call_ci), (result_mi, result_ci)) = pairs.last().copied()?;
     // A result always pairs with a call that came before it, so emitting the
     // call's message first preserves the original order.
-    if call_mi == result_mi {
+    let messages = if call_mi == result_mi {
         vec![reduced_call_with_signature(
             &messages[call_mi],
             call_ci,
@@ -590,7 +594,8 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
             reduced_call_with_signature(&messages[call_mi], call_ci, &[]),
             reduced_to(&messages[result_mi], &[result_ci]),
         ]
-    }
+    };
+    Some((call_mi, messages))
 }
 
 /// Whether this content reaches the model on **every** provider this workspace
@@ -1981,6 +1986,59 @@ mod tests {
             out[0].text(),
             "old question",
             "the fallback must precede the retained later reasoning, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_complete_exchange_fallback_is_also_inserted_chronologically() {
+        // The chronological fix covered only the plain-content fallback; the
+        // exchange fallback still appended, putting a stale tool turn after a
+        // newer reasoning message that Anthropic does render.
+        let messages = vec![
+            tool_call_message("c1", "get_weather"),
+            tool_result_message("c1", "sunny"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "newer thinking".into(),
+                    ..Default::default()
+                })],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+
+        let reasoning_at = out
+            .iter()
+            .position(|m| {
+                m.contents
+                    .iter()
+                    .any(|c| matches!(c, Content::TextReasoning(_)))
+            })
+            .expect("the retained reasoning is still present");
+        let call_at = out
+            .iter()
+            .position(|m| {
+                m.contents
+                    .iter()
+                    .any(|c| matches!(c, Content::FunctionCall(_)))
+            })
+            .expect("the exchange is restored");
+        assert!(
+            call_at < reasoning_at,
+            "the older exchange must precede the newer reasoning, got {out:?}"
+        );
+        // ...and its result stays with it, still after the call.
+        let result_at = out
+            .iter()
+            .position(|m| {
+                m.contents
+                    .iter()
+                    .any(|c| matches!(c, Content::FunctionResult(_)))
+            })
+            .expect("the result is restored");
+        assert!(
+            call_at < result_at && result_at < reasoning_at,
+            "got {out:?}"
         );
     }
 
