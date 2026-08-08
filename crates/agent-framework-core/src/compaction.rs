@@ -2251,6 +2251,26 @@ mod tests {
     }
 
     #[test]
+    fn blank_text_does_not_satisfy_the_retention_check() {
+        // `Text("")` is worse than unrendered — Anthropic rejects an empty
+        // text block outright — and a whitespace turn gives the model nothing
+        // either way, so the older substantive turn must be restored.
+        for blank in ["", "   \n\t"] {
+            let messages = vec![
+                text(Role::system(), "sys"),
+                text(Role::user(), "a real earlier turn"),
+                text(Role::assistant(), blank),
+            ];
+            let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+            assert!(
+                out.iter()
+                    .any(|m| m.role != Role::system() && !m.text().trim().is_empty()),
+                "expected the real turn restored for {blank:?}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_all_system_conversation_stays_all_system() {
         // Nothing to reinstate: the fallback must not invent a turn.
         let messages = vec![text(Role::system(), "a"), text(Role::system(), "b")];

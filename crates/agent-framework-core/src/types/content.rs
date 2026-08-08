@@ -635,7 +635,9 @@ impl Content {
     /// crates themselves, so a converter change that invalidates a row fails a
     /// test next to the converter rather than surfacing as a compaction bug:
     ///
-    /// * `Text`, `FunctionCall`, `FunctionResult` — mapped by every converter.
+    /// * `Text` — mapped by every converter, but only when it carries
+    ///   non-whitespace: Anthropic rejects an empty text block with a 400.
+    /// * `FunctionCall`, `FunctionResult` — mapped by every converter.
     /// * `Data` — only a valid `data:` URI carrying an image in a format
     ///   Bedrock's Converse API accepts (`png`/`jpeg`/`gif`/`webp`, the
     ///   narrowest image set in the workspace; Anthropic requires images too).
@@ -656,7 +658,11 @@ impl Content {
     /// while over-claiming produces an effectively empty request.
     pub fn renders_on_every_provider(&self) -> bool {
         match self {
-            Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_) => true,
+            // Whitespace-only text is worse than unrendered: Anthropic rejects
+            // an empty text block with a 400, and everywhere else it emits a
+            // blank turn — nothing for the model to answer either way.
+            Content::Text(t) => !t.text.trim().is_empty(),
+            Content::FunctionCall(_) | Content::FunctionResult(_) => true,
             Content::Data(dc) => match DataContent::media_type_from_uri(&dc.uri) {
                 Ok(parsed) => is_universal_image_media_type(
                     dc.media_type.as_deref().unwrap_or(parsed.as_str()),
