@@ -521,19 +521,22 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
 /// [`TextReasoningContent::raw_representation`]: crate::types::TextReasoningContent::raw_representation
 fn renders_on_every_provider(content: &Content) -> bool {
     // An explicit allowlist, deliberately not `!matches!(...)` over the few
-    // known-inert variants. `Content` has 25 of them and the narrowest
-    // converter — Gemini's `content_to_part` — has arms for exactly these five;
-    // everything else falls through its catch-all and vanishes. A negative list
-    // silently classifies each *new* variant as universally renderable, which
-    // is how `HostedFile` and the hosted tool-call variants came to count as
-    // usable content here.
+    // known-inert variants. `Content` has 25 of them, and a negative list
+    // silently classifies each *new* variant — and every one nobody thought
+    // about — as universally renderable. That is how `HostedFile` and the
+    // hosted tool-call variants came to count as usable content here.
+    //
+    // Only three qualify unconditionally. `Data` and `Uri` look like they
+    // should, and Gemini and OpenAI do map them, but Anthropic renders only
+    // *images*: `image_block_from_data` and `image_block_from_uri` return
+    // `None` for anything else, so an audio attachment or a non-image URI is
+    // dropped there. Whether they render is a property of the payload, not the
+    // variant, and this predicate answers a variant-level question — so they
+    // are excluded rather than media-type-analysed here. The cost is only a
+    // possibly-redundant fallback message; see the doc comment above.
     matches!(
         content,
-        Content::Text(_)
-            | Content::FunctionCall(_)
-            | Content::FunctionResult(_)
-            | Content::Data(_)
-            | Content::Uri(_)
+        Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_)
     )
 }
 
@@ -1386,6 +1389,32 @@ mod tests {
             cities.contains(&"new".to_string()),
             "the newer occurrence the result answers must be present, got {cities:?}"
         );
+    }
+
+    #[test]
+    fn non_image_media_alone_does_not_satisfy_the_retention_check() {
+        // Anthropic's image_block_from_data / image_block_from_uri return None
+        // for anything that is not an image, so audio Data or a non-image Uri
+        // is dropped there and the request is effectively system-only.
+        for media in [
+            Content::Data(crate::types::DataContent::from_bytes(b"aud", "audio/wav")),
+            Content::Uri(crate::types::UriContent {
+                uri: "https://example.com/doc.pdf".into(),
+                media_type: "application/pdf".into(),
+            }),
+        ] {
+            let messages = vec![
+                text(Role::system(), "sys"),
+                text(Role::user(), "a real earlier turn"),
+                Message::with_contents(Role::assistant(), vec![media]),
+            ];
+            let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+            assert!(
+                out.iter().any(|m| m.role != Role::system()
+                    && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+                "expected a real turn to be restored, got {out:?}"
+            );
+        }
     }
 
     #[test]
