@@ -60,9 +60,55 @@ pub fn count_message_tokens(tokenizer: &dyn Tokenizer, message: &Message) -> usi
     message
         .contents
         .iter()
-        .filter_map(Content::as_text)
-        .map(|text| tokenizer.count_tokens(text))
+        .map(|content| count_content_tokens(tokenizer, content))
         .sum()
+}
+
+/// Token cost of a single content item.
+///
+/// Tool payloads count. They were previously free, because the estimate went
+/// through `Content::as_text`, which exposes only text and reasoning — so a
+/// completed exchange carrying a megabyte of JSON added nothing to the total
+/// and any number of them survived [`TokenBudget`], which exists precisely to
+/// keep the request inside the context window. Tool arguments and results are
+/// literal text in the request and are counted as such.
+///
+/// Media is still not counted: an image's cost is provider-specific and is not
+/// its base64 length, so charging the data URI would be worse than charging
+/// nothing.
+fn count_content_tokens(tokenizer: &dyn Tokenizer, content: &Content) -> usize {
+    fn value_text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    match content {
+        Content::Text(t) => tokenizer.count_tokens(&t.text),
+        Content::TextReasoning(t) => tokenizer.count_tokens(&t.text),
+        Content::FunctionCall(fc) => {
+            let arguments = match &fc.arguments {
+                Some(crate::types::FunctionArguments::Raw(raw)) => raw.clone(),
+                Some(crate::types::FunctionArguments::Object(map)) => {
+                    serde_json::to_string(map).unwrap_or_default()
+                }
+                None => String::new(),
+            };
+            tokenizer.count_tokens(&fc.name) + tokenizer.count_tokens(&arguments)
+        }
+        Content::FunctionResult(fr) => {
+            let mut total = fr
+                .result
+                .as_ref()
+                .map_or(0, |v| tokenizer.count_tokens(&value_text(v)));
+            if let Some(exception) = &fr.exception {
+                total += tokenizer.count_tokens(exception);
+            }
+            total
+        }
+        _ => 0,
+    }
 }
 
 /// A strategy that reduces a message list to fit some constraint.
@@ -486,22 +532,34 @@ fn insert_chronologically(
     origin_index: usize,
     message: Message,
 ) {
-    let mut next_origin = 0usize;
-    for (position, kept) in retained.iter().enumerate() {
-        let Some(found) = original[next_origin..]
+    // Assign each retained message an original position, matching from the end
+    // backwards. Equal messages recur — two identical reasoning steps around an
+    // older user turn, say — and a forward greedy match aliases a retained
+    // *later* occurrence to the earlier duplicate, concluding it is older than
+    // the fallback and appending after it. Matching from the end assigns the
+    // latest position consistent with order, which is the one a suffix-retaining
+    // strategy actually kept.
+    let mut assigned: Vec<Option<usize>> = vec![None; retained.len()];
+    let mut limit = original.len();
+    for index in (0..retained.len()).rev() {
+        match original[..limit]
             .iter()
-            .position(|candidate| candidate == kept)
-            .map(|offset| next_origin + offset)
-        else {
-            break;
-        };
-        if found > origin_index {
-            retained.insert(position, message);
-            return;
+            .rposition(|candidate| *candidate == retained[index])
+        {
+            Some(found) => {
+                assigned[index] = Some(found);
+                limit = found;
+            }
+            None => break,
         }
-        next_origin = found + 1;
     }
-    retained.push(message);
+    match assigned
+        .iter()
+        .position(|slot| matches!(slot, Some(index) if *index > origin_index))
+    {
+        Some(position) => retained.insert(position, message),
+        None => retained.push(message),
+    }
 }
 
 /// The most recent complete call/result pair, as one or two messages reduced to
@@ -1858,6 +1916,71 @@ mod tests {
             out.iter().any(|m| m.role != Role::system()
                 && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
             "expected the real turn to be restored, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn tool_payloads_count_against_the_token_budget() {
+        // A megabyte-scale JSON result cost zero tokens, so any number of
+        // completed exchanges survived TokenBudget and the "compacted" request
+        // still blew the context window.
+        let t = ApproxTokenizer;
+        let bulky = Message::with_contents(
+            Role::tool(),
+            vec![Content::FunctionResult(FunctionResultContent::new(
+                "c1",
+                Some(json!("x".repeat(400))),
+            ))],
+        );
+        assert!(
+            count_message_tokens(&t, &bulky) >= 100,
+            "a large tool result must cost tokens, got {}",
+            count_message_tokens(&t, &bulky)
+        );
+
+        let call = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(
+                crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    Some(crate::types::FunctionArguments::Raw("y".repeat(400))),
+                ),
+            )],
+        );
+        assert!(count_message_tokens(&t, &call) >= 100);
+
+        // And the budget now actually excludes them.
+        let messages = vec![call.clone(), bulky.clone(), text(Role::user(), "tiny")];
+        let out = TokenBudget::new(10).compact(&messages, &t);
+        assert!(
+            out.len() < 3,
+            "the bulky exchange must not fit a 10-token budget, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_messages_do_not_alias_the_fallback_position() {
+        // Identical reasoning messages either side of an older user turn. A
+        // forward equality match aliased the retained *later* reasoning to the
+        // earlier duplicate, concluded the fallback was newer, and appended it —
+        // reversing the conversation again.
+        let reasoning = || {
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "same thinking".into(),
+                    ..Default::default()
+                })],
+            )
+        };
+        let messages = vec![reasoning(), text(Role::user(), "old question"), reasoning()];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].text(),
+            "old question",
+            "the fallback must precede the retained later reasoning, got {out:?}"
         );
     }
 

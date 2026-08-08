@@ -216,11 +216,18 @@ impl DataContent {
                     .to_string(),
             ));
         };
-        let Some(media_type) = header.strip_suffix(";base64") else {
+        let Some(parameters) = header.strip_suffix(";base64") else {
             return Err(Error::Content(
                 "invalid data URI: must declare `;base64` encoding".to_string(),
             ));
         };
+        // Only the part before the first `;` is the media type — the rest are
+        // parameters (`data:image/png;charset=utf-8;base64,...`). Returning
+        // `image/png;charset=utf-8` puts that whole string in
+        // [`Self::media_type`], which the Anthropic and Gemini converters
+        // prefer over their own parse, and it falls outside Anthropic's
+        // accepted image media types, so the attachment is rejected.
+        let media_type = parameters.split(';').next().unwrap_or(parameters);
         Ok(media_type.to_string())
     }
 }
@@ -731,6 +738,16 @@ mod tests {
         // unstated. Upstream rejects only structural problems.
         let dc = DataContent::from_uri("data:;base64,AAAA").unwrap();
         assert_eq!(dc.media_type.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn data_content_from_uri_drops_media_type_parameters() {
+        let dc = DataContent::from_uri("data:image/png;charset=utf-8;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            DataContent::media_type_from_uri("data:text/plain;charset=utf-8;base64,AAAA").unwrap(),
+            "text/plain"
+        );
     }
 
     #[test]
