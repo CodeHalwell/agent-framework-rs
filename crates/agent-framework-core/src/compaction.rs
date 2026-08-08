@@ -291,7 +291,7 @@ impl CompactionStrategy for SelectiveToolResult {
 /// the way upstream's `ToolResultCompactionStrategy` does; this port has no
 /// LLM-summarizing compaction strategy to build that summary with.
 fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> Vec<Message> {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::HashSet;
 
     // Pair by *occurrence*, not by id membership. Call ids are not guaranteed
     // unique across a conversation — providers may reuse one for a later
@@ -300,40 +300,15 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> 
     // balanced and leave the second call unanswered. Each result is instead
     // matched to the oldest still-unanswered call sharing its id; whatever is
     // left unmatched on either side is an orphan.
-    let paired: HashSet<(usize, usize)> = {
-        let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
-        let mut paired = HashSet::new();
-        // `pending` is scanned as a continuation of `messages` (its indices
-        // start past the end) so a call here can pair with a result that only
-        // arrives later, but it is never itself modified.
-        for (mi, message) in messages.iter().chain(pending.iter()).enumerate() {
-            for (ci, content) in message.contents.iter().enumerate() {
-                match content {
-                    Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
-                        unanswered
-                            .entry(fc.call_id.as_str())
-                            .or_default()
-                            .push_back((mi, ci));
-                    }
-                    Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
-                        // Nearest *preceding* outstanding call, not the oldest.
-                        // With FIFO a result in `pending` paired with a stale
-                        // historical call instead of the pending call directly
-                        // before it, leaving that one unanswered while the
-                        // historical one was kept — two calls, one result.
-                        if let Some(call_site) = unanswered
-                            .get_mut(fr.call_id.as_str())
-                            .and_then(VecDeque::pop_back)
-                        {
-                            paired.insert(call_site);
-                            paired.insert((mi, ci));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        paired
+    let paired: HashSet<Site> = {
+        // `pending` is walked as a continuation of `messages` (its indices start
+        // past the end) so a call here can pair with a result that only arrives
+        // later, but it is never itself modified.
+        let (pairs, _) = pair_tool_exchanges(messages.iter().chain(pending.iter()).enumerate());
+        pairs
+            .into_iter()
+            .flat_map(|(call_site, result_site)| [call_site, result_site])
+            .collect()
     };
 
     // Fast path: nothing is orphaned, so the (common) balanced conversation is
@@ -437,20 +412,31 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     retained
 }
 
-/// The most recent complete call/result pair, as one or two messages reduced to
-/// just that pair's contents (one when both halves share a message).
+/// A `(message index, content index)` position within a message list.
+type Site = (usize, usize);
+
+/// A call site paired with the result site that answers it.
+type ExchangePair = (Site, Site);
+
+/// A call site left unanswered, tagged with its call id.
+type UnansweredCall<'a> = (Site, &'a str);
+
+/// Pair each function result with the **nearest preceding** unanswered call
+/// sharing its id, walking `messages` in order.
 ///
-/// Returns empty when no result has a preceding unanswered call — there is no
-/// complete exchange to reinstate, and a half is worse than nothing.
-fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
+/// Returns the paired couples (in result order) and the call sites left
+/// unanswered, tagged with their id. Every pairing decision in this module
+/// comes from here. There were previously three separate walks of this shape;
+/// two took the nearest preceding call and one took the oldest, and they
+/// disagreed about which occurrence a result answers when an id is reused.
+fn pair_tool_exchanges<'a>(
+    messages: impl Iterator<Item = (usize, &'a Message)>,
+) -> (Vec<ExchangePair>, Vec<UnansweredCall<'a>>) {
     use std::collections::{HashMap, VecDeque};
 
-    let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
-    let mut last_pair: Option<((usize, usize), (usize, usize))> = None;
-    for (mi, message) in messages.iter().enumerate() {
-        if message.role == Role::system() {
-            continue;
-        }
+    let mut unanswered: HashMap<&str, VecDeque<Site>> = HashMap::new();
+    let mut pairs: Vec<ExchangePair> = Vec::new();
+    for (mi, message) in messages {
         for (ci, content) in message.contents.iter().enumerate() {
             match content {
                 Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
@@ -462,16 +448,36 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
                 Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
                     if let Some(call_site) = unanswered
                         .get_mut(fr.call_id.as_str())
-                        .and_then(VecDeque::pop_front)
+                        .and_then(VecDeque::pop_back)
                     {
-                        last_pair = Some((call_site, (mi, ci)));
+                        pairs.push((call_site, (mi, ci)));
                     }
                 }
                 _ => {}
             }
         }
     }
-    let Some(((call_mi, call_ci), (result_mi, result_ci))) = last_pair else {
+    let mut leftover: Vec<UnansweredCall<'_>> = unanswered
+        .into_iter()
+        .flat_map(|(id, sites)| sites.into_iter().map(move |site| (site, id)))
+        .collect();
+    leftover.sort_unstable_by_key(|(site, _)| *site);
+    (pairs, leftover)
+}
+
+/// The most recent complete call/result pair, as one or two messages reduced to
+/// just that pair's contents (one when both halves share a message).
+///
+/// Returns empty when no result has a preceding unanswered call — there is no
+/// complete exchange to reinstate, and a half is worse than nothing.
+fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
+    let (pairs, _) = pair_tool_exchanges(
+        messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role != Role::system()),
+    );
+    let Some(((call_mi, call_ci), (result_mi, result_ci))) = pairs.last().copied() else {
         return Vec::new();
     };
     // A result always pairs with a call that came before it, so emitting the
@@ -514,7 +520,15 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
 ///
 /// [`TextReasoningContent::raw_representation`]: crate::types::TextReasoningContent::raw_representation
 fn renders_on_every_provider(content: &Content) -> bool {
-    !matches!(content, Content::TextReasoning(_))
+    !matches!(
+        content,
+        // Reasoning: see above.
+        Content::TextReasoning(_)
+            // A forward-compatibility placeholder for a content type this build
+            // does not know. It carries no data and no converter has an arm for
+            // it, so it is inert everywhere.
+            | Content::Unknown
+    )
 }
 
 /// Clone `message` keeping the function call at `call_ci` (plus any
@@ -681,35 +695,11 @@ fn unanswered_result_counts(messages: &[Message]) -> std::collections::HashMap<&
 /// Pairs by occurrence — each result consumes the oldest still-unanswered call
 /// sharing its id — because ids are not unique across a conversation.
 fn unanswered_call_sites(messages: &[Message]) -> Vec<(usize, usize, &str)> {
-    use std::collections::{HashMap, VecDeque};
-
-    let mut unanswered: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
-    for (mi, message) in messages.iter().enumerate() {
-        for (ci, content) in message.contents.iter().enumerate() {
-            match content {
-                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
-                    unanswered
-                        .entry(fc.call_id.as_str())
-                        .or_default()
-                        .push_back((mi, ci));
-                }
-                Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
-                    if let Some(sites) = unanswered.get_mut(fr.call_id.as_str()) {
-                        // Same nearest-preceding rule as the orphan repair, so
-                        // both agree on which occurrence a result answers.
-                        sites.pop_back();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut out: Vec<(usize, usize, &str)> = unanswered
+    let (_, leftover) = pair_tool_exchanges(messages.iter().enumerate());
+    leftover
         .into_iter()
-        .flat_map(|(id, sites)| sites.into_iter().map(move |(mi, ci)| (mi, ci, id)))
-        .collect();
-    out.sort_unstable();
-    out
+        .map(|((mi, ci), id)| (mi, ci, id))
+        .collect()
 }
 
 /// Apply the invariants every compaction result must satisfy, whatever
@@ -1284,6 +1274,67 @@ mod tests {
             .find_map(Content::as_function_call)
             .expect("the call is reinstated");
         assert!(call.protected_data.is_none());
+    }
+
+    #[test]
+    fn the_fallback_restores_the_nearest_reused_call_not_the_oldest() {
+        // `call(c1, old) -> call(c1, new) -> result(c1)`: the result answers the
+        // *new* call. A third pairing walk here used FIFO while the repair paths
+        // used nearest-preceding, so the fallback replayed the old call's
+        // arguments with the new call's result.
+        let mk = |city: &str| {
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(
+                    crate::types::FunctionCallContent::new(
+                        "c1",
+                        "get_weather",
+                        Some(crate::types::FunctionArguments::Raw(format!(
+                            "{{\"city\":\"{city}\"}}"
+                        ))),
+                    ),
+                )],
+            )
+        };
+        let messages = vec![
+            text(Role::system(), "sys"),
+            mk("old"),
+            mk("new"),
+            tool_result_message("c1", "sunny"),
+        ];
+        let out = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+
+        let call = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_call)
+            .expect("the exchange is restored");
+        assert_eq!(
+            call.parse_arguments()
+                .unwrap()
+                .get("city")
+                .and_then(|v| v.as_str()),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn unknown_content_does_not_satisfy_the_retention_check() {
+        // `Content::Unknown` is a forward-compatibility placeholder carrying no
+        // data; no converter has an arm for it, so a message of only Unknown
+        // reaches every provider as nothing.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "a real earlier turn"),
+            Message::with_contents(Role::assistant(), vec![Content::Unknown]),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert!(
+            out.iter()
+                .any(|m| m.contents.iter().any(|c| matches!(c, Content::Text(_)))
+                    && m.role != Role::system()),
+            "expected a real turn to be restored, got {out:?}"
+        );
     }
 
     #[test]
