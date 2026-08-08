@@ -1,11 +1,227 @@
-# Alignment progress against current upstream (`68136ee`)
+# Alignment progress against current upstream
 
 Tracks the re-baselining of `agent-framework-rs` onto current upstream, as
-catalogued in [`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md). Section numbers below
-refer to that document. Everything under "Done" is landed on
-`claude/rust-agent-framework-alignment-q6bjwp` and independently verified
-(full workspace build + `cargo test` + clippy `--all-targets` + rustfmt, all
-green) before commit.
+catalogued in [`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md). Section numbers under
+the `68136ee` heading refer to that document. Every item recorded as landed was
+independently verified (full workspace build + `cargo test` + clippy
+`--all-targets` + rustfmt, all green) before commit.
+
+**Current upstream baseline: `4b1afd90` (2026-08-07).** Sections are newest
+first; each records the upstream revision it was checked against.
+
+## Post-`beb65b21` drift (checked against `4b1afd90`, 2026-08-07)
+
+Upstream moved **112 commits touching `python/packages`** in the ~3.5 weeks
+between `beb65b21` (2026-07-13) and `4b1afd90` (2026-08-07). Each was triaged
+against the subsystems this port actually implements. The outcome splits four
+ways; the counts are the honest picture, not a claim of completeness.
+
+### Ported this pass (6, each with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #6990 | **Structured-output text selection.** The JSON value was parsed from *every* message's text, joined with `"\n"`/`" "`, including reasoning content. Three separate corruptions: a tool result or user echo carrying JSON could be mistaken for the answer; a reasoning model's chain-of-thought was prepended to the payload; and a JSON document split across text chunks had separators injected into it (`{"na` + `me":1}` → `{"na me":1}`). Now mirrors upstream's `_last_non_empty_assistant_message_text` — last non-empty **assistant** message, `text` contents only, joined with no separator. | `core/types/response.rs` (`structured_output_text`, used by both `parse_json`s and `try_parse_value`) |
+| #6916 | **Data-URI validation.** No validating constructor existed; a malformed `data:` URI was silently mis-sliced or ignored. Added `DataContent::from_uri` / `media_type_from_uri`, rejecting a missing `data:` scheme, a missing `,`, or a non-`;base64` declaration. | `core/types/content.rs` |
+| #7126/#7127 | **Chat Completions `author_name` sanitization.** The API validates `name` against `^[^\s<\|\\/>]+$`. The port only skipped names containing whitespace, so `"a/b"` was sent and 400'd the entire request, while `"My Agent"` was dropped rather than sanitized. Now mirrors upstream/.NET `SanitizeAuthorName`: strip outside `[a-zA-Z0-9_]`, omit when empty, truncate to 64. | `openai/convert.rs` |
+| #7369 | **OpenAI cache-*write* tokens.** Only cache *reads* were parsed. Added `cache_write_tokens` on both surfaces, populating the typed `cache_creation_input_token_count` (which is what this port's OTel layer reads, so the `gen_ai.usage.cache_creation.input_tokens` attribute now flows without the extra key-mapping table upstream needs). | `openai/convert.rs`, `openai/responses.rs` |
+| #7162 | **Anthropic streaming token double-count.** Anthropic streams *cumulative* usage snapshots: `message_delta` repeats the input/cache counts `message_start` already reported. Because `absorb_update` sums every usage content, a stream reporting 25 input tokens aggregated to 50. Added a per-stream `StreamUsageAccumulator` threaded through `SseState` that emits increments. | `anthropic/convert.rs`, `anthropic/lib.rs` |
+| #7095 | **Gemini 3 `thought_signature` replay.** Not supported at all. Gemini 3 requires the signature echoed when a function call is replayed, or the follow-up turn is rejected. Two placements exist and both are now handled: on the **function-call part itself** (Gemini 3's usual placement — `FunctionCallContent::protected_data`, which wins) and on a **preceding thought part** (`TextReasoningContent::protected_data`, used only to backfill a call carrying none, mirroring upstream's "backfill only when the raw Part lacks one"). Reasoning is no longer sent back as a part, matching upstream. | `core/types/content.rs`, `gemini/convert.rs` |
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1508 passing**, 24 of them new), `cargo clippy --all-targets --all-features`
+clean, `cargo fmt --check` clean.
+
+### Compaction cluster (follow-up pass)
+
+Upstream's `_compaction.py` is an annotation-driven system that groups messages
+into spans and flags them `_excluded`; this port deliberately implements a
+smaller "return a reduced list" model (see the module docs). So the cluster was
+triaged by *invariant* rather than by patch — what does upstream's fix
+guarantee, and does this port's much simpler design guarantee it too? Two did
+not, and both produced conversations providers reject outright:
+
+| Upstream | Invariant | What was wrong here |
+|---|---|---|
+| #7406 | A function call and its result are retained or dropped **together**. | Confirmed broken two ways by probe. `TokenBudget` dropped an expensive call-bearing message while keeping its cheap result — a tool message answering nothing. `SelectiveToolResult` deleted stale results outright while their assistant `tool_calls` entries stayed — an unanswered call. Either half alone is a 400 on the next request, not merely a worse completion. Upstream enforces this by linking call and result into one indivisible span *before* any strategy runs; with no span model here, `drop_orphaned_tool_exchanges` enforces the identical observable guarantee as a repair pass over the retained set. |
+| #7219 | Compaction never yields a projection with nothing for the model to answer. | `Truncation::new(1)` / `SlidingWindow::new(0)` over a conversation with a system prefix returned system messages *only*. `ensure_non_system_message` reinstates the most recent non-system turn, accepting a result over the limit exactly as upstream does. |
+
+`SelectiveToolResult` changed shape as a result: it now **replaces** a stale
+result's payload with `OMITTED_TOOL_RESULT` instead of deleting the content.
+That keeps the exchange paired (no orphan to repair) while still shedding the
+bulk, and matches the intent of upstream's `ToolResultCompactionStrategy`,
+which likewise replaces stale tool groups with a compact stand-in rather than
+removing them — upstream summarizes the group with an LLM; this port, having no
+summarizing strategy, substitutes a fixed marker. Three existing tests asserted
+the old delete-and-drop behavior over fixtures with unpaired results; they were
+rebuilt on realistic paired conversations.
+
+Ordering is load-bearing and documented at the call site: the orphan repair runs
+*first*, because it can itself strip a conversation down to system-only (when
+the sole non-system message was an orphaned result), which the minimum-retention
+pass then catches.
+
+Not applicable in this cluster:
+
+- **#7124** (token counts inflated by `\uXXXX` escapes on non-ASCII text) —
+  upstream counted tokens off a JSON serialization with `ensure_ascii=True`;
+  this port counts message text directly, so the inflation never existed.
+  Pinned with a regression test rather than changed.
+- **#7391** (ignore `_excluded` tool results) — depends on upstream's
+  exclusion-marking model, which this port does not implement.
+- **#7396 / #7375** (bound tool-result summaries; bound summarization input
+  before the provider call) — both govern the LLM-backed `Summarization`
+  strategy, which this port does not have.
+
+### mem0 storage/retrieval scope separation (#7531)
+
+The port had the same cross-user memory leak upstream fixed: `before_run`
+searched with `self.user_id` / `self.agent_id` — the *storage* scope. A provider
+configured with a shared `agent_id` (one agent serving many users, the ordinary
+deployment shape) therefore retrieved memories written by **every** user of that
+agent and injected them into the current user's conversation.
+
+`Mem0Provider` now separates the two scopes exactly as upstream does:
+
+- **Storage** — `with_application_id` / `with_agent_id` / `with_user_id`, stamped
+  onto memories written by `after_run`, never used to retrieve.
+- **Retrieval** — `with_search_application_id` / `with_search_agent_id` /
+  `with_search_user_id`, each queried as its **own** request and the results
+  merged (Mem0 ANDs the entries of a single `filters` object, so one combined
+  query would return only memories tagged with *both* — dropping exactly the
+  agent-wide memories written by other users that `search_agent_id` exists for;
+  upstream fans the partitions out for the same reason). Used only by
+  `before_run`, and never inheriting from
+  the storage scope. With no retrieval scope set, `before_run` retrieves nothing
+  and warns once. `search_application_id` narrows a search only as a fallback
+  when neither user nor agent retrieval scope is set, matching upstream.
+
+This is a deliberate **behavior change**, as it was upstream: code that
+retrieved memories via `with_user_id` alone must now also set
+`with_search_user_id`. Agent-wide retrieval has to be requested explicitly,
+which is the entire point — the leak came from it being implicit. Seven
+loopback tests configured only a storage scope and were updated; three new tests
+pin the isolation.
+
+### Approvals: duplicate call on round-trip (#7271) — fixed
+
+`replace_approval_contents_with_results` deduped a restored function call
+against **only the message being scanned**. On an approval round trip a hosting
+layer replays the stored `function_call` item and its approval request as two
+*separate* assistant messages, so the per-message check never fired and the
+approval request restored a second copy of the call. Only one copy received the
+function result; the provider then rejects the orphan with "No tool output
+found for function call ...".
+
+Now collects pending call ids across all messages, excludes ids that already
+carry a result (reusing a call id for a later invocation is supported, and a
+completed pair must not suppress a fresh request), and records each restored id
+so two approval requests for the same call cannot both expand. Four regression
+tests cover the round-trip shape, the double-request case, the single-request
+case that must still expand, and the reused-id case.
+
+### Approvals: blocked on a missing core field (#7462)
+
+Upstream stopped serializing **local** function approvals as MCP input items on
+the OpenAI Responses path — local approvals are resolved in-process, and only
+*hosted* (MCP) decisions have a matching approval request on the provider. It
+distinguishes the two with `_is_hosted_tool_approval`, which tests
+`function_call.additional_properties["server_label"]`.
+
+This port cannot express that test: `FunctionCallContent` has only
+`call_id` / `name` / `arguments` — no `additional_properties` — so hosted and
+local approvals are indistinguishable, and `messages_to_input` serializes every
+approval content as `mcp_approval_request` / `mcp_approval_response`.
+
+In practice the local case is mostly shielded by layering, since
+`FunctionInvokingChatClient` converts local approvals into calls and results
+*before* the Responses client serializes anything, and an approved hosted
+approval survives untouched (no local tool produces a result for it, so the
+conversion is skipped). One narrower divergence is real and shares the same
+blocker: a **rejected** approval is unconditionally converted into a local
+rejection result, so a rejected *hosted* MCP approval never reaches the provider
+as `mcp_approval_response {approve: false}`. Closing either needs
+`additional_properties` on `FunctionCallContent` first — a core type change
+worth doing deliberately rather than as a side effect.
+
+### Provider cluster — triaged, six of seven not applicable
+
+Worked through the provider fixes as a batch. Only one turned out to need code,
+and it needed none: the rest do not apply to this port's architecture. Recorded
+individually so the next pass does not re-derive them.
+
+| Upstream | Verdict |
+|---|---|
+| #7199 — raw JSON-Schema `response_format` passed through unwrapped | **Structurally impossible here.** Upstream's bug needs a raw dict in the `response_format` slot; this port's `ResponseFormat` is a closed typed enum (`Text` / `JsonObject` / `JsonSchema{..}`) whose `Serialize` impl always builds the correct envelope. |
+| #7163 — GPT-5.6 prompt-cache breakpoints | **Half already available, half blocked.** The request-wide `prompt_cache_options` reaches the wire today through `ChatOptions::additional_properties`, which `apply_options` merges into the body — no typed field needed, now pinned by a test. The *per-content* `prompt_cache_breakpoint` marker is blocked: it lives on `Content.additional_properties`, which this port's content types do not have. |
+| #7283 — Foundry agent inheriting `OPENAI_CHAT_MODEL` | **N/A.** This port reads `FOUNDRY_MODEL` and never consults `OPENAI_CHAT_MODEL`, and the agent-*reference* request path the bug lives on is a documented unimplemented extension point here (`FoundryAgent` realizes a Prompt Agent client-side, where sending a model is correct). |
+| #7417 — CopilotStudio `LineTooLong` on large activities | **N/A.** aiohttp's 512 KB per-line read buffer is the cause; this port speaks Direct-to-Engine over `reqwest`, which has no equivalent per-line cap. |
+| #7155 — forward `GitHubCopilotOptions` verbatim to `create_session` | **N/A.** Different surface: this port's GitHub Copilot client is the OpenAI-compatible `POST /chat/completions` endpoint, not the Copilot Agent SDK's session API. |
+| #7300 — forward Copilot input attachments as inline blobs | **N/A**, same reason as #7155 (`copilot_session.send(..., attachments=...)`). |
+| #7278 — Azure AI Search query-source identity | **N/A for now.** The `x-ms-query-source-authorization` header applies to *agentic* Knowledge Base retrieval; this port's provider implements classic index search (hybrid/semantic/vector) only. Agentic retrieval is a feature gap, not a bug — worth its own decision. |
+
+The recurring blocker is worth calling out on its own: **three separate items
+now hinge on this port's content types lacking `additional_properties`** —
+#7462 (hosted vs. local approvals), the rejected-hosted-approval divergence
+found alongside it, and #7163's per-content cache breakpoints. Adding
+`additional_properties` to `Content` / `FunctionCallContent` would unblock all
+three at once and is the highest-leverage next piece of work in this area.
+
+### Verified already satisfied — no action (the port was level or ahead)
+
+- **#6809** function-call name lost when a streaming delta carries it late —
+  `FunctionCallContent::merge` already fills an empty name from `other`.
+- **#7488** Gemini thought summaries surfaced as reasoning content — already
+  done; upstream was catching up to the port here.
+- **#7292** OpenAI Responses native `instructions` — the port already sends the
+  top-level field rather than prepending a system message.
+- **#7060** per-run `additional_beta_flags` leaking into the Anthropic request
+  body — `compute_beta_flags` already removes the key from
+  `additional_properties`.
+- **#7105** finish-reason normalization — `map_stop_reason` already maps
+  `guardrail_intervened` → `content_filter` and passes unknown reasons through.
+
+### Not applicable — architectural divergence
+
+- **#6822** (Ollama parallel tool calls colliding on `call_id`) and the Ollama
+  half of **#7105** (`done_reason` normalization): this port's Ollama client
+  targets Ollama's **OpenAI-compatible** `/v1/chat/completions` surface, which
+  returns real per-call ids and OpenAI-shaped `finish_reason`s. Upstream's bugs
+  live in the native `/api/chat` path, which the port does not have.
+- The **AG-UI** cluster (~10 commits), **harness/skills/evaluation**
+  graduations, the **durabletask / Azure Functions** extraction,
+  **foundry-hosting**, and the **telegram / chatkit / monty / hyperlight / lab**
+  packages: no Rust counterpart, already documented under "Remaining" below.
+
+### Triaged as relevant but NOT yet ported
+
+Carried forward as the next pass's work — none is closed, and the list is
+roughly in descending value order:
+
+- **Approvals cluster** (#7407, #7408, #7410, #7345, #7090): decisions
+  preserved under OpenAI continuation, tool content returned after invocation
+  limits, provider-injected approvals deferred to in-run execution,
+  resume/replay, auto-approval name-collision warnings. (#7271 is done — see
+  above; #7462 is blocked — see below.)
+- **Workflow checkpointing**: full replayability (#7374, BREAKING), sub-workflow
+  restore preserving sub-workflow state (#7097), checkpoint encoding (#6579).
+- **Sessions**: `SessionStore` moved into core + Foundry Responses session
+  persistence (#7306), cross-session origin attribution (#7041), hosted session
+  snapshot isolation (#7141).
+- **Core**: agent-hooks interception contract (#7515, new experimental
+  feature), declaration-only streaming metadata (#7409), stateless replay of
+  reasoning-paired tool calls (#7233), `from_dict` type enforcement (#7256),
+  `PropertySchema` nested recursion (#7200), feature-usage User-Agent telemetry
+  (#7420), tool-def JSON for observability (#7029), restricting an unknown
+  `finish_reason` from the OTel attribute (#7105).
+- **Orchestration**: Magentic manager duplicating conversation history (#6297).
+- **Providers**: Responses conversation-ID helper (#7234, BREAKING). The rest
+  of this cluster was triaged and is not applicable — see below.
+- **MCP**: `header_provider` headers on the initialize handshake and ambient
+  requests (#7305, #7218), tool-use sampling results (#7189).
+- **New package**: `azure-cosmos-memory` context provider (#6719).
+- **Verification pass**: upstream added a Mistral *chat* client (#7392); this
+  port already has `MistralChatClient`, but it was written before upstream's and
+  has not been diffed against it.
 
 ## Post-`68136ee` drift (checked against `beb65b21`, 2026-07-13)
 

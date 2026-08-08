@@ -146,6 +146,31 @@ pub struct TextReasoningContent {
     /// Responses input mapper re-emits it from here. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub raw_representation: Option<Value>,
+    /// Provider-opaque replay token attached to this reasoning step, base64.
+    ///
+    /// Mirrors upstream's `Content.protected_data`. Gemini 3 returns a
+    /// `thoughtSignature` alongside a thought part and requires it echoed on
+    /// the function call that reasoning produced; dropping it makes the model
+    /// reject the replayed turn. Distinct from [`Self::raw_representation`],
+    /// which carries a whole provider item rather than a single opaque token.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub protected_data: Option<String>,
+}
+
+/// Whether `media_type` names an image every converter can carry: the
+/// intersection is Bedrock Converse's format set. Parameters after `;` are
+/// ignored.
+fn is_universal_image_media_type(media_type: &str) -> bool {
+    matches!(
+        media_type
+            .split(';')
+            .next()
+            .unwrap_or(media_type)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+    )
 }
 
 /// Inline binary data encoded as a `data:` URI.
@@ -166,6 +191,60 @@ impl DataContent {
             uri,
             media_type: Some(media_type),
         }
+    }
+
+    /// Build from an existing `data:` URI, validating its shape and inferring
+    /// the media type from it.
+    ///
+    /// Mirrors upstream's `detect_media_type_from_base64` (`_types.py:124`),
+    /// which rejects a malformed data URI instead of silently mis-slicing it.
+    /// The prior lenient `split(";base64,")[1]` would panic or yield garbage on
+    /// input that merely looked close enough.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Content`] when `uri` does not start with `data:`, has
+    /// no `,` separating the header from the payload, or is not declared
+    /// `;base64`.
+    pub fn from_uri(uri: impl Into<String>) -> Result<Self> {
+        let uri = uri.into();
+        let media_type = Self::media_type_from_uri(&uri)?;
+        Ok(Self {
+            uri,
+            media_type: Some(media_type),
+        })
+    }
+
+    /// Validate a `data:` URI and return the media type it declares.
+    ///
+    /// An empty media type (`data:;base64,...`) is permitted — the URI is
+    /// well-formed and the type is simply unstated — and yields an empty
+    /// string, matching upstream, which only rejects structural problems.
+    pub fn media_type_from_uri(uri: &str) -> Result<String> {
+        let Some(rest) = uri.strip_prefix("data:") else {
+            return Err(Error::Content(format!(
+                "invalid data URI: expected a `data:` prefix, got {uri:.32?}"
+            )));
+        };
+        let Some((header, _payload)) = rest.split_once(',') else {
+            return Err(Error::Content(
+                "invalid data URI: missing the `,` separating the header from the payload"
+                    .to_string(),
+            ));
+        };
+        let Some(parameters) = header.strip_suffix(";base64") else {
+            return Err(Error::Content(
+                "invalid data URI: must declare `;base64` encoding".to_string(),
+            ));
+        };
+        // Only the part before the first `;` is the media type — the rest are
+        // parameters (`data:image/png;charset=utf-8;base64,...`). Returning
+        // `image/png;charset=utf-8` puts that whole string in
+        // [`Self::media_type`], which the Anthropic and Gemini converters
+        // prefer over their own parse, and it falls outside Anthropic's
+        // accepted image media types, so the attachment is rejected.
+        let media_type = parameters.split(';').next().unwrap_or(parameters);
+        Ok(media_type.to_string())
     }
 }
 
@@ -197,6 +276,15 @@ pub struct FunctionCallContent {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub arguments: Option<FunctionArguments>,
+    /// Provider-opaque replay token attached to this call, base64.
+    ///
+    /// The counterpart of [`TextReasoningContent::protected_data`]. Gemini 3
+    /// returns a `thoughtSignature` on the part carrying the function call —
+    /// the *usual* placement — and requires it echoed when the call is
+    /// replayed; a signature on a preceding thought part is the fallback.
+    /// Absent for providers that do not use one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub protected_data: Option<String>,
 }
 
 /// Arguments to a function call: either a raw (possibly partial) string, or a
@@ -218,7 +306,15 @@ impl FunctionCallContent {
             call_id: call_id.into(),
             name: name.into(),
             arguments,
+            protected_data: None,
         }
+    }
+
+    /// Attach a provider-opaque replay token (see
+    /// [`Self::protected_data`]).
+    pub fn with_protected_data(mut self, protected_data: Option<String>) -> Self {
+        self.protected_data = protected_data;
+        self
     }
 
     /// Parse the arguments into a JSON object map.
@@ -253,6 +349,13 @@ impl FunctionCallContent {
         }
         if self.call_id.is_empty() {
             self.call_id = other.call_id.clone();
+        }
+        // A provider-opaque replay token is emitted once, on whichever fragment
+        // the provider chooses — often the last. Taking the later non-empty
+        // value keeps it; ignoring it here would silently drop the signature a
+        // streamed Gemini 3 tool call needs on replay.
+        if let Some(token) = other.protected_data.as_ref().filter(|t| !t.is_empty()) {
+            self.protected_data = Some(token.clone());
         }
         // The function name is not fragmented by real providers: it arrives once
         // in the first chunk. Set it if we don't have one yet; otherwise only
@@ -522,6 +625,57 @@ impl Content {
     }
 
     /// The text of this item, if it is text or reasoning content.
+    /// Whether this content reaches the model on **every** chat converter this
+    /// workspace ships.
+    ///
+    /// This is the contract compaction's minimum-retention logic depends on: a
+    /// retained message "counts" only if it will still be there after the
+    /// narrowest converter has had its say. The narrowest converter defines
+    /// each row, and the evidence is pinned by contract tests in the provider
+    /// crates themselves, so a converter change that invalidates a row fails a
+    /// test next to the converter rather than surfacing as a compaction bug:
+    ///
+    /// * `Text` — mapped by every converter, but only when it carries
+    ///   non-whitespace: Anthropic rejects an empty text block with a 400.
+    /// * `FunctionCall`, `FunctionResult` — mapped by every converter.
+    /// * `Data` — only a valid `data:` URI carrying an image in a format
+    ///   Bedrock's Converse API accepts (`png`/`jpeg`/`gif`/`webp`, the
+    ///   narrowest image set in the workspace; Anthropic requires images too),
+    ///   and only as **user-turn** content — Converse and Anthropic reject an
+    ///   assistant image block outright, so role-aware callers (compaction's
+    ///   retention check) must not count image data in assistant messages.
+    ///   The URI is validated even when `media_type` is set: declaring a type
+    ///   is not the same as carrying one, and Anthropic/Gemini parse the URI
+    ///   before emitting anything.
+    /// * `Uri` — never. Bedrock's Converse has no remote-URL image source
+    ///   (inline bytes or S3 only), so a hosted image reference renders
+    ///   nowhere there.
+    /// * `TextReasoning` — provider-dependent (Anthropic renders it, Gemini
+    ///   and OpenAI Chat Completions drop it), so it does not qualify.
+    /// * Everything else (hosted tool artifacts, approvals, `Unknown`, ...) —
+    ///   provider-specific at best.
+    ///
+    /// The check errs conservative on purpose: callers use it to decide
+    /// whether a fallback turn must be *added*, and nothing is ever removed on
+    /// its strength, so under-claiming costs a possibly-redundant message
+    /// while over-claiming produces an effectively empty request.
+    pub fn renders_on_every_provider(&self) -> bool {
+        match self {
+            // Whitespace-only text is worse than unrendered: Anthropic rejects
+            // an empty text block with a 400, and everywhere else it emits a
+            // blank turn — nothing for the model to answer either way.
+            Content::Text(t) => !t.text.trim().is_empty(),
+            Content::FunctionCall(_) | Content::FunctionResult(_) => true,
+            Content::Data(dc) => match DataContent::media_type_from_uri(&dc.uri) {
+                Ok(parsed) => is_universal_image_media_type(
+                    dc.media_type.as_deref().unwrap_or(parsed.as_str()),
+                ),
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Content::Text(t) => Some(&t.text),
@@ -635,6 +789,61 @@ mod base64_lite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: data-URI validation (upstream #6916)
+
+    #[test]
+    fn data_content_from_uri_infers_media_type() {
+        let dc = DataContent::from_uri("data:image/png;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some("image/png"));
+        assert_eq!(dc.uri, "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn data_content_from_uri_allows_an_unstated_media_type() {
+        // `data:;base64,...` is structurally well-formed; the type is simply
+        // unstated. Upstream rejects only structural problems.
+        let dc = DataContent::from_uri("data:;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn data_content_from_uri_drops_media_type_parameters() {
+        let dc = DataContent::from_uri("data:image/png;charset=utf-8;base64,AAAA").unwrap();
+        assert_eq!(dc.media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            DataContent::media_type_from_uri("data:text/plain;charset=utf-8;base64,AAAA").unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn data_content_from_uri_rejects_malformed_uris() {
+        // Each of these previously fell through a lenient
+        // `split(";base64,")[1]` that silently produced garbage.
+        for bad in [
+            "image/png;base64,AAAA",     // no `data:` scheme
+            "data:image/png;base64AAAA", // no `,` separator
+            "data:image/png,AAAA",       // not declared base64
+            "data:",                     // truncated
+            "",                          // empty
+        ] {
+            assert!(
+                DataContent::from_uri(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn data_content_from_bytes_round_trips_through_validation() {
+        let dc = DataContent::from_bytes(b"hello", "text/plain");
+        assert_eq!(
+            DataContent::media_type_from_uri(&dc.uri).unwrap(),
+            "text/plain"
+        );
+    }
+
     use crate::types::Message;
 
     #[test]

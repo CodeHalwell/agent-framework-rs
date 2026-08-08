@@ -100,11 +100,7 @@ pub fn messages_to_gemini(messages: &[Message]) -> Vec<Value> {
         } else {
             "user"
         };
-        let parts: Vec<Value> = msg
-            .contents
-            .iter()
-            .filter_map(|c| content_to_part(c, &call_names))
-            .collect();
+        let parts: Vec<Value> = message_contents_to_parts(&msg.contents, &call_names);
         if parts.is_empty() {
             // Gemini rejects a content entry with an empty `parts` array.
             continue;
@@ -134,10 +130,69 @@ fn collect_call_names(messages: &[Message]) -> HashMap<String, String> {
     map
 }
 
+/// Convert one message's contents into Gemini `Part`s.
+///
+/// Reasoning content is **not** sent back as a part. Gemini 3 instead uses a
+/// `thoughtSignature` that must be echoed when a function call is replayed, or
+/// the follow-up turn is rejected. Two placements exist and both are handled:
+///
+/// * **On the function-call part itself** — Gemini 3's usual placement, carried
+///   through on [`FunctionCallContent::protected_data`]. This wins.
+/// * **On a preceding thought part** — carried on
+///   [`TextReasoningContent::protected_data`] and used only to *backfill* a
+///   call that has none of its own, mirroring upstream's "backfill only when
+///   the raw Part lacks one".
+///
+/// A backfilled signature applies only to a function call *immediately*
+/// following its reasoning content: any other content in between clears it, so
+/// a stale signature is never stamped onto an unrelated call.
+///
+/// Mirrors upstream's `_convert_message_contents` (`_chat_client.py:660`).
+fn message_contents_to_parts(
+    contents: &[Content],
+    call_names: &HashMap<String, String>,
+) -> Vec<Value> {
+    let mut parts = Vec::with_capacity(contents.len());
+    let mut pending_signature: Option<&str> = None;
+    for content in contents {
+        if let Content::TextReasoning(t) = content {
+            // Keep the last non-empty signature across a run of consecutive
+            // reasoning parts: they are one thought block, and only some carry
+            // a signature. Overwriting unconditionally let an unsigned part
+            // that merely follows a signed one erase it. Non-reasoning content
+            // still clears it below, so a signature never reaches an unrelated
+            // call. This matters because `parse_response` does not coalesce
+            // adjacent reasoning content the way streaming aggregation does.
+            if let Some(signature) = t.protected_data.as_deref().filter(|s| !s.is_empty()) {
+                pending_signature = Some(signature);
+            }
+            continue;
+        }
+        let pending = pending_signature.take();
+        let Some(mut part) = content_to_part(content, call_names) else {
+            continue;
+        };
+        if let Content::FunctionCall(fc) = content {
+            // The call's own signature wins; the preceding reasoning content's
+            // only backfills when the call carries none (mirroring upstream's
+            // "backfill only when the raw Part lacks one").
+            let signature = fc
+                .protected_data
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(pending);
+            if let (Some(signature), Some(obj)) = (signature, part.as_object_mut()) {
+                obj.insert("thoughtSignature".into(), json!(signature));
+            }
+        }
+        parts.push(part);
+    }
+    parts
+}
+
 fn content_to_part(content: &Content, call_names: &HashMap<String, String>) -> Option<Value> {
     match content {
         Content::Text(t) => Some(json!({ "text": t.text })),
-        Content::TextReasoning(t) => Some(json!({ "text": t.text, "thought": true })),
         Content::FunctionCall(fc) => Some(function_call_part(fc)),
         Content::FunctionResult(fr) => Some(function_response_part(fr, call_names)),
         Content::Data(dc) => data_part(dc),
@@ -403,11 +458,17 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
             // key on. `messages_to_gemini` recovers the name from this id
             // via `collect_call_names` when the call is answered.
             let call_id = format!("call_{}", uuid::Uuid::new_v4());
-            out.push(Content::FunctionCall(FunctionCallContent::new(
-                call_id,
-                name,
-                Some(FunctionArguments::Object(args)),
-            )));
+            out.push(Content::FunctionCall(
+                FunctionCallContent::new(call_id, name, Some(FunctionArguments::Object(args)))
+                    // Gemini 3's usual placement for `thoughtSignature` is the
+                    // part carrying the call itself; a signature on a preceding
+                    // thought part is the fallback, not the norm.
+                    .with_protected_data(
+                        part.get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
+            ));
             continue;
         }
         if let Some(fr) = part.get("functionResponse") {
@@ -433,6 +494,13 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
                 out.push(Content::TextReasoning(TextReasoningContent {
                     text: text.to_string(),
                     annotations: None,
+                    // Gemini 3 pairs a thought part with a `thoughtSignature`
+                    // that must be echoed on the function call this reasoning
+                    // produced; keep it on the reasoning content.
+                    protected_data: part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     ..Default::default()
                 }));
             } else {
@@ -575,6 +643,244 @@ pub(crate) fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: universal-rendering contract
+
+    /// The canonical samples the core contract claims render on every
+    /// provider. If this converter stops emitting one of them, the failure
+    /// belongs here — next to the converter — not in compaction.
+    fn universal_content_samples() -> Vec<Content> {
+        use agent_framework_core::types::{
+            DataContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+        };
+        vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new(
+                "contract_call_1",
+                "get_weather",
+                Some(FunctionArguments::Raw("{\"city\":\"SF\"}".into())),
+            )),
+            Content::FunctionResult(FunctionResultContent::new(
+                "contract_call_1",
+                Some(serde_json::json!("sunny")),
+            )),
+            Content::Data(DataContent::from_bytes(b"png-bytes", "image/png")),
+            Content::Data(DataContent::from_bytes(b"jpeg-bytes", "image/jpeg")),
+            Content::Data(DataContent::from_bytes(b"webp-bytes", "image/webp")),
+            Content::Data(DataContent::from_bytes(b"gif-bytes", "image/gif")),
+        ]
+    }
+
+    #[test]
+    fn every_universal_content_produces_a_gemini_part() {
+        for content in universal_content_samples() {
+            assert!(content.renders_on_every_provider(), "sample not universal");
+            let msg = Message::with_contents(Role::user(), vec![content.clone()]);
+            let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+            assert!(
+                !parts.is_empty(),
+                "core claims this renders everywhere but Gemini emits nothing: {content:?}"
+            );
+        }
+    }
+
+    // region: Gemini 3 thought_signature replay (upstream #7095)
+
+    #[test]
+    fn parse_response_captures_thought_signature_on_reasoning() {
+        let value = json!({
+            "candidates": [{ "content": { "parts": [
+                { "text": "thinking...", "thought": true, "thoughtSignature": "c2ln" },
+                { "functionCall": { "name": "get_weather", "args": { "city": "SF" } } },
+            ] } }]
+        });
+        let resp = parse_response(&value);
+        let contents = &resp.messages[0].contents;
+        match &contents[0] {
+            Content::TextReasoning(t) => {
+                assert_eq!(t.protected_data.as_deref(), Some("c2ln"));
+            }
+            other => panic!("expected reasoning content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_captures_a_signature_on_the_function_call_part() {
+        // Gemini 3's usual placement: the signature rides on the part carrying
+        // the call, not on a preceding thought part.
+        let value = json!({
+            "candidates": [{ "content": { "parts": [
+                {
+                    "functionCall": { "name": "get_weather", "args": { "city": "SF" } },
+                    "thoughtSignature": "c2ln"
+                },
+            ] } }]
+        });
+        let resp = parse_response(&value);
+        match &resp.messages[0].contents[0] {
+            Content::FunctionCall(fc) => {
+                assert_eq!(fc.protected_data.as_deref(), Some("c2ln"));
+            }
+            other => panic!("expected a function call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_call_replays_its_own_signature_without_any_reasoning_content() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(
+                FunctionCallContent::new("call_1", "get_weather", None)
+                    .with_protected_data(Some("c2ln".into())),
+            )],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    #[test]
+    fn a_calls_own_signature_wins_over_the_preceding_reasoning_one() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("from-reasoning".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(
+                    FunctionCallContent::new("call_1", "get_weather", None)
+                        .with_protected_data(Some("from-call".into())),
+                ),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("from-call"));
+    }
+
+    #[test]
+    fn a_round_trip_preserves_a_part_level_signature() {
+        // The whole point: parse a Gemini 3 tool-call response and replay it.
+        let value = json!({
+            "candidates": [{ "content": { "parts": [
+                {
+                    "functionCall": { "name": "get_weather", "args": {} },
+                    "thoughtSignature": "c2ln"
+                },
+            ] } }]
+        });
+        let resp = parse_response(&value);
+        let parts = message_contents_to_parts(&resp.messages[0].contents, &HashMap::new());
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    #[test]
+    fn reasoning_is_not_replayed_as_a_part_but_signs_the_next_call() {
+        // Gemini does not accept thought parts back; the signature it carries
+        // must instead ride on the function call that reasoning produced.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1, "reasoning must not be sent back as a part");
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+        assert_eq!(parts[0]["functionCall"]["name"], json!("get_weather"));
+    }
+
+    #[test]
+    fn a_signature_survives_a_later_unsigned_reasoning_part() {
+        // Gemini can return several adjacent thought parts with the signature
+        // on an earlier one. `parse_response` does not coalesce them, so an
+        // unsigned part that merely follows a signed one used to erase it.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "first".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::TextReasoning(TextReasoningContent {
+                    text: "second".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    #[test]
+    fn a_later_reasoning_signature_wins_over_an_earlier_one() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "first".into(),
+                    protected_data: Some("older".into()),
+                    ..Default::default()
+                }),
+                Content::TextReasoning(TextReasoningContent {
+                    text: "second".into(),
+                    protected_data: Some("newer".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts[0]["thoughtSignature"], json!("newer"));
+    }
+
+    #[test]
+    fn a_signature_only_applies_to_an_immediately_following_call() {
+        // Text between the reasoning and the call clears the pending signature,
+        // so a stale signature is never stamped onto an unrelated call.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::text("here goes"),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert!(parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn a_call_without_reasoning_carries_no_signature() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                "call_1",
+                "get_weather",
+                None,
+            ))],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].get("thoughtSignature").is_none());
+    }
+
     use agent_framework_core::tools::ApprovalMode;
 
     fn user(text: &str) -> Message {

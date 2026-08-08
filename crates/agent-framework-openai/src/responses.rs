@@ -730,6 +730,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                     text: String::new(),
                     annotations: None,
                     raw_representation: raw,
+                    protected_data: None,
                 }));
             } else {
                 let n = summaries.len();
@@ -738,6 +739,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                         text,
                         annotations: None,
                         raw_representation: (i == n - 1).then(|| raw.clone()).flatten(),
+                        protected_data: None,
                     }));
                 }
             }
@@ -926,6 +928,18 @@ fn parse_responses_usage(usage: &Value) -> UsageDetails {
             .insert("openai.cached_input_tokens".into(), cached);
         // Mirror upstream: also surface as the typed, cross-language field.
         details.cache_read_input_token_count = Some(cached);
+    }
+    // Cache *writes* are reported separately from cache reads. Absent when the
+    // provider does not report them (older API versions).
+    if let Some(cache_write) = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+    {
+        details
+            .additional_counts
+            .insert("openai.cache_write_tokens".into(), cache_write);
+        details.cache_creation_input_token_count = Some(cache_write);
     }
     if let Some(reasoning) = usage
         .get("output_tokens_details")
@@ -1264,6 +1278,36 @@ mod tests {
     }
 
     #[test]
+    fn responses_usage_parses_cache_write_tokens() {
+        // Cache *writes* are reported separately from cache reads (upstream #7369).
+        let d = parse_responses_usage(&json!({
+            "input_tokens": 2000,
+            "output_tokens": 60,
+            "total_tokens": 2060,
+            "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 1024 },
+        }));
+        assert_eq!(d.cache_creation_input_token_count, Some(1024));
+        assert_eq!(d.cache_read_input_token_count, Some(0));
+        assert_eq!(
+            d.additional_counts.get("openai.cache_write_tokens"),
+            Some(&1024)
+        );
+    }
+
+    #[test]
+    fn responses_usage_omits_cache_write_tokens_when_not_reported() {
+        let d = parse_responses_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": { "cached_tokens": 40 },
+        }));
+        assert_eq!(d.cache_creation_input_token_count, None);
+        assert!(!d
+            .additional_counts
+            .contains_key("openai.cache_write_tokens"));
+    }
+
+    #[test]
     fn build_body_extracts_leading_system_message_as_instructions() {
         let c = client();
         let messages = vec![Message::system("Be terse."), user("Hi")];
@@ -1560,6 +1604,7 @@ mod tests {
                 text: "just display".into(),
                 annotations: None,
                 raw_representation: None,
+                protected_data: None,
             })],
         );
         let input = messages_to_input(&[msg]);

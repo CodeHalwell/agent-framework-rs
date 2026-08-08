@@ -60,7 +60,7 @@ const BASELINE_ENV_NAMES: &[&str] = &[
 ///
 /// **Secure by default:** unless [`StdioEnv::inherit_parent_environment`] is
 /// enabled, the child does **not** inherit the parent process's environment.
-/// It starts from a minimal baseline allowlist ([`BASELINE_ENV_NAMES`] — PATH,
+/// It starts from a minimal baseline allowlist (`BASELINE_ENV_NAMES` — PATH,
 /// temp-dir, and locale variables) plus any explicitly configured variables.
 /// This follows least privilege: an MCP package launched through `npx`,
 /// `python`, or another package runner does not automatically receive unrelated

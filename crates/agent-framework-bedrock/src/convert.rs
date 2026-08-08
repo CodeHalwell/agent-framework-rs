@@ -17,8 +17,8 @@
 
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatOptions, ChatResponse, Content, FinishReason, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Message, Role, ToolMode, UsageDetails,
+    ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
+    FunctionCallContent, FunctionResultContent, Message, Role, ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -76,7 +76,12 @@ pub fn messages_to_bedrock(messages: &[Message]) -> (Option<Value>, Vec<Value>) 
         } else {
             "user"
         };
-        let blocks: Vec<Value> = msg.contents.iter().filter_map(content_to_block).collect();
+        let in_user_turn = role == "user";
+        let blocks: Vec<Value> = msg
+            .contents
+            .iter()
+            .filter_map(|c| content_to_block(c, in_user_turn))
+            .collect();
         if blocks.is_empty() {
             // Converse rejects a turn with an empty `content` array.
             continue;
@@ -150,13 +155,68 @@ fn normalize_role_alternation(turns: Vec<Value>) -> Vec<Value> {
 /// Map a single [`Content`] item to a Converse content block, or `None` for
 /// a variant Converse has no representation for (skipped, mirroring the
 /// other non-OpenAI-shaped providers in this workspace).
-fn content_to_block(content: &Content) -> Option<Value> {
+fn content_to_block(content: &Content, in_user_turn: bool) -> Option<Value> {
     match content {
         Content::Text(t) => Some(json!({ "text": t.text })),
         Content::FunctionCall(fc) => Some(tool_use_block(fc)),
         Content::FunctionResult(fr) => Some(tool_result_block(fr)),
+        // Converse accepts image blocks only inside `user` turns; emitting one
+        // in an `assistant` turn fails the whole request rather than dropping
+        // the block, so assistant-authored image content is skipped like other
+        // unmappable content.
+        Content::Data(dc) if in_user_turn => image_block_from_data(dc),
+        // `Content::Uri` has no Converse mapping: image sources are inline
+        // `bytes` or an S3 location — there is no remote-URL source — so a
+        // hosted image reference cannot be rendered here.
         _ => None,
     }
+}
+
+/// Build a Converse `{"image": {...}}` block from inline image data.
+///
+/// Converse accepts exactly four formats (`png`, `jpeg`, `gif`, `webp`) with
+/// the payload as base64 `bytes` — which the data URI already carries, so the
+/// payload is sliced straight out rather than decoded and re-encoded. Anything
+/// else (non-image media, unsupported image formats, malformed URIs) is
+/// dropped, matching this converter's treatment of other unmappable content.
+fn image_block_from_data(dc: &DataContent) -> Option<Value> {
+    let (parsed_media_type, data) = split_data_uri(&dc.uri)?;
+    let media_type = dc.media_type.as_deref().unwrap_or(&parsed_media_type);
+    let format = converse_image_format(media_type)?;
+    Some(json!({
+        "image": {
+            "format": format,
+            "source": { "bytes": data },
+        }
+    }))
+}
+
+/// The Converse `format` value for an image media type, or `None` when
+/// Converse does not accept it.
+fn converse_image_format(media_type: &str) -> Option<&'static str> {
+    match media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpeg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// Split a `data:` URI into its media type and (still-base64) payload.
+fn split_data_uri(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    let media_type = media_type.split(';').next().unwrap_or(media_type);
+    Some((media_type.to_string(), data.to_string()))
 }
 
 /// Build a `{"toolUse": {...}}` block from a [`FunctionCallContent`].
@@ -375,6 +435,68 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The canonical samples the core contract claims render on every
+    /// provider. If this converter stops emitting one of them, the failure
+    /// belongs here — next to the converter — not in compaction.
+    fn universal_content_samples() -> Vec<Content> {
+        use agent_framework_core::types::{
+            DataContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+        };
+        vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new(
+                "contract_call_1",
+                "get_weather",
+                Some(FunctionArguments::Raw("{\"city\":\"SF\"}".into())),
+            )),
+            Content::FunctionResult(FunctionResultContent::new(
+                "contract_call_1",
+                Some(serde_json::json!("sunny")),
+            )),
+            Content::Data(DataContent::from_bytes(b"png-bytes", "image/png")),
+            Content::Data(DataContent::from_bytes(b"jpeg-bytes", "image/jpeg")),
+            Content::Data(DataContent::from_bytes(b"webp-bytes", "image/webp")),
+            Content::Data(DataContent::from_bytes(b"gif-bytes", "image/gif")),
+        ]
+    }
+
+    #[test]
+    fn every_universal_content_produces_a_converse_block() {
+        for content in universal_content_samples() {
+            assert!(content.renders_on_every_provider(), "sample not universal");
+            assert!(
+                content_to_block(&content, true).is_some(),
+                "core claims this renders everywhere but Converse emits nothing: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_assistant_turn_never_carries_an_image_block() {
+        // Converse rejects the whole request for an assistant image block —
+        // worse than dropping it — so assistant-authored image data is skipped.
+        let image = Content::Data(agent_framework_core::types::DataContent::from_bytes(
+            b"png",
+            "image/png",
+        ));
+        assert!(content_to_block(&image, false).is_none());
+        assert!(content_to_block(&image, true).is_some());
+    }
+
+    #[test]
+    fn a_remote_image_uri_still_has_no_converse_block() {
+        // Pins the reason `Content::Uri` is excluded from the universal
+        // contract. If Converse gains a remote-URL source and this arm is
+        // added, widen `Content::renders_on_every_provider` to match.
+        let uri = Content::Uri(agent_framework_core::types::UriContent {
+            uri: "https://example.com/a.png".into(),
+            media_type: "image/png".into(),
+        });
+        assert!(content_to_block(&uri, true).is_none());
+        assert!(!uri.renders_on_every_provider());
+    }
+
     use agent_framework_core::tools::ApprovalMode;
     use agent_framework_core::types::FunctionArguments;
     use std::collections::HashMap;

@@ -150,6 +150,43 @@ where
     (format!("http://{addr}"), handle)
 }
 
+/// Serve `n` sequential requests on one ephemeral port, returning each captured
+/// request in arrival order. Needed for the retrieval fan-out, which issues one
+/// request per configured scope.
+fn serve_n<F>(n: usize, respond: F) -> (String, std::thread::JoinHandle<Vec<CapturedRequest>>)
+where
+    F: Fn(&mut TcpStream, &CapturedRequest) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut stream = accept_with_timeout(&listener);
+            let request = read_http_request(&mut stream);
+            respond(&mut stream, &request);
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// The single scope key a search request filters on (`user_id` / `agent_id` /
+/// `app_id`), ignoring `run_id`. Lets a mock answer based on *content* rather
+/// than arrival position — the fan-out is concurrent, so arrival order is
+/// nondeterministic and any assertion keyed on it is flaky.
+fn scope_of(request: &CapturedRequest) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    body["filters"]
+        .as_object()
+        .expect("filters object")
+        .keys()
+        .find(|k| *k != "run_id")
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[tokio::test]
 async fn after_run_posts_to_v1_memories_with_body_and_auth_header() {
     let (base_url, handle) = serve_one(|stream| {
@@ -230,7 +267,8 @@ async fn before_run_posts_to_v2_search_and_injects_hits_into_ctx_messages() {
 
     let provider = Mem0Provider::new("test-api-key")
         .with_api_base(base_url)
-        .with_user_id("user-42");
+        .with_user_id("user-42")
+        .with_search_user_id("user-42");
 
     let mut ctx = SessionContext::new(vec![Message::user("What's the weather like where I live?")]);
     provider.before_run(&mut ctx).await.unwrap();
@@ -265,7 +303,8 @@ async fn before_run_handles_results_wrapper_response_shape() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_agent_id("agent-1");
+        .with_agent_id("agent-1")
+        .with_search_agent_id("agent-1");
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages[0]
@@ -281,7 +320,8 @@ async fn before_run_empty_results_injects_no_messages() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
     assert!(ctx.messages.is_empty());
@@ -300,7 +340,8 @@ async fn before_run_surfaces_non_2xx_status_as_service_error() {
 
     let provider = Mem0Provider::new("bad-key")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hi")]);
     let err = provider.before_run(&mut ctx).await.unwrap_err();
     let msg = err.to_string();
@@ -321,7 +362,8 @@ async fn after_run_surfaces_non_2xx_status_as_service_error() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let err = provider
         .after_run(&[Message::user("hi")], &[], None)
         .await
@@ -348,7 +390,8 @@ async fn before_run_surfaces_malformed_json_response_as_error() {
 
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
-        .with_user_id("u1");
+        .with_user_id("u1")
+        .with_search_user_id("u1");
     let mut ctx = SessionContext::new(vec![Message::user("hi")]);
     let err = provider.before_run(&mut ctx).await.unwrap_err();
     assert!(err.to_string().contains("invalid Mem0 API response JSON"));
@@ -363,7 +406,8 @@ async fn before_run_scopes_search_to_agent_and_run_id() {
     let provider = Mem0Provider::new("k")
         .with_api_base(base_url)
         .with_agent_id("agent-1")
-        .with_thread_id("thread-1");
+        .with_thread_id("thread-1")
+        .with_search_agent_id("agent-1");
 
     let mut ctx = SessionContext::new(vec![Message::user("hello")]);
     provider.before_run(&mut ctx).await.unwrap();
@@ -373,5 +417,232 @@ async fn before_run_scopes_search_to_agent_and_run_id() {
     assert_eq!(
         body["filters"],
         json!({"agent_id": "agent-1", "run_id": "thread-1"})
+    );
+}
+
+// region: storage vs. retrieval scope isolation (upstream #7531)
+
+#[tokio::test]
+async fn before_run_retrieves_nothing_without_a_retrieval_scope() {
+    // The storage scope must not double as the retrieval scope: a provider
+    // configured with a shared agent_id would otherwise read back memories
+    // written by every user of that agent. No search scope => no request at
+    // all, so no server is started here — a request would fail to connect.
+    let provider = Mem0Provider::new("k")
+        .with_api_base("http://127.0.0.1:1".to_string())
+        .with_user_id("u1")
+        .with_agent_id("shared-agent");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    assert!(ctx.messages.is_empty());
+}
+
+#[tokio::test]
+async fn before_run_searches_the_retrieval_scope_not_the_storage_scope() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": [{"memory": "m"}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("storage-user")
+        .with_agent_id("storage-agent")
+        .with_search_user_id("retrieval-user");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["filters"]["user_id"], json!("retrieval-user"));
+    // The storage-only agent scope must not widen the search.
+    assert!(body["filters"].get("agent_id").is_none());
+}
+
+#[tokio::test]
+async fn application_id_scopes_a_search_only_as_a_fallback() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": []}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        // A storage scope is still required (the provider validates it for
+        // writes); the search must key off the *search* application id.
+        .with_application_id("app-1")
+        .with_search_application_id("app-1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["filters"]["app_id"], json!("app-1"));
+}
+
+// region: retrieval scopes are queried independently (PR #12 review)
+
+#[tokio::test]
+async fn user_and_agent_scopes_are_queried_independently_and_merged() {
+    // Mem0 ANDs the entries of a single filters object, so packing user_id and
+    // agent_id into one request asks for memories tagged with *both* — silently
+    // dropping the agent-wide memories written by other users that
+    // search_agent_id exists to retrieve.
+    // Keyed on the requested scope, not arrival order.
+    let (base_url, handle) = serve_n(2, |stream, request| {
+        let memory = match scope_of(request).as_str() {
+            "user_id" => "user memory",
+            _ => "agent memory",
+        };
+        write_json_response(stream, &json!({"results": [{"memory": memory}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("u1")
+        .with_search_user_id("u1")
+        .with_search_agent_id("shared-agent");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests.len(), 2, "each scope must get its own request");
+
+    let filters: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            body["filters"].clone()
+        })
+        .collect();
+    // Compared as a set — arrival order is not part of the contract.
+    let mut filters = filters;
+    filters.sort_by_key(|f| f.to_string());
+    let mut expected = vec![
+        json!({"user_id": "u1"}),
+        json!({"agent_id": "shared-agent"}),
+    ];
+    expected.sort_by_key(|f| f.to_string());
+    assert_eq!(filters, expected);
+
+    // Both partitions' memories reach the model.
+    let injected = ctx.messages[0].text();
+    assert!(injected.contains("user memory"), "got {injected:?}");
+    assert!(injected.contains("agent memory"), "got {injected:?}");
+}
+
+#[tokio::test]
+async fn duplicate_memories_across_scopes_are_merged_once() {
+    let (base_url, handle) = serve_n(2, |stream, _request| {
+        write_json_response(stream, &json!({"results": [{"memory": "shared"}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("u1")
+        .with_search_user_id("u1")
+        .with_search_agent_id("a1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    handle.join().expect("server thread panicked");
+
+    let injected = ctx.messages[0].text();
+    assert_eq!(injected.matches("shared").count(), 1, "got {injected:?}");
+}
+
+#[tokio::test]
+async fn one_failing_scope_does_not_lose_the_other_scopes_memories() {
+    // Fail the user scope specifically, not "whichever arrives first".
+    let (base_url, handle) = serve_n(2, |stream, request| {
+        if scope_of(request) == "user_id" {
+            write_status_response(
+                stream,
+                500,
+                "Internal Server Error",
+                &json!({"error": "boom"}),
+            );
+        } else {
+            write_json_response(stream, &json!({"results": [{"memory": "agent memory"}]}));
+        }
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("u1")
+        .with_search_user_id("u1")
+        .with_search_agent_id("a1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    handle.join().expect("server thread panicked");
+
+    assert!(ctx.messages[0].text().contains("agent memory"));
+}
+
+#[tokio::test]
+async fn every_scope_failing_surfaces_the_error() {
+    // An empty result here would be indistinguishable from "this user has no
+    // memories", so a total failure must not be swallowed.
+    let (base_url, handle) = serve_n(2, |stream, _request| {
+        write_status_response(
+            stream,
+            500,
+            "Internal Server Error",
+            &json!({"error": "boom"}),
+        );
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_user_id("u1")
+        .with_search_user_id("u1")
+        .with_search_agent_id("a1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    let err = provider.before_run(&mut ctx).await.unwrap_err();
+    handle.join().expect("server thread panicked");
+    assert!(format!("{err}").contains("500"), "got {err}");
+}
+
+#[tokio::test]
+async fn a_thread_only_provider_still_retrieves_its_conversations_memories() {
+    // Regression: the scope separation's early return fired before the run id
+    // was considered, so a provider configured solely with a thread id — a
+    // supported, conversation-local configuration — never issued a search.
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": [{"memory": "thread memory"}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_thread_id("thread-1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(
+        body["filters"],
+        json!({"run_id": "thread-1"}),
+        "run id alone is the scope, exactly once"
+    );
+    assert!(ctx.messages[0].text().contains("thread memory"));
+}
+
+#[tokio::test]
+async fn a_thread_id_beside_an_entity_scope_rides_along_not_alone() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": []}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_thread_id("thread-1")
+        .with_user_id("u1")
+        .with_search_user_id("u1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(
+        body["filters"],
+        json!({"user_id": "u1", "run_id": "thread-1"})
     );
 }
