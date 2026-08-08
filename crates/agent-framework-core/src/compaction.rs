@@ -336,7 +336,11 @@ impl CompactionStrategy for SelectiveToolResult {
 /// Note this *drops* an unmatched call rather than replacing it with a summary
 /// the way upstream's `ToolResultCompactionStrategy` does; this port has no
 /// LLM-summarizing compaction strategy to build that summary with.
-fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> Vec<Message> {
+fn drop_orphaned_tool_exchanges(
+    messages: &mut Vec<Message>,
+    origins: &mut Vec<Option<usize>>,
+    pending: &[Message],
+) {
     use std::collections::HashSet;
 
     // Pair by *occurrence*, not by id membership. Call ids are not guaranteed
@@ -368,29 +372,37 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> 
         })
     });
     if !has_orphan {
-        return messages;
+        return;
     }
 
-    let mut out = Vec::with_capacity(messages.len());
-    for (mi, mut message) in messages.into_iter().enumerate() {
+    // Rebuilt in place, with `origins` kept index-aligned: a dropped message
+    // must drop its recovered position too, or every later ordering decision
+    // reads the wrong one.
+    let mut mi = 0;
+    let mut kept = 0;
+    messages.retain_mut(|message| {
+        let this = mi;
+        mi += 1;
         let had_contents = !message.contents.is_empty();
         let mut ci = 0;
         message.contents.retain(|content| {
             let keep = !matches!(
                 content,
                 Content::FunctionCall(_) | Content::FunctionResult(_)
-            ) || paired.contains(&(mi, ci));
+            ) || paired.contains(&(this, ci));
             ci += 1;
             keep
         });
         // A message that carried only an orphaned half is dropped outright; one
         // that was already empty is left alone (not this pass's business).
-        if had_contents && message.contents.is_empty() {
-            continue;
+        let keep_message = !(had_contents && message.contents.is_empty());
+        if keep_message {
+            origins.swap(kept, this);
+            kept += 1;
         }
-        out.push(message);
-    }
-    out
+        keep_message
+    });
+    origins.truncate(kept);
 }
 
 /// Ensure compaction never reduces a conversation to system messages alone.
@@ -406,7 +418,11 @@ fn drop_orphaned_tool_exchanges(messages: Vec<Message>, pending: &[Message]) -> 
 /// reinstated, since its counterpart is by definition not in the retained set —
 /// so this can never manufacture the orphan
 /// [`drop_orphaned_tool_exchanges`] exists to remove.
-fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -> Vec<Message> {
+fn ensure_non_system_message(
+    original: &[Message],
+    mut retained: Vec<Message>,
+    origins: &[Option<usize>],
+) -> Vec<Message> {
     // A non-system message that renders nothing does not satisfy this: the
     // orphan repair can strip a message down to reasoning alone, which reaches
     // the model as nothing and leaves the request effectively system-only.
@@ -447,7 +463,7 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
             (!candidate.contents.is_empty()).then_some((index, candidate))
         });
     if let Some((index, plain)) = plain {
-        let position = chronological_position(&retained, original, index);
+        let position = chronological_position(origins, index);
         retained.insert(position, plain);
         return retained;
     }
@@ -457,7 +473,7 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     // latest *complete* exchange instead: both halves together are valid, and
     // they give the model something to answer.
     if let Some((origin_index, exchange)) = latest_complete_tool_exchange(original) {
-        let position = chronological_position(&retained, original, origin_index);
+        let position = chronological_position(origins, origin_index);
         for (offset, message) in exchange.into_iter().enumerate() {
             retained.insert(position + offset, message);
         }
@@ -518,36 +534,20 @@ fn pair_tool_exchanges<'a>(
     (pairs, leftover)
 }
 
-/// The index in `retained` at which content originating at `origin_index` in
-/// `original` belongs chronologically.
+/// Recover each retained message's position in `original`.
 ///
-/// Appending unconditionally reverses the conversation when the retained set
-/// holds a *newer* message that failed the rendering check: with
-/// `[user("old"), assistant(reasoning)]` the reasoning is kept and the old user
-/// turn lands after it, so a provider that does render reasoning (Anthropic)
-/// sees a stale request as the latest turn and can answer it a second time.
+/// Called **before** anything mutates the retained values. The orphan repair
+/// strips contents from a message, after which it no longer equals its
+/// original, so recovering positions afterwards silently fails to match and
+/// every downstream ordering decision falls back to appending.
 ///
-/// `retained` is a subsequence of `original` for every strategy in this module,
-/// so positions are recovered by matching the two. A strategy that rewrites
-/// messages rather than selecting them breaks that match, and the result is
-/// `retained.len()` — appending, the best available without an origin to
-/// compare against.
-///
-/// Both fallback paths go through this. They previously did not: only the
-/// plain-content one was made chronological, and the complete-exchange one kept
-/// appending.
-fn chronological_position(
-    retained: &[Message],
-    original: &[Message],
-    origin_index: usize,
-) -> usize {
-    // Assign each retained message an original position, matching from the end
-    // backwards. Equal messages recur — two identical reasoning steps around an
-    // older user turn, say — and a forward greedy match aliases a retained
-    // *later* occurrence to the earlier duplicate, concluding it is older than
-    // the fallback and appending after it. Matching from the end assigns the
-    // latest position consistent with order, which is the one a suffix-retaining
-    // strategy actually kept.
+/// Matching runs from the end backwards. Equal messages recur — two identical
+/// reasoning steps around an older user turn, say — and a forward greedy match
+/// aliases a retained *later* occurrence to the earlier duplicate. Matching from
+/// the end assigns the latest position consistent with order, which is the one a
+/// suffix-retaining strategy actually kept. A strategy that rewrites messages
+/// rather than selecting them matches nothing, and those entries stay `None`.
+fn origin_indices(retained: &[Message], original: &[Message]) -> Vec<Option<usize>> {
     let mut assigned: Vec<Option<usize>> = vec![None; retained.len()];
     let mut limit = original.len();
     for index in (0..retained.len()).rev() {
@@ -563,9 +563,23 @@ fn chronological_position(
         }
     }
     assigned
+}
+
+/// The index at which content originating at `origin_index` belongs
+/// chronologically, given the retained set's recovered `origins`.
+///
+/// Appending unconditionally reverses the conversation when the retained set
+/// holds a *newer* message that failed the rendering check: with
+/// `[user("old"), assistant(reasoning)]` the reasoning is kept and the old user
+/// turn lands after it, so a provider that does render reasoning (Anthropic)
+/// sees a stale request as the latest turn and can answer it a second time.
+///
+/// Both fallback paths go through this; they previously did not.
+fn chronological_position(origins: &[Option<usize>], origin_index: usize) -> usize {
+    origins
         .iter()
         .position(|slot| matches!(slot, Some(index) if *index > origin_index))
-        .unwrap_or(retained.len())
+        .unwrap_or(origins.len())
 }
 
 /// The most recent complete call/result pair, as one or two messages reduced to
@@ -695,9 +709,10 @@ fn reduced_to(message: &Message, keep: &[usize]) -> Message {
 /// messages, which keeps it ahead of the `pending` result that follows.
 fn reinstate_calls_answered_by_pending(
     original: &[Message],
-    mut retained: Vec<Message>,
+    retained: &mut Vec<Message>,
+    origins: &mut Vec<Option<usize>>,
     pending: &[Message],
-) -> Vec<Message> {
+) {
     // Only results that `pending` does not answer *itself*. A run's input can
     // carry a complete exchange of its own, and it may reuse an id that an
     // older unanswered call also used. Counting every result would reinstate
@@ -706,7 +721,7 @@ fn reinstate_calls_answered_by_pending(
     // invalid exchange assembled out of two valid halves.
     let mut wanted = unanswered_result_counts(pending);
     if wanted.is_empty() {
-        return retained;
+        return;
     }
     // Which of the original's unanswered calls does `retained` already supply?
     // Compared by *content*, not counted by id: a strategy may retain an older
@@ -743,12 +758,25 @@ fn reinstate_calls_answered_by_pending(
         *count -= 1;
         chosen.push(site);
     }
-    // Append in original order so several recovered calls keep their sequence.
+    // Append in original order so several recovered calls keep their sequence,
+    // and group by source message: parallel calls declared together in one
+    // assistant turn must be reinstated as *one* message. Splitting them into
+    // `assistant(c1), assistant(c2)` puts an assistant turn between the
+    // declaration and the results, which provider tool protocols reject — the
+    // results must answer the single turn that declared both.
     chosen.sort_unstable();
-    for (mi, ci) in chosen {
-        retained.push(reduced_call_with_signature(&original[mi], ci, &[]));
+    let mut index = 0;
+    while index < chosen.len() {
+        let (mi, _) = chosen[index];
+        let mut group = Vec::new();
+        while index < chosen.len() && chosen[index].0 == mi {
+            group.push(chosen[index].1);
+            index += 1;
+        }
+        let (first, rest) = group.split_first().expect("a group has at least one call");
+        retained.push(reduced_call_with_signature(&original[mi], *first, rest));
+        origins.push(Some(mi));
     }
-    retained
 }
 
 /// The replay signature of the reasoning content immediately preceding the
@@ -820,8 +848,11 @@ fn finalize_compaction(
     retained: Vec<Message>,
     pending: &[Message],
 ) -> Vec<Message> {
-    let retained = reinstate_calls_answered_by_pending(original, retained, pending);
-    let retained = drop_orphaned_tool_exchanges(retained, pending);
+    // Recovered once, before the repair rewrites any retained message.
+    let mut origins = origin_indices(&retained, original);
+    let mut retained = retained;
+    reinstate_calls_answered_by_pending(original, &mut retained, &mut origins, pending);
+    drop_orphaned_tool_exchanges(&mut retained, &mut origins, pending);
     // A non-system message in `pending` gives the model something to answer —
     // but only if it actually reaches the provider. An input carrying just an
     // audio attachment (dropped by Anthropic) or a hosted-file reference
@@ -834,7 +865,7 @@ fn finalize_compaction(
     {
         return retained;
     }
-    ensure_non_system_message(original, retained)
+    ensure_non_system_message(original, retained, &origins)
 }
 
 /// Compact `messages` with `strategy` and `tokenizer`.
@@ -2039,6 +2070,79 @@ mod tests {
         assert!(
             call_at < result_at && result_at < reasoning_at,
             "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_reinstated_calls_stay_in_one_message() {
+        // Two calls declared together in one assistant turn. Reinstating them
+        // as separate messages puts an assistant turn between the declaration
+        // and the results, which provider tool protocols reject.
+        let parallel = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c1",
+                    "get_weather",
+                    None,
+                )),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "c2", "get_time", None,
+                )),
+            ],
+        );
+        let history = vec![parallel];
+        let input = vec![
+            tool_result_message("c1", "sunny"),
+            tool_result_message("c2", "noon"),
+        ];
+        let retained = SlidingWindow::new(0).compact(&history, &ApproxTokenizer);
+        let out = finalize_compaction(&history, retained, &input);
+
+        let with_calls: Vec<&Message> = out
+            .iter()
+            .filter(|m| {
+                m.contents
+                    .iter()
+                    .any(|c| matches!(c, Content::FunctionCall(_)))
+            })
+            .collect();
+        assert_eq!(
+            with_calls.len(),
+            1,
+            "both calls must be reinstated in one message, got {out:?}"
+        );
+        assert_eq!(with_calls[0].contents.len(), 2);
+    }
+
+    #[test]
+    fn chronology_survives_the_orphan_repair_rewriting_a_message() {
+        // The repair strips the orphaned call, so the retained message no longer
+        // equals its original. Recovering positions by equality *after* that
+        // matched nothing and the older fallback was appended, putting a stale
+        // user turn last for providers that render reasoning.
+        let newer = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "newer thinking".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(crate::types::FunctionCallContent::new(
+                    "orphan",
+                    "get_weather",
+                    None,
+                )),
+            ],
+        );
+        let messages = vec![text(Role::user(), "old question"), newer];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].text(),
+            "old question",
+            "the fallback must precede the retained (rewritten) message, got {out:?}"
         );
     }
 
