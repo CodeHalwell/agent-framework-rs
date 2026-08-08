@@ -157,6 +157,22 @@ pub struct TextReasoningContent {
     pub protected_data: Option<String>,
 }
 
+/// Whether `media_type` names an image every converter can carry: the
+/// intersection is Bedrock Converse's format set. Parameters after `;` are
+/// ignored.
+fn is_universal_image_media_type(media_type: &str) -> bool {
+    matches!(
+        media_type
+            .split(';')
+            .next()
+            .unwrap_or(media_type)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+    )
+}
+
 /// Inline binary data encoded as a `data:` URI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataContent {
@@ -609,6 +625,48 @@ impl Content {
     }
 
     /// The text of this item, if it is text or reasoning content.
+    /// Whether this content reaches the model on **every** chat converter this
+    /// workspace ships.
+    ///
+    /// This is the contract compaction's minimum-retention logic depends on: a
+    /// retained message "counts" only if it will still be there after the
+    /// narrowest converter has had its say. The narrowest converter defines
+    /// each row, and the evidence is pinned by contract tests in the provider
+    /// crates themselves, so a converter change that invalidates a row fails a
+    /// test next to the converter rather than surfacing as a compaction bug:
+    ///
+    /// * `Text`, `FunctionCall`, `FunctionResult` — mapped by every converter.
+    /// * `Data` — only a valid `data:` URI carrying an image in a format
+    ///   Bedrock's Converse API accepts (`png`/`jpeg`/`gif`/`webp`, the
+    ///   narrowest image set in the workspace; Anthropic requires images too).
+    ///   The URI is validated even when `media_type` is set: declaring a type
+    ///   is not the same as carrying one, and Anthropic/Gemini parse the URI
+    ///   before emitting anything.
+    /// * `Uri` — never. Bedrock's Converse has no remote-URL image source
+    ///   (inline bytes or S3 only), so a hosted image reference renders
+    ///   nowhere there.
+    /// * `TextReasoning` — provider-dependent (Anthropic renders it, Gemini
+    ///   and OpenAI Chat Completions drop it), so it does not qualify.
+    /// * Everything else (hosted tool artifacts, approvals, `Unknown`, ...) —
+    ///   provider-specific at best.
+    ///
+    /// The check errs conservative on purpose: callers use it to decide
+    /// whether a fallback turn must be *added*, and nothing is ever removed on
+    /// its strength, so under-claiming costs a possibly-redundant message
+    /// while over-claiming produces an effectively empty request.
+    pub fn renders_on_every_provider(&self) -> bool {
+        match self {
+            Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_) => true,
+            Content::Data(dc) => match DataContent::media_type_from_uri(&dc.uri) {
+                Ok(parsed) => is_universal_image_media_type(
+                    dc.media_type.as_deref().unwrap_or(parsed.as_str()),
+                ),
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Content::Text(t) => Some(&t.text),

@@ -34,7 +34,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::memory::{ContextProvider, SessionContext};
-use crate::types::{Content, DataContent, Message, Role};
+use crate::types::{Content, Message, Role};
 
 /// Counts tokens for a piece of text. Rust equivalent of upstream
 /// `TokenizerProtocol`.
@@ -612,75 +612,14 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Option<(usize, Vec<Mes
     Some((call_mi, messages))
 }
 
-/// Whether this content reaches the model on **every** provider this workspace
-/// targets.
-///
-/// Reasoning is the only variant that does not, and it is genuinely
-/// provider-dependent rather than universally dropped — an earlier version of
-/// this comment claimed otherwise and was wrong:
-///
-/// * **Anthropic** emits any reasoning content as a `thinking` block.
-/// * **OpenAI Responses** replays a preserved item verbatim when
-///   [`TextReasoningContent::raw_representation`] is set, and drops
-///   summary-only reasoning.
-/// * **Gemini** deliberately skips reasoning parts entirely, and the **OpenAI
-///   Chat Completions** converter has no mapping for them.
-///
-/// So this deliberately answers the *conservative* question — "would this still
-/// be there on the provider that renders the least?" — because the callers use
-/// it to decide whether a retained set needs a fallback turn added. Being
-/// conservative only ever appends a possibly-redundant message; being
-/// optimistic would let a Gemini request go out with nothing for the model to
-/// act on. Nothing is ever removed on the strength of this predicate, so a
-/// provider that *does* render reasoning keeps it either way.
-///
-/// [`TextReasoningContent::raw_representation`]: crate::types::TextReasoningContent::raw_representation
+/// See [`Content::renders_on_every_provider`] — the contract lives on
+/// `Content`, next to the type the converters consume, and is pinned by
+/// contract tests in the provider crates. This module used to define it
+/// locally and mis-derived it three times (variant-level, then
+/// media-type-level, then trusting a declared type over the payload); it now
+/// only asks.
 fn renders_on_every_provider(content: &Content) -> bool {
-    // An explicit allowlist, deliberately not `!matches!(...)` over the few
-    // known-inert variants. `Content` has 25 of them, and a negative list
-    // silently classifies each *new* variant — and every one nobody thought
-    // about — as universally renderable. That is how `HostedFile` and the
-    // hosted tool-call variants came to count as usable content here.
-    //
-    // Only three qualify unconditionally. `Data` and `Uri` look like they
-    // should, and Gemini and OpenAI do map them, but Anthropic renders only
-    // *images*: `image_block_from_data` and `image_block_from_uri` return
-    // `None` for anything else, so an audio attachment or a non-image URI is
-    // dropped there. Whether they render is a property of the payload, not the
-    // variant, and this predicate answers a variant-level question — so they
-    // are excluded rather than media-type-analysed here. The cost is only a
-    // possibly-redundant fallback message; see the doc comment above.
-    match content {
-        Content::Text(_) | Content::FunctionCall(_) | Content::FunctionResult(_) => true,
-        // Images do render everywhere — Anthropic accepts them, Gemini emits
-        // `inlineData`/`fileData`, and both OpenAI converters map them — so
-        // excluding all media was too blunt. It is not free either: the
-        // fallback then appends a stale turn, changing the prompt and
-        // defeating the window the caller asked for. Other media stays out:
-        // Anthropic's `image_block_from_*` return `None` for anything else.
-        // The URI is validated even when an explicit media type is present:
-        // both Anthropic and Gemini parse the data URI before emitting
-        // anything and drop the content when it does not, so
-        // `media_type: Some("image/png")` on a malformed URI renders nowhere.
-        // Declaring a type is not the same as carrying one.
-        Content::Data(dc) => match DataContent::media_type_from_uri(&dc.uri) {
-            Ok(parsed) => is_image_media_type(dc.media_type.as_deref().unwrap_or(&parsed)),
-            Err(_) => false,
-        },
-        Content::Uri(uc) => is_image_media_type(&uc.media_type),
-        _ => false,
-    }
-}
-
-/// Whether `media_type` names an image, ignoring any parameters after `;`.
-fn is_image_media_type(media_type: &str) -> bool {
-    media_type
-        .split(';')
-        .next()
-        .unwrap_or(media_type)
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("image/")
+    content.renders_on_every_provider()
 }
 
 /// Clone `message` keeping the function call at `call_ci` (plus any
@@ -2202,7 +2141,10 @@ mod tests {
     }
 
     #[test]
-    fn an_image_uri_turn_also_satisfies_it() {
+    fn a_remote_image_uri_does_not_satisfy_retention() {
+        // Bedrock's Converse API has no remote-URL image source (inline bytes
+        // or S3 only), so a hosted image reference renders nowhere there — a
+        // Uri turn is not universal even when it names an image.
         let messages = vec![
             text(Role::system(), "sys"),
             text(Role::user(), "an older turn"),
@@ -2215,7 +2157,34 @@ mod tests {
             ),
         ];
         let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
-        assert_eq!(out.len(), 2, "no fallback should be added, got {out:?}");
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+            "expected the real turn restored, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_format_outside_the_universal_set_does_not_satisfy_retention() {
+        // The floor is Bedrock's format set (png/jpeg/gif/webp); an SVG is an
+        // image but renders nowhere on Converse.
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "an older turn"),
+            Message::with_contents(
+                Role::user(),
+                vec![Content::Data(crate::types::DataContent::from_bytes(
+                    b"<svg/>",
+                    "image/svg+xml",
+                ))],
+            ),
+        ];
+        let out = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert!(
+            out.iter().any(|m| m.role != Role::system()
+                && m.contents.iter().any(|c| matches!(c, Content::Text(_)))),
+            "expected the real turn restored, got {out:?}"
+        );
     }
 
     #[test]

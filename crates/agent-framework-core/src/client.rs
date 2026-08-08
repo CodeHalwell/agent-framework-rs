@@ -343,9 +343,9 @@ fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalRespo
 /// `_replace_approval_contents_with_results`.
 ///
 /// * A [`FunctionApprovalRequestContent`] becomes its embedded
-///   [`FunctionCallContent`], unless an unanswered copy of that call already
-///   exists in *any* message (a duplicate), in which case the request is
-///   removed instead.
+///   [`FunctionCallContent`], unless an equal call is *outstanding at that
+///   point in the conversation* (a replayed duplicate), in which case the
+///   request is removed instead.
 /// * An approved [`FunctionApprovalResponseContent`] becomes the corresponding
 ///   result (correlated strictly by call id) and the message role becomes
 ///   `tool`.
@@ -355,42 +355,39 @@ fn replace_approval_contents_with_results(
     messages: &mut [Message],
     approved_results: &HashMap<String, FunctionResultContent>,
 ) {
-    // Collect ids that still have an *unanswered* call, across every message —
-    // not just the one being scanned. A function call and its approval request
-    // are frequently carried in separate messages (a hosting layer replaying
-    // them as separate items on an approval round trip does exactly this), so a
-    // per-message check never fires: the request restores a second copy of the
-    // call, only one copy receives the result, and the provider rejects the
-    // orphan ("No tool output found for function call ..."). Mirrors upstream's
-    // fix in `_replace_approval_contents_with_results` (#7267).
-    //
-    // Matched per occurrence *and* per invocation, not by id membership. Call
-    // ids are not guaranteed unique — reusing one for a later invocation is
-    // supported — so the decision needs the call itself, not its id: a fresh
-    // request whose call differs in name or arguments is a different
-    // invocation, and suppressing it as a duplicate drops the new call while
-    // its approval response still executes, attaching that result to the older
-    // call on the wire.
-    let mut unanswered_calls: Vec<FunctionCallContent> = {
-        let mut by_id: std::collections::HashMap<&str, Vec<&FunctionCallContent>> =
-            std::collections::HashMap::new();
-        for content in messages.iter().flat_map(|m| m.contents.iter()) {
-            match content {
-                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
-                    by_id.entry(fc.call_id.as_str()).or_default().push(fc);
-                }
-                Content::FunctionResult(fr) if !fr.call_id.is_empty() => {
-                    // Nearest preceding outstanding call, matching the rule the
-                    // compaction module settled on.
-                    if let Some(calls) = by_id.get_mut(fr.call_id.as_str()) {
-                        calls.pop();
-                    }
-                }
-                _ => {}
-            }
+    /// A call currently awaiting its result. `from_request` marks entries that
+    /// exist because an approval request expanded, so a *real* copy of the same
+    /// call arriving later is recognized as the duplicate instead.
+    struct Outstanding {
+        call: FunctionCallContent,
+        from_request: bool,
+    }
+
+    // One ordered walk. The outstanding-call set is *derived* as the walk
+    // decides each content — a call becomes outstanding when its (kept)
+    // declaration passes by, and stops being outstanding when the content that
+    // answers it passes by. Three earlier revisions instead maintained this
+    // set as separate bookkeeping around a whole-list pre-scan, and every one
+    // was wrong the same way: some site updated the mirror on an event that
+    // does not change what is outstanding, or missed one that does. A
+    // pre-scan is also order-blind — it nets a call against a result that
+    // only arrives *after* the replayed request, expanding the request into a
+    // second declaration — so deriving in order fixes a real timing bug, not
+    // just the structure.
+    let mut outstanding: Vec<Outstanding> = Vec::new();
+    // Nearest-preceding outstanding call sharing the id — the same pairing
+    // rule the compaction module settled on.
+    fn retire(outstanding: &mut Vec<Outstanding>, call_id: &str) {
+        if call_id.is_empty() {
+            return;
         }
-        by_id.into_values().flatten().cloned().collect()
-    };
+        if let Some(position) = outstanding
+            .iter()
+            .rposition(|entry| entry.call.call_id == call_id)
+        {
+            outstanding.remove(position);
+        }
+    }
 
     for msg in messages.iter_mut() {
         let mut to_remove: Vec<usize> = Vec::new();
@@ -398,62 +395,71 @@ fn replace_approval_contents_with_results(
 
         for (idx, content) in msg.contents.iter_mut().enumerate() {
             match content {
-                Content::FunctionApprovalRequest(req) => {
-                    match unanswered_calls
+                Content::FunctionCall(fc) => {
+                    if fc.call_id.is_empty() {
+                        continue;
+                    }
+                    // A real call matching an expanded request is the duplicate
+                    // now: the expansion already declared it. Keep exactly one,
+                    // and mark the survivor as real so it is not itself treated
+                    // as expendable.
+                    if let Some(position) = outstanding
                         .iter()
-                        .position(|call| *call == req.function_call)
+                        .position(|entry| entry.from_request && entry.call == *fc)
                     {
-                        // The same invocation is already present and
-                        // unanswered: this request would restore a second copy,
-                        // so drop the request. The call itself stays
-                        // outstanding — removing the *request* answers nothing —
-                        // so a further replayed copy is suppressed too. Consuming
-                        // the entry here let the second copy expand into a
-                        // duplicate declaration.
-                        Some(_) => to_remove.push(idx),
-                        // A different invocation (or none): restore it, and
-                        // record it as now-unanswered so a second identical
-                        // request cannot expand into a duplicate.
-                        None => {
-                            unanswered_calls.push(req.function_call.clone());
-                            *content = Content::FunctionCall(req.function_call.clone());
+                        outstanding[position].from_request = false;
+                        to_remove.push(idx);
+                    } else {
+                        outstanding.push(Outstanding {
+                            call: fc.clone(),
+                            from_request: false,
+                        });
+                    }
+                }
+                Content::FunctionResult(fr) => {
+                    retire(&mut outstanding, &fr.call_id);
+                }
+                Content::FunctionApprovalRequest(req) => {
+                    // Suppressed only for the *same invocation* — ids are
+                    // reused, so a request differing in name or arguments is a
+                    // fresh call, not a replay. Nothing is consumed on a match:
+                    // dropping a request answers no call.
+                    if outstanding
+                        .iter()
+                        .any(|entry| entry.call == req.function_call)
+                    {
+                        to_remove.push(idx);
+                    } else {
+                        if !req.function_call.call_id.is_empty() {
+                            outstanding.push(Outstanding {
+                                call: req.function_call.clone(),
+                                from_request: true,
+                            });
                         }
+                        *content = Content::FunctionCall(req.function_call.clone());
                     }
                 }
                 Content::FunctionApprovalResponse(resp) => {
-                    // Captured before `*content` is overwritten below.
-                    let answered_call = resp.function_call.clone();
-                    let call_id = answered_call.call_id.clone();
-                    let approved = resp.approved;
-
+                    let call_id = resp.function_call.call_id.clone();
                     let mut answered = false;
-                    if approved {
+                    if resp.approved {
                         if let Some(result) = approved_results.get(&call_id) {
                             *content = Content::FunctionResult(result.clone());
                             answered = true;
                         }
                     } else {
                         *content = Content::FunctionResult(FunctionResultContent {
-                            call_id,
+                            call_id: call_id.clone(),
                             result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                             exception: None,
                         });
                         answered = true;
                     }
+                    // A response that became a result answers its call, exactly
+                    // as a literal result would.
                     if answered {
+                        retire(&mut outstanding, &call_id);
                         set_role_tool = true;
-                        // A response becoming a result *answers* its call, so
-                        // retire it from the outstanding set. Leaving it there
-                        // let a stale entry suppress a later, legitimate request
-                        // for the same invocation — whose own response still
-                        // converted, giving the old call two results and the new
-                        // one no declaration.
-                        if let Some(position) = unanswered_calls
-                            .iter()
-                            .position(|call| *call == answered_call)
-                        {
-                            unanswered_calls.remove(position);
-                        }
                     }
                 }
                 _ => {}
@@ -1342,6 +1348,41 @@ mod approval_replacement_tests {
             vec!["c1", "c1"],
             "the second cycle needs its own declaration"
         );
+    }
+
+    #[test]
+    fn a_result_arriving_after_the_request_still_suppresses_it() {
+        // Order matters: at the moment the replayed request is seen, the call
+        // is still unanswered — the result only arrives later in the list. A
+        // whole-list pre-scan nets the call against that future result,
+        // concludes nothing is outstanding, and expands the request into a
+        // second declaration with a single result between them.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+            approval_request("c1"),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(FunctionResultContent {
+                    call_id: "c1".into(),
+                    result: Some(Value::String("sunny".into())),
+                    exception: None,
+                })],
+            ),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn a_request_replayed_before_its_call_still_collapses_to_one() {
+        // The replay order is not guaranteed: the approval request can precede
+        // the stored call. Whichever comes second is the duplicate.
+        let mut messages = vec![
+            approval_request("c1"),
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
     }
 
     #[test]

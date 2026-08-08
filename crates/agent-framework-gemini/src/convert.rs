@@ -644,6 +644,46 @@ pub(crate) fn parse_stream_chunk(
 mod tests {
     use super::*;
 
+    // region: universal-rendering contract
+
+    /// The canonical samples the core contract claims render on every
+    /// provider. If this converter stops emitting one of them, the failure
+    /// belongs here — next to the converter — not in compaction.
+    fn universal_content_samples() -> Vec<Content> {
+        use agent_framework_core::types::{
+            DataContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+        };
+        vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new(
+                "contract_call_1",
+                "get_weather",
+                Some(FunctionArguments::Raw("{\"city\":\"SF\"}".into())),
+            )),
+            Content::FunctionResult(FunctionResultContent::new(
+                "contract_call_1",
+                Some(serde_json::json!("sunny")),
+            )),
+            Content::Data(DataContent::from_bytes(b"png-bytes", "image/png")),
+            Content::Data(DataContent::from_bytes(b"jpeg-bytes", "image/jpeg")),
+            Content::Data(DataContent::from_bytes(b"webp-bytes", "image/webp")),
+            Content::Data(DataContent::from_bytes(b"gif-bytes", "image/gif")),
+        ]
+    }
+
+    #[test]
+    fn every_universal_content_produces_a_gemini_part() {
+        for content in universal_content_samples() {
+            assert!(content.renders_on_every_provider(), "sample not universal");
+            let msg = Message::with_contents(Role::user(), vec![content.clone()]);
+            let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+            assert!(
+                !parts.is_empty(),
+                "core claims this renders everywhere but Gemini emits nothing: {content:?}"
+            );
+        }
+    }
+
     // region: Gemini 3 thought_signature replay (upstream #7095)
 
     #[test]

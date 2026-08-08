@@ -975,6 +975,48 @@ impl StreamUsageAccumulator {
 mod tests {
     use super::*;
 
+    /// The canonical samples the core contract claims render on every
+    /// provider. If this converter stops emitting one of them, the failure
+    /// belongs here — next to the converter — not in compaction.
+    fn universal_content_samples() -> Vec<Content> {
+        use agent_framework_core::types::{
+            DataContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+        };
+        vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new(
+                "contract_call_1",
+                "get_weather",
+                Some(FunctionArguments::Raw("{\"city\":\"SF\"}".into())),
+            )),
+            Content::FunctionResult(FunctionResultContent::new(
+                "contract_call_1",
+                Some(serde_json::json!("sunny")),
+            )),
+            Content::Data(DataContent::from_bytes(b"png-bytes", "image/png")),
+            Content::Data(DataContent::from_bytes(b"jpeg-bytes", "image/jpeg")),
+            Content::Data(DataContent::from_bytes(b"webp-bytes", "image/webp")),
+            Content::Data(DataContent::from_bytes(b"gif-bytes", "image/gif")),
+        ]
+    }
+
+    #[test]
+    fn every_universal_content_produces_an_anthropic_block() {
+        for content in universal_content_samples() {
+            assert!(content.renders_on_every_provider(), "sample not universal");
+            let msg = Message::with_contents(Role::user(), vec![content.clone()]);
+            let body = build_request(&[msg], &ChatOptions::new(), "claude-test", 128, false);
+            let blocks = body["messages"][0]["content"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            assert!(
+                blocks > 0,
+                "core claims this renders everywhere but Anthropic emits nothing: {content:?}"
+            );
+        }
+    }
+
     // region: cumulative -> incremental streaming usage (upstream #7162)
 
     #[test]

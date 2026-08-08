@@ -530,6 +530,66 @@ mod tests {
         );
     }
 
+    // region: universal-rendering contract
+
+    /// The canonical samples the core contract claims render on every
+    /// provider. If this converter stops emitting one of them, the failure
+    /// belongs here — next to the converter — not in compaction.
+    fn universal_content_samples() -> Vec<Content> {
+        use agent_framework_core::types::{
+            DataContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+        };
+        vec![
+            Content::text("hello"),
+            Content::FunctionCall(FunctionCallContent::new(
+                "contract_call_1",
+                "get_weather",
+                Some(FunctionArguments::Raw("{\"city\":\"SF\"}".into())),
+            )),
+            Content::FunctionResult(FunctionResultContent::new(
+                "contract_call_1",
+                Some(serde_json::json!("sunny")),
+            )),
+            Content::Data(DataContent::from_bytes(b"png-bytes", "image/png")),
+            Content::Data(DataContent::from_bytes(b"jpeg-bytes", "image/jpeg")),
+            Content::Data(DataContent::from_bytes(b"webp-bytes", "image/webp")),
+            Content::Data(DataContent::from_bytes(b"gif-bytes", "image/gif")),
+        ]
+    }
+
+    #[test]
+    fn every_universal_content_survives_chat_completions_conversion() {
+        // messages_to_openai is also the build path for the Ollama, Mistral,
+        // Foundry Local and GitHub Copilot crates, so this contract covers all
+        // of them at once.
+        for content in universal_content_samples() {
+            assert!(content.renders_on_every_provider(), "sample not universal");
+            let role = if matches!(content, Content::FunctionResult(_)) {
+                Role::tool()
+            } else if matches!(content, Content::FunctionCall(_)) {
+                Role::assistant()
+            } else {
+                Role::user()
+            };
+            let msg = Message::with_contents(role, vec![content.clone()]);
+            let out = messages_to_openai(&[msg]);
+            let emitted = out.iter().any(|m| {
+                m.get("tool_calls")
+                    .is_some_and(|t| !t.as_array().unwrap().is_empty())
+                    || m.get("tool_call_id").is_some()
+                    || m.get("content").is_some_and(|c| match c {
+                        Value::String(s) => !s.is_empty(),
+                        Value::Array(parts) => !parts.is_empty(),
+                        _ => false,
+                    })
+            });
+            assert!(
+                emitted,
+                "core claims this renders everywhere but Chat Completions emits nothing: {content:?}"
+            );
+        }
+    }
+
     // region: author-name sanitization (upstream #7127)
 
     #[test]

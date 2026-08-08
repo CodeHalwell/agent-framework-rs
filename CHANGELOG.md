@@ -34,6 +34,11 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
   handled: on the function-call part itself (the usual one) and on a preceding
   thought part (backfill only). Reasoning content is no longer sent back as a
   part, matching upstream. (upstream #7095)
+- **Approval replacement is now a single ordered walk.** The outstanding-call
+  set is derived as the walk decides each content, rather than maintained as
+  separate bookkeeping around an order-blind pre-scan — which netted a call
+  against a result arriving *after* a replayed request and expanded the
+  request into a duplicate declaration.
 - **Approval round-trips could duplicate a function call.** The restored call
   was deduped against only the message being scanned, but a hosting layer
   replays the stored call and its approval request as two separate messages, so
@@ -69,6 +74,16 @@ Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`
 
 ### Added
 
+- **Bedrock Converse image blocks.** The Bedrock converter previously dropped
+  all `Data`/`Uri` content; inline images in Converse's accepted formats
+  (`png`/`jpeg`/`gif`/`webp`) are now emitted as `{"image": ...}` blocks,
+  closing a parity gap with upstream's Bedrock client.
+- **`Content::renders_on_every_provider`.** The wire-visibility contract that
+  compaction's minimum-retention logic depends on now lives on `Content`,
+  pinned by contract tests in each provider crate — a converter change that
+  invalidates a row fails a test next to the converter instead of surfacing as
+  a compaction bug. `Uri` content is excluded (Bedrock has no remote-URL image
+  source), and `Data` images are bounded by Bedrock's format set.
 - `DataContent::from_uri` / `DataContent::media_type_from_uri`: validating
   construction from a `data:` URI, rejecting a missing scheme, missing `,`, or
   non-base64 declaration instead of silently mis-slicing it. (upstream #6916)
