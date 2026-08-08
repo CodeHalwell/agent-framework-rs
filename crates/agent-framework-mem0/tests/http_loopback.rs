@@ -599,3 +599,50 @@ async fn every_scope_failing_surfaces_the_error() {
     handle.join().expect("server thread panicked");
     assert!(format!("{err}").contains("500"), "got {err}");
 }
+
+#[tokio::test]
+async fn a_thread_only_provider_still_retrieves_its_conversations_memories() {
+    // Regression: the scope separation's early return fired before the run id
+    // was considered, so a provider configured solely with a thread id — a
+    // supported, conversation-local configuration — never issued a search.
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": [{"memory": "thread memory"}]}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_thread_id("thread-1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(
+        body["filters"],
+        json!({"run_id": "thread-1"}),
+        "run id alone is the scope, exactly once"
+    );
+    assert!(ctx.messages[0].text().contains("thread memory"));
+}
+
+#[tokio::test]
+async fn a_thread_id_beside_an_entity_scope_rides_along_not_alone() {
+    let (base_url, handle) = serve_one(|stream| {
+        write_json_response(stream, &json!({"results": []}));
+    });
+
+    let provider = Mem0Provider::new("k")
+        .with_api_base(base_url)
+        .with_thread_id("thread-1")
+        .with_user_id("u1")
+        .with_search_user_id("u1");
+    let mut ctx = SessionContext::new(vec![Message::user("hello")]);
+    provider.before_run(&mut ctx).await.unwrap();
+
+    let request = handle.join().expect("server thread panicked");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(
+        body["filters"],
+        json!({"user_id": "u1", "run_id": "thread-1"})
+    );
+}

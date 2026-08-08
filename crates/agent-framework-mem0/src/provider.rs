@@ -438,6 +438,20 @@ impl Mem0Provider {
                 scopes.push(("app_id", application_id));
             }
         }
+        // Thread-only recall: with no entity retrieval scope at all, the run id
+        // itself is the scope — one search filtered by run_id alone, matching
+        // this crate's pre-scope-separation behavior for thread-scoped
+        // providers. (When an entity scope exists, the run id rides along in
+        // each partition instead; passing it as the scope with `run_id: None`
+        // below produces exactly one `run_id` filter, not two.)
+        let mut run_only = false;
+        if scopes.is_empty() {
+            if let Some(rid) = run_id {
+                scopes.push(("run_id", rid));
+                run_only = true;
+            }
+        }
+        let per_partition_run_id = if run_only { None } else { run_id };
 
         // Issue every partition's request together rather than awaiting each in
         // turn: the scopes are independent, so serializing them makes latency
@@ -446,7 +460,7 @@ impl Mem0Provider {
         // output, so the merge below stays deterministic (scope order, not
         // completion order) regardless of which partition returns first.
         let responses = futures::future::join_all(scopes.iter().map(|scope| {
-            let body = build_search_body(input_text, *scope, run_id);
+            let body = build_search_body(input_text, *scope, per_partition_run_id);
             async move { self.post(SEARCH_PATH, &body).await }
         }))
         .await;
@@ -548,10 +562,17 @@ impl ContextProvider for Mem0Provider {
             return Ok(());
         }
 
-        // Retrieval scope only — never the storage scope. See the type docs.
+        // Retrieval scope only — never the *entity* storage scope
+        // (user/agent/app). A thread id is the exception, and deliberately so:
+        // a thread belongs to one conversation, so retrieving by run id alone
+        // reads back only this conversation's own memories — conversation-local
+        // recall was supported before the scope separation and carries none of
+        // the cross-user risk that separation exists to prevent.
+        let run_id = self.effective_run_id().await;
         if self.search_user_id.is_none()
             && self.search_agent_id.is_none()
             && self.search_application_id.is_none()
+            && run_id.is_none()
         {
             if !self
                 .warned_no_search_scope
@@ -560,13 +581,11 @@ impl ContextProvider for Mem0Provider {
                 tracing::warn!(
                     "Mem0Provider has no retrieval scope configured, so no memories will be \
                      retrieved. Set search_user_id, search_agent_id and/or \
-                     search_application_id."
+                     search_application_id (or a thread id for conversation-local recall)."
                 );
             }
             return Ok(());
         }
-
-        let run_id = self.effective_run_id().await;
         let memory_texts = self.search_scopes(&input_text, run_id.as_deref()).await?;
         ctx.messages
             .extend(format_context(&self.context_prompt, &memory_texts));
