@@ -391,7 +391,7 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
     // the model as nothing and leaves the request effectively system-only.
     if retained
         .iter()
-        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_the_wire))
+        .any(|m| m.role != Role::system() && m.contents.iter().any(renders_on_every_provider))
     {
         return retained;
     }
@@ -419,7 +419,7 @@ fn ensure_non_system_message(original: &[Message], mut retained: Vec<Message>) -
             // request effectively system-only while bypassing the
             // complete-exchange fallback below.
             candidate.contents.retain(|c| {
-                renders_on_the_wire(c)
+                renders_on_every_provider(c)
                     && !matches!(c, Content::FunctionCall(_) | Content::FunctionResult(_))
             });
             (!candidate.contents.is_empty()).then_some(candidate)
@@ -490,15 +490,30 @@ fn latest_complete_tool_exchange(messages: &[Message]) -> Vec<Message> {
     }
 }
 
-/// Whether this content produces anything in a provider request.
+/// Whether this content reaches the model on **every** provider this workspace
+/// targets.
 ///
-/// Reasoning is replay metadata, not payload: Gemini's request builder
-/// deliberately skips reasoning parts and the OpenAI converter has no mapping
-/// for it, so a message consisting only of reasoning reaches the model as
-/// nothing at all. Every "is there still something here?" decision in this
-/// module asks through this predicate, so they cannot disagree — each has
-/// separately had to learn that reasoning does not count.
-fn renders_on_the_wire(content: &Content) -> bool {
+/// Reasoning is the only variant that does not, and it is genuinely
+/// provider-dependent rather than universally dropped — an earlier version of
+/// this comment claimed otherwise and was wrong:
+///
+/// * **Anthropic** emits any reasoning content as a `thinking` block.
+/// * **OpenAI Responses** replays a preserved item verbatim when
+///   [`TextReasoningContent::raw_representation`] is set, and drops
+///   summary-only reasoning.
+/// * **Gemini** deliberately skips reasoning parts entirely, and the **OpenAI
+///   Chat Completions** converter has no mapping for them.
+///
+/// So this deliberately answers the *conservative* question — "would this still
+/// be there on the provider that renders the least?" — because the callers use
+/// it to decide whether a retained set needs a fallback turn added. Being
+/// conservative only ever appends a possibly-redundant message; being
+/// optimistic would let a Gemini request go out with nothing for the model to
+/// act on. Nothing is ever removed on the strength of this predicate, so a
+/// provider that *does* render reasoning keeps it either way.
+///
+/// [`TextReasoningContent::raw_representation`]: crate::types::TextReasoningContent::raw_representation
+fn renders_on_every_provider(content: &Content) -> bool {
     !matches!(content, Content::TextReasoning(_))
 }
 
@@ -1558,6 +1573,30 @@ mod tests {
                     .any(|c| !matches!(c, Content::TextReasoning(_)))),
             "expected something that actually renders, got {out:?}"
         );
+    }
+
+    #[test]
+    fn retained_reasoning_is_never_discarded_by_the_retention_check() {
+        // The conservative predicate decides whether to *add* a fallback; it
+        // never removes anything. Providers that do render reasoning (Anthropic
+        // `thinking` blocks, OpenAI Responses replaying a preserved item) keep
+        // their context either way.
+        let reasoning_only = Message::with_contents(
+            Role::assistant(),
+            vec![Content::TextReasoning(crate::types::TextReasoningContent {
+                text: "thinking".into(),
+                raw_representation: Some(json!({"id": "rs_1"})),
+                ..Default::default()
+            })],
+        );
+        let messages = vec![text(Role::system(), "sys"), reasoning_only];
+        let out = compact(&messages, &SlidingWindow::new(10), &ApproxTokenizer);
+
+        let kept = out
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .any(|c| matches!(c, Content::TextReasoning(_)));
+        assert!(kept, "reasoning must survive, got {out:?}");
     }
 
     #[test]
