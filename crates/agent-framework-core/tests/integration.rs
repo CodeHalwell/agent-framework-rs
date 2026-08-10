@@ -2801,3 +2801,140 @@ async fn tool_context_outside_a_run_has_no_live_tools() {
 }
 
 // endregion
+
+// region: usage aggregation across the tool loop (upstream `UsageAggregator`,
+// .NET #7539). The loop issues one model call per iteration and each reports
+// only its own tokens, so the response it returns must carry their sum — not
+// the final iteration's count alone.
+
+/// A response carrying only usage, used to script per-iteration token counts.
+fn usage_of(input: u64, output: u64) -> UsageDetails {
+    let mut usage = UsageDetails::new();
+    usage.input_token_count = Some(input);
+    usage.output_token_count = Some(output);
+    usage.total_token_count = Some(input + output);
+    usage
+}
+
+fn noop_call_with_usage(call_id: &str, usage: UsageDetails) -> ChatResponse {
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                call_id,
+                "noop",
+                Some(FunctionArguments::Raw("{}".into())),
+            ))],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        usage_details: Some(usage),
+        ..Default::default()
+    }
+}
+
+fn noop_tool_definition() -> ToolDefinition {
+    FunctionTool::new(
+        "noop",
+        "No-op.",
+        json!({"type":"object"}),
+        |_args| async move { Ok(json!("ok")) },
+    )
+    .into_definition()
+}
+
+#[tokio::test]
+async fn tool_loop_sums_usage_across_every_iteration() {
+    // Two tool-calling iterations, then a final answer: 3 model calls total.
+    let answer = ChatResponse {
+        usage_details: Some(usage_of(300, 30)),
+        ..ChatResponse::from_text("done")
+    };
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        noop_call_with_usage("call_1", usage_of(100, 10)),
+        noop_call_with_usage("call_2", usage_of(200, 20)),
+        answer,
+    ]));
+
+    let response = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(noop_tool_definition()),
+        )
+        .await
+        .unwrap();
+
+    let usage = response.usage_details.expect("usage should be reported");
+    assert_eq!(usage.input_token_count, Some(600));
+    assert_eq!(usage.output_token_count, Some(60));
+    assert_eq!(usage.total_token_count, Some(660));
+}
+
+#[tokio::test]
+async fn tool_loop_usage_aggregate_survives_an_approval_pause() {
+    // The approval gate returns mid-loop. A free tool runs first, so there is a
+    // completed iteration whose usage the pause must carry out with it rather
+    // than discard — reporting only the gated turn would under-count the run.
+    let counter = Arc::new(Mutex::new(0));
+    let mut gated = secret_call();
+    gated.usage_details = Some(usage_of(200, 20));
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        noop_call_with_usage("call_0", usage_of(100, 10)),
+        gated,
+    ]));
+    let options = ChatOptions::new()
+        .with_tool(noop_tool_definition())
+        .with_tool(approval_tool(counter));
+
+    let response = client
+        .get_response(vec![Message::user("what is the secret?")], options)
+        .await
+        .unwrap();
+
+    assert_eq!(response.user_input_requests().len(), 1);
+    let usage = response.usage_details.expect("usage should be reported");
+    assert_eq!(usage.input_token_count, Some(300));
+    assert_eq!(usage.output_token_count, Some(30));
+}
+
+#[tokio::test]
+async fn tool_loop_reports_usage_from_the_iterations_that_had_it() {
+    // A provider that reports usage on some turns but not others must not have
+    // the reported turns erased by the silent ones, and a run where nothing was
+    // reported must stay `None` rather than becoming a bogus zero.
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        noop_call_with_usage("call_1", usage_of(100, 10)),
+        ChatResponse::from_text("done"),
+    ]));
+    let response = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(noop_tool_definition()),
+        )
+        .await
+        .unwrap();
+    let usage = response
+        .usage_details
+        .expect("partial usage still reported");
+    assert_eq!(usage.input_token_count, Some(100));
+    assert_eq!(usage.output_token_count, Some(10));
+
+    let mut silent_call = noop_call_with_usage("call_1", UsageDetails::new());
+    silent_call.usage_details = None;
+    let silent = FunctionInvokingChatClient::new(MockClient::new(vec![
+        silent_call,
+        ChatResponse::from_text("done"),
+    ]));
+    let response = silent
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(noop_tool_definition()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.usage_details.is_none(),
+        "no contributor reported usage, so none should be synthesized"
+    );
+}
+
+// endregion
