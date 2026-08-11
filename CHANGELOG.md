@@ -5,6 +5,27 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+Upstream-alignment pass against `microsoft/agent-framework` `266206e`
+(2026-08-07), covering the six commits that landed after the `4b1afd90`
+baseline. Five are .NET-only changes to subsystems this port does not
+implement; the sixth established an invariant this port was violating. See
+[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md) for the per-commit triage.
+
+### Fixed
+
+- **The tool loop reported only its last iteration's token usage.** Each model
+  call in the function-invocation loop reports its own usage, and every exit
+  path returned the final call's `ChatResponse` untouched — so a run that
+  called tools five times reported roughly a fifth of the tokens it spent, and
+  the `gen_ai.usage.*` OTel metrics (which read `usage_details`) under-reported
+  with it. Usage is now summed across every iteration and applied to whichever
+  response the loop returns, including the approval pause, the
+  declaration-only hand-back, and the tools-disabled failsafe. A run where no
+  iteration reported usage still reports none rather than a synthesized zero.
+  (upstream #7539)
+
 ## [0.2.0] — 2026-08-08
 
 Upstream-alignment pass against `microsoft/agent-framework` `4b1afd90`

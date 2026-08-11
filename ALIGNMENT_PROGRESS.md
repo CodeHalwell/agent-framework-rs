@@ -6,8 +6,58 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `4b1afd90` (2026-08-07).** Sections are newest
+**Current upstream baseline: `266206e` (2026-08-07).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`4b1afd90` drift (checked against `266206e`, 2026-08-07)
+
+Upstream moved **6 commits** after the `4b1afd90` baseline. All six are .NET;
+no Python commit landed in this window. One was ported, five are not
+applicable — and two of those five mark subsystems this port simply does not
+have, which is recorded here as a gap rather than dressed up as parity.
+
+### Ported this pass (1, with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7539 | **Usage aggregation across a looping run.** Upstream's invariant: when a component re-invokes an inner agent or chat client several times within one logical run, the usage it returns must cover the whole run. This port's function-invocation loop violated it — every exit path returned the final iteration's `ChatResponse` untouched, so a five-iteration tool run reported roughly a fifth of the tokens it spent, and the `gen_ai.usage.*` OTel metrics (which read `usage_details`) under-reported with it. Confirmed by probe before fixing: a two-call run reporting 100 then 200 input tokens surfaced 200. `accumulate_usage` now folds each iteration's usage into a running aggregate applied to whichever response the loop returns — the no-more-calls exit, the approval pause, the declaration-only hand-back, and the tools-disabled failsafe. `UsageDetails::add_assign` already carried the null-aware semantics upstream's `UsageAggregator.Combine` specifies, so `None` still means *not reported* rather than zero. | `core/client.rs` (`accumulate_usage`, the `get_response` tool loop) |
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1606 passing**, 3 of them new), `cargo clippy --all-targets --all-features`
+clean, `cargo fmt --check` clean. All three new tests were confirmed to fail
+against the pre-fix loop, so none of them is vacuous.
+
+### Not applicable (5)
+
+| Upstream | Why not |
+|---|---|
+| #7535 | **Declarative fenced-string parsing.** Replaces a backtracking regex in `TrimJsonDelimiter` with a linear scan, to deny a malformed fenced input the chance to trigger catastrophic backtracking. This port pulls in no regex engine at all (`regex` appears nowhere in the tree) and has no fenced-code-block trimmer — the declarative crate parses YAML and conditions directly. There is nothing here to harden. |
+| #7567 | **`AgentIsolationKeyProvider` rename.** A .NET hosting rename across A2A task stores, AG-UI endpoints, and session stores. This port has no isolation-key concept in `agent-framework-hosting`. |
+| #7525 | **Single source of conversation history for a hosted agent.** Rewires .NET's `AgentSessionStore` / `AgentFrameworkResponseHandler` for Foundry hosting. This port's hosting crate has no `AgentSessionStore` equivalent. |
+| #7540 | **Hardened file skill discovery.** Skips symlinked `SKILL.md` files and symlinked subdirectories during discovery, and fails closed on paths it cannot inspect. Not applicable *because the port has no filesystem skill source at all* — `skills.rs` builds `Skill` values in memory from caller-supplied strings, so there is no discovery walk to harden. See the gap note below. |
+| #7388 | **`InvocableFunctionBypassingChatClient`.** See the gap note below. |
+
+### Gaps this pass surfaced (not closed)
+
+Two upstream changes landed on subsystems this port lacks. Neither is a
+regression, and neither was half-implemented to make the table look better:
+
+- **File-based skills.** Upstream (both languages) discovers skills from disk:
+  `SKILL.md` with YAML frontmatter, resource and script files found by
+  scanning the skill directory, and a security boundary around path traversal
+  and symlink escape. This port's `SkillsProvider` is in-memory only, so
+  #7540 and the earlier #7507 (Windows junction detection) have no landing
+  site. Adding a file source means adopting that whole security boundary, not
+  just a directory walk.
+- **Sibling backend calls dropped beside a declaration-only call.** When one
+  response mixes an invocable tool call with a declaration-only (frontend)
+  one, this port returns the whole response unexecuted — the same limitation
+  #7388 works around in .NET. Upstream's fix is an opt-in decorator that
+  stashes the invocable calls in the session state bag and re-injects them
+  next turn as pre-approved approval responses. That mechanism depends on an
+  `AgentSessionStateBag` and approval-response binding this port does not
+  have, so it is a design task rather than a port, and is left open
+  deliberately.
 
 ## Post-`beb65b21` drift (checked against `4b1afd90`, 2026-08-07)
 

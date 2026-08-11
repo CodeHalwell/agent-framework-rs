@@ -19,6 +19,7 @@ use crate::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, EmbeddingGenerationOptions,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
     FunctionResultContent, GeneratedEmbeddings, Message, Role, ToolMode, UsageContent,
+    UsageDetails,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -184,6 +185,28 @@ fn executable_tools(options: &ChatOptions) -> Vec<ToolDefinition> {
 /// declaration-only, exactly as Python's `_get_tool_map` omits them.
 fn is_declaration_only(tool: &ToolDefinition) -> bool {
     tool.kind == ToolKind::Function && tool.executor.is_none()
+}
+
+/// Fold one model call's usage into a running aggregate.
+///
+/// The tool loop issues *several* model calls per logical `get_response`, and
+/// each reports only its own tokens. Without accumulation the returned response
+/// carries the last iteration's usage alone, so a run that called tools five
+/// times under-reports its cost by roughly a factor of five — and because this
+/// port's OTel layer reads `usage_details`, the `gen_ai.usage.*` metrics
+/// under-report with it. Mirrors upstream's `UsageAggregator` (.NET #7539).
+///
+/// `None` means *not reported* rather than zero: an aggregate only carries a
+/// count once some contributor reported one, and stays `None` when no iteration
+/// reported usage at all.
+fn accumulate_usage(aggregate: &mut Option<UsageDetails>, incoming: Option<&UsageDetails>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    match aggregate {
+        Some(current) => current.add_assign(incoming),
+        None => *aggregate = Some(incoming.clone()),
+    }
 }
 
 /// The exact rejection payload Python emits for a denied tool call.
@@ -519,6 +542,10 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             let mut conversation = messages;
             let mut carried: Vec<Message> = Vec::new();
             let mut consecutive_errors = 0usize;
+            // Usage summed over every model call this loop makes, applied to
+            // whichever response is returned so the caller sees the cost of the
+            // whole run and not just its final iteration.
+            let mut aggregated_usage: Option<UsageDetails> = None;
 
             for _ in 0..self.config.max_iterations {
                 options.tools = live_tools.snapshot();
@@ -563,6 +590,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 let response = self
                     .inner_get_response(conversation.clone(), options.clone())
                     .await?;
+                accumulate_usage(&mut aggregated_usage, response.usage_details.as_ref());
 
                 // A call whose result is already present in the same response
                 // was executed by the provider (e.g. Anthropic server-side
@@ -593,6 +621,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut final_resp.messages);
                     final_resp.messages = msgs;
+                    final_resp.usage_details = aggregated_usage;
                     return Ok(final_resp);
                 }
 
@@ -631,6 +660,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
                     resp.messages = msgs;
+                    resp.usage_details = aggregated_usage;
                     return Ok(resp);
                 }
 
@@ -655,6 +685,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
                     resp.messages = msgs;
+                    resp.usage_details = aggregated_usage;
                     return Ok(resp);
                 }
 
@@ -731,9 +762,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             // Failsafe: one final call with tools disabled.
             options.tool_choice = Some(ToolMode::None);
             let mut final_resp = self.inner_get_response(conversation, options).await?;
+            accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);
             msgs.append(&mut final_resp.messages);
             final_resp.messages = msgs;
+            final_resp.usage_details = aggregated_usage;
             Ok(final_resp)
         }
         .await?;
