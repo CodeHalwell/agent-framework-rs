@@ -396,8 +396,7 @@ impl AzureOpenAIResponsesClient {
             );
         }
 
-        // Before the `additional_properties` pass, whose `or_insert` must not
-        // clobber it — a caller's own `include` entries are already folded in.
+        // A caller's own `include` entries are already folded in here.
         if let Some(include) = agent_framework_openai::responses::responses_include(
             options,
             self.inner.implicit_encrypted_reasoning,
@@ -406,6 +405,11 @@ impl AzureOpenAIResponsesClient {
         }
 
         for (k, v) in &options.additional_properties {
+            // `include` belongs to `responses_include` alone — see the
+            // matching note in the OpenAI client's `build_body`.
+            if k == "include" {
+                continue;
+            }
             body.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
@@ -575,6 +579,26 @@ mod tests {
         assert!(
             body.get("include").is_none(),
             "no include expected, got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_include_is_omitted_not_sent_as_an_empty_array() {
+        // With the implicit add off (the Foundry shape), an empty `include`
+        // from the caller must not survive the `additional_properties` pass.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("include".into(), json!([]));
+        let body = client().without_implicit_encrypted_reasoning().build_body(
+            &[user("hi")],
+            &options,
+            false,
+        );
+        assert!(
+            body.get("include").is_none(),
+            "an empty include should be omitted entirely, got: {}",
             body
         );
     }

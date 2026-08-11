@@ -165,13 +165,19 @@ impl OpenAIChatClient {
         }
 
         // Inserted before the `additional_properties` pass below, whose
-        // `or_insert` must not clobber it — a caller's own `include` entries
-        // are already folded in by `responses_include`.
+        // A caller's own `include` entries are already folded in here.
         if let Some(include) = responses_include(options, true) {
             body.insert("include".into(), include);
         }
 
         for (k, v) in &options.additional_properties {
+            // `include` belongs to `responses_include` alone. Letting it
+            // through would resurrect a value that function deliberately
+            // dropped — an explicit empty array would land as `include: []`,
+            // the one shape it exists to avoid.
+            if k == "include" {
+                continue;
+            }
             body.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
@@ -1532,6 +1538,37 @@ mod tests {
             .insert("include".into(), json!(["reasoning.encrypted_content"]));
         let body = client().build_body(&[user("hi")], &options, false);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn an_explicit_empty_include_is_omitted_not_sent_as_an_empty_array() {
+        // `responses_include` drops an empty array, and the
+        // `additional_properties` pass must not put it back: `include` is
+        // that function's alone. Reached here via a stored conversation, which
+        // suppresses the implicit entry that would otherwise fill the array.
+        let mut options = ChatOptions::new();
+        options.conversation_id = Some("resp_abc123".into());
+        options
+            .additional_properties
+            .insert("include".into(), json!([]));
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert!(
+            body.get("include").is_none(),
+            "an empty include should be omitted entirely, got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn other_additional_properties_still_pass_through() {
+        // Only `include` is intercepted; everything else the caller sets still
+        // reaches the body.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("safety_identifier".into(), json!("user-123"));
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert_eq!(body["safety_identifier"], json!("user-123"));
     }
 
     #[test]
