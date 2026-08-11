@@ -137,7 +137,8 @@ impl FoundryChatClient {
         let endpoint = endpoint.into();
         let model = model.into();
         let inner = AzureOpenAIResponsesClient::new(endpoint.clone(), model.clone(), api_key)
-            .without_api_version();
+            .without_api_version()
+            .without_implicit_encrypted_reasoning();
         Self {
             inner,
             endpoint,
@@ -161,7 +162,8 @@ impl FoundryChatClient {
             model.clone(),
             credential,
         )
-        .without_api_version();
+        .without_api_version()
+        .without_implicit_encrypted_reasoning();
         Self {
             inner,
             endpoint,
