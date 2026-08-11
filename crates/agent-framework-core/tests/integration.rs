@@ -2807,7 +2807,8 @@ async fn tool_context_outside_a_run_has_no_live_tools() {
 // only its own tokens, so the response it returns must carry their sum — not
 // the final iteration's count alone.
 
-/// A response carrying only usage, used to script per-iteration token counts.
+/// The token counts for a single model call, used to script what each
+/// iteration of the loop reports.
 fn usage_of(input: u64, output: u64) -> UsageDetails {
     let mut usage = UsageDetails::new();
     usage.input_token_count = Some(input);
