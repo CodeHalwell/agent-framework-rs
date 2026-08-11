@@ -270,3 +270,57 @@ async fn api_key_client_uses_api_key_header() {
         "headers: {headers}"
     );
 }
+
+/// Foundry does not want encrypted reasoning unless it is asked for by name,
+/// so — unlike OpenAI and Azure OpenAI, which add it to every stateless
+/// request — `FoundryChatClient` must send no `include` at all. Asserted here
+/// on the real outbound body rather than on the flag, so the test covers the
+/// wiring through `AzureOpenAIResponsesClient` and not just its default.
+/// Mirrors upstream #7536.
+#[tokio::test]
+async fn foundry_does_not_implicitly_request_encrypted_reasoning() {
+    let server = FakeServer::start(
+        false,
+        r#"{"id":"resp_1","model":"gpt-4o","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+
+    let c = client(&server.addr);
+    c.get_response(vec![Message::user("hi")], ChatOptions::new())
+        .await
+        .unwrap();
+
+    let (_, _, body) = server.requests().remove(0);
+    let body_json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body_json.get("include").is_none(),
+        "Foundry should send no include, got: {body_json}"
+    );
+}
+
+/// The opt-out governs only what the client adds unprompted: a caller that
+/// names `reasoning.encrypted_content` still gets it on the wire.
+#[tokio::test]
+async fn foundry_still_honors_an_explicitly_requested_include() {
+    let server = FakeServer::start(
+        false,
+        r#"{"id":"resp_1","model":"gpt-4o","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+
+    let mut options = ChatOptions::new();
+    options.additional_properties.insert(
+        "include".into(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+
+    let c = client(&server.addr);
+    c.get_response(vec![Message::user("hi")], options)
+        .await
+        .unwrap();
+
+    let (_, _, body) = server.requests().remove(0);
+    let body_json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body_json["include"],
+        serde_json::json!(["reasoning.encrypted_content"])
+    );
+}

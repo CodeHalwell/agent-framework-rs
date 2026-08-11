@@ -121,6 +121,10 @@ struct Inner {
     deployment: String,
     api_version: Option<String>,
     auth: Auth,
+    /// Whether to add `reasoning.encrypted_content` to a stateless request's
+    /// `include` on the caller's behalf. True here, as on OpenAI; Foundry
+    /// turns it off (see [`Self::without_implicit_encrypted_reasoning`]).
+    implicit_encrypted_reasoning: bool,
 }
 
 impl Clone for AzureOpenAIResponsesClient {
@@ -165,6 +169,7 @@ impl AzureOpenAIResponsesClient {
                 deployment: deployment.into(),
                 api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::ApiKey(api_key.into()),
+                implicit_encrypted_reasoning: true,
             }),
         }
     }
@@ -184,6 +189,7 @@ impl AzureOpenAIResponsesClient {
                 deployment: deployment.into(),
                 api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::Credential(credential),
+                implicit_encrypted_reasoning: true,
             }),
         }
     }
@@ -254,6 +260,23 @@ impl AzureOpenAIResponsesClient {
     /// [`from_env`](Self::from_env).)
     pub fn without_api_version(mut self) -> Self {
         Arc::make_mut(&mut self.inner).api_version = None;
+        self
+    }
+
+    /// Stop adding `reasoning.encrypted_content` to a stateless request's
+    /// `include` on the caller's behalf.
+    ///
+    /// The implicit add is right for OpenAI and Azure OpenAI, where a
+    /// `store: false` tool loop has to replay the reasoning item itself. Azure
+    /// AI Foundry does not want it unless it is asked for by name, so
+    /// [`FoundryChatClient`](agent_framework_foundry) builds its transport
+    /// with this set (upstream #7536).
+    ///
+    /// A caller that puts `reasoning.encrypted_content` in its own `include`
+    /// (via `ChatOptions::additional_properties`) still gets it — this governs
+    /// only what the client adds unprompted.
+    pub fn without_implicit_encrypted_reasoning(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).implicit_encrypted_reasoning = false;
         self
     }
 
@@ -371,6 +394,15 @@ impl AzureOpenAIResponsesClient {
                 "text".into(),
                 json!({ "format": agent_framework_openai::responses::response_format_to_text(fmt) }),
             );
+        }
+
+        // Before the `additional_properties` pass, whose `or_insert` must not
+        // clobber it — a caller's own `include` entries are already folded in.
+        if let Some(include) = agent_framework_openai::responses::responses_include(
+            options,
+            self.inner.implicit_encrypted_reasoning,
+        ) {
+            body.insert("include".into(), include);
         }
 
         for (k, v) in &options.additional_properties {
@@ -526,6 +558,44 @@ mod tests {
     }
 
     #[test]
+    fn implicit_encrypted_reasoning_is_on_by_default_and_can_be_turned_off() {
+        // Azure OpenAI behaves like OpenAI: a stateless request asks for the
+        // encrypted reasoning item so the tool-loop replay has something valid
+        // to re-send.
+        let body = client().build_body(&[user("hi")], &ChatOptions::new(), false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        // Foundry builds its transport with the implicit add off, and then no
+        // `include` is sent at all rather than an empty one.
+        let body = client().without_implicit_encrypted_reasoning().build_body(
+            &[user("hi")],
+            &ChatOptions::new(),
+            false,
+        );
+        assert!(
+            body.get("include").is_none(),
+            "no include expected, got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn turning_off_the_implicit_add_still_honors_an_explicit_request() {
+        // The switch governs only what the client adds unprompted — a caller
+        // that names the entry still gets it.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("include".into(), json!(["reasoning.encrypted_content"]));
+        let body = client().without_implicit_encrypted_reasoning().build_body(
+            &[user("hi")],
+            &options,
+            false,
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
     fn without_api_version_omits_the_query_parameter() {
         // GA v1 resources / OpenAI-compatible gateways use the documented
         // bare URL with no api-version query.
@@ -627,6 +697,8 @@ mod tests {
                         { "type": "input_text", "text": "Hello there" }
                     ]}
                 ],
+                // Matches the OpenAI client's stateless-request `include`.
+                "include": ["reasoning.encrypted_content"],
             })
         );
     }

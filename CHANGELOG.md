@@ -7,6 +7,24 @@ may break APIs).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stateless Responses requests never asked for the encrypted reasoning
+  item.** A reasoning item is only replayable on the next turn of a `store:
+  false` tool loop if it carries `encrypted_content`, and the service only
+  returns that when the request's `include` asks for it. This port set
+  `include` nowhere, so the replay path in `messages_to_input` — which
+  re-emits the item verbatim and drops one lacking `id`/`encrypted_content` —
+  had nothing valid to re-send. Both Responses clients (OpenAI and Azure
+  OpenAI) now add `reasoning.encrypted_content` when a request carries no
+  service-side-storage indicator, matching upstream. A caller's own `include`
+  entries are preserved and never duplicated.
+- **Foundry opts out of the above**, matching upstream #7536: it does not want
+  encrypted reasoning unless asked for by name. New
+  `AzureOpenAIResponsesClient::without_implicit_encrypted_reasoning`, which
+  `FoundryChatClient` sets on its transport. An explicitly requested
+  `reasoning.encrypted_content` is still honored.
+
 Upstream-alignment pass against `microsoft/agent-framework` `266206e`
 (2026-08-07), covering the six commits that landed after the `4b1afd90`
 baseline. Five are .NET-only changes to subsystems this port does not

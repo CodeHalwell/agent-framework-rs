@@ -6,8 +6,45 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `266206e` (2026-08-07).** Sections are newest
+**Current upstream baseline: `2eb8fbb` (2026-08-11).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`266206e` drift (checked against `2eb8fbb`, 2026-08-11)
+
+Upstream moved **8 commits** in this window — the first batch to arrive after
+the fork's daily sync was repaired (it had failed on every run since it was
+added, so the three preceding passes were all triaged against a mirror that
+had stopped advancing on 2026-08-06).
+
+**Nothing in the batch needed porting.** Five are dependency bumps confined to
+Python tooling and the DevUI frontend (postcss ×2, pyrefly, js-yaml, zuban).
+The three substantive commits are all Python and all land on subsystems this
+port does not have:
+
+| Upstream | Why not applicable |
+|---|---|
+| #7550 | **JSON parsing for declarative workflows.** Rewrites how an agent's free-text output is coerced to JSON — fenced-block extraction, then a scan for the last decodable object in prose — inside `_executors_agents.py`. That file belongs to the Power-Platform-style declarative *workflow* DSL, where an action captures an agent's output into a typed variable. This port's declarative crate is a spec model that compiles YAML into a `WorkflowBuilder` graph and passes conversation messages between agent nodes; it never JSON-decodes agent prose. Already tracked as an open roadmap item ("the upstream Copilot-Studio declarative *workflow* DSL"). |
+| #7533 | **FHA migrated to `responses==2.0.0b1`, plus a Foundry state store.** Confined to the `foundry_hosting` package. This port has no Foundry hosted-agents host — `agent-framework-foundry` is the persistent-agents *client* only. |
+| #7536 | **Encrypted reasoning made opt-in for Foundry chat.** Strips `reasoning.encrypted_content` from the `include` that upstream's base Responses client adds implicitly. Not applicable as written — but verifying *why* surfaced a real gap in the opposite direction, fixed below. |
+
+### Ported this pass (1, with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7536 (inverted) | **Stateless Responses requests never asked for the encrypted reasoning item.** Upstream's Responses client appends `reasoning.encrypted_content` to `include` whenever a request carries no service-side-storage indicator (`_chat_client.py:1414-1418`); #7536 is Foundry opting *out* of that default. This port set `include` nowhere at all, so it never opted *in*. That quietly defeated machinery it already had: `messages_to_input` re-emits a reasoning item verbatim for a `store: false` tool-loop replay, and drops one that lacks `id`/`encrypted_content` as having "no valid input form" — but the item could never carry `encrypted_content`, because the request never asked for it. `responses_include` now builds the array once, shared by both Responses clients, and Foundry turns the implicit add off via `AzureOpenAIResponsesClient::without_implicit_encrypted_reasoning`, which is #7536's behavior. | `openai/responses.rs` (`responses_include`, `ENCRYPTED_REASONING_INCLUDE`, `build_body`), `azure/responses.rs` (`build_body`, the new builder), `foundry/lib.rs` (both constructors) |
+
+Semantics mirror upstream exactly: a caller's own `include` entries are always
+preserved; an explicitly named `reasoning.encrypted_content` is honored even
+with the implicit add disabled (the switch governs only what is added
+unprompted) and is never duplicated; the trigger is the service-side-storage
+indicator rather than `store`; and an empty `include` is omitted rather than
+sent as `[]`.
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1614 passing**, 8 of them new), `cargo clippy --all-targets --all-features`
+clean, `cargo fmt --check` clean. The Foundry opt-out is asserted on the real
+outbound body through the hermetic loopback server, not on the flag, and was
+confirmed to fail without the wiring.
 
 ## Post-`4b1afd90` drift (checked against `266206e`, 2026-08-07)
 

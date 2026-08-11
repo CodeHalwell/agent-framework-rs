@@ -164,6 +164,13 @@ impl OpenAIChatClient {
             );
         }
 
+        // Inserted before the `additional_properties` pass below, whose
+        // `or_insert` must not clobber it — a caller's own `include` entries
+        // are already folded in by `responses_include`.
+        if let Some(include) = responses_include(options, true) {
+            body.insert("include".into(), include);
+        }
+
         for (k, v) in &options.additional_properties {
             body.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -239,6 +246,59 @@ impl ChatClient for OpenAIChatClient {
 }
 
 // region: request conversion
+
+/// The `include` entry that asks a reasoning model to return its *encrypted*
+/// reasoning item alongside the summary.
+pub const ENCRYPTED_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
+
+/// Build the Responses request's `include` array.
+///
+/// A reasoning item must be replayed verbatim on the follow-up turn of a tool
+/// loop, and the service only accepts it when it carries its `id` *and*
+/// `encrypted_content`. When the conversation is held service-side the model
+/// already has that item, but on a stateless request nothing is stored — so
+/// unless the request asks for `reasoning.encrypted_content`, the item comes
+/// back without it and the replay in [`messages_to_input`] has nothing valid
+/// to re-send. This adds it implicitly in exactly that case, mirroring
+/// upstream's `_prepare_options`.
+///
+/// A caller's own `include` entries (passed through
+/// `ChatOptions::additional_properties`) are always preserved, and an explicit
+/// `reasoning.encrypted_content` is honored even when `implicit` is `false` —
+/// `implicit` gates only whether it is added on the caller's behalf. Foundry
+/// passes `false` here: it does not want encrypted reasoning unless asked for
+/// it by name (upstream #7536).
+///
+/// Returns `None` when the array would be empty, so a request that needs no
+/// `include` does not carry an empty one.
+///
+/// `pub` for the same reason as [`extract_instructions`]: `agent-framework-azure`'s
+/// Responses client builds its own body and reuses this step rather than
+/// reimplementing it.
+pub fn responses_include(options: &ChatOptions, implicit: bool) -> Option<Value> {
+    let mut include: Vec<Value> = options
+        .additional_properties
+        .get("include")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Upstream keys this off the service-side-storage indicators, not `store`:
+    // a request continuing a stored conversation needs nothing echoed back.
+    let uses_service_side_storage = options
+        .conversation_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty());
+
+    let already_present = include
+        .iter()
+        .any(|v| v.as_str() == Some(ENCRYPTED_REASONING_INCLUDE));
+    if implicit && !uses_service_side_storage && !already_present {
+        include.push(json!(ENCRYPTED_REASONING_INCLUDE));
+    }
+
+    (!include.is_empty()).then(|| json!(include))
+}
 
 /// Split a leading system message (and/or `ChatOptions::instructions`) out
 /// into the Responses API's top-level `instructions` field, returning the
@@ -1273,6 +1333,9 @@ mod tests {
                         { "type": "input_text", "text": "Hello there" }
                     ]}
                 ],
+                // Nothing is stored service-side on this request, so the
+                // encrypted reasoning item is requested for the replay path.
+                "include": ["reasoning.encrypted_content"],
             })
         );
     }
@@ -1413,6 +1476,62 @@ mod tests {
             body["tool_choice"],
             json!({ "type": "function", "name": "get_weather" })
         );
+    }
+
+    #[test]
+    fn stateless_request_asks_for_the_encrypted_reasoning_item() {
+        // A reasoning item is only replayable on the next turn if it carries
+        // `encrypted_content`, and the service only returns that when asked.
+        let c = client();
+        let body = c.build_body(&[user("hi")], &ChatOptions::new(), false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn a_service_side_conversation_needs_no_encrypted_reasoning() {
+        // The service already holds the reasoning item, so echoing it back is
+        // pointless — and upstream keys this off the storage indicators, not
+        // off `store`.
+        let mut options = ChatOptions::new();
+        options.conversation_id = Some("resp_abc123".into());
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert!(
+            body.get("include").is_none(),
+            "no include expected, got: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_id_is_not_service_side_storage() {
+        // An empty id is no id: it would not continue anything server-side, so
+        // the request is still stateless and still needs the item echoed back.
+        let mut options = ChatOptions::new();
+        options.conversation_id = Some(String::new());
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn a_callers_own_include_entries_survive_and_are_not_duplicated() {
+        // The caller's entries are preserved alongside the implicit one...
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("include".into(), json!(["file_search_call.results"]));
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert_eq!(
+            body["include"],
+            json!(["file_search_call.results", "reasoning.encrypted_content"])
+        );
+
+        // ...and asking for the encrypted item by name does not get it twice.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("include".into(), json!(["reasoning.encrypted_content"]));
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[test]
