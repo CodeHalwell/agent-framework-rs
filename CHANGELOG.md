@@ -28,10 +28,12 @@ may break APIs).
   so a `FunctionApprovalResponse` sitting between a reasoning carrier and its
   call dropped it, and a call replayed in a later message could never be
   signed at all. Both turns then failed with a 400. Content that emits no
-  wire Part no longer clears the signature, and signatures are additionally
-  resolved by `call_id` across the whole conversation. Precedence is
-  unchanged: the call's own `protected_data`, then an adjacent carrier, then
-  the conversation-wide map.
+  wire Part no longer clears the signature, and a `call_id -> signature` map
+  accumulated as the conversation is emitted signs a later replay. Precedence
+  is unchanged: the call's own `protected_data`, then an adjacent carrier,
+  then the map. The map is written by the emit walk rather than a pre-pass, so
+  the pairing rules have a single implementation — a pre-pass that restated
+  them laxly would re-sign the very calls adjacency had refused.
 - **Stateless Responses requests never asked for the encrypted reasoning
   item.** A reasoning item is only replayable on the next turn of a `store:
   false` tool loop if it carries `encrypted_content`, and the service only

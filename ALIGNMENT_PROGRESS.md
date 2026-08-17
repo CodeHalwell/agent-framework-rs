@@ -22,24 +22,34 @@ subsystems already tracked as open gaps.
 | Upstream | Change | Rust site |
 |---|---|---|
 | #7470 | **A Redis retention limit of zero retained everything.** The documented sentinel for *unlimited* is not calling `with_max_messages` at all, so `0` must retain nothing — it retained every message instead. Trimming to `-(max)` emits `LTRIM key 0 -1` for `max == 0`, which is Redis's "keep the whole list", while the `len > max` guard is true for any non-empty list: the trim ran on every save and did nothing. `add_messages` now short-circuits *before* serializing, so no payload reaches Redis — or an AOF or replica — even briefly. It deliberately does **not** delete the key: `redis_key` is `{key_prefix}:{session_id}` with no per-provider discriminator, so two stores sharing a prefix and session id address the same list, and deleting would drop a co-located store's just-written history. Removing stored history is what `clear` is for. Upstream's other half — rejecting a *negative* limit, which emitted `LTRIM key 5 -1` and deleted the five oldest messages on every save — cannot arise here: `max_messages` is a `usize`. | `redis/chat_message_store.rs` (`add_messages`, `with_max_messages`) |
-| #7546 | **Gemini 3 thought signatures were dropped across an approval round trip.** Gemini 3 rejects a request whose `functionCall` parts lack the `thoughtSignature` they were issued with. This port paired a signature to its call by *adjacency* only — a reasoning carrier immediately preceding the call — and cleared the held signature on any intervening content. Two failures followed, both ending in a 400 on the next turn: content that emits no Part at all (a `FunctionApprovalResponse`) cleared the signature merely by sitting between the carrier and its call; and a call replayed in a later message, with no carrier beside it, could never be signed. The clear now happens only for content that actually reaches the wire, and `collect_thought_signatures` resolves every signature to its `call_id` across the whole conversation as a final fallback. Precedence is unchanged and matches upstream: the call's own `protected_data` wins, then an adjacent carrier, then the conversation map. | `gemini/convert.rs` (`collect_thought_signatures`, `message_contents_to_parts`) |
+| #7546 | **Gemini 3 thought signatures were dropped across an approval round trip.** Gemini 3 rejects a request whose `functionCall` parts lack the `thoughtSignature` they were issued with. This port paired a signature to its call by *adjacency* only — a reasoning carrier immediately preceding the call — and cleared the held signature on any intervening content. Two failures followed, both ending in a 400 on the next turn: content that emits no Part at all (a `FunctionApprovalResponse`) cleared the signature merely by sitting between the carrier and its call; and a call replayed in a later message, with no carrier beside it, could never be signed. The clear now happens only for content that actually reaches the wire, and a `call_id -> signature` map accumulated across the conversation is the final fallback, which is what lets a later replay find its signature. Precedence is unchanged and matches upstream: the call's own `protected_data` wins, then an adjacent carrier, then the map. | `gemini/convert.rs` (`message_contents_to_parts`, `messages_to_gemini`) |
 | #7597 | **Mistral prompt-cache usage** — already mapped, now asserted. Upstream's Mistral package hand-rolls its own usage mapping and had to grow `prompt_tokens_details.cached_tokens`; this port's `parse_response` delegates to the OpenAI parser, whose usage handling already covers it, so the field was never dropped. The delegation is the only reason there is no bug, so it is now a tested contract rather than an inherited accident. Upstream's explicit `isinstance(..., int) and not isinstance(..., bool)` guard has no counterpart here — `Value::as_u64` rejects strings, floats, and bools structurally — which is also pinned. | `mistral/convert.rs` (tests only; no behavior change) |
 
 The Gemini fix diverges from upstream deliberately. Upstream caches signatures
 in a bounded (256-entry, LRU) map on the *client*, which spans conversations
 and therefore needs eviction and a `max_tracked_thought_signatures` knob.
-Scoping the map to the conversation being converted — the same pre-pass shape
-`collect_call_names` already uses — is naturally bounded by the history resent
-on every stateless request, needs no eviction policy, and cannot leak a
-signature between conversations. The tradeoff, recorded rather than hidden: a
-signature whose carrier has been dropped from history entirely is not
+Scoping the map to the conversation being converted is naturally bounded by the
+history resent on every stateless request, needs no eviction policy, and cannot
+leak a signature between conversations. The tradeoff, recorded rather than
+hidden: a signature whose carrier has been dropped from history entirely is not
 recoverable here, where upstream's client-lifetime cache would still hold it.
 
+The map is written by the emit walk itself rather than gathered by a pre-pass.
+The first cut used a pre-pass shaped like `collect_call_names`, and PR #15
+review caught the flaw: a pre-pass has to *restate* the pairing rules, and that
+restatement omitted the clear on wire-visible content. Because the map is
+consulted only after adjacency has deliberately declined to sign a call, the
+laxer map silently overrode that decision and re-signed calls the converter had
+just refused — `[reasoning(sig), text, call]` reached the wire signed. Since a
+replayed call always follows the turn that issued it, one forward pass suffices,
+so the rules now have exactly one implementation and cannot drift apart.
+
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1625 passing**, 8 of them new), `cargo clippy --all-targets --all-features`
+(**1627 passing**, 10 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
-`redis-server` spawned by the existing integration harness. All four
-bug-fixing tests were confirmed to fail against the pre-fix code; the
+`redis-server` spawned by the existing integration harness. All six
+bug-fixing tests were confirmed to fail against the code they fix — including
+the two covering the review finding, checked against a reinstated lax map; the
 remaining four are negative controls (an unsigned call stays unsigned, one
 carrier never signs a second call, non-integer cached tokens are ignored) and
 pass either way by design.
