@@ -88,6 +88,7 @@ fn build_system_instruction(
 /// feed [`build_system_instruction`] instead.
 pub fn messages_to_gemini(messages: &[Message]) -> Vec<Value> {
     let call_names = collect_call_names(messages);
+    let thought_signatures = collect_thought_signatures(messages);
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         if msg.role == Role::system() {
@@ -100,7 +101,8 @@ pub fn messages_to_gemini(messages: &[Message]) -> Vec<Value> {
         } else {
             "user"
         };
-        let parts: Vec<Value> = message_contents_to_parts(&msg.contents, &call_names);
+        let parts: Vec<Value> =
+            message_contents_to_parts(&msg.contents, &call_names, &thought_signatures);
         if parts.is_empty() {
             // Gemini rejects a content entry with an empty `parts` array.
             continue;
@@ -130,6 +132,62 @@ fn collect_call_names(messages: &[Message]) -> HashMap<String, String> {
     map
 }
 
+/// Build a `call_id -> thoughtSignature` map from the whole conversation.
+///
+/// Gemini 3 rejects a request whose `functionCall` parts lack the
+/// `thoughtSignature` they were issued with. Pairing a signature to its call
+/// by *adjacency* alone — a reasoning carrier immediately preceding the call —
+/// is not enough to survive an approval round trip: the replayed call is
+/// separated from its carrier (or reconstructed with none), so the signature
+/// is dropped and the follow-up turn fails with a 400. Resolving each
+/// signature to a `call_id` up front, across every message, keeps the pairing
+/// intact however the call is later replayed (upstream #7546).
+///
+/// Diverges from upstream deliberately: upstream caches signatures in a
+/// bounded (256-entry, LRU) map on the client, which spans conversations and
+/// therefore needs eviction. Scoping the map to the conversation being
+/// converted — the same pre-pass shape [`collect_call_names`] already uses —
+/// is naturally bounded by the history that is resent on every stateless
+/// request, and cannot leak a signature between conversations. The tradeoff:
+/// a signature whose carrier has been dropped from history entirely is not
+/// recoverable here, where upstream's client-lifetime cache would still hold
+/// it.
+fn collect_thought_signatures(messages: &[Message]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for msg in messages {
+        // A carrier applies to the next call in the same message. Nothing else
+        // clears it: intervening content that emits no Part (an approval
+        // request or response) is exactly the case adjacency got wrong.
+        let mut pending: Option<&str> = None;
+        for content in &msg.contents {
+            match content {
+                Content::TextReasoning(t) => {
+                    if let Some(signature) = t.protected_data.as_deref().filter(|s| !s.is_empty()) {
+                        pending = Some(signature);
+                    }
+                }
+                Content::FunctionCall(fc) if !fc.call_id.is_empty() => {
+                    // Every call consumes the carrier, whether or not it ends
+                    // up using it, so one carrier can never sign a second,
+                    // unrelated call. The call's own signature still wins —
+                    // the same precedence the emit side applies.
+                    let carried = pending.take();
+                    let signature = fc
+                        .protected_data
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or(carried);
+                    if let Some(signature) = signature {
+                        map.insert(fc.call_id.clone(), signature.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
 /// Convert one message's contents into Gemini `Part`s.
 ///
 /// Reasoning content is **not** sent back as a part. Gemini 3 instead uses a
@@ -144,13 +202,22 @@ fn collect_call_names(messages: &[Message]) -> HashMap<String, String> {
 ///   the raw Part lacks one".
 ///
 /// A backfilled signature applies only to a function call *immediately*
-/// following its reasoning content: any other content in between clears it, so
-/// a stale signature is never stamped onto an unrelated call.
+/// following its reasoning content: any other **wire-visible** content in
+/// between clears it, so a stale signature is never stamped onto an unrelated
+/// call. Content that emits no Part at all does *not* clear it — an approval
+/// request or response sitting between a carrier and its call is precisely the
+/// case that must keep the pairing (upstream #7546).
+///
+/// When neither the call nor an adjacent carrier supplies one,
+/// `thought_signatures` — resolved by `call_id` across the whole conversation
+/// by [`collect_thought_signatures`] — is the last resort. That is what makes
+/// a call replayed through an approval round trip still carry its signature.
 ///
 /// Mirrors upstream's `_convert_message_contents` (`_chat_client.py:660`).
 fn message_contents_to_parts(
     contents: &[Content],
     call_names: &HashMap<String, String>,
+    thought_signatures: &HashMap<String, String>,
 ) -> Vec<Value> {
     let mut parts = Vec::with_capacity(contents.len());
     let mut pending_signature: Option<&str> = None;
@@ -168,19 +235,26 @@ fn message_contents_to_parts(
             }
             continue;
         }
-        let pending = pending_signature.take();
         let Some(mut part) = content_to_part(content, call_names) else {
+            // Emits no Part, so it is not "content in between" as far as the
+            // wire is concerned: hold the signature rather than clearing it.
+            // An approval response between a carrier and its call used to
+            // drop the signature here, failing the replayed turn with a 400.
             continue;
         };
+        let pending = pending_signature.take();
         if let Content::FunctionCall(fc) = content {
             // The call's own signature wins; the preceding reasoning content's
             // only backfills when the call carries none (mirroring upstream's
-            // "backfill only when the raw Part lacks one").
+            // "backfill only when the raw Part lacks one"). Falling back to the
+            // conversation-wide map last keeps a replayed call signed even when
+            // its carrier is no longer beside it.
             let signature = fc
                 .protected_data
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .or(pending);
+                .or(pending)
+                .or_else(|| thought_signatures.get(&fc.call_id).map(String::as_str));
             if let (Some(signature), Some(obj)) = (signature, part.as_object_mut()) {
                 obj.insert("thoughtSignature".into(), json!(signature));
             }
@@ -643,6 +717,7 @@ pub(crate) fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_framework_core::types::FunctionApprovalResponseContent;
 
     // region: universal-rendering contract
 
@@ -676,7 +751,7 @@ mod tests {
         for content in universal_content_samples() {
             assert!(content.renders_on_every_provider(), "sample not universal");
             let msg = Message::with_contents(Role::user(), vec![content.clone()]);
-            let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+            let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
             assert!(
                 !parts.is_empty(),
                 "core claims this renders everywhere but Gemini emits nothing: {content:?}"
@@ -734,7 +809,7 @@ mod tests {
                     .with_protected_data(Some("c2ln".into())),
             )],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
     }
@@ -755,9 +830,111 @@ mod tests {
                 ),
             ],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["thoughtSignature"], json!("from-call"));
+    }
+
+    /// An approval request/response between a carrier and its call emits no
+    /// Part, so it must not break the pairing (upstream #7546). Before the
+    /// fix the signature was cleared by any intervening content, and the
+    /// replayed call went to Gemini 3 unsigned — a 400.
+    #[test]
+    fn approval_content_between_reasoning_and_call_does_not_drop_the_signature() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionApprovalResponse(FunctionApprovalResponseContent {
+                    approved: true,
+                    id: "call_1".into(),
+                    function_call: FunctionCallContent::new("call_1", "get_weather", None),
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
+        // Only the call reaches the wire, and it is signed.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    /// The conversation-wide map signs a call replayed in a *later* message,
+    /// with no carrier of its own anywhere near it — the shape an approval
+    /// round trip actually produces.
+    #[test]
+    fn a_replayed_call_is_signed_from_the_conversation_wide_map() {
+        let signed_turn = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
+            ],
+        );
+        // The replay carries the call alone: no reasoning, no part-level
+        // signature. Adjacency has nothing to work with here.
+        let replay = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                "call_1",
+                "get_weather",
+                None,
+            ))],
+        );
+
+        let contents = messages_to_gemini(&[signed_turn, replay]);
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], json!("c2ln"));
+        assert_eq!(contents[1]["parts"][0]["thoughtSignature"], json!("c2ln"));
+    }
+
+    /// One carrier signs one call. A self-signed call still consumes it, so a
+    /// later unrelated call in the same message is not stamped with a stale
+    /// signature — the same rule the emit side has always applied.
+    #[test]
+    fn a_carrier_does_not_sign_a_second_call() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking...".into(),
+                    protected_data: Some("carrier".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(
+                    FunctionCallContent::new("call_1", "get_weather", None)
+                        .with_protected_data(Some("own".into())),
+                ),
+                Content::FunctionCall(FunctionCallContent::new("call_2", "get_time", None)),
+            ],
+        );
+        let contents = messages_to_gemini(&[msg]);
+        let parts = &contents[0]["parts"];
+        assert_eq!(parts[0]["thoughtSignature"], json!("own"));
+        assert_eq!(parts[1].get("thoughtSignature"), None);
+    }
+
+    /// The map must not invent a signature for a call that never had one.
+    #[test]
+    fn an_unsigned_call_stays_unsigned() {
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                "call_1",
+                "get_weather",
+                None,
+            ))],
+        );
+        let contents = messages_to_gemini(&[msg]);
+        assert_eq!(contents[0]["parts"][0].get("thoughtSignature"), None);
     }
 
     #[test]
@@ -772,7 +949,8 @@ mod tests {
             ] } }]
         });
         let resp = parse_response(&value);
-        let parts = message_contents_to_parts(&resp.messages[0].contents, &HashMap::new());
+        let parts =
+            message_contents_to_parts(&resp.messages[0].contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
     }
 
@@ -791,7 +969,7 @@ mod tests {
                 Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
             ],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 1, "reasoning must not be sent back as a part");
         assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
         assert_eq!(parts[0]["functionCall"]["name"], json!("get_weather"));
@@ -817,7 +995,7 @@ mod tests {
                 Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
             ],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["thoughtSignature"], json!("c2ln"));
     }
@@ -840,7 +1018,7 @@ mod tests {
                 Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
             ],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts[0]["thoughtSignature"], json!("newer"));
     }
 
@@ -860,7 +1038,7 @@ mod tests {
                 Content::FunctionCall(FunctionCallContent::new("call_1", "get_weather", None)),
             ],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 2);
         assert!(parts[0].get("thoughtSignature").is_none());
         assert!(parts[1].get("thoughtSignature").is_none());
@@ -876,7 +1054,7 @@ mod tests {
                 None,
             ))],
         );
-        let parts = message_contents_to_parts(&msg.contents, &HashMap::new());
+        let parts = message_contents_to_parts(&msg.contents, &HashMap::new(), &HashMap::new());
         assert_eq!(parts.len(), 1);
         assert!(parts[0].get("thoughtSignature").is_none());
     }

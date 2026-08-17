@@ -221,6 +221,68 @@ async fn chat_message_store_trims_to_max_messages() {
     assert_eq!(messages[2].text(), "message 4");
 }
 
+/// A retention limit of zero must retain nothing (upstream #7470).
+///
+/// The pre-fix code trimmed to `-(max)`, which for `max == 0` emits
+/// `LTRIM key 0 -1` — Redis's "keep the whole list" — while `len > 0` was true
+/// for any non-empty list, so the trim ran on every save and did nothing. The
+/// documented sentinel for *unlimited* is not calling `with_max_messages` at
+/// all, so zero retaining everything was the exact inverse of the request.
+#[tokio::test]
+async fn chat_message_store_zero_max_messages_retains_nothing() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread")))
+        .unwrap()
+        .with_max_messages(0);
+
+    for i in 0..3 {
+        store
+            .add_messages(vec![Message::user(format!("message {i}"))])
+            .await
+            .unwrap();
+    }
+
+    assert!(store.list_messages().await.unwrap().is_empty());
+}
+
+/// Zero retention must not disturb history a co-located store already wrote.
+///
+/// `redis_key` is `{key_prefix}:{session_id}` with no per-provider
+/// discriminator, so two stores sharing a prefix and session id address the
+/// same list. Deleting the key to honor a zero limit — rather than declining
+/// to write — would drop the other store's just-written history on every turn.
+#[tokio::test]
+async fn chat_message_store_zero_max_messages_leaves_stored_history_alone() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let key_prefix = unique("shared");
+    let session_id = unique("thread");
+
+    let keeper = RedisChatMessageStore::new(&url, Some(session_id.clone()))
+        .unwrap()
+        .with_key_prefix(&key_prefix);
+    let zero_retention = RedisChatMessageStore::new(&url, Some(session_id))
+        .unwrap()
+        .with_key_prefix(&key_prefix)
+        .with_max_messages(0);
+
+    keeper
+        .add_messages(vec![Message::user("keep me")])
+        .await
+        .unwrap();
+    zero_retention
+        .add_messages(vec![Message::user("drop me")])
+        .await
+        .unwrap();
+
+    let messages = keeper.list_messages().await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text(), "keep me");
+}
+
 #[tokio::test]
 async fn chat_message_store_auto_generated_thread_ids_are_isolated() {
     let Some((url, _guard)) = test_server().await else {
