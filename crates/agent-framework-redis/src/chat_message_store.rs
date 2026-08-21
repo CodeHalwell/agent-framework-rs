@@ -88,6 +88,14 @@ impl RedisChatMessageStore {
 
     /// Automatically trim the list to the most recent `max_messages`
     /// entries after every `add_messages` call (builder style).
+    ///
+    /// Not calling this at all means unlimited retention. A limit of `0`
+    /// means *retain nothing*: [`Self::add_messages`] then writes no payload
+    /// to Redis at all rather than writing and trimming afterwards, so a
+    /// message never reaches an AOF or a replica even briefly. Stored history
+    /// is left as it is — removing it is what [`Self::clear`] is for, and the
+    /// key is not namespaced per provider, so deleting it here would discard a
+    /// co-located store's history (upstream #7470).
     pub fn with_max_messages(mut self, max_messages: usize) -> Self {
         self.max_messages = Some(max_messages);
         self
@@ -144,9 +152,20 @@ impl RedisChatMessageStore {
 
     /// Append `messages` (`RPUSH`, chronological order), then trim to
     /// [`Self::max_messages`] via `LTRIM` when configured. A no-op for an
-    /// empty `messages`.
+    /// empty `messages`, and — with a limit of `0` — a no-op outright.
     pub async fn add_messages(&self, messages: Vec<Message>) -> Result<()> {
         if messages.is_empty() {
+            return Ok(());
+        }
+        // A retention limit of zero retains nothing, so there is nothing to
+        // write. Short-circuit *before* serializing rather than pushing and
+        // trimming after: the payload would otherwise reach Redis — and any
+        // AOF or replica stream — before being removed. Returning here also
+        // leaves stored history alone, which matters because `redis_key`
+        // omits any per-provider discriminator: two stores sharing the
+        // default prefix and session id address the same list, so deleting it
+        // would drop the other's just-written history (upstream #7470).
+        if self.max_messages == Some(0) {
             return Ok(());
         }
         let mut conn = self.conn.get().await?;

@@ -347,6 +347,70 @@ mod tests {
         assert_eq!(usage.total_token_count, Some(15));
     }
 
+    /// Mistral reports prompt-cache hits as `usage.prompt_tokens_details.
+    /// cached_tokens`, and those must survive into the typed, cross-language
+    /// usage field rather than being dropped (upstream #7597).
+    ///
+    /// This port gets the mapping for free: `parse_response` delegates to the
+    /// OpenAI parser, whose usage handling already covers
+    /// `prompt_tokens_details`, where upstream's Mistral package hand-rolls
+    /// its own usage mapping and had to grow the field. The delegation is the
+    /// reason there is no bug here, so it is worth asserting rather than
+    /// assuming — a future decision to stop delegating would otherwise
+    /// reintroduce upstream's bug silently.
+    #[test]
+    fn parse_response_maps_prompt_cache_usage() {
+        let value = json!({
+            "id": "cmpl-125",
+            "model": "mistral-large-latest",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hello!" },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 7,
+                "total_tokens": 107,
+                "prompt_tokens_details": { "cached_tokens": 80 },
+            },
+        });
+        let usage = parse_response(&value).usage_details.unwrap();
+        assert_eq!(usage.cache_read_input_token_count, Some(80));
+        assert_eq!(
+            usage.additional_counts.get("prompt/cached_tokens"),
+            Some(&80)
+        );
+    }
+
+    /// A non-integer `cached_tokens` is ignored rather than coerced. Upstream
+    /// needed an explicit `isinstance(..., int) and not isinstance(..., bool)`
+    /// guard for this; `Value::as_u64` rejects strings, floats, and bools on
+    /// its own, so the behavior is structural here — asserted to keep it so.
+    #[test]
+    fn parse_response_ignores_non_integer_cached_tokens() {
+        for bogus in [json!("80"), json!(80.5), json!(true), json!(null)] {
+            let value = json!({
+                "id": "cmpl-126",
+                "model": "mistral-large-latest",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Hello!" },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 7,
+                    "total_tokens": 107,
+                    "prompt_tokens_details": { "cached_tokens": bogus },
+                },
+            });
+            let usage = parse_response(&value).usage_details.unwrap();
+            assert_eq!(usage.cache_read_input_token_count, None);
+            assert_eq!(usage.additional_counts.get("prompt/cached_tokens"), None);
+        }
+    }
+
     #[test]
     fn parse_response_tool_call() {
         let value = json!({

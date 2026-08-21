@@ -9,6 +9,31 @@ may break APIs).
 
 ### Fixed
 
+- **A Redis retention limit of zero retained everything** (upstream #7470).
+  `RedisChatMessageStore::with_max_messages(0)` is a request to retain
+  nothing — unlimited is expressed by not calling it at all — but trimming to
+  `-(max)` emits `LTRIM key 0 -1` for a limit of zero, which is Redis's "keep
+  the whole list", so the trim ran on every save and did nothing.
+  `add_messages` now returns before serializing, so no payload reaches Redis
+  (or an AOF or a replica) even briefly. Stored history is deliberately left
+  alone rather than deleted: the key carries no per-provider discriminator, so
+  two stores sharing a prefix and session id address the same list, and
+  deleting it would drop a co-located store's history. Use `clear` to remove
+  history. A negative limit — the other half of upstream's fix — is
+  unrepresentable here, since `max_messages` is a `usize`.
+- **Gemini 3 thought signatures were dropped across an approval round trip**
+  (upstream #7546). Gemini 3 rejects a `functionCall` part that lacks the
+  `thoughtSignature` it was issued with. Signatures were paired to calls by
+  adjacency alone, and any intervening content cleared the held signature —
+  so a `FunctionApprovalResponse` sitting between a reasoning carrier and its
+  call dropped it, and a call replayed in a later message could never be
+  signed at all. Both turns then failed with a 400. Content that emits no
+  wire Part no longer clears the signature, and a `call_id -> signature` map
+  accumulated as the conversation is emitted signs a later replay. Precedence
+  is unchanged: the call's own `protected_data`, then an adjacent carrier,
+  then the map. The map is written by the emit walk rather than a pre-pass, so
+  the pairing rules have a single implementation — a pre-pass that restated
+  them laxly would re-sign the very calls adjacency had refused.
 - **Stateless Responses requests never asked for the encrypted reasoning
   item.** A reasoning item is only replayable on the next turn of a `store:
   false` tool loop if it carries `encrypted_content`, and the service only
