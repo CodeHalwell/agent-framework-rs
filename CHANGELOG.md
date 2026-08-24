@@ -77,7 +77,11 @@ may break APIs).
   a window is searched for, preferring a match at the start (an at-cap list that
   has never actually been trimmed is still complete) and otherwise taking the
   last occurrence. The Redis store asks for `Window` only when its list is at
-  its cap.
+  its cap. Alignment also requires *evidence* that stored history could be a
+  replay at all — a matching message id, or a non-user turn, since a replay is
+  a transcript and carries the assistant's replies. Stored history that is
+  nothing but id-less user messages is indistinguishable from new input that
+  repeats it, and is left alone.
 - **Tool spans could report a different semconv version than chat spans.** The
   function-invocation loop rebuilt an `ObservabilityConfig` from the
   environment for every tool call, so a client configured explicitly for one

@@ -140,7 +140,7 @@ pub fn filter_new_messages_from<'a>(
     incoming: &'a [Message],
     shape: StoredHistory,
 ) -> &'a [Message] {
-    if existing.is_empty() || incoming.len() <= existing.len() {
+    if existing.is_empty() || incoming.len() <= existing.len() || !could_be_a_replay(existing) {
         return incoming;
     }
     let matches = |start: usize| {
@@ -169,6 +169,36 @@ pub fn filter_new_messages_from<'a>(
         Some(start) => &incoming[start + existing.len()..],
         None => incoming,
     }
+}
+
+/// Whether stored history could be a *replay* at all when it turns up inside a
+/// run's input, or whether a match could only ever be a coincidence.
+///
+/// Matching on content alone cannot tell a replayed transcript from new input
+/// that happens to repeat it — with stored `[user("yes")]`, an input of
+/// `[user("yes"), user("question")]` is equally well a caller replaying its one
+/// stored turn or a caller saying "yes" again and asking something. Treating it
+/// as a replay drops a real turn; treating it as new duplicates one. Neither
+/// content nor length separates them, so this asks what kind of evidence the
+/// stored messages carry:
+///
+/// - **A message id.** Ids are assigned, not guessed, so an id that matches is
+///   the replayed message, full stop.
+/// - **A non-user turn.** A replay is a *transcript*: it carries the assistant
+///   (and tool) turns the conversation produced. A caller sending genuinely new
+///   input sends its own turns, which are user messages — it does not compose
+///   the assistant's replies. So stored history that is nothing but id-less user
+///   messages is never read as a replay.
+///
+/// The cost is declining to deduplicate a genuine replay of a user-only,
+/// id-less history — a store whose retention window happens to hold no
+/// assistant turn, say — which then appends exactly as it did before any of
+/// this existed. That is the safe direction: a redundant write is trimmed away,
+/// a dropped turn is not recoverable.
+fn could_be_a_replay(existing: &[Message]) -> bool {
+    existing
+        .iter()
+        .any(|m| m.message_id.is_some() || m.role != crate::types::Role::user())
 }
 
 /// What a run adds to `existing`: the part of its **input** that is not a
@@ -759,6 +789,50 @@ mod tests {
                 StoredHistory::Window
             )),
             vec!["new".to_string()]
+        );
+    }
+
+    /// Stored history that is nothing but id-less user turns cannot be told
+    /// apart from new input that repeats it, so it is never read as a replay
+    /// (PR #16 review).
+    #[test]
+    fn id_less_user_only_history_is_never_read_as_a_replay() {
+        let existing = vec![Message::user("yes")];
+        let incoming = vec![Message::user("yes"), Message::user("question")];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["yes".to_string(), "question".to_string()],
+            "saying 'yes' again is not a replay of having said it"
+        );
+
+        // The same shape *with* the assistant's reply in the stored history is
+        // a transcript, and a caller sending it back is replaying.
+        let with_reply = vec![Message::user("yes"), Message::assistant("go on")];
+        let replayed = vec![
+            Message::user("yes"),
+            Message::assistant("go on"),
+            Message::user("question"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&with_reply, &replayed)),
+            vec!["question".to_string()]
+        );
+
+        // And a message id is evidence on its own, user-only or not.
+        let with_id = vec![Message {
+            message_id: Some("m1".to_string()),
+            ..Message::user("yes")
+        }];
+        let replayed_by_id = vec![
+            Message {
+                message_id: Some("m1".to_string()),
+                ..Message::user("yes")
+            },
+            Message::user("question"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&with_id, &replayed_by_id)),
+            vec!["question".to_string()]
         );
     }
 

@@ -107,7 +107,13 @@ A second review round raised two more, both fixed:
   conversation — and searching such a list loses the turns between two
   occurrences of it. The ambiguity that leaves (a genuine window whose content
   also opens the transcript) resolves to re-sending the middle, which the trim
-  discards, rather than to a dropped turn, which is not recoverable.
+  discards, rather than to a dropped turn, which is not recoverable. A sixth
+  round then reached the ambiguity underneath all of this: content alone cannot
+  tell a replayed transcript from new input that repeats it, so alignment now
+  requires *evidence* — a matching message id, or a non-user turn in the stored
+  block, since a replay is a transcript and carries the assistant's replies
+  while new input carries only the caller's own. Stored history that is nothing
+  but id-less user messages is left alone.
 - **A configured semconv version has to reach tool spans.** The tool loop
   rebuilt an `ObservabilityConfig` from the environment per call, so a client
   configured for one convention version could emit chat spans under it and tool
@@ -150,7 +156,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1658 passing**, 27 of them new), `cargo clippy --all-targets --all-features`
+(**1659 passing**, 28 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
