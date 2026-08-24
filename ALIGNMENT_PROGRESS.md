@@ -101,7 +101,13 @@ A second review round raised two more, both fixed:
   message in front of it — stored `[yes]` against an input of
   `[preface, yes, question]` kept only `question`, and `before_run` then
   injected nothing, so the stored turn never reached the model either. The
-  search remains for `Window`, which is what it was always for.
+  search remains for `Window`, but prefers an anchored match there too: a fifth
+  round pointed out that a list merely *reaching* its cap has not necessarily
+  been trimmed — a first write that filled it exactly is still the complete
+  conversation — and searching such a list loses the turns between two
+  occurrences of it. The ambiguity that leaves (a genuine window whose content
+  also opens the transcript) resolves to re-sending the middle, which the trim
+  discards, rather than to a dropped turn, which is not recoverable.
 - **A configured semconv version has to reach tool spans.** The tool loop
   rebuilt an `ObservabilityConfig` from the environment per call, so a client
   configured for one convention version could emit chat spans under it and tool
@@ -144,7 +150,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1657 passing**, 26 of them new), `cargo clippy --all-targets --all-features`
+(**1658 passing**, 27 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
