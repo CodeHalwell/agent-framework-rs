@@ -11,8 +11,10 @@
 //!   — the human-readable name is carried in the `otel.name` field (the static
 //!   `tracing` metadata name is the bare operation, since `tracing` requires a
 //!   literal span name).
-//! * chat-span attributes: `gen_ai.operation.name`, `gen_ai.system` /
-//!   `gen_ai.provider.name` (dual-emitted — see [`attr::PROVIDER_NAME`]),
+//! * chat-span attributes: `gen_ai.operation.name`, the provider tag as
+//!   either `gen_ai.provider.name` or `gen_ai.system` (whichever the active
+//!   GenAI semantic-convention version defines — see
+//!   [`ObservabilityConfig::use_latest_experimental_gen_ai_semconv`]),
 //!   `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`,
 //!   `gen_ai.response.finish_reasons`, `gen_ai.usage.{input,output}_tokens`,
 //!   the request parameters (`gen_ai.request.{temperature,top_p,max_tokens,
@@ -81,8 +83,11 @@
 //! ## Environment configuration
 //!
 //! [`ObservabilityConfig::from_env`] reads `ENABLE_SENSITIVE_DATA` (mirrors
-//! Python's `enable_sensitive_data`, `observability.py:347-394`) for use with
-//! [`ObservableChatClient::from_env`]. Unlike Python, there is no
+//! Python's `enable_sensitive_data`, `observability.py:347-394`) and
+//! `OTEL_SEMCONV_STABILITY_OPT_IN` (which GenAI semantic-convention version to
+//! emit — see
+//! [`ObservabilityConfig::use_latest_experimental_gen_ai_semconv`]) for use
+//! with [`ObservableChatClient::from_env`]. Unlike Python, there is no
 //! `ENABLE_OTEL` equivalent to read: this crate's spans are plain `tracing`
 //! spans, already effectively free without a subscriber attached, so there is
 //! no separate "enable observability" switch.
@@ -99,14 +104,19 @@ use crate::error::{Error, Result};
 use crate::tools::ToolDefinition;
 use crate::types::{ChatOptions, ChatResponse, Message};
 
+/// The token recognized in `OTEL_SEMCONV_STABILITY_OPT_IN` that selects the
+/// GenAI semantic conventions **above** the v1.36.0 baseline. Mirrors
+/// upstream's `GEN_AI_LATEST_EXPERIMENTAL_OPT_IN`.
+pub const GEN_AI_LATEST_EXPERIMENTAL_OPT_IN: &str = "gen_ai_latest_experimental";
+
 /// OpenTelemetry GenAI semantic-convention attribute keys.
 pub mod attr {
     pub const OPERATION: &str = "gen_ai.operation.name";
     /// The provider/system tag, e.g. `"openai"`. Supplied by the client.
     pub const SYSTEM: &str = "gen_ai.system";
-    /// Current semantic-convention replacement for [`SYSTEM`]; both are set
-    /// from the same value so older and newer consumers each find what they
-    /// expect on the span.
+    /// Semantic-convention replacement for [`SYSTEM`], introduced above
+    /// v1.36.0. Exactly one of the two is emitted, selected by
+    /// [`ObservabilityConfig::use_latest_experimental_gen_ai_semconv`].
     pub const PROVIDER_NAME: &str = "gen_ai.provider.name";
     pub const REQUEST_MODEL: &str = "gen_ai.request.model";
     pub const RESPONSE_MODEL: &str = "gen_ai.response.model";
@@ -202,13 +212,13 @@ pub fn error_type(err: &Error) -> String {
 /// rest of the request/response/error attribute set is filled in afterward
 /// via [`record_request`], [`record_response`], and [`record_error`] — mirrors
 /// `_get_span_attributes` (`observability.py:1345-1404`).
-pub fn chat_span(system: &str, model: &str) -> Span {
+pub fn chat_span(system: &str, model: &str, latest_semconv: bool) -> Span {
     let span = tracing::info_span!(
         "chat",
         otel.name = Empty,
         gen_ai.operation.name = op::CHAT,
-        gen_ai.system = system,
-        gen_ai.provider.name = system,
+        gen_ai.system = Empty,
+        gen_ai.provider.name = Empty,
         gen_ai.request.model = model,
         gen_ai.response.model = Empty,
         gen_ai.response.id = Empty,
@@ -234,6 +244,14 @@ pub fn chat_span(system: &str, model: &str) -> Span {
         gen_ai.input.messages = Empty,
         gen_ai.output.messages = Empty,
     );
+    // `gen_ai.system` was renamed to `gen_ai.provider.name` above v1.36.0;
+    // emit the one the active convention defines. A field left `Empty` is
+    // never exported, so the other name simply does not appear on the span.
+    if latest_semconv {
+        span.record(attr::PROVIDER_NAME, system);
+    } else {
+        span.record(attr::SYSTEM, system);
+    }
     span.record(attr::OTEL_NAME, format!("{} {}", op::CHAT, model).as_str());
     span
 }
@@ -313,8 +331,12 @@ pub fn tool_span(tool_name: &str, call_id: &str) -> Span {
 /// Record tool-call arguments onto a tool span, gated by content capture
 /// (mirrors the `SENSITIVE_DATA_ENABLED`-gated `gen_ai.tool.call.arguments`
 /// capture in Python's `AIFunction.invoke`, `_tools.py:751-759`).
-pub fn record_tool_arguments(span: &Span, arguments: &serde_json::Value, capture_content: bool) {
-    if !capture_content {
+pub fn record_tool_arguments(
+    span: &Span,
+    arguments: &serde_json::Value,
+    config: &ObservabilityConfig,
+) {
+    if !config.emit_tool_call_attributes() {
         return;
     }
     span.record(attr::TOOL_CALL_ARGUMENTS, arguments.to_string().as_str());
@@ -323,8 +345,8 @@ pub fn record_tool_arguments(span: &Span, arguments: &serde_json::Value, capture
 /// Record a tool-call result onto a tool span, gated by content capture
 /// (mirrors the `gen_ai.tool.call.result` capture in Python's
 /// `AIFunction.invoke`, `_tools.py:779-787`).
-pub fn record_tool_result(span: &Span, result: &serde_json::Value, capture_content: bool) {
-    if !capture_content {
+pub fn record_tool_result(span: &Span, result: &serde_json::Value, config: &ObservabilityConfig) {
+    if !config.emit_tool_call_attributes() {
         return;
     }
     span.record(attr::TOOL_CALL_RESULT, result.to_string().as_str());
@@ -347,7 +369,8 @@ pub fn record_error(span: &Span, err: &Error) {
 
 /// Record the response-side attributes (finish reason, usage, id, model) onto
 /// `span`, mirroring `_get_response_attributes` (`observability.py:1488-1512`).
-pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bool) {
+pub fn record_response(span: &Span, response: &ChatResponse, config: &ObservabilityConfig) {
+    let capture_content = config.enable_sensitive_data;
     if let Some(reason) = &response.finish_reason {
         span.record(attr::FINISH_REASONS, reason.as_str());
     }
@@ -364,14 +387,19 @@ pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bo
         if let Some(output) = usage.output_token_count {
             span.record(attr::OUTPUT_TOKENS, output);
         }
-        if let Some(v) = usage.cache_creation_input_token_count {
-            span.record(attr::CACHE_CREATION_INPUT_TOKENS, v);
-        }
-        if let Some(v) = usage.cache_read_input_token_count {
-            span.record(attr::CACHE_READ_INPUT_TOKENS, v);
-        }
-        if let Some(v) = usage.reasoning_output_token_count {
-            span.record(attr::REASONING_OUTPUT_TOKENS, v);
+        // The cache and reasoning token counts were introduced above the
+        // v1.36.0 baseline, so a consumer pinned to the baseline must not see
+        // them (upstream #7673).
+        if config.use_latest_experimental_gen_ai_semconv() {
+            if let Some(v) = usage.cache_creation_input_token_count {
+                span.record(attr::CACHE_CREATION_INPUT_TOKENS, v);
+            }
+            if let Some(v) = usage.cache_read_input_token_count {
+                span.record(attr::CACHE_READ_INPUT_TOKENS, v);
+            }
+            if let Some(v) = usage.reasoning_output_token_count {
+                span.record(attr::REASONING_OUTPUT_TOKENS, v);
+            }
         }
     }
     if capture_content {
@@ -386,7 +414,8 @@ pub fn record_response(span: &Span, response: &ChatResponse, capture_content: bo
 /// mirroring `_get_span_attributes` (`observability.py:1345-1404`). System
 /// instructions and the serialized tool list are additionally gated by
 /// `capture_content` (mirrors Python's `SENSITIVE_DATA_ENABLED` gate).
-pub fn record_request(span: &Span, options: &ChatOptions, capture_content: bool) {
+pub fn record_request(span: &Span, options: &ChatOptions, config: &ObservabilityConfig) {
+    let capture_content = config.enable_sensitive_data;
     if let Some(v) = options.temperature {
         span.record(attr::REQUEST_TEMPERATURE, f64::from(v));
     }
@@ -425,7 +454,9 @@ pub fn record_request(span: &Span, options: &ChatOptions, capture_content: bool)
                 );
             }
         }
-        if !options.tools.is_empty() {
+        // `gen_ai.tool.definitions` is also an above-baseline attribute, so it
+        // needs the semconv version as well as content capture.
+        if !options.tools.is_empty() && config.use_latest_experimental_gen_ai_semconv() {
             span.record(
                 attr::TOOL_DEFINITIONS,
                 tool_definitions_json(&options.tools).as_str(),
@@ -470,7 +501,7 @@ fn messages_json(messages: &[Message]) -> String {
 /// latter, so they (and the work to populate them) are compiled out
 /// entirely when the feature is off.
 struct StreamTelemetry {
-    capture: bool,
+    config: ObservabilityConfig,
     #[cfg(feature = "otel-metrics")]
     system: String,
     #[cfg(feature = "otel-metrics")]
@@ -491,7 +522,7 @@ struct StreamTelemetry {
 pub struct ObservableChatClient<C: ChatClient> {
     inner: C,
     system: String,
-    capture_content: bool,
+    config: ObservabilityConfig,
 }
 
 impl<C: ChatClient> ObservableChatClient<C> {
@@ -502,7 +533,13 @@ impl<C: ChatClient> ObservableChatClient<C> {
         Self {
             inner,
             system: system.into(),
-            capture_content: false,
+            // Content capture stays off unless asked for; the semconv opt-in
+            // still comes from the environment, since it describes the
+            // *consumer* of the telemetry rather than this call site.
+            config: ObservabilityConfig {
+                enable_sensitive_data: false,
+                ..ObservabilityConfig::from_env()
+            },
         }
     }
 
@@ -515,12 +552,19 @@ impl<C: ChatClient> ObservableChatClient<C> {
     /// ```
     pub fn from_env(inner: C, system: impl Into<String>) -> Self {
         let config = ObservabilityConfig::from_env();
-        Self::new(inner, system).with_content_capture(config.enable_sensitive_data)
+        Self::new(inner, system).with_observability_config(config)
     }
 
     /// Enable or disable capturing message content on spans (default: off).
     pub fn with_content_capture(mut self, capture: bool) -> Self {
-        self.capture_content = capture;
+        self.config.enable_sensitive_data = capture;
+        self
+    }
+
+    /// Replace the whole [`ObservabilityConfig`] — content capture *and* the
+    /// GenAI semantic-convention version this client emits for.
+    pub fn with_observability_config(mut self, config: ObservabilityConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -546,12 +590,16 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let request_model = self.model_for(&options);
-        let span = chat_span(&self.system, &request_model);
-        record_request(&span, &options, self.capture_content);
-        if self.capture_content {
+        let span = chat_span(
+            &self.system,
+            &request_model,
+            self.config.use_latest_experimental_gen_ai_semconv(),
+        );
+        record_request(&span, &options, &self.config);
+        if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
         }
-        let capture = self.capture_content;
+        let config = self.config.clone();
         #[cfg(feature = "otel-metrics")]
         let start = std::time::Instant::now();
         async move {
@@ -559,7 +607,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             let span = Span::current();
             match &result {
                 Ok(response) => {
-                    record_response(&span, response, capture);
+                    record_response(&span, response, &config);
                     #[cfg(feature = "otel-metrics")]
                     {
                         let (input_tokens, output_tokens) = response
@@ -574,6 +622,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                             input_tokens,
                             output_tokens,
                             start.elapsed(),
+                            config.use_latest_experimental_gen_ai_semconv(),
                         );
                     }
                 }
@@ -593,12 +642,16 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let request_model = self.model_for(&options);
-        let span = chat_span(&self.system, &request_model);
-        record_request(&span, &options, self.capture_content);
-        if self.capture_content {
+        let span = chat_span(
+            &self.system,
+            &request_model,
+            self.config.use_latest_experimental_gen_ai_semconv(),
+        );
+        record_request(&span, &options, &self.config);
+        if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
         }
-        let capture = self.capture_content;
+        let config = self.config.clone();
         // Instrument the initiation future with the span (never hold an
         // `enter()` guard across an await); attribute recording happens as
         // the stream drains and completes.
@@ -620,7 +673,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         // chunks, recording them onto the span (and, with `otel-metrics`, the
         // completion histograms) when the stream ends.
         let telemetry = StreamTelemetry {
-            capture,
+            config,
             #[cfg(feature = "otel-metrics")]
             system: self.system.clone(),
             #[cfg(feature = "otel-metrics")]
@@ -649,7 +702,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                     None => {
                         if let Some(span) = span.take() {
                             agg.finalize();
-                            record_response(&span, &agg, telemetry.capture);
+                            record_response(&span, &agg, &telemetry.config);
                             #[cfg(feature = "otel-metrics")]
                             {
                                 let (input_tokens, output_tokens) = agg
@@ -664,6 +717,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                                     input_tokens,
                                     output_tokens,
                                     telemetry.start.elapsed(),
+                                    telemetry.config.use_latest_experimental_gen_ai_semconv(),
                                 );
                             }
                         }
@@ -699,6 +753,11 @@ pub struct ObservabilityConfig {
     /// Python's `enable_sensitive_data` — "Warning: Sensitive events should
     /// only be enabled on test and development environments.").
     pub enable_sensitive_data: bool,
+    /// The raw `OTEL_SEMCONV_STABILITY_OPT_IN` value: a comma-separated
+    /// opt-in list in OpenTelemetry's standard format. Only the
+    /// [`GEN_AI_LATEST_EXPERIMENTAL_OPT_IN`] token is consulted here — see
+    /// [`use_latest_experimental_gen_ai_semconv`](Self::use_latest_experimental_gen_ai_semconv).
+    pub otel_semconv_stability_opt_in: Option<String>,
 }
 
 impl ObservabilityConfig {
@@ -709,7 +768,46 @@ impl ObservabilityConfig {
     pub fn from_env() -> Self {
         Self {
             enable_sensitive_data: env_flag("ENABLE_SENSITIVE_DATA"),
+            otel_semconv_stability_opt_in: std::env::var("OTEL_SEMCONV_STABILITY_OPT_IN").ok(),
         }
+    }
+
+    /// Whether to emit the GenAI semantic conventions **above** the v1.36.0
+    /// baseline.
+    ///
+    /// v1.36.0 is the OTel-recommended baseline; every version above it is
+    /// "latest" here. Computed from
+    /// [`otel_semconv_stability_opt_in`](Self::otel_semconv_stability_opt_in):
+    /// unset defaults to `true` (opted in), which — as upstream documents —
+    /// deliberately differs from OpenTelemetry's own default of retaining the
+    /// baseline. Set the variable to a list that omits
+    /// [`GEN_AI_LATEST_EXPERIMENTAL_OPT_IN`] to get the baseline instead.
+    ///
+    /// Two things change when this is `false`:
+    ///
+    /// - the provider is reported as `gen_ai.system` rather than
+    ///   `gen_ai.provider.name` (the rename landed above v1.36.0), and
+    /// - the attributes introduced above the baseline
+    ///   (`gen_ai.usage.cache_creation.input_tokens`,
+    ///   `gen_ai.usage.cache_read.input_tokens`,
+    ///   `gen_ai.usage.reasoning.output_tokens`, `gen_ai.tool.definitions`,
+    ///   `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) are not
+    ///   emitted at all.
+    pub fn use_latest_experimental_gen_ai_semconv(&self) -> bool {
+        match &self.otel_semconv_stability_opt_in {
+            None => true,
+            Some(value) => value
+                .split(',')
+                .any(|token| token.trim() == GEN_AI_LATEST_EXPERIMENTAL_OPT_IN),
+        }
+    }
+
+    /// Whether to emit `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result`
+    /// on `execute_tool` spans. These carry tool content *and* were introduced
+    /// above v1.36.0, so they need both content capture and the semconv
+    /// version that defines them.
+    pub fn emit_tool_call_attributes(&self) -> bool {
+        self.enable_sensitive_data && self.use_latest_experimental_gen_ai_semconv()
     }
 
     /// The `OTEL_SERVICE_NAME` passthrough, defaulting to `"agent_framework"`
@@ -851,11 +949,19 @@ pub mod metrics {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         duration: Duration,
+        latest_semconv: bool,
     ) {
         let m = instruments();
+        // Same rename as on the spans: `gen_ai.system` below the v1.36.0
+        // baseline, `gen_ai.provider.name` above it.
+        let provider_key = if latest_semconv {
+            attr::PROVIDER_NAME
+        } else {
+            attr::SYSTEM
+        };
         let mut base = vec![
             KeyValue::new(attr::OPERATION, op::CHAT),
-            KeyValue::new(attr::PROVIDER_NAME, provider.to_string()),
+            KeyValue::new(provider_key, provider.to_string()),
             KeyValue::new(attr::REQUEST_MODEL, request_model.to_string()),
         ];
         if let Some(model) = response_model {

@@ -291,9 +291,8 @@ async fn execute_tool_call(
                         &call_id,
                         Some(&description),
                     );
-                    let capture =
-                        crate::observability::ObservabilityConfig::from_env().enable_sensitive_data;
-                    crate::observability::record_tool_arguments(&span, &ctx.arguments, capture);
+                    let obs_config = crate::observability::ObservabilityConfig::from_env();
+                    crate::observability::record_tool_arguments(&span, &ctx.arguments, &obs_config);
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
@@ -316,7 +315,7 @@ async fn execute_tool_call(
                             .as_deref(),
                     );
                     if let Ok(value) = &outcome {
-                        crate::observability::record_tool_result(&span, value, capture);
+                        crate::observability::record_tool_result(&span, value, &obs_config);
                     }
                     ctx.result = Some(outcome?);
                     Ok(ctx)

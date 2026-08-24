@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_framework_core::observability::{
     attr, record_error, record_tool_arguments, record_tool_result, tool_span, tool_span_ex,
-    ObservableChatClient,
+    ObservabilityConfig, ObservableChatClient, GEN_AI_LATEST_EXPERIMENTAL_OPT_IN,
 };
 use agent_framework_core::prelude::*;
 use async_trait::async_trait;
@@ -65,6 +65,39 @@ impl ChatClient for StubClient {
 
     fn model(&self) -> Option<&str> {
         Some("stub-model")
+    }
+}
+
+/// A stub reporting the token counts that only exist above the v1.36.0
+/// baseline, so the version gate has something to withhold.
+#[derive(Default)]
+struct CacheUsageStubClient;
+
+#[async_trait]
+impl ChatClient for CacheUsageStubClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let mut resp = ChatResponse::from_text("hi");
+        resp.usage_details = Some(UsageDetails {
+            input_token_count: Some(7),
+            output_token_count: Some(3),
+            cache_creation_input_token_count: Some(11),
+            cache_read_input_token_count: Some(13),
+            reasoning_output_token_count: Some(17),
+            ..Default::default()
+        });
+        Ok(resp)
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Ok(Box::pin(futures::stream::empty()))
     }
 }
 
@@ -395,12 +428,47 @@ fn chat_span_omits_unset_request_attributes() {
     }
 }
 
-// -- chat span: gen_ai.system / gen_ai.provider.name dual emission ----
+// -- chat span: gen_ai.provider.name vs gen_ai.system ------------------
 
+/// Above the v1.36.0 baseline — the default — the provider is reported as
+/// `gen_ai.provider.name`, and the pre-rename `gen_ai.system` is not emitted
+/// at all (upstream #7673).
 #[test]
-fn chat_span_dual_emits_system_and_provider_name() {
+fn chat_span_emits_provider_name_under_the_latest_semconv() {
     let capture = run_captured(|| async {
-        let client = ObservableChatClient::new(StubClient::default(), "my-provider");
+        let client = ObservableChatClient::new(StubClient::default(), "my-provider")
+            .with_observability_config(ObservabilityConfig::default());
+        let _ = client
+            .get_response(
+                vec![Message::user("hi")],
+                ChatOptions::new().with_model("m"),
+            )
+            .await;
+    });
+    let span = capture.by_name("chat").expect("expected a chat span");
+    assert_eq!(
+        span.fields.get(attr::PROVIDER_NAME).map(String::as_str),
+        Some("my-provider")
+    );
+    assert!(
+        !span.fields.contains_key(attr::SYSTEM),
+        "the renamed-away attribute must not also be emitted, got {:?}",
+        span.fields.get(attr::SYSTEM)
+    );
+}
+
+/// Opting out of the latest conventions puts the provider back on
+/// `gen_ai.system`, the name the v1.36.0 baseline defines.
+#[test]
+fn chat_span_emits_system_when_opted_out_of_the_latest_semconv() {
+    let capture = run_captured(|| async {
+        let client = ObservableChatClient::new(StubClient::default(), "my-provider")
+            .with_observability_config(ObservabilityConfig {
+                enable_sensitive_data: false,
+                // A non-empty opt-in list that does not name the GenAI token:
+                // an unrelated opt-in must not be read as opting *in* here.
+                otel_semconv_stability_opt_in: Some("database".to_string()),
+            });
         let _ = client
             .get_response(
                 vec![Message::user("hi")],
@@ -413,9 +481,129 @@ fn chat_span_dual_emits_system_and_provider_name() {
         span.fields.get(attr::SYSTEM).map(String::as_str),
         Some("my-provider")
     );
+    assert!(
+        !span.fields.contains_key(attr::PROVIDER_NAME),
+        "the above-baseline name must not be emitted, got {:?}",
+        span.fields.get(attr::PROVIDER_NAME)
+    );
+}
+
+/// The opt-in list is comma-separated in OpenTelemetry's standard format, so
+/// the GenAI token alongside others still selects the latest conventions.
+#[test]
+fn semconv_opt_in_token_is_found_in_a_multi_entry_list() {
+    let config = ObservabilityConfig {
+        enable_sensitive_data: false,
+        otel_semconv_stability_opt_in: Some(format!(
+            "database, {GEN_AI_LATEST_EXPERIMENTAL_OPT_IN} ,http"
+        )),
+    };
+    assert!(config.use_latest_experimental_gen_ai_semconv());
+
+    let unset = ObservabilityConfig::default();
+    assert!(
+        unset.use_latest_experimental_gen_ai_semconv(),
+        "unset must default to the latest conventions, as upstream does"
+    );
+}
+
+/// The cache/reasoning token counts and `gen_ai.tool.definitions` were all
+/// introduced above the v1.36.0 baseline: emitted by default, withheld from a
+/// consumer pinned to the baseline (upstream #7673).
+#[test]
+fn above_baseline_attributes_follow_the_semconv_opt_in() {
+    fn run(config: ObservabilityConfig) -> FieldCapture {
+        run_captured(move || {
+            let config = config.clone();
+            async move {
+                let client = ObservableChatClient::new(CacheUsageStubClient, "my-provider")
+                    .with_observability_config(config);
+                let options = ChatOptions::new().with_model("m").with_tool(
+                    FunctionTool::new(
+                        "noop",
+                        "does nothing",
+                        serde_json::json!({"type": "object", "properties": {}}),
+                        |_a| async move { Ok(serde_json::Value::Null) },
+                    )
+                    .into_definition(),
+                );
+                let _ = client
+                    .get_response(vec![Message::user("hi")], options)
+                    .await;
+            }
+        })
+    }
+
+    let gated = [
+        attr::CACHE_CREATION_INPUT_TOKENS,
+        attr::CACHE_READ_INPUT_TOKENS,
+        attr::REASONING_OUTPUT_TOKENS,
+        attr::TOOL_DEFINITIONS,
+    ];
+
+    // Latest conventions (the default) plus content capture: all present.
+    let capture = run(capturing_config());
+    let span = capture.by_name("chat").expect("expected a chat span");
+    for key in gated {
+        assert!(
+            span.fields.contains_key(key),
+            "expected {key} under the latest conventions"
+        );
+    }
+    // The baseline counts are unaffected by the opt-in.
     assert_eq!(
-        span.fields.get(attr::PROVIDER_NAME).map(String::as_str),
-        Some("my-provider")
+        span.fields.get(attr::INPUT_TOKENS).map(String::as_str),
+        Some("7")
+    );
+
+    // Same content capture, baseline conventions: none of the four.
+    let capture = run(ObservabilityConfig {
+        enable_sensitive_data: true,
+        otel_semconv_stability_opt_in: Some("database".to_string()),
+    });
+    let span = capture.by_name("chat").expect("expected a chat span");
+    for key in gated {
+        assert!(
+            !span.fields.contains_key(key),
+            "expected {key} to be withheld at the v1.36.0 baseline, got {:?}",
+            span.fields.get(key)
+        );
+    }
+    assert_eq!(
+        span.fields.get(attr::INPUT_TOKENS).map(String::as_str),
+        Some("7"),
+        "the baseline token counts must still be emitted"
+    );
+}
+
+/// `gen_ai.tool.call.arguments`/`result` need *both* content capture and the
+/// semconv version that defines them.
+#[test]
+fn tool_call_attributes_need_the_latest_semconv_as_well_as_capture() {
+    let capture = run_captured(|| async {
+        let span = tool_span_ex("get_weather", "call-1", None);
+        async {
+            let args = serde_json::json!({"city": "Seattle"});
+            let result = serde_json::json!({"temp_f": 65});
+            let current = tracing::Span::current();
+            let config = ObservabilityConfig {
+                enable_sensitive_data: true,
+                otel_semconv_stability_opt_in: Some("database".to_string()),
+            };
+            record_tool_arguments(&current, &args, &config);
+            record_tool_result(&current, &result, &config);
+        }
+        .instrument(span)
+        .await;
+    });
+    let span = capture
+        .by_name("execute_tool")
+        .expect("expected an execute_tool span");
+    assert!(
+        !span.fields.contains_key(attr::TOOL_CALL_ARGUMENTS)
+            && !span.fields.contains_key(attr::TOOL_CALL_RESULT),
+        "content capture alone must not emit above-baseline attributes: {:?}",
+        span.fields
     );
 }
 
@@ -537,6 +725,15 @@ fn chat_span_records_error_status_on_failure() {
 
 // -- tool span --------------------------------------------------------
 
+/// A config with content capture on and the default (latest) GenAI semantic
+/// conventions — the combination `gen_ai.tool.call.arguments`/`result` need.
+fn capturing_config() -> ObservabilityConfig {
+    ObservabilityConfig {
+        enable_sensitive_data: true,
+        otel_semconv_stability_opt_in: None,
+    }
+}
+
 #[test]
 fn tool_span_ex_records_description_type_and_gated_arguments_result() {
     let capture = run_captured(|| async {
@@ -545,8 +742,8 @@ fn tool_span_ex_records_description_type_and_gated_arguments_result() {
             let args = serde_json::json!({"city": "Seattle"});
             let result = serde_json::json!({"temp_f": 65});
             let current = tracing::Span::current();
-            record_tool_arguments(&current, &args, true);
-            record_tool_result(&current, &result, true);
+            record_tool_arguments(&current, &args, &capturing_config());
+            record_tool_result(&current, &result, &capturing_config());
         }
         .instrument(span)
         .await;
@@ -591,8 +788,8 @@ fn tool_span_gates_arguments_and_result_behind_content_capture() {
             let args = serde_json::json!({"city": "Seattle"});
             let result = serde_json::json!({"temp_f": 65});
             let current = tracing::Span::current();
-            record_tool_arguments(&current, &args, false);
-            record_tool_result(&current, &result, false);
+            record_tool_arguments(&current, &args, &ObservabilityConfig::default());
+            record_tool_result(&current, &result, &ObservabilityConfig::default());
         }
         .instrument(span)
         .await;
