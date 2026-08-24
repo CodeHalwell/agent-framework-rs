@@ -71,10 +71,11 @@ may break APIs).
   q2` for a caller replaying `q1, a1, q2`. All four history providers now
   inject nothing when the run's input already carries the stored run
   (`inject_stored_history`).
-  `StoredHistory::{Complete, Window}` selects which occurrence of a stored run
-  a replay aligns on — the first for a provider that keeps everything, the last
-  for a retention-limited one whose stored list is a window of the most recent
-  messages (the Redis store picks `Window` only when its list is at its cap).
+  `StoredHistory::{Complete, Window}` selects where a stored run is looked for:
+  a complete history is matched at the start only — it begins at the
+  conversation's first message, so a replay of it can only begin with it — while
+  a window has to be searched for, taking the last occurrence (the Redis store
+  picks `Window` only when its list is at its cap).
 - **Tool spans could report a different semconv version than chat spans.** The
   function-invocation loop rebuilt an `ObservabilityConfig` from the
   environment for every tool call, so a client configured explicitly for one

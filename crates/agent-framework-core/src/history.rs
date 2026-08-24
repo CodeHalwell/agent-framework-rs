@@ -73,14 +73,12 @@ fn message_identity(message: &Message) -> MessageIdentity<'_> {
 /// the stored tail swallow the genuinely new turn in front of it.
 ///
 /// The stored run is located inside `incoming` by matching every message by
-/// [`MessageIdentity`]; the messages after that block are the new ones. Offset
-/// `0` — `incoming` starting with exactly what is stored — is the ordinary
-/// replay case; a later offset covers a provider whose stored history is a
-/// trimmed window of the conversation (a retention limit having dropped the
-/// oldest messages). When the stored run occurs more than once, which
-/// occurrence counts depends on what the provider holds: this function assumes
-/// [`StoredHistory::Complete`], and a windowed store should call
-/// [`filter_new_messages_from`] instead.
+/// [`MessageIdentity`]; the messages after that block are the new ones. Where
+/// it is looked for depends on what the provider holds, which is why
+/// [`StoredHistory`] is a parameter rather than a guess: a complete history can
+/// only be matched at offset `0`, while a trimmed window has to be searched
+/// for. This function assumes [`StoredHistory::Complete`]; a windowed store
+/// should call [`filter_new_messages_from`] instead.
 ///
 /// When no alignment is found, **all** of `incoming` is returned: appending is
 /// the behavior every provider had before this function existed, so a
@@ -140,10 +138,18 @@ pub fn filter_new_messages_from<'a>(
             .zip(existing)
             .all(|(a, b)| message_identity(a) == message_identity(b))
     };
-    let starts = 0..(incoming.len() - existing.len());
     let found = match shape {
-        StoredHistory::Complete => starts.into_iter().find(|s| matches(*s)),
-        StoredHistory::Window => starts.rev().find(|s| matches(*s)),
+        // A complete history starts at the conversation's first message, so a
+        // replay of it can only *begin* with it. Matching at a later offset
+        // would mean the input carried turns from before the conversation
+        // started — impossible — and a coincidental match there would silently
+        // drop every genuinely new message in front of it.
+        StoredHistory::Complete => matches(0).then_some(0),
+        // A window sits somewhere in the middle of the transcript, so it has to
+        // be searched for; the last occurrence is the retained one.
+        StoredHistory::Window => (0..(incoming.len() - existing.len()))
+            .rev()
+            .find(|s| matches(*s)),
     };
     match found {
         Some(start) => &incoming[start + existing.len()..],
@@ -664,7 +670,8 @@ mod tests {
     }
 
     /// A provider with a retention limit stores a *window* of the
-    /// conversation, so the replayed transcript starts before what is stored.
+    /// conversation, so the replayed transcript starts before what is stored
+    /// and the window has to be searched for.
     #[test]
     fn filter_new_messages_aligns_a_trimmed_window() {
         let existing = vec![Message::user("q2"), Message::assistant("a2")];
@@ -676,8 +683,36 @@ mod tests {
             Message::user("q3"),
         ];
         assert_eq!(
-            texts(filter_new_messages(&existing, &incoming)),
+            texts(filter_new_messages_from(
+                &existing,
+                &incoming,
+                StoredHistory::Window
+            )),
             vec!["q3".to_string()]
+        );
+        // A *complete* history can only be a replay when it comes first, so the
+        // same input is entirely new to a store that keeps everything.
+        assert_eq!(filter_new_messages(&existing, &incoming).len(), 5);
+    }
+
+    /// A complete history matched at a later offset would drop every genuinely
+    /// new message in front of the coincidence (PR #16 review).
+    #[test]
+    fn a_complete_history_never_matches_past_the_start() {
+        let existing = vec![Message::user("yes")];
+        let incoming = vec![
+            Message::user("preface"),
+            Message::user("yes"),
+            Message::user("question"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec![
+                "preface".to_string(),
+                "yes".to_string(),
+                "question".to_string()
+            ],
+            "nothing may be dropped: the stored 'yes' is not where this input starts"
         );
     }
 
