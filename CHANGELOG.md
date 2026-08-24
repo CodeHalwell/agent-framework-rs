@@ -81,7 +81,8 @@ may break APIs).
   convention version emitted tool spans under whatever the environment said.
   `FunctionInvokingChatClient` now carries the config, settable with
   `with_observability_config` and resolved from the environment once at
-  construction.
+  construction. `AgentBuilder::observability_config` reaches that wrapper,
+  which the builder constructs itself.
 
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain

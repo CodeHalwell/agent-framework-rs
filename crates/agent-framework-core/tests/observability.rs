@@ -666,6 +666,46 @@ fn tool_spans_follow_the_clients_configured_semconv_not_the_environment() {
     );
 }
 
+/// The builder wraps the caller's client in the tool-loop client itself, so
+/// without a way through it an explicit config reaches chat spans only and the
+/// setter is unreachable (PR #16 review).
+#[test]
+fn agent_builder_threads_the_observability_config_into_the_tool_loop() {
+    let capture = run_captured(|| async {
+        unsafe { std::env::set_var("ENABLE_SENSITIVE_DATA", "true") };
+        unsafe { std::env::remove_var("OTEL_SEMCONV_STABILITY_OPT_IN") };
+
+        let agent = Agent::builder(ToolCallingStubClient::default())
+            .observability_config(ObservabilityConfig {
+                enable_sensitive_data: true,
+                otel_semconv_stability_opt_in: Some("database".to_string()),
+            })
+            .tool(
+                FunctionTool::new(
+                    "noop",
+                    "does nothing",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                    |_a| async move { Ok(serde_json::json!("ok")) },
+                )
+                .into_definition(),
+            )
+            .build();
+        let _ = agent.run_once("go").await;
+
+        unsafe { std::env::remove_var("ENABLE_SENSITIVE_DATA") };
+    });
+
+    let span = capture
+        .by_name("execute_tool")
+        .expect("expected an execute_tool span");
+    assert!(
+        !span.fields.contains_key(attr::TOOL_CALL_ARGUMENTS)
+            && !span.fields.contains_key(attr::TOOL_CALL_RESULT),
+        "the builder must pass the configured baseline to the tool loop: {:?}",
+        span.fields
+    );
+}
+
 /// `gen_ai.tool.call.arguments`/`result` need *both* content capture and the
 /// semconv version that defines them.
 #[test]

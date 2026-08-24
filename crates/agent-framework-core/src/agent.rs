@@ -1039,6 +1039,9 @@ pub struct AgentBuilder {
     agent_middleware: Vec<Arc<crate::middleware::AgentMiddleware>>,
     chat_middleware: Vec<Arc<crate::middleware::ChatMiddleware>>,
     function_middleware: Vec<Arc<crate::middleware::FunctionMiddleware>>,
+    /// Governs the tool-loop spans; `None` leaves the wrapper reading the
+    /// environment. See [`AgentBuilder::observability_config`].
+    observability: Option<crate::observability::ObservabilityConfig>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
@@ -1055,6 +1058,7 @@ impl AgentBuilder {
             agent_middleware: Vec::new(),
             chat_middleware: Vec::new(),
             function_middleware: Vec::new(),
+            observability: None,
             tool_sources: Vec::new(),
         }
     }
@@ -1160,6 +1164,25 @@ impl AgentBuilder {
         self.function_middleware.push(mw);
         self
     }
+    /// Set the [`ObservabilityConfig`](crate::observability::ObservabilityConfig)
+    /// for the `execute_tool` spans this agent's tool loop emits — content
+    /// capture and the GenAI semantic-convention version.
+    ///
+    /// The builder wraps the caller's client in a
+    /// [`FunctionInvokingChatClient`] itself, so this is the only way to reach
+    /// that wrapper's own config. Pass the same value given to an
+    /// [`ObservableChatClient`](crate::observability::ObservableChatClient)
+    /// around the same client, so one trace reports one convention version
+    /// across its chat and tool spans. Left unset, the tool loop reads the
+    /// environment, as it always has.
+    pub fn observability_config(
+        mut self,
+        config: crate::observability::ObservabilityConfig,
+    ) -> Self {
+        self.observability = Some(config);
+        self
+    }
+
     /// Override the whole chat options object (advanced).
     pub fn chat_options(mut self, options: ChatOptions) -> Self {
         // Preserve tools/instructions collected so far by merging.
@@ -1180,10 +1203,12 @@ impl AgentBuilder {
         }
         // Wrap the raw client in `FunctionInvokingChatClient` now that all
         // builder-collected function middleware is known.
-        let client: Arc<dyn ChatClient> = Arc::new(
-            FunctionInvokingChatClient::new(self.client)
-                .with_function_middleware(self.function_middleware),
-        );
+        let mut invoking = FunctionInvokingChatClient::new(self.client)
+            .with_function_middleware(self.function_middleware);
+        if let Some(config) = self.observability {
+            invoking = invoking.with_observability_config(config);
+        }
+        let client: Arc<dyn ChatClient> = Arc::new(invoking);
         Agent {
             id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             name: self.name,
