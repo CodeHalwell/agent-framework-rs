@@ -416,6 +416,34 @@ async fn chat_message_store_does_not_duplicate_a_replayed_transcript() {
     );
 }
 
+/// A zero-retention store is documented to leave Redis untouched. Reading the
+/// stored history before writing must not break that: pointed at an address
+/// nothing is listening on, `after_run` still has to succeed, because it never
+/// connects (PR #16 review).
+#[tokio::test]
+async fn zero_retention_after_run_performs_no_redis_io() {
+    // A port nothing is bound to — any attempt to read or write fails.
+    let store = RedisChatMessageStore::new("redis://127.0.0.1:1/", Some(unique("thread")))
+        .unwrap()
+        .with_max_messages(0);
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .expect("a zero-retention run must not touch Redis at all");
+}
+
+/// Likewise for a run with nothing to store: no read, no write, no connection.
+#[tokio::test]
+async fn after_run_with_no_messages_performs_no_redis_io() {
+    let store = RedisChatMessageStore::new("redis://127.0.0.1:1/", Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[], &[], None)
+        .await
+        .expect("a run with nothing to store must not touch Redis");
+}
+
 /// With a retention limit the stored history is a trimmed *window* of the
 /// conversation, so a replay starts before what the list holds and the
 /// alignment has to find the window inside it.

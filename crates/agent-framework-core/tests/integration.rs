@@ -1463,6 +1463,45 @@ async fn function_middleware_order_is_onion_nested() {
     assert_eq!(log, vec!["A-before", "B-before", "B-after", "A-after"]);
 }
 
+/// The replay flow end to end: a caller that keeps its own transcript and
+/// replays it every turn must not have those turns sent to the model twice.
+/// Storing only the new suffix is half the fix; the request is assembled as
+/// injected-context + input, so the history provider also has to stay out of
+/// the way when the input already carries what it holds (PR #16 review).
+#[tokio::test]
+async fn replayed_transcript_is_not_sent_to_the_model_twice() {
+    let client = MockClient::new(vec![
+        ChatResponse::from_text("a1"),
+        ChatResponse::from_text("a2"),
+    ]);
+    let seen = client.seen.clone();
+    let agent = Agent::builder(client).build();
+    let mut session = agent.create_session();
+
+    let first = agent
+        .run(vec![Message::user("q1")], Some(&mut session))
+        .await
+        .unwrap();
+    assert_eq!(first.text(), "a1");
+
+    // Turn two: the caller replays everything it has, plus the new question.
+    let replay = vec![
+        Message::user("q1"),
+        Message::assistant("a1"),
+        Message::user("q2"),
+    ];
+    let _ = agent.run(replay, Some(&mut session)).await.unwrap();
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let second: Vec<String> = requests[1].iter().map(Message::text).collect();
+    assert_eq!(
+        second,
+        vec!["q1".to_string(), "a1".to_string(), "q2".to_string()],
+        "the replayed turns must reach the model once, not twice"
+    );
+}
+
 /// Function middleware that refuses the call with the fail-closed signal
 /// (an enforcement layer's "this must not run, and the run must not
 /// continue").

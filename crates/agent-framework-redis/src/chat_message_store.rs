@@ -265,11 +265,16 @@ impl ContextProvider for RedisChatMessageStore {
         error: Option<&Error>,
     ) -> Result<()> {
         if error.is_none() {
-            let incoming: Vec<Message> = request_messages
-                .iter()
-                .chain(response_messages)
-                .cloned()
-                .collect();
+            // Nothing to persist: no read, no write. `add_messages` already
+            // treats both of these as no-ops, and reading first must not turn
+            // a run with nothing to store into one that can fail on Redis
+            // availability — least of all a zero-retention store, which is
+            // documented to leave Redis untouched entirely.
+            if (request_messages.is_empty() && response_messages.is_empty())
+                || self.max_messages == Some(0)
+            {
+                return Ok(());
+            }
             // A caller that replays its own transcript hands back messages this
             // list already holds; pushing them again grows the list
             // superlinearly and resends the duplicates to the model on the next
@@ -279,10 +284,21 @@ impl ContextProvider for RedisChatMessageStore {
             // limit configured the stored history is a trimmed *window* of the
             // conversation, which is why the alignment scan is not anchored at
             // the start of the replay.
+            //
+            // Read-then-append is not atomic: two runs completing concurrently
+            // on the same session can both read the same list and both append
+            // the same suffix. That window is inherent to a compare-and-append
+            // over a remote store and would need a Lua script or a per-session
+            // lock to close; it is not a regression, since the blind append
+            // this replaces duplicated those messages unconditionally.
             let stored = self.list_messages().await?;
-            let new = agent_framework_core::history::filter_new_messages(&stored, &incoming);
+            let new = agent_framework_core::history::new_run_messages(
+                &stored,
+                request_messages,
+                response_messages,
+            );
             if !new.is_empty() {
-                self.add_messages(new.to_vec()).await?;
+                self.add_messages(new).await?;
             }
         }
         Ok(())

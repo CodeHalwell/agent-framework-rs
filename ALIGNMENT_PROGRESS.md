@@ -65,6 +65,32 @@ dynamically resolved Python types.
 | #7242 | **Replaying a conversation duplicated stored history.** A history provider is handed a run's input messages plus its response messages, so a caller that keeps its own transcript and replays all of it every turn (the AG-UI shape, and any client tracking history itself) hands back everything the provider already stored. Every provider appended it unconditionally, so history grew superlinearly — and because `before_run` prepends stored history to the request, the duplicated turns were resent to the model on every later run. `filter_new_messages` locates the stored run inside the incoming one and returns only what follows it. Matching is by `message_id` where a message has one and by role + contents where it does not, mirroring upstream's `get_message_identity`; the scan is not anchored at offset 0, so a provider whose stored history is a *trimmed window* (a retention limit having dropped the oldest messages) still aligns. Applied to all four history providers, not just the two upstream touched: `RedisChatMessageStore` and `CosmosChatMessageStore` have the identical shape and the identical bug, and now read their stored history before writing — one extra round trip per run, the same read `before_run` already makes. | `core/history.rs` (`filter_new_messages`, both providers' `after_run`), `redis/chat_message_store.rs`, `cosmos/chat_message_store.rs` |
 | #7562 | **Function middleware had no way to fail closed.** The invocation loop converts every error a tool or its middleware produces into a `FunctionResultContent { exception, .. }`, hands it to the model and keeps looping. That is right for a tool failure the model can recover from, but an enforcement layer — a guardrail, a policy or authorization gate — needs the opposite: when it refuses a call, the run must stop, not hand the model an error string it can retry around. `Error::MiddlewareFailure` is the escape, and the only error the loop propagates rather than absorbs. Because the parallel batch runs under `try_join_all`, propagating it also drops the siblings still in flight — upstream's "cancel the in-flight batch" without needing a cancellation mechanism of its own. | `core/error.rs` (`MiddlewareFailure`, `middleware_failure`, `is_middleware_failure`), `core/client.rs` (`execute_tool_call`), `core/observability.rs` (`error_type`) |
 
+Two review findings on PR #16 extended the fix past what upstream's own
+patch covers, both confirmed by probe before fixing:
+
+- **Alignment must not see response messages.** Concatenating a run's input and
+  its responses before aligning let a response that coincidentally reproduced
+  the stored tail match as a replay, swallowing the genuinely new input in
+  front of it — stored `[q, a]` plus a run whose input is `q` and whose
+  response opens with `a` stored nothing but the tail. Responses are generated
+  by the run reporting them and can never be a replay, so `new_run_messages`
+  aligns the input alone and appends every response.
+- **The request side duplicated too.** Storing only the new suffix left the
+  other half of the problem untouched: the agent sends injected context
+  followed by the caller's input, so a provider that injected unconditionally
+  sent `q1, a1, q1, a1, q2` for a caller replaying `q1, a1, q2` — verified end
+  to end against the messages the model actually received. The core providers
+  now inject nothing when the input already aligns against what they hold.
+
+The remote stores also no longer read before writing when there is nothing to
+write (an empty run, or a Redis store configured to retain nothing, which is
+documented to leave Redis untouched); both cases are pinned by pointing a store
+at an address nothing is listening on and asserting the run still succeeds.
+Their read-then-write sequence is not atomic, and the Cosmos read can lag a
+just-landed write on an account with session or eventual consistency; both are
+documented at the call sites rather than closed, since the fallback in each
+case is the duplicate that the blind append they replace produced every time.
+
 Two deliberate divergences in the dedup, both refusing to drop a turn that
 might be real. Upstream falls back, when alignment fails, to deduplicating by
 identity against a set of everything stored; that collapses two identical,
@@ -84,7 +110,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1641 passing**, 14 of them new), `cargo clippy --all-targets --all-features`
+(**1650 passing**, 19 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
