@@ -94,7 +94,14 @@ A second review round raised two more, both fixed:
   taking an earlier one re-pushes the whole middle of a replayed transcript on
   every turn. `StoredHistory::{Complete, Window}` makes it the caller's
   decision, and the Redis store picks `Window` only when its list is *at* its
-  cap, since only a trimmed list can be a window.
+  cap, since only a trimmed list can be a window. A fourth round then caught
+  that a complete history must be matched at the **start** and nowhere else: it
+  begins at the conversation's first message, so a replay can only begin with
+  it, and a coincidental match further in silently dropped every genuinely new
+  message in front of it — stored `[yes]` against an input of
+  `[preface, yes, question]` kept only `question`, and `before_run` then
+  injected nothing, so the stored turn never reached the model either. The
+  search remains for `Window`, which is what it was always for.
 - **A configured semconv version has to reach tool spans.** The tool loop
   rebuilt an `ObservabilityConfig` from the environment per call, so a client
   configured for one convention version could emit chat spans under it and tool
@@ -137,7 +144,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1656 passing**, 25 of them new), `cargo clippy --all-targets --all-features`
+(**1657 passing**, 26 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
