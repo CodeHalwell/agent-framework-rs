@@ -265,10 +265,25 @@ impl ContextProvider for RedisChatMessageStore {
         error: Option<&Error>,
     ) -> Result<()> {
         if error.is_none() {
-            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
-            combined.extend(request_messages.iter().cloned());
-            combined.extend(response_messages.iter().cloned());
-            self.add_messages(combined).await?;
+            let incoming: Vec<Message> = request_messages
+                .iter()
+                .chain(response_messages)
+                .cloned()
+                .collect();
+            // A caller that replays its own transcript hands back messages this
+            // list already holds; pushing them again grows the list
+            // superlinearly and resends the duplicates to the model on the next
+            // `before_run`. Reading the stored history first costs one extra
+            // `LRANGE` per run — the same read `before_run` already makes — and
+            // is what lets the replayed prefix be recognized. With a retention
+            // limit configured the stored history is a trimmed *window* of the
+            // conversation, which is why the alignment scan is not anchored at
+            // the start of the replay.
+            let stored = self.list_messages().await?;
+            let new = agent_framework_core::history::filter_new_messages(&stored, &incoming);
+            if !new.is_empty() {
+                self.add_messages(new.to_vec()).await?;
+            }
         }
         Ok(())
     }

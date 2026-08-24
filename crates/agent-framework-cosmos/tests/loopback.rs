@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use agent_framework_core::memory::ContextProvider;
 use agent_framework_core::types::Message;
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
 use agent_framework_cosmos::{CosmosChatMessageStore, CosmosCheckpointStorage};
@@ -451,6 +452,91 @@ async fn add_multiple_messages_then_list_preserves_order() {
     assert!(
         seq1 > seq0,
         "second message's seq must sort after the first's"
+    );
+}
+
+/// A caller that replays its own transcript on every turn used to have the
+/// whole conversation written to the container again each time (upstream
+/// #7242). `after_run` now reads the stored history first and writes only the
+/// messages the replay adds.
+#[tokio::test]
+async fn after_run_does_not_duplicate_a_replayed_transcript() {
+    // Turn 1: query (empty) + 2 creates. Turn 2: query (2 docs) + 2 creates.
+    // Then one final query for the assertion.
+    let (base_url, handle) = serve_sequence(7, {
+        let mut stored: Vec<Value> = Vec::new();
+        move |_i, request| {
+            if request.header("x-ms-documentdb-isquery").is_some() {
+                (
+                    200,
+                    "OK",
+                    vec![],
+                    json!({
+                        "_rid": "abc==",
+                        "Documents": stored.clone(),
+                        "_count": stored.len(),
+                    }),
+                )
+            } else {
+                let mut doc = request.body_json();
+                doc["_rid"] = json!(format!("r{}", stored.len()));
+                stored.push(doc.clone());
+                (201, "Created", vec![], doc)
+            }
+        }
+    });
+
+    let store = CosmosChatMessageStore::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-replay".to_string()),
+    )
+    .unwrap();
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+    store
+        .after_run(
+            &[
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+            ],
+            &[Message::assistant("a2")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = store
+        .list_messages()
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "q1".to_string(),
+            "a1".to_string(),
+            "q2".to_string(),
+            "a2".to_string()
+        ]
+    );
+
+    let requests = handle.join().expect("server thread panicked");
+    let creates = requests
+        .iter()
+        .filter(|r| r.header("x-ms-documentdb-isquery").is_none())
+        .count();
+    assert_eq!(
+        creates, 4,
+        "the replayed q1/a1 must not have been written a second time"
     );
 }
 

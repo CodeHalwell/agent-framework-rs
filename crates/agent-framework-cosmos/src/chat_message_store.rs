@@ -348,10 +348,22 @@ impl ContextProvider for CosmosChatMessageStore {
         error: Option<&Error>,
     ) -> Result<()> {
         if error.is_none() {
-            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
-            combined.extend(request_messages.iter().cloned());
-            combined.extend(response_messages.iter().cloned());
-            self.add_messages(combined).await?;
+            let incoming: Vec<Message> = request_messages
+                .iter()
+                .chain(response_messages)
+                .cloned()
+                .collect();
+            // A caller that replays its own transcript hands back messages this
+            // container already holds; storing them again grows the item set
+            // superlinearly and resends the duplicates to the model on the next
+            // `before_run`. Reading the stored history first costs one extra
+            // query per run — the same query `before_run` already makes — and
+            // is what lets the replayed prefix be recognized.
+            let stored = self.list_messages().await?;
+            let new = agent_framework_core::history::filter_new_messages(&stored, &incoming);
+            if !new.is_empty() {
+                self.add_messages(new.to_vec()).await?;
+            }
         }
         Ok(())
     }

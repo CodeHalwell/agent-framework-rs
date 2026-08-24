@@ -371,6 +371,99 @@ async fn chat_message_store_before_run_prepends_history_and_after_run_records_it
     assert!(store.is_history_provider());
 }
 
+/// A caller that replays its own transcript on every turn used to have the
+/// whole conversation pushed onto the list again each time (upstream #7242).
+#[tokio::test]
+async fn chat_message_store_does_not_duplicate_a_replayed_transcript() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+    // Turn two replays everything the caller has, plus the new turn.
+    store
+        .after_run(
+            &[
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+            ],
+            &[Message::assistant("a2")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = store
+        .list_messages()
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "q1".to_string(),
+            "a1".to_string(),
+            "q2".to_string(),
+            "a2".to_string()
+        ]
+    );
+}
+
+/// With a retention limit the stored history is a trimmed *window* of the
+/// conversation, so a replay starts before what the list holds and the
+/// alignment has to find the window inside it.
+#[tokio::test]
+async fn chat_message_store_dedup_aligns_against_a_trimmed_window() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread")))
+        .unwrap()
+        .with_max_messages(2);
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+    store
+        .after_run(&[Message::user("q2")], &[Message::assistant("a2")], None)
+        .await
+        .unwrap();
+    // Only the last two survive the trim.
+    assert_eq!(store.list_messages().await.unwrap().len(), 2);
+
+    store
+        .after_run(
+            &[
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+                Message::assistant("a2"),
+                Message::user("q3"),
+            ],
+            &[Message::assistant("a3")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = store
+        .list_messages()
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(texts, vec!["q3".to_string(), "a3".to_string()]);
+}
+
 #[tokio::test]
 async fn context_provider_after_run_then_before_run_surfaces_matching_memory() {
     let Some((url, _guard)) = test_server().await else {
