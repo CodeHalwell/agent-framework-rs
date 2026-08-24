@@ -116,7 +116,8 @@ pub mod attr {
     pub const SYSTEM: &str = "gen_ai.system";
     /// Semantic-convention replacement for [`SYSTEM`], introduced above
     /// v1.36.0. Exactly one of the two is emitted, selected by
-    /// [`ObservabilityConfig::use_latest_experimental_gen_ai_semconv`].
+    /// [`ObservabilityConfig::use_latest_experimental_gen_ai_semconv`](
+    /// super::ObservabilityConfig::use_latest_experimental_gen_ai_semconv).
     pub const PROVIDER_NAME: &str = "gen_ai.provider.name";
     pub const REQUEST_MODEL: &str = "gen_ai.request.model";
     pub const RESPONSE_MODEL: &str = "gen_ai.response.model";

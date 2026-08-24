@@ -85,7 +85,8 @@ fn real_message_id(message: &Message) -> Option<&str> {
 /// the stored tail swallow the genuinely new turn in front of it.
 ///
 /// The stored run is located inside `incoming` by matching every message by
-/// [`MessageIdentity`]; the messages after that block are the new ones. Where
+/// identity — its `message_id` when it has a non-empty one, and otherwise its
+/// role plus its contents; the messages after that block are the new ones. Where
 /// it is looked for depends on what the provider holds, which is why
 /// [`StoredHistory`] is a parameter rather than a guess: a complete history can
 /// only be matched at offset `0`, while a trimmed window has to be searched
