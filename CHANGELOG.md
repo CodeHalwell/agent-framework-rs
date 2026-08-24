@@ -74,8 +74,10 @@ may break APIs).
   `StoredHistory::{Complete, Window}` selects where a stored run is looked for:
   a complete history is matched at the start only — it begins at the
   conversation's first message, so a replay of it can only begin with it — while
-  a window has to be searched for, taking the last occurrence (the Redis store
-  picks `Window` only when its list is at its cap).
+  a window is searched for, preferring a match at the start (an at-cap list that
+  has never actually been trimmed is still complete) and otherwise taking the
+  last occurrence. The Redis store asks for `Window` only when its list is at
+  its cap.
 - **Tool spans could report a different semconv version than chat spans.** The
   function-invocation loop rebuilt an `ObservabilityConfig` from the
   environment for every tool call, so a client configured explicitly for one

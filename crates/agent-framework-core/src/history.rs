@@ -115,11 +115,22 @@ pub enum StoredHistory {
     /// everything after it is new — matching a later occurrence would discard
     /// the genuinely new turns in between.
     Complete,
-    /// A trimmed window of the most recent messages, as a retention limit
-    /// leaves behind. The **last** occurrence is the retained window, so only
-    /// what follows it is new. Matching an earlier occurrence would re-send the
-    /// whole middle of the transcript on every turn — messages the store is
+    /// A retention-limited store's list, which *may* be a trimmed window of
+    /// the most recent messages.
+    ///
+    /// A match at the start still wins, because a list that has not actually
+    /// been trimmed yet — a first write that happened to fill the cap exactly —
+    /// is still the complete conversation, and treating it as a window would
+    /// drop the turns between two occurrences of it. Only when the stored run
+    /// is *not* at the start is it searched for, and then the **last**
+    /// occurrence is the retained window: matching an earlier one would re-send
+    /// the whole middle of the transcript on every turn, messages the store is
     /// going to trim away again anyway.
+    ///
+    /// The ambiguous case — a genuine window whose content also opens the
+    /// transcript — resolves to the anchored match, so it re-sends the middle
+    /// rather than risking a lost turn. That is the right way round: the
+    /// redundant writes are trimmed away, a dropped turn is not recoverable.
     Window,
 }
 
@@ -145,11 +156,14 @@ pub fn filter_new_messages_from<'a>(
         // started — impossible — and a coincidental match there would silently
         // drop every genuinely new message in front of it.
         StoredHistory::Complete => matches(0).then_some(0),
-        // A window sits somewhere in the middle of the transcript, so it has to
-        // be searched for; the last occurrence is the retained one.
-        StoredHistory::Window => (0..(incoming.len() - existing.len()))
-            .rev()
-            .find(|s| matches(*s)),
+        // A window may sit in the middle of the transcript, so it has to be
+        // searched for — but an anchored match still wins, since an at-cap list
+        // that has never actually been trimmed is still a complete history.
+        StoredHistory::Window => matches(0).then_some(0).or_else(|| {
+            (1..(incoming.len() - existing.len()))
+                .rev()
+                .find(|s| matches(*s))
+        }),
     };
     match found {
         Some(start) => &incoming[start + existing.len()..],
@@ -695,6 +709,59 @@ mod tests {
         assert_eq!(filter_new_messages(&existing, &incoming).len(), 5);
     }
 
+    /// A retention-limited list whose length merely reaches the cap has not
+    /// necessarily been trimmed — a first write that filled it exactly is still
+    /// the complete conversation. The anchored match therefore wins even for a
+    /// `Window`, or the turns between two occurrences would be lost
+    /// (PR #16 review).
+    #[test]
+    fn a_window_prefers_an_anchored_match_over_a_later_one() {
+        let existing = vec![Message::user("q"), Message::assistant("a")];
+        let incoming = vec![
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("filler"),
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("new"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages_from(
+                &existing,
+                &incoming,
+                StoredHistory::Window
+            )),
+            vec![
+                "filler".to_string(),
+                "q".to_string(),
+                "a".to_string(),
+                "new".to_string()
+            ],
+            "an at-cap list that opens the replay is a complete history, not a window"
+        );
+
+        // A genuine window — one that does *not* open the replay — is still
+        // found by searching, and the last occurrence is the retained one.
+        let earlier = vec![
+            Message::user("q0"),
+            Message::assistant("a0"),
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("filler"),
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("new"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages_from(
+                &existing,
+                &earlier,
+                StoredHistory::Window
+            )),
+            vec!["new".to_string()]
+        );
+    }
+
     /// A complete history matched at a later offset would drop every genuinely
     /// new message in front of the coincidence (PR #16 review).
     #[test]
@@ -716,12 +783,10 @@ mod tests {
         );
     }
 
-    /// A retention-limited store holds a *window*, so when the replayed
-    /// transcript repeats that window earlier on, the window is the LAST
-    /// occurrence — aligning to the first would re-send the whole middle of the
-    /// transcript every turn (PR #16 review).
+    /// A store that keeps everything takes the anchored match, so a repeat in
+    /// the middle of a replay is a genuinely new turn it has never stored.
     #[test]
-    fn a_windowed_store_aligns_against_the_last_matching_occurrence() {
+    fn a_complete_store_keeps_the_turns_between_two_occurrences() {
         let existing = vec![Message::user("q"), Message::assistant("a")];
         let incoming = vec![
             Message::user("q"),
@@ -731,17 +796,6 @@ mod tests {
             Message::assistant("a"),
             Message::user("new"),
         ];
-        assert_eq!(
-            texts(filter_new_messages_from(
-                &existing,
-                &incoming,
-                StoredHistory::Window
-            )),
-            vec!["new".to_string()]
-        );
-
-        // A complete store must keep taking the first occurrence: the repeat in
-        // the middle is a genuinely new turn it has never stored.
         assert_eq!(
             texts(filter_new_messages_from(
                 &existing,
@@ -756,7 +810,6 @@ mod tests {
             ]
         );
     }
-
     /// The deliberate divergence from upstream: when the stored run cannot be
     /// aligned, everything is stored — never a set-based dedup that would drop
     /// a legitimately repeated turn.
