@@ -99,7 +99,15 @@ A second review round raised two more, both fixed:
   rebuilt an `ObservabilityConfig` from the environment per call, so a client
   configured for one convention version could emit chat spans under it and tool
   spans under another. `FunctionInvokingChatClient` now carries the config
-  (`with_observability_config`), resolved once at construction.
+  (`with_observability_config`), resolved once at construction, and
+  `AgentBuilder::observability_config` reaches that wrapper — the builder
+  constructs it internally, so without a way through it the setter was
+  unreachable on the main path.
+- **The injection fix had to reach the remote stores.** It landed in the two
+  core providers and stopped there, and the end-to-end test covered only the
+  in-memory one, so a replay through a Redis- or Cosmos-backed session was
+  still sent to the model twice. `inject_stored_history` is now public and used
+  by all four, with a `StoredHistory`-aware variant for the Redis store.
 
 The remote stores also no longer read before writing when there is nothing to
 write (an empty run, or a Redis store configured to retain nothing, which is
@@ -129,7 +137,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1655 passing**, 24 of them new), `cargo clippy --all-targets --all-features`
+(**1656 passing**, 25 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
