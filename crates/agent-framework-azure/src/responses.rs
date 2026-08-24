@@ -269,7 +269,7 @@ impl AzureOpenAIResponsesClient {
     /// The implicit add is right for OpenAI and Azure OpenAI, where a
     /// `store: false` tool loop has to replay the reasoning item itself. Azure
     /// AI Foundry does not want it unless it is asked for by name, so
-    /// [`FoundryChatClient`](agent_framework_foundry) builds its transport
+    /// `FoundryChatClient` builds its transport
     /// with this set (upstream #7536).
     ///
     /// A caller that puts `reasoning.encrypted_content` in its own `include`
