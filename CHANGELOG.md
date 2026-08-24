@@ -5,7 +5,19 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-24
+
+Upstream-alignment passes against `microsoft/agent-framework`, moving the
+baseline from `4b1afd90` (2026-08-07) to `a63d462` (2026-08-24). Six
+upstream changes are ported and 100+ intervening commits are triaged in
+[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md), which records why each
+one that does not apply does not.
+
+This release **breaks API** (pre-1.0, so a minor bump): the observability
+recording functions take an `&ObservabilityConfig` in place of a
+`capture_content: bool`, `chat_span` takes the semantic-convention flag, and
+`gen_ai.system` is no longer emitted alongside `gen_ai.provider.name`. See
+**Changed** below.
 
 ### Changed
 
@@ -90,7 +102,6 @@ may break APIs).
   `with_observability_config` and resolved from the environment once at
   construction. `AgentBuilder::observability_config` reaches that wrapper,
   which the builder constructs itself.
-
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain
   nothing — unlimited is expressed by not calling it at all — but trimming to
@@ -131,15 +142,6 @@ may break APIs).
   `AzureOpenAIResponsesClient::without_implicit_encrypted_reasoning`, which
   `FoundryChatClient` sets on its transport. An explicitly requested
   `reasoning.encrypted_content` is still honored.
-
-Upstream-alignment pass against `microsoft/agent-framework` `266206e`
-(2026-08-07), covering the six commits that landed after the `4b1afd90`
-baseline. Five are .NET-only changes to subsystems this port does not
-implement; the sixth established an invariant this port was violating. See
-[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md) for the per-commit triage.
-
-### Fixed
-
 - **The tool loop reported only its last iteration's token usage.** Each model
   call in the function-invocation loop reports its own usage, and every exit
   path returned the final call's `ChatResponse` untouched — so a run that
