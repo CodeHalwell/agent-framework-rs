@@ -57,9 +57,19 @@ may break APIs).
   run inside the incoming one (by `message_id`, or by role and contents when
   there is none) and stores only what follows it; `InMemoryHistoryProvider`,
   `FileHistoryProvider`, `RedisChatMessageStore` and `CosmosChatMessageStore`
-  all use it, the last two reading their stored history first. A run that
-  cannot be aligned is appended exactly as before — unlike upstream, no
-  set-based fallback drops a turn that merely repeats an earlier one.
+  all use it, the last two reading their stored history first (and skipping
+  that read entirely when there is nothing to store, or when a Redis store is
+  configured to retain nothing). A run that cannot be aligned is appended
+  exactly as before — unlike upstream, no set-based fallback drops a turn that
+  merely repeats an earlier one. Alignment sees a run's **input** only:
+  response messages were just generated and can never be a replay, so they are
+  always stored, even when one happens to reproduce the stored tail.
+- **A replayed transcript was also sent to the model twice.** Storing only the
+  new suffix fixed history growth, but the request is assembled the other way
+  round — injected context first, then the caller's input — so a history
+  provider that unconditionally injected what it held sent `q1, a1, q1, a1,
+  q2` for a caller replaying `q1, a1, q2`. The core history providers now
+  inject nothing when the run's input already carries the stored run.
 
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain
