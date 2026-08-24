@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use agent_framework_core::memory::ContextProvider;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::Message;
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
 use agent_framework_cosmos::{CosmosChatMessageStore, CosmosCheckpointStorage};
@@ -538,6 +538,66 @@ async fn after_run_does_not_duplicate_a_replayed_transcript() {
         creates, 4,
         "the replayed q1/a1 must not have been written a second time"
     );
+}
+
+/// The injection half of the replay fix, for the Cosmos store (PR #16 review).
+#[tokio::test]
+async fn before_run_does_not_inject_history_the_input_already_carries() {
+    let stored_doc = |seq: i64, message: &Message| {
+        serde_json::json!({
+            "id": format!("d{seq}"),
+            "threadId": "thread-inject",
+            "seq": seq,
+            "message": serde_json::to_string(message).unwrap(),
+        })
+    };
+    let docs = vec![
+        stored_doc(1, &Message::user("q1")),
+        stored_doc(2, &Message::assistant("a1")),
+    ];
+    // One query per `before_run` call below.
+    let (base_url, handle) = serve_sequence(2, move |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({"_rid": "abc==", "Documents": docs.clone(), "_count": docs.len()}),
+        )
+    });
+
+    let store = CosmosChatMessageStore::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-inject".to_string()),
+    )
+    .unwrap();
+
+    // A replaying caller's input already holds q1/a1.
+    let mut replayed = SessionContext::new(vec![
+        Message::user("q1"),
+        Message::assistant("a1"),
+        Message::user("q2"),
+    ]);
+    store.before_run(&mut replayed).await.unwrap();
+    assert!(
+        replayed.messages.is_empty(),
+        "stored history must not be injected on top of a replay of itself: {:?}",
+        replayed
+            .messages
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+    );
+
+    // A caller that tracks nothing itself still gets history injected.
+    let mut incremental = SessionContext::new(vec![Message::user("q2")]);
+    store.before_run(&mut incremental).await.unwrap();
+    let injected: Vec<String> = incremental.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(injected, vec!["q1".to_string(), "a1".to_string()]);
+
+    handle.join().expect("server thread panicked");
 }
 
 #[tokio::test]

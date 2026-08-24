@@ -68,8 +68,9 @@ may break APIs).
   new suffix fixed history growth, but the request is assembled the other way
   round — injected context first, then the caller's input — so a history
   provider that unconditionally injected what it held sent `q1, a1, q1, a1,
-  q2` for a caller replaying `q1, a1, q2`. The core history providers now
-  inject nothing when the run's input already carries the stored run.
+  q2` for a caller replaying `q1, a1, q2`. All four history providers now
+  inject nothing when the run's input already carries the stored run
+  (`inject_stored_history`).
   `StoredHistory::{Complete, Window}` selects which occurrence of a stored run
   a replay aligns on — the first for a provider that keeps everything, the last
   for a retention-limited one whose stored list is a window of the most recent

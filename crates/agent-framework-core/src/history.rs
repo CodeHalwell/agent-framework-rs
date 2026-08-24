@@ -202,13 +202,26 @@ pub fn new_run_messages_from(
 /// run — even though this provider stored each of them only once. When the
 /// input aligns against the stored run it is a superset of it, and injecting
 /// nothing leaves the request complete.
-fn prepend_stored_history(ctx: &mut SessionContext, stored: Vec<Message>) {
+pub fn inject_stored_history(ctx: &mut SessionContext, stored: Vec<Message>) {
+    inject_stored_history_from(ctx, stored, StoredHistory::Complete)
+}
+
+/// [`inject_stored_history`] for a provider whose stored history has a known
+/// [`StoredHistory`] shape — a retention-limited store holds a
+/// [`StoredHistory::Window`].
+pub fn inject_stored_history_from(
+    ctx: &mut SessionContext,
+    stored: Vec<Message>,
+    shape: StoredHistory,
+) {
     if stored.is_empty() {
         return;
     }
     // A shorter result means the input aligned against — and therefore already
     // contains — the stored run.
-    if filter_new_messages(&stored, &ctx.input_messages).len() < ctx.input_messages.len() {
+    if filter_new_messages_from(&stored, &ctx.input_messages, shape).len()
+        < ctx.input_messages.len()
+    {
         return;
     }
     let existing = std::mem::take(&mut ctx.messages);
@@ -279,7 +292,7 @@ impl InMemoryHistoryProvider {
 impl ContextProvider for InMemoryHistoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.messages.lock().unwrap().clone();
-        prepend_stored_history(ctx, stored);
+        inject_stored_history(ctx, stored);
         Ok(())
     }
 
@@ -426,7 +439,7 @@ impl FileHistoryProvider {
 impl ContextProvider for FileHistoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.messages.lock().unwrap().clone();
-        prepend_stored_history(ctx, stored);
+        inject_stored_history(ctx, stored);
         Ok(())
     }
 

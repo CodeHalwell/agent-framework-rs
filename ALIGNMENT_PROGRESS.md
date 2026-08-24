@@ -79,8 +79,10 @@ patch covers, both confirmed by probe before fixing:
   other half of the problem untouched: the agent sends injected context
   followed by the caller's input, so a provider that injected unconditionally
   sent `q1, a1, q1, a1, q2` for a caller replaying `q1, a1, q2` — verified end
-  to end against the messages the model actually received. The core providers
-  now inject nothing when the input already aligns against what they hold.
+  to end against the messages the model actually received. All four providers
+  now inject nothing when the input already aligns against what they hold; the
+  first fix covered only the two core ones, and a third review round caught
+  that the Redis and Cosmos stores still had the unconditional injection.
 
 A second review round raised two more, both fixed:
 
@@ -127,7 +129,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1653 passing**, 22 of them new), `cargo clippy --all-targets --all-features`
+(**1655 passing**, 24 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed

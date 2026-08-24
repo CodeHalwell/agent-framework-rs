@@ -273,8 +273,13 @@ impl RedisChatMessageStore {
 impl ContextProvider for RedisChatMessageStore {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.list_messages().await?;
-        let existing = std::mem::take(&mut ctx.messages);
-        ctx.messages = stored.into_iter().chain(existing).collect();
+        // Injecting unconditionally would send a replaying caller's turns to
+        // the model twice — the request is this provider's messages followed by
+        // the caller's own input, and for a replay those are the same turns.
+        // The window/complete distinction matters here for the same reason it
+        // does when storing.
+        let shape = self.stored_history_shape(stored.len());
+        agent_framework_core::history::inject_stored_history_from(ctx, stored, shape);
         Ok(())
     }
 

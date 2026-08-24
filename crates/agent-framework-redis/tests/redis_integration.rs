@@ -416,6 +416,41 @@ async fn chat_message_store_does_not_duplicate_a_replayed_transcript() {
     );
 }
 
+/// The injection half of the replay fix, for the Redis store: a caller that
+/// replays its own transcript must not have the stored copy put in front of it
+/// as well (PR #16 review).
+#[tokio::test]
+async fn before_run_does_not_inject_history_the_input_already_carries() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+
+    // A replaying caller's input already holds q1/a1.
+    let mut replayed = SessionContext::new(vec![
+        Message::user("q1"),
+        Message::assistant("a1"),
+        Message::user("q2"),
+    ]);
+    store.before_run(&mut replayed).await.unwrap();
+    let injected: Vec<String> = replayed.messages.iter().map(|m| m.text()).collect();
+    assert!(
+        replayed.messages.is_empty(),
+        "stored history must not be injected on top of a replay of itself: {injected:?}"
+    );
+
+    // A caller that tracks nothing itself still gets history injected.
+    let mut incremental = SessionContext::new(vec![Message::user("q2")]);
+    store.before_run(&mut incremental).await.unwrap();
+    let injected: Vec<String> = incremental.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(injected, vec!["q1".to_string(), "a1".to_string()]);
+}
+
 /// A zero-retention store is documented to leave Redis untouched. Reading the
 /// stored history before writing must not break that: pointed at an address
 /// nothing is listening on, `after_run` still has to succeed, because it never
