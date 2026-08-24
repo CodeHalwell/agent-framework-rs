@@ -227,6 +227,12 @@ const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by use
 /// converted to the same `(true, FunctionResultContent { exception: .. })`
 /// shape the direct-error path used before middleware existed, so
 /// `include_detailed_errors` behaves identically either way.
+///
+/// The single exception is [`Error::MiddlewareFailure`], which is propagated
+/// rather than absorbed: it is the fail-closed signal an enforcement layer
+/// returns to stop the run instead of letting the model retry around a
+/// tool-error result. Because the parallel batch is driven by `try_join_all`,
+/// propagating it also drops (cancels) the sibling calls still in flight.
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
@@ -329,6 +335,12 @@ async fn execute_tool_call(
                         exception: None,
                     },
                 )),
+                // The one error the loop does not absorb: middleware that
+                // refuses a call outright (a guardrail, a policy or
+                // authorization gate) needs the run to fail closed rather than
+                // hand the model an error string it can retry around. Every
+                // other error keeps the absorb-and-continue contract below.
+                Err(e) if e.is_middleware_failure() => Err(e),
                 Err(e) => {
                     let msg = if include_detailed_errors {
                         format!("{e}")

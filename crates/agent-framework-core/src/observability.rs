@@ -180,6 +180,7 @@ pub fn error_type(err: &Error) -> String {
         Error::Serialization(_) => "serialization",
         Error::Content(_) => "content",
         Error::Tool(_) => "tool",
+        Error::MiddlewareFailure(_) => "middleware_failure",
         Error::Service(_) => "service",
         Error::ServiceStatus { .. } => "service",
         Error::ServiceInvalidAuth { .. } => "service_invalid_auth",

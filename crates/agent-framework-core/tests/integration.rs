@@ -1463,6 +1463,180 @@ async fn function_middleware_order_is_onion_nested() {
     assert_eq!(log, vec!["A-before", "B-before", "B-after", "A-after"]);
 }
 
+/// Function middleware that refuses the call with the fail-closed signal
+/// (an enforcement layer's "this must not run, and the run must not
+/// continue").
+struct RefusingMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for RefusingMiddleware {
+    async fn process(
+        &self,
+        _ctx: FunctionInvocationContext,
+        _next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        Err(Error::middleware_failure("blocked by policy"))
+    }
+}
+
+/// Function middleware that fails the ordinary way, which the loop absorbs.
+struct FailingMiddleware;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for FailingMiddleware {
+    async fn process(
+        &self,
+        _ctx: FunctionInvocationContext,
+        _next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        Err(Error::tool("transient tool trouble"))
+    }
+}
+
+fn tool_calls_response(calls: &[(&str, &str)]) -> ChatResponse {
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            calls
+                .iter()
+                .map(|(call_id, name)| {
+                    Content::FunctionCall(FunctionCallContent::new(
+                        *call_id,
+                        *name,
+                        Some(FunctionArguments::Raw("{}".into())),
+                    ))
+                })
+                .collect(),
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+/// Upstream #7562: the loop absorbs every function-middleware error into a
+/// tool-error result and keeps going, which leaves an enforcement layer no way
+/// to fail closed. `Error::MiddlewareFailure` is the escape — it propagates.
+#[tokio::test]
+async fn middleware_failure_propagates_instead_of_becoming_a_tool_error() {
+    let client = MockClient::new(vec![
+        tool_calls_response(&[("call_1", "noop")]),
+        ChatResponse::from_text("done"),
+    ]);
+    let seen = client.seen.clone();
+
+    let agent = Agent::builder(client)
+        .tool(noop_tool("noop"))
+        .function_middleware(Arc::new(RefusingMiddleware))
+        .build();
+
+    let err = agent
+        .run_once("go")
+        .await
+        .expect_err("a middleware failure must fail the run");
+    assert!(
+        err.is_middleware_failure(),
+        "the fail-closed signal must reach the caller intact: {err:?}"
+    );
+    assert!(err.to_string().contains("blocked by policy"), "{err}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the loop must stop, not call the model again with a tool-error result"
+    );
+}
+
+/// The negative control for the test above: an ordinary middleware error keeps
+/// the absorb-and-continue contract the loop has always had.
+#[tokio::test]
+async fn ordinary_middleware_error_is_still_absorbed_into_a_tool_error() {
+    let client = MockClient::new(vec![
+        tool_calls_response(&[("call_1", "noop")]),
+        ChatResponse::from_text("done"),
+    ]);
+    let seen = client.seen.clone();
+
+    let agent = Agent::builder(client)
+        .tool(noop_tool("noop"))
+        .function_middleware(Arc::new(FailingMiddleware))
+        .build();
+
+    let response = agent.run_once("go").await.expect("run should not fail");
+    assert_eq!(response.text(), "done");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "the model should have been called again with the tool-error result"
+    );
+    assert!(
+        response.messages.iter().any(|m| m
+            .contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionResult(fr) if fr.exception.is_some()))),
+        "the absorbed error should surface as a tool-error result: {:?}",
+        response.messages
+    );
+}
+
+/// A failure in one call of a parallel batch takes the batch down with it: the
+/// siblings still in flight are dropped rather than left to complete.
+#[tokio::test]
+async fn middleware_failure_cancels_sibling_calls_in_the_batch() {
+    let client = MockClient::new(vec![
+        tool_calls_response(&[("call_1", "slow"), ("call_2", "refused")]),
+        ChatResponse::from_text("done"),
+    ]);
+
+    let finished = Arc::new(Mutex::new(false));
+    let finished_clone = finished.clone();
+    let slow = FunctionTool::new(
+        "slow",
+        "a tool that takes a while",
+        json!({"type":"object","properties":{}}),
+        move |_a| {
+            let finished_clone = finished_clone.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                *finished_clone.lock().unwrap() = true;
+                Ok(json!("ok"))
+            }
+        },
+    )
+    .into_definition();
+
+    // Only the refused call's middleware fails; `slow` is left running when it
+    // does.
+    struct RefuseOne;
+    #[async_trait]
+    impl Middleware<FunctionInvocationContext> for RefuseOne {
+        async fn process(
+            &self,
+            ctx: FunctionInvocationContext,
+            next: Next<FunctionInvocationContext>,
+        ) -> Result<FunctionInvocationContext> {
+            if ctx.function_name == "refused" {
+                return Err(Error::middleware_failure("blocked by policy"));
+            }
+            next.run(ctx).await
+        }
+    }
+
+    let agent = Agent::builder(client)
+        .tool(slow)
+        .tool(noop_tool("refused"))
+        .function_middleware(Arc::new(RefuseOne))
+        .build();
+
+    let err = agent
+        .run_once("go")
+        .await
+        .expect_err("the batch must fail with the refused call");
+    assert!(err.is_middleware_failure(), "{err:?}");
+    assert!(
+        !*finished.lock().unwrap(),
+        "the sibling call should have been dropped, not awaited to completion"
+    );
+}
+
 #[tokio::test]
 async fn service_conversation_id_is_adopted_by_thread() {
     use std::sync::{Arc, Mutex};
