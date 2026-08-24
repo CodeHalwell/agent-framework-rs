@@ -6,8 +6,48 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `e1326eb` (2026-08-20).** Sections are newest
+**Current upstream baseline: `a63d462` (2026-08-24).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`e1326eb` drift (checked against `a63d462`, 2026-08-24)
+
+The `e1326eb` pass below was triaged against a fork mirror that had stopped
+advancing on 2026-08-20; the sync then caught up and moved **31 further
+non-merge commits** (through 2026-08-24). One lands on this port.
+
+### Ported this pass (1, with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7673 | **The GenAI semantic-convention version was never selectable, and the provider tag was emitted twice.** `gen_ai.system` was renamed to `gen_ai.provider.name` above the OTel v1.36.0 baseline. This port emitted **both** names on every chat span (and `gen_ai.provider.name` on the metrics attributes), so a consumer pinned to the baseline saw an attribute its version does not define, and one on the latest saw a name that had been renamed away. Upstream's fix makes the version an explicit input: `OTEL_SEMCONV_STABILITY_OPT_IN`, a comma-separated opt-in list in OpenTelemetry's standard format, whose `gen_ai_latest_experimental` token selects the conventions above the baseline — defaulting, when unset, to *opted in*, which upstream documents as a deliberate departure from OpenTelemetry's own default. `ObservabilityConfig` now carries that value and derives `use_latest_experimental_gen_ai_semconv()` / `emit_tool_call_attributes()`; exactly one provider attribute is emitted, and the four above-baseline attributes (`cache_creation.input_tokens`, `cache_read.input_tokens`, `reasoning.output_tokens`, `tool.definitions`) plus `gen_ai.tool.call.arguments`/`result` are withheld at the baseline. Under the default the only visible change is that `gen_ai.system` no longer rides along beside `gen_ai.provider.name`. | `core/observability.rs` (`GEN_AI_LATEST_EXPERIMENTAL_OPT_IN`, `ObservabilityConfig`, `chat_span`, `record_request`, `record_response`, `record_tool_arguments`, `record_tool_result`, `ObservableChatClient`, `metrics::record_chat_completion`), `core/client.rs` (tool-span call sites) |
+
+The recording functions took a `capture_content: bool`; they now take
+`&ObservabilityConfig`, because the second gate is not a property of the call
+site. That keeps both gates explicit and, unlike reading the environment inside
+the recorders, leaves them free of hidden global state on a per-response path.
+`ObservableChatClient::with_content_capture` still works and sets the flag on
+the config; `with_observability_config` sets both.
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1645 passing**, 4 of them new), `cargo clippy --all-targets --all-features`
+under `-D warnings` (CI's own flag) clean, `cargo fmt --check` clean. All four
+new tests were confirmed to fail against ungated code.
+
+### Not applicable (30)
+
+| Upstream | Why not |
+|---|---|
+| #7799, #7801 | **MCP tool argument shadowing the remote tool name**, and its documentation follow-up. Python's generated MCP function held the remote tool name as a keyword-only parameter *default*, and model-supplied arguments are splatted into that function — so an argument named `_remote_tool_name` bound to the parameter and redirected the call to a different remote tool. This port's MCP tools capture the remote name in the tool struct and pass arguments as one `serde_json::Value` map to `call_tool(name, arguments)`; there is no splat and no parameter for an argument to bind to. |
+| #7289 | **Turn-scoped `after_run` providers deferred to the agent-loop boundary.** Each `AgentLoopMiddleware` iteration is a full agent run, so `CompactionProvider.after_run` fired per iteration and rewrote persisted history mid-task; providers can now opt into once-per-turn semantics. The port has no harness agent loop (a documented "remaining" item), so nothing drives several runs inside one turn and there is no per-iteration re-fire to defer. |
+| #7625 | **GitHub Copilot telemetry config forwarding**, plus the Python settings-machinery fixes it needed (parameterized generics and `Literal` arms in runtime annotation checks). Both halves are Python-shaped: this port's `agent-framework-github-copilot` targets the OpenAI-compatible chat endpoint rather than the Copilot Agent SDK's session API — the same reason #7155 and #7300 were not applicable — and its settings are typed struct fields, not runtime-inspected annotations. |
+| #7779 | **DevUI forwards `function_invocation_kwargs` to `agent.run`.** No `function_invocation_kwargs` concept here: tools receive a typed `Value` plus a `FunctionInvocationContext`. |
+| #7734 | **FoundryEvals always emits an `arguments` field for tool calls**, in `_evaluation.py`. No evaluation crate. |
+| #7423 | **A2UI (Agent-to-UI) support in the AG-UI adapter.** No AG-UI crate. |
+| #7670, #7370, #7649 | **Foundry hosted-agent resiliency, steerable hosted agents, hosted state persistence** (Python and .NET). This port has no Foundry hosted-agents host. |
+| #7768 | **Pin GitHub Actions to full-length commit SHAs**, across upstream's own 24 workflow files. This is repo hygiene rather than framework parity; worth adopting for this repo's two workflows, but resolving each action's SHA means reading repositories outside this session's GitHub scope, so it is left as a follow-up rather than guessed at. |
+| #7812, #7814, #7795, #7813, #7804, #7754, #7678 | Release version bumps (Python 1.15.0, .NET 1.19.0), release-tag resolution, a DevFlow command fix, codeowners, README/doc edits. |
+| #7774, #6441, #1893, #7709, #7639, #7778, #7829 | .NET: the MCP long-running-task migration to the 2026-07-28 Tasks extension, GitHub Copilot `ReasoningSummary` passthrough, Azure Blob Storage session persistence, a feature-usage bitmask, and dependency bumps. |
+| #7780, #7781, #7782, #7783, #7784 | Python tooling bumps (`uv`, `ruff`, `ty`, `mypy`, `flit-core`). |
 
 ## Post-`5c06755` drift (checked against `e1326eb`, 2026-08-20)
 

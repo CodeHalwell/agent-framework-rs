@@ -7,6 +7,30 @@ may break APIs).
 
 ## [Unreleased]
 
+### Changed
+
+- **The GenAI semantic-convention version is now selectable, and the provider
+  tag follows it** (upstream #7673, [BREAKING] there). `gen_ai.system` was
+  renamed to `gen_ai.provider.name` above the OTel v1.36.0 baseline, and this
+  port emitted *both* names on every chat span, so a consumer pinned to the
+  baseline saw an attribute its version does not define. `ObservabilityConfig`
+  now reads `OTEL_SEMCONV_STABILITY_OPT_IN` and exposes
+  `use_latest_experimental_gen_ai_semconv()`: unset means the latest
+  conventions (upstream's default too), and a list omitting
+  `gen_ai_latest_experimental` selects the baseline. Exactly one provider
+  attribute is emitted — on spans and on the metrics attributes — and the four
+  above-baseline attributes (`gen_ai.usage.cache_creation.input_tokens`,
+  `gen_ai.usage.cache_read.input_tokens`,
+  `gen_ai.usage.reasoning.output_tokens`, `gen_ai.tool.definitions`) plus
+  `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` are withheld at the
+  baseline. Under the default nothing changes except that `gen_ai.system` is
+  no longer emitted alongside `gen_ai.provider.name`.
+  - API: `record_request`, `record_response`, `record_tool_arguments` and
+    `record_tool_result` take `&ObservabilityConfig` in place of a
+    `capture_content: bool`; `chat_span` takes the semconv flag;
+    `ObservableChatClient` gained `with_observability_config`
+    (`with_content_capture` still works and now sets the flag on the config).
+
 ### Added
 
 - **`Error::MiddlewareFailure`, a fail-closed signal for function middleware**
