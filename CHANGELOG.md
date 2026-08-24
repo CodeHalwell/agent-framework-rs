@@ -7,7 +7,35 @@ may break APIs).
 
 ## [Unreleased]
 
+### Added
+
+- **`Error::MiddlewareFailure`, a fail-closed signal for function middleware**
+  (upstream #7562). The function-invocation loop absorbs every error a tool or
+  its middleware produces into a tool-error result, hands it to the model and
+  keeps looping — the right default for a tool failure the model can route
+  around, but it left an enforcement layer (a guardrail, a policy or
+  authorization gate) no way to stop a run: refusing a call just produced an
+  error string the model could try again. Middleware returning
+  `Error::middleware_failure(..)` is now propagated instead of absorbed, and
+  because the parallel batch is driven by `try_join_all`, propagating it also
+  drops the sibling calls still in flight. Every other error keeps the
+  absorb-and-continue contract unchanged.
+
 ### Fixed
+
+- **Replaying a conversation duplicated stored history** (upstream #7242). A
+  history provider is handed a run's input plus its response, so a caller that
+  keeps its own transcript and replays all of it each turn handed back
+  everything already stored — and each provider appended it unconditionally.
+  History grew superlinearly, and since `before_run` prepends it to the
+  request, the duplicated turns were resent to the model on every later run.
+  `agent_framework_core::history::filter_new_messages` now aligns the stored
+  run inside the incoming one (by `message_id`, or by role and contents when
+  there is none) and stores only what follows it; `InMemoryHistoryProvider`,
+  `FileHistoryProvider`, `RedisChatMessageStore` and `CosmosChatMessageStore`
+  all use it, the last two reading their stored history first. A run that
+  cannot be aligned is appended exactly as before — unlike upstream, no
+  set-based fallback drops a turn that merely repeats an earlier one.
 
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain

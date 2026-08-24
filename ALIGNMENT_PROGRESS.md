@@ -6,8 +6,84 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `5c06755` (2026-08-16).** Sections are newest
+**Current upstream baseline: `e1326eb` (2026-08-20).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`5c06755` drift (checked against `e1326eb`, 2026-08-20)
+
+Upstream moved **38 non-merge commits** in this window (2026-08-16 → 08-20).
+Two land on this port: a bug it shares with upstream, and a capability its
+middleware contract lacks. The other 36 are .NET, AG-UI, samples, dependency
+bumps, or Python-shaped problems that cannot arise here — several of those
+because the port's payloads are untyped `serde_json::Value`s rather than
+dynamically resolved Python types.
+
+### Ported this pass (1 fix + 1 capability, both with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7242 | **Replaying a conversation duplicated stored history.** A history provider is handed a run's input messages plus its response messages, so a caller that keeps its own transcript and replays all of it every turn (the AG-UI shape, and any client tracking history itself) hands back everything the provider already stored. Every provider appended it unconditionally, so history grew superlinearly — and because `before_run` prepends stored history to the request, the duplicated turns were resent to the model on every later run. `filter_new_messages` locates the stored run inside the incoming one and returns only what follows it. Matching is by `message_id` where a message has one and by role + contents where it does not, mirroring upstream's `get_message_identity`; the scan is not anchored at offset 0, so a provider whose stored history is a *trimmed window* (a retention limit having dropped the oldest messages) still aligns. Applied to all four history providers, not just the two upstream touched: `RedisChatMessageStore` and `CosmosChatMessageStore` have the identical shape and the identical bug, and now read their stored history before writing — one extra round trip per run, the same read `before_run` already makes. | `core/history.rs` (`filter_new_messages`, both providers' `after_run`), `redis/chat_message_store.rs`, `cosmos/chat_message_store.rs` |
+| #7562 | **Function middleware had no way to fail closed.** The invocation loop converts every error a tool or its middleware produces into a `FunctionResultContent { exception, .. }`, hands it to the model and keeps looping. That is right for a tool failure the model can recover from, but an enforcement layer — a guardrail, a policy or authorization gate — needs the opposite: when it refuses a call, the run must stop, not hand the model an error string it can retry around. `Error::MiddlewareFailure` is the escape, and the only error the loop propagates rather than absorbs. Because the parallel batch runs under `try_join_all`, propagating it also drops the siblings still in flight — upstream's "cancel the in-flight batch" without needing a cancellation mechanism of its own. | `core/error.rs` (`MiddlewareFailure`, `middleware_failure`, `is_middleware_failure`), `core/client.rs` (`execute_tool_call`), `core/observability.rs` (`error_type`) |
+
+Two deliberate divergences in the dedup, both refusing to drop a turn that
+might be real. Upstream falls back, when alignment fails, to deduplicating by
+identity against a set of everything stored; that collapses two identical,
+id-less `"yes"` turns into one and loses the second permanently. And upstream
+treats an alignment consuming *all* of the incoming run — a run whose messages
+exactly repeat the stored tail — as a replay carrying nothing new, storing
+nothing; since a provider only reaches `after_run` by completing a real run,
+this port reads it as a turn that genuinely repeated itself and stores it. In
+both cases the port's behavior is what it was before the fix (append), so
+neither can regress a conversation that used to be stored correctly.
+
+The fail-closed signal is carried by the error *type* rather than by who
+produced it, which is the one place it is looser than upstream's exception
+class: a tool executor returning `Error::MiddlewareFailure` propagates the same
+way. That is documented on the variant rather than guarded against — the
+alternative (a marker only the pipeline can set) would need a wrapper type
+threaded through every middleware signature for no practical gain.
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1641 passing**, 14 of them new), `cargo clippy --all-targets --all-features`
+clean, `cargo fmt --check` clean. The two Redis tests run against a real
+`redis-server` spawned by the existing integration harness; the Cosmos test
+asserts the write count on the loopback server, so it fails if a replayed
+message is written a second time. Both fixes were probed against the code they
+fix: 5 of the history tests and both fail-closed tests fail without them (the
+fail-closed pair by hanging on the 30-second sibling call, which is the
+cancellation the fix buys). The remaining tests are negative controls — an
+append-only run still accumulates every turn, an unalignable run is still
+stored whole, and an ordinary middleware error is still absorbed into a
+tool-error result and the loop still continues.
+
+### Not applicable (36)
+
+Grouped by why, rather than one row each:
+
+| Upstream | Why not |
+|---|---|
+| #7684, #7500, #7636 | **Python type resolution.** Coercing JSON workflow-resume payloads into declared annotations, restricting request-info type-name resolution to caller-provided mappings, and a global checkpoint type registry. All three exist because Python resolves a payload's type *by name* at runtime. This port's `PendingRequest.request_data` and `RequestResponse.data` are `serde_json::Value`; there is no declared response type to coerce to, no type name in the payload to resolve, and no import to restrict — the executor deserializes what it asked for. |
+| #7730 | **Structured instructions coerced to their `repr` when merged.** Upstream's `instructions` is declared `str` but widened by some clients to provider-native structured blocks, and three merge paths joined it with an f-string. `ChatOptions::instructions` is `Option<String>` here, so there is no non-string value to stringify; the newline concatenation in `ChatOptions::merge` and `prepare_request` is correct for every value the type admits. |
+| #7755 | **`HandoffBuilder` clones dropped `Agent.additional_properties`.** Upstream's `HandoffAgentExecutor` rebuilds each participant agent to attach handoff tools. This port's `HandoffBuilder` holds `Arc<dyn SupportsAgentRun>` participants and never rebuilds them, and `Agent` carries no `additional_properties` field to lose. |
+| #7557 | **Fan-in dropped all but the first trace context.** Upstream's workflow messages carry `trace_contexts` / `source_span_ids` lists for distributed-trace linking across a fan-in. This port's workflow engine propagates no trace context on messages at all — a standing gap in workflow observability, not a bug in aggregation, and one this commit does not close. |
+| #7761 | **A2A input handling in orchestrations.** Three-part change: reject an empty A2A invocation explicitly, translate a remote `INPUT_REQUIRED` task into the `user_input_request` content contract so a group chat pauses on it, and restore that pending input from a checkpoint. The first half is already satisfied: `A2AAgent::run` errors on an empty `messages` list rather than inventing input (upstream was raising a bare `ValueError` and now raises `AgentInvalidRequestException` with session context; this port's message is already specific). The rest is blocked — the port's `A2AAgent` surfaces an `INPUT_REQUIRED` task's status message as ordinary chat messages, and there is no `user_input_request` content classification to translate the task into, so pausing an orchestration on remote input is a design task (tracked below), not a port. The two core-workflow hunks in this commit ride on the same classification. |
+| #7766, #7510, #7662 | **AG-UI.** Unchanged predictive-state snapshots, tool-message IDs across snapshots, run continuity. No AG-UI crate. |
+| #7606 | **A2A preview consent URLs**, in `foundry_hosting`. This port has no Foundry hosted-agents host. |
+| #7698, #7695, #7693, #7706, #7746, #7740, #7762 | Harness blog samples, skill-script argument guidance, docs link fixes, spec/review-process guidance, engineering-system metadata, codeowners. |
+| #7722, #7741, #7764, #7742, #7564, #7668, #7295, #7737, #7731, #7641, #7721, #7713, #7674, #7412, #7648, #7650 | .NET: A2A streaming artifacts, AG-UI history and SDK bumps, agent-hooks interception (the .NET half of #7515, already tracked as open), Foundry hosted samples and identity pass-through, `IServiceProvider` overloads, harness tool descriptions, session-persisted routing, release/build/version chores, declarative samples, Cosmos chat-history retrieval, and opt-in concurrent tool invocation (this port's loop is concurrent by default). |
+| #7644, #7645 | Dependency bumps confined to Python tooling (`ty`, `flit`). |
+
+### Standing gaps, reconfirmed (not closed)
+
+- **Workflow trace propagation.** #7557 is the first upstream commit in this
+  window to touch machinery — per-message `trace_contexts` carried across
+  edges and merged at a fan-in — that the port's workflow engine does not have
+  at all. Agent and tool spans are instrumented; workflow message flow is not.
+- **`user_input_request` content classification.** #7761 needs an A2A
+  `INPUT_REQUIRED` task to become a content item an orchestration recognizes
+  as a request for caller input. The port has request-info events but no
+  content-level classification for them, so an A2A participant cannot pause a
+  group chat for remote input. Left open rather than half-built.
 
 ## Post-`2eb8fbb` drift (checked against `5c06755`, 2026-08-16)
 
