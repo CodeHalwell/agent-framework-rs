@@ -93,7 +93,8 @@ recording functions take an `&ObservabilityConfig` in place of a
   replay at all — a matching message id, or a non-user turn, since a replay is
   a transcript and carries the assistant's replies. Stored history that is
   nothing but id-less user messages is indistinguishable from new input that
-  repeats it, and is left alone.
+  repeats it, and is left alone. An empty `message_id` counts as no id at all,
+  matching the `!id.is_empty()` guard the crate already applies elsewhere.
 - **Tool spans could report a different semconv version than chat spans.** The
   function-invocation loop rebuilt an `ObservabilityConfig` from the
   environment for every tool call, so a client configured explicitly for one

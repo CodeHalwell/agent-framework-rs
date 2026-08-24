@@ -38,8 +38,8 @@ pub trait HistoryProvider: ContextProvider {}
 /// already-stored history.
 ///
 /// Mirrors upstream's `get_message_identity`: a message that carries a
-/// `message_id` is identified by it alone, and one that does not is identified
-/// by its role plus its contents. The two forms never compare equal, so an
+/// (non-empty) `message_id` is identified by it alone, and one that does not is
+/// identified by its role plus its contents. The two forms never compare equal, so an
 /// id-bearing message is never confused with an id-less one that happens to
 /// carry the same text.
 #[derive(PartialEq)]
@@ -49,10 +49,22 @@ enum MessageIdentity<'a> {
 }
 
 fn message_identity(message: &Message) -> MessageIdentity<'_> {
-    match &message.message_id {
+    match real_message_id(message) {
         Some(id) => MessageIdentity::Id(id),
         None => MessageIdentity::Contents(&message.role, &message.contents),
     }
+}
+
+/// A message's id when it actually identifies something.
+///
+/// An empty string is not an identity: every message carrying one would
+/// compare equal to every other, whatever its role or contents. The rest of the
+/// crate already reads an empty id as absent — see the `!id.is_empty()` guard
+/// in `agent::response_to_updates`'s `keep_provider_ids` — and matching that
+/// here keeps a provider or caller that emits `Some("")` from collapsing an
+/// entire conversation into one identity.
+fn real_message_id(message: &Message) -> Option<&str> {
+    message.message_id.as_deref().filter(|id| !id.is_empty())
 }
 
 /// Return the suffix of `incoming` that is not already present in `existing`,
@@ -198,7 +210,7 @@ pub fn filter_new_messages_from<'a>(
 fn could_be_a_replay(existing: &[Message]) -> bool {
     existing
         .iter()
-        .any(|m| m.message_id.is_some() || m.role != crate::types::Role::user())
+        .any(|m| real_message_id(m).is_some() || m.role != crate::types::Role::user())
 }
 
 /// What a run adds to `existing`: the part of its **input** that is not a
@@ -790,6 +802,37 @@ mod tests {
             )),
             vec!["new".to_string()]
         );
+    }
+
+    /// An empty string is not an identity — every message carrying one would
+    /// otherwise compare equal to every other (PR #16 review).
+    #[test]
+    fn an_empty_message_id_is_not_an_identity() {
+        let empty_id = |m: Message| Message {
+            message_id: Some(String::new()),
+            ..m
+        };
+        // Two unrelated messages, both with empty ids, must not align.
+        let existing = vec![
+            empty_id(Message::user("q")),
+            empty_id(Message::assistant("a")),
+        ];
+        let incoming = vec![
+            empty_id(Message::user("something else")),
+            empty_id(Message::assistant("unrelated")),
+            empty_id(Message::user("new")),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)).len(),
+            3,
+            "empty ids must fall back to role and contents, not match everything"
+        );
+
+        // And an empty id is not evidence of a replay either: user-only stored
+        // history carrying one is still left alone.
+        let user_only = vec![empty_id(Message::user("yes"))];
+        let repeat = vec![empty_id(Message::user("yes")), Message::user("question")];
+        assert_eq!(texts(filter_new_messages(&user_only, &repeat)).len(), 2);
     }
 
     /// Stored history that is nothing but id-less user turns cannot be told
