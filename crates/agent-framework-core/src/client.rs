@@ -116,6 +116,13 @@ impl<T: EmbeddingClient + ?Sized> EmbeddingClient for Arc<T> {
 pub struct FunctionInvokingChatClient<C: ChatClient> {
     inner: C,
     config: FunctionInvocationConfig,
+    /// Governs the `execute_tool` spans this client emits: content capture and
+    /// the GenAI semantic-convention version. Resolved from the environment
+    /// once at construction rather than re-read per tool call, so a caller who
+    /// selects a version explicitly (via [`Self::with_observability_config`])
+    /// gets that version on tool spans too, instead of a trace that mixes
+    /// conventions between its chat and tool spans.
+    observability: crate::observability::ObservabilityConfig,
     /// Middleware run around every individual tool call (mirrors Python's
     /// function-middleware pipeline, driven here instead of by a
     /// `use_function_invocation` decorator).
@@ -128,7 +135,21 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
             inner,
             config: FunctionInvocationConfig::default(),
             function_middleware: MiddlewarePipeline::default(),
+            observability: crate::observability::ObservabilityConfig::from_env(),
         }
+    }
+
+    /// Set the [`ObservabilityConfig`](crate::observability::ObservabilityConfig)
+    /// governing this client's `execute_tool` spans. Pass the same config given
+    /// to an [`ObservableChatClient`](crate::observability::ObservableChatClient)
+    /// wrapping the same stack, so one trace reports one semantic-convention
+    /// version throughout.
+    pub fn with_observability_config(
+        mut self,
+        observability: crate::observability::ObservabilityConfig,
+    ) -> Self {
+        self.observability = observability;
+        self
     }
 
     /// Override the function-invocation configuration.
@@ -227,15 +248,34 @@ const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by use
 /// converted to the same `(true, FunctionResultContent { exception: .. })`
 /// shape the direct-error path used before middleware existed, so
 /// `include_detailed_errors` behaves identically either way.
+///
+/// The single exception is [`Error::MiddlewareFailure`], which is propagated
+/// rather than absorbed: it is the fail-closed signal an enforcement layer
+/// returns to stop the run instead of letting the model retry around a
+/// tool-error result. Because the parallel batch is driven by `try_join_all`,
+/// propagating it also drops (cancels) the sibling calls still in flight.
+/// The ambient state one tool call runs against: everything that comes from
+/// the client and the run rather than from the call itself.
+struct ToolCallEnv<'a> {
+    function_middleware: &'a MiddlewarePipeline<FunctionInvocationContext>,
+    session: Option<&'a crate::session::AgentSession>,
+    live_tools: Option<&'a LiveToolList>,
+    observability: &'a crate::observability::ObservabilityConfig,
+}
+
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
     include_detailed_errors: bool,
     terminate_on_unknown: bool,
-    function_middleware: &MiddlewarePipeline<FunctionInvocationContext>,
-    session: Option<&crate::session::AgentSession>,
-    live_tools: Option<&LiveToolList>,
+    env: ToolCallEnv<'_>,
 ) -> Result<(bool, FunctionResultContent)> {
+    let ToolCallEnv {
+        function_middleware,
+        session,
+        live_tools,
+        observability,
+    } = env;
     match tool {
         None => {
             if terminate_on_unknown {
@@ -271,6 +311,7 @@ async fn execute_tool_call(
                     ));
                 }
             };
+            let obs_config = observability.clone();
             let exec = def.executor.as_ref().unwrap().clone();
             let tool_name = def.name.clone();
             let description = def.description.clone();
@@ -285,9 +326,7 @@ async fn execute_tool_call(
                         &call_id,
                         Some(&description),
                     );
-                    let capture =
-                        crate::observability::ObservabilityConfig::from_env().enable_sensitive_data;
-                    crate::observability::record_tool_arguments(&span, &ctx.arguments, capture);
+                    crate::observability::record_tool_arguments(&span, &ctx.arguments, &obs_config);
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
@@ -310,7 +349,7 @@ async fn execute_tool_call(
                             .as_deref(),
                     );
                     if let Ok(value) = &outcome {
-                        crate::observability::record_tool_result(&span, value, capture);
+                        crate::observability::record_tool_result(&span, value, &obs_config);
                     }
                     ctx.result = Some(outcome?);
                     Ok(ctx)
@@ -329,6 +368,12 @@ async fn execute_tool_call(
                         exception: None,
                     },
                 )),
+                // The one error the loop does not absorb: middleware that
+                // refuses a call outright (a guardrail, a policy or
+                // authorization gate) needs the run to fail closed rather than
+                // hand the model an error string it can retry around. Every
+                // other error keeps the absorb-and-continue contract below.
+                Err(e) if e.is_middleware_failure() => Err(e),
                 Err(e) => {
                     let msg = if include_detailed_errors {
                         format!("{e}")
@@ -570,9 +615,12 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             call,
                             self.config.include_detailed_errors,
                             self.config.terminate_on_unknown_calls,
-                            &self.function_middleware,
-                            session.as_ref(),
-                            Some(&live_tools),
+                            ToolCallEnv {
+                                function_middleware: &self.function_middleware,
+                                session: session.as_ref(),
+                                live_tools: Some(&live_tools),
+                                observability: &self.observability,
+                            },
                         )
                         .await?;
                         had_error |= is_error;
@@ -703,15 +751,19 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let function_middleware = self.function_middleware.clone();
                     let session = session.clone();
                     let live_tools = live_tools.clone();
+                    let observability = self.observability.clone();
                     async move {
                         execute_tool_call(
                             tool,
                             &call,
                             include_detailed_errors,
                             terminate_on_unknown,
-                            &function_middleware,
-                            session.as_ref(),
-                            Some(&live_tools),
+                            ToolCallEnv {
+                                function_middleware: &function_middleware,
+                                session: session.as_ref(),
+                                live_tools: Some(&live_tools),
+                                observability: &observability,
+                            },
                         )
                         .await
                     }

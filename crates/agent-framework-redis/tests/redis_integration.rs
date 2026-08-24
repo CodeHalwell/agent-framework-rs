@@ -371,6 +371,162 @@ async fn chat_message_store_before_run_prepends_history_and_after_run_records_it
     assert!(store.is_history_provider());
 }
 
+/// A caller that replays its own transcript on every turn used to have the
+/// whole conversation pushed onto the list again each time (upstream #7242).
+#[tokio::test]
+async fn chat_message_store_does_not_duplicate_a_replayed_transcript() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+    // Turn two replays everything the caller has, plus the new turn.
+    store
+        .after_run(
+            &[
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+            ],
+            &[Message::assistant("a2")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = store
+        .list_messages()
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "q1".to_string(),
+            "a1".to_string(),
+            "q2".to_string(),
+            "a2".to_string()
+        ]
+    );
+}
+
+/// The injection half of the replay fix, for the Redis store: a caller that
+/// replays its own transcript must not have the stored copy put in front of it
+/// as well (PR #16 review).
+#[tokio::test]
+async fn before_run_does_not_inject_history_the_input_already_carries() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+
+    // A replaying caller's input already holds q1/a1.
+    let mut replayed = SessionContext::new(vec![
+        Message::user("q1"),
+        Message::assistant("a1"),
+        Message::user("q2"),
+    ]);
+    store.before_run(&mut replayed).await.unwrap();
+    let injected: Vec<String> = replayed.messages.iter().map(|m| m.text()).collect();
+    assert!(
+        replayed.messages.is_empty(),
+        "stored history must not be injected on top of a replay of itself: {injected:?}"
+    );
+
+    // A caller that tracks nothing itself still gets history injected.
+    let mut incremental = SessionContext::new(vec![Message::user("q2")]);
+    store.before_run(&mut incremental).await.unwrap();
+    let injected: Vec<String> = incremental.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(injected, vec!["q1".to_string(), "a1".to_string()]);
+}
+
+/// A zero-retention store is documented to leave Redis untouched. Reading the
+/// stored history before writing must not break that: pointed at an address
+/// nothing is listening on, `after_run` still has to succeed, because it never
+/// connects (PR #16 review).
+#[tokio::test]
+async fn zero_retention_after_run_performs_no_redis_io() {
+    // A port nothing is bound to — any attempt to read or write fails.
+    let store = RedisChatMessageStore::new("redis://127.0.0.1:1/", Some(unique("thread")))
+        .unwrap()
+        .with_max_messages(0);
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .expect("a zero-retention run must not touch Redis at all");
+}
+
+/// Likewise for a run with nothing to store: no read, no write, no connection.
+#[tokio::test]
+async fn after_run_with_no_messages_performs_no_redis_io() {
+    let store = RedisChatMessageStore::new("redis://127.0.0.1:1/", Some(unique("thread"))).unwrap();
+
+    store
+        .after_run(&[], &[], None)
+        .await
+        .expect("a run with nothing to store must not touch Redis");
+}
+
+/// With a retention limit the stored history is a trimmed *window* of the
+/// conversation, so a replay starts before what the list holds and the
+/// alignment has to find the window inside it.
+#[tokio::test]
+async fn chat_message_store_dedup_aligns_against_a_trimmed_window() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let store = RedisChatMessageStore::new(&url, Some(unique("thread")))
+        .unwrap()
+        .with_max_messages(2);
+
+    store
+        .after_run(&[Message::user("q1")], &[Message::assistant("a1")], None)
+        .await
+        .unwrap();
+    store
+        .after_run(&[Message::user("q2")], &[Message::assistant("a2")], None)
+        .await
+        .unwrap();
+    // Only the last two survive the trim.
+    assert_eq!(store.list_messages().await.unwrap().len(), 2);
+
+    store
+        .after_run(
+            &[
+                Message::user("q1"),
+                Message::assistant("a1"),
+                Message::user("q2"),
+                Message::assistant("a2"),
+                Message::user("q3"),
+            ],
+            &[Message::assistant("a3")],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = store
+        .list_messages()
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(texts, vec!["q3".to_string(), "a3".to_string()]);
+}
+
 #[tokio::test]
 async fn context_provider_after_run_then_before_run_surfaces_matching_memory() {
     let Some((url, _guard)) = test_server().await else {

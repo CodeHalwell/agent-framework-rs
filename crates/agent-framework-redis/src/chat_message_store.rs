@@ -240,6 +240,26 @@ impl RedisChatMessageStore {
         Ok(store)
     }
 
+    /// Which [`StoredHistory`](agent_framework_core::history::StoredHistory)
+    /// shape a stored list of `stored_len` messages has.
+    ///
+    /// Only a list sitting *at* its retention cap can have been trimmed, and
+    /// only a trimmed list is a window: below the cap (or with no cap at all)
+    /// nothing has been dropped, so the list is the complete conversation and
+    /// must be aligned as such. Getting this wrong in either direction has a
+    /// cost — treating a complete list as a window discards the genuinely new
+    /// turns between two occurrences of it, and treating a window as complete
+    /// re-pushes the whole middle of a replayed transcript on every turn.
+    fn stored_history_shape(
+        &self,
+        stored_len: usize,
+    ) -> agent_framework_core::history::StoredHistory {
+        match self.max_messages {
+            Some(max) if stored_len >= max => agent_framework_core::history::StoredHistory::Window,
+            _ => agent_framework_core::history::StoredHistory::Complete,
+        }
+    }
+
     fn serialize_message(message: &Message) -> Result<String> {
         Ok(serde_json::to_string(message)?)
     }
@@ -253,8 +273,13 @@ impl RedisChatMessageStore {
 impl ContextProvider for RedisChatMessageStore {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.list_messages().await?;
-        let existing = std::mem::take(&mut ctx.messages);
-        ctx.messages = stored.into_iter().chain(existing).collect();
+        // Injecting unconditionally would send a replaying caller's turns to
+        // the model twice — the request is this provider's messages followed by
+        // the caller's own input, and for a replay those are the same turns.
+        // The window/complete distinction matters here for the same reason it
+        // does when storing.
+        let shape = self.stored_history_shape(stored.len());
+        agent_framework_core::history::inject_stored_history_from(ctx, stored, shape);
         Ok(())
     }
 
@@ -265,10 +290,46 @@ impl ContextProvider for RedisChatMessageStore {
         error: Option<&Error>,
     ) -> Result<()> {
         if error.is_none() {
-            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
-            combined.extend(request_messages.iter().cloned());
-            combined.extend(response_messages.iter().cloned());
-            self.add_messages(combined).await?;
+            // Nothing to persist: no read, no write. `add_messages` already
+            // treats both of these as no-ops, and reading first must not turn
+            // a run with nothing to store into one that can fail on Redis
+            // availability — least of all a zero-retention store, which is
+            // documented to leave Redis untouched entirely.
+            if (request_messages.is_empty() && response_messages.is_empty())
+                || self.max_messages == Some(0)
+            {
+                return Ok(());
+            }
+            // A caller that replays its own transcript hands back messages this
+            // list already holds; pushing them again grows the list
+            // superlinearly and resends the duplicates to the model on the next
+            // `before_run`. Reading the stored history first costs one extra
+            // `LRANGE` per run — the same read `before_run` already makes — and
+            // is what lets the replayed prefix be recognized. With a retention
+            // limit configured the stored history is a trimmed *window* of the
+            // conversation, which is why the alignment scan is not anchored at
+            // the start of the replay.
+            //
+            // Read-then-append is not atomic: two runs completing concurrently
+            // on the same session can both read the same list and both append
+            // the same suffix. That window is inherent to a compare-and-append
+            // over a remote store and would need a Lua script or a per-session
+            // lock to close; it is not a regression, since the blind append
+            // this replaces duplicated those messages unconditionally.
+            let stored = self.list_messages().await?;
+            // A trimmed list is a *window* of the most recent messages, so when
+            // a replayed transcript repeats that window earlier on, the window
+            // is the LAST occurrence — see `stored_history_shape`.
+            let shape = self.stored_history_shape(stored.len());
+            let new = agent_framework_core::history::new_run_messages_from(
+                &stored,
+                request_messages,
+                response_messages,
+                shape,
+            );
+            if !new.is_empty() {
+                self.add_messages(new).await?;
+            }
         }
         Ok(())
     }
@@ -291,6 +352,37 @@ mod tests {
         // construct in hermetic unit tests.
         RedisChatMessageStore::new("redis://127.0.0.1:6379/0", Some(session_id.to_string()))
             .expect("valid redis url")
+    }
+
+    /// Which occurrence of a stored run a replay aligns against depends on
+    /// whether the list has been trimmed, and only a list at its cap can have
+    /// been (PR #16 review).
+    #[test]
+    fn stored_history_shape_is_a_window_only_at_the_retention_cap() {
+        use agent_framework_core::history::StoredHistory;
+
+        // No retention limit: nothing is ever dropped.
+        let unlimited = store("s");
+        assert_eq!(
+            unlimited.stored_history_shape(1_000),
+            StoredHistory::Complete
+        );
+
+        let capped = store("s").with_max_messages(4);
+        // Below the cap the list still holds the whole conversation, so
+        // aligning it as a window would discard the new turns between two
+        // occurrences of it.
+        assert_eq!(capped.stored_history_shape(0), StoredHistory::Complete);
+        assert_eq!(capped.stored_history_shape(3), StoredHistory::Complete);
+        // At (or somehow past) the cap it is a window of the most recent
+        // messages, so the last occurrence is the stored one.
+        assert_eq!(capped.stored_history_shape(4), StoredHistory::Window);
+        assert_eq!(capped.stored_history_shape(9), StoredHistory::Window);
+
+        // A zero-retention store never writes, so the shape is moot, but the
+        // rule still classifies it consistently.
+        let zero = store("s").with_max_messages(0);
+        assert_eq!(zero.stored_history_shape(0), StoredHistory::Window);
     }
 
     // region: key construction

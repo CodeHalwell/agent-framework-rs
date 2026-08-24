@@ -336,8 +336,11 @@ impl CosmosChatMessageStore {
 impl ContextProvider for CosmosChatMessageStore {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.list_messages().await?;
-        let existing = std::mem::take(&mut ctx.messages);
-        ctx.messages = stored.into_iter().chain(existing).collect();
+        // Injecting unconditionally would send a replaying caller's turns to
+        // the model twice — the request is this provider's messages followed by
+        // the caller's own input, and for a replay those are the same turns.
+        // This store never trims, so what it holds is the complete history.
+        agent_framework_core::history::inject_stored_history(ctx, stored);
         Ok(())
     }
 
@@ -348,10 +351,38 @@ impl ContextProvider for CosmosChatMessageStore {
         error: Option<&Error>,
     ) -> Result<()> {
         if error.is_none() {
-            let mut combined = Vec::with_capacity(request_messages.len() + response_messages.len());
-            combined.extend(request_messages.iter().cloned());
-            combined.extend(response_messages.iter().cloned());
-            self.add_messages(combined).await?;
+            // Nothing to persist: no read, no write. `add_messages` is already
+            // a no-op for an empty batch, and reading first must not turn a run
+            // with nothing to store into one that can fail on service
+            // availability.
+            if request_messages.is_empty() && response_messages.is_empty() {
+                return Ok(());
+            }
+            // A caller that replays its own transcript hands back messages this
+            // container already holds; storing them again grows the item set
+            // superlinearly and resends the duplicates to the model on the next
+            // `before_run`. Reading the stored history first costs one extra
+            // query per run — the same query `before_run` already makes — and
+            // is what lets the replayed prefix be recognized.
+            //
+            // Two limits are worth naming rather than implying. Read-then-write
+            // is not atomic, so two runs completing concurrently on the same
+            // thread can both read the same history and both write the same
+            // suffix; and this client issues plain reads, so on an account with
+            // session or eventual consistency the read can lag a write that
+            // just landed. Either way the fallback is a duplicate — exactly
+            // what the blind append this replaces produced every time — so
+            // neither is a regression, and closing them needs transactional
+            // batches or session-token propagation.
+            let stored = self.list_messages().await?;
+            let new = agent_framework_core::history::new_run_messages(
+                &stored,
+                request_messages,
+                response_messages,
+            );
+            if !new.is_empty() {
+                self.add_messages(new).await?;
+            }
         }
         Ok(())
     }

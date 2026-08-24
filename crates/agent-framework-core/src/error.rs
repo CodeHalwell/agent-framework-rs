@@ -109,6 +109,30 @@ pub enum Error {
         message: String,
     },
 
+    /// Function middleware signalled an unrecoverable failure: the run must
+    /// stop rather than continue with a tool-error result.
+    ///
+    /// The function-invocation loop absorbs every other error a tool or its
+    /// middleware produces into a `FunctionResultContent { exception, .. }`,
+    /// hands it back to the model, and keeps looping — the right default for
+    /// an ordinary tool failure the model can recover from or route around.
+    /// An enforcement layer (a guardrail, a policy check, an authorization
+    /// gate) needs the opposite: when it refuses a call, the run must fail
+    /// closed, not hand the model an error string and let it try again.
+    ///
+    /// Middleware returning this variant gets that fail-closed escape. It is
+    /// the only error the loop propagates instead of absorbing; when one of a
+    /// parallel batch of calls raises it, the batch's in-flight siblings are
+    /// dropped (cancelled) and the failure surfaces from the run. Mirrors
+    /// upstream's `MiddlewareFailure` exception (Python #7562).
+    ///
+    /// The signal is carried by the error *type*, not by who produced it, so a
+    /// tool executor that returns this variant is propagated the same way.
+    /// Middleware that wants the ordinary absorb-and-continue contract should
+    /// keep returning any other variant — [`Error::Tool`] is the usual choice.
+    #[error("middleware failure: {0}")]
+    MiddlewareFailure(String),
+
     /// A workflow validation or execution error.
     #[error("workflow error: {0}")]
     Workflow(String),
@@ -193,6 +217,20 @@ impl Error {
     /// Create an [`Error::Tool`] from anything displayable.
     pub fn tool(msg: impl fmt::Display) -> Self {
         Error::Tool(msg.to_string())
+    }
+
+    /// Create an [`Error::MiddlewareFailure`] from anything displayable: the
+    /// fail-closed signal function middleware returns to stop a run outright
+    /// instead of having its error absorbed into a tool-error result.
+    pub fn middleware_failure(msg: impl fmt::Display) -> Self {
+        Error::MiddlewareFailure(msg.to_string())
+    }
+
+    /// Whether this error is the [`Error::MiddlewareFailure`] fail-closed
+    /// signal, which the function-invocation loop propagates rather than
+    /// absorbing into a tool-error result.
+    pub fn is_middleware_failure(&self) -> bool {
+        matches!(self, Error::MiddlewareFailure(_))
     }
 }
 

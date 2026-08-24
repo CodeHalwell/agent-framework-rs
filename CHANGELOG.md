@@ -5,10 +5,104 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-24
+
+Upstream-alignment passes against `microsoft/agent-framework`, moving the
+baseline from `4b1afd90` (2026-08-07) to `a63d462` (2026-08-24). Six
+upstream changes are ported and 100+ intervening commits are triaged in
+[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md), which records why each
+one that does not apply does not.
+
+This release **breaks API** (pre-1.0, so a minor bump): the observability
+recording functions take an `&ObservabilityConfig` in place of a
+`capture_content: bool`, `chat_span` takes the semantic-convention flag, and
+`gen_ai.system` is no longer emitted alongside `gen_ai.provider.name`. See
+**Changed** below.
+
+### Changed
+
+- **The GenAI semantic-convention version is now selectable, and the provider
+  tag follows it** (upstream #7673, [BREAKING] there). `gen_ai.system` was
+  renamed to `gen_ai.provider.name` above the OTel v1.36.0 baseline, and this
+  port emitted *both* names on every chat span, so a consumer pinned to the
+  baseline saw an attribute its version does not define. `ObservabilityConfig`
+  now reads `OTEL_SEMCONV_STABILITY_OPT_IN` and exposes
+  `use_latest_experimental_gen_ai_semconv()`: unset means the latest
+  conventions (upstream's default too), and a list omitting
+  `gen_ai_latest_experimental` selects the baseline. Exactly one provider
+  attribute is emitted — on spans and on the metrics attributes — and the four
+  above-baseline attributes (`gen_ai.usage.cache_creation.input_tokens`,
+  `gen_ai.usage.cache_read.input_tokens`,
+  `gen_ai.usage.reasoning.output_tokens`, `gen_ai.tool.definitions`) plus
+  `gen_ai.tool.call.arguments` / `gen_ai.tool.call.result` are withheld at the
+  baseline. Under the default nothing changes except that `gen_ai.system` is
+  no longer emitted alongside `gen_ai.provider.name`.
+  - API: `record_request`, `record_response`, `record_tool_arguments` and
+    `record_tool_result` take `&ObservabilityConfig` in place of a
+    `capture_content: bool`; `chat_span` takes the semconv flag;
+    `ObservableChatClient` gained `with_observability_config`
+    (`with_content_capture` still works and now sets the flag on the config).
+
+### Added
+
+- **`Error::MiddlewareFailure`, a fail-closed signal for function middleware**
+  (upstream #7562). The function-invocation loop absorbs every error a tool or
+  its middleware produces into a tool-error result, hands it to the model and
+  keeps looping — the right default for a tool failure the model can route
+  around, but it left an enforcement layer (a guardrail, a policy or
+  authorization gate) no way to stop a run: refusing a call just produced an
+  error string the model could try again. Middleware returning
+  `Error::middleware_failure(..)` is now propagated instead of absorbed, and
+  because the parallel batch is driven by `try_join_all`, propagating it also
+  drops the sibling calls still in flight. Every other error keeps the
+  absorb-and-continue contract unchanged.
 
 ### Fixed
 
+- **Replaying a conversation duplicated stored history** (upstream #7242). A
+  history provider is handed a run's input plus its response, so a caller that
+  keeps its own transcript and replays all of it each turn handed back
+  everything already stored — and each provider appended it unconditionally.
+  History grew superlinearly, and since `before_run` prepends it to the
+  request, the duplicated turns were resent to the model on every later run.
+  `agent_framework_core::history::filter_new_messages` now aligns the stored
+  run inside the incoming one (by `message_id`, or by role and contents when
+  there is none) and stores only what follows it; `InMemoryHistoryProvider`,
+  `FileHistoryProvider`, `RedisChatMessageStore` and `CosmosChatMessageStore`
+  all use it, the last two reading their stored history first (and skipping
+  that read entirely when there is nothing to store, or when a Redis store is
+  configured to retain nothing). A run that cannot be aligned is appended
+  exactly as before — unlike upstream, no set-based fallback drops a turn that
+  merely repeats an earlier one. Alignment sees a run's **input** only:
+  response messages were just generated and can never be a replay, so they are
+  always stored, even when one happens to reproduce the stored tail.
+- **A replayed transcript was also sent to the model twice.** Storing only the
+  new suffix fixed history growth, but the request is assembled the other way
+  round — injected context first, then the caller's input — so a history
+  provider that unconditionally injected what it held sent `q1, a1, q1, a1,
+  q2` for a caller replaying `q1, a1, q2`. All four history providers now
+  inject nothing when the run's input already carries the stored run
+  (`inject_stored_history`).
+  `StoredHistory::{Complete, Window}` selects where a stored run is looked for:
+  a complete history is matched at the start only — it begins at the
+  conversation's first message, so a replay of it can only begin with it — while
+  a window is searched for, preferring a match at the start (an at-cap list that
+  has never actually been trimmed is still complete) and otherwise taking the
+  last occurrence. The Redis store asks for `Window` only when its list is at
+  its cap. Alignment also requires *evidence* that stored history could be a
+  replay at all — a matching message id, or a non-user turn, since a replay is
+  a transcript and carries the assistant's replies. Stored history that is
+  nothing but id-less user messages is indistinguishable from new input that
+  repeats it, and is left alone. An empty `message_id` counts as no id at all,
+  matching the `!id.is_empty()` guard the crate already applies elsewhere.
+- **Tool spans could report a different semconv version than chat spans.** The
+  function-invocation loop rebuilt an `ObservabilityConfig` from the
+  environment for every tool call, so a client configured explicitly for one
+  convention version emitted tool spans under whatever the environment said.
+  `FunctionInvokingChatClient` now carries the config, settable with
+  `with_observability_config` and resolved from the environment once at
+  construction. `AgentBuilder::observability_config` reaches that wrapper,
+  which the builder constructs itself.
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain
   nothing — unlimited is expressed by not calling it at all — but trimming to
@@ -49,15 +143,6 @@ may break APIs).
   `AzureOpenAIResponsesClient::without_implicit_encrypted_reasoning`, which
   `FoundryChatClient` sets on its transport. An explicitly requested
   `reasoning.encrypted_content` is still honored.
-
-Upstream-alignment pass against `microsoft/agent-framework` `266206e`
-(2026-08-07), covering the six commits that landed after the `4b1afd90`
-baseline. Five are .NET-only changes to subsystems this port does not
-implement; the sixth established an invariant this port was violating. See
-[`ALIGNMENT_PROGRESS.md`](./ALIGNMENT_PROGRESS.md) for the per-commit triage.
-
-### Fixed
-
 - **The tool loop reported only its last iteration's token usage.** Each model
   call in the function-invocation loop reports its own usage, and every exit
   path returned the final call's `ChatResponse` untouched — so a run that
