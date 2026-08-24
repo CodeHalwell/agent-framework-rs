@@ -72,13 +72,15 @@ fn message_identity(message: &Message) -> MessageIdentity<'_> {
 /// input and responses together would let a response that happens to reproduce
 /// the stored tail swallow the genuinely new turn in front of it.
 ///
-/// The stored run is located inside `incoming` by scanning forward for the
-/// first position where every message matches by [`MessageIdentity`]; the
-/// messages after that block are the new ones. Offset `0` — `incoming` starting
-/// with exactly what is stored — is checked first, which is the ordinary replay
-/// case; a later offset covers a provider whose stored history is a trimmed
-/// window of the conversation (a retention limit having dropped the oldest
-/// messages).
+/// The stored run is located inside `incoming` by matching every message by
+/// [`MessageIdentity`]; the messages after that block are the new ones. Offset
+/// `0` — `incoming` starting with exactly what is stored — is the ordinary
+/// replay case; a later offset covers a provider whose stored history is a
+/// trimmed window of the conversation (a retention limit having dropped the
+/// oldest messages). When the stored run occurs more than once, which
+/// occurrence counts depends on what the provider holds: this function assumes
+/// [`StoredHistory::Complete`], and a windowed store should call
+/// [`filter_new_messages_from`] instead.
 ///
 /// When no alignment is found, **all** of `incoming` is returned: appending is
 /// the behavior every provider had before this function existed, so a
@@ -99,20 +101,54 @@ fn message_identity(message: &Message) -> MessageIdentity<'_> {
 ///   providers did before this function existed. Upstream reads it the other
 ///   way and stores nothing.
 pub fn filter_new_messages<'a>(existing: &[Message], incoming: &'a [Message]) -> &'a [Message] {
+    filter_new_messages_from(existing, incoming, StoredHistory::Complete)
+}
+
+/// What a provider's stored history is, which decides *which* occurrence of it
+/// inside a replayed transcript is the one it actually holds.
+///
+/// The distinction only bites when the stored run occurs more than once in the
+/// replay — a conversation that repeats an exchange verbatim — and the two
+/// answers are opposites, so it is a caller's decision rather than a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredHistory {
+    /// Everything the conversation has said so far, in order: the provider
+    /// drops nothing. The **first** occurrence is therefore the stored one, and
+    /// everything after it is new — matching a later occurrence would discard
+    /// the genuinely new turns in between.
+    Complete,
+    /// A trimmed window of the most recent messages, as a retention limit
+    /// leaves behind. The **last** occurrence is the retained window, so only
+    /// what follows it is new. Matching an earlier occurrence would re-send the
+    /// whole middle of the transcript on every turn — messages the store is
+    /// going to trim away again anyway.
+    Window,
+}
+
+/// [`filter_new_messages`] with an explicit [`StoredHistory`] shape.
+pub fn filter_new_messages_from<'a>(
+    existing: &[Message],
+    incoming: &'a [Message],
+    shape: StoredHistory,
+) -> &'a [Message] {
     if existing.is_empty() || incoming.len() <= existing.len() {
         return incoming;
     }
-    for start in 0..(incoming.len() - existing.len()) {
-        let candidate = &incoming[start..start + existing.len()];
-        if candidate
+    let matches = |start: usize| {
+        incoming[start..start + existing.len()]
             .iter()
             .zip(existing)
             .all(|(a, b)| message_identity(a) == message_identity(b))
-        {
-            return &incoming[start + existing.len()..];
-        }
+    };
+    let starts = 0..(incoming.len() - existing.len());
+    let found = match shape {
+        StoredHistory::Complete => starts.into_iter().find(|s| matches(*s)),
+        StoredHistory::Window => starts.rev().find(|s| matches(*s)),
+    };
+    match found {
+        Some(start) => &incoming[start + existing.len()..],
+        None => incoming,
     }
-    incoming
 }
 
 /// What a run adds to `existing`: the part of its **input** that is not a
@@ -130,7 +166,24 @@ pub fn new_run_messages(
     request_messages: &[Message],
     response_messages: &[Message],
 ) -> Vec<Message> {
-    filter_new_messages(existing, request_messages)
+    new_run_messages_from(
+        existing,
+        request_messages,
+        response_messages,
+        StoredHistory::Complete,
+    )
+}
+
+/// [`new_run_messages`] for a provider whose stored history has a known
+/// [`StoredHistory`] shape — a retention-limited store holds a
+/// [`StoredHistory::Window`].
+pub fn new_run_messages_from(
+    existing: &[Message],
+    request_messages: &[Message],
+    response_messages: &[Message],
+    shape: StoredHistory,
+) -> Vec<Message> {
+    filter_new_messages_from(existing, request_messages, shape)
         .iter()
         .chain(response_messages)
         .cloned()
@@ -612,6 +665,47 @@ mod tests {
         assert_eq!(
             texts(filter_new_messages(&existing, &incoming)),
             vec!["q3".to_string()]
+        );
+    }
+
+    /// A retention-limited store holds a *window*, so when the replayed
+    /// transcript repeats that window earlier on, the window is the LAST
+    /// occurrence — aligning to the first would re-send the whole middle of the
+    /// transcript every turn (PR #16 review).
+    #[test]
+    fn a_windowed_store_aligns_against_the_last_matching_occurrence() {
+        let existing = vec![Message::user("q"), Message::assistant("a")];
+        let incoming = vec![
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("filler"),
+            Message::user("q"),
+            Message::assistant("a"),
+            Message::user("new"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages_from(
+                &existing,
+                &incoming,
+                StoredHistory::Window
+            )),
+            vec!["new".to_string()]
+        );
+
+        // A complete store must keep taking the first occurrence: the repeat in
+        // the middle is a genuinely new turn it has never stored.
+        assert_eq!(
+            texts(filter_new_messages_from(
+                &existing,
+                &incoming,
+                StoredHistory::Complete
+            )),
+            vec![
+                "filler".to_string(),
+                "q".to_string(),
+                "a".to_string(),
+                "new".to_string()
+            ]
         );
     }
 

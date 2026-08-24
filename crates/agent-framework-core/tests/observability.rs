@@ -19,6 +19,7 @@ use agent_framework_core::observability::{
     ObservabilityConfig, ObservableChatClient, GEN_AI_LATEST_EXPERIMENTAL_OPT_IN,
 };
 use agent_framework_core::prelude::*;
+use agent_framework_core::types::FunctionArguments;
 use async_trait::async_trait;
 use tracing::Instrument;
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -90,6 +91,46 @@ impl ChatClient for CacheUsageStubClient {
             ..Default::default()
         });
         Ok(resp)
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+}
+
+/// Requests one `noop` tool call on the first turn, then answers.
+#[derive(Default)]
+struct ToolCallingStubClient {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ChatClient for ToolCallingStubClient {
+    async fn get_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n > 0 {
+            return Ok(ChatResponse::from_text("done"));
+        }
+        Ok(ChatResponse {
+            messages: vec![Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call_1",
+                    "noop",
+                    Some(FunctionArguments::Raw("{}".into())),
+                ))],
+            )],
+            finish_reason: Some(FinishReason::tool_calls()),
+            ..Default::default()
+        })
     }
 
     async fn get_streaming_response(
@@ -573,6 +614,55 @@ fn above_baseline_attributes_follow_the_semconv_opt_in() {
         span.fields.get(attr::INPUT_TOKENS).map(String::as_str),
         Some("7"),
         "the baseline token counts must still be emitted"
+    );
+}
+
+/// A configured semconv version has to reach tool spans as well as chat spans,
+/// or one trace mixes conventions: the tool loop used to rebuild the config
+/// from the environment per call (PR #16 review).
+///
+/// The environment is deliberately set to the *emitting* combination while the
+/// client is configured for the baseline, so reading the environment back would
+/// record the attributes this asserts are absent. `run_captured` holds the
+/// span-test mutex for the duration, which is what makes mutating the
+/// environment here safe against the other tests in this binary.
+#[test]
+fn tool_spans_follow_the_clients_configured_semconv_not_the_environment() {
+    let capture = run_captured(|| async {
+        unsafe { std::env::set_var("ENABLE_SENSITIVE_DATA", "true") };
+        unsafe { std::env::remove_var("OTEL_SEMCONV_STABILITY_OPT_IN") };
+
+        // Baseline conventions selected explicitly, against an environment that
+        // says capture everything under the latest conventions.
+        let client = FunctionInvokingChatClient::new(ToolCallingStubClient::default())
+            .with_observability_config(ObservabilityConfig {
+                enable_sensitive_data: true,
+                otel_semconv_stability_opt_in: Some("database".to_string()),
+            });
+        let options = ChatOptions::new().with_model("m").with_tool(
+            FunctionTool::new(
+                "noop",
+                "does nothing",
+                serde_json::json!({"type": "object", "properties": {}}),
+                |_a| async move { Ok(serde_json::json!("ok")) },
+            )
+            .into_definition(),
+        );
+        let _ = client
+            .get_response(vec![Message::user("go")], options)
+            .await;
+
+        unsafe { std::env::remove_var("ENABLE_SENSITIVE_DATA") };
+    });
+
+    let span = capture
+        .by_name("execute_tool")
+        .expect("expected an execute_tool span");
+    assert!(
+        !span.fields.contains_key(attr::TOOL_CALL_ARGUMENTS)
+            && !span.fields.contains_key(attr::TOOL_CALL_RESULT),
+        "the client's configured baseline must govern its tool spans, not the environment: {:?}",
+        span.fields
     );
 }
 

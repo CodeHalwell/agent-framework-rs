@@ -240,6 +240,26 @@ impl RedisChatMessageStore {
         Ok(store)
     }
 
+    /// Which [`StoredHistory`](agent_framework_core::history::StoredHistory)
+    /// shape a stored list of `stored_len` messages has.
+    ///
+    /// Only a list sitting *at* its retention cap can have been trimmed, and
+    /// only a trimmed list is a window: below the cap (or with no cap at all)
+    /// nothing has been dropped, so the list is the complete conversation and
+    /// must be aligned as such. Getting this wrong in either direction has a
+    /// cost — treating a complete list as a window discards the genuinely new
+    /// turns between two occurrences of it, and treating a window as complete
+    /// re-pushes the whole middle of a replayed transcript on every turn.
+    fn stored_history_shape(
+        &self,
+        stored_len: usize,
+    ) -> agent_framework_core::history::StoredHistory {
+        match self.max_messages {
+            Some(max) if stored_len >= max => agent_framework_core::history::StoredHistory::Window,
+            _ => agent_framework_core::history::StoredHistory::Complete,
+        }
+    }
+
     fn serialize_message(message: &Message) -> Result<String> {
         Ok(serde_json::to_string(message)?)
     }
@@ -292,10 +312,15 @@ impl ContextProvider for RedisChatMessageStore {
             // lock to close; it is not a regression, since the blind append
             // this replaces duplicated those messages unconditionally.
             let stored = self.list_messages().await?;
-            let new = agent_framework_core::history::new_run_messages(
+            // A trimmed list is a *window* of the most recent messages, so when
+            // a replayed transcript repeats that window earlier on, the window
+            // is the LAST occurrence — see `stored_history_shape`.
+            let shape = self.stored_history_shape(stored.len());
+            let new = agent_framework_core::history::new_run_messages_from(
                 &stored,
                 request_messages,
                 response_messages,
+                shape,
             );
             if !new.is_empty() {
                 self.add_messages(new).await?;
@@ -322,6 +347,37 @@ mod tests {
         // construct in hermetic unit tests.
         RedisChatMessageStore::new("redis://127.0.0.1:6379/0", Some(session_id.to_string()))
             .expect("valid redis url")
+    }
+
+    /// Which occurrence of a stored run a replay aligns against depends on
+    /// whether the list has been trimmed, and only a list at its cap can have
+    /// been (PR #16 review).
+    #[test]
+    fn stored_history_shape_is_a_window_only_at_the_retention_cap() {
+        use agent_framework_core::history::StoredHistory;
+
+        // No retention limit: nothing is ever dropped.
+        let unlimited = store("s");
+        assert_eq!(
+            unlimited.stored_history_shape(1_000),
+            StoredHistory::Complete
+        );
+
+        let capped = store("s").with_max_messages(4);
+        // Below the cap the list still holds the whole conversation, so
+        // aligning it as a window would discard the new turns between two
+        // occurrences of it.
+        assert_eq!(capped.stored_history_shape(0), StoredHistory::Complete);
+        assert_eq!(capped.stored_history_shape(3), StoredHistory::Complete);
+        // At (or somehow past) the cap it is a window of the most recent
+        // messages, so the last occurrence is the stored one.
+        assert_eq!(capped.stored_history_shape(4), StoredHistory::Window);
+        assert_eq!(capped.stored_history_shape(9), StoredHistory::Window);
+
+        // A zero-retention store never writes, so the shape is moot, but the
+        // rule still classifies it consistently.
+        let zero = store("s").with_max_messages(0);
+        assert_eq!(zero.stored_history_shape(0), StoredHistory::Window);
     }
 
     // region: key construction

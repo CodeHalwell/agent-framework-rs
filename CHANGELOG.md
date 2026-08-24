@@ -70,6 +70,17 @@ may break APIs).
   provider that unconditionally injected what it held sent `q1, a1, q1, a1,
   q2` for a caller replaying `q1, a1, q2`. The core history providers now
   inject nothing when the run's input already carries the stored run.
+  `StoredHistory::{Complete, Window}` selects which occurrence of a stored run
+  a replay aligns on — the first for a provider that keeps everything, the last
+  for a retention-limited one whose stored list is a window of the most recent
+  messages (the Redis store picks `Window` only when its list is at its cap).
+- **Tool spans could report a different semconv version than chat spans.** The
+  function-invocation loop rebuilt an `ObservabilityConfig` from the
+  environment for every tool call, so a client configured explicitly for one
+  convention version emitted tool spans under whatever the environment said.
+  `FunctionInvokingChatClient` now carries the config, settable with
+  `with_observability_config` and resolved from the environment once at
+  construction.
 
 - **A Redis retention limit of zero retained everything** (upstream #7470).
   `RedisChatMessageStore::with_max_messages(0)` is a request to retain

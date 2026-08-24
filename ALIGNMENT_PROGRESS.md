@@ -82,6 +82,23 @@ patch covers, both confirmed by probe before fixing:
   to end against the messages the model actually received. The core providers
   now inject nothing when the input already aligns against what they hold.
 
+A second review round raised two more, both fixed:
+
+- **Which occurrence of a stored run to align on depends on what the provider
+  holds.** A forward scan takes the first match, which is right for a store
+  that keeps everything — a later match would discard the genuinely new turns
+  in between — but wrong for a retention-limited one, whose stored list is a
+  *window* of the most recent messages: there the last match is the window, and
+  taking an earlier one re-pushes the whole middle of a replayed transcript on
+  every turn. `StoredHistory::{Complete, Window}` makes it the caller's
+  decision, and the Redis store picks `Window` only when its list is *at* its
+  cap, since only a trimmed list can be a window.
+- **A configured semconv version has to reach tool spans.** The tool loop
+  rebuilt an `ObservabilityConfig` from the environment per call, so a client
+  configured for one convention version could emit chat spans under it and tool
+  spans under another. `FunctionInvokingChatClient` now carries the config
+  (`with_observability_config`), resolved once at construction.
+
 The remote stores also no longer read before writing when there is nothing to
 write (an empty run, or a Redis store configured to retain nothing, which is
 documented to leave Redis untouched); both cases are pinned by pointing a store
@@ -110,7 +127,7 @@ alternative (a marker only the pipeline can set) would need a wrapper type
 threaded through every middleware signature for no practical gain.
 
 Verified: full workspace build, `cargo test --workspace --all-features`
-(**1650 passing**, 19 of them new), `cargo clippy --all-targets --all-features`
+(**1653 passing**, 22 of them new), `cargo clippy --all-targets --all-features`
 clean, `cargo fmt --check` clean. The two Redis tests run against a real
 `redis-server` spawned by the existing integration harness; the Cosmos test
 asserts the write count on the loopback server, so it fails if a replayed
