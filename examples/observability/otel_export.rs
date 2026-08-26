@@ -100,6 +100,12 @@ fn compose_your_own_subscriber() -> Result<()> {
 async fn main() -> Result<()> {
     // Route A: build the pipeline and let it install the subscriber. The
     // endpoint defaults to OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4318.
+    //
+    // Order matters, which is why this is the first thing main does: the GenAI
+    // instruments are created once on first use and bind to whichever meter
+    // provider is installed at that moment. Run a chat call before build() and
+    // they bind to the no-op provider for the life of the process — traces
+    // would still export while metrics stayed silently empty.
     let pipeline = OtelExport::new("agent-framework-example")
         .with_metric_interval(std::time::Duration::from_secs(5))
         .build()?;

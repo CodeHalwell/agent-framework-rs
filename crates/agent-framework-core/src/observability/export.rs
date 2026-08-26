@@ -91,6 +91,38 @@ pub const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4318";
 /// Instrumentation-scope name used for the tracer this pipeline creates.
 pub const SCOPE_NAME: &str = "agent_framework";
 
+/// Join a configured endpoint with a signal path.
+///
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is a *base* URL under the OTel specification,
+/// with the signal path appended — which is what this does. But the
+/// signal-specific variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and friends)
+/// are full URLs, and a caller who reaches for [`OtelExport::with_endpoint`]
+/// having read those docs will naturally pass one. Appending unconditionally
+/// would turn that into `…/v1/traces/v1/traces`, which fails as an opaque
+/// exporter error far from the mistake. An endpoint already carrying its
+/// signal path is therefore used as given.
+///
+/// Note this port does not read the signal-specific variables itself; only
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is consulted, in [`OtelExport::new`].
+///
+/// One pipeline drives both signals from one endpoint, so a signal path found
+/// on the input is stripped before the right one is appended, rather than
+/// merely suppressed. Suppressing would leave a traces URL correct for traces
+/// and nonsense for metrics (`…/v1/traces/v1/metrics`) — the same class of
+/// broken URL, just harder to notice because only one signal breaks.
+fn signal_url(endpoint: &str, signal_path: &str) -> String {
+    const SIGNAL_PATHS: [&str; 3] = ["/v1/traces", "/v1/metrics", "/v1/logs"];
+
+    let mut base = endpoint.trim_end_matches('/');
+    for known in SIGNAL_PATHS {
+        if let Some(stripped) = base.strip_suffix(known) {
+            base = stripped.trim_end_matches('/');
+            break;
+        }
+    }
+    format!("{base}{signal_path}")
+}
+
 /// Builder for the OTLP export pipeline.
 ///
 /// `service_name` is the only required input: it becomes the `service.name`
@@ -152,6 +184,14 @@ impl OtelExport {
     /// with [`OtelPipeline::tracing_layer`] and never calls `install` still
     /// needs metrics to work.
     ///
+    /// **Call this before running any instrumented code.** The GenAI
+    /// instruments are created once, on first use, and bind to whichever
+    /// meter provider is installed at that moment — so a chat call made
+    /// before `build()` permanently binds them to the no-op provider, and
+    /// metrics stay silently inert for the life of the process while traces
+    /// export normally. Nothing reports this; it looks like the metrics were
+    /// never recorded.
+    ///
     /// Spans are *not* wired up here — that requires claiming a subscriber,
     /// which is [`OtelPipeline::install`]'s job, or the caller's via
     /// [`OtelPipeline::tracing_layer`].
@@ -163,7 +203,7 @@ impl OtelExport {
         let tracer_provider = if self.traces {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
-                .with_endpoint(format!("{}/v1/traces", self.endpoint.trim_end_matches('/')))
+                .with_endpoint(signal_url(&self.endpoint, "/v1/traces"))
                 .build()
                 .map_err(|e| Error::other(format!("OTLP span exporter: {e}")))?;
             Some(
@@ -179,10 +219,7 @@ impl OtelExport {
         let meter_provider = if self.metrics {
             let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
-                .with_endpoint(format!(
-                    "{}/v1/metrics",
-                    self.endpoint.trim_end_matches('/')
-                ))
+                .with_endpoint(signal_url(&self.endpoint, "/v1/metrics"))
                 .build()
                 .map_err(|e| Error::other(format!("OTLP metric exporter: {e}")))?;
             let reader = PeriodicReader::builder(exporter)
@@ -304,6 +341,37 @@ mod tests {
         );
         // Shutting down a pipeline that exports nothing is a no-op, not a panic.
         pipeline.shutdown();
+    }
+
+    #[test]
+    fn signal_paths_are_joined_without_doubling() {
+        // The documented base-URL form.
+        assert_eq!(
+            signal_url("http://localhost:4318", "/v1/traces"),
+            "http://localhost:4318/v1/traces"
+        );
+        // A trailing slash must not produce `//v1/traces`.
+        assert_eq!(
+            signal_url("http://localhost:4318/", "/v1/metrics"),
+            "http://localhost:4318/v1/metrics"
+        );
+        // A full signal URL, as the signal-specific OTel env vars carry, is
+        // used as given rather than suffixed a second time.
+        assert_eq!(
+            signal_url("http://collector:4318/v1/traces", "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        // ...and the *other* signal is rebased off it rather than stacked on
+        // top, since one pipeline serves both from a single endpoint.
+        assert_eq!(
+            signal_url("http://collector:4318/v1/traces", "/v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+        // A path-prefixed collector keeps its prefix.
+        assert_eq!(
+            signal_url("http://gateway/otlp", "/v1/traces"),
+            "http://gateway/otlp/v1/traces"
+        );
     }
 
     /// A trailing slash on the endpoint must not produce `//v1/traces`. Builds
