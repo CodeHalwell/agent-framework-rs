@@ -32,7 +32,7 @@
 //! supported route to Azure Monitor is OTLP into an OpenTelemetry Collector
 //! configured with the Azure Monitor exporter — which is what this points at.
 
-use agent_framework::observability::export::OtelExport;
+use agent_framework::observability::export::{OtelExport, OtelPipeline};
 use agent_framework::observability::ObservableChatClient;
 use agent_framework::prelude::*;
 use async_trait::async_trait;
@@ -80,8 +80,15 @@ impl ChatClient for CannedClient {
 /// collector *and* stay readable on the console. Use this instead of
 /// `install()` whenever the application already owns its subscriber, since
 /// `install()` sets the global default and would conflict.
+///
+/// The pipeline is **returned, not shut down here**. It has to outlive every
+/// instrumented call: the layer just installed holds a tracer belonging to its
+/// tracer provider, and `build()` installed its meter provider globally, so
+/// shutting down before the work runs would leave the subscriber wired to dead
+/// providers and silently discard everything after it. The caller holds this
+/// for the process lifetime and shuts it down on the way out.
 #[allow(dead_code)]
-fn compose_your_own_subscriber() -> Result<()> {
+fn compose_your_own_subscriber() -> Result<OtelPipeline> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -94,8 +101,7 @@ fn compose_your_own_subscriber() -> Result<()> {
         .try_init()
         .map_err(|e| agent_framework_core::error::Error::other(e.to_string()))?;
 
-    pipeline.shutdown()?;
-    Ok(())
+    Ok(pipeline)
 }
 
 #[tokio::main]

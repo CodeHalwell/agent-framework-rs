@@ -294,6 +294,14 @@ impl OtelPipeline {
     /// composing their own subscriber.
     ///
     /// Returns `None` when traces are disabled.
+    ///
+    /// **Keep the [`OtelPipeline`] alive for as long as the subscriber is
+    /// installed.** The layer holds a tracer belonging to this pipeline's
+    /// tracer provider, and [`OtelExport::build`] installed its meter provider
+    /// globally, so calling [`shutdown`](Self::shutdown) while the subscriber
+    /// is still in place leaves it wired to stopped providers — every
+    /// subsequent span and metric is then discarded, with nothing reporting
+    /// it. Shut down on the way out of the process, not after installing.
     pub fn tracing_layer<S>(
         &self,
     ) -> Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>>
