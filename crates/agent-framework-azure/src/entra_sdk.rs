@@ -1,10 +1,12 @@
 //! Entra ID credentials backed by the official [Azure SDK for Rust].
 //!
 //! Behind the `entra-sdk` feature. This module does not replace the
-//! hand-rolled credentials in [`crate::credentials`] — it adapts *any*
-//! credential from the official [`azure_identity`] crate onto this crate's
-//! [`TokenCredential`] trait, so both can be used interchangeably wherever a
-//! credential is accepted.
+//! hand-rolled credentials this crate already ships (such as
+//! [`ChainedTokenCredential`](crate::ChainedTokenCredential) and
+//! [`ManagedIdentityCredential`](crate::ManagedIdentityCredential)) — it
+//! adapts *any* credential from the official [`azure_identity`] crate onto
+//! this crate's [`TokenCredential`] trait, so both can be used
+//! interchangeably wherever a credential is accepted.
 //!
 //! # Why both exist
 //!
