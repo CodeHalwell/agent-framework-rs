@@ -6,8 +6,53 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `a63d462` (2026-08-24).** Sections are newest
+**Current upstream baseline: `e6d8d99` (2026-08-26).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`a63d462` drift (checked against `e6d8d99`, 2026-08-26)
+
+Upstream moved **17 non-merge commits** in this window (2026-08-24 → 08-26).
+**None require a code change here.** Four are Python, one of which (#7850) is a
+bug this port never had; the rest are .NET, samples, dependency bumps, or
+Python-shaped problems that cannot arise here. The mirror is current — its last
+`microsoft:main` merge is ~2h behind the newest commit triaged.
+
+### Ported this pass (0 behavioral changes; 3 regression tests)
+
+#7850 needed no fix, but it pins a behavior worth protecting, so it is recorded
+as a test-only change following the precedent set by `7f4cc296` last pass
+(correct by construction, pinned rather than left implicit).
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7850 | **Unmapped Anthropic and Mistral finish reasons were dropped.** Both Python clients looked their finish-reason map up without a default, so any provider value the map did not cover — Anthropic's `model_context_window_exceeded`, Mistral's `error` — reached the caller as *no finish reason at all*. This port has always passed unmapped values through: `map_stop_reason` ends in `other => FinishReason::new(other)` and is the single resolution site for both the buffered and streaming Anthropic paths, while the Mistral client reuses `agent_framework_openai::convert::parse_response`, which builds the reason straight from the wire string. `FinishReason` is an open string enum, so there was nothing to widen. Three regression tests now pin it, because in two of the three sites the behavior is *inherited* rather than written locally, and upstream's own bug is exactly what a later "tidy the match into a lookup table" refactor would reintroduce. | `anthropic/convert.rs` (`map_stop_reason_passes_unmapped_values_through`), `anthropic/lib.rs` (`stream_passes_an_unmapped_stop_reason_through`), `mistral/convert.rs` (`parse_response_passes_an_unmapped_finish_reason_through`) |
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1663 passing**, 3 of them new), `cargo clippy --all-targets --all-features`
+under `-D warnings` (CI's own flag) clean, `cargo fmt --check` clean. Each new
+test was confirmed to fail against the lossy behavior — the Anthropic pair
+against a fallback arm rewritten to collapse unknown values, the Mistral one
+against a lookup-without-default in the shared OpenAI parser — and each was the
+*only* test in its crate to fail, so they pin the passthrough specifically and
+not the documented mappings alongside it.
+
+### Not applicable (16)
+
+| Upstream | Why not |
+|---|---|
+| #7860 | **The harness agent-loop marker leaked into provider options.** `RawAgent` now pops the loop-iteration key off the merged options so it stays on `SessionContext.options` for `after_run` provider scoping without reaching the client. This port has no harness agent loop at all — the same reason #7289 was not applicable last pass — so there is no marker to leak. |
+| #7703 | **Programmatic OTel service name, resource attributes, and OTLP exporter config**, added as keyword arguments to `configure_otel_providers()` / `ObservabilitySettings`. That entry point configures the OpenTelemetry **SDK**: tracer/meter providers and OTLP exporters. This port deliberately ships none of that — it emits `tracing` spans the application bridges itself (e.g. via `tracing-opentelemetry`) and touches the `opentelemetry` **API** crate only for its two metrics instruments, with `opentelemetry_sdk` a test-only dependency. There is no provider-setup function here to add parameters to. A documented divergence, not a gap. |
+| #7705 | **Streaming broke when the Azure GenAI instrumentor replaced the raw response.** The instrumentor substitutes an object exposing neither `.parse()` nor `.headers` for the OpenAI Python SDK's raw-response wrapper, so `_open_event_stream()` must probe `.parse` with `callable()` and parse the *inner* unparsed response the wrapper holds. Both halves are Python-SDK object-graph plumbing: this port speaks HTTP directly over `reqwest` and parses SSE frames itself, so there is no SDK response wrapper for an instrumentor to swap out. |
+| #7846 | **ChatKit attachment handling** — `python/samples/05-end-to-end/chatkit-integration/` only. Samples, and there is no ChatKit crate (a tracked ecosystem gap). |
+| #5860 | **.NET preserves the Responses `logprobs` field**, adding it to `CreateResponse`/`Response` and echoing the request's value onto the response. Those are `Microsoft.Agents.AI.Hosting.OpenAI`'s full, stateful Responses-service models. This port's `hosting::responses` mirrors Python's `hosting-responses` *conversion* surface instead: `ResponsesRequest` is a documented subset (`model`/`input`/`stream`/`metadata`/`extra_body`) modelling no sampling parameters at all, and `ResponseObject` echoes none of the request-parameter fields (`instructions`, `max_output_tokens`, `max_tool_calls`, `top_logprobs`, …). Adding `logprobs` alone would be arbitrary; the request-echo surface as a whole, and the stateful service (`InMemoryResponsesService`) it belongs to, are out of scope — hosted runs here are stateless by design. |
+| #7843, #7861, #7792 | .NET **samples** only (verified against each commit's file list): AG-UI hosted web search moved onto the Responses API, A2A function-tool sample simplification, and a Mem0Sharp in-memory sample. No framework change. |
+| #7842, #7817 | .NET Foundry hosted-agent response cancellation, and recovery-test stabilization. This port has no Foundry hosted-agents host. |
+| #7864, #7858 | .NET static-analysis annotations — DevUI aggregator and Zip Slip false positives. |
+| #7878, #7870, #7826, #7868 | .NET package rename (`CommunityToolkit.VectorData.CosmosNoSql` → `AzureCosmosDB`), an ASP.NET OpenAPI dependency upgrade, an `Aspire.Hosting` bump, and a dependabot cooldown setting. Dependency and repo hygiene. |
+
+Still deferred from last pass: **#7768** (pin GitHub Actions to full-length
+commit SHAs) remains blocked for the same reason — resolving each action's SHA
+means reading repositories outside this session's GitHub scope.
 
 ## Post-`e1326eb` drift (checked against `a63d462`, 2026-08-24)
 

@@ -347,6 +347,31 @@ mod tests {
         assert_eq!(usage.total_token_count, Some(15));
     }
 
+    /// Upstream #7850: Mistral's Python client looked its finish-reason map up
+    /// without a default, so a value the map did not cover — notably Mistral's
+    /// own `error` — was reported as no finish reason at all. This port reuses
+    /// [`oai::parse_response`], which builds the reason straight from the wire
+    /// string, so unmapped values pass through untouched. Pinned here because
+    /// the behavior is inherited rather than written locally: a future Mistral
+    /// -specific finish-reason mapping would be the natural place to
+    /// reintroduce the bug.
+    #[test]
+    fn parse_response_passes_an_unmapped_finish_reason_through() {
+        let value = json!({
+            "id": "cmpl-123",
+            "model": "mistral-large-latest",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "error",
+            }],
+        });
+        assert_eq!(
+            parse_response(&value).finish_reason,
+            Some(agent_framework_core::types::FinishReason::new("error"))
+        );
+    }
+
     /// Mistral reports prompt-cache hits as `usage.prompt_tokens_details.
     /// cached_tokens`, and those must survive into the typed, cross-language
     /// usage field rather than being dropped (upstream #7597).

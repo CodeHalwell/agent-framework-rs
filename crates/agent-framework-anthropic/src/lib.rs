@@ -705,6 +705,44 @@ mod tests {
         assert_eq!(usage.output_token_count, Some(15));
     }
 
+    /// The streaming counterpart of
+    /// `convert::tests::map_stop_reason_passes_unmapped_values_through`
+    /// (upstream #7850): `message_delta` is the other of the two sites that
+    /// resolve a stop reason, and Python dropped unmapped values on both. It
+    /// routes through the same [`convert::map_stop_reason`], so an unknown
+    /// value survives aggregation onto the final response.
+    #[tokio::test]
+    async fn stream_passes_an_unmapped_stop_reason_through() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-x", "usage": { "input_tokens": 25, "output_tokens": 1 } }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "model_context_window_exceeded" },
+                "usage": { "output_tokens": 15 }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        ));
+
+        let resp = ChatResponse::from_updates(collect_updates(text).await);
+        assert_eq!(
+            resp.finish_reason,
+            Some(agent_framework_core::types::FinishReason::new(
+                "model_context_window_exceeded"
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn stream_usage_is_not_double_counted_when_deltas_repeat_input_tokens() {
         // Anthropic streams *cumulative* usage: `message_delta` repeats the
