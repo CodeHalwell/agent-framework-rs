@@ -16,10 +16,12 @@
 //! This file is compiled by CI, so the wiring here cannot drift out of date
 //! the way a prose snippet can.
 //!
-//! It runs fully offline: with no collector listening the exporter simply
-//! fails to deliver and logs it, which is exactly what it does in production
-//! when a collector is down. Point it somewhere real with
-//! `OTEL_EXPORTER_OTLP_ENDPOINT`, or run one locally:
+//! It runs fully offline. With no collector listening the exporter cannot
+//! deliver, and the final flush reports that — which is exactly what happens
+//! in production when a collector is down, and is why `shutdown` returns its
+//! outcome instead of logging into a subscriber that is already being torn
+//! down. Point it somewhere real with `OTEL_EXPORTER_OTLP_ENDPOINT`, or run
+//! one locally:
 //!
 //! ```bash
 //! docker run --rm -p 4318:4318 otel/opentelemetry-collector
@@ -92,7 +94,7 @@ fn compose_your_own_subscriber() -> Result<()> {
         .try_init()
         .map_err(|e| agent_framework_core::error::Error::other(e.to_string()))?;
 
-    pipeline.shutdown();
+    pipeline.shutdown()?;
     Ok(())
 }
 
@@ -127,6 +129,15 @@ async fn main() -> Result<()> {
 
     // Flush before exit: the span exporter batches, so dropping without this
     // loses whatever is still queued.
-    pipeline.shutdown();
+    //
+    // `shutdown` returns the outcome instead of logging it, because by this
+    // point the subscriber installed above can no longer report anything —
+    // its only layer feeds the tracer provider being shut down. Handle it
+    // rather than propagate: with no collector listening this *does* fail, and
+    // failing to deliver telemetry is not a reason to exit non-zero. What
+    // matters is that the caller can now see it at all.
+    if let Err(e) = pipeline.shutdown() {
+        eprintln!("telemetry flush failed (expected with no collector running): {e}");
+    }
     Ok(())
 }

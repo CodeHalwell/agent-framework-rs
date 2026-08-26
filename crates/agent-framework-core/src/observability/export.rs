@@ -69,7 +69,8 @@
 //!
 //! // ... run agents; spans and GenAI metrics now export ...
 //!
-//! pipeline.shutdown();
+//! // Flush before exit; a failure here means queued telemetry was dropped.
+//! pipeline.shutdown()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -341,20 +342,39 @@ impl OtelPipeline {
 
     /// Flush and shut down both providers.
     ///
-    /// Errors are reported through `tracing` rather than returned: this runs on
-    /// the shutdown path, where a caller has nothing useful left to do with a
-    /// failure, and losing the other provider's flush because the first errored
-    /// would be worse than logging.
-    pub fn shutdown(&self) {
+    /// Both are always attempted, and their errors aggregated: a failure
+    /// flushing one must not cost the other its flush, so this does not
+    /// short-circuit.
+    ///
+    /// The outcome is *returned* rather than logged, because logging it would
+    /// go nowhere in the very setup this module recommends.
+    /// [`install`](Self::install) builds a subscriber of an `EnvFilter` and the
+    /// OpenTelemetry layer and nothing else — there is no formatting layer for
+    /// a `tracing` event to reach, and the one layer present forwards to a
+    /// tracer provider this method has just shut down. A failed flush means
+    /// queued telemetry was dropped, which is worth telling the caller about;
+    /// `Result` is `#[must_use]`, so ignoring it has to be deliberate.
+    pub fn shutdown(&self) -> Result<()> {
+        let mut failures = Vec::new();
+
         if let Some(p) = &self.tracer_provider {
             if let Err(e) = p.shutdown() {
-                tracing::warn!(error = %e, "OTel tracer provider shutdown failed");
+                failures.push(format!("tracer provider: {e}"));
             }
         }
         if let Some(p) = &self.meter_provider {
             if let Err(e) = p.shutdown() {
-                tracing::warn!(error = %e, "OTel meter provider shutdown failed");
+                failures.push(format!("meter provider: {e}"));
             }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::other(format!(
+                "OTel shutdown failed, so queued telemetry may have been dropped: {}",
+                failures.join("; ")
+            )))
         }
     }
 }
@@ -391,8 +411,9 @@ mod tests {
                 .is_none(),
             "no tracer provider means no layer to compose"
         );
-        // Shutting down a pipeline that exports nothing is a no-op, not a panic.
-        pipeline.shutdown();
+        // Shutting down a pipeline that exports nothing is a no-op, and
+        // reports success rather than a spurious failure.
+        assert!(pipeline.shutdown().is_ok());
     }
 
     #[test]
@@ -475,7 +496,7 @@ mod tests {
             .install()
             .expect("so is the second, having taken nothing");
 
-        pipeline.shutdown();
+        let _ = pipeline.shutdown();
     }
 
     /// A trailing slash on the endpoint must not produce `//v1/traces`. Builds
@@ -488,6 +509,6 @@ mod tests {
             .build()
             .expect("trailing-slash endpoint builds");
         assert!(pipeline.tracer_provider.is_some());
-        pipeline.shutdown();
+        let _ = pipeline.shutdown();
     }
 }

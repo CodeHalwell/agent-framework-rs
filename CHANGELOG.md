@@ -60,7 +60,17 @@ compatibility break to cargo, so dependants pinned to `0.3` need to move to
   export never inherit the SDK or its version churn.
   - `OtelPipeline::install` claims the global subscriber for applications that
     have none; `OtelPipeline::tracing_layer` returns the bridge layer for
-    applications composing their own.
+    applications composing their own. `install` is a no-op when traces are
+    disabled, so a metrics-only pipeline leaves the global subscriber free for
+    the application's own logging rather than taking it irreversibly.
+  - `OtelPipeline::shutdown` returns its outcome instead of logging it, and
+    attempts both providers before reporting. Logging would go nowhere in the
+    setup this module recommends: `install` builds a subscriber of an
+    `EnvFilter` and the OpenTelemetry layer alone, so there is no formatting
+    layer for the event to reach, and the one layer present feeds the tracer
+    provider being shut down. A failed flush means telemetry was dropped —
+    which happens whenever the collector is unreachable — and the caller can
+    now see it.
   - Transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not
     gRPC and not the async client. gRPC would add the tonic/hyper stack; the
     async client panics with "there is no reactor running" when the batch span
