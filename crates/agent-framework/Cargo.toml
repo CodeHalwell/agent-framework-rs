@@ -37,6 +37,10 @@ purview = ["dep:agent-framework-purview"]
 # histograms) via the opentelemetry API crate — see agent-framework-core's
 # observability module docs.
 otel-metrics = ["agent-framework-core/otel-metrics"]
+# A ready-made OTLP export pipeline for those spans and metrics
+# (`observability::export`). Implies `otel-metrics`; the only feature here that
+# pulls an OpenTelemetry *SDK*.
+otel-export = ["agent-framework-core/otel-export"]
 full = [
     "openai",
     "anthropic",

@@ -29,6 +29,27 @@ may break APIs).
     reuses the existing reqwest + ring TLS; the workspace lock gains only
     pure-Rust crates and no C toolchain requirement.
 
+- **A ready-made OTLP export pipeline**, behind `agent-framework-core`'s new
+  optional `otel-export` feature (re-exported by the umbrella crate).
+  `observability::export::OtelExport` builds an OTLP exporter, tracer
+  provider, meter provider and the `tracing`↔OpenTelemetry bridge in one call,
+  wired to the GenAI conventions this crate already emits. Enabling it implies
+  `otel-metrics`, since the pipeline installs the `MeterProvider` those
+  histograms record through. This is the only feature that pulls an OTel
+  *SDK* — the default build stays API-only, so consumers who don't ask for
+  export never inherit the SDK or its version churn.
+  - `OtelPipeline::install` claims the global subscriber for applications that
+    have none; `OtelPipeline::tracing_layer` returns the bridge layer for
+    applications composing their own.
+  - Transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not
+    gRPC and not the async client. gRPC would add a second HTTP stack; the
+    async client panics with "there is no reactor running" when the batch span
+    processor flushes, because that processor and the periodic metric reader
+    each export from a background thread with no tokio runtime on it.
+  - `examples/observability/otel_export.rs` demonstrates both routes and is
+    compiled by CI, so the wiring cannot drift — replacing the previous
+    ` ```ignore ` snippet in the module docs, which was never compiled.
+
 ### Fixed
 
 - **`observability`: corrected stale documentation on the third GenAI

@@ -59,6 +59,31 @@ pin-project-lite = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
+# OTel SDK export pipeline, behind agent-framework-core's optional
+# `otel-export` feature. Transport is OTLP-over-HTTP/protobuf rather than
+# `grpc-tonic`, which would pull the whole tonic/hyper gRPC stack beside the
+# `reqwest` already here.
+#
+# The client is the *blocking* one deliberately. `BatchSpanProcessor` and
+# `PeriodicReader` each export from their own dedicated background thread,
+# which has no tokio reactor on it: the async `reqwest-client` panics there
+# with "there is no reactor running" the moment a batch is flushed (observed
+# by running `examples/observability/otel_export.rs`, not theorised). This is
+# why the crate itself defaults to the blocking client. It costs no second
+# HTTP stack — reqwest's `blocking` is the same crate and TLS backend wrapping
+# its own async core.
+#
+# `tracing-opentelemetry` 0.33 requires `opentelemetry` ^0.32, matching the
+# API-crate pin above — these versions move in lockstep and must agree.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "metrics",
+    "http-proto",
+    "reqwest-blocking-client",
+] }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }
+
 # Official Azure SDK for Rust (GA May 2026), behind agent-framework-azure's
 # optional `entra-sdk` feature. `default-features = false` is load-bearing:
 # the defaults pull `aws-lc-rs` (a C library needing `cmake`) as a *second*

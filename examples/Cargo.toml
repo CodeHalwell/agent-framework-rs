@@ -7,7 +7,7 @@ license = "MIT"
 description = "Runnable examples for agent-framework, organized by topic"
 
 [dependencies]
-agent-framework = { path = "../crates/agent-framework", features = ["full", "otel-metrics"] }
+agent-framework = { path = "../crates/agent-framework", features = ["full", "otel-metrics", "otel-export"] }
 agent-framework-core = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -116,6 +116,10 @@ path = "observability/observability.rs"
 [[example]]
 name = "otel_metrics"
 path = "observability/otel_metrics.rs"
+
+[[example]]
+name = "otel_export"
+path = "observability/otel_export.rs"
 
 [[example]]
 name = "openai_responses"
