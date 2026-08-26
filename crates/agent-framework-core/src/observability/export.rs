@@ -110,17 +110,48 @@ pub const SCOPE_NAME: &str = "agent_framework";
 /// merely suppressed. Suppressing would leave a traces URL correct for traces
 /// and nonsense for metrics (`…/v1/traces/v1/metrics`) — the same class of
 /// broken URL, just harder to notice because only one signal breaks.
+///
+/// Only the path is touched. A query or fragment is detached first and put
+/// back afterwards, because appending to the whole string would bury the
+/// signal path inside the query — `https://gw/otlp?api-version=1` would become
+/// `https://gw/otlp?api-version=1/v1/traces`, which is a valid URL pointing at
+/// the wrong path with a corrupted parameter, so it fails as a remote 404
+/// rather than anything that names the cause. Query strings carrying an auth
+/// token or an api-version are common enough on hosted collectors to be worth
+/// handling. Split by hand rather than pulling in a URL parser: the endpoint is
+/// only ever reassembled here, never inspected, so parsing would buy nothing
+/// but a dependency.
 fn signal_url(endpoint: &str, signal_path: &str) -> String {
     const SIGNAL_PATHS: [&str; 3] = ["/v1/traces", "/v1/metrics", "/v1/logs"];
 
-    let mut base = endpoint.trim_end_matches('/');
+    // Fragment first: it may itself contain a `?`, which is fragment text.
+    let (rest, fragment) = match endpoint.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (endpoint, None),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+
+    let mut base = path.trim_end_matches('/');
     for known in SIGNAL_PATHS {
         if let Some(stripped) = base.strip_suffix(known) {
             base = stripped.trim_end_matches('/');
             break;
         }
     }
-    format!("{base}{signal_path}")
+
+    let mut out = format!("{base}{signal_path}");
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
 }
 
 /// Builder for the OTLP export pipeline.
@@ -392,6 +423,34 @@ mod tests {
         assert_eq!(
             signal_url("http://gateway/otlp", "/v1/traces"),
             "http://gateway/otlp/v1/traces"
+        );
+    }
+
+    /// A query string must survive on the *query* side of the URL. Appending to
+    /// the whole string instead buries the signal path in the query, producing
+    /// a valid URL that targets the wrong path with a corrupted parameter —
+    /// which surfaces only as a remote 404.
+    #[test]
+    fn a_query_or_fragment_survives_the_signal_path() {
+        assert_eq!(
+            signal_url("https://gateway/otlp?api-version=1", "/v1/traces"),
+            "https://gateway/otlp/v1/traces?api-version=1"
+        );
+        // Rebasing across signals has to work with a query attached too.
+        assert_eq!(
+            signal_url("https://collector/v1/traces?token=abc", "/v1/metrics"),
+            "https://collector/v1/metrics?token=abc"
+        );
+        // A fragment is preserved, and a `?` inside it stays fragment text
+        // rather than being mistaken for the start of a query.
+        assert_eq!(
+            signal_url("https://gateway/otlp#frag?not-a-query", "/v1/traces"),
+            "https://gateway/otlp/v1/traces#frag?not-a-query"
+        );
+        // Both at once, in the correct order.
+        assert_eq!(
+            signal_url("https://gateway/otlp?a=1#f", "/v1/metrics"),
+            "https://gateway/otlp/v1/metrics?a=1#f"
         );
     }
 
