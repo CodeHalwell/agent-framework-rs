@@ -159,6 +159,10 @@ impl OtelExport {
     }
 
     /// Export spans. On by default.
+    ///
+    /// Turning this off also makes [`OtelPipeline::install`] a no-op, so a
+    /// metrics-only pipeline leaves the global `tracing` subscriber free for
+    /// the application's own logging.
     pub fn with_traces(mut self, enabled: bool) -> Self {
         self.traces = enabled;
         self
@@ -274,10 +278,27 @@ impl OtelPipeline {
     /// follows `RUST_LOG` (defaulting to `info`). Fails if a global subscriber
     /// is already set — compose with [`tracing_layer`](Self::tracing_layer)
     /// instead in that case.
+    ///
+    /// With traces disabled ([`OtelExport::with_traces(false)`](OtelExport::with_traces))
+    /// this does nothing and returns `Ok`, deliberately. There is no span layer
+    /// to install, so the subscriber it would otherwise register is a bare
+    /// registry that records nothing — and, worse, claiming the global slot is
+    /// irreversible, so a metrics-only pipeline would silently take away the
+    /// application's ability to install its own logging subscriber. Returning
+    /// an error instead was the alternative, but a caller wiring this from
+    /// configuration (`with_traces(cfg.traces)`) would then have to branch
+    /// around a case where nothing is wrong. Metrics are unaffected either way:
+    /// their provider is installed by [`OtelExport::build`], not here.
     pub fn install(&self) -> Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::EnvFilter;
+
+        // Nothing to wire, and claiming the global subscriber anyway would cost
+        // the application its own.
+        if self.tracer_provider.is_none() {
+            return Ok(());
+        }
 
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         tracing_subscriber::registry()
@@ -372,6 +393,30 @@ mod tests {
             signal_url("http://gateway/otlp", "/v1/traces"),
             "http://gateway/otlp/v1/traces"
         );
+    }
+
+    /// A metrics-only pipeline must leave the global subscriber alone, so the
+    /// application can still install its own logging.
+    ///
+    /// Asserted by installing twice: claiming the global slot is irreversible,
+    /// so if the first call had taken it the second would fail with "a global
+    /// default trace dispatcher has already been set". Both succeeding is only
+    /// possible if neither claimed it. (This also holds if some other test in
+    /// this binary claimed the global first — without the guard both calls
+    /// would fail instead.)
+    #[test]
+    fn a_metrics_only_pipeline_does_not_claim_the_global_subscriber() {
+        let pipeline = OtelExport::new("svc")
+            .with_traces(false)
+            .build()
+            .expect("metrics-only pipeline builds");
+
+        pipeline.install().expect("first install is a no-op");
+        pipeline
+            .install()
+            .expect("so is the second, having taken nothing");
+
+        pipeline.shutdown();
     }
 
     /// A trailing slash on the endpoint must not produce `//v1/traces`. Builds
