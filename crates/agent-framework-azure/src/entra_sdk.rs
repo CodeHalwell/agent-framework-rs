@@ -21,16 +21,22 @@
 //!
 //! # Dependency shape
 //!
-//! `azure_core` and `azure_identity` are declared with `default-features =
-//! false` deliberately, and that is load-bearing rather than incidental. Their
-//! default features pull `aws-lc-rs` — a C library needing `cmake` at build
-//! time — as a *second* `rustls` crypto backend beside the `ring` one this
-//! workspace's `reqwest` already uses, plus a platform-verifier and Android
-//! JNI stack. Two backends in one graph is not merely extra weight: `rustls`
-//! then has no unambiguous process-level default provider. With defaults off
-//! and `azure_core`'s `reqwest` feature on, `azure_core` reuses this
-//! workspace's existing `reqwest` + `ring` TLS and the whole addition is 16
-//! pure-Rust crates.
+//! `azure_core` depends on **reqwest 0.13**, a different major version from
+//! the 0.12 the rest of this workspace uses. Cargo does not unify features
+//! across semver-incompatible versions, so the two are separate packages and
+//! the workspace's `rustls-tls` does not reach the Azure SDK's client: it must
+//! enable TLS for itself, which is why `azure_core` carries the
+//! `reqwest_rustls` feature here. Without it, reqwest 0.13 resolves with no
+//! TLS backend and every Entra token request fails before leaving the process
+//! — not at compile time, only on the first call.
+//!
+//! That TLS comes from `aws-lc-rs`, a C library needing `cmake` at build time,
+//! so a build with this feature on needs a C toolchain and the graph carries
+//! two rustls crypto providers: `ring` behind reqwest 0.12 and `aws-lc-rs`
+//! behind reqwest 0.13. A real handshake against Entra completes under that
+//! arrangement (see the ignored `tls_probe` test), so the shared rustls has no
+//! trouble picking a provider. All of it is gated behind `entra-sdk`, leaving
+//! the default build unaffected.
 //!
 //! # Example
 //!

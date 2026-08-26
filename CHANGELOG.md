@@ -20,14 +20,16 @@ may break APIs).
   `AzurePipelinesCredential`, `AzureDeveloperCliCredential` — and to let
   Microsoft own IMDS quirks, sovereign-cloud endpoints and token lifetimes
   under a semver guarantee.
-  - `azure_core`/`azure_identity` are pinned with `default-features = false`
-    deliberately. Their defaults pull `aws-lc-rs` (a C library requiring
-    `cmake`) as a *second* `rustls` crypto backend beside the `ring` one
-    `reqwest` already uses here, which leaves `rustls` without an unambiguous
-    process-level default provider, plus a platform-verifier/Android-JNI
-    stack. With defaults off and `azure_core`'s `reqwest` feature on, it
-    reuses the existing reqwest + ring TLS; the workspace lock gains only
-    pure-Rust crates and no C toolchain requirement.
+  - `azure_core` depends on **reqwest 0.13**, a different major from the 0.12
+    the workspace uses. Cargo does not unify features across
+    semver-incompatible versions, so the workspace's `rustls-tls` does not
+    apply to the SDK's client and `azure_core` carries its own
+    `reqwest_rustls`. Without it reqwest 0.13 resolves with no TLS backend:
+    everything compiles and every unit test passes, but every Entra token
+    request fails at run time. Enabling it means `aws-lc-rs` (a C library
+    needing `cmake`) is the TLS provider on that side, so builds with this
+    feature need a C toolchain. Verified both ways against the live Entra
+    endpoint — see the ignored `tls_probe` test in `agent-framework-azure`.
 
 - **A ready-made OTLP export pipeline**, behind `agent-framework-core`'s new
   optional `otel-export` feature (re-exported by the umbrella crate).
@@ -42,10 +44,14 @@ may break APIs).
     have none; `OtelPipeline::tracing_layer` returns the bridge layer for
     applications composing their own.
   - Transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not
-    gRPC and not the async client. gRPC would add a second HTTP stack; the
+    gRPC and not the async client. gRPC would add the tonic/hyper stack; the
     async client panics with "there is no reactor running" when the batch span
     processor flushes, because that processor and the periodic metric reader
     each export from a background thread with no tokio runtime on it.
+  - `opentelemetry-otlp` brings its own reqwest 0.13 and so needs its own TLS
+    feature (`reqwest-rustls`) for the same reason as `azure_core` above;
+    without it the exporter reaches plain-HTTP collectors only and fails
+    against any HTTPS endpoint.
   - `examples/observability/otel_export.rs` demonstrates both routes and is
     compiled by CI, so the wiring cannot drift — replacing the previous
     ` ```ignore ` snippet in the module docs, which was never compiled.

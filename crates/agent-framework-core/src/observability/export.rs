@@ -27,12 +27,17 @@
 //!
 //! # Transport
 //!
-//! OTLP over HTTP/protobuf rather than gRPC, so no second HTTP stack joins the
-//! `reqwest` already in the graph. The exporter uses reqwest's *blocking*
-//! client because the batch span processor and the periodic metric reader each
-//! export from their own background thread, where no tokio reactor is running
-//! and an async client panics; that is the same reason `opentelemetry-otlp`
-//! defaults to it.
+//! OTLP over HTTP/protobuf rather than gRPC, which would pull the whole
+//! tonic/hyper stack. The exporter uses reqwest's *blocking* client because the
+//! batch span processor and the periodic metric reader each export from their
+//! own background thread, where no tokio reactor is running and an async client
+//! panics; that is the same reason `opentelemetry-otlp` defaults to it.
+//!
+//! `opentelemetry-otlp` brings its own reqwest 0.13, whose features cargo
+//! cannot unify with the workspace's 0.12, so its TLS backend is enabled
+//! explicitly (`reqwest-rustls`). Without that the exporter reaches plain-HTTP
+//! collectors only and fails against any HTTPS endpoint — a failure that shows
+//! up at run time, not build time.
 //!
 //! Point it at an OpenTelemetry Collector, which is also the supported route
 //! to Azure Monitor — there is no official Microsoft OTel exporter for Rust.

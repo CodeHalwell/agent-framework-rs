@@ -69,9 +69,14 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["m
 # which has no tokio reactor on it: the async `reqwest-client` panics there
 # with "there is no reactor running" the moment a batch is flushed (observed
 # by running `examples/observability/otel_export.rs`, not theorised). This is
-# why the crate itself defaults to the blocking client. It costs no second
-# HTTP stack — reqwest's `blocking` is the same crate and TLS backend wrapping
-# its own async core.
+# why the crate itself defaults to the blocking client.
+#
+# `reqwest-rustls` is required for the same reason spelled out under
+# `azure_core` below: this crate uses reqwest 0.13, whose features cannot be
+# unified with the 0.12 pinned above, so without it the exporter has no TLS
+# and only plain-HTTP collectors work — HTTPS ones fail. (Its sibling
+# `reqwest-rustls-webpki-roots` does not resolve at all against reqwest 0.13:
+# it asks for a `webpki-roots` feature that version no longer has.)
 #
 # `tracing-opentelemetry` 0.33 requires `opentelemetry` ^0.32, matching the
 # API-crate pin above — these versions move in lockstep and must agree.
@@ -80,19 +85,32 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "metrics",
     "http-proto",
     "reqwest-blocking-client",
+    "reqwest-rustls",
 ] }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }
 
 # Official Azure SDK for Rust (GA May 2026), behind agent-framework-azure's
-# optional `entra-sdk` feature. `default-features = false` is load-bearing:
-# the defaults pull `aws-lc-rs` (a C library needing `cmake`) as a *second*
-# rustls crypto backend beside the `ring` one `reqwest` already uses here,
-# which leaves rustls without an unambiguous process-level default provider,
-# plus a platform-verifier/Android-JNI stack. With defaults off and
-# `azure_core`'s `reqwest` feature on, it reuses the reqwest + ring TLS
-# configured above and adds 16 pure-Rust crates. MSRV 1.85, under ours.
-azure_core = { version = "1.1", default-features = false, features = ["reqwest"] }
+# optional `entra-sdk` feature.
+#
+# `reqwest_rustls` is REQUIRED, not cosmetic. `azure_core` (like
+# `opentelemetry-otlp` above) depends on **reqwest 0.13**, a different major
+# from the 0.12 pinned at the top of this file. Cargo does not unify features
+# across semver-incompatible versions, so the `rustls-tls` configured there
+# does not reach this one: with `default-features = false` and no TLS feature,
+# reqwest 0.13 resolves with no TLS backend at all and every HTTPS request —
+# which is every Entra token request — fails before it leaves the process.
+# Confirmed both ways against the real Entra endpoint; see the ignored
+# `tls_probe` test in agent-framework-azure.
+#
+# The cost is real and worth stating: reqwest 0.13's `rustls` feature selects
+# `aws-lc-rs`, a C library needing `cmake` at build time, so this graph ends up
+# with `ring` behind reqwest 0.12 and `aws-lc-rs` behind reqwest 0.13, both
+# features enabled on one shared rustls 0.23. That is only a problem if it
+# leaves rustls unable to pick a process default; the probe above shows a real
+# handshake completing, so it does not. All of it is gated behind the optional
+# feature, so the default build is untouched. MSRV 1.85, under ours.
+azure_core = { version = "1.1", default-features = false, features = ["reqwest", "reqwest_rustls"] }
 azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
 
 agent-framework-core = { path = "crates/agent-framework-core", version = "0.3.0" }
