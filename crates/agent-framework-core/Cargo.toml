@@ -26,17 +26,35 @@ pin-project-lite = { workspace = true }
 # Optional: GenAI metrics behind the `otel-metrics` feature. API crate only —
 # no SDK/exporter is pulled in; see `observability` module docs.
 opentelemetry = { workspace = true, optional = true }
+# Optional: the OTLP export pipeline behind the `otel-export` feature. Only
+# these are SDK/exporter crates — everything above stays API-only.
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` adds tokio's mock clock (`start_paused`, `pause`/`advance`) used
 # by the retry-layer tests to assert backoff timing without real sleeps.
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = "0.3"
+tracing-subscriber = { workspace = true }
 # In-memory metric reader for `otel-metrics` tests only.
 opentelemetry_sdk = { workspace = true }
 
 [features]
-# Enables the two (later three, pending a client.rs follow-up) GenAI
-# histograms on `ObservableChatClient` via the `opentelemetry` API crate.
-# Purely additive: default behavior/build is unaffected when this is off.
+# Enables the three GenAI histograms on `ObservableChatClient` and the
+# function-invocation loop via the `opentelemetry` API crate. Purely additive:
+# default behavior/build is unaffected when this is off, and the instruments
+# are no-ops until the application installs a `MeterProvider`.
 otel-metrics = ["dep:opentelemetry"]
+# Ships a ready-made OTLP export pipeline (`observability::export`) so the
+# spans and metrics above actually reach a backend. Implies `otel-metrics`,
+# since the pipeline installs the `MeterProvider` those histograms record
+# through. This is the only feature that pulls an OTel *SDK*.
+otel-export = [
+    "otel-metrics",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]

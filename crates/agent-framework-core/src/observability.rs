@@ -42,40 +42,34 @@
 //! `"tokens"`) and [`metrics::OPERATION_DURATION_METRIC`]
 //! (`gen_ai.client.operation.duration`, unit `"s"`). A third histogram,
 //! [`metrics::FUNCTION_INVOCATION_DURATION_METRIC`]
-//! (`agent_framework.function.invocation.duration`), is defined for tool-call
-//! timing; see [`metrics::record_function_invocation_duration`] for why it
-//! isn't wired to a call site yet. This crate never depends on an OTel SDK:
+//! (`agent_framework.function.invocation.duration`), times tool calls and is
+//! recorded by [`FunctionInvokingChatClient`] around each tool invocation.
+//! This crate never depends on an OTel SDK:
 //! without an application-installed `MeterProvider` (via
 //! [`opentelemetry::global::set_meter_provider`]) the instruments are no-ops,
 //! so the feature is safe to enable unconditionally.
 //!
 //! ## Wiring to a real OTel backend
 //!
-//! Neither the `tracing` spans nor the `otel-metrics` histograms are exported
-//! anywhere by this crate — that stays the application's job. A minimal
-//! bridge, using `tracing-opentelemetry` for spans and `opentelemetry_sdk` for
-//! metrics:
+//! By default neither the `tracing` spans nor the `otel-metrics` histograms are
+//! exported anywhere by this crate — that stays the application's job, so that
+//! an OTel SDK and its version churn never reach consumers who don't ask for
+//! them.
 //!
-//! ```ignore
-//! use opentelemetry_sdk::trace::SdkTracerProvider;
-//! use opentelemetry_sdk::metrics::SdkMeterProvider;
-//! use tracing_subscriber::layer::SubscriberExt;
+//! Two ways to close that loop:
 //!
-//! let tracer_provider = SdkTracerProvider::builder()
-//!     // .with_batch_exporter(otlp_span_exporter) / .with_simple_exporter(...) …
-//!     .build();
-//! let meter_provider = SdkMeterProvider::builder()
-//!     // .with_reader(periodic_reader_wrapping_your_metric_exporter) …
-//!     .build();
-//! opentelemetry::global::set_meter_provider(meter_provider); // powers `otel-metrics`
+//! * **`otel-export` feature** — [`export::OtelExport`] builds an OTLP
+//!   pipeline (exporter, tracer provider, meter provider, and the
+//!   `tracing`↔OTel bridge) in one call, already wired to the conventions
+//!   above. This is the only feature that pulls an OTel *SDK*.
+//! * **Wire it yourself** — compose `tracing-opentelemetry` for spans with an
+//!   `opentelemetry_sdk` `MeterProvider` installed via
+//!   [`opentelemetry::global::set_meter_provider`] for the histograms. The
+//!   `otel_export` example in this repository's `examples/observability/`
+//!   shows both routes end to end, and is compiled by CI so it cannot drift
+//!   out of date.
 //!
-//! let tracer = tracer_provider.tracer("agent_framework");
-//! let subscriber = tracing_subscriber::registry()
-//!     .with(tracing_opentelemetry::layer().with_tracer(tracer));
-//! tracing::subscriber::set_global_default(subscriber).unwrap();
-//! ```
-//!
-//! Without any of this, spans are still emitted to whatever plain `tracing`
+//! Without either, spans are still emitted to whatever plain `tracing`
 //! subscriber you do have (e.g. for structured logging), and `otel-metrics`
 //! instruments silently drop their measurements — zero required setup either
 //! way.
@@ -108,6 +102,9 @@ use crate::types::{ChatOptions, ChatResponse, Message};
 /// GenAI semantic conventions **above** the v1.36.0 baseline. Mirrors
 /// upstream's `GEN_AI_LATEST_EXPERIMENTAL_OPT_IN`.
 pub const GEN_AI_LATEST_EXPERIMENTAL_OPT_IN: &str = "gen_ai_latest_experimental";
+
+#[cfg(feature = "otel-export")]
+pub mod export;
 
 /// OpenTelemetry GenAI semantic-convention attribute keys.
 pub mod attr {
@@ -982,16 +979,17 @@ pub mod metrics {
 
     /// Record the function-invocation-duration histogram for one tool call.
     ///
-    /// Not yet called anywhere in this crate: the timing measurement belongs
-    /// around `exec.invoke(...)` in `client.rs`'s
-    /// `FunctionInvokingChatClient::execute_tool_call`, which is out of scope
-    /// here (see the observability task's final report for the exact
-    /// follow-up). The instrument and its recording logic are complete and
-    /// tested on their own so that call site only needs to wrap its
-    /// invocation with a timer and call this — plus, ideally, switch
-    /// `tool_span` to [`super::tool_span_ex`] and add
-    /// [`super::record_tool_arguments`] / [`super::record_tool_result`] calls
-    /// at the same time.
+    /// Called by
+    /// [`FunctionInvokingChatClient`](crate::client::FunctionInvokingChatClient)
+    /// around each tool invocation, timing the executor call itself and
+    /// passing [`super::error_type`] for a failed one. That call site also
+    /// uses [`super::tool_span_ex`] and records
+    /// [`super::record_tool_arguments`] / [`super::record_tool_result`], so
+    /// a tool call is covered by both the span and the histogram.
+    ///
+    /// Callers instrumenting their own invocation path may call this
+    /// directly; it is a no-op unless the `otel-metrics` feature is on *and*
+    /// the application has installed a `MeterProvider`.
     pub fn record_function_invocation_duration(
         tool_name: &str,
         duration: Duration,

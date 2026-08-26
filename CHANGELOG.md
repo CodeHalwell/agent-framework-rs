@@ -5,6 +5,99 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [0.4.0] — 2026-08-26
+
+Two optional integrations: Entra ID credentials from the official Azure SDK
+for Rust (GA'd in May 2026), and a ready-made OTLP export pipeline for the
+spans and GenAI metrics this framework already emits.
+
+Nothing in the existing API was removed or changed, and the default build
+gains no dependencies, so nothing here should break a compiling caller. The
+minor bump reflects the size of the new surface and the build requirement
+below rather than an incompatibility — but pre-1.0 it is still a
+compatibility break to cargo, so dependants pinned to `0.3` need to move to
+`0.4` to pick this up.
+
+> **Build requirement for the new features.** Enabling `entra-sdk` or
+> `otel-export` requires a **C toolchain (`cmake`)**. Both pull `aws-lc-rs`,
+> which is the TLS provider for the reqwest 0.13 that `azure_core` and
+> `opentelemetry-otlp` depend on — a separate major version from the reqwest
+> 0.12 used elsewhere here, whose features cargo cannot unify with it. Builds
+> that do not enable either feature are unaffected.
+
+### Added
+
+- **Entra ID credentials from the official Azure SDK for Rust**, behind
+  `agent-framework-azure`'s new optional `entra-sdk` feature.
+  `SdkTokenCredential` adapts any [`azure_identity`] credential onto this
+  crate's `TokenCredential`, so SDK and hand-rolled credentials are
+  interchangeable wherever a credential is accepted. This is additive: the
+  hand-rolled chain remains the default and is unchanged when the feature is
+  off. It exists to reach credential types this crate does not implement —
+  `ClientCertificateCredential`, `ClientAssertionCredential`,
+  `AzurePipelinesCredential`, `AzureDeveloperCliCredential` — and to let
+  Microsoft own IMDS quirks, sovereign-cloud endpoints and token lifetimes
+  under a semver guarantee.
+  - `azure_core` depends on **reqwest 0.13**, a different major from the 0.12
+    the workspace uses. Cargo does not unify features across
+    semver-incompatible versions, so the workspace's `rustls-tls` does not
+    apply to the SDK's client and `azure_core` carries its own
+    `reqwest_rustls`. Without it reqwest 0.13 resolves with no TLS backend:
+    everything compiles and every unit test passes, but every Entra token
+    request fails at run time. Enabling it means `aws-lc-rs` (a C library
+    needing `cmake`) is the TLS provider on that side, so builds with this
+    feature need a C toolchain. Verified both ways against the live Entra
+    endpoint — see the ignored `tls_probe` test in `agent-framework-azure`.
+
+- **A ready-made OTLP export pipeline**, behind `agent-framework-core`'s new
+  optional `otel-export` feature (re-exported by the umbrella crate).
+  `observability::export::OtelExport` builds an OTLP exporter, tracer
+  provider, meter provider and the `tracing`↔OpenTelemetry bridge in one call,
+  wired to the GenAI conventions this crate already emits. Enabling it implies
+  `otel-metrics`, since the pipeline installs the `MeterProvider` those
+  histograms record through. This is the only feature that pulls an OTel
+  *SDK* — the default build stays API-only, so consumers who don't ask for
+  export never inherit the SDK or its version churn.
+  - `OtelPipeline::install` claims the global subscriber for applications that
+    have none; `OtelPipeline::tracing_layer` returns the bridge layer for
+    applications composing their own. `install` is a no-op when traces are
+    disabled, so a metrics-only pipeline leaves the global subscriber free for
+    the application's own logging rather than taking it irreversibly.
+  - `OtelPipeline::shutdown` returns its outcome instead of logging it, and
+    attempts both providers before reporting. Logging would go nowhere in the
+    setup this module recommends: `install` builds a subscriber of an
+    `EnvFilter` and the OpenTelemetry layer alone, so there is no formatting
+    layer for the event to reach, and the one layer present feeds the tracer
+    provider being shut down. A failed flush means telemetry was dropped —
+    which happens whenever the collector is unreachable — and the caller can
+    now see it.
+  - Transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not
+    gRPC and not the async client. gRPC would add the tonic/hyper stack; the
+    async client panics with "there is no reactor running" when the batch span
+    processor flushes, because that processor and the periodic metric reader
+    each export from a background thread with no tokio runtime on it.
+  - `opentelemetry-otlp` brings its own reqwest 0.13 and so needs its own TLS
+    feature (`reqwest-rustls`) for the same reason as `azure_core` above;
+    without it the exporter reaches plain-HTTP collectors only and fails
+    against any HTTPS endpoint.
+  - `examples/observability/otel_export.rs` demonstrates both routes and is
+    compiled by CI, so the wiring cannot drift — replacing the previous
+    ` ```ignore ` snippet in the module docs, which was never compiled.
+
+### Fixed
+
+- **`observability`: corrected stale documentation on the third GenAI
+  histogram.** The module docs and
+  `metrics::record_function_invocation_duration` both stated that
+  `agent_framework.function.invocation.duration` was defined but "not yet
+  called anywhere in this crate", and listed switching to `tool_span_ex` and
+  adding `record_tool_arguments`/`record_tool_result` as outstanding
+  follow-ups. All of that had in fact landed —
+  `FunctionInvokingChatClient` times each tool invocation and records the
+  histogram, and uses all three span helpers. A reader following the old docs
+  would have concluded tool-call timing was unavailable, or wired up a second
+  recording of it. Documentation only; no behavior change.
+
 ## [0.3.0] — 2026-08-24
 
 Upstream-alignment passes against `microsoft/agent-framework`, moving the

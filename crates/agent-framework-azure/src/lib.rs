@@ -69,6 +69,8 @@
 mod credential;
 mod credentials;
 pub mod embeddings;
+#[cfg(feature = "entra-sdk")]
+pub mod entra_sdk;
 pub mod responses;
 
 pub use credential::{StaticTokenCredential, TokenCredential};
@@ -78,6 +80,8 @@ pub use credentials::{
     DEFAULT_AUTHORITY, DEFAULT_IMDS_ENDPOINT, REFRESH_SKEW,
 };
 pub use embeddings::AzureOpenAIEmbeddingClient;
+#[cfg(feature = "entra-sdk")]
+pub use entra_sdk::{SdkTokenCredential, AZURE_OPENAI_SCOPE, FOUNDRY_SCOPE};
 pub use responses::AzureOpenAIResponsesClient;
 
 use std::sync::Arc;

@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -59,27 +59,81 @@ pin-project-lite = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
-agent-framework-core = { path = "crates/agent-framework-core", version = "0.3.0" }
-agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.3.0" }
-agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.3.0" }
-agent-framework-ollama = { path = "crates/agent-framework-ollama", version = "0.3.0" }
-agent-framework-gemini = { path = "crates/agent-framework-gemini", version = "0.3.0" }
-agent-framework-mistral = { path = "crates/agent-framework-mistral", version = "0.3.0" }
-agent-framework-foundry-local = { path = "crates/agent-framework-foundry-local", version = "0.3.0" }
-agent-framework-bedrock = { path = "crates/agent-framework-bedrock", version = "0.3.0" }
-agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot", version = "0.3.0" }
-agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.3.0" }
-agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.3.0" }
-agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.3.0" }
-agent-framework-declarative = { path = "crates/agent-framework-declarative", version = "0.3.0" }
-agent-framework-hosting = { path = "crates/agent-framework-hosting", version = "0.3.0" }
-agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.3.0" }
-agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.3.0" }
-agent-framework-foundry = { path = "crates/agent-framework-foundry", version = "0.3.0" }
-agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.3.0" }
-agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.3.0" }
-agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.3.0" }
-agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.3.0" }
+# OTel SDK export pipeline, behind agent-framework-core's optional
+# `otel-export` feature. Transport is OTLP-over-HTTP/protobuf rather than
+# `grpc-tonic`, which would pull the whole tonic/hyper gRPC stack beside the
+# `reqwest` already here.
+#
+# The client is the *blocking* one deliberately. `BatchSpanProcessor` and
+# `PeriodicReader` each export from their own dedicated background thread,
+# which has no tokio reactor on it: the async `reqwest-client` panics there
+# with "there is no reactor running" the moment a batch is flushed (observed
+# by running `examples/observability/otel_export.rs`, not theorised). This is
+# why the crate itself defaults to the blocking client.
+#
+# `reqwest-rustls` is required for the same reason spelled out under
+# `azure_core` below: this crate uses reqwest 0.13, whose features cannot be
+# unified with the 0.12 pinned above, so without it the exporter has no TLS
+# and only plain-HTTP collectors work — HTTPS ones fail. (Its sibling
+# `reqwest-rustls-webpki-roots` does not resolve at all against reqwest 0.13:
+# it asks for a `webpki-roots` feature that version no longer has.)
+#
+# `tracing-opentelemetry` 0.33 requires `opentelemetry` ^0.32, matching the
+# API-crate pin above — these versions move in lockstep and must agree.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "metrics",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+] }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }
+
+# Official Azure SDK for Rust (GA May 2026), behind agent-framework-azure's
+# optional `entra-sdk` feature.
+#
+# `reqwest_rustls` is REQUIRED, not cosmetic. `azure_core` (like
+# `opentelemetry-otlp` above) depends on **reqwest 0.13**, a different major
+# from the 0.12 pinned at the top of this file. Cargo does not unify features
+# across semver-incompatible versions, so the `rustls-tls` configured there
+# does not reach this one: with `default-features = false` and no TLS feature,
+# reqwest 0.13 resolves with no TLS backend at all and every HTTPS request —
+# which is every Entra token request — fails before it leaves the process.
+# Confirmed both ways against the real Entra endpoint; see the ignored
+# `tls_probe` test in agent-framework-azure.
+#
+# The cost is real and worth stating: reqwest 0.13's `rustls` feature selects
+# `aws-lc-rs`, a C library needing `cmake` at build time, so this graph ends up
+# with `ring` behind reqwest 0.12 and `aws-lc-rs` behind reqwest 0.13, both
+# features enabled on one shared rustls 0.23. That is only a problem if it
+# leaves rustls unable to pick a process default; the probe above shows a real
+# handshake completing, so it does not. All of it is gated behind the optional
+# feature, so the default build is untouched. MSRV 1.85, under ours.
+azure_core = { version = "1.1", default-features = false, features = ["reqwest", "reqwest_rustls"] }
+azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
+
+agent-framework-core = { path = "crates/agent-framework-core", version = "0.4.0" }
+agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.4.0" }
+agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.4.0" }
+agent-framework-ollama = { path = "crates/agent-framework-ollama", version = "0.4.0" }
+agent-framework-gemini = { path = "crates/agent-framework-gemini", version = "0.4.0" }
+agent-framework-mistral = { path = "crates/agent-framework-mistral", version = "0.4.0" }
+agent-framework-foundry-local = { path = "crates/agent-framework-foundry-local", version = "0.4.0" }
+agent-framework-bedrock = { path = "crates/agent-framework-bedrock", version = "0.4.0" }
+agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot", version = "0.4.0" }
+agent-framework-azure = { path = "crates/agent-framework-azure", version = "0.4.0" }
+agent-framework-mcp = { path = "crates/agent-framework-mcp", version = "0.4.0" }
+agent-framework-a2a = { path = "crates/agent-framework-a2a", version = "0.4.0" }
+agent-framework-declarative = { path = "crates/agent-framework-declarative", version = "0.4.0" }
+agent-framework-hosting = { path = "crates/agent-framework-hosting", version = "0.4.0" }
+agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.4.0" }
+agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.4.0" }
+agent-framework-foundry = { path = "crates/agent-framework-foundry", version = "0.4.0" }
+agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.4.0" }
+agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.4.0" }
+agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.4.0" }
+agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.4.0" }
 
 [profile.release]
 opt-level = 3

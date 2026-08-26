@@ -1524,6 +1524,34 @@ mod tests {
         assert_eq!(map_stop_reason("tool_use"), FinishReason::tool_calls());
     }
 
+    /// Upstream #7850: a `stop_reason` the documented map does not cover must
+    /// still reach the caller. Python looked `FINISH_REASON_MAP` up without a
+    /// default, so Anthropic's `model_context_window_exceeded` was reported as
+    /// no finish reason at all; this port's fallback arm passes any unknown
+    /// value through, and [`FinishReason`] is an open string enum, so there is
+    /// nothing to widen. Pinned here so the mapping cannot later be "tidied"
+    /// into a lookup without a default — which is precisely how upstream
+    /// acquired the bug.
+    #[test]
+    fn map_stop_reason_passes_unmapped_values_through() {
+        assert_eq!(
+            map_stop_reason("model_context_window_exceeded"),
+            FinishReason::new("model_context_window_exceeded")
+        );
+
+        // ...and the buffered parse carries it onto the response.
+        let value = json!({
+            "id": "msg_1",
+            "model": "claude-x",
+            "content": [{ "type": "text", "text": "hi" }],
+            "stop_reason": "model_context_window_exceeded",
+        });
+        assert_eq!(
+            parse_response(&value).finish_reason,
+            Some(FinishReason::new("model_context_window_exceeded"))
+        );
+    }
+
     #[test]
     fn message_start_usage_omits_output_tokens() {
         let usage = json!({ "input_tokens": 25, "output_tokens": 1 });
