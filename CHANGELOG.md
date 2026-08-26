@@ -5,7 +5,25 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.4.0] — 2026-08-26
+
+Two optional integrations: Entra ID credentials from the official Azure SDK
+for Rust (GA'd in May 2026), and a ready-made OTLP export pipeline for the
+spans and GenAI metrics this framework already emits.
+
+Nothing in the existing API was removed or changed, and the default build
+gains no dependencies, so nothing here should break a compiling caller. The
+minor bump reflects the size of the new surface and the build requirement
+below rather than an incompatibility — but pre-1.0 it is still a
+compatibility break to cargo, so dependants pinned to `0.3` need to move to
+`0.4` to pick this up.
+
+> **Build requirement for the new features.** Enabling `entra-sdk` or
+> `otel-export` requires a **C toolchain (`cmake`)**. Both pull `aws-lc-rs`,
+> which is the TLS provider for the reqwest 0.13 that `azure_core` and
+> `opentelemetry-otlp` depend on — a separate major version from the reqwest
+> 0.12 used elsewhere here, whose features cargo cannot unify with it. Builds
+> that do not enable either feature are unaffected.
 
 ### Added
 
