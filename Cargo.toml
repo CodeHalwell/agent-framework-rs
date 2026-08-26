@@ -59,6 +59,17 @@ pin-project-lite = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 
+# Official Azure SDK for Rust (GA May 2026), behind agent-framework-azure's
+# optional `entra-sdk` feature. `default-features = false` is load-bearing:
+# the defaults pull `aws-lc-rs` (a C library needing `cmake`) as a *second*
+# rustls crypto backend beside the `ring` one `reqwest` already uses here,
+# which leaves rustls without an unambiguous process-level default provider,
+# plus a platform-verifier/Android-JNI stack. With defaults off and
+# `azure_core`'s `reqwest` feature on, it reuses the reqwest + ring TLS
+# configured above and adds 16 pure-Rust crates. MSRV 1.85, under ours.
+azure_core = { version = "1.1", default-features = false, features = ["reqwest"] }
+azure_identity = { version = "1.0", default-features = false, features = ["tokio"] }
+
 agent-framework-core = { path = "crates/agent-framework-core", version = "0.3.0" }
 agent-framework-openai = { path = "crates/agent-framework-openai", version = "0.3.0" }
 agent-framework-anthropic = { path = "crates/agent-framework-anthropic", version = "0.3.0" }

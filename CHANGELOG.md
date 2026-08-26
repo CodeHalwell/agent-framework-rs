@@ -5,6 +5,44 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Added
+
+- **Entra ID credentials from the official Azure SDK for Rust**, behind
+  `agent-framework-azure`'s new optional `entra-sdk` feature.
+  `SdkTokenCredential` adapts any [`azure_identity`] credential onto this
+  crate's `TokenCredential`, so SDK and hand-rolled credentials are
+  interchangeable wherever a credential is accepted. This is additive: the
+  hand-rolled chain remains the default and is unchanged when the feature is
+  off. It exists to reach credential types this crate does not implement —
+  `ClientCertificateCredential`, `ClientAssertionCredential`,
+  `AzurePipelinesCredential`, `AzureDeveloperCliCredential` — and to let
+  Microsoft own IMDS quirks, sovereign-cloud endpoints and token lifetimes
+  under a semver guarantee.
+  - `azure_core`/`azure_identity` are pinned with `default-features = false`
+    deliberately. Their defaults pull `aws-lc-rs` (a C library requiring
+    `cmake`) as a *second* `rustls` crypto backend beside the `ring` one
+    `reqwest` already uses here, which leaves `rustls` without an unambiguous
+    process-level default provider, plus a platform-verifier/Android-JNI
+    stack. With defaults off and `azure_core`'s `reqwest` feature on, it
+    reuses the existing reqwest + ring TLS; the workspace lock gains only
+    pure-Rust crates and no C toolchain requirement.
+
+### Fixed
+
+- **`observability`: corrected stale documentation on the third GenAI
+  histogram.** The module docs and
+  `metrics::record_function_invocation_duration` both stated that
+  `agent_framework.function.invocation.duration` was defined but "not yet
+  called anywhere in this crate", and listed switching to `tool_span_ex` and
+  adding `record_tool_arguments`/`record_tool_result` as outstanding
+  follow-ups. All of that had in fact landed —
+  `FunctionInvokingChatClient` times each tool invocation and records the
+  histogram, and uses all three span helpers. A reader following the old docs
+  would have concluded tool-call timing was unavailable, or wired up a second
+  recording of it. Documentation only; no behavior change.
+
 ## [0.3.0] — 2026-08-24
 
 Upstream-alignment passes against `microsoft/agent-framework`, moving the

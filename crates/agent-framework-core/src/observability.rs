@@ -42,9 +42,9 @@
 //! `"tokens"`) and [`metrics::OPERATION_DURATION_METRIC`]
 //! (`gen_ai.client.operation.duration`, unit `"s"`). A third histogram,
 //! [`metrics::FUNCTION_INVOCATION_DURATION_METRIC`]
-//! (`agent_framework.function.invocation.duration`), is defined for tool-call
-//! timing; see [`metrics::record_function_invocation_duration`] for why it
-//! isn't wired to a call site yet. This crate never depends on an OTel SDK:
+//! (`agent_framework.function.invocation.duration`), times tool calls and is
+//! recorded by [`FunctionInvokingChatClient`] around each tool invocation.
+//! This crate never depends on an OTel SDK:
 //! without an application-installed `MeterProvider` (via
 //! [`opentelemetry::global::set_meter_provider`]) the instruments are no-ops,
 //! so the feature is safe to enable unconditionally.
@@ -982,16 +982,17 @@ pub mod metrics {
 
     /// Record the function-invocation-duration histogram for one tool call.
     ///
-    /// Not yet called anywhere in this crate: the timing measurement belongs
-    /// around `exec.invoke(...)` in `client.rs`'s
-    /// `FunctionInvokingChatClient::execute_tool_call`, which is out of scope
-    /// here (see the observability task's final report for the exact
-    /// follow-up). The instrument and its recording logic are complete and
-    /// tested on their own so that call site only needs to wrap its
-    /// invocation with a timer and call this — plus, ideally, switch
-    /// `tool_span` to [`super::tool_span_ex`] and add
-    /// [`super::record_tool_arguments`] / [`super::record_tool_result`] calls
-    /// at the same time.
+    /// Called by
+    /// [`FunctionInvokingChatClient`](crate::client::FunctionInvokingChatClient)
+    /// around each tool invocation, timing the executor call itself and
+    /// passing [`super::error_type`] for a failed one. That call site also
+    /// uses [`super::tool_span_ex`] and records
+    /// [`super::record_tool_arguments`] / [`super::record_tool_result`], so
+    /// a tool call is covered by both the span and the histogram.
+    ///
+    /// Callers instrumenting their own invocation path may call this
+    /// directly; it is a no-op unless the `otel-metrics` feature is on *and*
+    /// the application has installed a `MeterProvider`.
     pub fn record_function_invocation_duration(
         tool_name: &str,
         duration: Duration,

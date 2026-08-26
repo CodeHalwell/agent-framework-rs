@@ -25,6 +25,14 @@ reqwest = { workspace = true }
 bytes = { workspace = true }
 tokio-stream = { workspace = true }
 uuid = { workspace = true }
+azure_core = { workspace = true, optional = true }
+azure_identity = { workspace = true, optional = true }
+
+[features]
+# Entra ID credentials from the official Azure SDK for Rust, adapted onto this
+# crate's `TokenCredential` (see the `entra_sdk` module). Purely additive: the
+# hand-rolled credential chain stays the default and is unaffected when off.
+entra-sdk = ["dep:azure_core", "dep:azure_identity"]
 
 [dev-dependencies]
 tokio = { workspace = true }
