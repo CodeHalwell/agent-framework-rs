@@ -5,7 +5,60 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.5.0] — 2026-08-31
+
+Embeddings for two more providers, and a Gemini finish-reason fix.
+
+Nothing was removed and no existing public item changed shape, so a compiling
+caller should keep compiling. The bump is a minor one for the new surface —
+two embedding clients, both re-exported from the prelude — rather than for an
+incompatibility. Pre-1.0 that is still a compatibility break to cargo, so
+dependants pinned to `0.4` need to move to `0.5` to pick this up.
+
+The one behavior change is in the Gemini client: finish reasons that used to
+arrive as raw lowercased strings now arrive as the canonical values, and
+`FINISH_REASON_UNSPECIFIED` now reads as absent. Code matching on the old
+strings needs updating — see **Fixed** below.
+
+### Added
+
+- **`BedrockEmbeddingClient`** (`agent-framework-bedrock`) — Amazon Titan Text
+  Embeddings through Bedrock Runtime `InvokeModel`
+  (`POST /model/{modelId}/invoke`), SigV4-signed by the same `sigv4` module
+  the Converse chat client uses.
+  - Titan's body carries a single `inputText` rather than a batch, so a batch
+    of *n* values costs *n* signed requests, issued concurrently and
+    reassembled in input order, with `inputTextTokenCount` summed across the
+    batch into `UsageDetails::input_token_count`.
+  - `with_endpoint` overrides the base URL — a PrivateLink interface
+    endpoint, a region the host derivation does not cover, or a local test
+    server. The `Host` signed into the canonical request is taken from that
+    URL, so the signature follows the request.
+  - Credentials are the static or `AWS_*`-environment ones the chat client
+    already takes. Upstream reaches Bedrock through boto3 and inherits its
+    whole credential chain; this crate signs directly and does not.
+  - Titan's `normalize` knob is forwarded through
+    `EmbeddingGenerationOptions::additional_properties`.
+- **`FoundryEmbeddingClient`** (`agent-framework-foundry`) — the Azure AI
+  Foundry **Models** inference endpoint (`POST {models_endpoint}/embeddings`),
+  with `api-key` or Entra `TokenCredential` auth. Distinct from
+  `AzureOpenAIEmbeddingClient`, which is deployment-scoped; the body and
+  response are OpenAI-shaped, so parsing and error classification are shared
+  with `agent-framework-openai` rather than duplicated.
+  - **Text inputs only.** Upstream also accepts image `Content` and splits a
+    batch across `ImageEmbeddingsClient` (`/images/embeddings`). The core
+    `EmbeddingClient` trait takes `Vec<String>`, so an image input cannot be
+    expressed at that boundary at all — closing this needs a trait widening
+    across every provider, not a change to this client.
+    `FOUNDRY_IMAGE_EMBEDDING_MODEL` is correspondingly not read.
+  - `DEFAULT_API_VERSION` reproduces the default in `azure-ai-inference`
+    1.0.0b9 (the version upstream's `foundry` package pins), since upstream
+    sends no explicit `api-version` of its own. It is the one value here taken
+    from an SDK default rather than a verified service contract, so
+    `with_api_version` overrides it.
+- Both clients are re-exported from `agent_framework::prelude` under their
+  existing `bedrock` and `foundry` features. No new default dependencies;
+  `agent-framework-foundry` gains `reqwest` and `agent-framework-openai`.
 
 ### Fixed
 
