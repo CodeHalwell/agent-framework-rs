@@ -71,6 +71,14 @@ strings needs updating — see **Fixed** below.
     ignore. Expanding also sends `extra-parameters: pass-through`, without
     which Azure AI Inference rejects body fields outside its schema.
     `encoding_format` and `input_type` continue to forward verbatim.
+  - `additional_properties` is an **allowlist**, matching the kwargs upstream
+    builds and the sibling OpenAI/Azure clients: only `encoding_format`,
+    `input_type` and `extra_parameters` reach the wire. Copying arbitrary
+    entries through would put fields outside the inference schema on the
+    request, which the service rejects — so an options struct reused across
+    providers (carrying, say, OpenAI's `user`) would 4xx on an option that is
+    merely irrelevant here. `extra_parameters` remains the escape hatch for
+    anything genuinely model-specific.
   - `from_env` requires only the endpoint and model, matching upstream's
     `required_fields`. With no `FOUNDRY_MODELS_API_KEY` it falls back to
     `DefaultAzureCredential` at the scope above, so a managed-identity or

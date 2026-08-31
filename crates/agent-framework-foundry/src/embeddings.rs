@@ -72,6 +72,13 @@ pub const DEFAULT_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 const EXTRA_PARAMETERS_HEADER: &str = "extra-parameters";
 const EXTRA_PARAMETERS_PASS_THROUGH: &str = "pass-through";
 
+/// Keys in [`EmbeddingGenerationOptions::additional_properties`] this endpoint
+/// understands directly, matching the kwargs upstream builds. `dimensions` has
+/// a typed slot on the options struct and is handled separately; anything
+/// outside this list belongs under
+/// [`FoundryEmbeddingClient::EXTRA_PARAMETERS_KEY`].
+const SUPPORTED_PROPERTIES: &[&str] = &["encoding_format", "input_type"];
+
 enum Auth {
     ApiKey(String),
     Credential(Arc<dyn TokenCredential>),
@@ -257,24 +264,28 @@ impl FoundryEmbeddingClient {
 
         let mut expanded_extras = false;
         if let Some(properties) = options.map(|o| &o.additional_properties) {
-            for (key, value) in properties {
-                if key == Self::EXTRA_PARAMETERS_KEY {
-                    // An object is expanded; anything else is passed through
-                    // unchanged rather than silently dropped, so a caller who
-                    // means something else by the key still sees it on the wire.
-                    match value {
-                        Value::Object(extras) => {
-                            for (extra_key, extra_value) in extras {
-                                body.insert(extra_key.clone(), extra_value.clone());
-                                expanded_extras = true;
-                            }
-                        }
-                        other => {
-                            body.insert(key.clone(), other.clone());
-                        }
-                    }
-                } else {
-                    body.insert(key.clone(), value.clone());
+            // An allowlist, not a passthrough: upstream builds its kwargs from
+            // exactly these keys, and the sibling OpenAI/Azure clients forward
+            // a fixed list the same way. Anything else would reach the wire as
+            // a field outside the inference schema, which the service rejects
+            // unless pass-through is set — so a stray OpenAI-ism like `user`
+            // would turn the whole request into a 4xx. Dropping it matches
+            // upstream, which never forwards it either.
+            for key in SUPPORTED_PROPERTIES {
+                if let Some(value) = properties.get(*key) {
+                    body.insert((*key).into(), value.clone());
+                }
+            }
+            // `extra_parameters` is the deliberate escape hatch for anything
+            // outside that list: its entries are expanded under their own
+            // names and carry the pass-through header. A non-object value has
+            // nothing to expand, and forwarding it as a literal field would be
+            // the very 4xx this allowlist exists to avoid, so it is dropped
+            // like any other unsupported entry.
+            if let Some(Value::Object(extras)) = properties.get(Self::EXTRA_PARAMETERS_KEY) {
+                for (extra_key, extra_value) in extras {
+                    body.insert(extra_key.clone(), extra_value.clone());
+                    expanded_extras = true;
                 }
             }
         }
@@ -480,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_object_extra_parameters_is_passed_through_untouched() {
+    fn a_non_object_extra_parameters_is_dropped_rather_than_sent() {
         let client = FoundryEmbeddingClient::new("https://e/models", "m", "k");
         let mut options = EmbeddingGenerationOptions::new();
         options
@@ -488,10 +499,48 @@ mod tests {
             .insert("extra_parameters".into(), json!("not-a-map"));
 
         let (body, extras) = client.body_for(&["a".into()], Some(&options));
-        // Nothing to expand, so it stays visible rather than being dropped —
-        // and no pass-through header is claimed on its behalf.
-        assert_eq!(body["extra_parameters"], json!("not-a-map"));
+        // Nothing to expand. Sending it as a literal field would be a field
+        // outside the inference schema without pass-through — the 4xx the
+        // allowlist exists to prevent — so it is dropped.
+        assert!(body.get("extra_parameters").is_none());
         assert!(!extras);
+    }
+
+    /// Upstream builds its request from a fixed set of keys and forwards
+    /// nothing else, and the sibling OpenAI/Azure clients use the same
+    /// allowlist shape. Copying arbitrary entries through would put fields
+    /// outside the inference schema on the wire, which the service rejects
+    /// unless pass-through is set — so a caller reusing one options struct
+    /// across providers would get a 4xx from an option that is merely
+    /// irrelevant here.
+    #[test]
+    fn unsupported_additional_properties_are_not_forwarded() {
+        let client = FoundryEmbeddingClient::new("https://e/models", "m", "k");
+        let mut options = EmbeddingGenerationOptions::new();
+        // Supported here...
+        options
+            .additional_properties
+            .insert("encoding_format".into(), json!("float"));
+        options
+            .additional_properties
+            .insert("input_type".into(), json!("query"));
+        // ...and an OpenAI-ism this endpoint does not take.
+        options
+            .additional_properties
+            .insert("user".into(), json!("alice"));
+
+        let (body, extras) = client.body_for(&["a".into()], Some(&options));
+        assert_eq!(
+            body,
+            json!({
+                "input": ["a"],
+                "model": "m",
+                "encoding_format": "float",
+                "input_type": "query",
+            })
+        );
+        assert!(body.get("user").is_none(), "must not reach the wire");
+        assert!(!extras, "dropping a key never claims pass-through");
     }
 
     #[test]
