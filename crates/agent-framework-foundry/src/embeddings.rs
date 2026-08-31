@@ -63,6 +63,15 @@ pub const DEFAULT_API_VERSION: &str = "2024-05-01-preview";
 /// if a particular deployment wants something else.
 pub const DEFAULT_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 
+/// Header that tells Azure AI Inference what to do with body fields outside
+/// its own schema. It defaults to erroring; `pass-through` forwards them to
+/// the model instead. The `azure-ai-inference` SDK sets it whenever
+/// `model_extras` is supplied, which is what upstream maps
+/// `extra_parameters` onto — so expanding those extras into the body without
+/// this header would turn a call that works upstream into a 4xx here.
+const EXTRA_PARAMETERS_HEADER: &str = "extra-parameters";
+const EXTRA_PARAMETERS_PASS_THROUGH: &str = "pass-through";
+
 enum Auth {
     ApiKey(String),
     Credential(Arc<dyn TokenCredential>),
@@ -216,8 +225,26 @@ impl FoundryEmbeddingClient {
         )
     }
 
-    /// Build the request body for a batch.
-    fn body_for(&self, values: &[String], options: Option<&EmbeddingGenerationOptions>) -> Value {
+    /// The option key upstream maps onto the Azure AI Inference SDK's
+    /// `model_extras`: a map of model-specific parameters that belong in the
+    /// request body under **their own names**, not nested under this key.
+    const EXTRA_PARAMETERS_KEY: &'static str = "extra_parameters";
+
+    /// Build the request body for a batch, and report whether any
+    /// model-specific extras were expanded into it.
+    ///
+    /// Upstream forwards `encoding_format` and `input_type` explicitly and
+    /// passes `extra_parameters` as `model_extras`, which the SDK *expands*
+    /// into the body. The core options struct has no typed slot for any of
+    /// them, so all three arrive through `additional_properties`: the first
+    /// two are forwarded verbatim, while `extra_parameters` has its entries
+    /// merged in — sending it as a literal `extra_parameters` field would
+    /// mean the model never sees those parameters under the names it expects.
+    fn body_for(
+        &self,
+        values: &[String],
+        options: Option<&EmbeddingGenerationOptions>,
+    ) -> (Value, bool) {
         let mut body = Map::new();
         body.insert("input".into(), json!(values));
         body.insert(
@@ -227,16 +254,31 @@ impl FoundryEmbeddingClient {
         if let Some(dimensions) = options.and_then(|o| o.dimensions) {
             body.insert("dimensions".into(), json!(dimensions));
         }
-        // Upstream forwards `encoding_format` and `input_type` explicitly, and
-        // anything under `extra_parameters` as `model_extras`. The core
-        // options struct has no typed slot for the first two, so all three
-        // arrive through `additional_properties` and are passed verbatim.
-        if let Some(extras) = options.map(|o| &o.additional_properties) {
-            for (key, value) in extras {
-                body.insert(key.clone(), value.clone());
+
+        let mut expanded_extras = false;
+        if let Some(properties) = options.map(|o| &o.additional_properties) {
+            for (key, value) in properties {
+                if key == Self::EXTRA_PARAMETERS_KEY {
+                    // An object is expanded; anything else is passed through
+                    // unchanged rather than silently dropped, so a caller who
+                    // means something else by the key still sees it on the wire.
+                    match value {
+                        Value::Object(extras) => {
+                            for (extra_key, extra_value) in extras {
+                                body.insert(extra_key.clone(), extra_value.clone());
+                                expanded_extras = true;
+                            }
+                        }
+                        other => {
+                            body.insert(key.clone(), other.clone());
+                        }
+                    }
+                } else {
+                    body.insert(key.clone(), value.clone());
+                }
             }
         }
-        Value::Object(body)
+        (Value::Object(body), expanded_extras)
     }
 
     fn effective_model(default: &str, options: Option<&EmbeddingGenerationOptions>) -> String {
@@ -286,8 +328,16 @@ impl EmbeddingClient for FoundryEmbeddingClient {
             return Ok(GeneratedEmbeddings::new(Vec::new()));
         }
 
-        let body = self.body_for(&values, options.as_ref());
-        let request = self.inner.http.post(self.url()).json(&body);
+        let (body, expanded_extras) = self.body_for(&values, options.as_ref());
+        let mut request = self.inner.http.post(self.url()).json(&body);
+        if expanded_extras {
+            // Azure AI Inference rejects body fields it does not recognise
+            // unless this header opts into passing them to the model. The SDK
+            // sets it whenever `model_extras` is supplied, so expanding the
+            // extras without it would turn a working upstream call into a
+            // 4xx here.
+            request = request.header(EXTRA_PARAMETERS_HEADER, EXTRA_PARAMETERS_PASS_THROUGH);
+        }
         let request = match &self.inner.auth {
             Auth::ApiKey(key) => request.header("api-key", key),
             Auth::Credential(credential) => {
@@ -365,11 +415,12 @@ mod tests {
     #[test]
     fn body_carries_input_model_and_forwarded_extras() {
         let client = FoundryEmbeddingClient::new("https://e/models", "default-model", "k");
-        let bare = client.body_for(&["a".into(), "b".into()], None);
+        let (bare, extras) = client.body_for(&["a".into(), "b".into()], None);
         assert_eq!(
             bare,
             json!({ "input": ["a", "b"], "model": "default-model" })
         );
+        assert!(!extras);
 
         let mut options = EmbeddingGenerationOptions::new();
         options.model = Some("per-request".into());
@@ -380,7 +431,7 @@ mod tests {
         options
             .additional_properties
             .insert("input_type".into(), json!("query"));
-        let full = client.body_for(&["a".into()], Some(&options));
+        let (full, extras) = client.body_for(&["a".into()], Some(&options));
         assert_eq!(
             full,
             json!({
@@ -391,6 +442,56 @@ mod tests {
                 "input_type": "query",
             })
         );
+        assert!(!extras, "no extra_parameters means no pass-through header");
+    }
+
+    /// Upstream maps `extra_parameters` onto the SDK's `model_extras`, which
+    /// *expands* the map into the request body. Sending it as a literal
+    /// `extra_parameters` field instead would mean the model never sees those
+    /// parameters under the names it expects — the call would succeed and
+    /// quietly ignore them.
+    #[test]
+    fn extra_parameters_are_expanded_rather_than_nested() {
+        let client = FoundryEmbeddingClient::new("https://e/models", "m", "k");
+        let mut options = EmbeddingGenerationOptions::new();
+        options.additional_properties.insert(
+            "extra_parameters".into(),
+            json!({ "truncate": "END", "custom_knob": 7 }),
+        );
+        options
+            .additional_properties
+            .insert("input_type".into(), json!("document"));
+
+        let (body, extras) = client.body_for(&["a".into()], Some(&options));
+        assert_eq!(
+            body,
+            json!({
+                "input": ["a"],
+                "model": "m",
+                // Expanded to the top level, under their own names...
+                "truncate": "END",
+                "custom_knob": 7,
+                // ...while the explicitly-forwarded option is untouched.
+                "input_type": "document",
+            })
+        );
+        assert!(body.get("extra_parameters").is_none());
+        assert!(extras, "expanding extras must request pass-through");
+    }
+
+    #[test]
+    fn a_non_object_extra_parameters_is_passed_through_untouched() {
+        let client = FoundryEmbeddingClient::new("https://e/models", "m", "k");
+        let mut options = EmbeddingGenerationOptions::new();
+        options
+            .additional_properties
+            .insert("extra_parameters".into(), json!("not-a-map"));
+
+        let (body, extras) = client.body_for(&["a".into()], Some(&options));
+        // Nothing to expand, so it stays visible rather than being dropped —
+        // and no pass-through header is claimed on its behalf.
+        assert_eq!(body["extra_parameters"], json!("not-a-map"));
+        assert!(!extras);
     }
 
     #[test]

@@ -65,6 +65,12 @@ strings needs updating — see **Fixed** below.
     audience `FoundryChatClient` needs for the Responses API. The Models
     inference endpoint rejects a token minted for the project scope.
     `with_scope` overrides it.
+  - `extra_parameters` is **expanded** into the request body under each
+    entry's own name, matching what upstream's `model_extras` mapping does,
+    rather than sent as a literal `extra_parameters` field the model would
+    ignore. Expanding also sends `extra-parameters: pass-through`, without
+    which Azure AI Inference rejects body fields outside its schema.
+    `encoding_format` and `input_type` continue to forward verbatim.
   - `from_env` requires only the endpoint and model, matching upstream's
     `required_fields`. With no `FOUNDRY_MODELS_API_KEY` it falls back to
     `DefaultAzureCredential` at the scope above, so a managed-identity or

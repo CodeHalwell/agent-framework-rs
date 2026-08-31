@@ -276,6 +276,53 @@ async fn an_overridden_api_version_reaches_the_query_string() {
     );
 }
 
+/// Expanding `extra_parameters` into the body is only half the job: Azure AI
+/// Inference rejects body fields outside its schema unless the
+/// `extra-parameters: pass-through` header opts into forwarding them, which
+/// is what the SDK sets alongside `model_extras`. Expanding without the
+/// header would turn a call that works upstream into a 4xx.
+#[tokio::test]
+async fn expanded_extras_carry_the_pass_through_header() {
+    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+
+    let mut options = EmbeddingGenerationOptions::new();
+    options
+        .additional_properties
+        .insert("extra_parameters".into(), serde_json::json!({ "knob": 1 }));
+
+    client
+        .get_embeddings(vec!["alpha".into()], Some(options))
+        .await
+        .expect("embeddings");
+
+    let req = seen.lock().unwrap().clone().expect("one request");
+    assert_eq!(
+        req.headers.get("extra-parameters").map(String::as_str),
+        Some("pass-through")
+    );
+    let body: serde_json::Value = serde_json::from_str(&req.body).expect("json body");
+    assert_eq!(body["knob"], serde_json::json!(1));
+    assert!(body.get("extra_parameters").is_none());
+}
+
+#[tokio::test]
+async fn no_extras_means_no_pass_through_header() {
+    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+
+    client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect("embeddings");
+
+    let req = seen.lock().unwrap().clone().expect("one request");
+    assert!(
+        !req.headers.contains_key("extra-parameters"),
+        "the header must not ride along on ordinary requests"
+    );
+}
+
 #[tokio::test]
 async fn a_429_is_classified_as_a_retryable_service_status() {
     const THROTTLED: &str = r#"{"error": {"message": "rate limited"}}"#;
