@@ -137,7 +137,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | GenAI-semantic-convention tracing spans | ✅ | ✅ | ✅ done | `observability::ObservableChatClient` (`chat` span); `invoke_agent` span in `ChatAgent::run_core`; `execute_tool` span in the function-invocation loop |
-| OpenTelemetry SDK exporter wiring | ✅ | ✅ | 🚧 partial | spans follow OTel GenAI conventions and are bridge-ready (e.g. via `tracing-opentelemetry`), but no OTel SDK/exporter is wired up or shipped |
+| OpenTelemetry SDK exporter wiring | ✅ | ✅ | ✅ done | shipped in 0.4.0 behind `agent-framework-core`'s optional `otel-export` feature: `observability::export::OtelExport` builds an OTLP exporter, tracer provider, meter provider and the `tracing`↔OTel bridge in one call, already wired to the GenAI conventions above. Off by default, so an OTel SDK and its version churn never reach consumers who don't ask for it; spans stay bridge-ready (e.g. via `tracing-opentelemetry`) for applications composing their own pipeline. Divergences: transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not gRPC and not the async client; enabling the feature needs a C toolchain (`cmake`), via `aws-lc-rs` |
 
 ## Serving & ecosystem
 
@@ -172,5 +172,4 @@ Everything not listed here ships (see the tables above). What genuinely remains:
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
 - **Azure AI Foundry `FoundryAgent`**: realizes a Prompt Agent client-side over the Responses API only — it does not create, fetch, or bind to a server-hosted agent by id/name on the Foundry Agents control plane (`AIProjectClient.agents.*`), which has no Rust equivalent yet.
 - **Purview**: covers only `processContent` — no protection-scopes precheck/caching, background content-activity logging, or JWT-derived identity fallback.
-- **Observability**: spans are OTel-GenAI-shaped and bridge-ready, but no OTel SDK exporter is wired up or shipped.
 - **Ecosystem**: ChatKit, the `lab` experimental packages, DurableTask/Azure Functions hosting, and a dedicated guardrails module (which no implementation ships) remain unported.
