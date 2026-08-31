@@ -158,10 +158,19 @@ fn parse_embedding_vector(field: Option<&Value>) -> Result<Vec<f32>> {
                     bytes.len()
                 )));
             }
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect())
+            // `split_first_chunk::<4>` hands back a `&[u8; 4]` directly, so
+            // `from_le_bytes` needs no length check or fallible conversion.
+            // (`chunks_exact(4)` reads the same but draws clippy's
+            // `chunks_exact_to_as_chunks`, whose suggested `as_chunks` only
+            // stabilised at this crate's exact MSRV — `split_first_chunk` has
+            // been stable since 1.77, well under it.)
+            let mut vector = Vec::with_capacity(bytes.len() / 4);
+            let mut rest = bytes.as_slice();
+            while let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
+                vector.push(f32::from_le_bytes(*chunk));
+                rest = tail;
+            }
+            Ok(vector)
         }
         _ => Err(Error::service("embeddings item missing 'embedding' vector")),
     }
