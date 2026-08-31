@@ -6,8 +6,92 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `e6d8d99` (2026-08-26).** Sections are newest
+**Current upstream baseline: `b5d9f4b` (2026-08-31).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`d8d07eb` drift (checked against `b5d9f4b`, 2026-08-31)
+
+The mirror had stopped advancing on 2026-08-29 (its sync workflow was failing
+at startup); a manual sync caught it up, moving **4 non-merge commits**.
+**None require a code change here.** Three are Python and one .NET, and the two
+that touch surfaces this port does have — the Gemini client and agent
+middleware — land on shapes the Rust type system does not admit in the first
+place.
+
+### Ported this pass (0)
+
+No code changes. Nothing below needed a behavioral fix or a new test: unlike
+#7850 and #7837, where the correct behavior was *inherited* from a shared
+helper and worth pinning, both near-misses here are already pinned by existing
+tests or are unrepresentable rather than merely unwritten.
+
+### Not applicable (4)
+
+| Upstream | Why not |
+|---|---|
+| #7879 | **A Pydantic `response_format` reached Gemini with no schema attached.** #5893 taught the Python client to forward *mapping*-shaped `response_format` values as a Gemini `response_schema` and scoped itself to those shapes, so a Pydantic model class — the first shape the option's own docs offer — fell through `_extract_response_schema` and the request carried `response_mime_type="application/json"` with nothing constraining it; free-form JSON then came back to be parsed against that same model. The hole is shape-matching over a union of accepted Python types (mapping, model class, and the `format` / `json_schema` / bare `schema` envelopes it unwraps). `ResponseFormat` here is a closed three-variant enum whose `JsonSchema { schema, .. }` carries the schema as a `serde_json::Value` directly, so there is no unrecognized shape to fall through: `build_request` already writes `responseMimeType` **and** `responseSchema` for `JsonSchema`, and `responseMimeType` alone for `JsonObject`. Both are pinned by existing tests (`build_request_response_format_json_schema_embeds_schema`, `build_request_response_format_json_object`), so upstream's fix is this port's already-tested behavior. |
+| #7918 | **[BREAKING] agent middleware inputs are sequence-only again.** Python had allowed `middleware=` to take either a bare middleware object (a `MiddlewareBundle` among them, treated as a one-element list) or a sequence; that union is withdrawn across `BaseAgent`, `RawAgent`, `Agent.run`, `AgentMiddlewareLayer` and the Foundry factory, with a new `_copy_middleware_sequence` raising `TypeError` on a non-sequence, and the `agent-hooks` extra is dropped from the core package. All of it is dynamic-typing ergonomics being taken back. `ChatAgentBuilder` accepts exactly one middleware per call — `.middleware(Arc<AgentMiddleware>)`, `.chat_middleware(..)`, `.function_middleware(..)`, each appending — so there is no single-or-sequence union to disambiguate, no runtime validator to write (a non-middleware argument is a compile error), and no `agent-hooks` extra to remove. The breaking change moves upstream *toward* the shape this port already has. |
+| #7604 | **Redis history-provider type checking across the supported redis-py range.** The dependency-range validator failed pyright at redis 8.0.1 with five unnecessary-type-ignore errors, while the same ignores were *required* at 7.1.1 and 6.4.0, where redis-py annotates the asyncio commands as returning the sync/async union — no single ignore comment satisfies the whole range, so results are normalized through one helper and `lrange` reached via an inline cast. Purely an artifact of one library's annotations shifting between versions under a gradual type checker. `agent-framework-redis` talks to Redis over a client whose types are fixed at compile time; there is no analogous condition. |
+| #7938 | **.NET tests drop FluentAssertions over its licensing change.** Test-dependency hygiene in the .NET solution. |
+
+Note on the window: this section is the first triaged against a mirror that had
+to be synced by hand. The fork's scheduled sync has been failing since
+2026-08-29 — `permissions:` on `.github/workflows/sync-upstream.yml` declares
+`workflows: write`, which is not a valid GITHUB_TOKEN permission key, so the
+workflow file is invalid and every run fails at startup. A fix is open on
+`claude/optimistic-edison-qtskmr` in the mirror repo (sync via the
+`merge-upstream` fork-sync API, since GITHUB_TOKEN cannot push commits touching
+`.github/workflows/**` under any permissions block). Until that lands, each
+triage window depends on someone syncing the mirror by hand first.
+
+## Post-`e6d8d99` drift (checked against `d8d07eb`, 2026-08-29)
+
+Upstream moved **20 non-merge commits** in this window (2026-08-26 → 08-29).
+**One lands on this port**, in the Gemini finish-reason mapping — and it turned
+out to be a wider gap than the upstream commit that surfaced it, because the
+Rust map had been transcribed from a shorter version of upstream's than the one
+that shipped. The other 19 are .NET, samples, dependency bumps, or
+Python-shaped problems that cannot arise here — four of those because Rust's
+ownership rules make the aliasing bug upstream fixed unrepresentable.
+
+### Ported this pass (1 fix + 4 missing mappings, with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7837 | **Gemini dropped four finish-reason mappings and reported the proto default as a real reason.** Upstream's own bug was the unmapped-value fallback (`_FINISH_REASON_MAP.get(reason)` with no default), which this port never had — `map_finish_reason` has always ended in `other => FinishReason::new(other.to_lowercase())`, and `parse_stream_chunk` attaches `usageMetadata` unconditionally, so the usage-attach cascade upstream describes (usage rides along only when the finish reason is truthy) cannot fire here either. Both are now pinned rather than left implicit, following the #7850 precedent. What the commit *did* expose is that the port's map is a shorter transcription of upstream's: `LANGUAGE`, `IMAGE_PROHIBITED_CONTENT` and `IMAGE_RECITATION` (→ `content_filter`) and `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` (→ `tool_calls`) were falling through the passthrough arm as lowercased raw strings, so a caller matching on the canonical `content_filter` saw `"language"` instead. Separately, `FINISH_REASON_UNSPECIFIED` — proto3's "field never set" — was surfacing as a finish reason named `finish_reason_unspecified`; upstream maps it to `None`, and `map_finish_reason` now returns `Option<FinishReason>` so it (and the empty string) takes the absent path. That routes it through `finalize_finish_reason`'s `has_call` branch, so an unspecified turn that ends in a function call is upgraded to `tool_calls` exactly like a turn with no `finishReason` at all. | `gemini/convert.rs` (`map_finish_reason`, `finalize_finish_reason`) |
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1678 passing**, 3 of them new), `cargo clippy --all-targets --all-features`
+under `-D warnings` (CI's own flag) clean, `cargo fmt --check` clean. The three
+new tests were confirmed to fail against the prior behavior — the mapping and
+`FINISH_REASON_UNSPECIFIED` tests against the old match arms, the streaming one
+against a usage attachment gated on `finish_reason.is_some()` (upstream's own
+cascade), probed on its own to confirm the usage assertion is load-bearing
+rather than passing on the finish-reason change beside it. In each probe the
+new tests were the only ones in the crate to fail.
+`map_finish_reason_passes_unmapped_values_through` passes against the old code
+by design: it pins behavior that was already correct.
+
+### Not applicable (19)
+
+| Upstream | Why not |
+|---|---|
+| #7847 | **Workflow checkpoints could be mutated outside their storage.** Python's `InMemoryCheckpointStorage.load`/`list`/`latest` handed back the stored object itself, and `State.get`/`set`/`export_state`/`import_state` passed values by reference, so a caller that mutated what it read silently rewrote persisted state; the fix deep-copies at every boundary. Neither aliasing is representable here. `CheckpointStorage::save` takes `WorkflowCheckpoint` **by value** and `load`/`list` return owned values cloned out of the map, and `SharedState::get` returns an owned `Option<Value>` while `set` takes `impl Into<Value>` — a `serde_json::Value` clone *is* the deep copy Python had to ask for. There is no shared handle for a caller to hold, so there is nothing to defend and no test that could fail. |
+| #7903 | **`Content.__deepcopy__` now discards `_SHALLOW_COPY_FIELDS` instead of sharing them**, because those fields hold LLM SDK objects (proto/gRPC responses) that are neither safe to deep-copy nor safe to share between copies. This port's nearest fields, `raw_representation` and `protected_data`, are a `serde_json::Value` and a `String` — inert data that `derive(Clone)` copies correctly. Discarding them on clone would be actively wrong here: `raw_representation` carries the OpenAI Responses reasoning item that must be replayed verbatim on the follow-up tool-call turn, and `protected_data` the Gemini thought signature; a clone that dropped either would make the model reject the replayed turn. A deliberate divergence, and one the type system already makes safe. |
+| #7901 | **`SerializationMixin.from_dict` mutated its caller's dict**, merging into a nested `dict` in place rather than building a new one. Deserialization here is `serde`: `from_dict`-shaped entry points take `&Value` or an owned `Value` and construct a fresh struct. There is no caller-owned mutable map to write through. |
+| #7875 | **Azure AI Search declared every knowledge source as `searchIndex`**, so a mixed knowledge base failed retrieval; the fix reads each source's real `kind` back and sends `KnowledgeSourceParams` per source. Entirely inside the Knowledge-Base ("agentic") retrieval mode, which `agent-framework-azure-ai-search` does not implement — the crate ports the *semantic* mode only, a divergence documented at the top of `lib.rs`. |
+| #7770 | **AG-UI service-session snapshot replay** — canonical-form comparison of stored vs. incoming snapshot messages, contiguous-overlap detection, unanswered-tool-call tracking, and a `service_session_id_from_thread_id` compatibility switch. All of it belongs to the Python package's thread-snapshot store and service-session machinery. `agent-framework-hosting::agui` has neither: it streams one run to completion and, as its module docs state, emits no `STATE_SNAPSHOT` / `STATE_DELTA` / `MESSAGES_SNAPSHOT` events and keeps no per-thread snapshot store. |
+| #7908, #7911 | **A timeout for wait-for-first-completion** in the Python (`_harness/_background_agents.py`) and .NET background-agent hosts. This port has no harness agent loop and no background-agent host — the same reason #7289 and #7860 were not applicable in earlier passes. |
+| #7896 | **.NET removes the retired OpenAI Assistants integration tests.** Already reflected here: `OpenAIAssistantsClient` was deleted in the `68136ee` re-baseline (see the `a63d462` section's predecessor below), for the same reason — upstream removed the API. Recorded rather than skipped because it is the last visible trace of a surface this port used to ship. |
+| #7932, #7913, #7891 | .NET: a duplicate Foundry `AgentHost` port binding, a workflow file-input sample, and an A2A client-server sample simplification. No framework change reaching this port (and no Foundry hosted-agents host here). |
+| #7924, #7921, #7915 | Python 1.16.0 version bumps, an agentserver dependency upgrade, and Python-wide code ownership. Release and repo hygiene. |
+| #7889, #7888, #7886 | Dependency bumps (`Dapr.AI.Microsoft.Extensions`, `CommunityToolkit.VectorData.InMemory`, `Azure.AI.AgentServer.Invocations`). |
+| #7869 | .NET contributing-docs update for CFS users. |
+| (fork) | `Fix sync-upstream workflow: grant workflows:write permission` — a workflow-permission fix in the mirror fork itself, not an upstream framework change. |
+
+Still deferred from earlier passes: **#7768** (pin GitHub Actions to
+full-length commit SHAs) remains blocked for the same reason — resolving each
+action's SHA means reading repositories outside this session's GitHub scope.
 
 ## Post-`a63d462` drift (checked against `e6d8d99`, 2026-08-26)
 

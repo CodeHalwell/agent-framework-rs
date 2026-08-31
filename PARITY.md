@@ -62,7 +62,9 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Azure OpenAI embeddings | ✅ | ✅ | ✅ done | `AzureOpenAIEmbeddingClient` (deployment-scoped, api-key or Entra `TokenCredential`) |
 | Ollama embeddings | ✅ | — | ✅ done | `OllamaEmbeddingClient` — OpenAI-compatible `/v1/embeddings` surface (upstream drives native `/api/embed`; documented) |
 | Mistral embeddings | ✅ (embeddings-only package) | — | ✅ done | `MistralEmbeddingClient`, default `mistral-embed`, `output_dimension`/`output_dtype` mapping |
-| Bedrock / Foundry / Gemini embeddings | ✅ | 🚧 | ❌ not yet | small independent additions; see ALIGNMENT_PROGRESS.md |
+| Bedrock embeddings | ✅ | 🚧 | ✅ done | `BedrockEmbeddingClient` — Titan Text Embeddings over Bedrock Runtime `InvokeModel` (`POST /model/{modelId}/invoke`), SigV4-signed by the crate's existing `sigv4` module. Titan takes one `inputText` per call, so a batch fans out into one signed request per value (concurrently, via `try_join_all`), reassembled in input order with `inputTextTokenCount` summed into `UsageDetails`. Upstream reaches Bedrock through boto3 and inherits its full credential chain; this port signs directly, so credentials are the static/`AWS_*`-env ones the chat client already takes. `normalize` rides through `additional_properties` (Titan-specific) |
+| Foundry embeddings | ✅ | 🚧 | 🚧 partial | `FoundryEmbeddingClient` — the Foundry **Models** inference endpoint (`POST {models_endpoint}/embeddings`), `api-key` or Entra `TokenCredential`, OpenAI-shaped body/response so parsing and error classification are shared with `agent-framework-openai`. **Text inputs only**: upstream also accepts image `Content` and splits a batch across `ImageEmbeddingsClient` (`/images/embeddings`), which the core `EmbeddingClient` trait's `Vec<String>` signature cannot express — closing it means widening a shared trait, not extending this client, so `FOUNDRY_IMAGE_EMBEDDING_MODEL` is not read. The `api-version` default mirrors `azure-ai-inference` 1.0.0b9 (what upstream pins) and is overridable |
+| Gemini embeddings | ❌ (no embedding support in the `gemini` package) | — | ❌ n/a | not a gap: upstream's Gemini package ships no embedding client, so there is nothing to port. Previously tracked here as a Rust-only hole, which overstated upstream |
 
 ## Agents
 
@@ -137,7 +139,7 @@ Legend: ✅ done · 🚧 partial · ❌ not yet.
 | Feature | Python | .NET | Rust | Notes |
 | --- | --- | --- | --- | --- |
 | GenAI-semantic-convention tracing spans | ✅ | ✅ | ✅ done | `observability::ObservableChatClient` (`chat` span); `invoke_agent` span in `ChatAgent::run_core`; `execute_tool` span in the function-invocation loop |
-| OpenTelemetry SDK exporter wiring | ✅ | ✅ | 🚧 partial | spans follow OTel GenAI conventions and are bridge-ready (e.g. via `tracing-opentelemetry`), but no OTel SDK/exporter is wired up or shipped |
+| OpenTelemetry SDK exporter wiring | ✅ | ✅ | ✅ done | shipped in 0.4.0 behind `agent-framework-core`'s optional `otel-export` feature: `observability::export::OtelExport` builds an OTLP exporter, tracer provider, meter provider and the `tracing`↔OTel bridge in one call, already wired to the GenAI conventions above. Off by default, so an OTel SDK and its version churn never reach consumers who don't ask for it; spans stay bridge-ready (e.g. via `tracing-opentelemetry`) for applications composing their own pipeline. Divergences: transport is OTLP-over-HTTP/protobuf on reqwest's *blocking* client, not gRPC and not the async client; enabling the feature needs a C toolchain (`cmake`), via `aws-lc-rs` |
 
 ## Serving & ecosystem
 
@@ -171,6 +173,6 @@ Everything not listed here ships (see the tables above). What genuinely remains:
 - **Cosmos DB store**: master-key (HMAC) auth only, no Entra ID/AAD; one `POST` per message instead of `TransactionalBatch`; no hierarchical partition keys or TTL.
 - **Hosted tools** (code interpreter, web search, file search, hosted MCP): pass-through markers only.
 - **Azure AI Foundry `FoundryAgent`**: realizes a Prompt Agent client-side over the Responses API only — it does not create, fetch, or bind to a server-hosted agent by id/name on the Foundry Agents control plane (`AIProjectClient.agents.*`), which has no Rust equivalent yet.
+- **Foundry embeddings**: text inputs only. The image half of upstream's client (`/images/embeddings`) is blocked by the core `EmbeddingClient` trait taking `Vec<String>`, so it needs a trait widening rather than a provider change.
 - **Purview**: covers only `processContent` — no protection-scopes precheck/caching, background content-activity logging, or JWT-derived identity fallback.
-- **Observability**: spans are OTel-GenAI-shaped and bridge-ready, but no OTel SDK exporter is wired up or shipped.
 - **Ecosystem**: ChatKit, the `lab` experimental packages, DurableTask/Azure Functions hosting, and a dedicated guardrails module (which no implementation ships) remain unported.

@@ -72,7 +72,10 @@
 //! # }
 //! ```
 
+pub mod embeddings;
 mod tool_definition_wire;
+
+pub use embeddings::FoundryEmbeddingClient;
 
 use std::sync::Arc;
 

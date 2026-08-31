@@ -582,13 +582,16 @@ pub(crate) fn parse_parts(parts: &[Value]) -> Vec<Content> {
 /// contents include a `FunctionCall`. Any other raw reason (`MAX_TOKENS`,
 /// `SAFETY`, ...) is left as-is even alongside a function call, since those
 /// describe a more specific/severe outcome.
+///
+/// `FINISH_REASON_UNSPECIFIED` — the proto3 default, meaning the field was
+/// never set — is treated exactly like an absent reason, so it takes the
+/// `has_call` path rather than surfacing as a finish reason of its own.
 fn finalize_finish_reason(raw: Option<&str>, contents: &[Content]) -> Option<FinishReason> {
     let has_call = contents
         .iter()
         .any(|c| matches!(c, Content::FunctionCall(_)));
-    match raw {
-        Some(r) => {
-            let mapped = map_finish_reason(r);
+    match raw.and_then(map_finish_reason) {
+        Some(mapped) => {
             if has_call && mapped == FinishReason::stop() {
                 Some(FinishReason::tool_calls())
             } else {
@@ -599,15 +602,37 @@ fn finalize_finish_reason(raw: Option<&str>, contents: &[Content]) -> Option<Fin
     }
 }
 
-pub(crate) fn map_finish_reason(reason: &str) -> FinishReason {
-    match reason {
+/// Map one raw Gemini `finishReason` name onto the shared [`FinishReason`].
+///
+/// The mapped names mirror upstream Python's `_FINISH_REASON_MAP`
+/// (`gemini/_chat_client.py`), which covers 13 of the 18 members of
+/// `google.genai.types.FinishReason`. Anything outside it — `OTHER`,
+/// `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`, and whatever the API
+/// adds next — passes through lowercased rather than being dropped, since
+/// [`FinishReason`] is an open string enum and a caller learning the turn
+/// ended abnormally beats it learning nothing.
+///
+/// Returns `None` only for `FINISH_REASON_UNSPECIFIED` (and the empty
+/// string): both mean "no reason was reported", not "a reason named
+/// unspecified".
+pub(crate) fn map_finish_reason(reason: &str) -> Option<FinishReason> {
+    let mapped = match reason {
+        "" | "FINISH_REASON_UNSPECIFIED" => return None,
         "STOP" => FinishReason::stop(),
         "MAX_TOKENS" => FinishReason::new(FinishReason::LENGTH),
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
-            FinishReason::new(FinishReason::CONTENT_FILTER)
-        }
+        "SAFETY"
+        | "RECITATION"
+        | "LANGUAGE"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION" => FinishReason::new(FinishReason::CONTENT_FILTER),
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => FinishReason::tool_calls(),
         other => FinishReason::new(other.to_lowercase()),
-    }
+    };
+    Some(mapped)
 }
 
 /// Parse a Gemini `usageMetadata` object into [`UsageDetails`].
@@ -1520,25 +1545,82 @@ mod tests {
 
     #[test]
     fn map_finish_reason_covers_documented_mapping() {
-        assert_eq!(map_finish_reason("STOP"), FinishReason::stop());
+        assert_eq!(map_finish_reason("STOP"), Some(FinishReason::stop()));
         assert_eq!(
             map_finish_reason("MAX_TOKENS"),
-            FinishReason::new(FinishReason::LENGTH)
+            Some(FinishReason::new(FinishReason::LENGTH))
         );
         for reason in [
             "SAFETY",
             "RECITATION",
+            "LANGUAGE",
             "BLOCKLIST",
             "PROHIBITED_CONTENT",
             "SPII",
             "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
         ] {
             assert_eq!(
                 map_finish_reason(reason),
-                FinishReason::new(FinishReason::CONTENT_FILTER),
+                Some(FinishReason::new(FinishReason::CONTENT_FILTER)),
                 "{reason}"
             );
         }
+        for reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"] {
+            assert_eq!(
+                map_finish_reason(reason),
+                Some(FinishReason::tool_calls()),
+                "{reason}"
+            );
+        }
+    }
+
+    /// `FinishReason` is an open string enum, so a name the map does not
+    /// cover — `OTHER`, `TOO_MANY_TOOL_CALLS`, `NO_IMAGE`, `IMAGE_OTHER`,
+    /// or whatever the API adds next — must reach the caller rather than
+    /// being dropped. Upstream's own `_FINISH_REASON_MAP.get(reason)`
+    /// looked up without a default and lost exactly these (#7837); pinned
+    /// here because a later "tidy the match into a lookup table" refactor
+    /// is precisely how it would come back.
+    #[test]
+    fn map_finish_reason_passes_unmapped_values_through() {
+        for reason in ["OTHER", "TOO_MANY_TOOL_CALLS", "NO_IMAGE", "IMAGE_OTHER"] {
+            assert_eq!(
+                map_finish_reason(reason),
+                Some(FinishReason::new(reason.to_lowercase())),
+                "{reason}"
+            );
+        }
+    }
+
+    /// `FINISH_REASON_UNSPECIFIED` is proto3's "field never set", not a
+    /// reason in its own right: it must read as *absent*, so a response
+    /// carrying it behaves exactly like one carrying no `finishReason` at
+    /// all — including the `tool_calls` upgrade when the turn ends in a
+    /// function call.
+    #[test]
+    fn unspecified_finish_reason_reads_as_absent() {
+        assert_eq!(map_finish_reason("FINISH_REASON_UNSPECIFIED"), None);
+        assert_eq!(map_finish_reason(""), None);
+
+        let resp = parse_response(&json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "hi" }] },
+                "finishReason": "FINISH_REASON_UNSPECIFIED",
+            }],
+        }));
+        assert_eq!(resp.finish_reason, None);
+
+        let with_call = parse_response(&json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "functionCall": { "name": "f", "args": {} } }
+                ]},
+                "finishReason": "FINISH_REASON_UNSPECIFIED",
+            }],
+        }));
+        assert_eq!(with_call.finish_reason, Some(FinishReason::tool_calls()));
     }
 
     #[test]
@@ -1580,6 +1662,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(usage_content.total_token_count, Some(10));
+    }
+
+    /// The second half of upstream #7837: Python attached a streamed
+    /// chunk's usage only when the finish reason was truthy, so an unmapped
+    /// reason dropping to `None` took the whole turn's token accounting
+    /// down with it. Usage here is attached from `usageMetadata` alone,
+    /// independent of the finish reason — pinned for both an unmapped
+    /// reason and `FINISH_REASON_UNSPECIFIED`, the two values that made the
+    /// cascade fire.
+    #[test]
+    fn parse_stream_chunk_carries_usage_regardless_of_finish_reason() {
+        for (raw, expected) in [
+            (
+                "TOO_MANY_TOOL_CALLS",
+                Some(FinishReason::new("too_many_tool_calls")),
+            ),
+            ("FINISH_REASON_UNSPECIFIED", None),
+        ] {
+            let value = json!({
+                "candidates": [{ "content": { "role": "model", "parts": [] }, "finishReason": raw }],
+                "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10 },
+            });
+            let update = parse_stream_chunk(&value).unwrap();
+            assert_eq!(update.finish_reason, expected, "{raw}");
+            let usage = update
+                .contents
+                .iter()
+                .find_map(|c| match c {
+                    Content::Usage(u) => Some(u.details.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{raw}: usage dropped"));
+            assert_eq!(usage.total_token_count, Some(10), "{raw}");
+        }
     }
 
     #[test]

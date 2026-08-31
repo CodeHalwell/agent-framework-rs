@@ -14,7 +14,11 @@ description = "Azure AI Foundry (Responses API) chat client and Prompt Agents fo
 [dependencies]
 agent-framework-core = { workspace = true }
 agent-framework-azure = { workspace = true }
+# The Foundry Models embeddings surface is OpenAI-shaped on the wire, so
+# response parsing and error classification are shared rather than duplicated.
+agent-framework-openai = { workspace = true }
 async-trait = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

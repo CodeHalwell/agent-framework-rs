@@ -32,7 +32,10 @@
 //! ```
 
 pub mod convert;
+pub mod embeddings;
 pub mod sigv4;
+
+pub use embeddings::BedrockEmbeddingClient;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
