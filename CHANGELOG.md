@@ -5,6 +5,23 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Fixed
+
+- **Gemini finish reasons.** Five of the names in the Gemini API's
+  `FinishReason` enum were not in `agent-framework-gemini`'s mapping table and
+  fell through its passthrough arm as lowercased raw strings, so a caller
+  matching on the canonical value saw `"language"`, `"image_recitation"`,
+  `"image_prohibited_content"`, `"malformed_function_call"` or
+  `"unexpected_tool_call"` where `content_filter` or `tool_calls` was meant.
+  All five now map, matching upstream's table (#7837).
+- **Gemini `FINISH_REASON_UNSPECIFIED`.** Proto3's "field never set" was being
+  reported as a finish reason named `finish_reason_unspecified`. It now reads
+  as *absent*, like a response carrying no `finishReason` at all — so a turn
+  that ends in a function call is upgraded to `tool_calls` as it already was
+  when the field was omitted entirely.
+
 ## [0.4.0] — 2026-08-26
 
 Two optional integrations: Entra ID credentials from the official Azure SDK
