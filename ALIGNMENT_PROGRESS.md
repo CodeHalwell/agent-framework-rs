@@ -6,8 +6,43 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `d8d07eb` (2026-08-29).** Sections are newest
+**Current upstream baseline: `b5d9f4b` (2026-08-31).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`d8d07eb` drift (checked against `b5d9f4b`, 2026-08-31)
+
+The mirror had stopped advancing on 2026-08-29 (its sync workflow was failing
+at startup); a manual sync caught it up, moving **4 non-merge commits**.
+**None require a code change here.** Three are Python and one .NET, and the two
+that touch surfaces this port does have — the Gemini client and agent
+middleware — land on shapes the Rust type system does not admit in the first
+place.
+
+### Ported this pass (0)
+
+No code changes. Nothing below needed a behavioral fix or a new test: unlike
+#7850 and #7837, where the correct behavior was *inherited* from a shared
+helper and worth pinning, both near-misses here are already pinned by existing
+tests or are unrepresentable rather than merely unwritten.
+
+### Not applicable (4)
+
+| Upstream | Why not |
+|---|---|
+| #7879 | **A Pydantic `response_format` reached Gemini with no schema attached.** #5893 taught the Python client to forward *mapping*-shaped `response_format` values as a Gemini `response_schema` and scoped itself to those shapes, so a Pydantic model class — the first shape the option's own docs offer — fell through `_extract_response_schema` and the request carried `response_mime_type="application/json"` with nothing constraining it; free-form JSON then came back to be parsed against that same model. The hole is shape-matching over a union of accepted Python types (mapping, model class, and the `format` / `json_schema` / bare `schema` envelopes it unwraps). `ResponseFormat` here is a closed three-variant enum whose `JsonSchema { schema, .. }` carries the schema as a `serde_json::Value` directly, so there is no unrecognized shape to fall through: `build_request` already writes `responseMimeType` **and** `responseSchema` for `JsonSchema`, and `responseMimeType` alone for `JsonObject`. Both are pinned by existing tests (`build_request_response_format_json_schema_embeds_schema`, `build_request_response_format_json_object`), so upstream's fix is this port's already-tested behavior. |
+| #7918 | **[BREAKING] agent middleware inputs are sequence-only again.** Python had allowed `middleware=` to take either a bare middleware object (a `MiddlewareBundle` among them, treated as a one-element list) or a sequence; that union is withdrawn across `BaseAgent`, `RawAgent`, `Agent.run`, `AgentMiddlewareLayer` and the Foundry factory, with a new `_copy_middleware_sequence` raising `TypeError` on a non-sequence, and the `agent-hooks` extra is dropped from the core package. All of it is dynamic-typing ergonomics being taken back. `ChatAgentBuilder` accepts exactly one middleware per call — `.middleware(Arc<AgentMiddleware>)`, `.chat_middleware(..)`, `.function_middleware(..)`, each appending — so there is no single-or-sequence union to disambiguate, no runtime validator to write (a non-middleware argument is a compile error), and no `agent-hooks` extra to remove. The breaking change moves upstream *toward* the shape this port already has. |
+| #7604 | **Redis history-provider type checking across the supported redis-py range.** The dependency-range validator failed pyright at redis 8.0.1 with five unnecessary-type-ignore errors, while the same ignores were *required* at 7.1.1 and 6.4.0, where redis-py annotates the asyncio commands as returning the sync/async union — no single ignore comment satisfies the whole range, so results are normalized through one helper and `lrange` reached via an inline cast. Purely an artifact of one library's annotations shifting between versions under a gradual type checker. `agent-framework-redis` talks to Redis over a client whose types are fixed at compile time; there is no analogous condition. |
+| #7938 | **.NET tests drop FluentAssertions over its licensing change.** Test-dependency hygiene in the .NET solution. |
+
+Note on the window: this section is the first triaged against a mirror that had
+to be synced by hand. The fork's scheduled sync has been failing since
+2026-08-29 — `permissions:` on `.github/workflows/sync-upstream.yml` declares
+`workflows: write`, which is not a valid GITHUB_TOKEN permission key, so the
+workflow file is invalid and every run fails at startup. A fix is open on
+`claude/optimistic-edison-qtskmr` in the mirror repo (sync via the
+`merge-upstream` fork-sync API, since GITHUB_TOKEN cannot push commits touching
+`.github/workflows/**` under any permissions block). Until that lands, each
+triage window depends on someone syncing the mirror by hand first.
 
 ## Post-`e6d8d99` drift (checked against `d8d07eb`, 2026-08-29)
 
