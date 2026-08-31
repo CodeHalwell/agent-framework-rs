@@ -18,6 +18,8 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Embedding responses arrive base64-packed when encoding_format = "base64".
+base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }

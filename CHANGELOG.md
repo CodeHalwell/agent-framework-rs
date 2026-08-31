@@ -76,6 +76,16 @@ strings needs updating — see **Fixed** below.
 
 ### Fixed
 
+- **Base64 embedding responses were rejected.** Every OpenAI-shaped embedding
+  client here (`OpenAIEmbeddingClient`, `AzureOpenAIEmbeddingClient`,
+  `MistralEmbeddingClient`, `OllamaEmbeddingClient`, and the new
+  `FoundryEmbeddingClient`) forwards `encoding_format` verbatim, but the
+  shared response parser accepted only a numeric `embedding` array. Asking for
+  `encoding_format: "base64"` — a documented, forwarded option — therefore
+  failed a perfectly successful response. The parser now decodes the base64
+  form (packed little-endian `f32`s) as well, and reports undecodable or
+  misaligned payloads rather than silently truncating. Pre-existing since
+  embeddings were introduced, not new in 0.5.0.
 - **Gemini finish reasons.** Five of the names in the Gemini API's
   `FinishReason` enum were not in `agent-framework-gemini`'s mapping table and
   fell through its passthrough arm as lowercased raw strings, so a caller

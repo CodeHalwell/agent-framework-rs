@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{
@@ -131,9 +134,46 @@ fn arc_inner(inner: &mut Arc<Inner>) -> &mut Inner {
     Arc::get_mut(inner).expect("just ensured unique")
 }
 
+/// Decode one `embedding` field into a vector.
+///
+/// The field is a numeric array under the default `encoding_format: "float"`,
+/// but a **base64 string** when the caller asks for `encoding_format:
+/// "base64"` — a packed little-endian `f32` array, per the OpenAI embeddings
+/// API and the Azure AI Inference surface that mirrors it. Every client here
+/// forwards `encoding_format` verbatim, so refusing the encoded form would
+/// reject a perfectly successful response for a documented option.
+fn parse_embedding_vector(field: Option<&Value>) -> Result<Vec<f32>> {
+    match field {
+        Some(Value::Array(values)) => Ok(values
+            .iter()
+            .map(|v| v.as_f64().unwrap_or_default() as f32)
+            .collect()),
+        Some(Value::String(encoded)) => {
+            let bytes = BASE64_STANDARD.decode(encoded.as_bytes()).map_err(|e| {
+                Error::service(format!("embeddings item has undecodable base64: {e}"))
+            })?;
+            if bytes.len() % 4 != 0 {
+                return Err(Error::service(format!(
+                    "base64 embedding decodes to {} bytes, not a whole number of f32s",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        _ => Err(Error::service("embeddings item missing 'embedding' vector")),
+    }
+}
+
 /// Parse an OpenAI-shaped embeddings response
 /// (`{"data": [{"embedding": [...], "index": n}], "model": .., "usage": ..}`)
 /// into a [`GeneratedEmbeddings`], restoring input order via `index`.
+///
+/// `embedding` may be a numeric array (the default `encoding_format:
+/// "float"`) or a base64 string of packed little-endian `f32`s
+/// (`encoding_format: "base64"`); both decode to the same vector.
 pub fn parse_embeddings_response(value: &Value) -> Result<GeneratedEmbeddings> {
     let model = value.get("model").and_then(Value::as_str);
     let data = value
@@ -143,13 +183,7 @@ pub fn parse_embeddings_response(value: &Value) -> Result<GeneratedEmbeddings> {
 
     let mut indexed: Vec<(usize, Embedding)> = Vec::with_capacity(data.len());
     for (position, item) in data.iter().enumerate() {
-        let vector: Vec<f32> = item
-            .get("embedding")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::service("embeddings item missing 'embedding' vector"))?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or_default() as f32)
-            .collect();
+        let vector = parse_embedding_vector(item.get("embedding"))?;
         let index = item
             .get("index")
             .and_then(Value::as_u64)
@@ -285,5 +319,54 @@ mod tests {
     #[test]
     fn parse_response_missing_data_errors() {
         assert!(parse_embeddings_response(&json!({})).is_err());
+    }
+
+    /// Every client here forwards `encoding_format` verbatim, so a caller can
+    /// ask for `"base64"` and get embeddings back as packed little-endian f32
+    /// strings. Rejecting those would fail a successful response for a
+    /// documented option, so the parser accepts both encodings.
+    #[test]
+    fn parse_response_decodes_base64_embeddings() {
+        let vector: [f32; 3] = [1.0, -2.5, 0.125];
+        let mut bytes = Vec::new();
+        for f in vector {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        let encoded = BASE64_STANDARD.encode(&bytes);
+
+        let value = json!({
+            "data": [{ "index": 0, "embedding": encoded }],
+            "model": "text-embedding-3-small",
+        });
+        let batch = parse_embeddings_response(&value).unwrap();
+        assert_eq!(batch.embeddings[0].vector, vector.to_vec());
+    }
+
+    #[test]
+    fn parse_response_mixes_base64_and_array_items_by_index() {
+        let encoded = BASE64_STANDARD.encode(2.0f32.to_le_bytes());
+        let value = json!({
+            "data": [
+                { "index": 1, "embedding": encoded },
+                { "index": 0, "embedding": [1.0] },
+            ],
+        });
+        let batch = parse_embeddings_response(&value).unwrap();
+        assert_eq!(batch.embeddings[0].vector, vec![1.0]);
+        assert_eq!(batch.embeddings[1].vector, vec![2.0]);
+    }
+
+    #[test]
+    fn parse_response_rejects_undecodable_or_misaligned_base64() {
+        // Not valid base64 at all.
+        let bad = json!({ "data": [{ "index": 0, "embedding": "!!!not base64!!!" }] });
+        assert!(parse_embeddings_response(&bad).is_err());
+
+        // Valid base64, but not a whole number of f32s — better to say so
+        // than to silently hand back a truncated vector.
+        let misaligned = BASE64_STANDARD.encode([1u8, 2, 3, 4, 5]);
+        let value = json!({ "data": [{ "index": 0, "embedding": misaligned }] });
+        let err = parse_embeddings_response(&value).unwrap_err();
+        assert!(err.to_string().contains("whole number of f32s"), "{err}");
     }
 }
