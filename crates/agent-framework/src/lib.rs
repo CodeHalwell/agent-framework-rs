@@ -159,7 +159,7 @@ pub mod prelude {
     pub use agent_framework_foundry_local::FoundryLocalChatClient;
 
     #[cfg(feature = "bedrock")]
-    pub use agent_framework_bedrock::BedrockChatClient;
+    pub use agent_framework_bedrock::{BedrockChatClient, BedrockEmbeddingClient};
 
     #[cfg(feature = "github-copilot")]
     pub use agent_framework_github_copilot::GitHubCopilotChatClient;
@@ -188,7 +188,7 @@ pub mod prelude {
     pub use agent_framework_mem0::Mem0Provider;
 
     #[cfg(feature = "foundry")]
-    pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient};
+    pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient, FoundryEmbeddingClient};
 
     #[cfg(feature = "azure-ai-search")]
     pub use agent_framework_azure_ai_search::AzureAISearchProvider;
