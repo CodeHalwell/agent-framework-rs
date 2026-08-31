@@ -163,6 +163,79 @@ async fn a_token_credential_authenticates_with_a_bearer_header() {
     assert!(!req.headers.contains_key("api-key"));
 }
 
+/// A credential that records which audience it was asked for.
+#[derive(Clone, Default)]
+struct RecordingCredential {
+    scopes: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_azure::TokenCredential for RecordingCredential {
+    async fn get_token(&self) -> agent_framework_core::error::Result<String> {
+        self.scopes.lock().unwrap().push("<unscoped>".into());
+        Ok("unscoped-token".into())
+    }
+
+    async fn get_token_for_scope(
+        &self,
+        scope: &str,
+    ) -> agent_framework_core::error::Result<String> {
+        self.scopes.lock().unwrap().push(scope.to_string());
+        Ok("scoped-token".into())
+    }
+}
+
+/// The Models inference data plane wants the cognitive-services audience, not
+/// the `https://ai.azure.com/.default` project audience the Responses API
+/// uses. Asking a real credential for the wrong one yields a token the service
+/// rejects, and the failure looks like a permissions problem rather than a
+/// scope bug — so this pins that the client requests the scope explicitly
+/// rather than falling through to the credential's own default.
+#[tokio::test]
+async fn the_credential_is_asked_for_the_models_inference_scope() {
+    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let credential = RecordingCredential::default();
+    let client = FoundryEmbeddingClient::with_credential(
+        format!("{endpoint}/models"),
+        "m",
+        Arc::new(credential.clone()),
+    );
+
+    client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect("embeddings");
+
+    let scopes = credential.scopes.lock().unwrap().clone();
+    assert_eq!(
+        scopes,
+        vec!["https://cognitiveservices.azure.com/.default".to_string()],
+        "must request the Models data-plane audience, not the credential default"
+    );
+}
+
+#[tokio::test]
+async fn an_overridden_scope_reaches_the_credential() {
+    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let credential = RecordingCredential::default();
+    let client = FoundryEmbeddingClient::with_credential(
+        format!("{endpoint}/models"),
+        "m",
+        Arc::new(credential.clone()),
+    )
+    .with_scope("https://sovereign.example/.default");
+
+    client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect("embeddings");
+
+    assert_eq!(
+        credential.scopes.lock().unwrap().clone(),
+        vec!["https://sovereign.example/.default".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn a_response_without_a_model_falls_back_to_the_requested_one() {
     const NO_MODEL_BODY: &str = r#"{"data": [{"index": 0, "embedding": [0.5]}]}"#;

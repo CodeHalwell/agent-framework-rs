@@ -183,20 +183,46 @@ impl BedrockEmbeddingClient {
     /// The host to sign and send to: the endpoint's authority, with the
     /// scheme and any path stripped.
     fn host(&self) -> &str {
-        let endpoint = &self.inner.endpoint;
+        Self::split_endpoint(&self.inner.endpoint).0
+    }
+
+    /// The endpoint's path prefix, if it carries one (`""` otherwise), with
+    /// no trailing slash.
+    fn path_prefix(&self) -> &str {
+        Self::split_endpoint(&self.inner.endpoint).1
+    }
+
+    /// Split an endpoint into `(authority, path prefix)`, dropping the scheme.
+    /// The prefix keeps its leading `/` and loses any trailing one, so it
+    /// concatenates cleanly with a path that starts with `/`.
+    fn split_endpoint(endpoint: &str) -> (&str, &str) {
         let after_scheme = endpoint
             .split_once("://")
-            .map_or(endpoint.as_str(), |(_, rest)| rest);
-        after_scheme
-            .split_once('/')
-            .map_or(after_scheme, |(host, _)| host)
+            .map_or(endpoint, |(_, rest)| rest);
+        match after_scheme.find('/') {
+            Some(slash) => (
+                &after_scheme[..slash],
+                after_scheme[slash..].trim_end_matches('/'),
+            ),
+            None => (after_scheme, ""),
+        }
     }
 
     /// Sign and POST one `InvokeModel` request, returning the parsed body.
     async fn invoke(&self, model: &str, payload: Vec<u8>) -> Result<Value> {
-        let path = invoke_path(model);
-        let url = format!("{}{path}", self.inner.endpoint);
+        // The path actually requested and the canonical URI signed must be
+        // byte-identical, so an endpoint path prefix has to be folded in
+        // *before* signing — otherwise a proxy or VPC endpoint that preserves
+        // the prefix forwards a request whose signature covers a different
+        // path, and AWS rejects it.
+        let path = format!("{}{}", self.path_prefix(), invoke_path(model));
         let host = self.host();
+        let scheme = self
+            .inner
+            .endpoint
+            .split_once("://")
+            .map_or("https", |(scheme, _)| scheme);
+        let url = format!("{scheme}://{host}{path}");
 
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -361,12 +387,22 @@ mod tests {
     fn host_is_the_endpoint_authority_without_scheme_or_path() {
         let client = BedrockEmbeddingClient::new("ak", "sk", "us-east-1", "m");
         assert_eq!(client.host(), "bedrock-runtime.us-east-1.amazonaws.com");
+        assert_eq!(client.path_prefix(), "");
 
         let overridden = client.clone().with_endpoint("http://127.0.0.1:8080");
         assert_eq!(overridden.host(), "127.0.0.1:8080");
+        assert_eq!(overridden.path_prefix(), "");
 
-        let with_path = client.with_endpoint("https://vpce-abc.bedrock-runtime.aws/prefix");
+        let with_path = client
+            .clone()
+            .with_endpoint("https://vpce-abc.bedrock-runtime.aws/prefix");
         assert_eq!(with_path.host(), "vpce-abc.bedrock-runtime.aws");
+        assert_eq!(with_path.path_prefix(), "/prefix");
+
+        // A trailing slash on the endpoint must not double up against the
+        // leading slash of the invoke path.
+        let trailing = client.with_endpoint("https://vpce-abc.bedrock-runtime.aws/prefix/");
+        assert_eq!(trailing.path_prefix(), "/prefix");
     }
 
     #[test]

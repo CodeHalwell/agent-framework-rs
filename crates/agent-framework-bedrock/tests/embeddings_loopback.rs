@@ -217,6 +217,56 @@ async fn a_session_token_is_signed_and_sent() {
     );
 }
 
+/// An endpoint carrying a path prefix (a PrivateLink/VPC endpoint or a proxy
+/// mounted under a sub-path) must have that prefix in *both* the requested
+/// path and the canonical URI the signature covers. Signing the bare
+/// `/model/.../invoke` while sending `/prefix/model/.../invoke` produces a
+/// signature AWS rejects, and nothing about the sent request looks wrong —
+/// so this recomputes the expected `Authorization` from the request's own
+/// `x-amz-date` and body and compares it, rather than only eyeballing the
+/// request line.
+#[tokio::test]
+async fn an_endpoint_path_prefix_is_signed_as_well_as_sent() {
+    let (endpoint, seen) = embedding_server(1);
+    let client = BedrockEmbeddingClient::new("AKIDEXAMPLE", "secret", "us-east-1", "m")
+        .with_endpoint(format!("{endpoint}/prefix"));
+
+    client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect("embeddings");
+
+    let recorded = seen.lock().unwrap().clone();
+    let req = recorded.first().expect("one request");
+    assert_eq!(req.start_line, "POST /prefix/model/m/invoke HTTP/1.1");
+
+    let host = req.headers.get("host").expect("host header").clone();
+    let amz_date = req.headers.get("x-amz-date").expect("x-amz-date").clone();
+    let expected = agent_framework_bedrock::sigv4::authorization_header(
+        &agent_framework_bedrock::sigv4::SigV4Params {
+            access_key: "AKIDEXAMPLE",
+            secret_key: "secret",
+            session_token: None,
+            region: "us-east-1",
+            service: "bedrock",
+            host: &host,
+            method: "POST",
+            // The whole point: the prefix belongs in the canonical URI.
+            canonical_uri: "/prefix/model/m/invoke",
+            canonical_query: "",
+            payload: req.body.as_bytes(),
+            amz_date: &amz_date,
+            date_stamp: &amz_date[..8],
+        },
+    )
+    .0;
+    assert_eq!(
+        req.headers.get("authorization").map(String::as_str),
+        Some(expected.as_str()),
+        "the Authorization header must sign the prefixed path that was actually requested"
+    );
+}
+
 #[tokio::test]
 async fn a_service_error_is_classified_rather_than_swallowed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");

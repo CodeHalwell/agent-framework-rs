@@ -50,6 +50,19 @@ pub const FOUNDRY_EMBEDDING_MODEL_ENV: &str = "FOUNDRY_EMBEDDING_MODEL";
 /// pins. Override with [`FoundryEmbeddingClient::with_api_version`].
 pub const DEFAULT_API_VERSION: &str = "2024-05-01-preview";
 
+/// Default Entra ID scope requested for the bearer token.
+///
+/// This is the **data plane** audience for Azure AI Services, the same one
+/// `agent-framework-anthropic`'s Foundry client and
+/// [`agent_framework_azure::AzureOpenAIClient`] use — *not*
+/// [`crate::FOUNDRY_SCOPE`] (`https://ai.azure.com/.default`), which is the
+/// Foundry **project** audience that [`crate::FoundryChatClient`] needs for
+/// the Responses API. The two are different surfaces with different
+/// audiences: a token minted for the project scope is rejected by the Models
+/// inference endpoint. Override with [`FoundryEmbeddingClient::with_scope`]
+/// if a particular deployment wants something else.
+pub const DEFAULT_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
+
 enum Auth {
     ApiKey(String),
     Credential(Arc<dyn TokenCredential>),
@@ -77,6 +90,7 @@ struct Inner {
     endpoint: String,
     model: String,
     api_version: String,
+    scope: String,
     auth: Auth,
 }
 
@@ -109,8 +123,14 @@ impl FoundryEmbeddingClient {
     }
 
     /// Create a client authenticating via a [`TokenCredential`] (Microsoft
-    /// Entra ID bearer token). The credential should already be scoped to
-    /// [`crate::FOUNDRY_SCOPE`].
+    /// Entra ID bearer token).
+    ///
+    /// The token is requested for [`DEFAULT_SCOPE`] through
+    /// [`TokenCredential::get_token_for_scope`], so a credential that mints
+    /// per-audience tokens gets the right one without the caller having to
+    /// know which. A credential wrapping a single fixed token ignores the
+    /// scope, as that trait method's default does — such a token must already
+    /// carry the Models-inference audience.
     pub fn with_credential(
         endpoint: impl Into<String>,
         model: impl Into<String>,
@@ -126,6 +146,7 @@ impl FoundryEmbeddingClient {
                 endpoint: endpoint.into().trim_end_matches('/').to_string(),
                 model: model.into(),
                 api_version: DEFAULT_API_VERSION.to_string(),
+                scope: DEFAULT_SCOPE.to_string(),
                 auth,
             }),
         }
@@ -136,9 +157,15 @@ impl FoundryEmbeddingClient {
     /// overrides the environment's model when supplied.
     ///
     /// Mirrors upstream's `required_fields=["models_endpoint",
-    /// "embedding_model"]`: both must be resolvable, from arguments or the
-    /// environment, or this errors rather than deferring the failure to the
-    /// first request.
+    /// "embedding_model"]`: only those two are required, and they must be
+    /// resolvable from arguments or the environment or this errors rather
+    /// than deferring the failure to the first request.
+    ///
+    /// The API key is **not** required. Without it this falls back to
+    /// `DefaultAzureCredential` scoped to [`DEFAULT_SCOPE`], matching both
+    /// upstream (whose key is optional beside a credential) and
+    /// [`crate::FoundryChatClient::from_env`], so a managed-identity or
+    /// `az login` environment works with no key configured.
     pub fn from_env(model: Option<String>) -> Result<Self> {
         let endpoint = std::env::var(FOUNDRY_MODELS_ENDPOINT_ENV).map_err(|_| {
             Error::Configuration(format!("{FOUNDRY_MODELS_ENDPOINT_ENV} is not set"))
@@ -151,16 +178,28 @@ impl FoundryEmbeddingClient {
                     "an embedding model is required: pass one or set {FOUNDRY_EMBEDDING_MODEL_ENV}"
                 ))
             })?;
-        let api_key = std::env::var(FOUNDRY_MODELS_API_KEY_ENV).map_err(|_| {
-            Error::Configuration(format!("{FOUNDRY_MODELS_API_KEY_ENV} is not set"))
-        })?;
-        Ok(Self::new(endpoint, model, api_key))
+        match std::env::var(FOUNDRY_MODELS_API_KEY_ENV) {
+            Ok(api_key) if !api_key.trim().is_empty() => Ok(Self::new(endpoint, model, api_key)),
+            _ => {
+                let credential: Arc<dyn TokenCredential> = Arc::new(
+                    agent_framework_azure::DefaultAzureCredential::new(DEFAULT_SCOPE),
+                );
+                Ok(Self::with_credential(endpoint, model, credential))
+            }
+        }
     }
 
     /// Override the `api-version` query parameter (see
     /// [`DEFAULT_API_VERSION`]).
     pub fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
         arc_inner(&mut self.inner).api_version = api_version.into();
+        self
+    }
+
+    /// Override the Entra ID scope requested for the bearer token (see
+    /// [`DEFAULT_SCOPE`]). No effect on the API-key path.
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        arc_inner(&mut self.inner).scope = scope.into();
         self
     }
 
@@ -217,6 +256,7 @@ fn arc_inner(inner: &mut Arc<Inner>) -> &mut Inner {
             endpoint: inner.endpoint.clone(),
             model: inner.model.clone(),
             api_version: inner.api_version.clone(),
+            scope: inner.scope.clone(),
             auth: match &inner.auth {
                 Auth::ApiKey(key) => Auth::ApiKey(key.clone()),
                 Auth::Credential(cred) => Auth::Credential(cred.clone()),
@@ -251,7 +291,7 @@ impl EmbeddingClient for FoundryEmbeddingClient {
         let request = match &self.inner.auth {
             Auth::ApiKey(key) => request.header("api-key", key),
             Auth::Credential(credential) => {
-                let token = credential.get_token().await?;
+                let token = credential.get_token_for_scope(&self.inner.scope).await?;
                 request.bearer_auth(token)
             }
         };
@@ -354,15 +394,60 @@ mod tests {
     }
 
     #[test]
-    fn from_env_requires_endpoint_model_and_key() {
-        // Each missing piece names itself rather than failing at request time.
+    fn from_env_requires_only_the_endpoint_and_model() {
         temp_env_absent(|| {
+            // Each missing required piece names itself rather than failing at
+            // request time.
             let err = FoundryEmbeddingClient::from_env(None).expect_err("no endpoint");
             assert!(
                 err.to_string().contains(FOUNDRY_MODELS_ENDPOINT_ENV),
                 "{err}"
             );
+
+            std::env::set_var(FOUNDRY_MODELS_ENDPOINT_ENV, "https://e/models");
+            let err = FoundryEmbeddingClient::from_env(None).expect_err("no model");
+            assert!(
+                err.to_string().contains(FOUNDRY_EMBEDDING_MODEL_ENV),
+                "{err}"
+            );
+
+            // The API key is *not* required: with endpoint and model present,
+            // a keyless managed-identity or `az login` environment resolves to
+            // a credential rather than erroring, matching FoundryChatClient.
+            let client = FoundryEmbeddingClient::from_env(Some("m".into()))
+                .expect("keyless env must fall back to a credential");
+            assert!(
+                matches!(client.inner.auth, Auth::Credential(_)),
+                "expected a credential, got the api-key path"
+            );
+            assert_eq!(client.inner.scope, DEFAULT_SCOPE);
+
+            // A key present still takes the api-key path.
+            std::env::set_var(FOUNDRY_MODELS_API_KEY_ENV, "k");
+            let keyed = FoundryEmbeddingClient::from_env(Some("m".into())).expect("keyed");
+            assert!(matches!(keyed.inner.auth, Auth::ApiKey(_)));
+
+            // An empty key is treated as absent rather than sent as "".
+            std::env::set_var(FOUNDRY_MODELS_API_KEY_ENV, "   ");
+            let blank = FoundryEmbeddingClient::from_env(Some("m".into())).expect("blank key");
+            assert!(matches!(blank.inner.auth, Auth::Credential(_)));
         });
+    }
+
+    #[test]
+    fn the_default_scope_is_the_models_data_plane_not_the_project_audience() {
+        // Regression guard for a real mix-up: FOUNDRY_SCOPE
+        // (https://ai.azure.com/.default) is the project audience the
+        // Responses API needs; the Models inference endpoint rejects it.
+        assert_eq!(
+            DEFAULT_SCOPE,
+            "https://cognitiveservices.azure.com/.default"
+        );
+        assert_ne!(DEFAULT_SCOPE, crate::FOUNDRY_SCOPE);
+
+        let client = FoundryEmbeddingClient::new("https://e/models", "m", "k")
+            .with_scope("https://custom/.default");
+        assert_eq!(client.inner.scope, "https://custom/.default");
     }
 
     /// Run `f` with the three Foundry embedding variables unset, restoring

@@ -32,8 +32,10 @@ strings needs updating — see **Fixed** below.
     batch into `UsageDetails::input_token_count`.
   - `with_endpoint` overrides the base URL — a PrivateLink interface
     endpoint, a region the host derivation does not cover, or a local test
-    server. The `Host` signed into the canonical request is taken from that
-    URL, so the signature follows the request.
+    server. Both the `Host` *and* any path prefix on that URL are folded into
+    the canonical request before signing, so the signature always covers the
+    path actually requested; an endpoint or proxy mounted under a sub-path
+    works rather than failing AWS authentication.
   - Credentials are the static or `AWS_*`-environment ones the chat client
     already takes. Upstream reaches Bedrock through boto3 and inherits its
     whole credential chain; this crate signs directly and does not.
@@ -56,6 +58,18 @@ strings needs updating — see **Fixed** below.
     sends no explicit `api-version` of its own. It is the one value here taken
     from an SDK default rather than a verified service contract, so
     `with_api_version` overrides it.
+  - Entra tokens are requested for `DEFAULT_SCOPE`
+    (`https://cognitiveservices.azure.com/.default`), the Azure AI Services
+    **data plane** audience — *not* `FOUNDRY_SCOPE`
+    (`https://ai.azure.com/.default`), which is the Foundry **project**
+    audience `FoundryChatClient` needs for the Responses API. The Models
+    inference endpoint rejects a token minted for the project scope.
+    `with_scope` overrides it.
+  - `from_env` requires only the endpoint and model, matching upstream's
+    `required_fields`. With no `FOUNDRY_MODELS_API_KEY` it falls back to
+    `DefaultAzureCredential` at the scope above, so a managed-identity or
+    `az login` environment works keyless — the same fallback
+    `FoundryChatClient::from_env` already had.
 - Both clients are re-exported from `agent_framework::prelude` under their
   existing `bedrock` and `foundry` features. No new default dependencies;
   `agent-framework-foundry` gains `reqwest` and `agent-framework-openai`.
