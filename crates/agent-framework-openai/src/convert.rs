@@ -448,14 +448,19 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
     details
 }
 
-/// Copy a positive token count from `obj[src]` into `details.additional_counts`
-/// under `dest`. Zero/absent counts are skipped, mirroring upstream's truthy
-/// `if tokens := ...` guard.
+/// Copy a reported token count from `obj[src]` into `details.additional_counts`
+/// under `dest`. An absent (or non-integer) count is skipped; a **reported zero
+/// is recorded**, because "the model used none of this" and "the provider did
+/// not report this" are different facts and `additional_counts` can only say
+/// the second by omission.
+///
+/// This used to skip zeros, mirroring upstream's truthy `if tokens := ...`
+/// guard — Python's walrus is falsy for `0`, so a reported zero vanished.
+/// Upstream fixed that to `is not None` (#7964); the port had inherited the
+/// bug, test included.
 fn add_usage_detail(details: &mut UsageDetails, obj: &Value, src: &str, dest: &str) {
     if let Some(v) = obj.get(src).and_then(Value::as_u64) {
-        if v > 0 {
-            details.additional_counts.insert(dest.to_string(), v);
-        }
+        details.additional_counts.insert(dest.to_string(), v);
     }
 }
 
@@ -919,12 +924,67 @@ mod tests {
                 .get("completion/accepted_prediction_tokens"),
             Some(&3)
         );
-        // Zero-valued counts are skipped (truthy guard).
-        assert!(!d
-            .additional_counts
-            .contains_key("completion/rejected_prediction_tokens"));
+        // A reported zero is a reported count, not an absent one.
+        assert_eq!(
+            d.additional_counts
+                .get("completion/rejected_prediction_tokens"),
+            Some(&0)
+        );
         assert_eq!(d.additional_counts.get("prompt/cached_tokens"), Some(&40));
         assert_eq!(d.additional_counts.get("prompt/audio_tokens"), Some(&2));
+    }
+
+    #[test]
+    fn reported_zero_token_counts_are_kept_and_absent_ones_omitted() {
+        // The distinction this pins: a provider reporting `0` is saying the
+        // model used none of that budget, which is not the same as a provider
+        // that does not break the count out at all. `additional_counts` has no
+        // way to express the second except by omission, so conflating them
+        // loses the first.
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "completion_tokens_details": {
+                "audio_tokens": 0,
+                "reasoning_tokens": 0,
+                // accepted_prediction_tokens deliberately absent
+            },
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        });
+        let d = parse_usage(&usage);
+
+        assert_eq!(d.additional_counts.get("completion/audio_tokens"), Some(&0));
+        assert_eq!(
+            d.additional_counts.get("completion/reasoning_tokens"),
+            Some(&0)
+        );
+        assert_eq!(d.additional_counts.get("prompt/cached_tokens"), Some(&0));
+        assert!(!d
+            .additional_counts
+            .contains_key("completion/accepted_prediction_tokens"));
+
+        // The typed fields never had the truthy guard, so a zero already
+        // survived there; asserting it keeps the two paths agreeing.
+        assert_eq!(d.reasoning_output_token_count, Some(0));
+        assert_eq!(d.cache_read_input_token_count, Some(0));
+    }
+
+    #[test]
+    fn non_integer_usage_details_are_still_ignored() {
+        // Dropping the `> 0` guard must not widen what counts as a count: a
+        // string or float is still not a token count.
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens_details": { "audio_tokens": "12", "reasoning_tokens": 1.5 },
+            "prompt_tokens_details": { "cached_tokens": null },
+        });
+        let d = parse_usage(&usage);
+        assert!(!d.additional_counts.contains_key("completion/audio_tokens"));
+        assert!(!d
+            .additional_counts
+            .contains_key("completion/reasoning_tokens"));
+        assert!(!d.additional_counts.contains_key("prompt/cached_tokens"));
     }
 
     // endregion

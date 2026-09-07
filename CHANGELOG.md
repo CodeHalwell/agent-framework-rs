@@ -26,6 +26,21 @@ may break APIs).
   holds, so the database and container must be provisioned out of band. The
   call now says so rather than surfacing a bare `403`.
 
+### Fixed
+
+- **A token count reported as zero is no longer dropped from the OpenAI usage
+  breakdown.** `parse_usage` skipped any `completion_tokens_details.*` /
+  `prompt_tokens_details.*` value equal to `0`, mirroring a truthiness bug in
+  upstream's Python (since fixed there), so a provider reporting zero audio,
+  accepted-prediction, rejected-prediction or cached tokens produced no entry
+  at all — indistinguishable from a provider that does not report that count.
+  Both now appear as `Some(0)` and `None` respectively in
+  `UsageDetails::additional_counts`, which is what the GenAI metrics layer
+  reads. Non-integer values are still ignored. The Responses path and the
+  typed fields (`reasoning_output_token_count`, `cache_read_input_token_count`)
+  were already correct, so this also removes a silent disagreement between the
+  two paths about the same response.
+
 ### Changed
 
 - `CosmosChatMessageStore::serialize` omits `key` and emits
