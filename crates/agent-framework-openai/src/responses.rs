@@ -362,6 +362,19 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         let mut buffered: Vec<Value> = Vec::new();
         for content in &msg.contents {
             match content {
+                // A refusal is its own output content part — `{"type":
+                // "refusal", "refusal": "..."}` — sitting beside `output_text`
+                // in an output message. Re-emitting it as `output_text` would
+                // replay a decline to the provider as an answer. Only
+                // meaningful on the assistant side: an *input* message's
+                // content list admits only input_text/input_image/input_file,
+                // so a refusal on any other role has no wire form and is
+                // dropped rather than mis-encoded.
+                Content::Text(t) if t.refusal => {
+                    if role == Role::ASSISTANT {
+                        buffered.push(json!({ "type": "refusal", "refusal": t.text }));
+                    }
+                }
                 Content::Text(t) => {
                     let text_type = if role == Role::ASSISTANT {
                         "output_text"
@@ -2281,6 +2294,48 @@ mod tests {
     fn reasoning_event(value: Value) -> EventOutcome {
         let mut ids = HashMap::new();
         parse_responses_event(&value, &mut ids, None)
+    }
+
+    #[test]
+    fn a_replayed_refusal_becomes_a_refusal_content_part() {
+        // Beside `output_text` in an output message, a refusal has its own
+        // part type. Re-emitting it as `output_text` replays a decline to the
+        // provider as an answer.
+        let input = messages_to_input(&[Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::new("here is half")),
+                Content::Text(TextContent::refusal("I can't do the rest")),
+            ],
+        )]);
+        let content = &input[0]["content"];
+        assert_eq!(
+            content[0],
+            json!({"type": "output_text", "text": "here is half"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type": "refusal", "refusal": "I can't do the rest"})
+        );
+    }
+
+    #[test]
+    fn a_refusal_on_a_non_assistant_role_is_dropped_rather_than_mis_encoded() {
+        // An *input* message's content list admits only
+        // input_text/input_image/input_file — there is no refusal part — so
+        // emitting one would be rejected by the API. Dropping it is the only
+        // correct option, and it cannot arise from a parsed provider response
+        // anyway (refusals are assistant output).
+        let input = messages_to_input(&[Message::with_contents(
+            Role::user(),
+            vec![
+                Content::Text(TextContent::new("hello")),
+                Content::Text(TextContent::refusal("stray")),
+            ],
+        )]);
+        let content = &input[0]["content"];
+        assert_eq!(content.as_array().map(Vec::len), Some(1));
+        assert_eq!(content[0], json!({"type": "input_text", "text": "hello"}));
     }
 
     #[test]

@@ -76,7 +76,11 @@ may break APIs).
   `AgentResponse::text` and both streaming updates — because a tool loop
   accumulates earlier assistant turns, so blanking only the refusing message
   still handed back an intermediate aside as the final answer.
-  `has_refusal()` / `refusal_text()` are available on each.
+  `has_refusal()` / `refusal_text()` are available on each. The **outbound**
+  path preserves the marker too: replaying a refusal as history now uses the
+  assistant message's own `refusal` field (Chat Completions) and a
+  `{"type": "refusal"}` output content part (Responses), instead of folding
+  it into ordinary content and telling the provider the assistant answered.
 
 - **Two approvals pending under one provider `call_id` are no longer
   conflated.** They were matched structurally, so a second pending approval

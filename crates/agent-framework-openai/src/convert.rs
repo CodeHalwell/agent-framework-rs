@@ -91,8 +91,19 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut tool_results: Vec<&FunctionResultContent> = Vec::new();
 
+        // Refusal text replayed as history: the assistant message object
+        // carries it in its own `refusal` field, not in `content`. Folding it
+        // into `content` presents a decline to the provider as a successful
+        // answer on the next turn, which is the distinction the marker exists
+        // to keep. Verified against the API's assistant-message request
+        // schema, which declares `refusal: Optional[str]`.
+        let mut refusal = String::new();
+
         for content in &msg.contents {
             match content {
+                Content::Text(t) if t.refusal => {
+                    refusal.push_str(&t.text);
+                }
                 Content::Text(t) => {
                     text.push_str(&t.text);
                     parts.push(json!({ "type": "text", "text": t.text }));
@@ -138,6 +149,9 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
             obj.insert("content".into(), Value::Array(parts));
         } else if !text.is_empty() || tool_calls.is_empty() {
             obj.insert("content".into(), json!(text));
+        }
+        if !refusal.is_empty() {
+            obj.insert("refusal".into(), json!(refusal));
         }
         if let Some(name) = msg.author_name.as_deref().and_then(sanitize_author_name) {
             obj.insert("name".into(), json!(name));
@@ -871,6 +885,34 @@ mod tests {
     // endregion
 
     // region: response parsing
+
+    #[test]
+    fn a_replayed_refusal_uses_the_assistant_refusal_field_not_content() {
+        // Replaying a refusal as ordinary `content` tells the provider the
+        // assistant answered, on every subsequent turn — the exact
+        // distinction the marker exists to preserve. The API's assistant
+        // message object has its own `refusal` field for this.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::new("here is half")),
+                Content::Text(TextContent::refusal("I can't do the rest")),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        assert_eq!(wire[0]["content"], json!("here is half"));
+        assert_eq!(wire[0]["refusal"], json!("I can't do the rest"));
+    }
+
+    #[test]
+    fn a_message_without_a_refusal_carries_no_refusal_field() {
+        let wire = messages_to_openai(&[Message::assistant("the answer")]);
+        assert_eq!(wire[0]["content"], json!("the answer"));
+        assert!(
+            wire[0].get("refusal").is_none(),
+            "an ordinary turn must not grow a refusal field"
+        );
+    }
 
     #[test]
     fn a_refusal_is_marked_and_withheld_from_text() {
