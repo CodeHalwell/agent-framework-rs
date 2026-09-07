@@ -319,9 +319,21 @@ impl VectorStoreCollectionDefinition {
             }
             seen_names.push(&field.name);
 
+            let storage = field.effective_storage_name();
+            // An empty override is rejected for the same reason an empty name
+            // is: `to_storage` would emit the field under an empty JSON key,
+            // which the in-memory store tolerates but a real provider will
+            // reject at collection creation or on the first write — the worst
+            // place to discover it. `unwrap_or(&name)` means this can only be
+            // an explicit `Some("")`, never an absent override.
+            if storage.is_empty() {
+                return Err(Error::Configuration(format!(
+                    "vector store field '{}' has an empty storage name",
+                    field.name
+                )));
+            }
             // Two fields renamed onto one storage name would silently
             // overwrite each other on every write.
-            let storage = field.effective_storage_name();
             if seen_storage.contains(&storage) {
                 return Err(Error::Configuration(format!(
                     "two vector store fields map to the same storage name '{storage}'"
@@ -997,6 +1009,36 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_storage_name_override_is_rejected() {
+        // An empty `name` was already rejected; an empty override was not,
+        // even though it produces the same broken result — a field written
+        // under an empty JSON key.
+        let err = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::data("text").with_storage_name(""),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("empty storage name"), "{err}");
+
+        // Including through deserialization, which shares the validator.
+        let from_json = serde_json::from_value::<VectorStoreCollectionDefinition>(json!({
+            "fields": [
+                {"field_type": "key", "name": "id"},
+                {"field_type": "data", "name": "text", "storage_name": ""},
+            ]
+        }));
+        assert!(from_json.is_err());
+
+        // An absent override still falls back to the name, as before.
+        let ok = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::data("text"),
+        ])
+        .unwrap();
+        assert_eq!(ok.storage_names(), vec!["id", "text"]);
     }
 
     #[test]
