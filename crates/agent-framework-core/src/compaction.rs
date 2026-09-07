@@ -129,16 +129,78 @@ fn leading_system_count(messages: &[Message]) -> usize {
         .count()
 }
 
+/// Index, within `rest` (the non-system tail), of the earliest user message —
+/// this port's stand-in for upstream's "first user group".
+///
+/// Upstream annotates messages into groups and protects the whole earliest
+/// user group; this port has no group model, so it protects the earliest user
+/// *message*. That is the load-bearing part of the group in practice: a user
+/// turn carries no tool calls of its own, so preserving it alone cannot
+/// orphan a call/result pair (and `drop_orphaned_tool_exchanges` would repair
+/// it if it somehow did).
+fn first_user_index(rest: &[Message]) -> Option<usize> {
+    rest.iter().position(|m| m.role == Role::user())
+}
+
+/// Splice the earliest user message back in ahead of a retained tail, when
+/// `preserve_first_user` is set and truncation would otherwise have dropped
+/// it.
+///
+/// `out` is the system prefix; `rest` the non-system tail; `start` the index
+/// in `rest` where the retained tail begins. Mirrors upstream's treatment of
+/// a protected group: it is added *regardless of budget*, so the result may
+/// exceed the configured limit by one message rather than dropping the turn
+/// the conversation is about.
+fn push_preserved_first_user(
+    out: &mut Vec<Message>,
+    rest: &[Message],
+    start: usize,
+    preserve_first_user: bool,
+) {
+    if !preserve_first_user {
+        return;
+    }
+    // Only when it falls outside the retained tail — otherwise it is already
+    // there and re-adding it would duplicate the turn.
+    if let Some(index) = first_user_index(rest) {
+        if index < start {
+            out.push(rest[index].clone());
+        }
+    }
+}
+
 /// Keep the most recent `max_messages`, always preserving any leading system
 /// message(s) at the front. Mirrors upstream's `Truncation` strategy.
 #[derive(Debug, Clone, Copy)]
 pub struct Truncation {
     pub max_messages: usize,
+    /// When set, the earliest user message is retained alongside the recent
+    /// tail — see [`Truncation::preserve_first_user`].
+    pub preserve_first_user: bool,
 }
 
 impl Truncation {
     pub fn new(max_messages: usize) -> Self {
-        Self { max_messages }
+        Self {
+            max_messages,
+            preserve_first_user: false,
+        }
+    }
+
+    /// Also retain the earliest user message, whatever the budget.
+    ///
+    /// Truncation drops the oldest turns, and the oldest turn is usually the
+    /// one that states the task — so a long conversation can lose the request
+    /// it is *about* while keeping the chatter that followed. Upstream added
+    /// this for the same reason (`preserve_first_user_group` on
+    /// `TruncationStrategy`, #7912).
+    ///
+    /// Like upstream's protected groups, the preserved message is kept
+    /// *regardless of budget*: the result may exceed `max_messages` by one.
+    /// Off by default, so existing behavior is unchanged.
+    pub fn preserve_first_user(mut self) -> Self {
+        self.preserve_first_user = true;
+        self
     }
 }
 
@@ -150,16 +212,25 @@ impl CompactionStrategy for Truncation {
         let sys_count = leading_system_count(messages);
         let mut out: Vec<Message> = messages[..sys_count].to_vec();
 
+        let rest = &messages[sys_count..];
+
         if sys_count >= self.max_messages {
             // The system prefix alone already fills (or exceeds) the budget;
             // keep just the system prefix, truncated to the budget.
             out.truncate(self.max_messages);
+            // A protected message is kept *regardless of budget*, so it
+            // survives this branch too — returning early without it was the
+            // one path where `preserve_first_user` silently did nothing, and
+            // it is the path most likely to matter (a small limit, or a
+            // multi-message system prefix, is exactly when the opening
+            // request gets dropped).
+            push_preserved_first_user(&mut out, rest, rest.len(), self.preserve_first_user);
             return out;
         }
 
         let remaining_budget = self.max_messages - sys_count;
-        let rest = &messages[sys_count..];
         let start = rest.len().saturating_sub(remaining_budget);
+        push_preserved_first_user(&mut out, rest, start, self.preserve_first_user);
         out.extend_from_slice(&rest[start..]);
         out
     }
@@ -170,11 +241,29 @@ impl CompactionStrategy for Truncation {
 #[derive(Debug, Clone, Copy)]
 pub struct SlidingWindow {
     pub window: usize,
+    /// See [`SlidingWindow::preserve_first_user`].
+    pub preserve_first_user: bool,
 }
 
 impl SlidingWindow {
     pub fn new(window: usize) -> Self {
-        Self { window }
+        Self {
+            window,
+            preserve_first_user: false,
+        }
+    }
+
+    /// Also retain the earliest user message, whatever the window size — see
+    /// [`Truncation::preserve_first_user`], which this mirrors.
+    ///
+    /// Upstream added the option to its truncation strategy only; it is
+    /// offered here on every strategy that drops the oldest turns, because
+    /// the exposure it addresses is identical in each and a caller's choice
+    /// between them is about *how* to bound context, not about whether the
+    /// opening request matters.
+    pub fn preserve_first_user(mut self) -> Self {
+        self.preserve_first_user = true;
+        self
     }
 }
 
@@ -184,6 +273,7 @@ impl CompactionStrategy for SlidingWindow {
         let mut out: Vec<Message> = messages[..sys_count].to_vec();
         let rest = &messages[sys_count..];
         let start = rest.len().saturating_sub(self.window);
+        push_preserved_first_user(&mut out, rest, start, self.preserve_first_user);
         out.extend_from_slice(&rest[start..]);
         out
     }
@@ -196,11 +286,25 @@ impl CompactionStrategy for SlidingWindow {
 #[derive(Debug, Clone, Copy)]
 pub struct TokenBudget {
     pub max_tokens: usize,
+    /// See [`TokenBudget::preserve_first_user`].
+    pub preserve_first_user: bool,
 }
 
 impl TokenBudget {
     pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens }
+        Self {
+            max_tokens,
+            preserve_first_user: false,
+        }
+    }
+
+    /// Also retain the earliest user message, whatever the token budget — see
+    /// [`Truncation::preserve_first_user`], which this mirrors. As there, the
+    /// preserved message is added regardless of budget, so the retained set
+    /// may exceed `max_tokens`.
+    pub fn preserve_first_user(mut self) -> Self {
+        self.preserve_first_user = true;
+        self
     }
 }
 
@@ -232,6 +336,10 @@ impl CompactionStrategy for TokenBudget {
         kept_rest.reverse();
 
         let mut out: Vec<Message> = system_prefix.to_vec();
+        // `kept_rest` is a suffix of `rest`, so its length gives the index
+        // the retained tail starts at.
+        let start = rest.len() - kept_rest.len();
+        push_preserved_first_user(&mut out, rest, start, self.preserve_first_user);
         out.extend(kept_rest.into_iter().cloned());
         out
     }
@@ -2376,6 +2484,181 @@ mod tests {
         assert_eq!(out[0].text(), "3");
         assert_eq!(out[1].text(), "4");
     }
+
+    // region: preserve_first_user
+
+    #[test]
+    fn truncation_preserve_first_user_keeps_the_opening_request() {
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "port the auth module to Rust"),
+            text(Role::assistant(), "2"),
+            text(Role::user(), "3"),
+            text(Role::assistant(), "4"),
+        ];
+        // Without the option this keeps only [sys, "4"] — the task statement
+        // is gone and the model sees only the tail of the conversation.
+        let plain = compact(&messages, &Truncation::new(2), &ApproxTokenizer);
+        assert_eq!(plain.len(), 2);
+        assert_eq!(plain[1].text(), "4");
+
+        let out = compact(
+            &messages,
+            &Truncation::new(2).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out[0].role, Role::system());
+        assert_eq!(out[1].text(), "port the auth module to Rust");
+        assert_eq!(out[2].text(), "4");
+        // Protected messages are kept regardless of budget, so the result is
+        // allowed to exceed `max_messages` — as upstream documents.
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn preserve_first_user_survives_a_system_prefix_that_fills_the_budget() {
+        // The branch that returns early on a full system prefix used to skip
+        // the preservation entirely, which is the case the option matters
+        // most in: a small limit or a long system prefix is exactly when the
+        // opening request would otherwise be dropped.
+        let messages = vec![
+            text(Role::system(), "s1"),
+            text(Role::system(), "s2"),
+            text(Role::user(), "the ask"),
+            text(Role::assistant(), "a"),
+        ];
+        let out = compact(
+            &messages,
+            &Truncation::new(2).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].text(), "s1");
+        assert_eq!(out[1].text(), "s2");
+        assert_eq!(out[2].text(), "the ask");
+
+        // Without the option, this branch returns a system-only projection,
+        // which `ensure_non_system_message` then rescues by reinstating the
+        // *most recent* non-system turn — the assistant's reply, not the
+        // request it was replying to. That contrast is the whole point of the
+        // option: both results are three messages, but only one of them still
+        // contains the task.
+        let plain = compact(&messages, &Truncation::new(2), &ApproxTokenizer);
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain[2].text(), "a");
+    }
+
+    #[test]
+    fn preserve_first_user_does_not_duplicate_a_message_still_in_the_tail() {
+        let messages = vec![text(Role::user(), "the ask"), text(Role::assistant(), "ok")];
+        let out = compact(
+            &messages,
+            &Truncation::new(2).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text(), "the ask");
+        assert_eq!(out[1].text(), "ok");
+    }
+
+    #[test]
+    fn preserve_first_user_is_inert_without_a_user_message() {
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::assistant(), "1"),
+            text(Role::assistant(), "2"),
+            text(Role::assistant(), "3"),
+        ];
+        let out = compact(
+            &messages,
+            &Truncation::new(2).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, Role::system());
+        assert_eq!(out[1].text(), "3");
+    }
+
+    #[test]
+    fn preserve_first_user_picks_the_earliest_user_turn_not_any_later_one() {
+        let messages = vec![
+            text(Role::user(), "first"),
+            text(Role::assistant(), "a"),
+            text(Role::user(), "second"),
+            text(Role::assistant(), "b"),
+            text(Role::assistant(), "c"),
+        ];
+        let out = compact(
+            &messages,
+            &Truncation::new(1).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text(), "first");
+        assert_eq!(out[1].text(), "c");
+    }
+
+    #[test]
+    fn sliding_window_preserve_first_user_keeps_the_opening_request() {
+        let messages = vec![
+            text(Role::system(), "sys"),
+            text(Role::user(), "the ask"),
+            text(Role::assistant(), "a"),
+            text(Role::assistant(), "b"),
+        ];
+        let out = compact(
+            &messages,
+            &SlidingWindow::new(1).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role, Role::system());
+        assert_eq!(out[1].text(), "the ask");
+        assert_eq!(out[2].text(), "b");
+    }
+
+    #[test]
+    fn token_budget_preserve_first_user_keeps_the_opening_request() {
+        let messages = vec![
+            text(Role::user(), "the ask"),
+            text(Role::assistant(), "a"),
+            text(Role::assistant(), "b"),
+        ];
+        // Budget of 10 with 10 tokens per message admits exactly one message.
+        let out = compact(
+            &messages,
+            &TokenBudget::new(10).preserve_first_user(),
+            &FixedTokenizer(10),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text(), "the ask");
+        assert_eq!(out[1].text(), "b");
+    }
+
+    #[test]
+    fn preserve_first_user_defaults_off_on_every_strategy() {
+        // The option must never change behavior for existing callers.
+        let messages = vec![
+            text(Role::user(), "the ask"),
+            text(Role::assistant(), "a"),
+            text(Role::assistant(), "b"),
+        ];
+        assert!(!Truncation::new(1).preserve_first_user);
+        assert!(!SlidingWindow::new(1).preserve_first_user);
+        assert!(!TokenBudget::new(10).preserve_first_user);
+
+        let t = compact(&messages, &Truncation::new(1), &ApproxTokenizer);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].text(), "b");
+        let w = compact(&messages, &SlidingWindow::new(1), &ApproxTokenizer);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].text(), "b");
+        let b = compact(&messages, &TokenBudget::new(10), &FixedTokenizer(10));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].text(), "b");
+    }
+
+    // endregion
 
     #[test]
     fn truncation_preserves_leading_system_messages() {

@@ -362,6 +362,19 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         let mut buffered: Vec<Value> = Vec::new();
         for content in &msg.contents {
             match content {
+                // A refusal is its own output content part — `{"type":
+                // "refusal", "refusal": "..."}` — sitting beside `output_text`
+                // in an output message. Re-emitting it as `output_text` would
+                // replay a decline to the provider as an answer. Only
+                // meaningful on the assistant side: an *input* message's
+                // content list admits only input_text/input_image/input_file,
+                // so a refusal on any other role has no wire form and is
+                // dropped rather than mis-encoded.
+                Content::Text(t) if t.refusal => {
+                    if role == Role::ASSISTANT {
+                        buffered.push(json!({ "type": "refusal", "refusal": t.text }));
+                    }
+                }
                 Content::Text(t) => {
                     let text_type = if role == Role::ASSISTANT {
                         "output_text"
@@ -742,7 +755,9 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                         }
                         Some("refusal") => {
                             if let Some(text) = part.get("refusal").and_then(Value::as_str) {
-                                contents.push(Content::Text(TextContent::new(text)));
+                                // Marked, so `Message::text` withholds it
+                                // rather than presenting it as the answer.
+                                contents.push(Content::Text(TextContent::refusal(text)));
                             }
                         }
                         _ => {}
@@ -1166,6 +1181,24 @@ fn parse_responses_event(
             }
             EventOutcome::Update(ChatResponseUpdate {
                 contents: vec![Content::Text(TextContent::new(text))],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            })
+        }
+        // A refusal streams on its own channel. Only the incremental `.delta`
+        // is consumed: the terminal `response.refusal.done` repeats the whole
+        // refusal, which aggregation would append to the fragments already
+        // collected, doubling it — the same reason the text channel above
+        // does not consume its `.done`. Dropping these events entirely, as
+        // this parser used to, let a streamed decline reach the caller as an
+        // empty response.
+        "response.refusal.delta" => {
+            let text = value.get("delta").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                return EventOutcome::None;
+            }
+            EventOutcome::Update(ChatResponseUpdate {
+                contents: vec![Content::Text(TextContent::refusal(text))],
                 role: Some(Role::assistant()),
                 ..Default::default()
             })
@@ -2261,6 +2294,68 @@ mod tests {
     fn reasoning_event(value: Value) -> EventOutcome {
         let mut ids = HashMap::new();
         parse_responses_event(&value, &mut ids, None)
+    }
+
+    #[test]
+    fn a_replayed_refusal_becomes_a_refusal_content_part() {
+        // Beside `output_text` in an output message, a refusal has its own
+        // part type. Re-emitting it as `output_text` replays a decline to the
+        // provider as an answer.
+        let input = messages_to_input(&[Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::new("here is half")),
+                Content::Text(TextContent::refusal("I can't do the rest")),
+            ],
+        )]);
+        let content = &input[0]["content"];
+        assert_eq!(
+            content[0],
+            json!({"type": "output_text", "text": "here is half"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type": "refusal", "refusal": "I can't do the rest"})
+        );
+    }
+
+    #[test]
+    fn a_refusal_on_a_non_assistant_role_is_dropped_rather_than_mis_encoded() {
+        // An *input* message's content list admits only
+        // input_text/input_image/input_file — there is no refusal part — so
+        // emitting one would be rejected by the API. Dropping it is the only
+        // correct option, and it cannot arise from a parsed provider response
+        // anyway (refusals are assistant output).
+        let input = messages_to_input(&[Message::with_contents(
+            Role::user(),
+            vec![
+                Content::Text(TextContent::new("hello")),
+                Content::Text(TextContent::refusal("stray")),
+            ],
+        )]);
+        let content = &input[0]["content"];
+        assert_eq!(content.as_array().map(Vec::len), Some(1));
+        assert_eq!(content[0], json!({"type": "input_text", "text": "hello"}));
+    }
+
+    #[test]
+    fn a_streamed_refusal_is_marked_and_its_done_event_is_not_duplicated() {
+        // Before this, `response.refusal.delta` fell through the catch-all
+        // and a streamed decline reached the caller as an empty response —
+        // the non-streaming path marked refusals while the streaming path
+        // dropped them.
+        let EventOutcome::Update(delta) =
+            reasoning_event(json!({ "type": "response.refusal.delta", "delta": "I can't" }))
+        else {
+            panic!("expected update");
+        };
+        assert!(matches!(&delta.contents[0], Content::Text(t) if t.refusal && t.text == "I can't"));
+
+        // `.done` repeats the whole refusal; emitting it would double the
+        // text already streamed, exactly as for the text channel.
+        let done =
+            reasoning_event(json!({ "type": "response.refusal.done", "refusal": "I can't help" }));
+        assert!(matches!(done, EventOutcome::None));
     }
 
     #[test]

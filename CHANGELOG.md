@@ -5,6 +5,117 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Added
+
+- **Microsoft Entra ID authentication for `agent-framework-cosmos`.**
+  `CosmosChatMessageStore::with_token_credential` and
+  `CosmosCheckpointStorage::with_token_credential` take any
+  `agent_framework_azure::TokenCredential`, so a Cosmos store authenticates
+  with a managed identity, a workload identity, or the Azure CLI instead of a
+  master key — and a Cosmos account with `disableLocalAuth` set, which has no
+  key to give, becomes usable at all.
+  `CosmosChatMessageStore::from_state_with_token_credential` restores a
+  serialized store, since a credential cannot round-trip through a state blob
+  the way a key does. The token scope defaults to
+  `https://cosmos.azure.com/.default` — Cosmos DB's data-plane audience is
+  service-wide, not per account — and `AZURE_COSMOS_AAD_SCOPE_OVERRIDE`
+  overrides it, matching the official `azure-cosmos` SDK.
+
+  Note that Cosmos DB's Entra RBAC grants data-plane actions only:
+  `ensure_created` cannot succeed with a token whatever role the principal
+  holds, so the database and container must be provisioned out of band. The
+  call now says so rather than surfacing a bare `403`.
+
+- **`InMemoryVectorStore` validates vectors before scoring**: non-numeric
+  elements, wrong-width stored vectors, and non-finite values are skipped
+  rather than reshaped or ranked, and a non-finite query vector is rejected
+  outright (it would score every record identically and produce a score that
+  cannot serialize as JSON).
+
+- **Vector-store abstractions** (`agent_framework_core::vectors`):
+  `VectorStoreField`, `VectorStoreCollectionDefinition`, `IndexKind`,
+  `DistanceFunction`, `VectorSearchOptions`, `VectorSearchResult`, the
+  object-safe `VectorCollection` and `VectorStore` traits, and an
+  `InMemoryVectorStore`. Records are `serde_json::Value` objects keyed by
+  field name; a definition maps logical names to storage names. No provider
+  crate implements the traits yet.
+
+- **`preserve_first_user()`** on the `Truncation`, `SlidingWindow` and
+  `TokenBudget` compaction strategies: retain the earliest user message
+  whatever the budget, so a long conversation cannot lose the request it is
+  about. Off by default; a preserved message is kept regardless of budget, so
+  the result may exceed the configured limit by one.
+
+- **`FunctionCallContent::id`**, a framework-generated occurrence id
+  (`af-call-<uuid>`) minted when a call is deferred for approval, plus
+  `ensure_occurrence_id()` and `same_invocation()`. Approvals now bind to a
+  specific occurrence rather than to the provider `call_id`, which providers
+  reuse.
+
+- **`TextContent::refusal`** and `TextContent::refusal(..)`, plus
+  `Message::has_refusal()` / `Message::refusal_text()`.
+
+### Fixed
+
+- **Provider refusals no longer read as answers.** An OpenAI refusal was
+  parsed into plain text, so `Message::text()` returned it as though the model
+  had answered and `parse_json` would try to parse it as the requested output.
+  Refusal text is now marked, `Message::text()` returns `""` when one is
+  present, and streamed coalescing keeps refusal and ordinary text in separate
+  content items. The Chat Completions parser also used to emit a refusal only
+  when there was no content, hiding a model that answered part of a request
+  and declined part; both are now kept. Streamed refusals are parsed too
+  (`delta.refusal` on Chat Completions, `response.refusal.delta` on
+  Responses) — they were dropped outright, so a streamed decline reached the
+  caller as an empty response. And `structured_output_text` withholds a
+  refused turn, so `parse_json` / `value` cannot be populated from a refusal
+  (nor fall back to an older turn's JSON and serve it as this run's answer).
+  The guard is applied at the response level too — `ChatResponse::text`,
+  `AgentResponse::text` and both streaming updates — because a tool loop
+  accumulates earlier assistant turns, so blanking only the refusing message
+  still handed back an intermediate aside as the final answer.
+  `has_refusal()` / `refusal_text()` are available on each. The **outbound**
+  path preserves the marker too: replaying a refusal as history now uses the
+  assistant message's own `refusal` field (Chat Completions) and a
+  `{"type": "refusal"}` output content part (Responses), instead of folding
+  it into ordinary content and telling the provider the assistant answered.
+
+- **Two approvals pending under one provider `call_id` are no longer
+  conflated.** They were matched structurally, so a second pending approval
+  for the same call looked like a replay and was dropped, and one result
+  answered both. Occurrence ids now decide identity when present, with the
+  structural rule as a fallback so approvals stored before this keep
+  resolving.
+
+- **Purview asks for inline evaluation.** Every `processContent` request now
+  carries `Prefer: evaluateInline`. Without it the service may evaluate
+  content offline and return no actionable verdict, which would leave the
+  blocking middleware with nothing to decide on — enforcement would quietly
+  become a no-op rather than fail.
+
+- **A token count reported as zero is no longer dropped from the OpenAI usage
+  breakdown.** `parse_usage` skipped any `completion_tokens_details.*` /
+  `prompt_tokens_details.*` value equal to `0`, mirroring a truthiness bug in
+  upstream's Python (since fixed there), so a provider reporting zero audio,
+  accepted-prediction, rejected-prediction or cached tokens produced no entry
+  at all — indistinguishable from a provider that does not report that count.
+  Both now appear as `Some(0)` and `None` respectively in
+  `UsageDetails::additional_counts`, which is what the GenAI metrics layer
+  reads. Non-integer values are still ignored. The Responses path and the
+  typed fields (`reasoning_output_token_count`, `cache_read_input_token_count`)
+  were already correct, so this also removes a silent disagreement between the
+  two paths about the same response.
+
+### Changed
+
+- `CosmosChatMessageStore::serialize` omits `key` and emits
+  `"auth": "token_credential"` for a credential-authenticated store (a
+  master-key store's state is unchanged). `from_state` on such a blob now
+  returns an error naming `from_state_with_token_credential` rather than
+  reporting a missing field.
+
 ## [0.5.0] — 2026-08-31
 
 Embeddings for two more providers, and a Gemini finish-reason fix.

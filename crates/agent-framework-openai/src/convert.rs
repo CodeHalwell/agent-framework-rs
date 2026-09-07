@@ -91,8 +91,19 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut tool_results: Vec<&FunctionResultContent> = Vec::new();
 
+        // Refusal text replayed as history: the assistant message object
+        // carries it in its own `refusal` field, not in `content`. Folding it
+        // into `content` presents a decline to the provider as a successful
+        // answer on the next turn, which is the distinction the marker exists
+        // to keep. Verified against the API's assistant-message request
+        // schema, which declares `refusal: Optional[str]`.
+        let mut refusal = String::new();
+
         for content in &msg.contents {
             match content {
+                Content::Text(t) if t.refusal => {
+                    refusal.push_str(&t.text);
+                }
                 Content::Text(t) => {
                     text.push_str(&t.text);
                     parts.push(json!({ "type": "text", "text": t.text }));
@@ -138,6 +149,9 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
             obj.insert("content".into(), Value::Array(parts));
         } else if !text.is_empty() || tool_calls.is_empty() {
             obj.insert("content".into(), json!(text));
+        }
+        if !refusal.is_empty() {
+            obj.insert("refusal".into(), json!(refusal));
         }
         if let Some(name) = msg.author_name.as_deref().and_then(sanitize_author_name) {
             obj.insert("name".into(), json!(name));
@@ -332,20 +346,20 @@ pub fn parse_response(value: &Value) -> ChatResponse {
     {
         let mut contents: Vec<Content> = Vec::new();
         if let Some(msg) = choice.get("message") {
-            let mut has_text = false;
             if let Some(text) = msg.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
                     contents.push(Content::Text(TextContent::new(text)));
-                    has_text = true;
                 }
             }
-            // A refusal is surfaced as plain text (mirrors upstream
-            // `_parse_text_from_choice`), used only when there is no content.
-            if !has_text {
-                if let Some(refusal) = msg.get("refusal").and_then(Value::as_str) {
-                    if !refusal.is_empty() {
-                        contents.push(Content::Text(TextContent::new(refusal)));
-                    }
+            // A refusal is surfaced as text *marked as a refusal*, so it can
+            // never be mistaken for the answer (mirrors upstream #7992). It is
+            // emitted whether or not ordinary content is present: the two are
+            // separate content items, and dropping the refusal when content
+            // happens to accompany it would hide the fact that the model
+            // declined part of what was asked.
+            if let Some(refusal) = msg.get("refusal").and_then(Value::as_str) {
+                if !refusal.is_empty() {
+                    contents.push(Content::Text(TextContent::refusal(refusal)));
                 }
             }
             if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
@@ -448,14 +462,19 @@ pub fn parse_usage(usage: &Value) -> UsageDetails {
     details
 }
 
-/// Copy a positive token count from `obj[src]` into `details.additional_counts`
-/// under `dest`. Zero/absent counts are skipped, mirroring upstream's truthy
-/// `if tokens := ...` guard.
+/// Copy a reported token count from `obj[src]` into `details.additional_counts`
+/// under `dest`. An absent (or non-integer) count is skipped; a **reported zero
+/// is recorded**, because "the model used none of this" and "the provider did
+/// not report this" are different facts and `additional_counts` can only say
+/// the second by omission.
+///
+/// This used to skip zeros, mirroring upstream's truthy `if tokens := ...`
+/// guard — Python's walrus is falsy for `0`, so a reported zero vanished.
+/// Upstream fixed that to `is not None` (#7964); the port had inherited the
+/// bug, test included.
 fn add_usage_detail(details: &mut UsageDetails, obj: &Value, src: &str, dest: &str) {
     if let Some(v) = obj.get(src).and_then(Value::as_u64) {
-        if v > 0 {
-            details.additional_counts.insert(dest.to_string(), v);
-        }
+        details.additional_counts.insert(dest.to_string(), v);
     }
 }
 
@@ -868,7 +887,35 @@ mod tests {
     // region: response parsing
 
     #[test]
-    fn refusal_is_parsed_as_text() {
+    fn a_replayed_refusal_uses_the_assistant_refusal_field_not_content() {
+        // Replaying a refusal as ordinary `content` tells the provider the
+        // assistant answered, on every subsequent turn — the exact
+        // distinction the marker exists to preserve. The API's assistant
+        // message object has its own `refusal` field for this.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::new("here is half")),
+                Content::Text(TextContent::refusal("I can't do the rest")),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        assert_eq!(wire[0]["content"], json!("here is half"));
+        assert_eq!(wire[0]["refusal"], json!("I can't do the rest"));
+    }
+
+    #[test]
+    fn a_message_without_a_refusal_carries_no_refusal_field() {
+        let wire = messages_to_openai(&[Message::assistant("the answer")]);
+        assert_eq!(wire[0]["content"], json!("the answer"));
+        assert!(
+            wire[0].get("refusal").is_none(),
+            "an ordinary turn must not grow a refusal field"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_marked_and_withheld_from_text() {
         let value = json!({
             "id": "chatcmpl-1",
             "model": "gpt-4o",
@@ -878,17 +925,74 @@ mod tests {
             }],
         });
         let resp = parse_response(&value);
-        assert_eq!(resp.text(), "I can't help with that.");
+
+        // The refusal must not read as the answer: a caller doing
+        // `resp.text()` (or parse_json over it) would otherwise treat the
+        // model's decline as the output it asked for.
+        assert_eq!(resp.text(), "");
+
+        let message = &resp.messages[0];
+        assert!(message.has_refusal());
+        assert_eq!(
+            message.refusal_text().as_deref(),
+            Some("I can't help with that.")
+        );
+        // Still carried as content, so nothing is lost — only reclassified.
+        assert!(matches!(
+            &message.contents[0],
+            Content::Text(t) if t.refusal && t.text == "I can't help with that."
+        ));
     }
 
     #[test]
-    fn content_takes_precedence_over_refusal() {
+    fn a_refusal_alongside_content_is_kept_rather_than_dropped() {
+        // Both halves are real: the model answered part of the request and
+        // declined part of it. Returning only the content would hide the
+        // decline; returning only the refusal would lose the answer.
         let value = json!({
             "choices": [{
                 "message": { "role": "assistant", "content": "answer", "refusal": "nope" },
             }],
         });
         let resp = parse_response(&value);
+        let message = &resp.messages[0];
+
+        assert!(message.has_refusal());
+        assert_eq!(message.refusal_text().as_deref(), Some("nope"));
+        // `text()` is withheld whenever a refusal is present, so a caller
+        // cannot silently consume a partial answer as a complete one.
+        assert_eq!(resp.text(), "");
+        let texts: Vec<&str> = message
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["answer", "nope"]);
+    }
+
+    #[test]
+    fn an_empty_refusal_field_marks_nothing() {
+        let value = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "answer", "refusal": "" },
+            }],
+        });
+        let resp = parse_response(&value);
+        assert!(!resp.messages[0].has_refusal());
+        assert_eq!(resp.text(), "answer");
+    }
+
+    #[test]
+    fn ordinary_text_is_never_marked_as_a_refusal() {
+        let value = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "answer" } }],
+        });
+        let resp = parse_response(&value);
+        assert!(!resp.messages[0].has_refusal());
+        assert_eq!(resp.messages[0].refusal_text(), None);
         assert_eq!(resp.text(), "answer");
     }
 
@@ -919,12 +1023,67 @@ mod tests {
                 .get("completion/accepted_prediction_tokens"),
             Some(&3)
         );
-        // Zero-valued counts are skipped (truthy guard).
-        assert!(!d
-            .additional_counts
-            .contains_key("completion/rejected_prediction_tokens"));
+        // A reported zero is a reported count, not an absent one.
+        assert_eq!(
+            d.additional_counts
+                .get("completion/rejected_prediction_tokens"),
+            Some(&0)
+        );
         assert_eq!(d.additional_counts.get("prompt/cached_tokens"), Some(&40));
         assert_eq!(d.additional_counts.get("prompt/audio_tokens"), Some(&2));
+    }
+
+    #[test]
+    fn reported_zero_token_counts_are_kept_and_absent_ones_omitted() {
+        // The distinction this pins: a provider reporting `0` is saying the
+        // model used none of that budget, which is not the same as a provider
+        // that does not break the count out at all. `additional_counts` has no
+        // way to express the second except by omission, so conflating them
+        // loses the first.
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "completion_tokens_details": {
+                "audio_tokens": 0,
+                "reasoning_tokens": 0,
+                // accepted_prediction_tokens deliberately absent
+            },
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        });
+        let d = parse_usage(&usage);
+
+        assert_eq!(d.additional_counts.get("completion/audio_tokens"), Some(&0));
+        assert_eq!(
+            d.additional_counts.get("completion/reasoning_tokens"),
+            Some(&0)
+        );
+        assert_eq!(d.additional_counts.get("prompt/cached_tokens"), Some(&0));
+        assert!(!d
+            .additional_counts
+            .contains_key("completion/accepted_prediction_tokens"));
+
+        // The typed fields never had the truthy guard, so a zero already
+        // survived there; asserting it keeps the two paths agreeing.
+        assert_eq!(d.reasoning_output_token_count, Some(0));
+        assert_eq!(d.cache_read_input_token_count, Some(0));
+    }
+
+    #[test]
+    fn non_integer_usage_details_are_still_ignored() {
+        // Dropping the `> 0` guard must not widen what counts as a count: a
+        // string or float is still not a token count.
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens_details": { "audio_tokens": "12", "reasoning_tokens": 1.5 },
+            "prompt_tokens_details": { "cached_tokens": null },
+        });
+        let d = parse_usage(&usage);
+        assert!(!d.additional_counts.contains_key("completion/audio_tokens"));
+        assert!(!d
+            .additional_counts
+            .contains_key("completion/reasoning_tokens"));
+        assert!(!d.additional_counts.contains_key("prompt/cached_tokens"));
     }
 
     // endregion

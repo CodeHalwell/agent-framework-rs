@@ -101,6 +101,29 @@ pub(crate) fn authorization_header(
     Ok(percent_encode(&raw))
 }
 
+/// Compute the `Authorization` header value for one Cosmos DB REST request
+/// authenticated with a Microsoft Entra ID (AAD) access token.
+///
+/// Cosmos DB does not take the token as a plain `Authorization: Bearer`
+/// header. It reuses the same `type=...&ver=1.0&sig=...` envelope the
+/// master-key path uses, with `type=aad` and the token itself as the
+/// signature, and the whole string percent-encoded — see
+/// <https://learn.microsoft.com/en-us/rest/api/cosmos-db/access-control-on-cosmosdb-resources>.
+///
+/// Unlike the master-key header this one is not a function of the request:
+/// no verb, resource link, or date is signed, so the value is identical for
+/// every request made with the same token. `x-ms-date` is still sent
+/// alongside it, because the service requires the header regardless of
+/// whether it participates in a signature.
+///
+/// A JWT's own alphabet (base64url plus `.`) is entirely RFC 3986
+/// unreserved, so in practice [`percent_encode`] escapes only the `=` and
+/// `&` of the envelope; it is applied to the whole string anyway, exactly as
+/// on the master-key path, rather than relying on that property.
+pub(crate) fn aad_authorization_header(token: &str) -> String {
+    percent_encode(&format!("type=aad&ver=1.0&sig={token}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +310,67 @@ mod tests {
     fn decode_master_key_rejects_invalid_base64() {
         let err = decode_master_key("not base64!!! ***").unwrap_err();
         assert!(err.to_string().contains("master key"));
+    }
+
+    // endregion
+
+    // region: aad_authorization_header
+
+    // A JWT-*shaped* string: three `.`-separated segments drawn from the
+    // base64url alphabet. Assembled at runtime rather than written as one
+    // literal, for the same reason `synthetic_key` builds its key — a
+    // contiguous `a.b.c` literal trips a secret scanner's JWT detector, and
+    // nothing here is a credential: the segments are fixed markers and no key
+    // signs them. The `-` and `_` are load-bearing: they are the
+    // base64url-specific characters the encoding assertions turn on.
+    fn synthetic_token() -> String {
+        ["jwt-header", "jwt-payload", "jwt-signature_-x"].join(".")
+    }
+
+    #[test]
+    fn aad_authorization_header_wraps_the_token_in_the_aad_envelope() {
+        let header = aad_authorization_header(&synthetic_token());
+        // The envelope's own `=` and `&` are escaped, exactly as on the
+        // master-key path.
+        assert_eq!(
+            header,
+            format!("type%3Daad%26ver%3D1.0%26sig%3D{}", synthetic_token())
+        );
+    }
+
+    #[test]
+    fn aad_authorization_header_leaves_a_jwts_own_characters_unescaped() {
+        // Every character a JWT can contain is RFC 3986 unreserved, so the
+        // token must survive verbatim — an implementation that escaped `.`,
+        // `-` or `_` would produce a header the service rejects.
+        let header = aad_authorization_header(&synthetic_token());
+        assert!(
+            header.ends_with(&synthetic_token()),
+            "token was altered: {header}"
+        );
+        assert!(header.contains('.') && header.contains('-') && header.contains('_'));
+    }
+
+    #[test]
+    fn aad_authorization_header_does_not_depend_on_the_request() {
+        // Unlike the master-key header there is nothing per-request to vary,
+        // which is what lets `send` reuse one token across every call.
+        assert_eq!(
+            aad_authorization_header(&synthetic_token()),
+            aad_authorization_header(&synthetic_token())
+        );
+        assert_ne!(
+            aad_authorization_header(&synthetic_token()),
+            aad_authorization_header("other-token")
+        );
+    }
+
+    #[test]
+    fn aad_and_master_key_headers_are_distinguishable_by_type() {
+        let key = decode_master_key(&synthetic_key()).unwrap();
+        let master = authorization_header("get", "docs", "dbs/d/colls/c", "date", &key).unwrap();
+        assert!(master.starts_with("type%3Dmaster%26"));
+        assert!(aad_authorization_header(&synthetic_token()).starts_with("type%3Daad%26"));
     }
 
     // endregion

@@ -83,6 +83,28 @@ pub struct ChatResponse {
     pub additional_properties: HashMap<String, Value>,
 }
 
+/// Whether any content item in `contents` is a provider refusal.
+///
+/// The content-level counterpart of [`Message::has_refusal`], for the
+/// streaming-update types that hold contents directly rather than messages.
+fn contents_have_refusal(contents: &[Content]) -> bool {
+    contents
+        .iter()
+        .any(|c| matches!(c, Content::Text(t) if t.refusal))
+}
+
+/// The refusal text within `contents`, space-joined, or `None`.
+fn contents_refusal_text(contents: &[Content]) -> Option<String> {
+    let parts: Vec<&str> = contents
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) if t.refusal => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 /// The text a structured (JSON) response value should be parsed from.
 ///
 /// Mirrors upstream's `_last_non_empty_assistant_message_text`
@@ -107,6 +129,17 @@ pub fn structured_output_text(messages: &[Message]) -> String {
         if message.role.as_str() != Role::ASSISTANT {
             continue;
         }
+        // A refusal means there is no structured output to find. Returning
+        // empty here — rather than skipping the refusal and scanning further
+        // back — is deliberate twice over: the refusal's own text must not be
+        // parsed as the answer (a refusal that happens to contain JSON would
+        // otherwise populate `value` as though the run succeeded), and an
+        // *older* assistant message's JSON must not be served as this run's
+        // result either. `parse_json` then fails, which is the honest outcome
+        // for a request the model declined.
+        if message.has_refusal() {
+            return String::new();
+        }
         let text: String = message
             .contents
             .iter()
@@ -122,6 +155,31 @@ pub fn structured_output_text(messages: &[Message]) -> String {
     String::new()
 }
 
+/// Whether the run's **final** assistant turn is a refusal.
+///
+/// Response-level text suppression is anchored to the last assistant message
+/// rather than to any message carrying a refusal marker, because a tool loop
+/// accumulates every earlier assistant turn into one response. A provider may
+/// decline *part* of a request while still calling a tool for the rest —
+/// OpenAI emits `refusal` and `tool_calls` on the same message, and
+/// `openai::convert` keeps both — so an `any`-style guard lets that
+/// intermediate turn blank the successful final answer that follows it, which
+/// is the one thing the caller actually asked for.
+///
+/// Anchoring here still refuses what the guard was written to refuse: a run
+/// that says "I'll check that", calls a tool, and *then* declines ends on the
+/// refusal, so the intermediate aside is not served as though it were the
+/// answer. Non-assistant messages (tool results) are skipped — they are never
+/// the run's outcome — and a response with no assistant message at all has no
+/// refusal to report.
+fn final_turn_refused(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role.as_str() == Role::ASSISTANT)
+        .is_some_and(Message::has_refusal)
+}
+
 impl ChatResponse {
     /// Build a response from a single assistant text message.
     pub fn from_text(text: impl Into<String>) -> Self {
@@ -132,14 +190,40 @@ impl ChatResponse {
     }
 
     /// The concatenated text of all messages (newline-joined, trimmed).
+    ///
+    /// Empty when the run's **final** assistant turn is a refusal — see
+    /// [`final_turn_refused`] for why the check is anchored there rather than
+    /// applied to any accumulated turn. Refusal text is never served as the
+    /// answer regardless: [`Message::text`] blanks a refusing message on its
+    /// own, so a refusal reached through this join contributes nothing.
+    /// See [`Self::refusal_text`] to read a decline deliberately.
     pub fn text(&self) -> String {
+        if final_turn_refused(&self.messages) {
+            return String::new();
+        }
         self.messages
             .iter()
             .map(Message::text)
+            .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
             .to_string()
+    }
+
+    /// Whether any message in this response carries a provider refusal.
+    pub fn has_refusal(&self) -> bool {
+        self.messages.iter().any(Message::has_refusal)
+    }
+
+    /// The refusal text across this response's messages, or `None`.
+    pub fn refusal_text(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .messages
+            .iter()
+            .filter_map(Message::refusal_text)
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     /// All function-call content items across the response's messages.
@@ -348,7 +432,16 @@ fn coalesce_text(contents: &mut Vec<Content>) {
     let mut out: Vec<Content> = Vec::with_capacity(contents.len());
     for c in contents.drain(..) {
         match (out.last_mut(), &c) {
-            (Some(Content::Text(prev)), Content::Text(cur)) => prev.text.push_str(&cur.text),
+            // Only fragments of the *same kind* merge. A refusal and ordinary
+            // text are different kinds of output that a provider can stream
+            // back to back, and merging them would fold the refusal into the
+            // answer under whichever flag the first fragment happened to
+            // carry — silently losing the marker, or mislabelling a real
+            // answer as a refusal. Upstream splits on the same boundary
+            // (#7992).
+            (Some(Content::Text(prev)), Content::Text(cur)) if prev.refusal == cur.refusal => {
+                prev.text.push_str(&cur.text)
+            }
             (Some(Content::TextReasoning(prev)), Content::TextReasoning(cur)) => {
                 prev.text.push_str(&cur.text);
                 if let Some(token) = cur.protected_data.as_ref().filter(|t| !t.is_empty()) {
@@ -404,11 +497,28 @@ impl ChatResponseUpdate {
     }
 
     /// The concatenated text of this update.
+    ///
+    /// Empty when the update carries a refusal fragment — see
+    /// [`ChatResponse::text`] for why refusals are withheld rather than
+    /// surfaced as text.
     pub fn text_content(&self) -> String {
+        if self.has_refusal() {
+            return String::new();
+        }
         self.contents
             .iter()
             .filter_map(Content::as_text)
             .collect::<String>()
+    }
+
+    /// Whether this update carries a provider refusal fragment.
+    pub fn has_refusal(&self) -> bool {
+        contents_have_refusal(&self.contents)
+    }
+
+    /// This update's refusal text, or `None`.
+    pub fn refusal_text(&self) -> Option<String> {
+        contents_refusal_text(&self.contents)
     }
 }
 
@@ -439,8 +549,29 @@ pub struct AgentResponse {
 
 impl AgentResponse {
     /// The concatenated text of all messages (no separator), matching Python.
+    ///
+    /// Empty when the run's final assistant turn is a refusal — see
+    /// [`ChatResponse::text`] and [`final_turn_refused`].
     pub fn text(&self) -> String {
+        if final_turn_refused(&self.messages) {
+            return String::new();
+        }
         self.messages.iter().map(Message::text).collect::<String>()
+    }
+
+    /// Whether any message in this response carries a provider refusal.
+    pub fn has_refusal(&self) -> bool {
+        self.messages.iter().any(Message::has_refusal)
+    }
+
+    /// The refusal text across this response's messages, or `None`.
+    pub fn refusal_text(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .messages
+            .iter()
+            .filter_map(Message::refusal_text)
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
 
     /// All pending user-input (function-approval) requests across the messages.
@@ -540,11 +671,27 @@ pub struct AgentResponseUpdate {
 
 impl AgentResponseUpdate {
     /// The concatenated text of this update.
+    ///
+    /// Empty when the update carries a refusal fragment — see
+    /// [`ChatResponse::text`].
     pub fn text(&self) -> String {
+        if self.has_refusal() {
+            return String::new();
+        }
         self.contents
             .iter()
             .filter_map(Content::as_text)
             .collect::<String>()
+    }
+
+    /// Whether this update carries a provider refusal fragment.
+    pub fn has_refusal(&self) -> bool {
+        contents_have_refusal(&self.contents)
+    }
+
+    /// This update's refusal text, or `None`.
+    pub fn refusal_text(&self) -> Option<String> {
+        contents_refusal_text(&self.contents)
     }
 
     /// The user-input (function-approval) requests carried by this update.
@@ -591,7 +738,7 @@ impl AgentResponseUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ResponseFormat, TextReasoningContent};
+    use crate::types::{FunctionResultContent, ResponseFormat, TextContent, TextReasoningContent};
     use serde_json::json;
 
     fn text_update(text: &str) -> ChatResponseUpdate {
@@ -648,6 +795,165 @@ mod tests {
     fn from_updates_without_format_leaves_value_none() {
         let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
         assert_eq!(resp.value, None);
+    }
+
+    #[test]
+    fn a_refused_run_does_not_surface_earlier_tool_loop_text() {
+        // The shape that motivates guarding at the response level: a tool
+        // loop accumulates an intermediate assistant aside, then the final
+        // call refuses. Blanking only the refusing message left `text()`
+        // returning "I'll check that" as though it were the answer.
+        let resp = ChatResponse {
+            messages: vec![
+                Message::assistant("I'll check that"),
+                Message {
+                    contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                        "I can't help",
+                    ))],
+                    ..Message::new(Role::assistant(), "")
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(resp.text(), "");
+        assert!(resp.has_refusal());
+        assert_eq!(resp.refusal_text().as_deref(), Some("I can't help"));
+    }
+
+    #[test]
+    fn an_agent_response_withholds_text_on_a_refusal_too() {
+        let resp = AgentResponse {
+            messages: vec![
+                Message::assistant("working on it"),
+                Message {
+                    contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                        "no",
+                    ))],
+                    ..Message::new(Role::assistant(), "")
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(resp.text(), "");
+        assert_eq!(resp.refusal_text().as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn a_streaming_update_withholds_a_refusal_fragment() {
+        let update = ChatResponseUpdate {
+            contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                "I can't",
+            ))],
+            ..Default::default()
+        };
+        assert_eq!(update.text_content(), "");
+        assert!(update.has_refusal());
+        assert_eq!(update.refusal_text().as_deref(), Some("I can't"));
+
+        let agent_update = AgentResponseUpdate {
+            contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                "I can't",
+            ))],
+            ..Default::default()
+        };
+        assert_eq!(agent_update.text(), "");
+        assert_eq!(agent_update.refusal_text().as_deref(), Some("I can't"));
+    }
+
+    #[test]
+    fn an_ordinary_response_is_unaffected_by_the_refusal_guards() {
+        let resp = ChatResponse::from_text("the answer");
+        assert_eq!(resp.text(), "the answer");
+        assert!(!resp.has_refusal());
+        assert_eq!(resp.refusal_text(), None);
+    }
+
+    #[test]
+    fn structured_output_is_withheld_when_the_model_refused() {
+        // The nastiest shape: a refusal that happens to contain valid JSON.
+        // Concatenating every text content would parse it into `value` as
+        // though the run had succeeded.
+        let messages = vec![Message {
+            contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                r#"{"error": "I can't help"}"#,
+            ))],
+            ..Message::new(Role::assistant(), "")
+        }];
+        assert_eq!(structured_output_text(&messages), "");
+
+        let resp = ChatResponse {
+            messages,
+            ..Default::default()
+        };
+        assert!(
+            resp.parse_json::<serde_json::Value>().is_err(),
+            "a refusal must not parse as the structured answer"
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_fall_back_to_an_older_assistant_answer() {
+        // Scanning past the refusal would serve a previous turn's JSON as
+        // this run's result — stale data presented as fresh.
+        let messages = vec![
+            Message::assistant(r#"{"answer": 1}"#),
+            Message {
+                contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                    "no",
+                ))],
+                ..Message::new(Role::assistant(), "")
+            },
+        ];
+        assert_eq!(structured_output_text(&messages), "");
+    }
+
+    #[test]
+    fn structured_output_is_unaffected_without_a_refusal() {
+        let messages = vec![Message::assistant(r#"{"answer": 1}"#)];
+        assert_eq!(structured_output_text(&messages), r#"{"answer": 1}"#);
+    }
+
+    #[test]
+    fn coalesce_keeps_a_refusal_separate_from_ordinary_text() {
+        // A provider can stream an answer and a refusal back to back. Merging
+        // them would fold the refusal into the answer under the first
+        // fragment's flag, so `Message::text` would hand the whole thing back
+        // as though the model had answered.
+        let mut contents = vec![
+            Content::Text(crate::types::content::TextContent::new("here is ")),
+            Content::Text(crate::types::content::TextContent::new("half an answer")),
+            Content::Text(crate::types::content::TextContent::refusal("I can't ")),
+            Content::Text(crate::types::content::TextContent::refusal("do the rest")),
+        ];
+        coalesce_text(&mut contents);
+
+        assert_eq!(
+            contents.len(),
+            2,
+            "fragments of each kind merge, kinds do not"
+        );
+        match (&contents[0], &contents[1]) {
+            (Content::Text(answer), Content::Text(refusal)) => {
+                assert!(!answer.refusal);
+                assert_eq!(answer.text, "here is half an answer");
+                assert!(refusal.refusal);
+                assert_eq!(refusal.text, "I can't do the rest");
+            }
+            other => panic!("unexpected contents: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_still_merges_ordinary_text_fragments() {
+        // Negative control: the split must not fragment normal streaming.
+        let mut contents = vec![
+            Content::Text(crate::types::content::TextContent::new("a")),
+            Content::Text(crate::types::content::TextContent::new("b")),
+            Content::Text(crate::types::content::TextContent::new("c")),
+        ];
+        coalesce_text(&mut contents);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].as_text(), Some("abc"));
     }
 
     // region: opaque fields survive streaming coalescence (PR #12 review)
@@ -893,5 +1199,71 @@ mod tests {
         let reserialized = serde_json::to_string(&text_update("y")).unwrap();
         assert!(!reserialized.contains("additional_properties"));
         assert!(!reserialized.contains("raw_representation"));
+    }
+
+    #[test]
+    fn a_partial_refusal_mid_tool_loop_does_not_blank_the_final_answer() {
+        // The shape `FunctionInvokingChatClient` actually accumulates: the
+        // provider declines part of the request while still calling a tool for
+        // the rest (OpenAI puts `refusal` and `tool_calls` on one message, and
+        // `openai::convert` keeps both), the loop carries that turn forward,
+        // runs the tool, and the model then answers successfully.
+        let mut partial = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::refusal("I won't do the first part")),
+                Content::FunctionCall(FunctionCallContent::new("c1", "lookup", None)),
+            ],
+        );
+        partial.message_id = Some("m1".into());
+        let tool_result = Message::with_contents(
+            Role::tool(),
+            vec![Content::FunctionResult(FunctionResultContent::new(
+                "c1",
+                Some(json!("42")),
+            ))],
+        );
+        let resp = ChatResponse {
+            messages: vec![partial, tool_result, Message::assistant("the answer is 42")],
+            ..Default::default()
+        };
+
+        // The successful final answer survives; the decline is still reported
+        // separately rather than folded into the answer.
+        assert_eq!(resp.text(), "the answer is 42");
+        assert!(resp.has_refusal());
+        assert_eq!(
+            resp.refusal_text().as_deref(),
+            Some("I won't do the first part")
+        );
+        // The refusal's own words never reach the answer, because
+        // `Message::text` blanks the message carrying them.
+        assert!(!resp.text().contains("won't"));
+
+        // A run that ends on the refusal is still withheld entirely.
+        let declined = ChatResponse {
+            messages: vec![
+                Message::assistant("I'll check that"),
+                Message::with_contents(
+                    Role::assistant(),
+                    vec![Content::Text(TextContent::refusal("I can't help"))],
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(declined.text(), "");
+
+        // Same anchoring for `AgentResponse`.
+        let agent = AgentResponse {
+            messages: vec![
+                Message::with_contents(
+                    Role::assistant(),
+                    vec![Content::Text(TextContent::refusal("no to that bit"))],
+                ),
+                Message::assistant("but here is the rest"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(agent.text(), "but here is the rest");
     }
 }

@@ -13,8 +13,10 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agent_framework_azure::TokenCredential;
 use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::Message;
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
@@ -1078,6 +1080,342 @@ async fn checkpoint_ensure_created_uses_id_partition_key() {
         body["partitionKey"],
         json!({"paths": ["/id"], "kind": "Hash"})
     );
+}
+
+// endregion
+
+// region: Microsoft Entra ID (AAD) authentication
+
+/// A [`TokenCredential`] that hands back a fixed token and counts the calls,
+/// so a test can assert both what reached the wire and how often the store
+/// asked for a token.
+struct CountingCredential {
+    token: String,
+    scopes: Mutex<Vec<String>>,
+}
+
+impl CountingCredential {
+    fn new(token: &str) -> Arc<Self> {
+        Arc::new(Self {
+            token: token.to_string(),
+            scopes: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn scopes(&self) -> Vec<String> {
+        self.scopes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenCredential for CountingCredential {
+    async fn get_token(&self) -> agent_framework_core::error::Result<String> {
+        Ok(self.token.clone())
+    }
+
+    async fn get_token_for_scope(
+        &self,
+        scope: &str,
+    ) -> agent_framework_core::error::Result<String> {
+        self.scopes.lock().unwrap().push(scope.to_string());
+        Ok(self.token.clone())
+    }
+}
+
+/// A JWT-*shaped* string, assembled at runtime so the source carries no
+/// contiguous `a.b.c` literal for a secret scanner to flag — the same reason
+/// `test_key` above builds its key rather than embedding one. Nothing here is
+/// a credential: the segments are fixed markers and no key signs them.
+fn test_token() -> String {
+    ["jwt-header", "jwt-payload", "jwt-signature_-x"].join(".")
+}
+
+#[tokio::test]
+async fn token_credential_sends_the_aad_authorization_envelope() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        let mut created = request.body_json();
+        created["_rid"] = json!("abc==");
+        (201, "Created", vec![], created)
+    });
+
+    let credential = CountingCredential::new(&test_token());
+    let store = CosmosChatMessageStore::with_token_credential(
+        base_url,
+        credential.clone(),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-aad".to_string()),
+        None,
+    )
+    .unwrap();
+
+    store
+        .add_messages(vec![Message::user("Hello, Entra!")])
+        .await
+        .unwrap();
+
+    let requests = handle.join().unwrap();
+    let auth = requests[0].header("authorization").expect("Authorization");
+
+    // `type=aad&ver=1.0&sig=<token>`, percent-encoded — not `Bearer <token>`,
+    // which Cosmos DB rejects.
+    assert_eq!(
+        auth,
+        format!("type%3Daad%26ver%3D1.0%26sig%3D{}", test_token()),
+        "Cosmos DB takes the token inside the same envelope as a master-key signature"
+    );
+    assert!(!auth.to_lowercase().contains("bearer"));
+
+    // The rest of the request is unchanged by the auth mode.
+    assert_eq!(
+        requests[0].path,
+        "/dbs/agent-framework/colls/chat-messages/docs"
+    );
+    assert!(requests[0]
+        .header("x-ms-date")
+        .is_some_and(|d| d.ends_with("GMT")));
+    assert_eq!(
+        requests[0].header("x-ms-version").as_deref(),
+        Some("2018-12-31")
+    );
+    assert_eq!(
+        requests[0]
+            .header("x-ms-documentdb-partitionkey")
+            .as_deref(),
+        Some("[\"thread-aad\"]")
+    );
+}
+
+#[tokio::test]
+async fn token_credential_scope_defaults_to_the_cosmos_service_audience() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+
+    let credential = CountingCredential::new(&test_token());
+    let store = CosmosChatMessageStore::with_token_credential(
+        format!("{base_url}/"),
+        credential.clone(),
+        "db",
+        "coll",
+        Some("t".to_string()),
+        None,
+    )
+    .unwrap();
+
+    store.add_messages(vec![Message::user("hi")]).await.unwrap();
+    handle.join().unwrap();
+
+    // Cosmos DB's data-plane audience is service-wide, *not* per account.
+    // Deriving it from the endpoint reads plausibly and is what this crate
+    // did at first, but Entra rejects
+    // `https://<account>.documents.azure.com/.default` outright, so a store
+    // built that way could never acquire a token. This value matches
+    // `AAD_DEFAULT_SCOPE` in the official `azure-cosmos` SDK.
+    assert_eq!(
+        credential.scopes(),
+        vec!["https://cosmos.azure.com/.default".to_string()]
+    );
+    assert!(
+        !credential.scopes()[0].contains(&base_url),
+        "the account endpoint must not leak into the scope"
+    );
+}
+
+#[tokio::test]
+async fn token_credential_scope_can_be_overridden() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+
+    let credential = CountingCredential::new(&test_token());
+    let store = CosmosChatMessageStore::with_token_credential(
+        base_url,
+        credential.clone(),
+        "db",
+        "coll",
+        Some("t".to_string()),
+        Some("https://sovereign.example/.default".to_string()),
+    )
+    .unwrap();
+
+    store.add_messages(vec![Message::user("hi")]).await.unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(
+        credential.scopes(),
+        vec!["https://sovereign.example/.default".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn ensure_created_under_entra_id_explains_the_data_plane_limit() {
+    // What the service actually returns for a control-plane operation
+    // attempted with a data-plane token, whatever role is assigned.
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            403,
+            "Forbidden",
+            vec![],
+            json!({"code": "Forbidden", "message": "Request blocked by Auth"}),
+        )
+    });
+
+    let store = CosmosChatMessageStore::with_token_credential(
+        base_url,
+        CountingCredential::new(&test_token()),
+        "agent-framework",
+        "chat-messages",
+        Some("t".to_string()),
+        None,
+    )
+    .unwrap();
+
+    let err = store.ensure_created().await.unwrap_err();
+    handle.join().unwrap();
+
+    let msg = err.to_string();
+    assert!(msg.contains("data-plane"), "unhelpful message: {msg}");
+    assert!(msg.contains("master key"), "no way out offered: {msg}");
+    // The raw service response is still there for anyone debugging.
+    assert!(msg.contains("Request blocked by Auth"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_master_key_403_is_not_reinterpreted_as_the_data_plane_limit() {
+    // The same status under master-key auth means something else entirely
+    // (a wrong or revoked key), so the Entra explanation must not attach.
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            403,
+            "Forbidden",
+            vec![],
+            json!({"code": "Forbidden", "message": "signature mismatch"}),
+        )
+    });
+
+    let store = CosmosChatMessageStore::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "chat-messages",
+        Some("t".to_string()),
+    )
+    .unwrap();
+
+    let err = store.ensure_created().await.unwrap_err();
+    handle.join().unwrap();
+
+    let msg = err.to_string();
+    assert!(!msg.contains("data-plane"), "misattributed: {msg}");
+    assert!(msg.contains("signature mismatch"), "{msg}");
+}
+
+#[tokio::test]
+async fn checkpoint_storage_also_authenticates_with_a_token_credential() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+
+    let storage = CosmosCheckpointStorage::with_token_credential(
+        base_url,
+        CountingCredential::new(&test_token()),
+        "agent-framework",
+        "workflow-checkpoints",
+        None,
+    )
+    .unwrap();
+
+    storage
+        .save(sample_checkpoint("cp-aad", "wf-aad"))
+        .await
+        .unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(
+        requests[0].header("authorization").unwrap(),
+        format!("type%3Daad%26ver%3D1.0%26sig%3D{}", test_token())
+    );
+}
+
+#[tokio::test]
+async fn entra_state_round_trips_through_the_credential_aware_restore() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+
+    let store = CosmosChatMessageStore::with_token_credential(
+        base_url.clone(),
+        CountingCredential::new(&test_token()),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-restore".to_string()),
+        None,
+    )
+    .unwrap();
+
+    let state = store.serialize().await.unwrap();
+    // A credential cannot be serialized, so no secret is written — which is
+    // the one shape of this blob that is not itself sensitive.
+    assert_eq!(state["auth"], json!("token_credential"));
+    assert!(state.get("key").is_none(), "a secret leaked into state");
+
+    // Restoring without a credential must say what to do, not fail obscurely.
+    // (`CosmosChatMessageStore` is not `Debug`, so `unwrap_err` is out.)
+    match CosmosChatMessageStore::from_state(&state) {
+        Ok(_) => panic!("restoring credential state without a credential must fail"),
+        Err(err) => assert!(
+            err.to_string().contains("from_state_with_token_credential"),
+            "{err}"
+        ),
+    }
+
+    let restored = CosmosChatMessageStore::from_state_with_token_credential(
+        &state,
+        CountingCredential::new(&test_token()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(restored.thread_id(), "thread-restore");
+    assert_eq!(restored.database_id(), "agent-framework");
+    assert_eq!(restored.container_id(), "chat-messages");
+
+    // And it is a working store, not just the right fields.
+    restored
+        .add_messages(vec![Message::user("after restore")])
+        .await
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[0].body_json()["threadId"], json!("thread-restore"));
+}
+
+#[tokio::test]
+async fn master_key_state_still_round_trips_unchanged() {
+    let store = CosmosChatMessageStore::new(
+        "https://acct.documents.azure.com",
+        test_key(),
+        "db",
+        "coll",
+        Some("thread-mk".to_string()),
+    )
+    .unwrap();
+
+    let state = store.serialize().await.unwrap();
+    assert_eq!(state["key"], json!(test_key()));
+    assert!(state.get("auth").is_none());
+
+    let restored = CosmosChatMessageStore::from_state(&state).unwrap();
+    assert_eq!(restored.thread_id(), "thread-mk");
+
+    // A master-key state may also be moved onto Entra ID auth, keeping the
+    // thread id — the supported migration path off a key.
+    let migrated = CosmosChatMessageStore::from_state_with_token_credential(
+        &state,
+        CountingCredential::new(&test_token()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(migrated.thread_id(), "thread-mk");
 }
 
 // endregion

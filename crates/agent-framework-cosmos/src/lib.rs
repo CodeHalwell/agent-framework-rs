@@ -8,12 +8,31 @@
 //! - [`CosmosChatMessageStore`] — one container holds every thread's
 //!   messages as individual documents, partitioned by `threadId`. Talks
 //!   directly to the [Cosmos DB REST
-//!   API](https://learn.microsoft.com/en-us/rest/api/cosmos-db/) with
-//!   master-key (HMAC-SHA256) request signing — see the internal `auth` module —
-//!   rather than depending on the `azure_data_cosmos`/`Microsoft.Azure.Cosmos`
-//!   SDK. **Only master-key authentication is implemented**; Entra ID/AAD
-//!   (`TokenCredential`) auth, which the .NET package also supports, is not
-//!   ported — see `PARITY.md`.
+//!   API](https://learn.microsoft.com/en-us/rest/api/cosmos-db/) — see the
+//!   internal `auth` module — rather than depending on the
+//!   `azure_data_cosmos`/`Microsoft.Azure.Cosmos` SDK.
+//!
+//! # Authentication
+//!
+//! Both modes the .NET `Microsoft.Agents.AI.CosmosNoSql` package supports are
+//! available, and every type here offers a constructor for each:
+//!
+//! - **Master key** ([`CosmosChatMessageStore::new`],
+//!   [`CosmosCheckpointStorage::new`]) — per-request HMAC-SHA256 signing.
+//! - **Microsoft Entra ID** ([`CosmosChatMessageStore::with_token_credential`],
+//!   [`CosmosCheckpointStorage::with_token_credential`]) — a bearer token from
+//!   any [`agent_framework_azure::TokenCredential`], so a workload
+//!   authenticates as itself with no key anywhere in the deployment. This is
+//!   the only mode that works on an account with `disableLocalAuth` set,
+//!   which many tenants require by policy.
+//!
+//! Entra ID's Cosmos DB RBAC grants **data-plane** actions only, so
+//! `ensure_created` — a control-plane operation — cannot succeed with a token
+//! however the principal is assigned; the database and container must be
+//! provisioned out of band (ARM/Bicep, the Azure CLI, or the portal). The
+//! call reports that rather than surfacing a bare `403`. See
+//! [`CosmosChatMessageStore::with_token_credential`] for the role assignment
+//! the data operations do need.
 //!
 //! ```no_run
 //! use agent_framework_cosmos::CosmosChatMessageStore;

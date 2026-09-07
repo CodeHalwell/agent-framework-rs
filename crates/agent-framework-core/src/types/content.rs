@@ -122,6 +122,23 @@ pub struct TextContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotations: Option<Vec<Annotation>>,
+    /// Set when this text is a provider **refusal** rather than an answer.
+    ///
+    /// A refusal is the model declining to produce the requested output. It
+    /// arrives as text and reads like text, but it is not the answer, and
+    /// treating it as one is a silent correctness bug: a caller that asked
+    /// for JSON gets prose it will fail to parse, and a caller reading
+    /// [`Message::text`](crate::types::Message::text) gets a plausible-looking
+    /// string that answers nothing.
+    ///
+    /// Mirrors upstream's `additional_properties["model_output_kind"] ==
+    /// "refusal"` (#7992), as a typed field rather than an untyped bag since
+    /// that is the only marker this port needs to carry. Refusal text is kept
+    /// as its own content item and never merged with ordinary text — see
+    /// [`Message::text`](crate::types::Message::text) for how it is then
+    /// withheld.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub refusal: bool,
 }
 
 impl TextContent {
@@ -129,6 +146,17 @@ impl TextContent {
         Self {
             text: text.into(),
             annotations: None,
+            refusal: false,
+        }
+    }
+
+    /// A [`TextContent`] marked as a provider refusal — see
+    /// [`TextContent::refusal`].
+    pub fn refusal(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            annotations: None,
+            refusal: true,
         }
     }
 }
@@ -285,6 +313,25 @@ pub struct FunctionCallContent {
     /// Absent for providers that do not use one.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub protected_data: Option<String>,
+    /// A framework-generated id for *this occurrence* of the call, distinct
+    /// from [`Self::call_id`].
+    ///
+    /// `call_id` is the provider's, and providers reuse it: the same id can
+    /// name two different invocations in one conversation. That is fine while
+    /// a call is answered immediately, but an approval round trip leaves a
+    /// call outstanding across turns, and two approvals pending at once under
+    /// one `call_id` cannot then be told apart — approving one can resolve
+    /// the other.
+    ///
+    /// An occurrence id is minted when a call first needs to outlive its turn
+    /// (see `FunctionInvokingChatClient`'s approval path), formatted
+    /// `af-call-<uuid>`. Mirrors upstream's `Content.id` (#7383/#7988).
+    ///
+    /// `None` for a call that never needed one, and for calls restored from
+    /// state written before this existed — [`Self::same_invocation`] falls
+    /// back to structural comparison there.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
 }
 
 /// Arguments to a function call: either a raw (possibly partial) string, or a
@@ -307,6 +354,42 @@ impl FunctionCallContent {
             name: name.into(),
             arguments,
             protected_data: None,
+            id: None,
+        }
+    }
+
+    /// Mint an occurrence id for this call if it has none, and return it.
+    ///
+    /// See [`Self::id`]. Idempotent: a call that already carries one keeps it,
+    /// so re-processing a conversation cannot re-identify a call and orphan an
+    /// approval already bound to it.
+    pub fn ensure_occurrence_id(&mut self) -> &str {
+        self.id
+            .get_or_insert_with(|| format!("af-call-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Whether `other` is the **same invocation** as this call.
+    ///
+    /// Occurrence ids decide it when both sides carry one — that is what they
+    /// exist for, and two calls that are structurally identical but separately
+    /// issued are genuinely different invocations. When either side has none
+    /// (a call that never needed an id, or state written before ids existed),
+    /// this falls back to the structural comparison that was the only rule
+    /// before: same `call_id`, name and arguments. Mirrors upstream's staged
+    /// migration, which likewise accepts the legacy binding rather than
+    /// dropping approvals stored under it.
+    ///
+    /// `protected_data` is deliberately not compared: it is a provider replay
+    /// token attached to whichever fragment carried it, not part of the call's
+    /// identity.
+    pub fn same_invocation(&self, other: &FunctionCallContent) -> bool {
+        match (&self.id, &other.id) {
+            (Some(a), Some(b)) => a == b,
+            _ => {
+                self.call_id == other.call_id
+                    && self.name == other.name
+                    && self.arguments == other.arguments
+            }
         }
     }
 
@@ -356,6 +439,12 @@ impl FunctionCallContent {
         // streamed Gemini 3 tool call needs on replay.
         if let Some(token) = other.protected_data.as_ref().filter(|t| !t.is_empty()) {
             self.protected_data = Some(token.clone());
+        }
+        // Same reasoning as the replay token: whichever fragment carries the
+        // occurrence id, the merged call must keep it, or an approval bound to
+        // it would no longer match the call it approves.
+        if self.id.is_none() {
+            self.id = other.id.clone();
         }
         // The function name is not fragmented by real providers: it arrives once
         // in the first chunk. Set it if we don't have one yet; otherwise only
@@ -1034,5 +1123,113 @@ mod tests {
             assert_eq!(c, back);
             assert_ne!(back, Content::Unknown);
         }
+    }
+}
+
+#[cfg(test)]
+mod occurrence_id_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_occurrence_id_is_idempotent_and_prefixed() {
+        let mut call = FunctionCallContent::new("c1", "f", None);
+        assert!(call.id.is_none());
+        let first = call.ensure_occurrence_id().to_string();
+        assert!(first.starts_with("af-call-"), "{first}");
+        // Re-identifying a call would orphan an approval already bound to it.
+        let second = call.ensure_occurrence_id().to_string();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn occurrence_ids_are_unique_per_call() {
+        let mut a = FunctionCallContent::new("c1", "f", None);
+        let mut b = FunctionCallContent::new("c1", "f", None);
+        assert_ne!(a.ensure_occurrence_id(), b.ensure_occurrence_id());
+    }
+
+    #[test]
+    fn same_invocation_prefers_occurrence_ids_when_both_carry_one() {
+        let mut a = FunctionCallContent::new("c1", "f", None);
+        let mut b = FunctionCallContent::new("c1", "f", None);
+        a.ensure_occurrence_id();
+        b.ensure_occurrence_id();
+        // Structurally identical, but separately issued — two invocations.
+        assert!(!a.same_invocation(&b));
+        assert!(a.same_invocation(&a.clone()));
+    }
+
+    #[test]
+    fn same_invocation_falls_back_to_structure_without_ids() {
+        let a = FunctionCallContent::new("c1", "f", None);
+        let b = FunctionCallContent::new("c1", "f", None);
+        assert!(a.same_invocation(&b));
+
+        let different_name = FunctionCallContent::new("c1", "g", None);
+        assert!(!a.same_invocation(&different_name));
+
+        let different_args =
+            FunctionCallContent::new("c1", "f", Some(FunctionArguments::Raw("{\"x\":1}".into())));
+        assert!(!a.same_invocation(&different_args));
+    }
+
+    #[test]
+    fn a_one_sided_id_falls_back_rather_than_failing_to_match() {
+        // A stored call identified before a replay that lost the id must still
+        // resolve, which is what keeps pre-existing approvals working.
+        let mut identified = FunctionCallContent::new("c1", "f", None);
+        identified.ensure_occurrence_id();
+        let bare = FunctionCallContent::new("c1", "f", None);
+        assert!(identified.same_invocation(&bare));
+        assert!(bare.same_invocation(&identified));
+    }
+
+    #[test]
+    fn protected_data_is_not_part_of_identity() {
+        // It is a provider replay token attached to whichever fragment carried
+        // it, not a property of which invocation this is.
+        let a = FunctionCallContent::new("c1", "f", None);
+        let b = FunctionCallContent::new("c1", "f", None).with_protected_data(Some("sig".into()));
+        assert!(a.same_invocation(&b));
+    }
+
+    #[test]
+    fn merge_carries_the_occurrence_id_across_streamed_fragments() {
+        let mut head = FunctionCallContent::new("c1", "f", None);
+        let mut tail = FunctionCallContent::new("c1", "", None);
+        tail.ensure_occurrence_id();
+        let expected = tail.id.clone();
+        head.merge(&tail).unwrap();
+        assert_eq!(head.id, expected);
+    }
+
+    #[test]
+    fn distinct_calls_sharing_a_call_id_get_distinct_ids() {
+        // The stamping loop used to `find` a match per response copy, with a
+        // `call_id`-only fallback, so two calls sharing an id both took the
+        // first entry's occurrence id — reintroducing exactly the ambiguity
+        // the id exists to remove. Positional consumption is what keeps them
+        // apart; this pins the property that makes it matter.
+        let mut a = FunctionCallContent::new("c1", "f", None);
+        let mut b = FunctionCallContent::new("c1", "f", None);
+        a.ensure_occurrence_id();
+        b.ensure_occurrence_id();
+        assert_ne!(a.id, b.id);
+        assert!(!a.same_invocation(&b));
+        assert_eq!(a.call_id, b.call_id, "the provider id really is shared");
+    }
+
+    #[test]
+    fn the_occurrence_id_is_absent_from_the_wire_when_unset() {
+        let call = FunctionCallContent::new("c1", "f", None);
+        let wire = serde_json::to_value(&call).unwrap();
+        assert!(wire.get("id").is_none());
+
+        let mut identified = call.clone();
+        identified.ensure_occurrence_id();
+        let wire = serde_json::to_value(&identified).unwrap();
+        assert!(wire["id"].as_str().unwrap().starts_with("af-call-"));
+        let restored: FunctionCallContent = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.id, identified.id);
     }
 }

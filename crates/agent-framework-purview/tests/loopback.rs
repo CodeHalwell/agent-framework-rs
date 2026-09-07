@@ -228,6 +228,11 @@ async fn allow_end_to_end_both_directions_pass() {
             req.header("content-type").as_deref(),
             Some("application/json")
         );
+        // Without this the service may evaluate the content offline and
+        // return no actionable verdict, which would leave the middleware
+        // below with nothing to block on — enforcement would quietly become
+        // a no-op rather than fail.
+        assert_eq!(req.header("prefer").as_deref(), Some("evaluateInline"));
         let body = req.body_json();
         assert_eq!(
             body["userId"],

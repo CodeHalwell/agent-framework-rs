@@ -6,43 +6,146 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `b5d9f4b` (2026-08-31).** Sections are newest
+**Current upstream baseline: `010a43a` (2026-09-07).** Sections are newest
 first; each records the upstream revision it was checked against.
 
-## Post-`d8d07eb` drift (checked against `b5d9f4b`, 2026-08-31)
+## Post-`b5d9f4b` drift + Azure-ecosystem review (checked against `010a43a`, 2026-09-07)
 
-The mirror had stopped advancing on 2026-08-29 (its sync workflow was failing
-at startup); a manual sync caught it up, moving **4 non-merge commits**.
-**None require a code change here.** Three are Python and one .NET, and the two
-that touch surfaces this port does have — the Gemini client and agent
-middleware — land on shapes the Rust type system does not admit in the first
-place.
+Upstream moved **83 non-merge commits** in this window (2026-08-31 → 09-07).
+**Six land on this port**: a usage-accounting bug it inherited from upstream
+and has now fixed, plus the five changes that land on surfaces this port has
+but needed more than a transcription (refusal marking, occurrence-bound
+approvals, the compaction preserve-first-user option, core vector stores, and
+Purview's inline-evaluation header). Alongside the drift triage, this pass ran
+a review of the whole Azure surface and closed its largest gap (Cosmos DB
+authentication).
 
-### Ported this pass (0)
+### The sync was still broken; the window was recovered by hand
 
-No code changes. Nothing below needed a behavioral fix or a new test: unlike
-#7850 and #7837, where the correct behavior was *inherited* from a shared
-helper and worth pinning, both near-misses here are already pinned by existing
-tests or are unrepresentable rather than merely unwritten.
+The mirror did not advance on its own: its scheduled sync failed on **every**
+run from 2026-09-01 through 09-07, seven consecutive scheduled failures, and
+the window below only became readable because it was synced manually.
 
-### Not applicable (4)
+The cause was not the one the previous pass fixed. That pass moved the sync
+onto the fork-sync API (`POST /repos/{owner}/{repo}/merge-upstream`) on the
+premise that a server-side merge would sidestep GitHub's refusal to let
+GITHUB_TOKEN write `.github/workflows/**`. It does not — the endpoint applies
+the identical rule, and every run returned `422`:
+
+> refusing to allow a GitHub App to create or update workflow
+> `.github/workflows/codeql-analysis.yml` without `workflows` permission
+
+Because upstream touches a workflow file regularly, one such commit entering
+the window stops the mirror indefinitely rather than for a single day, which
+is why three successive windows were affected.
+
+Fixed in the mirror repo (`CodeHalwell/agent-framework`
+[PR #6](https://github.com/CodeHalwell/agent-framework/pull/6), branch
+`claude/amazing-mayer-h5ps6a`): the sync is a plain git merge again, and the
+pushed ref update is made to contain no change under `.github/workflows/**` —
+after merging, that directory is restored to the fork's own version, so the
+restriction has nothing to apply to. Upstream history still merges in full, so
+the merge base advances and a window is never re-attempted; only upstream's CI
+*files* are frozen, which costs this mirror's one consumer nothing. A
+`SYNC_PAT` secret carrying the `workflow` scope, if added, is used instead and
+drops the exclusion. Verified against a local two-repo simulation of both
+shapes upstream produces (a workflow file modified plus one added alongside a
+source change; and a workflow file edited on the same lines by both sides).
+
+Until that PR merges, each window still depends on someone syncing the mirror
+by hand. The next pass should confirm the 06:00 UTC run went green before
+triaging.
+
+### Ported this pass (7, all with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7964 | **A token count reported as zero was dropped from the usage breakdown.** Python's walrus guard `if tokens := usage.completion_tokens_details.audio_tokens:` is falsy for `0`, so a provider reporting *zero* audio / accepted-prediction / rejected-prediction / cached tokens produced no entry at all — indistinguishable from a provider that does not break that count out. This port had transcribed the guard faithfully as `if v > 0` in `add_usage_detail`, **with a test pinning it** ("Zero-valued counts are skipped (truthy guard)"), so the bug was not merely inherited but protected. Upstream's fix is `is not None`; here it is dropping the comparison, leaving `Value::as_u64` as the only filter — so a non-integer is still ignored and the guard has not been widened into accepting junk. The distinction matters downstream: `additional_counts` feeds the GenAI metrics layer, which can only express "not reported" by omission, so a real zero and a missing field collapsed into the same reading. Scoped to Chat Completions: `parse_responses_usage` never had the guard, and the typed fields (`reasoning_output_token_count`, `cache_read_input_token_count`) never did either — which is why the two paths silently disagreed about the same response until now. | `openai/convert.rs` (`add_usage_detail`) |
+
+The other five from this window are below; the Cosmos DB authentication work
+that follows them came out of the Azure review rather than this window.
+
+### Ported this pass (Azure review)
+
+| Gap | Change | Rust site |
+|---|---|---|
+| **Cosmos DB was master-key-only.** `agent-framework-cosmos` signed every request with an HMAC-SHA256 master key and had no Entra ID path, while .NET's `Microsoft.Agents.AI.CosmosNoSql` accepts an already-authenticated `CosmosClient` and therefore any `TokenCredential`. That is not a cosmetic gap: an Azure account with `disableLocalAuth` set — a common governance default, since key-based auth cannot be attributed to a principal or scoped by role — has no master key to give, so the crate could not be used on such an account at all, and a deployment that could use it had to carry a key. The credential machinery already existed one crate away (`agent_framework_azure::credentials`: `DefaultAzureCredential`, `ManagedIdentityCredential`, `WorkloadIdentityCredential`, `ClientSecretCredential`, `AzureCliCredential`, all caching per scope), so this was wiring rather than new infrastructure. `CosmosAuth` now selects between the two modes at the one point that builds the `Authorization` header. Cosmos does **not** take an Entra token as `Authorization: Bearer` — it reuses the master-key envelope as `type=aad&ver=1.0&sig={token}`, percent-encoded — which is the detail a hand-rolled client gets wrong silently, so it is pinned by both a unit test on the header builder and a loopback test on the real outbound request. The default scope is `https://cosmos.azure.com/.default`, matching `AAD_DEFAULT_SCOPE` in the official `azure-cosmos` SDK, with `AZURE_COSMOS_AAD_SCOPE_OVERRIDE` honored as that SDK does. The first cut derived it from the account endpoint instead — which reads plausibly and is what a per-account service would use — and PR #21 review caught that Entra rejects `https://<account>.documents.azure.com/.default` as an invalid scope outright, so every credential-backed store would have failed at token acquisition. | `cosmos/auth.rs` (`aad_authorization_header`), `cosmos/client.rs` (`CosmosAuth`, `with_token_credential`, `authorization`, `management_error`, `normalize_endpoint`), `cosmos/chat_message_store.rs`, `cosmos/checkpoint_storage.rs` |
+
+Two consequences are handled rather than left to surface as confusing
+failures:
+
+- **`ensure_created` cannot work under Entra ID.** Cosmos DB's Entra RBAC
+  covers data-plane actions only; creating a database or container is a
+  control-plane (ARM) operation, so it is refused with `403` no matter which
+  role the principal holds — including Owner. The raw body says only "Request
+  blocked by Auth", which reads like a missing role assignment rather than an
+  operation no assignment can grant. `management_error` attaches the
+  explanation and the way out (provision out of band, or use a master key),
+  and does so *only* under credential auth: a `403` on the master-key path
+  means a wrong or revoked key, and a negative-control test pins that it is
+  not re-labelled.
+- **A credential cannot be serialized.** `serialize()` embeds the master key
+  when there is one; under Entra ID there is no value to embed, so it emits
+  `"auth": "token_credential"` and no `key` — the one shape of this blob that
+  is not itself a secret. `from_state` then fails naming
+  `from_state_with_token_credential`, which takes the credential back in
+  (the same shape as .NET's `CreateFromSerializedState(CosmosClient, ...)`).
+  Master-key state is also accepted there, which is the supported way to move
+  an existing conversation off a key without losing its thread id.
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1726 passing**, 14 of them new), `cargo clippy --all-targets --all-features`
+under `-D warnings` (CI's own flag) clean, `cargo fmt --check` clean. The new
+tests were probed against the behavior they pin: degrading `management_error`
+to the plain error mapping fails the Entra diagnostic test while the
+master-key negative control still passes; emitting `Bearer {token}` instead of
+the AAD envelope fails the two header-shape tests; dropping the endpoint trim
+before deriving the scope fails the scope-default test (and only it — the
+explicit-override test still passes); and reinstating the `> 0` truthy guard
+fails both usage tests, while the non-integer negative control passes either
+way by design.
+
+### Not applicable (77)
+
+Grouped by why, rather than one row each. The commits touching subsystems this
+port has were read as diffs; the routine remainder (CI, dependency bumps,
+docs, samples, release version bumps) was classified from its file scope and
+subject.
 
 | Upstream | Why not |
 |---|---|
-| #7879 | **A Pydantic `response_format` reached Gemini with no schema attached.** #5893 taught the Python client to forward *mapping*-shaped `response_format` values as a Gemini `response_schema` and scoped itself to those shapes, so a Pydantic model class — the first shape the option's own docs offer — fell through `_extract_response_schema` and the request carried `response_mime_type="application/json"` with nothing constraining it; free-form JSON then came back to be parsed against that same model. The hole is shape-matching over a union of accepted Python types (mapping, model class, and the `format` / `json_schema` / bare `schema` envelopes it unwraps). `ResponseFormat` here is a closed three-variant enum whose `JsonSchema { schema, .. }` carries the schema as a `serde_json::Value` directly, so there is no unrecognized shape to fall through: `build_request` already writes `responseMimeType` **and** `responseSchema` for `JsonSchema`, and `responseMimeType` alone for `JsonObject`. Both are pinned by existing tests (`build_request_response_format_json_schema_embeds_schema`, `build_request_response_format_json_object`), so upstream's fix is this port's already-tested behavior. |
-| #7918 | **[BREAKING] agent middleware inputs are sequence-only again.** Python had allowed `middleware=` to take either a bare middleware object (a `MiddlewareBundle` among them, treated as a one-element list) or a sequence; that union is withdrawn across `BaseAgent`, `RawAgent`, `Agent.run`, `AgentMiddlewareLayer` and the Foundry factory, with a new `_copy_middleware_sequence` raising `TypeError` on a non-sequence, and the `agent-hooks` extra is dropped from the core package. All of it is dynamic-typing ergonomics being taken back. `ChatAgentBuilder` accepts exactly one middleware per call — `.middleware(Arc<AgentMiddleware>)`, `.chat_middleware(..)`, `.function_middleware(..)`, each appending — so there is no single-or-sequence union to disambiguate, no runtime validator to write (a non-middleware argument is a compile error), and no `agent-hooks` extra to remove. The breaking change moves upstream *toward* the shape this port already has. |
-| #7604 | **Redis history-provider type checking across the supported redis-py range.** The dependency-range validator failed pyright at redis 8.0.1 with five unnecessary-type-ignore errors, while the same ignores were *required* at 7.1.1 and 6.4.0, where redis-py annotates the asyncio commands as returning the sync/async union — no single ignore comment satisfies the whole range, so results are normalized through one helper and `lrange` reached via an inline cast. Purely an artifact of one library's annotations shifting between versions under a gradual type checker. `agent-framework-redis` talks to Redis over a client whose types are fixed at compile time; there is no analogous condition. |
-| #7938 | **.NET tests drop FluentAssertions over its licensing change.** Test-dependency hygiene in the .NET solution. |
+| #7790, #8023, #7704, #8095 | **Python runtime shapes with no Rust counterpart.** Recursion/cycle handling and scalar fast paths in `SerializationMixin`; a `__getstate__`/pickle path so runtime raw representations survive checkpointing; naming the real error when an anyio cancel scope masks an MCP init failure; and initializing `_close_http_client` on the user-supplied-client path. Serialization here is `serde` over owned types (a `serde_json::Value` cannot be cyclic and needs no pickle protocol), there are no cancel scopes, and client ownership is settled by the type system. |
+| #8039, #7855, #7835, #7747 | **Python-shaped again, one layer up.** Scoping MCP provider headers per tool across a *shared* `httpx` client with mutable request-hook lists; wrapping Anthropic and Gemini SDK exceptions in `ChatClientException`; rejecting MCP servers passed as provider agent tools; projecting the per-call effective tool set on an agent-hooks `pre_model_call`. This port's MCP tools each own their `reqwest` client and carry their own headers, so there is no shared hook list to scope or to mutate mid-iteration; it depends on no provider SDK, so there are no SDK exceptions to wrap; and it has no agent-hooks/harness loop. |
+| #7984, #8046, #8032, #7671, #7998, #7986, #7983, #3932, #8027, #7995, #7954, #8029 | **.NET only.** Foundry hosted-response streamed annotations, declarative workflow input serialization, A2A run modes and task-state tracking, `file_access_read_lines`/`AgentFileStore`, removing the `Azure.AI.OpenAI` and deprecated Bedrock MEAI dependencies, Cosmos emulator test reliability, and dependency bumps. The A2A pair lands on serving-side task lifecycle, already tracked as an open gap. |
+| #8097, #8071, #8009, #8019, #7997, #8006, #7965, #8031 | **Packages with no Rust counterpart.** ChatKit, `lab`, the DevUI frontend, `foundry_hosting` (×3 — still the single most frequent source of "not applicable" here), and moving Foundry eval serialization out of core. |
+| #8052, #7967, #8002, #7960 | **Dependency-floor moves.** FastAPI 0.141, OpenAI SDK 3.x, the GitHub Copilot SDK, and migrating Mistral onto the official SDK. This port speaks each provider's REST surface over `reqwest` and pins no provider SDK, so an SDK floor has no landing site. The Mistral one was read for wire-visible behavior alongside the SDK swap and carries none: the port's client continues to reuse `agent_framework_openai::convert::parse_response`. |
+| #8003, #8011, #7980, #7776, #7906 | **AG-UI depth.** Surfacing workflow intermediate events as reasoning, stamping the checkpoint owner on every save, preserving parallel `function_result` contents, workflow-as-agent approval resumes, and Responses replay metadata across continuations. `agent-framework-hosting::agui` streams one run to completion and keeps no snapshot store, checkpoint owner, or continuation state, so each of these lands on machinery the router does not have — the standing AG-UI depth gap, unchanged. |
+| #8065, #8085, #8062, #8084, #8090, #8101, #8102, #8076, #8077, #8074, #8043, #8072, #8073, #8070, #8059, #8066, #8067, #8060, #7582, #8037, #8036, #8047, #7876, #7777, #8038, #8033, #8035, #8004, #8007, #7937, #6046, #7883, #8030, #7972, #7935, #7680 | CI and dependabot configuration, action bumps, docs and sample additions, code owners, public-API analyzers, and the Python 1.17.0 / .NET 1.20.0 release bumps. |
 
-Note on the window: this section is the first triaged against a mirror that had
-to be synced by hand. The fork's scheduled sync has been failing since
-2026-08-29 — `permissions:` on `.github/workflows/sync-upstream.yml` declares
-`workflows: write`, which is not a valid GITHUB_TOKEN permission key, so the
-workflow file is invalid and every run fails at startup. A fix is open on
-`claude/optimistic-edison-qtskmr` in the mirror repo (sync via the
-`merge-upstream` fork-sync API, since GITHUB_TOKEN cannot push commits touching
-`.github/workflows/**` under any permissions block). Until that lands, each
-triage window depends on someone syncing the mirror by hand first.
+### Also ported this pass: the five deltas this window opened
+
+Each lands on a surface this port has, and each needed more than a
+transcription. All five are built.
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #7992 | **A provider refusal read as the answer.** The port parsed an OpenAI refusal into plain `TextContent` on both the Chat Completions and Responses paths — upstream's *previous* behavior. So `response.text()` handed back "I can't help with that" as though the model had answered, and `parse_json` would try to parse it as the requested JSON. `TextContent::refusal` now marks it (a typed `bool` rather than upstream's `additional_properties["model_output_kind"]` bag, since it is the only marker this port needs); `Message::text` returns `""` when one is present, with `has_refusal()` / `refusal_text()` to read it deliberately. Two consequences fell out. The Chat Completions parser used to emit the refusal *only when there was no content*, which hid a model that answered part of a request and declined part — both are now kept as separate items. And `coalesce_text` merged any two adjacent text items, so a streamed refusal following ordinary text folded into it under the first fragment's flag; the merge is now gated on the flag matching, which is the same boundary upstream splits on. | `core/types/content.rs`, `core/types/message.rs`, `core/types/response.rs` (`coalesce_text`), `openai/convert.rs`, `openai/responses.rs` |
+| #7383/#7988 | **Two approvals pending under one provider `call_id` were indistinguishable.** Providers reuse `call_id`, which is harmless while a call is answered inside its turn but not across an approval round trip. The port matched approvals structurally (`call_id` + name + arguments), so two *simultaneously* pending approvals for the same call collapsed: the second request looked like a replay and was dropped, and one result answered both. `FunctionCallContent::id` is now a framework-generated occurrence id (`af-call-<uuid>`), minted at the one moment a call stops being answered within its turn — the approval deferral — and stamped on the call, its request, and the response's own copies so a replay carries it. `same_invocation` replaces the `==` comparisons in the invocation loop: occurrence ids decide when both sides have one, and it falls back to the structural rule otherwise, so approvals stored before this keep resolving (upstream's staged migration, without the deprecation warnings — nothing here has shipped a stored occurrence-less approval to warn about). Results are keyed by occurrence id with the same fallback. `merge` carries the id across streamed fragments for the same reason it carries `protected_data`. | `core/types/content.rs` (`id`, `ensure_occurrence_id`, `same_invocation`, `merge`), `core/client.rs` (approval deferral, `replace_approval_contents_with_results`) |
+| #7912 | **Truncation could drop the request the conversation is about.** Upstream added `preserve_first_user_group` to its truncation strategy; the annotation-model halves of that commit (summary reconciliation across the middleware boundary) have no landing site here, since this port implements the reduced-list model and has no summarizing strategy. The portable half is built as `preserve_first_user()` on `Truncation`, `SlidingWindow` **and** `TokenBudget` — upstream offers it on one strategy, but all three drop the oldest turns and the exposure is identical in each; a caller's choice between them is about how to bound context, not about whether the opening request matters. Protected messages are kept regardless of budget, as upstream documents, so the result may exceed the limit by one. Off by default. This port has no group model, so it protects the earliest user *message*; a user turn carries no tool calls, so that cannot orphan a call/result pair. | `core/compaction.rs` (`first_user_index`, `push_preserved_first_user`, all three strategies) |
+| #8014 | **Core vector-store abstractions**, a new upstream surface with no Rust counterpart. Built as `core::vectors`: `VectorStoreField` / `VectorStoreCollectionDefinition` (with validation at construction — no key, two keys, duplicate names, two fields renamed onto one storage name, a vector field without dimensions), `IndexKind` / `DistanceFunction` as open value wrappers carrying upstream's constants plus `higher_is_closer()` (upstream's `DISTANCE_FUNCTION_DIRECTION_HELPER` — get the direction wrong and a search returns the *worst* matches first), `VectorSearchOptions` / `VectorSearchResult`, the `VectorCollection` and `VectorStore` traits, and an `InMemoryVectorStore` for tests. Roughly half of upstream's 1,923-line module is a model layer — a decorator that registers a Python class, walks its annotations and generates encoders between instances and flat mappings — which `serde` makes redundant, so records are `serde_json::Value` objects keyed by field name and both traits stay object-safe. The one piece of that layer that *is* load-bearing is the logical-name/storage-name split, since it is a property of the store rather than of the Rust type: `to_storage` / `from_storage` do that renaming. Upstream's lambda-AST filter parsing has no Rust counterpart (there is no runtime AST), so a filter is the provider's own expression. | `core/vectors.rs` (new module) |
+| #7976 | **Purview never asked for inline evaluation.** `process_inline` turns out not to be a body field at all: both upstream implementations translate it to a `Prefer: evaluateInline` request header, and set it when the protection-scope cache is cold. This crate holds no cache, so every request is that case — and it is the only case that can work here, because the middleware blocks a prompt or a response on the verdict in the reply, and an offline evaluation would leave it with nothing to decide on and silently turn enforcement into a no-op. Sent unconditionally as a constant rather than modelled as a field that could only hold one value. | `purview/client.rs` (`PREFER_EVALUATE_INLINE`), `purview/models.rs` (docs) |
+
+Verified across all five: full workspace build, `cargo test --workspace
+--all-features` (**1776 passing**, 48 of them new), `cargo clippy
+--all-targets --all-features` under `-D warnings` clean, `cargo fmt --check`
+clean. Each behavioral test was probed against the code it pins — degrading
+`same_invocation` to the structural rule fails the two-pending-approvals test
+and the identity test; keying results by `call_id` alone fails the
+matched-results test; the two refusal tests that previously pinned
+refusal-as-answer were rewritten and fail against the new parser only in their
+old form; and the compaction and vector tests carry negative controls
+(`preserve_first_user` off by default on every strategy, ordinary text still
+coalescing, an unknown distance function refusing to guess a direction).
 
 ## Post-`e6d8d99` drift (checked against `d8d07eb`, 2026-08-29)
 

@@ -160,11 +160,21 @@ pub struct ContentToProcess {
 }
 
 /// The `processContent` request body. Mirrors Python's
-/// `ProcessContentRequest`; `scope_identifier` (sent as an `If-None-Match`
-/// header, not a body field, and only meaningful after a
-/// `protectionScopes/compute` precheck this port doesn't perform) and
-/// `process_inline` (ditto — derived from that same precheck's execution
-/// mode) are intentionally not modeled. See the crate docs' "Scope" section.
+/// `ProcessContentRequest`.
+///
+/// Neither of upstream's two remaining request fields is a body field, and
+/// neither is modeled here:
+///
+/// - `scope_identifier` becomes an `If-None-Match` header, and is only
+///   meaningful after a `protectionScopes/compute` precheck this crate does
+///   not perform.
+/// - `process_inline` becomes a `Prefer: evaluateInline` header. Upstream
+///   varies it per request from that same precheck; this crate has no
+///   precheck and needs the verdict synchronously, so it sends the header
+///   unconditionally instead of carrying a field that could only ever hold
+///   one value. See [`crate::client`]'s `PREFER_EVALUATE_INLINE`.
+///
+/// See the crate docs' "Scope" section.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessContentRequest {
     #[serde(rename = "contentToProcess")]
