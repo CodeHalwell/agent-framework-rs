@@ -155,6 +155,31 @@ pub fn structured_output_text(messages: &[Message]) -> String {
     String::new()
 }
 
+/// Whether the run's **final** assistant turn is a refusal.
+///
+/// Response-level text suppression is anchored to the last assistant message
+/// rather than to any message carrying a refusal marker, because a tool loop
+/// accumulates every earlier assistant turn into one response. A provider may
+/// decline *part* of a request while still calling a tool for the rest —
+/// OpenAI emits `refusal` and `tool_calls` on the same message, and
+/// `openai::convert` keeps both — so an `any`-style guard lets that
+/// intermediate turn blank the successful final answer that follows it, which
+/// is the one thing the caller actually asked for.
+///
+/// Anchoring here still refuses what the guard was written to refuse: a run
+/// that says "I'll check that", calls a tool, and *then* declines ends on the
+/// refusal, so the intermediate aside is not served as though it were the
+/// answer. Non-assistant messages (tool results) are skipped — they are never
+/// the run's outcome — and a response with no assistant message at all has no
+/// refusal to report.
+fn final_turn_refused(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role.as_str() == Role::ASSISTANT)
+        .is_some_and(Message::has_refusal)
+}
+
 impl ChatResponse {
     /// Build a response from a single assistant text message.
     pub fn from_text(text: impl Into<String>) -> Self {
@@ -166,18 +191,20 @@ impl ChatResponse {
 
     /// The concatenated text of all messages (newline-joined, trimmed).
     ///
-    /// Empty when **any** message carries a refusal. Guarding only the
-    /// refusing message is not enough here: a tool loop accumulates earlier
-    /// assistant turns, so a run that says "I'll check that" and then
-    /// declines would otherwise hand the caller that intermediate aside as
-    /// though it were the final answer. See [`Self::refusal_text`].
+    /// Empty when the run's **final** assistant turn is a refusal — see
+    /// [`final_turn_refused`] for why the check is anchored there rather than
+    /// applied to any accumulated turn. Refusal text is never served as the
+    /// answer regardless: [`Message::text`] blanks a refusing message on its
+    /// own, so a refusal reached through this join contributes nothing.
+    /// See [`Self::refusal_text`] to read a decline deliberately.
     pub fn text(&self) -> String {
-        if self.has_refusal() {
+        if final_turn_refused(&self.messages) {
             return String::new();
         }
         self.messages
             .iter()
             .map(Message::text)
+            .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -523,9 +550,10 @@ pub struct AgentResponse {
 impl AgentResponse {
     /// The concatenated text of all messages (no separator), matching Python.
     ///
-    /// Empty when any message carries a refusal — see [`ChatResponse::text`].
+    /// Empty when the run's final assistant turn is a refusal — see
+    /// [`ChatResponse::text`] and [`final_turn_refused`].
     pub fn text(&self) -> String {
-        if self.has_refusal() {
+        if final_turn_refused(&self.messages) {
             return String::new();
         }
         self.messages.iter().map(Message::text).collect::<String>()
@@ -710,7 +738,7 @@ impl AgentResponseUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ResponseFormat, TextReasoningContent};
+    use crate::types::{FunctionResultContent, ResponseFormat, TextContent, TextReasoningContent};
     use serde_json::json;
 
     fn text_update(text: &str) -> ChatResponseUpdate {
@@ -1171,5 +1199,71 @@ mod tests {
         let reserialized = serde_json::to_string(&text_update("y")).unwrap();
         assert!(!reserialized.contains("additional_properties"));
         assert!(!reserialized.contains("raw_representation"));
+    }
+
+    #[test]
+    fn a_partial_refusal_mid_tool_loop_does_not_blank_the_final_answer() {
+        // The shape `FunctionInvokingChatClient` actually accumulates: the
+        // provider declines part of the request while still calling a tool for
+        // the rest (OpenAI puts `refusal` and `tool_calls` on one message, and
+        // `openai::convert` keeps both), the loop carries that turn forward,
+        // runs the tool, and the model then answers successfully.
+        let mut partial = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Text(TextContent::refusal("I won't do the first part")),
+                Content::FunctionCall(FunctionCallContent::new("c1", "lookup", None)),
+            ],
+        );
+        partial.message_id = Some("m1".into());
+        let tool_result = Message::with_contents(
+            Role::tool(),
+            vec![Content::FunctionResult(FunctionResultContent::new(
+                "c1",
+                Some(json!("42")),
+            ))],
+        );
+        let resp = ChatResponse {
+            messages: vec![partial, tool_result, Message::assistant("the answer is 42")],
+            ..Default::default()
+        };
+
+        // The successful final answer survives; the decline is still reported
+        // separately rather than folded into the answer.
+        assert_eq!(resp.text(), "the answer is 42");
+        assert!(resp.has_refusal());
+        assert_eq!(
+            resp.refusal_text().as_deref(),
+            Some("I won't do the first part")
+        );
+        // The refusal's own words never reach the answer, because
+        // `Message::text` blanks the message carrying them.
+        assert!(!resp.text().contains("won't"));
+
+        // A run that ends on the refusal is still withheld entirely.
+        let declined = ChatResponse {
+            messages: vec![
+                Message::assistant("I'll check that"),
+                Message::with_contents(
+                    Role::assistant(),
+                    vec![Content::Text(TextContent::refusal("I can't help"))],
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(declined.text(), "");
+
+        // Same anchoring for `AgentResponse`.
+        let agent = AgentResponse {
+            messages: vec![
+                Message::with_contents(
+                    Role::assistant(),
+                    vec![Content::Text(TextContent::refusal("no to that bit"))],
+                ),
+                Message::assistant("but here is the rest"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(agent.text(), "but here is the rest");
     }
 }
