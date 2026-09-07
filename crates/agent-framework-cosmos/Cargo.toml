@@ -13,6 +13,11 @@ description = "Azure Cosmos DB NoSQL chat-message store"
 
 [dependencies]
 agent-framework-core = { workspace = true }
+# For `TokenCredential` and the Entra ID credential chain behind it, so a
+# Cosmos store authenticates the same way (and with the same credential
+# objects) as every other Azure crate in this workspace — the pattern
+# `agent-framework-azure-ai-search` already follows.
+agent-framework-azure = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

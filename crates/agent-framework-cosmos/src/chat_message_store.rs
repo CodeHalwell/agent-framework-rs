@@ -59,10 +59,13 @@
 //!   This store does not set a Cosmos `ttl` property — messages persist
 //!   until explicitly [`CosmosChatMessageStore::clear`]ed.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
+use agent_framework_azure::TokenCredential;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::history::HistoryProvider;
 use agent_framework_core::memory::{ContextProvider, SessionContext};
@@ -180,6 +183,68 @@ impl CosmosChatMessageStore {
         })
     }
 
+    /// As [`Self::new`], but authenticating with Microsoft Entra ID: every
+    /// request carries a bearer token from `credential` instead of a
+    /// master-key signature.
+    ///
+    /// This is the mode to use on an account with `disableLocalAuth` set, and
+    /// the one that lets a workload authenticate as itself — pair it with
+    /// `agent_framework_azure::DefaultAzureCredential` (or
+    /// `ManagedIdentityCredential` in Azure, `AzureCliCredential` locally)
+    /// and no key needs to exist anywhere in the deployment.
+    ///
+    /// `scope` defaults to the account endpoint plus `/.default`, e.g.
+    /// `https://my-account.documents.azure.com/.default`, matching the Azure
+    /// SDKs; pass `Some(..)` only for a sovereign cloud or another
+    /// non-default audience.
+    ///
+    /// The principal needs a **Cosmos DB data-plane** role assignment (the
+    /// built-in "Cosmos DB Built-in Data Contributor" covers this store's
+    /// reads and writes). Control-plane roles such as "Cosmos DB Account
+    /// Reader" or even Owner grant nothing here, and no role grants database
+    /// or container creation over the data plane — so [`Self::ensure_created`]
+    /// cannot succeed under this constructor and the container must be
+    /// provisioned out of band. Calling it anyway returns an error saying so
+    /// rather than a bare `403`.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use agent_framework_azure::DefaultAzureCredential;
+    /// use agent_framework_cosmos::CosmosChatMessageStore;
+    ///
+    /// # async fn demo() -> agent_framework_core::error::Result<()> {
+    /// let endpoint = "https://my-account.documents.azure.com:443/";
+    /// // The chain's own default scope; the store asks for the same one
+    /// // per request via `get_token_for_scope`, so the two agree.
+    /// let credential = DefaultAzureCredential::new("https://my-account.documents.azure.com/.default");
+    /// let store = CosmosChatMessageStore::with_token_credential(
+    ///     endpoint,
+    ///     Arc::new(credential),
+    ///     "agent-framework",
+    ///     "chat-messages",
+    ///     None,
+    ///     None,
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_token_credential(
+        account_endpoint: impl Into<String>,
+        credential: Arc<dyn TokenCredential>,
+        database_id: impl Into<String>,
+        container_id: impl Into<String>,
+        thread_id: Option<String>,
+        scope: Option<String>,
+    ) -> Result<Self> {
+        let client = CosmosRestClient::with_token_credential(account_endpoint, credential, scope)?;
+        Ok(Self {
+            client,
+            database_id: database_id.into(),
+            container_id: container_id.into(),
+            thread_id: thread_id.unwrap_or_else(|| format!("thread_{}", Uuid::new_v4())),
+        })
+    }
+
     /// This thread's id (also its Cosmos partition key value;
     /// auto-generated if not supplied to [`Self::new`]).
     pub fn thread_id(&self) -> &str {
@@ -263,6 +328,14 @@ impl CosmosChatMessageStore {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::Configuration(format!("state is missing '{name}'")))
         }
+        if state.get("key").is_none() {
+            return Err(Error::Configuration(
+                "state carries no 'key': it was serialized by a store using Microsoft Entra ID \
+                 authentication, whose credential cannot be serialized. Restore it with \
+                 CosmosChatMessageStore::from_state_with_token_credential instead."
+                    .into(),
+            ));
+        }
         let thread_id = field(state, "thread_id")?.to_string();
         let account_endpoint = field(state, "account_endpoint")?.to_string();
         let key = field(state, "key")?.to_string();
@@ -274,6 +347,43 @@ impl CosmosChatMessageStore {
             database_id,
             container_id,
             Some(thread_id),
+        )
+    }
+
+    /// Reconstruct a store from serialized state, supplying the credential
+    /// separately.
+    ///
+    /// A [`TokenCredential`] is a live object — it holds cached tokens and,
+    /// in the managed-identity and CLI cases, a way of reaching an issuer —
+    /// so it cannot round-trip through a state blob the way a master key
+    /// does. [`Self::serialize`] therefore records only *that* the store was
+    /// credential-authenticated, and restoring it means handing the
+    /// credential back in, which is also the shape .NET's
+    /// `CreateFromSerializedState(CosmosClient, ...)` takes (an
+    /// already-authenticated client plus the state).
+    ///
+    /// `scope` follows [`Self::with_token_credential`]. State written by a
+    /// master-key store is accepted too — this is the supported way to move
+    /// an existing conversation onto Entra ID auth without losing its thread
+    /// id — and its embedded key is ignored.
+    pub fn from_state_with_token_credential(
+        state: &Value,
+        credential: Arc<dyn TokenCredential>,
+        scope: Option<String>,
+    ) -> Result<Self> {
+        fn field<'a>(state: &'a Value, name: &str) -> Result<&'a str> {
+            state
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Configuration(format!("state is missing '{name}'")))
+        }
+        Self::with_token_credential(
+            field(state, "account_endpoint")?.to_string(),
+            credential,
+            field(state, "database_id")?.to_string(),
+            field(state, "container_id")?.to_string(),
+            Some(field(state, "thread_id")?.to_string()),
+            scope,
         )
     }
 
@@ -320,15 +430,38 @@ impl CosmosChatMessageStore {
     /// `RedisChatMessageStore::to_dict`, including the `"type"`
     /// discriminator field. See [`Self::from_state`] for the security note
     /// on the embedded master key.
+    ///
+    /// Under Entra ID auth there is no key to embed — the credential is a
+    /// live object, not a value — so `key` is **omitted** and `auth` records
+    /// the mode instead. That state restores through
+    /// [`Self::from_state_with_token_credential`], and is the one shape of
+    /// this blob that is not itself a secret.
     pub async fn serialize(&self) -> Result<Value> {
-        Ok(serde_json::json!({
+        let mut state = serde_json::json!({
             "type": "cosmos_store_state",
             "thread_id": self.thread_id,
             "account_endpoint": self.client.account_endpoint(),
-            "key": self.client.master_key(),
             "database_id": self.database_id,
             "container_id": self.container_id,
-        }))
+        });
+        let map = state
+            .as_object_mut()
+            .expect("serialize builds a JSON object literal");
+        match self.client.master_key() {
+            // Field order in the emitted object is not preserved by
+            // `serde_json`'s default map anyway, so inserting after the
+            // literal costs nothing and keeps the two shapes in one place.
+            Some(key) => {
+                map.insert("key".to_string(), Value::String(key.to_string()));
+            }
+            None => {
+                map.insert(
+                    "auth".to_string(),
+                    Value::String("token_credential".to_string()),
+                );
+            }
+        }
+        Ok(state)
     }
 }
 

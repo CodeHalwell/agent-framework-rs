@@ -53,8 +53,12 @@
 //!   [`crate::CosmosChatMessageStore`]'s module docs already carry for its
 //!   own multi-request operations.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::Value;
+
+use agent_framework_azure::TokenCredential;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
@@ -144,6 +148,26 @@ impl CosmosCheckpointStorage {
         container_id: impl Into<String>,
     ) -> Result<Self> {
         let client = CosmosRestClient::new(account_endpoint, key)?;
+        Ok(Self {
+            client,
+            database_id: database_id.into(),
+            container_id: container_id.into(),
+        })
+    }
+
+    /// As [`Self::new`], but authenticating with Microsoft Entra ID rather
+    /// than a master key — see
+    /// [`CosmosChatMessageStore::with_token_credential`](crate::CosmosChatMessageStore::with_token_credential)
+    /// for the scope default and for why [`Self::ensure_created`] cannot
+    /// succeed in this mode.
+    pub fn with_token_credential(
+        account_endpoint: impl Into<String>,
+        credential: Arc<dyn TokenCredential>,
+        database_id: impl Into<String>,
+        container_id: impl Into<String>,
+        scope: Option<String>,
+    ) -> Result<Self> {
+        let client = CosmosRestClient::with_token_credential(account_endpoint, credential, scope)?;
         Ok(Self {
             client,
             database_id: database_id.into(),

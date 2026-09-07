@@ -9,6 +9,104 @@ independently verified (full workspace build + `cargo test` + clippy
 **Current upstream baseline: `b5d9f4b` (2026-08-31).** Sections are newest
 first; each records the upstream revision it was checked against.
 
+## Azure-ecosystem review (2026-09-07) — drift triage blocked
+
+### The mirror is stale, so no drift window was triaged this pass
+
+The baseline is unchanged at `b5d9f4b` because the mirror has not advanced
+since 2026-08-31. Its scheduled sync has failed on **every** run since
+(2026-09-01 through 09-07, seven consecutive scheduled failures), so there is
+no new upstream history to triage and this pass deliberately reports none
+rather than triaging a window it cannot see.
+
+The cause is not the one the previous pass fixed. That pass moved the sync
+onto the fork-sync API (`POST /repos/{owner}/{repo}/merge-upstream`) on the
+premise that a server-side merge would sidestep GitHub's refusal to let
+GITHUB_TOKEN write `.github/workflows/**`. It does not — the endpoint applies
+the identical rule, and every run since has returned `422`:
+
+> refusing to allow a GitHub App to create or update workflow
+> `.github/workflows/codeql-analysis.yml` without `workflows` permission
+
+Because upstream touches a workflow file regularly, one such commit entering
+the window stops the mirror indefinitely rather than for a single day, which
+is why three successive windows have now been affected.
+
+Fixed in the mirror repo (`CodeHalwell/agent-framework`, branch
+`claude/amazing-mayer-h5ps6a`, awaiting merge to `main`): the sync is a plain
+git merge again, and the pushed ref update is made to contain no change under
+`.github/workflows/**` — after merging, that directory is restored to the
+fork's own version, so the restriction has nothing to apply to. Upstream
+history still merges in full, so the merge base advances and a window is never
+re-attempted; only upstream's CI *files* are frozen, which costs this mirror's
+one consumer nothing. A `SYNC_PAT` secret carrying the `workflow` scope, if
+added, is used instead and drops the exclusion. Verified against a local
+two-repo simulation of both shapes upstream produces (a workflow file modified
+plus one added alongside a source change; and a workflow file edited on the
+same lines by both sides).
+
+**Until that merges, every drift triage remains blind.** The next pass should
+confirm the 06:00 UTC run went green before triaging.
+
+### Ported this pass (1 capability, with regression tests)
+
+The rest of the pass was the Azure-ecosystem review, which does not depend on
+the stale window — the gaps below are structural rather than last-week's
+commits. One of them was closed.
+
+| Gap | Change | Rust site |
+|---|---|---|
+| **Cosmos DB was master-key-only.** `agent-framework-cosmos` signed every request with an HMAC-SHA256 master key and had no Entra ID path, while .NET's `Microsoft.Agents.AI.CosmosNoSql` accepts an already-authenticated `CosmosClient` and therefore any `TokenCredential`. That is not a cosmetic gap: an Azure account with `disableLocalAuth` set — a common governance default, since key-based auth cannot be attributed to a principal or scoped by role — has no master key to give, so the crate could not be used on such an account at all, and a deployment that could use it had to carry a key. The credential machinery already existed one crate away (`agent_framework_azure::credentials`: `DefaultAzureCredential`, `ManagedIdentityCredential`, `WorkloadIdentityCredential`, `ClientSecretCredential`, `AzureCliCredential`, all caching per scope), so this was wiring rather than new infrastructure. `CosmosAuth` now selects between the two modes at the one point that builds the `Authorization` header. Cosmos does **not** take an Entra token as `Authorization: Bearer` — it reuses the master-key envelope as `type=aad&ver=1.0&sig={token}`, percent-encoded — which is the detail a hand-rolled client gets wrong silently, so it is pinned by both a unit test on the header builder and a loopback test on the real outbound request. The default scope is the account endpoint plus `/.default` (Cosmos scopes tokens per account, not to one service-wide audience), overridable for sovereign clouds. | `cosmos/auth.rs` (`aad_authorization_header`), `cosmos/client.rs` (`CosmosAuth`, `with_token_credential`, `authorization`, `management_error`, `normalize_endpoint`), `cosmos/chat_message_store.rs`, `cosmos/checkpoint_storage.rs` |
+
+Two consequences are handled rather than left to surface as confusing
+failures:
+
+- **`ensure_created` cannot work under Entra ID.** Cosmos DB's Entra RBAC
+  covers data-plane actions only; creating a database or container is a
+  control-plane (ARM) operation, so it is refused with `403` no matter which
+  role the principal holds — including Owner. The raw body says only "Request
+  blocked by Auth", which reads like a missing role assignment rather than an
+  operation no assignment can grant. `management_error` attaches the
+  explanation and the way out (provision out of band, or use a master key),
+  and does so *only* under credential auth: a `403` on the master-key path
+  means a wrong or revoked key, and a negative-control test pins that it is
+  not re-labelled.
+- **A credential cannot be serialized.** `serialize()` embeds the master key
+  when there is one; under Entra ID there is no value to embed, so it emits
+  `"auth": "token_credential"` and no `key` — the one shape of this blob that
+  is not itself a secret. `from_state` then fails naming
+  `from_state_with_token_credential`, which takes the credential back in
+  (the same shape as .NET's `CreateFromSerializedState(CosmosClient, ...)`).
+  Master-key state is also accepted there, which is the supported way to move
+  an existing conversation off a key without losing its thread id.
+
+Verified: full workspace build, `cargo test --workspace --all-features`
+(**1724 passing**, 12 of them new), `cargo clippy --all-targets --all-features`
+under `-D warnings` (CI's own flag) clean, `cargo fmt --check` clean. The new
+tests were probed against the behavior they pin: degrading `management_error`
+to the plain error mapping fails the Entra diagnostic test while the
+master-key negative control still passes; emitting `Bearer {token}` instead of
+the AAD envelope fails the two header-shape tests; and dropping the endpoint
+trim before deriving the scope fails the scope-default test (and only it —
+the explicit-override test still passes).
+
+### Reviewed, still open (Azure surface)
+
+The rest of the review, recorded so the next pass starts from a map rather
+than re-deriving one. Nothing below was half-built to improve the table.
+
+| Gap | Where it stands |
+|---|---|
+| **`azure-cosmos-memory`** (Python) | No Rust crate. A `CosmosMemoryContextProvider` doing LLM-backed memory extraction over Cosmos with cadence thresholds and background flush — architecturally a sibling of `agent-framework-mem0`, not of `CosmosChatMessageStore`, so the new Entra work above does not advance it. The nearest existing shape to build on is the Mem0 provider's storage/retrieval scope separation. |
+| **`azure-contentunderstanding`** (Python) | No Rust crate. Document ingestion (media-type sniffing, attachment detection and stripping, doc keys) plus a `FileSearchBackend` abstraction with OpenAI and Foundry implementations, surfaced as a `ContextProvider`. Would be the port's first document-ingestion surface, so it is a design task rather than a transcription. |
+| **`foundry_hosting`** / .NET `Foundry.Hosting` | Standing gap, reconfirmed. `agent-framework-foundry` is a *client*; hosting server-side Foundry agents (sessions, state store, response cancellation, consent URLs) has no Rust equivalent, which is why a long run of upstream commits in recent passes has been "not applicable". |
+| **.NET `Hosting.AzureStorage`** | No Rust equivalent (Azure Blob-backed session persistence, upstream #7639). Now that `agent-framework-cosmos` has both auth modes, a Blob-backed history provider is the natural next Azure storage backend and would reuse the same `TokenCredential`. |
+| **.NET `Workflows.Declarative.Foundry`** | Rides on the declarative-workflow DSL divergence already tracked in `PARITY.md`; not separately actionable. |
+| **Purview protection scopes** | Unchanged: `agent-framework-purview` calls `processContent` only — no `protectionScopes/compute` precheck/ETag caching, no background `contentActivities` audit logging, no JWT-derived tenant/app-location fallback. |
+| **Azure AI Search Knowledge-Base mode** | Unchanged: the crate ports the *semantic* mode only. |
+| **Cosmos, remaining** | `TransactionalBatch` (multi-message adds are one `POST` each), hierarchical partition keys, TTL. |
+| **Foundry embeddings** | Unchanged: text inputs only; the image half needs the core `EmbeddingClient` trait widened past `Vec<String>`, so it is a core change rather than a provider one. |
+
 ## Post-`d8d07eb` drift (checked against `b5d9f4b`, 2026-08-31)
 
 The mirror had stopped advancing on 2026-08-29 (its sync workflow was failing

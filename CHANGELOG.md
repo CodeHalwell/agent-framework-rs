@@ -5,6 +5,35 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Added
+
+- **Microsoft Entra ID authentication for `agent-framework-cosmos`.**
+  `CosmosChatMessageStore::with_token_credential` and
+  `CosmosCheckpointStorage::with_token_credential` take any
+  `agent_framework_azure::TokenCredential`, so a Cosmos store authenticates
+  with a managed identity, a workload identity, or the Azure CLI instead of a
+  master key — and a Cosmos account with `disableLocalAuth` set, which has no
+  key to give, becomes usable at all. The token scope defaults to the account
+  endpoint plus `/.default` and is overridable for sovereign clouds.
+  `CosmosChatMessageStore::from_state_with_token_credential` restores a
+  serialized store, since a credential cannot round-trip through a state blob
+  the way a key does.
+
+  Note that Cosmos DB's Entra RBAC grants data-plane actions only:
+  `ensure_created` cannot succeed with a token whatever role the principal
+  holds, so the database and container must be provisioned out of band. The
+  call now says so rather than surfacing a bare `403`.
+
+### Changed
+
+- `CosmosChatMessageStore::serialize` omits `key` and emits
+  `"auth": "token_credential"` for a credential-authenticated store (a
+  master-key store's state is unchanged). `from_state` on such a blob now
+  returns an error naming `from_state_with_token_credential` rather than
+  reporting a missing field.
+
 ## [0.5.0] — 2026-08-31
 
 Embeddings for two more providers, and a Gemini finish-reason fix.
