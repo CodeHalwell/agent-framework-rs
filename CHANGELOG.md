@@ -60,7 +60,12 @@ may break APIs).
   present, and streamed coalescing keeps refusal and ordinary text in separate
   content items. The Chat Completions parser also used to emit a refusal only
   when there was no content, hiding a model that answered part of a request
-  and declined part; both are now kept.
+  and declined part; both are now kept. Streamed refusals are parsed too
+  (`delta.refusal` on Chat Completions, `response.refusal.delta` on
+  Responses) — they were dropped outright, so a streamed decline reached the
+  caller as an empty response. And `structured_output_text` withholds a
+  refused turn, so `parse_json` / `value` cannot be populated from a refusal
+  (nor fall back to an older turn's JSON and serve it as this run's answer).
 
 - **Two approvals pending under one provider `call_id` are no longer
   conflated.** They were matched structurally, so a second pending approval

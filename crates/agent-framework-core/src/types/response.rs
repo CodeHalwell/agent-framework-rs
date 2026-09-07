@@ -107,6 +107,17 @@ pub fn structured_output_text(messages: &[Message]) -> String {
         if message.role.as_str() != Role::ASSISTANT {
             continue;
         }
+        // A refusal means there is no structured output to find. Returning
+        // empty here — rather than skipping the refusal and scanning further
+        // back — is deliberate twice over: the refusal's own text must not be
+        // parsed as the answer (a refusal that happens to contain JSON would
+        // otherwise populate `value` as though the run succeeded), and an
+        // *older* assistant message's JSON must not be served as this run's
+        // result either. `parse_json` then fails, which is the honest outcome
+        // for a request the model declined.
+        if message.has_refusal() {
+            return String::new();
+        }
         let text: String = message
             .contents
             .iter()
@@ -657,6 +668,51 @@ mod tests {
     fn from_updates_without_format_leaves_value_none() {
         let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
         assert_eq!(resp.value, None);
+    }
+
+    #[test]
+    fn structured_output_is_withheld_when_the_model_refused() {
+        // The nastiest shape: a refusal that happens to contain valid JSON.
+        // Concatenating every text content would parse it into `value` as
+        // though the run had succeeded.
+        let messages = vec![Message {
+            contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                r#"{"error": "I can't help"}"#,
+            ))],
+            ..Message::new(Role::assistant(), "")
+        }];
+        assert_eq!(structured_output_text(&messages), "");
+
+        let resp = ChatResponse {
+            messages,
+            ..Default::default()
+        };
+        assert!(
+            resp.parse_json::<serde_json::Value>().is_err(),
+            "a refusal must not parse as the structured answer"
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_fall_back_to_an_older_assistant_answer() {
+        // Scanning past the refusal would serve a previous turn's JSON as
+        // this run's result — stale data presented as fresh.
+        let messages = vec![
+            Message::assistant(r#"{"answer": 1}"#),
+            Message {
+                contents: vec![Content::Text(crate::types::content::TextContent::refusal(
+                    "no",
+                ))],
+                ..Message::new(Role::assistant(), "")
+            },
+        ];
+        assert_eq!(structured_output_text(&messages), "");
+    }
+
+    #[test]
+    fn structured_output_is_unaffected_without_a_refusal() {
+        let messages = vec![Message::assistant(r#"{"answer": 1}"#)];
+        assert_eq!(structured_output_text(&messages), r#"{"answer": 1}"#);
     }
 
     #[test]

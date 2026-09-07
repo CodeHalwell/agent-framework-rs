@@ -1172,6 +1172,24 @@ fn parse_responses_event(
                 ..Default::default()
             })
         }
+        // A refusal streams on its own channel. Only the incremental `.delta`
+        // is consumed: the terminal `response.refusal.done` repeats the whole
+        // refusal, which aggregation would append to the fragments already
+        // collected, doubling it — the same reason the text channel above
+        // does not consume its `.done`. Dropping these events entirely, as
+        // this parser used to, let a streamed decline reach the caller as an
+        // empty response.
+        "response.refusal.delta" => {
+            let text = value.get("delta").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                return EventOutcome::None;
+            }
+            EventOutcome::Update(ChatResponseUpdate {
+                contents: vec![Content::Text(TextContent::refusal(text))],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            })
+        }
         // Reasoning (chain-of-thought / summary) streams as its own text
         // channel. Both the incremental `.delta` and the terminal `.done`
         // (full text) map to `TextReasoningContent`, mirroring upstream
@@ -2263,6 +2281,26 @@ mod tests {
     fn reasoning_event(value: Value) -> EventOutcome {
         let mut ids = HashMap::new();
         parse_responses_event(&value, &mut ids, None)
+    }
+
+    #[test]
+    fn a_streamed_refusal_is_marked_and_its_done_event_is_not_duplicated() {
+        // Before this, `response.refusal.delta` fell through the catch-all
+        // and a streamed decline reached the caller as an empty response —
+        // the non-streaming path marked refusals while the streaming path
+        // dropped them.
+        let EventOutcome::Update(delta) =
+            reasoning_event(json!({ "type": "response.refusal.delta", "delta": "I can't" }))
+        else {
+            panic!("expected update");
+        };
+        assert!(matches!(&delta.contents[0], Content::Text(t) if t.refusal && t.text == "I can't"));
+
+        // `.done` repeats the whole refusal; emitting it would double the
+        // text already streamed, exactly as for the text channel.
+        let done =
+            reasoning_event(json!({ "type": "response.refusal.done", "refusal": "I can't help" }));
+        assert!(matches!(done, EventOutcome::None));
     }
 
     #[test]

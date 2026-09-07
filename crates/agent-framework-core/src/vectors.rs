@@ -845,6 +845,16 @@ impl VectorCollection for InMemoryCollection {
             .distance_function
             .clone()
             .unwrap_or_else(|| DistanceFunction::new(DistanceFunction::COSINE_SIMILARITY));
+        // The declared width, checked against both the query and every stored
+        // vector below.
+        let dimensions = field.dimensions.unwrap_or_default();
+        if vector.len() != dimensions {
+            return Err(Error::Configuration(format!(
+                "query vector has {} dimensions but field '{}' declares {dimensions}",
+                vector.len(),
+                field.name
+            )));
+        }
         let higher_is_closer = distance.higher_is_closer().ok_or_else(|| {
             Error::Configuration(format!(
                 "InMemoryVectorStore cannot rank by distance function '{}': its direction is \
@@ -859,10 +869,24 @@ impl VectorCollection for InMemoryCollection {
             let Some(stored_vector) = record.get(&field_name).and_then(Value::as_array) else {
                 continue;
             };
-            let stored: Vec<f32> = stored_vector
+            // Every element must be a number. `filter_map`ing the bad ones
+            // away silently reshapes the vector — `[1, "bad", 0, 0]` becomes
+            // `[1, 0, 0]`, which then matches a three-dimensional query
+            // perfectly — so schema-invalid data ranked as a top result.
+            let Some(stored) = stored_vector
                 .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect();
+                .map(|v| v.as_f64().map(|f| f as f32))
+                .collect::<Option<Vec<f32>>>()
+            else {
+                continue;
+            };
+            // And it must be the declared width. Two vectors of the same
+            // *wrong* length compare fine to `score_vectors`, so without this
+            // a collection whose records disagree with its own definition
+            // still returns confident hits.
+            if stored.len() != dimensions {
+                continue;
+            }
             if let Some(score) = score_vectors(&distance, &vector, &stored) {
                 scored.push((score, record));
             }
@@ -1223,6 +1247,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("direction is unknown"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_vector_with_a_non_numeric_element_is_not_ranked() {
+        // Filtering the bad element away reshaped the vector: a declared
+        // 3-dimensional `[1, "bad", 0, 0]` became `[1, 0, 0]` and scored as a
+        // perfect match, so schema-invalid data came back as the top result.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![json!({
+            "id": "bad", "text": "t", "embedding": [1.0, "bad", 0.0, 0.0]
+        })])
+        .await
+        .unwrap();
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "a malformed vector must not rank");
+    }
+
+    #[tokio::test]
+    async fn a_stored_vector_of_the_wrong_width_is_not_ranked() {
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "short", "text": "t", "embedding": [1.0, 0.0]}),
+            json!({"id": "ok", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_query_vector_of_the_wrong_width_is_an_error() {
+        // Two vectors of the same *wrong* length compare fine, so without
+        // this a mismatched query silently returns confident hits.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        let err = c
+            .search(vec![1.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dimensions"), "{err}");
     }
 
     #[tokio::test]

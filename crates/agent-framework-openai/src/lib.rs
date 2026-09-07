@@ -419,6 +419,17 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
                     contents.push(Content::Text(TextContent::new(text)));
                 }
             }
+            // A streamed refusal arrives on its own `delta.refusal` channel,
+            // fragmented like content. Without this it was dropped outright,
+            // so a streamed decline reached the caller as an empty response —
+            // and the non-streaming path's refusal marking had no streaming
+            // counterpart. Marked, so aggregation keeps it separate from
+            // ordinary text and `Message::text` withholds it.
+            if let Some(text) = delta.get("refusal").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    contents.push(Content::Text(TextContent::refusal(text)));
+                }
+            }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
@@ -480,6 +491,42 @@ mod tests {
     // Canned status+body combinations run through the exact classification
     // `OpenAIChatCompletionClient::post` and `responses::OpenAIChatClient::post`
     // both delegate to.
+
+    #[test]
+    fn a_streamed_chat_refusal_is_parsed_and_marked() {
+        // `delta.refusal` is its own channel, fragmented like content. It was
+        // not read at all, so a streamed decline vanished entirely.
+        let mut ids = HashMap::new();
+        let update = parse_delta(
+            &serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{ "delta": { "role": "assistant", "refusal": "I can't" } }],
+            }),
+            &mut ids,
+        )
+        .expect("a refusal delta must produce an update");
+        assert!(
+            matches!(&update.contents[0], Content::Text(t) if t.refusal && t.text == "I can't")
+        );
+
+        // Aggregated across fragments, and kept apart from ordinary text.
+        let mut ids = HashMap::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"content": "here: "}}]}),
+            serde_json::json!({"choices": [{"delta": {"refusal": "I can't "}}]}),
+            serde_json::json!({"choices": [{"delta": {"refusal": "help"}}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .collect();
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        assert_eq!(
+            resp.messages[0].refusal_text().as_deref(),
+            Some("I can't help")
+        );
+        // `text()` withholds it rather than presenting the partial answer.
+        assert_eq!(resp.text(), "");
+    }
 
     #[test]
     fn classifies_401_and_403_as_invalid_auth() {
