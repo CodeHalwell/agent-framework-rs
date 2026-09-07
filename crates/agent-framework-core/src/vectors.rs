@@ -774,7 +774,7 @@ impl VectorCollection for InMemoryCollection {
             stored.push(self.definition.to_storage(record)?);
         }
         self.with_data(|d| {
-            for (key, record) in keys.iter().zip(stored.into_iter()) {
+            for (key, record) in keys.iter().zip(stored) {
                 d.records.insert(key_string(key), record);
             }
         });
