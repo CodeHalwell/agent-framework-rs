@@ -26,7 +26,52 @@ may break APIs).
   holds, so the database and container must be provisioned out of band. The
   call now says so rather than surfacing a bare `403`.
 
+- **Vector-store abstractions** (`agent_framework_core::vectors`):
+  `VectorStoreField`, `VectorStoreCollectionDefinition`, `IndexKind`,
+  `DistanceFunction`, `VectorSearchOptions`, `VectorSearchResult`, the
+  object-safe `VectorCollection` and `VectorStore` traits, and an
+  `InMemoryVectorStore`. Records are `serde_json::Value` objects keyed by
+  field name; a definition maps logical names to storage names. No provider
+  crate implements the traits yet.
+
+- **`preserve_first_user()`** on the `Truncation`, `SlidingWindow` and
+  `TokenBudget` compaction strategies: retain the earliest user message
+  whatever the budget, so a long conversation cannot lose the request it is
+  about. Off by default; a preserved message is kept regardless of budget, so
+  the result may exceed the configured limit by one.
+
+- **`FunctionCallContent::id`**, a framework-generated occurrence id
+  (`af-call-<uuid>`) minted when a call is deferred for approval, plus
+  `ensure_occurrence_id()` and `same_invocation()`. Approvals now bind to a
+  specific occurrence rather than to the provider `call_id`, which providers
+  reuse.
+
+- **`TextContent::refusal`** and `TextContent::refusal(..)`, plus
+  `Message::has_refusal()` / `Message::refusal_text()`.
+
 ### Fixed
+
+- **Provider refusals no longer read as answers.** An OpenAI refusal was
+  parsed into plain text, so `Message::text()` returned it as though the model
+  had answered and `parse_json` would try to parse it as the requested output.
+  Refusal text is now marked, `Message::text()` returns `""` when one is
+  present, and streamed coalescing keeps refusal and ordinary text in separate
+  content items. The Chat Completions parser also used to emit a refusal only
+  when there was no content, hiding a model that answered part of a request
+  and declined part; both are now kept.
+
+- **Two approvals pending under one provider `call_id` are no longer
+  conflated.** They were matched structurally, so a second pending approval
+  for the same call looked like a replay and was dropped, and one result
+  answered both. Occurrence ids now decide identity when present, with the
+  structural rule as a fallback so approvals stored before this keep
+  resolving.
+
+- **Purview asks for inline evaluation.** Every `processContent` request now
+  carries `Prefer: evaluateInline`. Without it the service may evaluate
+  content offline and return no actionable verdict, which would leave the
+  blocking middleware with nothing to decide on — enforcement would quietly
+  become a no-op rather than fail.
 
 - **A token count reported as zero is no longer dropped from the OpenAI usage
   breakdown.** `parse_usage` skipped any `completion_tokens_details.*` /

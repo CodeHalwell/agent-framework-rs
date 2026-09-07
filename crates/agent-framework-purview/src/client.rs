@@ -30,6 +30,31 @@ use crate::settings::PurviewSettings;
 
 const PURVIEW_USER_AGENT: &str = concat!("agent-framework-rs-purview/", env!("CARGO_PKG_VERSION"));
 
+/// `Prefer: evaluateInline` — sent on **every** `processContent` request this
+/// crate makes.
+///
+/// Purview can evaluate content either inline (the DLP verdict comes back on
+/// this response) or offline (the service accepts the content and evaluates
+/// it out of band, so the response carries no actionable verdict). Upstream
+/// picks per request from the protection-scopes precheck: the cached scope's
+/// execution mode when there is one, and unconditionally inline when the
+/// scope cache is cold (Python `ScopedContentProcessor`, .NET
+/// `ScopedContentProcessor`; both then set a `Prefer: evaluateInline`
+/// header).
+///
+/// This crate performs no precheck and holds no scope cache, so *every*
+/// request it makes is upstream's cold-cache case. It is also the only case
+/// that can work here: [`crate::middleware`] blocks a prompt or a response on
+/// the verdict in this reply, so an offline evaluation would leave it with
+/// nothing to decide on and silently turn enforcement into a no-op. The
+/// header is therefore a constant rather than a request field.
+const PREFER_EVALUATE_INLINE: &str = "evaluateInline";
+
+/// The `Prefer` header name. Not in `reqwest::header`'s constant set (it is
+/// an RFC 7240 header rather than one of the well-known HTTP/1.1 ones), so it
+/// is spelled out here.
+const PREFER_HEADER: &str = "prefer";
+
 /// Calls the Microsoft Graph `dataSecurityAndGovernance/processContent`
 /// endpoint. See the module docs for how this differs in scope from
 /// Python's `PurviewClient`.
@@ -83,6 +108,10 @@ impl PurviewClient {
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/json")
             .header(USER_AGENT, PURVIEW_USER_AGENT)
+            // See PREFER_EVALUATE_INLINE: this crate's verdict is only useful
+            // if it comes back on this response, so it always asks for inline
+            // evaluation.
+            .header(PREFER_HEADER, PREFER_EVALUATE_INLINE)
             .json(request)
             .send()
             .await

@@ -332,20 +332,20 @@ pub fn parse_response(value: &Value) -> ChatResponse {
     {
         let mut contents: Vec<Content> = Vec::new();
         if let Some(msg) = choice.get("message") {
-            let mut has_text = false;
             if let Some(text) = msg.get("content").and_then(Value::as_str) {
                 if !text.is_empty() {
                     contents.push(Content::Text(TextContent::new(text)));
-                    has_text = true;
                 }
             }
-            // A refusal is surfaced as plain text (mirrors upstream
-            // `_parse_text_from_choice`), used only when there is no content.
-            if !has_text {
-                if let Some(refusal) = msg.get("refusal").and_then(Value::as_str) {
-                    if !refusal.is_empty() {
-                        contents.push(Content::Text(TextContent::new(refusal)));
-                    }
+            // A refusal is surfaced as text *marked as a refusal*, so it can
+            // never be mistaken for the answer (mirrors upstream #7992). It is
+            // emitted whether or not ordinary content is present: the two are
+            // separate content items, and dropping the refusal when content
+            // happens to accompany it would hide the fact that the model
+            // declined part of what was asked.
+            if let Some(refusal) = msg.get("refusal").and_then(Value::as_str) {
+                if !refusal.is_empty() {
+                    contents.push(Content::Text(TextContent::refusal(refusal)));
                 }
             }
             if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
@@ -873,7 +873,7 @@ mod tests {
     // region: response parsing
 
     #[test]
-    fn refusal_is_parsed_as_text() {
+    fn a_refusal_is_marked_and_withheld_from_text() {
         let value = json!({
             "id": "chatcmpl-1",
             "model": "gpt-4o",
@@ -883,17 +883,74 @@ mod tests {
             }],
         });
         let resp = parse_response(&value);
-        assert_eq!(resp.text(), "I can't help with that.");
+
+        // The refusal must not read as the answer: a caller doing
+        // `resp.text()` (or parse_json over it) would otherwise treat the
+        // model's decline as the output it asked for.
+        assert_eq!(resp.text(), "");
+
+        let message = &resp.messages[0];
+        assert!(message.has_refusal());
+        assert_eq!(
+            message.refusal_text().as_deref(),
+            Some("I can't help with that.")
+        );
+        // Still carried as content, so nothing is lost — only reclassified.
+        assert!(matches!(
+            &message.contents[0],
+            Content::Text(t) if t.refusal && t.text == "I can't help with that."
+        ));
     }
 
     #[test]
-    fn content_takes_precedence_over_refusal() {
+    fn a_refusal_alongside_content_is_kept_rather_than_dropped() {
+        // Both halves are real: the model answered part of the request and
+        // declined part of it. Returning only the content would hide the
+        // decline; returning only the refusal would lose the answer.
         let value = json!({
             "choices": [{
                 "message": { "role": "assistant", "content": "answer", "refusal": "nope" },
             }],
         });
         let resp = parse_response(&value);
+        let message = &resp.messages[0];
+
+        assert!(message.has_refusal());
+        assert_eq!(message.refusal_text().as_deref(), Some("nope"));
+        // `text()` is withheld whenever a refusal is present, so a caller
+        // cannot silently consume a partial answer as a complete one.
+        assert_eq!(resp.text(), "");
+        let texts: Vec<&str> = message
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["answer", "nope"]);
+    }
+
+    #[test]
+    fn an_empty_refusal_field_marks_nothing() {
+        let value = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "answer", "refusal": "" },
+            }],
+        });
+        let resp = parse_response(&value);
+        assert!(!resp.messages[0].has_refusal());
+        assert_eq!(resp.text(), "answer");
+    }
+
+    #[test]
+    fn ordinary_text_is_never_marked_as_a_refusal() {
+        let value = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "answer" } }],
+        });
+        let resp = parse_response(&value);
+        assert!(!resp.messages[0].has_refusal());
+        assert_eq!(resp.messages[0].refusal_text(), None);
         assert_eq!(resp.text(), "answer");
     }
 

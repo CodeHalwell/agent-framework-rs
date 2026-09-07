@@ -610,6 +610,11 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                 out.push(Content::Text(TextContent {
                     text: text.to_string(),
                     annotations: parse_citations(block),
+                    // Anthropic signals a refusal through `stop_reason:
+                    // "refusal"` on the message rather than a distinct content
+                    // block, so a text block here is ordinary text. See the
+                    // stop-reason mapping to `FinishReason::CONTENT_FILTER`.
+                    refusal: false,
                 }));
             }
             "tool_use" | "mcp_tool_use" | "server_tool_use" => {

@@ -57,6 +57,7 @@ pub mod skills;
 pub mod streaming;
 pub mod tools;
 pub mod types;
+pub mod vectors;
 pub mod workflow;
 
 pub use error::{Error, Result};

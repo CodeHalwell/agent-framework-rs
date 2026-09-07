@@ -742,7 +742,9 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                         }
                         Some("refusal") => {
                             if let Some(text) = part.get("refusal").and_then(Value::as_str) {
-                                contents.push(Content::Text(TextContent::new(text)));
+                                // Marked, so `Message::text` withholds it
+                                // rather than presenting it as the answer.
+                                contents.push(Content::Text(TextContent::refusal(text)));
                             }
                         }
                         _ => {}

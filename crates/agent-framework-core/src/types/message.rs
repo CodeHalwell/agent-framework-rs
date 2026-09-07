@@ -121,12 +121,50 @@ impl Message {
     }
 
     /// The concatenated text of all text content items (space-joined).
+    ///
+    /// Returns an **empty string** when the message carries a provider
+    /// refusal (see [`TextContent::refusal`](super::content::TextContent::refusal)).
+    /// A refusal is the model declining to answer; handing its text back here
+    /// would present it as the answer, which is how a caller ends up parsing
+    /// "I can't help with that" as its requested JSON. Reach for
+    /// [`Self::refusal_text`] to read it deliberately, or [`Self::has_refusal`]
+    /// to branch. Mirrors upstream's `Message.text` (#7992).
     pub fn text(&self) -> String {
+        if self.has_refusal() {
+            return String::new();
+        }
         self.contents
             .iter()
             .filter_map(Content::as_text)
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Whether any content item is a provider refusal.
+    pub fn has_refusal(&self) -> bool {
+        self.contents
+            .iter()
+            .any(|c| matches!(c, Content::Text(t) if t.refusal))
+    }
+
+    /// The refusal text, when the model declined — `None` otherwise.
+    ///
+    /// Several refusal items (which streaming can produce) are space-joined,
+    /// matching [`Self::text`]'s convention for ordinary text.
+    pub fn refusal_text(&self) -> Option<String> {
+        let parts: Vec<&str> = self
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) if t.refusal => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
     }
 
     /// The function-call content items in this message.
@@ -202,5 +240,71 @@ impl IntoMessages for Vec<String> {
 impl IntoMessages for Vec<&str> {
     fn into_messages(self) -> Vec<Message> {
         self.into_iter().map(Message::user).collect()
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::types::content::TextContent;
+
+    fn refusal_message() -> Message {
+        Message {
+            contents: vec![
+                Content::Text(TextContent::new("here is half an answer")),
+                Content::Text(TextContent::refusal("I can't do the rest")),
+            ],
+            ..Message::new(Role::assistant(), "")
+        }
+    }
+
+    #[test]
+    fn text_is_withheld_when_a_refusal_is_present() {
+        // The whole point: a caller reading `.text()` must not receive
+        // something that reads like the answer when the model declined.
+        assert_eq!(refusal_message().text(), "");
+    }
+
+    #[test]
+    fn refusal_text_reads_the_decline_deliberately() {
+        assert_eq!(
+            refusal_message().refusal_text().as_deref(),
+            Some("I can't do the rest")
+        );
+        assert!(refusal_message().has_refusal());
+    }
+
+    #[test]
+    fn several_refusal_items_join_like_ordinary_text() {
+        // Streaming can split one refusal across chunks.
+        let m = Message {
+            contents: vec![
+                Content::Text(TextContent::refusal("I can't")),
+                Content::Text(TextContent::refusal("help with that")),
+            ],
+            ..Message::new(Role::assistant(), "")
+        };
+        assert_eq!(m.refusal_text().as_deref(), Some("I can't help with that"));
+    }
+
+    #[test]
+    fn an_ordinary_message_is_unaffected() {
+        let m = Message::assistant("the answer");
+        assert!(!m.has_refusal());
+        assert_eq!(m.refusal_text(), None);
+        assert_eq!(m.text(), "the answer");
+    }
+
+    #[test]
+    fn the_refusal_flag_round_trips_through_serde() {
+        let m = refusal_message();
+        let restored: Message = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert!(restored.has_refusal());
+        assert_eq!(restored.text(), "");
+
+        // And an ordinary message serializes without the field at all, so the
+        // wire shape is unchanged for everything that is not a refusal.
+        let plain = serde_json::to_value(Message::assistant("hi")).unwrap();
+        assert!(plain["contents"][0].get("refusal").is_none());
     }
 }

@@ -473,7 +473,7 @@ fn replace_approval_contents_with_results(
                     // as expendable.
                     if let Some(position) = outstanding
                         .iter()
-                        .position(|entry| entry.from_request && entry.call == *fc)
+                        .position(|entry| entry.from_request && entry.call.same_invocation(fc))
                     {
                         outstanding[position].from_request = false;
                         to_remove.push(idx);
@@ -494,7 +494,7 @@ fn replace_approval_contents_with_results(
                     // dropping a request answers no call.
                     if outstanding
                         .iter()
-                        .any(|entry| entry.call == req.function_call)
+                        .any(|entry| entry.call.same_invocation(&req.function_call))
                     {
                         to_remove.push(idx);
                     } else {
@@ -509,9 +509,15 @@ fn replace_approval_contents_with_results(
                 }
                 Content::FunctionApprovalResponse(resp) => {
                     let call_id = resp.function_call.call_id.clone();
+                    // Mirrors how the results were keyed above.
+                    let result_key = resp
+                        .function_call
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| call_id.clone());
                     let mut answered = false;
                     if resp.approved {
-                        if let Some(result) = approved_results.get(&call_id) {
+                        if let Some(result) = approved_results.get(&result_key) {
                             *content = Content::FunctionResult(result.clone());
                             answered = true;
                         }
@@ -624,7 +630,13 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         )
                         .await?;
                         had_error |= is_error;
-                        approved_results.insert(content.call_id.clone(), content);
+                        // Keyed by occurrence id when the call carries one, so
+                        // two approvals pending under the same provider
+                        // `call_id` get their own results instead of one
+                        // overwriting the other. Falls back to `call_id` for a
+                        // call that predates occurrence ids.
+                        let key = call.id.clone().unwrap_or_else(|| content.call_id.clone());
+                        approved_results.insert(key, content);
                     }
                     replace_approval_contents_with_results(&mut conversation, &approved_results);
                     if had_error {
@@ -685,15 +697,42 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 });
                 if needs_approval {
                     let mut resp = response;
-                    let approval_contents: Vec<Content> = calls
-                        .iter()
+                    // This is the one moment a call stops being answered within
+                    // its turn: it now has to survive a round trip and come back
+                    // matched to an approval. A provider `call_id` cannot carry
+                    // that on its own — providers reuse ids, so two approvals
+                    // pending at once under one id are indistinguishable and
+                    // approving either could resolve the other. Mint an
+                    // occurrence id here and stamp it on the call itself, so the
+                    // request, the response derived from it, and the replayed
+                    // call all carry the same identity.
+                    let mut identified_calls = calls.clone();
+                    let approval_contents: Vec<Content> = identified_calls
+                        .iter_mut()
                         .map(|c| {
+                            let occurrence_id = c.ensure_occurrence_id().to_string();
                             Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
-                                id: c.call_id.clone(),
+                                id: occurrence_id,
                                 function_call: c.clone(),
                             })
                         })
                         .collect();
+                    // The response's own copies of the calls must carry the id
+                    // too: they are what a caller replays back, and a replay
+                    // without the id would fall back to structural matching and
+                    // reintroduce the ambiguity the id exists to remove.
+                    for message in resp.messages.iter_mut() {
+                        for content in message.contents.iter_mut() {
+                            if let Content::FunctionCall(fc) = content {
+                                if let Some(identified) = identified_calls
+                                    .iter()
+                                    .find(|c| c.same_invocation(fc) || c.call_id == fc.call_id)
+                                {
+                                    fc.id = identified.id.clone();
+                                }
+                            }
+                        }
+                    }
                     if let Some(m) = resp
                         .messages
                         .iter_mut()
@@ -1293,6 +1332,137 @@ mod approval_replacement_tests {
             .map(|fc| fc.call_id.as_str())
             .collect()
     }
+
+    /// A call carrying an explicit occurrence id.
+    fn identified_call(call_id: &str, occurrence: &str) -> FunctionCallContent {
+        let mut c = call(call_id);
+        c.id = Some(occurrence.to_string());
+        c
+    }
+
+    fn identified_request(call_id: &str, occurrence: &str) -> Message {
+        Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionApprovalRequest(
+                FunctionApprovalRequestContent {
+                    id: occurrence.to_string(),
+                    function_call: identified_call(call_id, occurrence),
+                },
+            )],
+        )
+    }
+
+    // region: occurrence identity
+
+    #[test]
+    fn two_pending_approvals_sharing_a_call_id_stay_distinct() {
+        // The case occurrence ids exist for. Providers reuse `call_id`, so two
+        // approvals outstanding at once under one id were indistinguishable:
+        // the second request looked like a replay of the first and was
+        // dropped, leaving one of the two calls never declared. With distinct
+        // occurrence ids both are genuine invocations and both must expand.
+        let mut messages = vec![
+            identified_request("c1", "af-call-one"),
+            identified_request("c1", "af-call-two"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1", "c1"]);
+    }
+
+    #[test]
+    fn a_replayed_request_for_the_same_occurrence_is_still_deduped() {
+        // The counterpart: same occurrence id really is the same invocation,
+        // so a replay collapses exactly as it did before.
+        let mut messages = vec![
+            identified_request("c1", "af-call-one"),
+            identified_request("c1", "af-call-one"),
+        ];
+        replace_approval_contents_with_results(&mut messages, &HashMap::new());
+        assert_eq!(function_calls(&messages), vec!["c1"]);
+    }
+
+    #[test]
+    fn approved_results_are_matched_by_occurrence_id() {
+        // Two approvals under one `call_id`, each with its own result. Keying
+        // by `call_id` alone would let one result answer both.
+        let mut approved: HashMap<String, FunctionResultContent> = HashMap::new();
+        approved.insert(
+            "af-call-one".into(),
+            FunctionResultContent {
+                call_id: "c1".into(),
+                result: Some(Value::String("first".into())),
+                exception: None,
+            },
+        );
+        approved.insert(
+            "af-call-two".into(),
+            FunctionResultContent {
+                call_id: "c1".into(),
+                result: Some(Value::String("second".into())),
+                exception: None,
+            },
+        );
+
+        let mut messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionApprovalResponse(FunctionApprovalResponseContent {
+                    approved: true,
+                    id: "af-call-one".into(),
+                    function_call: identified_call("c1", "af-call-one"),
+                }),
+                Content::FunctionApprovalResponse(FunctionApprovalResponseContent {
+                    approved: true,
+                    id: "af-call-two".into(),
+                    function_call: identified_call("c1", "af-call-two"),
+                }),
+            ],
+        )];
+        replace_approval_contents_with_results(&mut messages, &approved);
+
+        let results: Vec<&str> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_result)
+            .filter_map(|fr| fr.result.as_ref().and_then(Value::as_str))
+            .collect();
+        assert_eq!(results, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn a_legacy_approval_without_an_occurrence_id_still_resolves() {
+        // State written before occurrence ids existed must keep working: the
+        // result is keyed by `call_id` and found by the structural fallback.
+        let mut approved: HashMap<String, FunctionResultContent> = HashMap::new();
+        approved.insert(
+            "c1".into(),
+            FunctionResultContent {
+                call_id: "c1".into(),
+                result: Some(Value::String("legacy".into())),
+                exception: None,
+            },
+        );
+        let mut messages = vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionApprovalResponse(
+                FunctionApprovalResponseContent {
+                    approved: true,
+                    id: "req_c1".into(),
+                    function_call: call("c1"),
+                },
+            )],
+        )];
+        replace_approval_contents_with_results(&mut messages, &approved);
+        let results: Vec<&str> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(Content::as_function_result)
+            .filter_map(|fr| fr.result.as_ref().and_then(Value::as_str))
+            .collect();
+        assert_eq!(results, vec!["legacy"]);
+    }
+
+    // endregion
 
     #[test]
     fn an_approval_request_in_a_separate_message_does_not_duplicate_the_call() {

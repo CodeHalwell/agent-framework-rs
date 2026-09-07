@@ -348,7 +348,16 @@ fn coalesce_text(contents: &mut Vec<Content>) {
     let mut out: Vec<Content> = Vec::with_capacity(contents.len());
     for c in contents.drain(..) {
         match (out.last_mut(), &c) {
-            (Some(Content::Text(prev)), Content::Text(cur)) => prev.text.push_str(&cur.text),
+            // Only fragments of the *same kind* merge. A refusal and ordinary
+            // text are different kinds of output that a provider can stream
+            // back to back, and merging them would fold the refusal into the
+            // answer under whichever flag the first fragment happened to
+            // carry — silently losing the marker, or mislabelling a real
+            // answer as a refusal. Upstream splits on the same boundary
+            // (#7992).
+            (Some(Content::Text(prev)), Content::Text(cur)) if prev.refusal == cur.refusal => {
+                prev.text.push_str(&cur.text)
+            }
             (Some(Content::TextReasoning(prev)), Content::TextReasoning(cur)) => {
                 prev.text.push_str(&cur.text);
                 if let Some(token) = cur.protected_data.as_ref().filter(|t| !t.is_empty()) {
@@ -648,6 +657,49 @@ mod tests {
     fn from_updates_without_format_leaves_value_none() {
         let resp = ChatResponse::from_updates(vec![text_update("{\"a\": 1}")]);
         assert_eq!(resp.value, None);
+    }
+
+    #[test]
+    fn coalesce_keeps_a_refusal_separate_from_ordinary_text() {
+        // A provider can stream an answer and a refusal back to back. Merging
+        // them would fold the refusal into the answer under the first
+        // fragment's flag, so `Message::text` would hand the whole thing back
+        // as though the model had answered.
+        let mut contents = vec![
+            Content::Text(crate::types::content::TextContent::new("here is ")),
+            Content::Text(crate::types::content::TextContent::new("half an answer")),
+            Content::Text(crate::types::content::TextContent::refusal("I can't ")),
+            Content::Text(crate::types::content::TextContent::refusal("do the rest")),
+        ];
+        coalesce_text(&mut contents);
+
+        assert_eq!(
+            contents.len(),
+            2,
+            "fragments of each kind merge, kinds do not"
+        );
+        match (&contents[0], &contents[1]) {
+            (Content::Text(answer), Content::Text(refusal)) => {
+                assert!(!answer.refusal);
+                assert_eq!(answer.text, "here is half an answer");
+                assert!(refusal.refusal);
+                assert_eq!(refusal.text, "I can't do the rest");
+            }
+            other => panic!("unexpected contents: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_still_merges_ordinary_text_fragments() {
+        // Negative control: the split must not fragment normal streaming.
+        let mut contents = vec![
+            Content::Text(crate::types::content::TextContent::new("a")),
+            Content::Text(crate::types::content::TextContent::new("b")),
+            Content::Text(crate::types::content::TextContent::new("c")),
+        ];
+        coalesce_text(&mut contents);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].as_text(), Some("abc"));
     }
 
     // region: opaque fields survive streaming coalescence (PR #12 review)
