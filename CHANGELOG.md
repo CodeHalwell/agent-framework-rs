@@ -28,6 +28,12 @@ may break APIs).
   holds, so the database and container must be provisioned out of band. The
   call now says so rather than surfacing a bare `403`.
 
+- **`InMemoryVectorStore` validates vectors before scoring**: non-numeric
+  elements, wrong-width stored vectors, and non-finite values are skipped
+  rather than reshaped or ranked, and a non-finite query vector is rejected
+  outright (it would score every record identically and produce a score that
+  cannot serialize as JSON).
+
 - **Vector-store abstractions** (`agent_framework_core::vectors`):
   `VectorStoreField`, `VectorStoreCollectionDefinition`, `IndexKind`,
   `DistanceFunction`, `VectorSearchOptions`, `VectorSearchResult`, the
@@ -66,6 +72,11 @@ may break APIs).
   caller as an empty response. And `structured_output_text` withholds a
   refused turn, so `parse_json` / `value` cannot be populated from a refusal
   (nor fall back to an older turn's JSON and serve it as this run's answer).
+  The guard is applied at the response level too — `ChatResponse::text`,
+  `AgentResponse::text` and both streaming updates — because a tool loop
+  accumulates earlier assistant turns, so blanking only the refusing message
+  still handed back an intermediate aside as the final answer.
+  `has_refusal()` / `refusal_text()` are available on each.
 
 - **Two approvals pending under one provider `call_id` are no longer
   conflated.** They were matched structurally, so a second pending approval

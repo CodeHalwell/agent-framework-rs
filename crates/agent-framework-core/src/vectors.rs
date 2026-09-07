@@ -855,6 +855,17 @@ impl VectorCollection for InMemoryCollection {
                 field.name
             )));
         }
+        // A correctly-sized vector can still hold NaN or infinity. A NaN query
+        // scores *every* record NaN, `total_cmp` then orders them arbitrarily,
+        // and the resulting `score` cannot even be serialized as JSON — so the
+        // caller gets a meaningless ranking that may also fail to encode.
+        if let Some(bad) = vector.iter().position(|v| !v.is_finite()) {
+            return Err(Error::Configuration(format!(
+                "query vector element {bad} is not finite ({}); a non-finite query ranks every \
+                 record identically",
+                vector[bad]
+            )));
+        }
         let higher_is_closer = distance.higher_is_closer().ok_or_else(|| {
             Error::Configuration(format!(
                 "InMemoryVectorStore cannot rank by distance function '{}': its direction is \
@@ -887,8 +898,17 @@ impl VectorCollection for InMemoryCollection {
             if stored.len() != dimensions {
                 continue;
             }
-            if let Some(score) = score_vectors(&distance, &vector, &stored) {
-                scored.push((score, record));
+            // A stored non-finite element poisons the score the same way a
+            // query one does; skip the record rather than rank it.
+            if stored.iter().any(|v| !v.is_finite()) {
+                continue;
+            }
+            match score_vectors(&distance, &vector, &stored) {
+                // Belt and braces: overflow on very large finite inputs can
+                // still produce a non-finite score, which must not be ranked
+                // or handed back as JSON.
+                Some(score) if score.is_finite() => scored.push((score, record)),
+                _ => continue,
             }
         }
         if higher_is_closer {
@@ -1284,6 +1304,58 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record["id"], json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_query_vector_is_rejected() {
+        // NaN scores every record NaN, `total_cmp` then orders them
+        // arbitrarily, and the score cannot serialize as JSON.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![record("a", "alpha", [1.0, 0.0, 0.0])])
+            .await
+            .unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = c
+                .search(vec![bad, 0.0, 0.0], &VectorSearchOptions::new(5))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not finite"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_non_finite_vector_is_not_ranked() {
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "nan", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
+            json!({"id": "ok", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+        // JSON cannot spell Infinity, but it does not need to: a magnitude
+        // that is finite as `f64` overflows when narrowed to `f32`, which is
+        // exactly what the stored-vector parse does. This is the realistic
+        // way a non-finite value gets into a store.
+        assert!((1e39_f64 as f32).is_infinite());
+        c.upsert(vec![json!({
+            "id": "nan", "text": "t", "embedding": [1e39, 0.0, 0.0]
+        })])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], json!("ok"));
+        // Every returned score must be serializable.
+        for hit in &hits {
+            assert!(hit.score.unwrap().is_finite());
+            assert!(serde_json::to_value(hit).is_ok());
+        }
     }
 
     #[tokio::test]
