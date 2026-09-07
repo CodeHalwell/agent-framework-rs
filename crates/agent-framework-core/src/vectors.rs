@@ -228,9 +228,29 @@ impl VectorStoreField {
 
 /// The shape of one vector-store collection: its fields, and the accessors a
 /// provider needs to build requests from them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `fields` is private and every constructor validates, including
+/// deserialization: [`Self::key_field`] and friends are documented as
+/// infallible, and they can only honour that if an invalid definition cannot
+/// exist. A definition loaded from configuration goes through the same checks
+/// as one built in code, so a missing key field is a deserialization error
+/// rather than a panic at first use.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VectorStoreCollectionDefinition {
-    pub fields: Vec<VectorStoreField>,
+    fields: Vec<VectorStoreField>,
+}
+
+impl<'de> Deserialize<'de> for VectorStoreCollectionDefinition {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            fields: Vec<VectorStoreField>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.fields).map_err(serde::de::Error::custom)
+    }
 }
 
 impl VectorStoreCollectionDefinition {
@@ -245,6 +265,15 @@ impl VectorStoreCollectionDefinition {
         let definition = Self { fields };
         definition.validate()?;
         Ok(definition)
+    }
+
+    /// The declared fields, in declaration order.
+    ///
+    /// Read-only: mutating them could invalidate the definition, which the
+    /// infallible accessors below rely on not happening. Build a new
+    /// definition with [`Self::new`] instead.
+    pub fn fields(&self) -> &[VectorStoreField] {
+        &self.fields
     }
 
     fn validate(&self) -> Result<()> {
@@ -630,31 +659,62 @@ impl InMemoryVectorStore {
 }
 
 /// Render a key `Value` as the map key used by [`InMemoryVectorStore`].
-/// A JSON string key uses its contents, so `"a"` and `a` address one record.
+///
+/// The whole `Value` is serialized, *including* its JSON type: a string key
+/// `"1"` renders as `"\"1\""` and a numeric key `1` as `"1"`, so a collection
+/// handed both does not silently collapse them onto one record — where the
+/// later upsert would overwrite the earlier and either key would retrieve the
+/// survivor.
 fn key_string(key: &Value) -> String {
-    match key {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
+    key.to_string()
 }
 
-/// Cosine similarity, or `None` when either vector is zero-length or the
-/// lengths differ (a dimension mismatch is a schema error, not a distant
-/// match).
-fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
+/// Score two vectors under `distance`, or `None` when they cannot be
+/// compared: differing lengths or an empty vector (a dimension mismatch is a
+/// schema error, not a distant match), or a zero vector where the metric is
+/// undefined for one.
+///
+/// Only the metrics [`DistanceFunction::higher_is_closer`] knows the
+/// direction of are computed; `search` rejects anything else rather than
+/// ranking it arbitrarily.
+fn score_vectors(distance: &DistanceFunction, a: &[f32], b: &[f32]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += f64::from(*x) * f64::from(*y);
-        na += f64::from(*x) * f64::from(*x);
-        nb += f64::from(*y) * f64::from(*y);
+    let pairs = || {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (f64::from(*x), f64::from(*y)))
+    };
+    let dot: f64 = pairs().map(|(x, y)| x * y).sum();
+
+    match distance.as_str() {
+        DistanceFunction::DOT_PROD => Some(dot),
+        DistanceFunction::COSINE_SIMILARITY | DistanceFunction::COSINE_DISTANCE => {
+            let na: f64 = pairs().map(|(x, _)| x * x).sum::<f64>().sqrt();
+            let nb: f64 = pairs().map(|(_, y)| y * y).sum::<f64>().sqrt();
+            if na == 0.0 || nb == 0.0 {
+                // Cosine is undefined against a zero vector; scoring it as 0
+                // would rank it as merely orthogonal rather than incomparable.
+                return None;
+            }
+            let similarity = dot / (na * nb);
+            Some(if distance.as_str() == DistanceFunction::COSINE_DISTANCE {
+                1.0 - similarity
+            } else {
+                similarity
+            })
+        }
+        DistanceFunction::EUCLIDEAN_DISTANCE => {
+            Some(pairs().map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt())
+        }
+        DistanceFunction::EUCLIDEAN_SQUARED_DISTANCE => {
+            Some(pairs().map(|(x, y)| (x - y).powi(2)).sum())
+        }
+        DistanceFunction::MANHATTAN => Some(pairs().map(|(x, y)| (x - y).abs()).sum()),
+        DistanceFunction::HAMMING => Some(pairs().filter(|(x, y)| x != y).count() as f64),
+        _ => None,
     }
-    if na == 0.0 || nb == 0.0 {
-        return None;
-    }
-    Some(dot / (na.sqrt() * nb.sqrt()))
 }
 
 struct InMemoryCollection {
@@ -700,15 +760,22 @@ impl VectorCollection for InMemoryCollection {
     async fn upsert(&self, records: Vec<Value>) -> Result<Vec<Value>> {
         let key_name = self.definition.key_field().name.clone();
         let mut keys = Vec::with_capacity(records.len());
+        // Converted to storage form on the way in, so this store exercises the
+        // same logical-to-storage mapping a real provider does. Holding the
+        // logical form and reading it back through `from_storage` — which
+        // looks up storage names — silently dropped every renamed field,
+        // including a renamed key.
+        let mut stored = Vec::with_capacity(records.len());
         for record in &records {
             let key = record.get(&key_name).cloned().ok_or_else(|| {
                 Error::Configuration(format!("record is missing its key field '{key_name}'"))
             })?;
             keys.push(key);
+            stored.push(self.definition.to_storage(record)?);
         }
         self.with_data(|d| {
-            for (key, record) in keys.iter().zip(records.iter()) {
-                d.records.insert(key_string(key), record.clone());
+            for (key, record) in keys.iter().zip(stored.into_iter()) {
+                d.records.insert(key_string(key), record);
             }
         });
         Ok(keys)
@@ -723,12 +790,11 @@ impl VectorCollection for InMemoryCollection {
         stored
             .into_iter()
             .map(|record| match record {
-                Some(r) if !include_vectors => {
-                    // Records are already keyed logically here, so the
-                    // round trip exists only to drop the vector fields.
-                    self.definition.from_storage(&r, false).map(Some)
-                }
-                other => Ok(other),
+                // Always mapped back, not only when dropping vectors: records
+                // are held in storage form, and the trait documents what it
+                // returns as keyed by *logical* name.
+                Some(r) => self.definition.from_storage(&r, include_vectors).map(Some),
+                None => Ok(None),
             })
             .collect()
     }
@@ -748,6 +814,15 @@ impl VectorCollection for InMemoryCollection {
         options: &VectorSearchOptions,
     ) -> Result<Vec<VectorSearchResult>> {
         options.validate()?;
+        // Silently ignoring a filter would return every record as a match,
+        // which reads as a passing retrieval test while scoping is broken.
+        if options.filter.is_some() {
+            return Err(Error::Configuration(
+                "InMemoryVectorStore does not support `VectorSearchOptions::filter`: it has no \
+                 filter dialect. Drop the filter, or use a provider-backed collection."
+                    .into(),
+            ));
+        }
         let field = self
             .definition
             .try_get_vector_field(options.vector_field_name.as_deref())
@@ -758,7 +833,25 @@ impl VectorCollection for InMemoryCollection {
                         .into(),
                 )
             })?;
-        let field_name = field.name.clone();
+        // Records are held in storage form, so the vector is under the
+        // storage name; using the logical name found nothing whenever a
+        // vector field was renamed, and the search returned no hits at all.
+        let field_name = field.effective_storage_name().to_string();
+        // Honor what the collection actually declared. Scoring everything as
+        // cosine — while `DistanceFunction::higher_is_closer` sat unused right
+        // there — returns a confidently wrong ranking for any collection that
+        // asked for a different metric.
+        let distance = field
+            .distance_function
+            .clone()
+            .unwrap_or_else(|| DistanceFunction::new(DistanceFunction::COSINE_SIMILARITY));
+        let higher_is_closer = distance.higher_is_closer().ok_or_else(|| {
+            Error::Configuration(format!(
+                "InMemoryVectorStore cannot rank by distance function '{}': its direction is \
+                 unknown, and guessing would order results backwards",
+                distance.as_str()
+            ))
+        })?;
 
         let records: Vec<Value> = self.with_data(|d| d.records.values().cloned().collect());
         let mut scored: Vec<(f64, Value)> = Vec::new();
@@ -770,12 +863,15 @@ impl VectorCollection for InMemoryCollection {
                 .iter()
                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                 .collect();
-            if let Some(score) = cosine_similarity(&vector, &stored) {
+            if let Some(score) = score_vectors(&distance, &vector, &stored) {
                 scored.push((score, record));
             }
         }
-        // Cosine similarity: higher is closer.
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if higher_is_closer {
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        } else {
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
 
         scored
             .into_iter()
@@ -1022,6 +1118,191 @@ mod tests {
         assert!(VectorSearchOptions::new(1).validate().is_ok());
         assert_eq!(VectorSearchOptions::default().top, 10);
         assert!(!VectorSearchOptions::default().include_vectors);
+    }
+
+    // endregion
+
+    // region: review findings (PR #21)
+
+    fn renamed_definition() -> VectorStoreCollectionDefinition {
+        VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_storage_name("_id"),
+            VectorStoreField::data("text").with_storage_name("body"),
+            VectorStoreField::vector("embedding", 3).with_storage_name("vec"),
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_name_overrides_round_trip_through_the_in_memory_store() {
+        // Records are held in storage form, so every read maps back. Holding
+        // the logical form and reading it through `from_storage` dropped every
+        // renamed field — including the key.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", renamed_definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "a", "text": "alpha", "embedding": [1.0, 0.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+
+        let got = c.get(vec![json!("a")], true).await.unwrap();
+        let record = got[0].as_ref().expect("record found under its logical key");
+        assert_eq!(record["id"], json!("a"));
+        assert_eq!(record["text"], json!("alpha"));
+        assert_eq!(record["embedding"], json!([1.0, 0.0, 0.0]));
+
+        let without = c.get(vec![json!("a")], false).await.unwrap();
+        let record = without[0].as_ref().unwrap();
+        assert_eq!(record["id"], json!("a"));
+        assert!(record.get("embedding").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_finds_a_renamed_vector_field() {
+        // Looking the vector up by logical name found nothing once the field
+        // was renamed, so search silently returned no hits.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", renamed_definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "a", "text": "alpha", "embedding": [1.0, 0.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], json!("a"));
+    }
+
+    #[tokio::test]
+    async fn search_honors_the_declared_distance_function() {
+        // Under Euclidean distance the nearest record is the one with the
+        // smallest score, and results must rank ascending. Scoring everything
+        // as cosine and ranking descending returns the opposite order here.
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 2).with_distance_function(DistanceFunction::new(
+                DistanceFunction::EUCLIDEAN_DISTANCE,
+            )),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", d).unwrap();
+        c.upsert(vec![
+            json!({"id": "near", "embedding": [1.0, 0.0]}),
+            json!({"id": "far", "embedding": [9.0, 9.0]}),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(vec![1.0, 0.0], &VectorSearchOptions::new(2))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].record["id"], json!("near"));
+        assert_eq!(hits[1].record["id"], json!("far"));
+        assert_eq!(hits[0].score, Some(0.0));
+        assert!(hits[0].score.unwrap() < hits[1].score.unwrap());
+    }
+
+    #[tokio::test]
+    async fn search_refuses_a_distance_function_it_cannot_rank() {
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 2)
+                .with_distance_function(DistanceFunction::new("bespoke")),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", d).unwrap();
+        let err = c
+            .search(vec![1.0, 0.0], &VectorSearchOptions::new(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("direction is unknown"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_a_filter_it_cannot_apply() {
+        // Ignoring the filter returned every record, which reads as a passing
+        // retrieval test while scoping is silently broken.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![record("a", "alpha", [1.0, 0.0, 0.0])])
+            .await
+            .unwrap();
+        let err = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(5).with_filter("text eq 'nothing'"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("filter"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_string_key_and_a_numeric_key_are_different_records() {
+        // Rendering keys without their JSON type collapsed `"1"` and `1` onto
+        // one entry, so the second upsert overwrote the first.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "1", "text": "string key", "embedding": [1.0, 0.0, 0.0]}),
+            json!({"id": 1, "text": "numeric key", "embedding": [0.0, 1.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+
+        let got = c.get(vec![json!("1"), json!(1)], false).await.unwrap();
+        assert_eq!(got[0].as_ref().unwrap()["text"], json!("string key"));
+        assert_eq!(got[1].as_ref().unwrap()["text"], json!("numeric key"));
+    }
+
+    #[test]
+    fn a_deserialized_definition_is_validated() {
+        // `key_field()` is documented infallible, which only holds if an
+        // invalid definition cannot be constructed — deriving `Deserialize`
+        // let one in through the back door and turned that into a panic.
+        let valid: VectorStoreCollectionDefinition = serde_json::from_value(json!({
+            "fields": [
+                {"field_type": "key", "name": "id"},
+                {"field_type": "data", "name": "text"},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(valid.key_field().name, "id");
+
+        let no_key = serde_json::from_value::<VectorStoreCollectionDefinition>(json!({
+            "fields": [{"field_type": "data", "name": "text"}]
+        }));
+        assert!(
+            no_key.is_err(),
+            "a definition with no key must not deserialize"
+        );
+
+        let bad_vector = serde_json::from_value::<VectorStoreCollectionDefinition>(json!({
+            "fields": [
+                {"field_type": "key", "name": "id"},
+                {"field_type": "vector", "name": "v"},
+            ]
+        }));
+        assert!(
+            bad_vector.is_err(),
+            "a dimensionless vector field must not deserialize"
+        );
+    }
+
+    #[test]
+    fn a_definition_round_trips_through_serde() {
+        let d = renamed_definition();
+        let restored: VectorStoreCollectionDefinition =
+            serde_json::from_value(serde_json::to_value(&d).unwrap()).unwrap();
+        assert_eq!(restored, d);
+        assert_eq!(restored.fields().len(), 3);
     }
 
     // endregion

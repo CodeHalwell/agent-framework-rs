@@ -696,6 +696,12 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         .unwrap_or(false)
                 });
                 if needs_approval {
+                    // Owned before `response` moves below: the stamping walk
+                    // needs the same filter `calls` was built with.
+                    let resolved_owned: std::collections::HashSet<String> = resolved_call_ids
+                        .iter()
+                        .map(|id| (*id).to_string())
+                        .collect();
                     let mut resp = response;
                     // This is the one moment a call stops being answered within
                     // its turn: it now has to survive a round trip and come back
@@ -721,14 +727,31 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     // too: they are what a caller replays back, and a replay
                     // without the id would fall back to structural matching and
                     // reintroduce the ambiguity the id exists to remove.
+                    //
+                    // Matched **positionally, consuming each id**, rather than
+                    // by searching. `calls` was collected from these same
+                    // messages in this same order, so the nth function call
+                    // here is the nth entry of `identified_calls`. A search
+                    // would reintroduce exactly the bug the ids exist to fix:
+                    // for two calls sharing a `call_id` — the case this whole
+                    // mechanism is for — every copy would match the *first*
+                    // entry and be stamped with one id, so two approval
+                    // requests would carry distinct ids while the replayed
+                    // calls carried the same one.
+                    let mut ids = identified_calls.iter().map(|c| c.id.clone());
                     for message in resp.messages.iter_mut() {
                         for content in message.contents.iter_mut() {
                             if let Content::FunctionCall(fc) = content {
-                                if let Some(identified) = identified_calls
-                                    .iter()
-                                    .find(|c| c.same_invocation(fc) || c.call_id == fc.call_id)
-                                {
-                                    fc.id = identified.id.clone();
+                                // `calls` skipped provider-resolved calls, so
+                                // this walk must skip them too — otherwise a
+                                // resolved call appearing first consumes the
+                                // id belonging to the unresolved call after
+                                // it, and every later stamp is off by one.
+                                if resolved_owned.contains(fc.call_id.as_str()) {
+                                    continue;
+                                }
+                                if let Some(id) = ids.next() {
+                                    fc.id = id;
                                 }
                             }
                         }

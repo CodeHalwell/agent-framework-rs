@@ -1204,6 +1204,22 @@ mod occurrence_id_tests {
     }
 
     #[test]
+    fn distinct_calls_sharing_a_call_id_get_distinct_ids() {
+        // The stamping loop used to `find` a match per response copy, with a
+        // `call_id`-only fallback, so two calls sharing an id both took the
+        // first entry's occurrence id — reintroducing exactly the ambiguity
+        // the id exists to remove. Positional consumption is what keeps them
+        // apart; this pins the property that makes it matter.
+        let mut a = FunctionCallContent::new("c1", "f", None);
+        let mut b = FunctionCallContent::new("c1", "f", None);
+        a.ensure_occurrence_id();
+        b.ensure_occurrence_id();
+        assert_ne!(a.id, b.id);
+        assert!(!a.same_invocation(&b));
+        assert_eq!(a.call_id, b.call_id, "the provider id really is shared");
+    }
+
+    #[test]
     fn the_occurrence_id_is_absent_from_the_wire_when_unset() {
         let call = FunctionCallContent::new("c1", "f", None);
         let wire = serde_json::to_value(&call).unwrap();

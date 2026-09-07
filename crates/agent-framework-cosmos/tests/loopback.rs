@@ -1187,15 +1187,13 @@ async fn token_credential_sends_the_aad_authorization_envelope() {
 }
 
 #[tokio::test]
-async fn token_credential_scope_defaults_to_the_account_endpoint() {
+async fn token_credential_scope_defaults_to_the_cosmos_service_audience() {
     let (base_url, handle) = serve_sequence(1, |_i, request| {
         (201, "Created", vec![], request.body_json())
     });
 
     let credential = CountingCredential::new(&test_token());
     let store = CosmosChatMessageStore::with_token_credential(
-        // A trailing slash must not survive into the scope, or the audience
-        // is `https://host//.default` and the token request fails.
         format!("{base_url}/"),
         credential.clone(),
         "db",
@@ -1208,7 +1206,20 @@ async fn token_credential_scope_defaults_to_the_account_endpoint() {
     store.add_messages(vec![Message::user("hi")]).await.unwrap();
     handle.join().unwrap();
 
-    assert_eq!(credential.scopes(), vec![format!("{base_url}/.default")]);
+    // Cosmos DB's data-plane audience is service-wide, *not* per account.
+    // Deriving it from the endpoint reads plausibly and is what this crate
+    // did at first, but Entra rejects
+    // `https://<account>.documents.azure.com/.default` outright, so a store
+    // built that way could never acquire a token. This value matches
+    // `AAD_DEFAULT_SCOPE` in the official `azure-cosmos` SDK.
+    assert_eq!(
+        credential.scopes(),
+        vec!["https://cosmos.azure.com/.default".to_string()]
+    );
+    assert!(
+        !credential.scopes()[0].contains(&base_url),
+        "the account endpoint must not leak into the scope"
+    );
 }
 
 #[tokio::test]

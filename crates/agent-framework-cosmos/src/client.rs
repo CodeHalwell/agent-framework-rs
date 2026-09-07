@@ -22,12 +22,22 @@ use agent_framework_core::error::{Error, Result};
 use crate::auth::{aad_authorization_header, authorization_header, decode_master_key};
 use crate::dates::{format_rfc1123, now_unix_seconds};
 
-/// Suffix appended to the account endpoint to form the default Entra ID
-/// token scope, e.g. `https://my-account.documents.azure.com/.default`.
-/// Cosmos DB scopes tokens per account rather than to one service-wide
-/// audience, which is why this is derived from the endpoint instead of being
-/// a constant like `agent_framework_azure::AZURE_OPENAI_SCOPE`.
-const SCOPE_SUFFIX: &str = "/.default";
+/// The default Microsoft Entra ID scope for Cosmos DB data-plane access.
+///
+/// This is a **service-wide** audience, not a per-account one. Deriving the
+/// scope from the account endpoint — which reads plausibly, and which this
+/// crate did at first — does not work: Entra rejects
+/// `https://<account>.documents.azure.com/.default` as an invalid scope at
+/// token acquisition, so a store built that way could never authenticate.
+/// The value here matches `AAD_DEFAULT_SCOPE` in the official
+/// `azure-cosmos` SDK.
+const DEFAULT_COSMOS_SCOPE: &str = "https://cosmos.azure.com/.default";
+
+/// Environment variable overriding [`DEFAULT_COSMOS_SCOPE`], for sovereign
+/// clouds and other non-public audiences. Same name the official
+/// `azure-cosmos` SDK reads, so an environment already configured for that
+/// SDK works here unchanged.
+const SCOPE_OVERRIDE_ENV: &str = "AZURE_COSMOS_AAD_SCOPE_OVERRIDE";
 
 /// Cosmos DB REST API version this crate speaks. `2018-12-31` is the first
 /// version that *requires* a `partitionKey` on `Create Collection` — this
@@ -90,6 +100,22 @@ pub(crate) fn parse_query_response(body: &Value) -> Vec<Value> {
 
 fn map_error_response(status: reqwest::StatusCode, body: &str) -> Error {
     Error::service(format!("Cosmos DB API error {status}: {body}"))
+}
+
+/// Pick the Entra scope: an explicit argument first, then the
+/// SDK-compatible environment override, then [`DEFAULT_COSMOS_SCOPE`]. A
+/// blank value at either of the first two positions falls through rather than
+/// producing an empty scope.
+///
+/// Takes the environment value as a parameter rather than reading it, so the
+/// precedence is unit-testable without a parallel test mutating
+/// process-global state under its neighbours.
+fn resolve_scope(explicit: Option<String>, from_env: Option<String>) -> String {
+    explicit
+        .into_iter()
+        .chain(from_env)
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_COSMOS_SCOPE.to_string())
 }
 
 /// Trim a trailing slash off the account endpoint and reject an empty one.
@@ -187,17 +213,16 @@ impl CosmosRestClient {
     /// As [`Self::new`], but authenticating with Microsoft Entra ID: every
     /// request carries a bearer token minted by `credential` for `scope`.
     ///
-    /// `scope` defaults to the account endpoint plus `/.default` (e.g.
-    /// `https://my-account.documents.azure.com/.default`), which is what the
-    /// Azure SDKs use; pass `Some(..)` only for a sovereign cloud or another
-    /// non-default audience.
+    /// `scope` defaults to [`DEFAULT_COSMOS_SCOPE`], or to
+    /// `AZURE_COSMOS_AAD_SCOPE_OVERRIDE` when that is set; pass `Some(..)`
+    /// only to override both.
     pub(crate) fn with_token_credential(
         account_endpoint: impl Into<String>,
         credential: Arc<dyn TokenCredential>,
         scope: Option<String>,
     ) -> Result<Self> {
         let account_endpoint = normalize_endpoint(account_endpoint.into())?;
-        let scope = scope.unwrap_or_else(|| format!("{account_endpoint}{SCOPE_SUFFIX}"));
+        let scope = resolve_scope(scope, std::env::var(SCOPE_OVERRIDE_ENV).ok());
         Ok(Self {
             http: reqwest::Client::new(),
             account_endpoint,
@@ -659,6 +684,48 @@ impl CosmosRestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: Entra scope resolution (pure)
+
+    #[test]
+    fn scope_precedence_is_explicit_then_env_then_default() {
+        assert_eq!(
+            resolve_scope(
+                Some("https://explicit/.default".into()),
+                Some("https://env/.default".into())
+            ),
+            "https://explicit/.default"
+        );
+        assert_eq!(
+            resolve_scope(None, Some("https://env/.default".into())),
+            "https://env/.default"
+        );
+        // The default must be the service-wide audience: an account-derived
+        // scope is rejected by Entra outright, so getting this wrong makes
+        // every credential-backed store fail at token acquisition.
+        assert_eq!(
+            resolve_scope(None, None),
+            "https://cosmos.azure.com/.default"
+        );
+    }
+
+    #[test]
+    fn a_blank_scope_falls_through_rather_than_being_sent() {
+        assert_eq!(
+            resolve_scope(Some("   ".into()), None),
+            DEFAULT_COSMOS_SCOPE
+        );
+        assert_eq!(
+            resolve_scope(None, Some(String::new())),
+            DEFAULT_COSMOS_SCOPE
+        );
+        assert_eq!(
+            resolve_scope(Some(" ".into()), Some("https://env/.default".into())),
+            "https://env/.default"
+        );
+    }
+
+    // endregion
 
     // region: resource link / path helpers (pure)
 

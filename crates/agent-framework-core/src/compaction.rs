@@ -212,15 +212,23 @@ impl CompactionStrategy for Truncation {
         let sys_count = leading_system_count(messages);
         let mut out: Vec<Message> = messages[..sys_count].to_vec();
 
+        let rest = &messages[sys_count..];
+
         if sys_count >= self.max_messages {
             // The system prefix alone already fills (or exceeds) the budget;
             // keep just the system prefix, truncated to the budget.
             out.truncate(self.max_messages);
+            // A protected message is kept *regardless of budget*, so it
+            // survives this branch too — returning early without it was the
+            // one path where `preserve_first_user` silently did nothing, and
+            // it is the path most likely to matter (a small limit, or a
+            // multi-message system prefix, is exactly when the opening
+            // request gets dropped).
+            push_preserved_first_user(&mut out, rest, rest.len(), self.preserve_first_user);
             return out;
         }
 
         let remaining_budget = self.max_messages - sys_count;
-        let rest = &messages[sys_count..];
         let start = rest.len().saturating_sub(remaining_budget);
         push_preserved_first_user(&mut out, rest, start, self.preserve_first_user);
         out.extend_from_slice(&rest[start..]);
@@ -2505,6 +2513,39 @@ mod tests {
         // Protected messages are kept regardless of budget, so the result is
         // allowed to exceed `max_messages` — as upstream documents.
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn preserve_first_user_survives_a_system_prefix_that_fills_the_budget() {
+        // The branch that returns early on a full system prefix used to skip
+        // the preservation entirely, which is the case the option matters
+        // most in: a small limit or a long system prefix is exactly when the
+        // opening request would otherwise be dropped.
+        let messages = vec![
+            text(Role::system(), "s1"),
+            text(Role::system(), "s2"),
+            text(Role::user(), "the ask"),
+            text(Role::assistant(), "a"),
+        ];
+        let out = compact(
+            &messages,
+            &Truncation::new(2).preserve_first_user(),
+            &ApproxTokenizer,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].text(), "s1");
+        assert_eq!(out[1].text(), "s2");
+        assert_eq!(out[2].text(), "the ask");
+
+        // Without the option, this branch returns a system-only projection,
+        // which `ensure_non_system_message` then rescues by reinstating the
+        // *most recent* non-system turn — the assistant's reply, not the
+        // request it was replying to. That contrast is the whole point of the
+        // option: both results are three messages, but only one of them still
+        // contains the task.
+        let plain = compact(&messages, &Truncation::new(2), &ApproxTokenizer);
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain[2].text(), "a");
     }
 
     #[test]

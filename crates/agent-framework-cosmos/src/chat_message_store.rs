@@ -41,9 +41,11 @@
 //!
 //! # Divergences from .NET
 //!
-//! - **Auth**: master key only (HMAC request signing — see [`crate::auth`]).
-//!   The .NET store also supports Azure `TokenCredential` (Entra ID/AAD);
-//!   that is **not** ported here. See `PARITY.md`.
+//! - **Auth**: both modes the .NET store supports are available — master key
+//!   (HMAC request signing) and Microsoft Entra ID via
+//!   [`CosmosChatMessageStore::with_token_credential`]. See [`crate::auth`]
+//!   for the two `Authorization` shapes and the crate docs for the
+//!   data-plane-only limit that Entra RBAC imposes on `ensure_created`.
 //! - **Batching**: .NET uses `Container.CreateTransactionalBatch` for
 //!   multi-message `AddMessagesAsync` calls; hand-rolling that wire format
 //!   (a multipart-style batch request/response) was judged out of scope for
@@ -193,10 +195,11 @@ impl CosmosChatMessageStore {
     /// `ManagedIdentityCredential` in Azure, `AzureCliCredential` locally)
     /// and no key needs to exist anywhere in the deployment.
     ///
-    /// `scope` defaults to the account endpoint plus `/.default`, e.g.
-    /// `https://my-account.documents.azure.com/.default`, matching the Azure
-    /// SDKs; pass `Some(..)` only for a sovereign cloud or another
-    /// non-default audience.
+    /// `scope` defaults to `https://cosmos.azure.com/.default` — Cosmos DB's
+    /// data-plane audience is service-wide, not per account, and Entra
+    /// rejects an account-derived scope outright. `AZURE_COSMOS_AAD_SCOPE_OVERRIDE`
+    /// overrides that default (the same variable the official `azure-cosmos`
+    /// SDK reads); pass `Some(..)` only to override both.
     ///
     /// The principal needs a **Cosmos DB data-plane** role assignment (the
     /// built-in "Cosmos DB Built-in Data Contributor" covers this store's
@@ -214,9 +217,9 @@ impl CosmosChatMessageStore {
     ///
     /// # async fn demo() -> agent_framework_core::error::Result<()> {
     /// let endpoint = "https://my-account.documents.azure.com:443/";
-    /// // The chain's own default scope; the store asks for the same one
-    /// // per request via `get_token_for_scope`, so the two agree.
-    /// let credential = DefaultAzureCredential::new("https://my-account.documents.azure.com/.default");
+    /// // The chain's own default scope; the store asks for the same one per
+    /// // request via `get_token_for_scope`, so the two agree.
+    /// let credential = DefaultAzureCredential::new("https://cosmos.azure.com/.default");
     /// let store = CosmosChatMessageStore::with_token_credential(
     ///     endpoint,
     ///     Arc::new(credential),

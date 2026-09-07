@@ -15,11 +15,13 @@ may break APIs).
   `agent_framework_azure::TokenCredential`, so a Cosmos store authenticates
   with a managed identity, a workload identity, or the Azure CLI instead of a
   master key — and a Cosmos account with `disableLocalAuth` set, which has no
-  key to give, becomes usable at all. The token scope defaults to the account
-  endpoint plus `/.default` and is overridable for sovereign clouds.
+  key to give, becomes usable at all.
   `CosmosChatMessageStore::from_state_with_token_credential` restores a
   serialized store, since a credential cannot round-trip through a state blob
-  the way a key does.
+  the way a key does. The token scope defaults to
+  `https://cosmos.azure.com/.default` — Cosmos DB's data-plane audience is
+  service-wide, not per account — and `AZURE_COSMOS_AAD_SCOPE_OVERRIDE`
+  overrides it, matching the official `azure-cosmos` SDK.
 
   Note that Cosmos DB's Entra RBAC grants data-plane actions only:
   `ensure_created` cannot succeed with a token whatever role the principal
