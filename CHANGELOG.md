@@ -7,6 +7,29 @@ may break APIs).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-09
+
+Provider refusals handled properly end to end, Entra ID authentication for
+Cosmos DB, and the first vector-store abstractions.
+
+**This one can break a compiling caller**, unlike 0.4 and 0.5. Two public
+structs gained a field: `TextContent::refusal` and `FunctionCallContent::id`.
+Neither is `#[non_exhaustive]`, so any code constructing them with
+struct-literal syntax needs updating. `TextContent` derives `Default`, so a
+`..Default::default()` literal keeps working; `FunctionCallContent` does not,
+so its literals must add `id` (or move to `FunctionCallContent::new`, which
+takes the same three arguments as before). Nothing was removed, and no
+function signature changed.
+
+The behavior change to check for is refusal handling. A provider decline used
+to arrive as ordinary text, so `Message::text()`, `ChatResponse::text()` and
+`AgentResponse::text()` returned the refusal prose as though it were the
+answer — and `parse_json` tried to parse it. They now return `""` for a
+refused turn, and the decline is read deliberately through `refusal_text()`.
+Code that displayed whatever `text()` returned will show an empty string
+where it used to show "I can't help with that"; branch on `has_refusal()` to
+render a decline. This is the fix, not a regression, but it is visible.
+
 ### Added
 
 - **Microsoft Entra ID authentication for `agent-framework-cosmos`.**
@@ -75,12 +98,26 @@ may break APIs).
   The guard is applied at the response level too — `ChatResponse::text`,
   `AgentResponse::text` and both streaming updates — because a tool loop
   accumulates earlier assistant turns, so blanking only the refusing message
-  still handed back an intermediate aside as the final answer.
+  still handed back an intermediate aside as the final answer. On the two
+  response types that guard is anchored to the run's **final** assistant
+  turn rather than to any accumulated one: a provider may decline part of a
+  request while still calling a tool for the rest (OpenAI puts `refusal` and
+  `tool_calls` on the same message, and the parser keeps both), and an
+  `any`-style check let that carried turn blank the successful answer that
+  followed it. A run that ends on a refusal is still withheld whole.
   `has_refusal()` / `refusal_text()` are available on each. The **outbound**
   path preserves the marker too: replaying a refusal as history now uses the
   assistant message's own `refusal` field (Chat Completions) and a
   `{"type": "refusal"}` output content part (Responses), instead of folding
   it into ordinary content and telling the provider the assistant answered.
+
+- **An empty vector-store storage-name override is rejected.** A
+  `VectorStoreField` whose `name` was empty was refused, but one carrying
+  `storage_name: Some("")` was accepted and produced the same broken result:
+  the field is written under an empty JSON key. `InMemoryVectorStore`
+  tolerates that, so it passed locally and would have failed at a real
+  provider's collection creation or first write. An absent override is
+  unaffected — it still falls back to the field name.
 
 - **Two approvals pending under one provider `call_id` are no longer
   conflated.** They were matched structurally, so a second pending approval

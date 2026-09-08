@@ -191,9 +191,12 @@ impl ChatResponse {
 
     /// The concatenated text of all messages (newline-joined, trimmed).
     ///
-    /// Empty when the run's **final** assistant turn is a refusal — see
-    /// [`final_turn_refused`] for why the check is anchored there rather than
-    /// applied to any accumulated turn. Refusal text is never served as the
+    /// Empty when the run's **final** assistant turn is a refusal. The check
+    /// is anchored to the last assistant message rather than applied to any
+    /// accumulated turn, because a tool loop carries earlier assistant turns
+    /// into one response and a provider may decline part of a request while
+    /// still calling a tool for the rest — blanking on any refusal would
+    /// discard the successful answer that follows. Refusal text is never served as the
     /// answer regardless: [`Message::text`] blanks a refusing message on its
     /// own, so a refusal reached through this join contributes nothing.
     /// See [`Self::refusal_text`] to read a decline deliberately.
@@ -551,7 +554,7 @@ impl AgentResponse {
     /// The concatenated text of all messages (no separator), matching Python.
     ///
     /// Empty when the run's final assistant turn is a refusal — see
-    /// [`ChatResponse::text`] and [`final_turn_refused`].
+    /// [`ChatResponse::text`] for why the check is anchored there.
     pub fn text(&self) -> String {
         if final_turn_refused(&self.messages) {
             return String::new();
