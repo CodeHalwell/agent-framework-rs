@@ -98,7 +98,11 @@ impl ChatClient for ScriptedClient {
         }
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -161,7 +165,10 @@ impl Middleware<FunctionInvocationContext> for OneShot {
         if matched && ctx.result.is_some() {
             if let Some(tools) = &ctx.tools {
                 tools.remove_tools([self.tool_name]);
-                println!("    [middleware] `{}` is one-shot -> removed", self.tool_name);
+                println!(
+                    "    [middleware] `{}` is one-shot -> removed",
+                    self.tool_name
+                );
             }
         }
         Ok(ctx)

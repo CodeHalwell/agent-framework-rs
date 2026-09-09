@@ -147,9 +147,7 @@ async fn main() -> Result<()> {
 
     // The buffered form: identical events, available after the fact. Handy
     // for tests and for post-hoc analysis of a run you did not stream.
-    let run = workflow
-        .run(json!("a much shorter sentence here"))
-        .await?;
+    let run = workflow.run(json!("a much shorter sentence here")).await?;
 
     let customs: Vec<&Value> = run
         .events()

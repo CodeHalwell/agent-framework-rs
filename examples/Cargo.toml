@@ -392,3 +392,15 @@ path = "memory/vector_store.rs"
 [[example]]
 name = "custom_chat_client"
 path = "providers/custom_chat_client.rs"
+
+[[example]]
+name = "hosting_security"
+path = "hosting/hosting_security.rs"
+
+[[example]]
+name = "mcp_http_transport"
+path = "mcp/mcp_http_transport.rs"
+
+[[example]]
+name = "a2a_task_lifecycle"
+path = "a2a/a2a_task_lifecycle.rs"

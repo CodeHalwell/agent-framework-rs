@@ -22,8 +22,8 @@ OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example quickstart
 ```
 
 No example needs a `--features` flag: the crate depends on `agent-framework`
-with `features = ["full", "otel-metrics"]`, so every provider/integration is
-already compiled in.
+with `features = ["full", "otel-metrics", "otel-export"]`, so every
+provider/integration is already compiled in.
 
 **Offline vs. needs keys.** Each table below has a `Requires` column.
 `offline` means the example runs with no credentials, network access, or
@@ -74,6 +74,11 @@ middleware.
 | `compaction_basics` | Compaction strategies (`Truncation`, `SlidingWindow`, `TokenBudget`, `SelectiveToolResult`) applied to a message list | offline |
 | `compaction_provider` | `AgentBuilder::with_compaction` shrinks the history sent to the model on every run | offline |
 | `skills` | `Skill` + `SkillsProvider`: progressive disclosure via `load_skill` / `read_skill_resource` tools | offline |
+| `tool_choice_and_limits` | `ToolMode` on the wire, plus `FunctionInvocationConfig` (iteration cap, unknown calls, error detail) | offline |
+| `dynamic_tools` | `LiveToolList`: unlock tools mid-run after a login, and make a tool one-shot | offline |
+| `hosted_tools` | The five `hosted_*` constructors, local-vs-hosted approval, and per-provider support | offline (live web search optional, `OPENAI_API_KEY`) |
+| `error_handling` | The granular `Error::Service*` variants, what the retry policy treats as transient, and fail-closed tool errors | offline |
+| `settings_and_secrets` | `load_setting`'s precedence chain and `SecretString` masking | offline |
 
 ## Providers (`providers/`)
 
@@ -83,6 +88,7 @@ Studio.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
+| `custom_chat_client` | Implementing `ChatClient` for your own backend, and what that owes its callers | offline |
 | `openai_responses` | OpenAI Responses API + `conversation_id` (`previous_response_id`) reuse | `OPENAI_API_KEY` |
 | `openai_embeddings` | `OpenAIEmbeddingClient`: batch text embeddings + cosine similarity (same trait: Azure/Ollama/Mistral) | `OPENAI_API_KEY` |
 | `openai_compatible_endpoint` | `OpenAIChatCompletionClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
@@ -123,6 +129,8 @@ loops, checkpointing, shared state, sub-workflows, and custom executors.
 | `workflow_checkpoint` | `FileCheckpointStorage`: persist every superstep, list, and resume mid-pipeline | offline |
 | `workflow_hitl` | `RequestInfoExecutor` pause / `send_response` resume | offline |
 | `workflow_viz` | Render a branching workflow as Mermaid and Graphviz DOT | offline |
+| `workflow_validation` | Every `ValidationType`, via `build()` and via `validate_workflow_graph` directly | offline |
+| `workflow_events` | The full `WorkflowEvent` taxonomy; `Output` vs. `Intermediate` vs. `Custom` | offline |
 
 ## Orchestrations (`orchestrations/`)
 
@@ -145,8 +153,9 @@ stall-intervention).
 ## MCP (`mcp/`)
 
 Model Context Protocol: tools (static and dynamic), prompts, server-initiated
-sampling, and roots. All five connect to
-`@modelcontextprotocol/server-everything` over stdio.
+sampling, roots, and the remote transports. The first five connect to
+`@modelcontextprotocol/server-everything` over stdio; `mcp_http_transport`
+serves its own MCP server in-process and needs nothing external.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
@@ -155,6 +164,7 @@ sampling, and roots. All five connect to
 | `mcp_prompts` | List an MCP server's prompts, render one, and run it through a real agent | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_roots` | Advertise filesystem roots via `.roots(...)`; explains the server-side `roots/list` flow | `OPENAI_API_KEY` (skips gracefully), `npx` |
 | `mcp_sampling` | Answer MCP server-initiated `sampling/createMessage` with your own model | `OPENAI_API_KEY` (skips gracefully), `npx` |
+| `mcp_http_transport` | `McpStreamableHttpTool` against a real in-process MCP server, plus how `McpWebsocketTool` differs | offline (self-terminating) |
 
 ## Hosting (`hosting/`)
 
@@ -168,6 +178,7 @@ AG-UI surfaces, all nestable into one app.
 | `openai_compat_server` | `OpenAiRouter`: OpenAI-Chat-Completions-compatible `/v1/chat/completions` | offline (canned fallback; `OPENAI_API_KEY` optional) |
 | `a2a_server` | `A2ARouter`: agent card + JSON-RPC `message/send` / `tasks/get` / `tasks/cancel` | offline (canned fallback; `OPENAI_API_KEY` optional) |
 | `streaming_sse` | Real token streaming end to end: canned streaming agent + in-process SSE client | offline (self-terminating) |
+| `hosting_security` | `HostingSecurity`: bearer-token auth and the anti-DNS-rebinding `Host` allowlist | offline (self-terminating) |
 
 ## Memory (`memory/`)
 
@@ -180,6 +191,7 @@ Azure AI Search.
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
+| `vector_store` | The `vectors` module end to end against `InMemoryVectorStore`, incl. logical vs. storage names | offline |
 
 ## Observability (`observability/`)
 
@@ -189,14 +201,19 @@ Azure AI Search.
 | --- | --- | --- |
 | `observability` | `ObservableChatClient` emits OTel GenAI-semantic-convention `tracing` spans | `OPENAI_API_KEY` |
 | `otel_metrics` | GenAI token-usage/duration histograms via the `otel-metrics` feature | offline |
+| `otel_export` | Wiring the OTel SDK export pipeline (OTLP/HTTP) behind the `otel-export` feature | offline (an OTLP collector optional) |
 
 ## A2A (`a2a/`)
 
 The Agent2Agent protocol *client* side (see Hosting above for serving one).
+`A2AAgent` is the convenient shape; `A2AClient` underneath it is what you
+want when the *task* -- its id, state, artifacts, cancellation -- is the
+thing you are managing.
 
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `a2a_client` | `A2AAgent`: talk to a remote A2A server as a local `Agent`, multi-turn continuity | `A2A_AGENT_URL` (e.g. the `a2a_server` example) |
+| `a2a_task_lifecycle` | `A2AClient`'s raw surface: card discovery, `message/send`, `tasks/get`, `tasks/cancel`, push config | offline (self-terminating) |
 
 ## Declarative (`declarative/`)
 
@@ -216,5 +233,5 @@ calls.
 
 ---
 
-83 examples total. See the root [`README.md`](../README.md) for the
+96 examples total. See the root [`README.md`](../README.md) for the
 project-level overview, feature-flag table, and workspace layout.

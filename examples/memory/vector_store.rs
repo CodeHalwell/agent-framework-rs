@@ -30,7 +30,7 @@
 
 use agent_framework::prelude::*;
 use agent_framework::vectors::{
-    DistanceFunction, IndexKind, InMemoryVectorStore, VectorSearchOptions, VectorStore,
+    DistanceFunction, InMemoryVectorStore, IndexKind, VectorSearchOptions, VectorStore,
     VectorStoreCollectionDefinition, VectorStoreField,
 };
 use serde::{Deserialize, Serialize};
@@ -99,9 +99,12 @@ async fn main() -> Result<()> {
     let store = InMemoryVectorStore::new();
     let collection = store.get_collection("docs", definition.clone())?;
     collection.ensure_collection_exists().await?;
-    println!("  collection exists: {}", collection.collection_exists().await?);
+    println!(
+        "  collection exists: {}",
+        collection.collection_exists().await?
+    );
 
-    let docs = vec![
+    let docs = [
         Doc {
             id: "d1".into(),
             title: "Ownership and borrowing".into(),
@@ -198,7 +201,11 @@ async fn main() -> Result<()> {
     let d1 = collection.get(vec![json!("d1")], true).await?;
     let doc: Doc = serde_json::from_value(d1[0].clone().unwrap())
         .map_err(|e| Error::Serialization(e.to_string()))?;
-    println!("  typed round trip: {} ({} dims)", doc.title, doc.embedding.len());
+    println!(
+        "  typed round trip: {} ({} dims)",
+        doc.title,
+        doc.embedding.len()
+    );
 
     println!("\n== 5. logical vs. storage names ==\n");
 

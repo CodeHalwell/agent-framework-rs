@@ -35,16 +35,18 @@ use agent_framework::prelude::*;
 /// A one-line summary of what a definition will put on the wire.
 fn describe(tool: &ToolDefinition) -> String {
     match &tool.kind {
-        ToolKind::Function => "Function            -- executed locally by the invocation loop".into(),
-        ToolKind::HostedCodeInterpreter => {
-            "HostedCodeInterpreter -- provider-side sandbox".into()
+        ToolKind::Function => {
+            "Function            -- executed locally by the invocation loop".into()
         }
+        ToolKind::HostedCodeInterpreter => "HostedCodeInterpreter -- provider-side sandbox".into(),
         ToolKind::HostedImageGeneration => {
             "HostedImageGeneration -- provider-side image model".into()
         }
         ToolKind::HostedWebSearch => "HostedWebSearch     -- provider-side web search".into(),
         ToolKind::HostedFileSearch { max_results } => {
-            format!("HostedFileSearch    -- provider-side vector stores, max_results={max_results:?}")
+            format!(
+                "HostedFileSearch    -- provider-side vector stores, max_results={max_results:?}"
+            )
         }
         ToolKind::HostedMcp { url, allowed_tools } => format!(
             "HostedMcp           -- the *service* connects to {url}, allowed={allowed_tools:?}"
@@ -102,8 +104,8 @@ async fn main() -> Result<()> {
     // A hosted MCP connector's gate is enforced by the *service*, so it is a
     // separate setting that travels on the wire in the tool's parameters
     // rather than being interpreted locally.
-    let hosted =
-        hosted_mcp("docs", "https://mcp.example.com/sse", None).mcp_approval_mode(McpApprovalMode::Always);
+    let hosted = hosted_mcp("docs", "https://mcp.example.com/sse", None)
+        .mcp_approval_mode(McpApprovalMode::Always);
     println!(
         "  hosted `{}`: wire approval_mode={} -- enforced by the provider",
         hosted.name, hosted.parameters["approval_mode"]

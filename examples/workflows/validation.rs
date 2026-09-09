@@ -143,7 +143,9 @@ async fn main() -> Result<()> {
                 ValidationType::UnknownExecutor => "add_executor for the node the edge names",
                 ValidationType::EdgeDuplication => "delete the repeated add_edge call",
                 ValidationType::GraphConnectivity => "connect it, or delete it",
-                ValidationType::OutputValidation => "pick one of output_from / intermediate_output_from",
+                ValidationType::OutputValidation => {
+                    "pick one of output_from / intermediate_output_from"
+                }
             };
             println!("  category: {:?}", e.validation_type);
             println!("  wire name: {}", e.validation_type);

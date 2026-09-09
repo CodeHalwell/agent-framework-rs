@@ -56,7 +56,11 @@ impl ChatClient for AlwaysFails {
         Err((self.make_error)())
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -69,13 +73,11 @@ fn classify(err: &Error) -> String {
             retry_after,
             ..
         } => format!("ServiceStatus  status={status} retry_after={retry_after:?}"),
-        Error::ServiceInvalidAuth { .. } => "ServiceInvalidAuth    (bad/missing credentials)".into(),
-        Error::ServiceInvalidRequest { .. } => {
-            "ServiceInvalidRequest (malformed request)".into()
+        Error::ServiceInvalidAuth { .. } => {
+            "ServiceInvalidAuth    (bad/missing credentials)".into()
         }
-        Error::ServiceContentFilter { .. } => {
-            "ServiceContentFilter  (moderation refusal)".into()
-        }
+        Error::ServiceInvalidRequest { .. } => "ServiceInvalidRequest (malformed request)".into(),
+        Error::ServiceContentFilter { .. } => "ServiceContentFilter  (moderation refusal)".into(),
         Error::Service(msg) => format!("Service               (transport-ish) -- {msg}"),
         other => format!("{other:?}"),
     }
@@ -107,7 +109,10 @@ async fn attempts_for(
 
     let n = attempts.load(Ordering::SeqCst);
     let verdict = if n > 1 { "RETRIED" } else { "not retried" };
-    println!("  {label:<22} {n} attempt(s)  {verdict:<11} -- {}", classify(&err));
+    println!(
+        "  {label:<22} {n} attempt(s)  {verdict:<11} -- {}",
+        classify(&err)
+    );
 }
 
 #[tokio::main]
@@ -174,9 +179,9 @@ async fn main() -> Result<()> {
     // A stricter policy: retry 5xx only, never 429 (e.g. because this
     // deployment would rather shed load than queue behind a rate limit).
     let only_5xx = || {
-        RetryOn::predicate(|err| {
-            matches!(err, Error::ServiceStatus { status, .. } if *status >= 500)
-        })
+        RetryOn::predicate(
+            |err| matches!(err, Error::ServiceStatus { status, .. } if *status >= 500),
+        )
     };
     attempts_for(
         "429 (custom rule)",
@@ -209,9 +214,11 @@ impl ChatClient for ToolCallingClient {
     async fn get_response(&self, messages: Vec<Message>, _o: ChatOptions) -> Result<ChatResponse> {
         // If a tool result is already in the transcript, the loop has come
         // back round: produce a final answer instead of calling again.
-        let has_result = messages
-            .iter()
-            .any(|m| m.contents.iter().any(|c| matches!(c, Content::FunctionResult(_))));
+        let has_result = messages.iter().any(|m| {
+            m.contents
+                .iter()
+                .any(|c| matches!(c, Content::FunctionResult(_)))
+        });
         if has_result {
             let detail = messages
                 .iter()
@@ -239,7 +246,11 @@ impl ChatClient for ToolCallingClient {
         })
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -247,13 +258,16 @@ impl ChatClient for ToolCallingClient {
 async fn tool_error_handling() -> Result<()> {
     // An ordinary failing tool: `Error::Tool` is absorbed into the function
     // result and handed back to the model, which gets to react to it.
-    let flaky = FunctionTool::new(
-        "flaky",
-        "A tool that always fails in the ordinary way.",
-        json!({ "type": "object", "properties": {} }),
-        |_args| async move { Err::<serde_json::Value, _>(Error::Tool("upstream API is down".into())) },
-    )
-    .into_definition();
+    let flaky =
+        FunctionTool::new(
+            "flaky",
+            "A tool that always fails in the ordinary way.",
+            json!({ "type": "object", "properties": {} }),
+            |_args| async move {
+                Err::<serde_json::Value, _>(Error::Tool("upstream API is down".into()))
+            },
+        )
+        .into_definition();
 
     // A guardrail that refuses: `Error::MiddlewareFailure` is the one error
     // the function-invocation loop propagates instead of absorbing, so the

@@ -203,7 +203,7 @@ agent-framework = { version = "0.1", features = ["anthropic"] }
 
 ## Examples
 
-69 runnable examples live in [`examples/`](examples), organized by topic
+96 runnable examples live in [`examples/`](examples), organized by topic
 (agents, providers, workflows, orchestrations, mcp, hosting, memory,
 observability, a2a, declarative, compliance). See
 [`examples/README.md`](examples/README.md) for the full gallery — every
@@ -224,6 +224,8 @@ OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example quickstart
 cargo run -p agent-framework-examples --example streaming_sse              # offline -- real SSE token streaming end to end
 cargo run -p agent-framework-examples --example typed_tools                # offline -- JSON Schema derived from a Rust struct
 cargo run -p agent-framework-examples --example checkpoint_resume_fanin    # offline -- checkpoint mid-fan-in, then resume
+cargo run -p agent-framework-examples --example custom_chat_client         # offline -- implement ChatClient for your own backend
+cargo run -p agent-framework-examples --example mcp_http_transport         # offline -- a real MCP server, served in-process
 OPENAI_API_KEY=sk-... cargo run -p agent-framework-examples --example magentic
 ```
 
@@ -328,7 +330,7 @@ Done — everything else, including:
 - [x] Redis (BM25), Mem0, Cosmos DB, Azure AI Search; Purview middleware
 - [x] Observability: OTel GenAI spans (request + tool attributes) and
       optional GenAI metrics histograms (`otel-metrics`)
-- [x] 69 runnable examples in [`examples/`](examples)
+- [x] 96 runnable examples in [`examples/`](examples)
 
 ## Development
 

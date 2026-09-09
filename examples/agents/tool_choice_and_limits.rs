@@ -57,7 +57,11 @@ impl ChatClient for EchoToolChoice {
         )))
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -90,7 +94,11 @@ impl ChatClient for NeverStops {
         })
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -224,7 +232,10 @@ async fn main() -> Result<()> {
         let response = looping
             .get_response(vec![Message::user("go")], options)
             .await?;
-        println!("  include_detailed_errors={detailed:<5} -> {}", response.text());
+        println!(
+            "  include_detailed_errors={detailed:<5} -> {}",
+            response.text()
+        );
     }
     println!(
         "\n  Off by default: a tool's error text can carry internal detail you do\n  \
@@ -268,7 +279,11 @@ impl ChatClient for ReportsToolError {
         }
     }
 
-    async fn get_streaming_response(&self, _m: Vec<Message>, _o: ChatOptions) -> Result<ChatStream> {
+    async fn get_streaming_response(
+        &self,
+        _m: Vec<Message>,
+        _o: ChatOptions,
+    ) -> Result<ChatStream> {
         Ok(Box::pin(futures::stream::empty()))
     }
 }

@@ -51,12 +51,18 @@ async fn main() -> Result<()> {
 
     println!("  Debug:   {config:?}");
     println!("  Display: {}", config.api_key);
-    println!("  real value (via expose_secret): {}", config.api_key.expose_secret());
+    println!(
+        "  real value (via expose_secret): {}",
+        config.api_key.expose_secret()
+    );
     println!(
         "\n  Note the derived `Debug` on the whole struct is already safe -- \n  \
          that is the point: you cannot leak it by forgetting."
     );
-    println!("  endpoint={} timeout={}s", config.endpoint, config.timeout_secs);
+    println!(
+        "  endpoint={} timeout={}s",
+        config.endpoint, config.timeout_secs
+    );
 
     // Equality compares the underlying value, so a config round-trip can
     // still be asserted on.
@@ -75,15 +81,24 @@ async fn main() -> Result<()> {
     std::env::set_current_dir(&dir).map_err(|e| Error::Configuration(e.to_string()))?;
 
     // 4. default only -- nothing else is set.
-    show("nothing set", load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())));
-    show("nothing set, no default", load_setting("DEMO_MODEL", None, None));
+    show(
+        "nothing set",
+        load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())),
+    );
+    show(
+        "nothing set, no default",
+        load_setting("DEMO_MODEL", None, None),
+    );
 
     // 3. the process environment beats the default.
     //
     // SAFETY: single-threaded at this point in `main`; `set_var` is only
     // unsound when another thread may be reading the environment concurrently.
     unsafe { std::env::set_var("DEMO_MODEL", "from-the-environment") };
-    show("env var set", load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())));
+    show(
+        "env var set",
+        load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())),
+    );
 
     // 2. a ./.env file beats the process environment.
     std::fs::write(
@@ -91,13 +106,23 @@ async fn main() -> Result<()> {
         "# a comment\nDEMO_MODEL=from-the-dotenv-file\nDEMO_REGION='eu-west-1'\n",
     )
     .map_err(|e| Error::Configuration(e.to_string()))?;
-    show("./.env present", load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())));
-    show("./.env, quotes stripped", load_setting("DEMO_REGION", None, None));
+    show(
+        "./.env present",
+        load_setting("DEMO_MODEL", None, Some("gpt-4o-mini".into())),
+    );
+    show(
+        "./.env, quotes stripped",
+        load_setting("DEMO_REGION", None, None),
+    );
 
     // 1. an explicit override beats everything.
     show(
         "explicit override",
-        load_setting("DEMO_MODEL", Some("from-the-caller".into()), Some("gpt-4o-mini".into())),
+        load_setting(
+            "DEMO_MODEL",
+            Some("from-the-caller".into()),
+            Some("gpt-4o-mini".into()),
+        ),
     );
 
     // Clean up: restore the working directory and drop the temp files.

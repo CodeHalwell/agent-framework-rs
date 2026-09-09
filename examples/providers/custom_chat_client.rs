@@ -104,13 +104,14 @@ impl MyChatClient {
 
         // Already have a tool result? Then this is the second pass of the
         // function-invocation loop: produce a final answer.
-        if let Some(result) = messages
-            .iter()
-            .flat_map(|m| m.contents.iter())
-            .find_map(|c| match c {
-                Content::FunctionResult(r) => r.result.clone(),
-                _ => None,
-            })
+        if let Some(result) =
+            messages
+                .iter()
+                .flat_map(|m| m.contents.iter())
+                .find_map(|c| match c {
+                    Content::FunctionResult(r) => r.result.clone(),
+                    _ => None,
+                })
         {
             return with_usage(ChatResponse::from_text(format!("The answer is {result}.")));
         }
@@ -235,7 +236,9 @@ async fn main() -> Result<()> {
     let response = client
         .get_response(
             vec![Message::user("hello there")],
-            ChatOptions::new().with_temperature(0.4).with_max_tokens(256),
+            ChatOptions::new()
+                .with_temperature(0.4)
+                .with_max_tokens(256),
         )
         .await?;
     println!("    {}", response.text());
@@ -274,7 +277,10 @@ async fn main() -> Result<()> {
     println!("\n== 3. streaming ==\n");
     use std::io::Write as _;
     let mut stream = MyChatClient::new("my-model-v1")
-        .get_streaming_response(vec![Message::user("stream me something")], ChatOptions::new())
+        .get_streaming_response(
+            vec![Message::user("stream me something")],
+            ChatOptions::new(),
+        )
         .await?;
     print!("    ");
     while let Some(update) = stream.next().await {
