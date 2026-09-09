@@ -153,13 +153,13 @@ jobs:
             return 1
           }
           publish agent-framework-core
-          for c in a2a bedrock copilotstudio cosmos declarative gemini hosting mcp mem0 openai purview redis; do
+          for c in a2a bedrock copilotstudio declarative gemini hosting mcp mem0 openai purview redis; do
             publish agent-framework-$c
           done
           for c in azure foundry-local github-copilot mistral ollama; do
             publish agent-framework-$c
           done
-          for c in anthropic azure-ai-search foundry; do
+          for c in anthropic azure-ai-search cosmos foundry; do
             publish agent-framework-$c
           done
           publish agent-framework
