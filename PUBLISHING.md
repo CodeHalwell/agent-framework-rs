@@ -21,7 +21,7 @@ the order does not matter:
 
 1. **Tier 0** — `agent-framework-core`
 2. **Tier 1** — `agent-framework-a2a`, `agent-framework-bedrock`,
-   `agent-framework-copilotstudio`, `agent-framework-cosmos`,
+   `agent-framework-copilotstudio`,
    `agent-framework-declarative`, `agent-framework-gemini`,
    `agent-framework-hosting`, `agent-framework-mcp`, `agent-framework-mem0`,
    `agent-framework-openai`, `agent-framework-purview`,
@@ -30,21 +30,21 @@ the order does not matter:
    `agent-framework-github-copilot`, `agent-framework-mistral`,
    `agent-framework-ollama` (need `openai`)
 4. **Tier 3** — `agent-framework-anthropic` (needs `azure` + `bedrock`),
-   `agent-framework-azure-ai-search`, `agent-framework-foundry`
-   (need `azure`)
+   `agent-framework-azure-ai-search`, `agent-framework-cosmos`,
+   `agent-framework-foundry` (need `azure`)
 5. **Tier 4** — `agent-framework` (the umbrella crate)
 
 ```bash
 # One tier at a time; crates.io indexing is fast but not instant, so give
 # each tier a moment before publishing the next.
 cargo publish -p agent-framework-core
-for c in a2a bedrock copilotstudio cosmos declarative gemini hosting mcp mem0 openai purview redis; do
+for c in a2a bedrock copilotstudio declarative gemini hosting mcp mem0 openai purview redis; do
   cargo publish -p agent-framework-$c
 done
 for c in azure foundry-local github-copilot mistral ollama; do
   cargo publish -p agent-framework-$c
 done
-for c in anthropic azure-ai-search foundry; do
+for c in anthropic azure-ai-search cosmos foundry; do
   cargo publish -p agent-framework-$c
 done
 cargo publish -p agent-framework
