@@ -356,3 +356,51 @@ path = "compliance/purview_middleware.rs"
 [[example]]
 name = "declarative_workflow"
 path = "declarative/declarative_workflow.rs"
+
+[[example]]
+name = "error_handling"
+path = "agents/error_handling.rs"
+
+[[example]]
+name = "tool_choice_and_limits"
+path = "agents/tool_choice_and_limits.rs"
+
+[[example]]
+name = "hosted_tools"
+path = "agents/hosted_tools.rs"
+
+[[example]]
+name = "dynamic_tools"
+path = "agents/dynamic_tools.rs"
+
+[[example]]
+name = "settings_and_secrets"
+path = "agents/settings_and_secrets.rs"
+
+[[example]]
+name = "workflow_validation"
+path = "workflows/validation.rs"
+
+[[example]]
+name = "workflow_events"
+path = "workflows/workflow_events.rs"
+
+[[example]]
+name = "vector_store"
+path = "memory/vector_store.rs"
+
+[[example]]
+name = "custom_chat_client"
+path = "providers/custom_chat_client.rs"
+
+[[example]]
+name = "hosting_security"
+path = "hosting/hosting_security.rs"
+
+[[example]]
+name = "mcp_http_transport"
+path = "mcp/mcp_http_transport.rs"
+
+[[example]]
+name = "a2a_task_lifecycle"
+path = "a2a/a2a_task_lifecycle.rs"
