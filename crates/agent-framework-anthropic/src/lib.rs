@@ -890,6 +890,37 @@ mod tests {
         assert_eq!(reasoning[0].protected_data.as_deref(), Some("c2lnMA"));
         assert_eq!(reasoning[1].text, "second");
         assert_eq!(reasoning[1].protected_data.as_deref(), Some("c2lnMQ"));
+
+        // …and, the surface that actually decides whether the next turn is
+        // accepted: what goes back on the wire. Asserting only on the
+        // coalesced response leaves the replay untested, and the replay is
+        // where the signatures have to line up with their text — a merge that
+        // survived this far would produce one block signed by neither.
+        let replayed = convert::messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                resp.messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter().cloned())
+                    .collect(),
+            ),
+        ]);
+        let blocks: Vec<&Value> = replayed[1]["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "two thinking blocks on the wire: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["thinking"], "first");
+        assert_eq!(blocks[0]["signature"], "c2lnMA");
+        assert_eq!(blocks[1]["thinking"], "second");
+        assert_eq!(blocks[1]["signature"], "c2lnMQ");
     }
 
     #[tokio::test]
