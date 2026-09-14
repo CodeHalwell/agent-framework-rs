@@ -689,7 +689,19 @@ impl FilterExpression {
                     }
                     Ok(false)
                 }
-                FilterGroupOperator::Not => Ok(!group.filters[0].matches(record, resolve)?),
+                // Indexing would panic, and this is reachable: `matches` is
+                // public and `FilterExpression` is `Deserialize`, so a tree
+                // that never went through a constructor (or `validate`) can
+                // arrive here empty. An error is what the rest of this
+                // method does with malformed input.
+                FilterGroupOperator::Not => {
+                    let inner = group.filters.first().ok_or_else(|| {
+                        Error::Configuration(
+                            "a 'not' filter group requires exactly one filter".into(),
+                        )
+                    })?;
+                    Ok(!inner.matches(record, resolve)?)
+                }
             },
             Self::Condition(filter) => evaluate_filter(filter, record, resolve),
         }
@@ -759,8 +771,12 @@ fn evaluate_filter(
             }
         }
         FilterOperator::Between => {
+            // Same reasoning as the `not` group above: an unvalidated
+            // `between` can carry any number of bounds, and indexing them
+            // would panic rather than report the malformed filter.
             let bounds = expected
                 .and_then(Value::as_array)
+                .filter(|bounds| bounds.len() == 2)
                 .ok_or_else(|| type_error("'between' requires two bounds"))?;
             let lower = compare_values(actual, &bounds[0])
                 .ok_or_else(|| type_error("incomparable types"))?;
@@ -1269,5 +1285,40 @@ mod tests {
         let expr: FilterExpression = Filter::eq("a.b", 1).unwrap().into();
         let err = expr.matches(&record, &identity).unwrap_err().to_string();
         assert!(err.contains("nested filter field paths"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod unvalidated_input_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every field resolves to itself.
+    fn identity(name: &str) -> Option<String> {
+        Some(name.to_string())
+    }
+
+    /// `matches` is public and `FilterExpression` is `Deserialize`, so a tree
+    /// that never passed through a constructor can reach it. Indexing its
+    /// children would then panic on caller data — in a method whose whole
+    /// signature says it reports bad input as an error.
+    #[test]
+    fn an_unvalidated_expression_errors_rather_than_panicking() {
+        let empty_not: FilterExpression =
+            serde_json::from_value(json!({ "operator": "not", "filters": [] })).unwrap();
+        assert!(empty_not.validate().is_err(), "validate already caught it");
+        assert!(
+            empty_not.matches(&json!({ "a": 1 }), &identity).is_err(),
+            "and matches must not panic on the same input"
+        );
+
+        let short_between: FilterExpression = serde_json::from_value(
+            json!({ "field_name": "a", "operator": "between", "value": [1] }),
+        )
+        .unwrap();
+        assert!(short_between.validate().is_err());
+        assert!(short_between
+            .matches(&json!({ "a": 1 }), &identity)
+            .is_err());
     }
 }

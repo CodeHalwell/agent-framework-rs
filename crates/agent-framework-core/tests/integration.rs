@@ -3682,3 +3682,68 @@ fn a_duration_budget_a_duration_cannot_hold_is_refused() {
     .validate()
     .is_ok());
 }
+
+#[tokio::test]
+async fn a_failed_run_does_not_leave_its_budget_parked_on_the_session() {
+    // A budget is parked only for an approval round trip. If the resumed leg
+    // then fails, the parked clock outlives the run that started it, and the
+    // next — unrelated — run on the same session resumes it: `started_millis`
+    // from a run already over, so a fresh request can be spent before it
+    // makes a single call.
+    let session = AgentSession::new();
+    let counter = Arc::new(Mutex::new(0));
+    let approving = FunctionInvokingChatClient::new(MockClient::new(vec![secret_call()]))
+        .with_config(FunctionInvocationConfig {
+            max_duration_seconds: Some(30.0),
+            ..Default::default()
+        });
+    let tool = approval_tool(counter.clone());
+
+    // 1. A run that pauses for approval parks the budget.
+    let mut options = ChatOptions::new().with_tool(tool.clone());
+    options.session = Some(session.clone());
+    let paused = approving
+        .get_response(vec![Message::user("go")], options)
+        .await
+        .unwrap();
+    assert!(session
+        .state
+        .get("__af_function_invocation_budget__")
+        .is_some());
+
+    // 2. The resumed leg fails at the provider.
+    let approvals: Vec<Content> = paused
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(|c| match c {
+            Content::FunctionApprovalRequest(req) => {
+                Some(Content::FunctionApprovalResponse(req.create_response(true)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!approvals.is_empty(), "the run paused for approval");
+    let failing =
+        FunctionInvokingChatClient::new(FailingClient).with_config(FunctionInvocationConfig {
+            max_duration_seconds: Some(30.0),
+            ..Default::default()
+        });
+    let mut resume_options = ChatOptions::new().with_tool(tool);
+    resume_options.session = Some(session.clone());
+    let err = failing
+        .get_response(
+            vec![Message::with_contents(Role::user(), approvals)],
+            resume_options,
+        )
+        .await;
+    assert!(err.is_err(), "the provider failed, so the run must fail");
+
+    assert!(
+        session
+            .state
+            .get("__af_function_invocation_budget__")
+            .is_none(),
+        "a failed run must not leave its budget behind for the next one"
+    );
+}

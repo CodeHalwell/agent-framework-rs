@@ -803,7 +803,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                                 observability: &self.observability,
                             },
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
                         had_error |= is_error;
                         // Keyed by occurrence id when the call carries one, so
                         // two approvals pending under the same provider
@@ -849,7 +850,13 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
                 let response = self
                     .inner_get_response(conversation.clone(), options.clone())
-                    .await?;
+                    .await
+                    // An error ends the run, so a budget parked by an earlier
+                    // approval must not outlive it: the next, unrelated run on
+                    // this session would otherwise resume a clock that started
+                    // in a run already over, and could be spent before making
+                    // a single call.
+                    .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
                 accumulate_usage(&mut aggregated_usage, response.usage_details.as_ref());
 
                 // A call whose result is already present in the same response
@@ -1066,7 +1073,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     }
                 });
 
-                let outcomes = futures::future::try_join_all(invocations).await?;
+                let outcomes = futures::future::try_join_all(invocations)
+                    .await
+                    .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
                 budget.record(outcomes.len());
                 let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
                 let mut had_error = false;

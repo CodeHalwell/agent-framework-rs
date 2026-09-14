@@ -121,6 +121,26 @@ works.
   followed by `reqwest`, a bare send read a same-origin 3xx as a delivered
   teardown and left the server session open.
 
+- `AzureAISearchCollection` sent the **SDK's** vector-field property names
+  (`vectorSearchDimensions` / `vectorSearchProfileName`) where the REST index
+  schema defines `dimensions` / `vectorSearchProfile`. Creating a vector index
+  would have been rejected by a real Search service; every SDK serializes to
+  the REST names, and this client speaks REST directly.
+
+- `FilterExpression::matches` no longer panics on an expression that never
+  passed through a constructor — `Deserialize` bypasses them, and an empty
+  `not` group or a one-bound `between` indexed out of range. Both now report
+  the malformed filter as the error the signature already promised.
+
+- The Anthropic converter replayed a raw `thinking` block even when it carried
+  no `signature`, contradicting the unsigned-block rule beside it. A raw block
+  is replayed verbatim only when signed (`redacted_thinking`, which has no
+  signature by construction, still is); otherwise the signed rebuild applies.
+
+- A parked tool-loop budget no longer survives a failed run. If a run resumed
+  from an approval hit a provider error, the parked clock outlived it and the
+  next, unrelated run on that session resumed it — possibly already spent.
+
 - **The Azure chat api-version was pinned to GA `2024-10-21`**, which rejects
   request fields this client sends (`store` first among them) with
   "Unrecognized request argument supplied". Now `2024-12-01-preview` for chat,

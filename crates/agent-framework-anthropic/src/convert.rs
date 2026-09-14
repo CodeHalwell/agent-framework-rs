@@ -250,11 +250,19 @@ fn append_response_format_instructions(
 ///   thinking is not context for the next turn, the signature is.
 fn thinking_block(content: &TextReasoningContent) -> Option<Value> {
     if let Some(raw) = content.raw_representation.as_ref() {
-        if matches!(
-            raw.get("type").and_then(Value::as_str),
-            Some("thinking") | Some("redacted_thinking")
-        ) {
-            return Some(raw.clone());
+        match raw.get("type").and_then(Value::as_str) {
+            // Encrypted and signature-free by construction: replaying it
+            // verbatim is the only thing anyone can do with it.
+            Some("redacted_thinking") => return Some(raw.clone()),
+            // Verbatim *only when signed*, which is the same rule the
+            // rebuilt path below applies. A raw block whose signature was
+            // stripped — or one a caller hand-built — is refused by the API
+            // exactly like any other unsigned thinking block, so it must not
+            // take a shortcut past that rule just for being raw.
+            Some("thinking") if raw.get("signature").and_then(Value::as_str).is_some() => {
+                return Some(raw.clone())
+            }
+            _ => {}
         }
     }
     let signature = content.protected_data.as_ref()?;
@@ -2412,6 +2420,58 @@ mod tests {
                 vec![Content::TextReasoning(TextReasoningContent {
                     text: "recalled".into(),
                     protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                })],
+            ),
+        ]);
+        assert_eq!(
+            out[1]["content"][0],
+            json!({ "type": "thinking", "thinking": "recalled", "signature": "c2ln" })
+        );
+    }
+
+    #[test]
+    fn an_unsigned_raw_thinking_block_is_not_replayed_either() {
+        // The verbatim-replay shortcut exists because a signature covers the
+        // block's exact text — not as a way past the unsigned rule. A raw
+        // block whose signature was stripped is refused by the API like any
+        // other, so it must not ride through just for being raw.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![
+                    Content::TextReasoning(TextReasoningContent {
+                        text: "tampered".into(),
+                        raw_representation: Some(json!({
+                            "type": "thinking",
+                            "thinking": "tampered",
+                        })),
+                        ..Default::default()
+                    }),
+                    Content::text("the answer"),
+                ],
+            ),
+        ]);
+        assert_eq!(out[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out[1]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn a_raw_thinking_block_without_a_signature_falls_back_to_the_rebuilt_form() {
+        // …and when the signature survived on the content even though the raw
+        // block lost it, the rebuilt form is sent rather than nothing.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(TextReasoningContent {
+                    text: "recalled".into(),
+                    protected_data: Some("c2ln".into()),
+                    raw_representation: Some(json!({
+                        "type": "thinking",
+                        "thinking": "recalled",
+                    })),
                     ..Default::default()
                 })],
             ),

@@ -194,7 +194,7 @@ async fn ensure_collection_exists_creates_the_index_when_absent() {
         .iter()
         .find(|f| f["name"] == "vec")
         .expect("the vector field is sent under its storage name");
-    assert_eq!(vector["vectorSearchDimensions"], 3);
+    assert_eq!(vector["dimensions"], 3);
     assert_eq!(schema["vectorSearch"]["algorithms"][0]["kind"], "hnsw");
 }
 

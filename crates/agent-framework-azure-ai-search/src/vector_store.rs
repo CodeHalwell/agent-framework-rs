@@ -322,8 +322,16 @@ impl AzureAISearchCollection {
                     let algorithm = format!("{name}_algorithm");
                     spec.insert("searchable".into(), json!(true));
                     spec.insert("filterable".into(), json!(false));
-                    spec.insert("vectorSearchDimensions".into(), json!(dimensions));
-                    spec.insert("vectorSearchProfileName".into(), json!(profile));
+                    // The REST index schema's names, not the SDKs'. Every
+                    // Azure Search SDK exposes these as
+                    // `vectorSearchDimensions`/`vectorSearchProfileName` and
+                    // serializes them to `dimensions`/`vectorSearchProfile`
+                    // on the wire; this client speaks the wire directly, so
+                    // the SDK spelling would be rejected by a real service
+                    // ("the property does not exist on type ... Field") no
+                    // matter what a fake accepts.
+                    spec.insert("dimensions".into(), json!(dimensions));
+                    spec.insert("vectorSearchProfile".into(), json!(profile));
 
                     let metric = search_metric(field)?;
                     let kind = match field
@@ -1225,8 +1233,14 @@ mod tests {
 
         let vector = by_name("embedding");
         assert_eq!(vector["type"], "Collection(Edm.Single)");
-        assert_eq!(vector["vectorSearchDimensions"], 3);
-        assert_eq!(vector["vectorSearchProfileName"], "embedding_profile");
+        // The REST schema's names. An SDK spells these
+        // `vectorSearchDimensions`/`vectorSearchProfileName`, and a request
+        // carrying those is rejected by the service — which no fake service
+        // can tell you.
+        assert_eq!(vector["dimensions"], 3);
+        assert_eq!(vector["vectorSearchProfile"], "embedding_profile");
+        assert!(vector.get("vectorSearchDimensions").is_none());
+        assert!(vector.get("vectorSearchProfileName").is_none());
         let search = &index["vectorSearch"];
         assert_eq!(search["algorithms"][0]["kind"], "hnsw");
         assert_eq!(
