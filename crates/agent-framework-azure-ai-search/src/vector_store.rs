@@ -629,15 +629,19 @@ impl AzureAISearchCollection {
                     // `ne null` keeps a missing field out of the negation:
                     // without it every record lacking the field would match.
                     //
-                    // It also excludes a field that is *explicitly* null,
-                    // where the portable evaluator matches — the field is
-                    // present, and null is in no list of values. That
-                    // divergence cannot be closed here: an Azure index has a
-                    // fixed schema in which every declared field exists with
-                    // a value or null, so "absent" and "null" are one state,
-                    // and this is upstream's translation for the same reason.
-                    // `ne` itself stays refused because there the wrong
-                    // answer is the *common* case rather than the null one.
+                    // It excludes a field that is *explicitly* null too —
+                    // and so does the portable evaluator, which returns false
+                    // for every operator but `eq`/`ne` on a null field
+                    // (`vectors::filters`, and upstream's `_in_memory`
+                    // `_evaluate_filter` has the same rule). So this is
+                    // agreement, not an approximation: a null field is a
+                    // non-match for `not_in` on both sides.
+                    //
+                    // `ne` stays refused because there the two really do
+                    // disagree, and in the *common* case rather than the null
+                    // one: plain `field ne 'x'` matches every Azure row where
+                    // the field is null, which the portable rule calls a
+                    // non-match.
                     format!("({name} ne null and not ({contained}))")
                 })
             }

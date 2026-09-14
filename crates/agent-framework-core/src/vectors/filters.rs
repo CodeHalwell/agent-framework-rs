@@ -776,8 +776,25 @@ fn evaluate_filter(
     };
 
     Ok(match op {
-        FilterOperator::Eq => values_equal(actual, expected.unwrap_or(&Value::Null)),
-        FilterOperator::Ne => !values_equal(actual, expected.unwrap_or(&Value::Null)),
+        // An *absent* operand is an error, as it is for every other
+        // value-taking operator and as `validate` already says. Defaulting
+        // it to null instead would turn a malformed `eq` into a working
+        // null-matching predicate — a quiet change of meaning in a scoping
+        // filter.
+        //
+        // A filter *constructed* with an explicitly null operand still
+        // works as a null test. A *deserialized* one does not, and cannot:
+        // serde folds JSON `null` into `None` for an `Option`, so the two
+        // are one value by the time this sees them. `is_null` is the
+        // operator for that test, which is what upstream's docs say to use.
+        FilterOperator::Eq => values_equal(
+            actual,
+            expected.ok_or_else(|| type_error("no value supplied"))?,
+        ),
+        FilterOperator::Ne => !values_equal(
+            actual,
+            expected.ok_or_else(|| type_error("no value supplied"))?,
+        ),
         FilterOperator::Gt | FilterOperator::Gte | FilterOperator::Lt | FilterOperator::Lte => {
             let expected = expected.ok_or_else(|| type_error("no value supplied"))?;
             let ordering =
@@ -1434,6 +1451,30 @@ mod unvalidated_input_tests {
             .matches(&json!({ "a": 1, "b": 9 }), &identity)
             .is_err());
 
+        // An `eq` with no operand: `validate` calls it an error, so `matches`
+        // must not quietly read it as "field is null" instead.
+        let valueless_eq: FilterExpression =
+            serde_json::from_value(json!({ "field_name": "a", "operator": "eq" })).unwrap();
+        assert!(valueless_eq.validate().is_err());
+        assert!(valueless_eq
+            .matches(&json!({ "a": null }), &identity)
+            .is_err());
+        // …while a filter *constructed* with an explicitly null operand is a
+        // real null test. It has to be constructed: serde folds JSON `null`
+        // into `None` for an `Option`, so a deserialized `"value": null` is
+        // indistinguishable from an absent one and errors like the case
+        // above. `is_null` is the operator for testing nullness through JSON.
+        let null_eq: FilterExpression = Filter::new("a", FilterOperator::Eq, Some(Value::Null))
+            .unwrap()
+            .into();
+        assert!(null_eq.matches(&json!({ "a": null }), &identity).unwrap());
+        assert!(!null_eq.matches(&json!({ "a": 1 }), &identity).unwrap());
+        let deserialized_null: FilterExpression =
+            serde_json::from_value(json!({ "field_name": "a", "operator": "eq", "value": null }))
+                .unwrap();
+        assert!(deserialized_null
+            .matches(&json!({ "a": null }), &identity)
+            .is_err());
         let short_between: FilterExpression = serde_json::from_value(
             json!({ "field_name": "a", "operator": "between", "value": [1] }),
         )

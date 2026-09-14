@@ -151,6 +151,11 @@ works.
   run's elapsed clock, and could find the new request's tools disabled before
   it made a single call.
 
+- `FilterExpression::matches` requires an operand for `eq` and `ne`, as it
+  already did for every other value-taking operator and as `validate` says.
+  Defaulting an absent one to null turned a malformed `eq` into a working
+  null-matching predicate.
+
 - `FilterExpression::matches` rejects an empty group for every operator, not
   just `not`. An empty `and` is vacuously true, so a malformed predicate that
   never went through `validate` silently became match-all.
