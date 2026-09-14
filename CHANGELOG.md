@@ -151,6 +151,11 @@ works.
   run's elapsed clock, and could find the new request's tools disabled before
   it made a single call.
 
+- The RediSearch index watches the namespace entries are actually written
+  under. With a key prefix that the storage-key encoding touches, `FT.CREATE`
+  was given the raw prefix while entries were written under the encoded one,
+  so every write succeeded and every search came back empty.
+
 - Azure AI Search indexing batches are bounded by serialized payload size as
   well as action count. The 1,000-action limit is not the binding one for
   vector data — a 1536-dimension embedding serializes to roughly 18 KB, so a

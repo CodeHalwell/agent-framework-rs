@@ -695,11 +695,18 @@ impl FilterExpression {
                 // arrive here empty. An error is what the rest of this
                 // method does with malformed input.
                 FilterGroupOperator::Not => {
-                    let inner = group.filters.first().ok_or_else(|| {
-                        Error::Configuration(
-                            "a 'not' filter group requires exactly one filter".into(),
-                        )
-                    })?;
+                    // Exactly one, not "the first of however many": taking
+                    // `filters[0]` and ignoring the rest would answer a
+                    // *different* predicate than the caller wrote, which is
+                    // the failure mode this whole branch exists to avoid.
+                    // Silently narrowing an authorization filter is worse
+                    // than refusing it.
+                    let [inner] = group.filters.as_slice() else {
+                        return Err(Error::Configuration(format!(
+                            "a 'not' filter group requires exactly one filter, got {}",
+                            group.filters.len()
+                        )));
+                    };
                     Ok(!inner.matches(record, resolve)?)
                 }
             },
@@ -1386,6 +1393,23 @@ mod unvalidated_input_tests {
             empty_not.matches(&json!({ "a": 1 }), &identity).is_err(),
             "and matches must not panic on the same input"
         );
+
+        // Two children is the sharper case: taking the first and ignoring the
+        // rest answers a different predicate than the caller wrote, which is
+        // worse than refusing — a narrowed authorization filter looks like a
+        // working one.
+        let wide_not: FilterExpression = serde_json::from_value(json!({
+            "operator": "not",
+            "filters": [
+                { "field_name": "a", "operator": "eq", "value": 1 },
+                { "field_name": "b", "operator": "eq", "value": 2 },
+            ]
+        }))
+        .unwrap();
+        assert!(wide_not.validate().is_err());
+        assert!(wide_not
+            .matches(&json!({ "a": 1, "b": 9 }), &identity)
+            .is_err());
 
         let short_between: FilterExpression = serde_json::from_value(
             json!({ "field_name": "a", "operator": "between", "value": [1] }),

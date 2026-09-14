@@ -748,7 +748,12 @@ impl RedisContextProvider {
     /// called once [`Self::use_redisearch`] has confirmed RediSearch is
     /// available.
     async fn ensure_index(&self, conn: &mut redis::aio::MultiplexedConnection) -> Result<()> {
-        let args = ft_create_args(&self.key_prefix, &self.index_name());
+        // The *encoded* prefix, the one `entry_key` writes under. Passing the
+        // raw prefix points the index at a namespace nothing is written to
+        // whenever the prefix encodes, so every write succeeds and every
+        // `FT.SEARCH` comes back empty — a silent retrieval failure rather
+        // than an error.
+        let args = ft_create_args(&self.key_segment(), &self.index_name());
         self.index_ready
             .get_or_try_init(move || async move {
                 let mut cmd = redis::cmd("FT.CREATE");
@@ -1581,5 +1586,37 @@ mod key_scoping_tests {
         assert_eq!(p.entry_key("id1"), "myapp:entry:id1");
         assert_eq!(p.scan_pattern(), "myapp:entry:*");
         assert_eq!(p.index_name(), "myapp_idx");
+    }
+}
+
+#[cfg(test)]
+mod index_prefix_tests {
+    use super::*;
+
+    /// The RediSearch index must watch the namespace entries are actually
+    /// written to. If `FT.CREATE ... PREFIX` gets the raw prefix while
+    /// `entry_key` writes under the encoded one, every write succeeds and
+    /// every search comes back empty — a silent retrieval failure, which is
+    /// the worst shape this bug could take.
+    #[test]
+    fn the_index_prefix_matches_the_keys_entries_are_written_under() {
+        let provider = RedisContextProvider::new("redis://127.0.0.1:6379")
+            .expect("provider")
+            .with_key_prefix("tenant:a");
+        let args = ft_create_args(&provider.key_segment(), &provider.index_name());
+
+        let prefix_arg = args
+            .iter()
+            .position(|a| a == "PREFIX")
+            .map(|i| args[i + 2].clone())
+            .expect("a PREFIX argument");
+        let entry = provider.entry_key("0000");
+        assert!(
+            entry.starts_with(&prefix_arg),
+            "entries are written to {entry}, index watches {prefix_arg}"
+        );
+        // And the prefix really is the encoded one, so this is not passing by
+        // accident on a literal-safe name.
+        assert!(prefix_arg.starts_with("~p-"), "{prefix_arg}");
     }
 }
