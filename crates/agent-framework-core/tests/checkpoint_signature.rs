@@ -180,3 +180,83 @@ async fn legacy_signatureless_checkpoint_loads() {
     assert_eq!(run.state(), WorkflowRunState::Idle);
     assert_eq!(run.last_output(), Some(json!(10)));
 }
+
+/// Executor ids are only required to be non-empty, so a signature that
+/// renders them by joining with separators is not injective: a caller whose
+/// ids happen to contain `,` or `->` can produce two structurally different
+/// graphs that hash identically. A checkpoint from either would then be
+/// accepted for the other — resumed onto a topology it was never written
+/// for, which is exactly what the signature exists to prevent.
+#[test]
+fn ids_containing_separators_do_not_collide() {
+    // Two different graphs, distinguishable only by where the separator falls.
+    let node = |id: &str| Arc::new(FunctionExecutor::new(id, |_m, _c| async move { Ok(()) }));
+    // A fans out to two executors; B fans out to one whose id happens to
+    // contain the separator. Under a joined rendering both the node list
+    // ("s,x,y") and the edge descriptor ("fanout:s->[x,y]") come out
+    // character-for-character identical.
+    let a = WorkflowBuilder::new()
+        .add_executor(node("s"))
+        .add_executor(node("x"))
+        .add_executor(node("y"))
+        .set_start("s")
+        .add_fan_out("s", vec!["x".to_string(), "y".to_string()])
+        .build()
+        .expect("build a");
+    let b = WorkflowBuilder::new()
+        .add_executor(node("s"))
+        .add_executor(node("x,y"))
+        .set_start("s")
+        .add_fan_out("s", vec!["x,y".to_string()])
+        .build()
+        .expect("build b");
+
+    assert_ne!(
+        a.graph_signature(),
+        b.graph_signature(),
+        "a fan-out to two targets must not sign the same as one target named after both"
+    );
+}
+
+/// A checkpoint written by an older signature *scheme* has not necessarily
+/// been written for a different graph — the encoding changed under it. The
+/// mismatch must say so, rather than sending the reader looking for a change
+/// to their own graph that is not there.
+#[tokio::test]
+async fn an_older_signature_scheme_is_reported_as_such() {
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let cp = mid_run_checkpoint(&storage).await;
+
+    let mut value = serde_json::to_value(&cp).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("graph_signature".into(), json!("v1-0123456789abcdef"));
+    let old_scheme: WorkflowCheckpoint = serde_json::from_value(value).unwrap();
+    let old_storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let id = old_storage.save(old_scheme).await.unwrap();
+
+    let err = match build_pipeline(Some(storage.clone()), false)
+        .run_from_checkpoint(&id, old_storage.clone())
+        .await
+    {
+        Ok(_) => panic!("an older scheme cannot be compared"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("scheme mismatch"), "{err}");
+    assert!(
+        err.contains("may well be identical"),
+        "the message must not claim the graph changed: {err}"
+    );
+
+    // And the override still resumes it, which is the way out the message
+    // points at.
+    let run = match build_pipeline(Some(storage), false)
+        .run_from_checkpoint_unchecked(&id, old_storage)
+        .await
+    {
+        Ok(run) => run,
+        Err(e) => panic!("unchecked resume ignores the scheme mismatch: {e}"),
+    };
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+}

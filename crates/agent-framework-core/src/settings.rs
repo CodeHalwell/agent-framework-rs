@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// The literal used to mask a [`SecretString`]'s value in [`Debug`]/[`Display`]
 /// output.
@@ -39,20 +39,36 @@ const MASK: &str = "***";
 
 /// A string wrapper that masks its value when printed via [`Debug`] or
 /// [`Display`](std::fmt::Display), to prevent secrets (API keys, tokens,
-/// passwords, ...) from
-/// accidentally ending up in logs or error messages.
+/// passwords, ...) from accidentally ending up in logs or error messages.
 ///
-/// The real value is still accessible via [`SecretString::expose_secret`],
-/// and is preserved (not masked) when (de)serialized with `serde`, since
-/// serialization is generally used to persist or transmit the value rather
-/// than to display it.
+/// The real value is reachable only through
+/// [`expose_secret`](SecretString::expose_secret), which is what makes an
+/// audit of where a secret escapes a `grep` rather than a reading of every
+/// call site.
 ///
-/// This is the Rust analogue of upstream's `SecretString(str)`, which masks
-/// its `repr()` but not its `str()`/`__format__` behavior. Rust has no
-/// implicit string-like coercions, so the equivalent masked-only surface is
-/// `Debug` and `Display`; call [`SecretString::expose_secret`] whenever the
-/// real value is needed (e.g. to authenticate a request).
-#[derive(Clone, Serialize, Deserialize)]
+/// This is the Rust analogue of upstream's `SecretString`, which upstream
+/// #8127 rewrote from a `str` subclass into a wrapper for the same reason:
+/// the subclass masked `repr()` while every other path — `str()`, f-strings,
+/// concatenation, JSON encoding — silently produced the secret. Rust has no
+/// implicit string coercions, so `Debug` and `Display` are the equivalent
+/// surface, and both are masked here.
+///
+/// # It deliberately does not implement `Serialize`
+///
+/// A `Serialize` impl would put the secret in cleartext into anything a
+/// caller encodes a config struct into — a log line, a checkpoint, an HTTP
+/// body — with no call site to audit, which is the whole failure the type
+/// exists to prevent. Upstream reached the same conclusion from the other
+/// side: since #8127 a `SecretString` *rejects* JSON encoding rather than
+/// exposing its value.
+///
+/// A masked `Serialize` is not the alternative: it would round-trip
+/// `"***"` back as the value and silently replace the secret with the mask.
+/// So `#[derive(Serialize)]` on a struct holding one fails to compile — at
+/// which point the author decides what to write instead, which is the point.
+/// `Deserialize` is kept: reading a secret *in* from a config file is what
+/// the type is for.
+#[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
 
@@ -241,15 +257,17 @@ mod tests {
     }
 
     #[test]
-    fn secret_string_serde_round_trip_preserves_real_value() {
-        let secret = SecretString::new("sk-super-secret");
-        let json = serde_json::to_string(&secret).expect("serialize");
-        // The serialized form carries the real secret (serialization is not
-        // masking) — only Debug/Display mask.
-        assert_eq!(json, "\"sk-super-secret\"");
-        let round_tripped: SecretString = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(round_tripped, secret);
-        assert_eq!(round_tripped.expose_secret(), "sk-super-secret");
+    fn secret_string_deserializes_from_a_plain_string() {
+        // Reading a secret *in* is what the type is for; writing one back out
+        // is not offered at all (there is no `Serialize` impl), so a config
+        // struct holding one cannot be JSON-encoded by accident. See the type
+        // docs.
+        let secret: SecretString =
+            serde_json::from_str("\"sk-super-secret\"").expect("deserialize");
+        assert_eq!(secret.expose_secret(), "sk-super-secret");
+        assert_eq!(secret, SecretString::new("sk-super-secret"));
+        // And the value it holds is still masked everywhere it can be printed.
+        assert!(!format!("{secret:?} {secret}").contains("sk-super-secret"));
     }
 
     #[test]
