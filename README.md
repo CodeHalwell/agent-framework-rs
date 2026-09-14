@@ -21,8 +21,8 @@ parity with the Python and .NET implementations.
 > stall-intervention HITL, workflow-as-agent); a complete A2A client; YAML
 > agents/workflows; HTTP hosting (DevUI-style + embedded debug page, A2A,
 > AG-UI, OpenAI-compatible); Redis, Mem0, Cosmos DB, and Azure AI Search
-> memory/storage; and Purview compliance middleware are implemented and
-> tested. See [PARITY.md](PARITY.md) for the detailed, grounded matrix and
+> memory/storage (including an Azure AI Search vector store with portable
+> filters); and Purview compliance middleware are implemented and tested. See [PARITY.md](PARITY.md) for the detailed, grounded matrix and
 > the [roadmap](#roadmap) for the short list of what's left.
 
 ## Highlights
@@ -31,7 +31,11 @@ parity with the Python and .NET implementations.
   conversation threads, memory/context providers, and middleware at all three
   levels: agent-run, chat-client-call, and per-tool-invocation.
 - **Automatic tool calling** — the function-invocation loop executes local
-  tools and feeds results back to the model until it produces a final answer.
+  tools and feeds results back to the model until it produces a final answer,
+  bounded three ways: model round trips (`max_iterations`), total tool
+  executions (`max_function_calls`), and wall-clock time
+  (`max_duration_seconds`). The last two are cumulative across approval round
+  trips, so a run that pauses for a human cannot reset its own budget.
 - **Retries** — `RetryingChatClient` wraps any client with a `RetryPolicy`:
   exponential backoff with jitter, retryable-status classification, and
   server `Retry-After` honored over the computed delay.
@@ -76,7 +80,12 @@ parity with the Python and .NET implementations.
   `/v1/chat/completions`.
 - **Memory & storage** — Redis-backed history and long-term memory (BM25 via
   RediSearch, SCAN fallback on plain Redis), Mem0, Azure Cosmos DB message
-  store, and an Azure AI Search context provider.
+  store and workflow checkpoints (master key or Entra ID), and Azure AI Search
+  both as a context provider and as a full vector store.
+- **Vector stores** — a provider-agnostic `VectorStore`/`VectorCollection`
+  pair with a **portable filter** (`Filter::gte("year", 2020)`) each connector
+  translates into its own dialect, so the same retrieval code runs against the
+  in-memory store in a test and against Azure AI Search in production.
 - **Compliance** — Purview middleware evaluates prompts and responses against
   Microsoft Graph `processContent` and blocks on DLP verdicts.
 - **Observability** — `ObservableChatClient` emits `tracing` spans following
@@ -92,7 +101,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-anthropic`](crates/agent-framework-anthropic) | Anthropic (Claude) Messages API client. |
 | [`agent-framework-azure`](crates/agent-framework-azure) | Azure OpenAI client + the Entra ID credential chain (CLI / client-secret / managed-identity / chained). |
 | [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`) + client-side Prompt Agents (`FoundryAgent`). |
-| [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search context provider (semantic + optional vector query). |
+| [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search: context provider (semantic + optional vector query) and vector store (index management, document CRUD, filtered vector and keyword-hybrid search). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
 | [`agent-framework-declarative`](crates/agent-framework-declarative) | Declarative YAML/JSON agents and workflows with provider/tool registries. |
@@ -282,8 +291,12 @@ section (the current source of truth). The remaining gaps:
       elicitation
 - [ ] Redis provider: embeddings/vector-KNN and hybrid search (BM25
       full-text ships on Redis Stack)
-- [ ] Cosmos DB: Entra ID/AAD auth, `TransactionalBatch`, hierarchical
-      partition keys, TTL, and a Cosmos-backed workflow-checkpoint store
+- [ ] Cosmos DB: `TransactionalBatch`, hierarchical partition keys, TTL
+      (Entra ID auth and the Cosmos-backed workflow-checkpoint store ship)
+- [ ] Vector connectors upstream added alongside the portable filter:
+      PostgreSQL/pgvector, Qdrant, and Redis HASH/JSON
+- [ ] Azure: a Content Understanding context provider, the Foundry memory
+      provider, and Foundry evaluations
 - [ ] The upstream Copilot-Studio declarative *workflow* DSL (declarative
       agents already follow the official schema)
 - [ ] Purview: protection-scopes precheck/caching, background

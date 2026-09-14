@@ -7,6 +7,114 @@ may break APIs).
 
 ## [Unreleased]
 
+Portable vector filters and an Azure AI Search vector store, bounds on the
+tool loop, and three isolation fixes.
+
+**Breaking, in four places.** `VectorSearchOptions::filter` is now a
+`FilterExpression` rather than a provider-dialect `String`; the string form
+moved to `provider_filter` / `with_provider_filter`.
+`McpStreamableHttpTransport::new` returns a `Result` (it validates the URL).
+`SecretString` no longer implements `Serialize`, so a `#[derive(Serialize)]`
+on a struct holding one stops compiling — deliberately; see below. And every
+workflow graph signature changes, so a checkpoint written by 0.6.x is refused
+on resume with a message naming the scheme change (and
+`run_from_checkpoint_unchecked` still resumes it).
+
+Two behavior changes to look for. Redis keys are now derived through an
+injective encoding: a literal-safe prefix and session id — the default prefix
+and any UUID — produce exactly the keys they always did, so existing data is
+unaffected, but an identifier containing `:`, uppercase, or a glob character
+now addresses a different key than before. And an Anthropic reasoning content
+with no signature is no longer sent as a thinking block; with extended
+thinking enabled the API rejects one, so this turns a 400 into a request that
+works.
+
+### Added
+
+- **Portable vector filters** (`agent_framework_core::vectors::filters`):
+  `Filter` leaves and `FilterGroup` nodes across 18 operators, validated at
+  construction (operand shape per operator, depth ≤ 8, ≤ 64 nodes), with a
+  namespaced escape hatch (`azure_ai_search.match`) for anything a connector
+  defines itself. `InMemoryVectorStore` evaluates them instead of refusing
+  every filter. The semantics are upstream's: a missing field is a non-match
+  for every operator except `exists` (so `ne` and `not(eq)` differ), a boolean
+  never equals a number, and two numbers compare by value — so a record that
+  round-tripped through JSON as `1` still matches `eq: 1.0`.
+
+- **An Azure AI Search vector store**: `AzureAISearchStore` and
+  `AzureAISearchCollection` in `agent-framework-azure-ai-search`. Index
+  create/exists/delete from a `VectorStoreCollectionDefinition` (EDM types,
+  vector profiles, hnsw vs exhaustiveKnn, metric mapping), document
+  upsert/get/delete, vector search with the portable filter translated to
+  OData, keyword-hybrid search, and index aliases. `build_index()` and
+  `prepare_filter()` are public so a caller driving the REST API themselves
+  can reuse either. An operator Azure cannot express is refused with the
+  alternative named, never silently dropped.
+
+- **Bounds on the function-invocation loop**:
+  `FunctionInvocationConfig::max_function_calls` caps total tool executions
+  per request and `max_duration_seconds` caps elapsed wall time, both
+  cumulative across approval round trips (the budget is parked in the session)
+  and both graceful — tools are disabled and the model answers with what it
+  has. `AgentBuilder::function_invocation_config` reaches the whole config
+  from an agent for the first time, `max_iterations` included.
+
+- `agent_framework_core::storage_keys::storage_key_segment`, the derivation
+  behind the Redis key fix below.
+
+- `agent_framework_azure::DEFAULT_CHAT_API_VERSION` /
+  `DEFAULT_EMBEDDING_API_VERSION`, both public.
+
+### Fixed
+
+- **MCP HTTP headers leaked across a redirect.** Headers attached to an
+  `McpStreamableHttpTool` went onto a client that follows redirects and strips
+  only `Authorization`, `Cookie` and `Proxy-Authorization` on a cross-*host*
+  hop — so an `X-Api-Key` reached whatever host the server redirected to, and
+  even `Authorization` survived a redirect to a different port or scheme. The
+  `Mcp-Session-Id` was both sent to and adopted from a redirect target. The
+  transport now follows redirects itself, scoped to scheme/host/port, and
+  preserves the POST method and body across every hop.
+
+- **Anthropic extended-thinking signatures were dropped**, on both the
+  buffered and streaming paths, and `redacted_thinking` blocks vanished
+  entirely. With extended thinking enabled the Messages API requires a
+  replayed thinking block to carry its signature, so a conversation that used
+  it could not be continued — the tool-result turn was rejected. Signatures
+  now ride in `protected_data`, and a decoded block is replayed verbatim
+  (the signature covers the exact text).
+
+- **The workflow graph signature was not injective.** Executor ids were joined
+  with `,` and `->`, so a fan-out to `["x", "y"]` and one to `"x,y"` signed
+  identically and a checkpoint from either was accepted for the other. Now
+  JSON-encoded; the scheme tag is `v2`, and a `v1` checkpoint is reported as a
+  scheme mismatch rather than as a graph change.
+
+- **Redis keys were ambiguous.** `{key_prefix}:{session_id}` addressed one
+  list for `("chat", "a:b")` and `("chat:a", "b")`, so two conversations that
+  should be isolated shared a history — one tenant reading another's, where
+  the prefix is the tenant boundary. The context provider had a second
+  variant: a prefix containing `:entry:` put one provider's entries inside
+  another's `SCAN MATCH`, which `clear()` would then delete.
+
+- **`SecretString` serialized its secret in cleartext.** The derive is
+  removed rather than masked, because a masked `Serialize` round-trips the
+  mask back as the value.
+
+- **The Azure chat api-version was pinned to GA `2024-10-21`**, which rejects
+  request fields this client sends (`store` first among them) with
+  "Unrecognized request argument supplied". Now `2024-12-01-preview` for chat,
+  matching upstream, with embeddings left on GA as upstream also has it.
+
+### Changed
+
+- `VectorStoreCollectionDefinition` gains `try_get_field` and
+  `storage_name_for`.
+- `AzureAISearchStore::collection` returns the concrete collection type, for
+  the surfaces (`search_hybrid`, `build_index`) the object-safe
+  `VectorCollection` trait cannot declare.
+
+
 ## [0.6.0] — 2026-09-09
 
 Provider refusals handled properly end to end, Entra ID authentication for

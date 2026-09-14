@@ -6,10 +6,132 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `010a43a` (2026-09-07).** Sections are newest
+**Current upstream baseline: `061dc28` (2026-09-14).** Sections are newest
 first; each records the upstream revision it was checked against.
 
-## Post-`b5d9f4b` drift + Azure-ecosystem review (checked against `010a43a`, 2026-09-07)
+## Post-`010a43a` drift + Azure-ecosystem review (checked against `061dc28`, 2026-09-14)
+
+Upstream moved **116 non-merge commits** in this window (2026-09-07 → 09-14).
+**Eight land on this port**, and they are unusually substantial for one
+window: upstream made its vector-store filter portable and built the first
+connector on top of it, added a second and third bound to the tool loop, and
+landed three separate isolation fixes (MCP headers, Redis keys, `SecretString`)
+whose Rust equivalents were all present and all exposed. Alongside the drift
+triage, this pass ran a review of the whole Azure surface — the largest gap it
+found is now built (the Azure AI Search vector store), and one silent
+misconfiguration is fixed (the chat api-version).
+
+### The mirror sync worked, unattended, for the first time
+
+Every window since 2026-08-16 had to be recovered by hand: the fork-sync
+failed on any upstream commit touching `.github/workflows/**`, which upstream
+touches most days. The fix landed in the mirror repo last pass (restore the
+fork's own workflow directory after merging, so the pushed ref contains no
+change under it). It has now held for a full week — the mirror carried
+upstream through 2026-09-14 with no manual intervention, and this window was
+readable the moment the pass started. Nothing to do here; recorded because
+three consecutive passes had to open with the opposite.
+
+### Ported this pass (8, all with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #8115 | **Portable vector filters.** Upstream turned the vector-store filter from a provider dialect into an expression tree, which is what makes a collection swappable at all: `core::vectors` landed here last pass with `VectorSearchOptions::filter` as a raw provider string, so a caller who wrote one was pinned to that provider. Built as `core::vectors::filters`: 18 operators across `Filter` leaves and `FilterGroup` nodes, validated at construction (operand shape per operator, depth ≤ 8, ≤ 64 nodes), plus an evaluator implementing upstream's documented semantics that `InMemoryVectorStore` now uses instead of refusing every filter. Three semantics are load-bearing and easy to get subtly wrong: a missing field is a non-match for every operator *except* `exists` (so `ne` and `not(eq)` differ, which the module docs and a test both pin); a boolean never equals a number; and two numbers compare **by value**, so a record that round-tripped through JSON as `1` still matches `eq: 1.0` — `serde_json`'s own `==` says it does not, and the mismatch would silently return nothing. Provider-specific operators are namespaced (`azure_ai_search.match`), so a misspelled standard operator is rejected at construction rather than at search time. Upstream's `Param` late-binding machinery is not ported: it exists to fill filter values from an agent tool call that Python cannot type, which a Rust caller does with the arguments it already holds. | `core/vectors/filters.rs` (new), `core/vectors.rs` (`VectorSearchOptions::filter` / `provider_filter`, `InMemoryVectorStore::search`) |
+| #8153 | **An Azure AI Search vector store.** The largest Azure gap this pass's review found, and the reason the filter work came first. The crate was a read-only `ContextProvider` against an index someone else built; it now owns one. `AzureAISearchStore` / `AzureAISearchCollection` speak the Search REST API directly (as the context provider beside them already did, rather than through an SDK): index create/exists/delete from a collection definition — EDM types, vector profiles, hnsw vs exhaustiveKnn, the metric mapping — document upsert/get/delete over the indexing-batch endpoint, vector and keyword-hybrid search, and index aliases. Three details are right rather than plausible. Filtering is `preFilter`: a post-filter discards matches from an already-truncated neighbor list, so a selective filter returns far fewer than `top`, and `k` covers `skip + top` for the same reason. An indexing batch can return HTTP **207** with per-document failures — a success status, so a plain `is_success()` check reports a half-written batch as a complete one; the per-document results are read and any failure raised with the service's own message. And an operator Azure cannot express is refused rather than dropped: `ne`/`exists`/`is_null`/`is_not_null` cannot preserve missing-versus-null semantics there, and `starts_with`/`ends_with`/`contains_text` have no literal form, so each names the alternative (a NOT group, `azure_ai_search.match`) instead of silently widening the result set. Filter literals double embedded quotes, so a value cannot become part of the expression. | `azure-ai-search/vector_store.rs` (new), `azure-ai-search/tests/vector_store_loopback.rs` (new), `examples/memory/azure_ai_search_vector_store.rs` |
+| #7587/#7772 | **Bounds on the tool loop.** Upstream added `max_duration_seconds` alongside the `max_function_calls` it already had; this port had neither, so the only bound was `max_iterations` — which caps model round trips and says nothing about how many tools run per trip or how long any of them takes. Both are added, both graceful (tools off, model answers with what it has), both validated (zero, negative and NaN refused rather than silently meaning "never"). Three things a transcription would have missed. The budget lives in the **session**, not the request: an approval round trip is a separate `get_response`, so a per-request budget would reset at exactly the pause it most needs to survive, and an unattended approve-and-continue loop would never hit a limit. A spent budget **stops execution**, not just asking — `tool_choice: none` is a hint, and a provider that ignores it would have its calls executed, which is the one thing a ceiling must not allow — so the loop breaks to its existing tools-disabled failsafe, re-checking after the approval replay since that replay can spend the last of it. And an approval arriving past the budget still gets a **result** saying it did not run, where upstream simply skips execution and leaves approval content unresolved in the conversation. `AgentBuilder::function_invocation_config` makes all of this reachable from an agent at all — the builder wraps the caller's client itself, which had left `max_iterations` unreachable too. | `core/tools.rs` (`FunctionInvocationConfig`), `core/client.rs` (`InvocationBudget`), `core/agent.rs` (builder) |
+| #8285 | **MCP headers scoped to their origin.** Upstream moved its Secure MCP proxy's static headers behind an origin-scoped hook. This port had the same exposure and a slightly worse version of it: headers went onto a default `reqwest::Client`, which follows redirects and strips exactly three header names (`Authorization`, `Cookie`, `Proxy-Authorization`) on a cross-*host* hop — so an `X-Api-Key`, the shape most MCP servers actually use, went to whatever host the server redirected to, and because the check is host-only even `Authorization` survived a redirect to a different port or scheme. The `Mcp-Session-Id` was in the same position both ways: sent to a redirect target, and *adopted* from one, so any host the server redirected to could fix this client's session. The transport now follows redirects itself with `Policy::none()`, comparing scheme/host/port (ports defaulted from the scheme, so `https://h` and `https://h:443` are one origin) and re-attaching headers and session id only while same-origin. Method and body are preserved across every hop: `reqwest` would have degraded a 301/302/303 to a GET, which turns a JSON-RPC request into something no MCP server can answer. `McpStreamableHttpTransport::new` now returns a `Result` and rejects a URL with no origin to scope to. | `mcp/transport/http.rs` (`url_origin`, `post`, `capture_session_id`), `mcp/tests/http_loopback.rs` |
+| #8171 | **Anthropic extended-thinking signatures.** Upstream fixed a narrow merge bug; this port had the whole mechanism missing — it parsed a thinking block's text and dropped its `signature`, never handled `signature_delta` while streaming, and emitted unsigned thinking blocks outbound. With extended thinking on, the Messages API requires a replayed thinking block to carry its signature and validates it against the block's exact text, so a conversation that used extended thinking could not be continued at all: the next request, usually the tool-result turn, was rejected. `redacted_thinking` was worse — it fell through the catch-all and vanished, breaking the same replay with no trace. Signatures now ride in `protected_data` (the field Gemini thought signatures already use) on both paths, with the streamed `signature_delta` carried as an empty-text fragment so the existing `coalesce_text` merge lands it on the block it signs. Outbound, a decoded block is replayed **verbatim** from its raw form rather than re-serialized, because the signature covers the exact text; an unsigned reasoning content is dropped rather than sent, since the API rejects it and emitting one turns a working request into a 400. | `anthropic/convert.rs` (`thinking_block`, `parse_content_blocks`), `anthropic/lib.rs` (stream `signature_delta`) |
+| #7948 | **The graph signature was not injective.** Only the sub-fix in upstream's third commit lands — the fan-in buffer carry and the sibling-cancellation race it is mostly about are both already handled here (see *Already ahead* below) — but it lands on a bigger surface than upstream's. `compute_graph_signature` joined executor ids with `,` and `->`, and ids are only required to be non-empty: a fan-out to `["x", "y"]` and one to the single target `"x,y"` produced the same descriptor *and* the same node list, so two different graphs shared one signature and a checkpoint from either would be accepted for the other — resumed onto a topology it was never written for, which is what the signature exists to prevent. Now JSON-encoded throughout, including the node list, which upstream's own fix did not have to cover. Every signature changes, so the scheme tag is bumped to `v2` and a `v1` checkpoint is reported as a *scheme* mismatch — "the graph itself may well be identical" — rather than as a graph change the reader will go looking for and not find. | `core/workflow/runner.rs` (`edge_group_descriptor`, `compute_graph_signature`, `check_graph_signature`) |
+| #8127 | **`SecretString` serialized its secret.** Upstream rewrote its own away from a `str` subclass because every path but `repr()` silently produced the value; the Rust type already masked `Debug` and `Display` but derived `Serialize`, so `serde_json::to_string` on any struct holding one wrote the secret in cleartext — no call site to audit, which is the entire failure the type exists to prevent, and it made the careful masking beside it beside the point. The impl is **removed** rather than masked: a masked `Serialize` round-trips `"***"` back as the value and silently replaces the secret with the mask. Without it, `#[derive(Serialize)]` on a struct holding one fails to compile, which is where the author decides what to write instead. `Deserialize` stays — reading a secret in from config is what the type is for. | `core/settings.rs` |
+| #8236 | **Redis keys were ambiguous.** `{key_prefix}:{session_id}` is only unambiguous while no identifier contains the separator, and nothing constrains one: `prefix="chat"` + `session="a:b"` and `prefix="chat:a"` + `session="b"` address the same list, so two conversations that should be isolated share a history — and where the prefix is a tenant boundary, that is one tenant reading another's. `core::storage_keys::storage_key_segment` renders each segment unambiguously before joining. The context provider had a second variant: a prefix containing `:entry:` puts one provider's entries inside another's `SCAN MATCH a:entry:*`, so it reads — and `clear()` deletes — memories that are not its own, and a prefix containing a glob metacharacter changes what that pattern selects at all. A literal-safe value passes through unchanged, which covers the default prefix and every UUID session id, so existing data stays addressable and this is not a migration; only the ambiguous identifiers move, which are the ones that were colliding. Two documented divergences: hex rather than base32-with-a-SHA-256-fallback (these are Redis keys, whose limit is 512 MB rather than a filesystem's 255 bytes, so the cap guards nothing and dropping it keeps the derivation injective rather than merely collision-resistant), and upstream's tenant/application/agent segments are not ported because with an injective encoding a caller composes those into `key_prefix` and gets the same isolation — which is exactly what they could not safely do before. | `core/storage_keys.rs` (new), `redis/chat_message_store.rs`, `redis/context_provider.rs` |
+
+### Also ported this pass: the Azure review
+
+The review is below; it produced one code change beyond the vector store.
+
+| Gap | Change | Rust site |
+|---|---|---|
+| **The Azure chat api-version was pinned to GA.** One `DEFAULT_API_VERSION = "2024-10-21"` covered both the chat-completions and the embeddings client. Upstream carries two, and the difference is not bookkeeping: its chat default is `2024-12-01-preview` while its embedding default stays on GA `2024-10-21`. Azure OpenAI answers a request field its api-version does not know with "Unrecognized request argument supplied" rather than ignoring it, and this client sends `store` whenever a caller sets it — a field `2024-10-21` does not have. So the pin quietly narrowed what the Azure client could express relative to the OpenAI client it shares its request builder with, and did so as a runtime rejection at the first caller to use the feature. Split into `DEFAULT_CHAT_API_VERSION` / `DEFAULT_EMBEDDING_API_VERSION`, both public so a caller pinning a validated version can see what they are moving away from. | `azure/lib.rs`, `azure/embeddings.rs` |
+
+Verified across all nine: full workspace build, `cargo test --workspace
+--all-features` (**1914 passing**, 104 of them new, including 11 hermetic
+loopback tests against a fake Azure AI Search service and 2 against a pair of
+loopback MCP servers), `cargo clippy --all-targets --all-features` under
+`-D warnings` (CI's own flag) clean, `cargo fmt --check` clean, `cargo doc`
+clean. Every behavioral test was probed against the code it pins: making
+number equality fall back to `serde_json`'s fails the integer/float filter
+test; switching the Azure search body to `postFilter` fails the pre-filter
+test; dropping the budget-spent break lets the mock's ignored `tool_choice`
+run a second batch and fails the ceiling test; widening the MCP origin check
+to always match fails the cross-origin test while the same-origin control
+still passes; disabling the `signature_delta` arm fails the streaming
+signature test; restoring the joined graph rendering fails the collision test;
+and making the storage-key derivation the identity fails all three Redis
+collision tests while both existing-keys-unchanged tests still pass.
+
+### Already ahead of upstream (2, plus half of a third)
+
+These fixes are for bugs this port does not have — recorded because each was a
+deliberate earlier decision, and a later refactor could undo one without
+noticing. The third row is #7948 again: its key-encoding sub-fix landed (see
+above), its main change had nothing to land on.
+
+| Upstream | Why it does not land |
+|---|---|
+| #8269 | **Replayed history persisted twice in the Cosmos provider.** Upstream's `CosmosHistoryProvider.save_messages` now reads existing history and filters the replayed prefix before writing. This port did that in the #7242 window, and did it for *all four* history providers rather than the two upstream had touched then — `cosmos/chat_message_store.rs` has called `filter_new_messages` since. Upstream is catching up to the port here, not the other way round. |
+| #8237 | **Anthropic request-parsing state was shared across requests.** Upstream held the active tool-call id, its content type, and the tool-name aliases on the client, so two concurrent requests corrupted each other's parse; the fix moves them into a per-request dataclass. This port never had the bug, and not by luck: streaming state lives in an `SseState` owned by the stream's `unfold`, so the borrow checker would reject the shared-mutable shape upstream had. Nothing to port. |
+| #7948 (main change) | **Fan-in buffers through a checkpoint restore.** Upstream now checkpoints edge-runner delivery state and resets every runner on restore. `WorkflowCheckpoint::fanin_state` has carried partially-satisfied barriers since it was written, and `restore` replaces `self.fanin` wholesale, which is both halves of upstream's fix. The sibling-cancellation race that the rest of the PR addresses cannot arise here either: deliveries run under `join_all` inside the superstep rather than as detached tasks, so dropping the joining future cancels the rest — structured concurrency instead of an explicit cancel-and-await helper. Only the key-encoding sub-fix landed (above). |
+
+### Not applicable (106)
+
+Grouped by why, rather than one row each. The commits touching subsystems this
+port has were read as diffs; the routine remainder (CI, dependency bumps,
+docs, samples, release version bumps) was classified from its file scope and
+subject.
+
+| Upstream | Why not |
+|---|---|
+| #8301, #8307, #8252, #8295, #8297, #8270, #8227, #8259, #8253, #8164, #8229, #8202, #8239, #8198, #7844, #8151, #8165, #8190, #8166, #8146, #8159, #8020, #8082 | **.NET only.** Header delimiters, workflow formula state races, Hyperlight fingerprints, PowerShell exit codes, redirect header forwarding, LocalCodeAct OS validation, file-skill path revalidation, hosting storage isolation, hosted-agent workflow outputs, and dependency/analyzer bumps. |
+| #8142, #8141, #8139, #8138, #8187 | **FIDES.** Policy-approval binding and recovery, confidentiality through security tools, label enforcement on expanded variables, per-session security state, and keeping MCP labels subordinate to local policy. `agent_framework.security` has no Rust counterpart; it is an `@experimental` surface that upstream is still reshaping weekly, which is the standing reason not to pin it. |
+| #8176, #8174, #8289, #8233, #8290, #8118 | **Sandboxed code execution and MCP skill archives.** Bounding Hyperlight output attachments, the 0.6 sandbox bump, LocalCodeAct approval parity, local-shell approval binding, restricting skill archives to ZIP, and inline-skill argument errors. This port has skills but no sandbox and no archive loader. |
+| #8199, #8197, #8116, #8129, #8158, #8130, #8005, #7808, #8128 | **AG-UI depth.** Reserved HA session ids, rejecting empty scope-resolver results, multimodal messages in chat-client requests, MCP Host payloads in snapshots and their metadata, scoped internal session ids, MCP Host history conversion, tool call/result ordering in the message split, and `emit_messages_snapshot`. `agent-framework-hosting::agui` streams one run to completion and keeps no snapshot store or scope resolver, so each lands on machinery the router does not have — the standing AG-UI depth gap, unchanged. |
+| #8331, #8145, #8219, #8126, #7951, #8278, #8215, #7798, #8224, #8246, #8225, #7963, #8312 | **Python runtime shapes.** Awaiting `Task`/`Future` stream sources; preserving a `Param` unset sentinel's identity; lazy provider imports; `httpx` resource cleanup after a failed MCP connection; an `AttributeError` on exit with a caller-supplied client; counting exceptions raised *inside* a returned coroutine; validating that `on_checkpoint_save` returned a dict; `ContextVar` leaks in abandoned streams; deduplicating MessagePack file-history writes; MCP request ownership and connection-lifetime kwargs; mixed workflow invocation kwargs; and forwarding workflow run kwargs to the GroupChat orchestrator. A Rust `async fn` returns a `Result` rather than a coroutine that can fail later, `serde` types the checkpoint payload, `FileHistoryProvider` rewrites its whole file atomically, and there is no untyped kwargs bag to forward — per-run configuration is `AgentRunOptions`, which the orchestrator already receives. |
+| #8155, #8154, #8156 | **New non-Azure vector connectors** — PostgreSQL/pgvector, Qdrant, and Redis HASH/JSON. Each is a substantial new crate, and each was *blocked* until this pass: with no portable filter there was nothing for them to translate. They are now the most tractable ecosystem work on the books; see the roadmap. |
+| #8045, #8188, #8152, #8162, #8172, #7839, #7765, #8122, #7517, #8206, #8087, #8123, #8144, #8136 | **Packages and surfaces with no Rust counterpart.** `FoundryCheckpointStore` deserialization restrictions, isolating Lab, the Monty bridge (×2), DevUI frontend CVEs, declarative-workflow DevUI input, the workflow HTTP request handler's query strings, Claude prompt-history roles, GitHub Copilot workspace file hooks (this port has the chat client, not the agent), PowerShell session state, summarizer tool-trajectory input (no summarizing compaction strategy here), shared path normalization (this port's equivalent is the new `storage_keys` module, built for the Redis keys above), native issue types, and code owners. |
+| #8323, #8335, #8324, #8316, #8317, #8318, #8321, #8322, #8325, #7942, #8296, #8222, #8213, #8208, #8210, #8211, #8212, #8207, #8209, #8064, #8175, #7583, #7584, #7887, #8069, #8110, #8113, #8112, #8111, #8100, #8167, #8179, #8190 | Docs and ADR typo fixes, dependabot and action bumps, ruff/type-checker bumps, code owners, and the Python 1.18.0 release version bump. |
+
+### The Azure-ecosystem review
+
+The whole Azure surface, upstream against this port. Two items changed as a
+result (the vector store and the api-version split, both above); the rest is
+the standing picture, and three of the gaps below are new to this document.
+
+| Azure surface | Upstream | Here | Assessment |
+|---|---|---|---|
+| Azure OpenAI — chat completions, Responses, embeddings | ✅ | ✅ | Complete, with api-key and Entra auth on all three. The api-version defaults were the one thing wrong, and are fixed above. |
+| Microsoft Entra ID credentials | ✅ (`azure-identity`) | ✅ | `DefaultAzureCredential`, managed identity, workload identity, client secret, and the Azure CLI, all with per-scope caching, plus an `azure_core`-backed path. |
+| Azure AI Foundry — chat client | ✅ | ✅ | Foundry project Responses API, delegating to the Azure Responses client rather than re-implementing it. |
+| Foundry — Prompt Agents | ✅ | 🚧 | `FoundryAgent` realizes a Prompt Agent client-side; binding to a server-hosted agent by id on the Foundry Agents control plane remains a documented extension point. |
+| Foundry — embeddings | ✅ | 🚧 | Text inputs only; upstream also splits a batch across an image-embeddings endpoint, which the core `EmbeddingClient` signature cannot express without widening a shared trait. |
+| Foundry — memory provider | ✅ (`_memory_provider.py`) | ❌ | **New gap.** Foundry's managed memory as a `ContextProvider`. Portable in principle — it is a REST surface on the Projects data plane — and the closest analogue here (`Mem0Provider`, `AzureAISearchProvider`) shows the shape. The most tractable Azure item left. |
+| Foundry — evaluations | ✅ (`_foundry_evals.py`) | ❌ | **New gap.** Graders and evaluator runs over stored responses (~600 lines upstream, built on `azure-ai-projects`' evals client). Large, and upstream is still moving it (it left core this window), so pinning it now would buy a rewrite. |
+| Foundry hosting (`foundry_hosting`) | ✅ | ❌ | Standing gap, and the single most frequent source of "not applicable" rows in this document. Hosting agents *on* Foundry infrastructure, against a server contract this repo does not have. |
+| Foundry Local | ✅ | ✅ | OpenAI-compatible localhost endpoint. |
+| Azure AI Search — context provider | ✅ | ✅ | Hybrid/semantic retrieval. |
+| Azure AI Search — vector store | ✅ | ✅ | **Built this pass.** |
+| Azure AI Search — Knowledge Base ("agentic") retrieval | ✅ | ❌ | Standing documented gap: upstream's second retrieval mode, a different service surface from the one the provider speaks. |
+| Azure Cosmos DB — history provider | ✅ | ✅ | Including Entra ID auth, added last pass; this window's upstream fix (#8269) was already here. |
+| Azure Cosmos DB — checkpoint storage | ❌ (upstream has a Foundry one) | ✅ | This port is ahead: workflow checkpoints in Cosmos have no upstream Python equivalent. |
+| Azure Cosmos DB — memory provider | ✅ (`azure-cosmos-memory`) | ❌ | **New gap**, and an externally-blocked one: it wraps the separate Azure Cosmos DB Agent Memory Toolkit rather than the Cosmos data plane, so porting it means porting that toolkit first. |
+| Azure AI Content Understanding | ✅ (`azure-contentunderstanding`) | ❌ | **New gap.** A `ContextProvider` that runs Content Understanding analyzers over documents, audio and video and injects the extracted fields, plus a file-search backend pair. A REST surface, so genuinely portable; the largest remaining Azure item that is not blocked on something else. |
+| Microsoft Purview | ✅ | ✅ | Prompt and response policy enforcement as middleware, including the inline-evaluation header added last pass. |
+| Azure Monitor / Application Insights | ✅ (exporter package) | 🚧 | Spans and metrics export over OTLP, which Azure Monitor accepts through its OTLP-capable collector; the dedicated Application Insights exporter (connection-string auth, its own ingestion endpoint) is not built. |
+
+Nothing in the Azure surface is *wrong* after this pass; what is left is
+missing rather than misbehaving, and the three items marked new are each a
+self-contained crate.
+
+
 
 Upstream moved **83 non-merge commits** in this window (2026-08-31 → 09-07).
 **Six land on this port**: a usage-accounting bug it inherited from upstream
