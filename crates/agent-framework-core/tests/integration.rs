@@ -3894,3 +3894,58 @@ async fn a_spent_budget_keeps_what_the_provider_already_resolved() {
         "but the unresolved local call is not left dangling: {all:?}"
     );
 }
+
+#[tokio::test]
+async fn a_call_that_never_reached_a_tool_does_not_spend_the_budget() {
+    // `max_function_calls` bounds executions, and its own docs say so. A
+    // hallucinated tool name produces a result without the executor — or the
+    // middleware — ever running, so charging it would let one bad name from
+    // the model spend a budget of one and force the tools-off failsafe before
+    // the model got a chance to correct itself.
+    let counter = Arc::new(Mutex::new(0));
+    let bad_call = ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                "call_bad",
+                "no_such_tool",
+                Some(FunctionArguments::Raw("{}".into())),
+            ))],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    };
+    let inner = MockClient::new(vec![
+        bad_call,
+        ping_calls(1),
+        ChatResponse::from_text("recovered"),
+    ]);
+    let client =
+        FunctionInvokingChatClient::new(inner.clone()).with_config(FunctionInvocationConfig {
+            max_function_calls: Some(1),
+            ..Default::default()
+        });
+
+    let response = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "the real call still had its budget: the miss cost nothing"
+    );
+    assert_eq!(response.text(), "recovered");
+    assert!(
+        inner
+            .all_options()
+            .iter()
+            .take(2)
+            .all(|o| o.tool_choice != Some(ToolMode::None)),
+        "the model was not forced into the tools-off failsafe by the miss"
+    );
+}

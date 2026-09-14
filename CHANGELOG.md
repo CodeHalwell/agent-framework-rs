@@ -151,6 +151,13 @@ works.
   run's elapsed clock, and could find the new request's tools disabled before
   it made a single call.
 
+- `max_function_calls` charges only calls that reached a tool. A hallucinated
+  tool name or unparseable arguments produce a result without the executor or
+  the middleware ever running, and charging those let one bad name from the
+  model spend a budget of one — forcing the tools-off failsafe before the
+  model could correct itself. `InvocationBudget::record` documented this
+  behaviour; the two call sites did not implement it.
+
 - `FilterExpression::matches` requires an operand for `eq` and `ne`, as it
   already did for every other value-taking operator and as `validate` says.
   Defaulting an absent one to null turned a malformed `eq` into a working

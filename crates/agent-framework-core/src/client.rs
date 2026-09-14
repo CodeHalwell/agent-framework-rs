@@ -423,13 +423,30 @@ struct ToolCallEnv<'a> {
     observability: &'a crate::observability::ObservabilityConfig,
 }
 
+/// What came of one tool call.
+struct ToolCallOutcome {
+    /// Whether the call reached the invocation pipeline at all.
+    ///
+    /// The budget charges executions, not *attempts*: a hallucinated tool name
+    /// or unparseable arguments produce a result without the executor — or
+    /// even the middleware — ever running, and charging those would let one
+    /// bad name from the model spend a `max_function_calls: 1` budget and
+    /// force the tools-off failsafe before the model got a chance to correct
+    /// itself. A call that entered the pipeline counts even if middleware
+    /// terminated it before the executor: middleware ran, and that is work the
+    /// caller asked for.
+    executed: bool,
+    is_error: bool,
+    content: FunctionResultContent,
+}
+
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
     include_detailed_errors: bool,
     terminate_on_unknown: bool,
     env: ToolCallEnv<'_>,
-) -> Result<(bool, FunctionResultContent)> {
+) -> Result<ToolCallOutcome> {
     let ToolCallEnv {
         function_middleware,
         session,
@@ -441,14 +458,15 @@ async fn execute_tool_call(
             if terminate_on_unknown {
                 return Err(Error::tool(format!("unknown tool: {}", call.name)));
             }
-            Ok((
-                true,
-                FunctionResultContent {
+            Ok(ToolCallOutcome {
+                executed: false,
+                is_error: true,
+                content: FunctionResultContent {
                     call_id: call.call_id.clone(),
                     result: None,
                     exception: Some(format!("tool '{}' not found", call.name)),
                 },
-            ))
+            })
         }
         Some(def) => {
             // Reject unparseable arguments rather than silently invoking the tool
@@ -461,14 +479,15 @@ async fn execute_tool_call(
                     } else {
                         "invalid tool arguments".to_string()
                     };
-                    return Ok((
-                        true,
-                        FunctionResultContent {
+                    return Ok(ToolCallOutcome {
+                        executed: false,
+                        is_error: true,
+                        content: FunctionResultContent {
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
                         },
-                    ));
+                    });
                 }
             };
             let obs_config = observability.clone();
@@ -520,14 +539,15 @@ async fn execute_tool_call(
                 .with_session(session.cloned())
                 .with_tools(live_tools.cloned());
             match function_middleware.execute(ctx, terminal).await {
-                Ok(ctx) => Ok((
-                    false,
-                    FunctionResultContent {
+                Ok(ctx) => Ok(ToolCallOutcome {
+                    executed: true,
+                    is_error: false,
+                    content: FunctionResultContent {
                         call_id: call.call_id.clone(),
                         result: Some(ctx.result.unwrap_or(Value::Null)),
                         exception: None,
                     },
-                )),
+                }),
                 // The one error the loop does not absorb: middleware that
                 // refuses a call outright (a guardrail, a policy or
                 // authorization gate) needs the run to fail closed rather than
@@ -540,14 +560,17 @@ async fn execute_tool_call(
                     } else {
                         "tool execution failed".to_string()
                     };
-                    Ok((
-                        true,
-                        FunctionResultContent {
+                    // The pipeline ran and the tool failed, which is an
+                    // execution: charged like any other.
+                    Ok(ToolCallOutcome {
+                        executed: true,
+                        is_error: true,
+                        content: FunctionResultContent {
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
                         },
-                    ))
+                    })
                 }
             }
         }
@@ -817,7 +840,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             continue;
                         }
                         let tool = tools.iter().find(|t| t.name == call.name).cloned();
-                        let (is_error, content) = execute_tool_call(
+                        let outcome = execute_tool_call(
                             tool,
                             call,
                             self.config.include_detailed_errors,
@@ -831,6 +854,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         )
                         .await
                         .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
+                        let ToolCallOutcome {
+                            executed: ran,
+                            is_error,
+                            content,
+                        } = outcome;
                         had_error |= is_error;
                         // Keyed by occurrence id when the call carries one, so
                         // two approvals pending under the same provider
@@ -839,7 +867,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         // call that predates occurrence ids.
                         let key = call.id.clone().unwrap_or_else(|| content.call_id.clone());
                         approved_results.insert(key, content);
-                        executed += 1;
+                        if ran {
+                            executed += 1;
+                        }
                     }
                     budget.record(executed);
                     replace_approval_contents_with_results(&mut conversation, &approved_results);
@@ -1142,10 +1172,13 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 let outcomes = futures::future::try_join_all(invocations)
                     .await
                     .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
-                budget.record(outcomes.len());
+                budget.record(outcomes.iter().filter(|o| o.executed).count());
                 let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
                 let mut had_error = false;
-                for (is_error, content) in outcomes {
+                for ToolCallOutcome {
+                    is_error, content, ..
+                } in outcomes
+                {
                     had_error |= is_error;
                     result_contents.push(Content::FunctionResult(content));
                 }
