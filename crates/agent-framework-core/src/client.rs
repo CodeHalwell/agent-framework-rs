@@ -14,6 +14,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, Result};
 use crate::middleware::{FunctionInvocationContext, LiveToolList, MiddlewarePipeline, Terminal};
+use crate::session::AgentSession;
 use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, EmbeddingGenerationOptions,
@@ -232,6 +233,141 @@ fn accumulate_usage(aggregate: &mut Option<UsageDetails>, incoming: Option<&Usag
 
 /// The exact rejection payload Python emits for a denied tool call.
 const REJECTION_MESSAGE: &str = "Error: Tool call invocation was rejected by user.";
+
+/// The payload a call approved *after* the run's budget was spent receives in
+/// place of an execution.
+const BUDGET_EXHAUSTED_MESSAGE: &str =
+    "Error: Tool call was not executed: the request's function-invocation budget is spent.";
+
+/// Where a run's budget is parked in [`AgentSession::state`] while it waits
+/// for an approval. Reserved: a caller's own state keys must not collide with
+/// it.
+const BUDGET_STATE_KEY: &str = "__af_function_invocation_budget__";
+
+/// Milliseconds since the Unix epoch.
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The run's tool-call and wall-clock budgets
+/// ([`FunctionInvocationConfig::max_function_calls`] and
+/// [`FunctionInvocationConfig::max_duration_seconds`]).
+///
+/// Both are *graceful*: when one is spent the loop disables tools and lets the
+/// model answer with what it has, rather than failing the run. Both are also
+/// checked between batches rather than inside one, so a batch of parallel
+/// calls always completes — a half-executed batch would leave calls without
+/// results, which providers reject.
+///
+/// # Why this lives in the session
+///
+/// A budget that reset on every `get_response` would be no bound at all on
+/// the case it most needs to cover: an approval round trip is a *separate*
+/// request, so a run that pauses for a human and resumes would start each leg
+/// with a full budget, and an unattended loop of approve-and-continue would
+/// never hit either limit. So it is parked in [`AgentSession::state`] at the
+/// one point the loop pauses across requests — the approval deferral — and
+/// cleared at every terminal exit, so an unrelated later run starts fresh.
+///
+/// A caller with no session gets a per-request budget, which is the most that
+/// can be tracked when there is nowhere to park it; that is also upstream's
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvocationBudget {
+    /// Wall-clock start, as Unix milliseconds rather than an `Instant`: it
+    /// has to survive a round trip through the session's JSON state, which an
+    /// `Instant` cannot.
+    started_millis: u64,
+    executed: usize,
+    max_calls: Option<usize>,
+    max_duration: Option<Duration>,
+}
+
+impl InvocationBudget {
+    /// Resume the session's budget, or start one.
+    fn resume_or_start(config: &FunctionInvocationConfig, session: Option<&AgentSession>) -> Self {
+        let mut budget = Self {
+            started_millis: epoch_millis(),
+            executed: 0,
+            max_calls: config.max_function_calls,
+            // Validated as finite and positive by
+            // `FunctionInvocationConfig::validate`, which every run calls
+            // before reaching here.
+            max_duration: config.max_duration_seconds.map(Duration::from_secs_f64),
+        };
+        // The limits always come from the live config, never from the parked
+        // state: a caller who lowered a limit between runs means it, and a
+        // resumed run must not keep spending against the old one.
+        if let Some(parked) = session.and_then(|s| s.state.get(BUDGET_STATE_KEY)) {
+            if let Some(started) = parked.get("started_millis").and_then(Value::as_u64) {
+                budget.started_millis = started;
+            }
+            if let Some(executed) = parked.get("executed").and_then(Value::as_u64) {
+                budget.executed = executed as usize;
+            }
+        }
+        budget
+    }
+
+    /// Park this budget for the approval round trip to come.
+    fn park(&self, session: Option<&AgentSession>) {
+        if let Some(session) = session {
+            session.state.insert(
+                BUDGET_STATE_KEY,
+                serde_json::json!({
+                    "started_millis": self.started_millis,
+                    "executed": self.executed,
+                }),
+            );
+        }
+    }
+
+    /// Drop any parked budget: this run is over, and the next one starts with
+    /// a full budget.
+    fn clear(session: Option<&AgentSession>) {
+        if let Some(session) = session {
+            session.state.remove(BUDGET_STATE_KEY);
+        }
+    }
+
+    /// Charge `count` executed tool bodies against the call budget.
+    ///
+    /// Only calls that actually ran are charged: a call deferred on an
+    /// approval has executed nothing yet, and charging it at deferral *and*
+    /// again on the replay would spend the budget twice for one execution.
+    fn record(&mut self, count: usize) {
+        self.executed = self.executed.saturating_add(count);
+    }
+
+    /// Why the budget is spent, or `None` while it is not.
+    fn spent(&self) -> Option<String> {
+        if let Some(max) = self.max_calls {
+            if self.executed >= max {
+                return Some(format!(
+                    "maximum function calls reached ({}/{max})",
+                    self.executed
+                ));
+            }
+        }
+        if let Some(max) = self.max_duration {
+            // Saturating: a clock that moved backwards between requests
+            // reads as no time elapsed rather than as an enormous negative
+            // that wraps into an instantly-spent budget.
+            let elapsed = Duration::from_millis(epoch_millis().saturating_sub(self.started_millis));
+            if elapsed >= max {
+                return Some(format!(
+                    "maximum duration reached ({:.2}s/{:.2}s)",
+                    elapsed.as_secs_f64(),
+                    max.as_secs_f64()
+                ));
+            }
+        }
+        None
+    }
+}
 
 /// Execute a single requested tool call through the function-middleware
 /// pipeline, with the actual invocation (wrapped in an `execute_tool` span)
@@ -593,6 +729,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             let mut conversation = messages;
             let mut carried: Vec<Message> = Vec::new();
             let mut consecutive_errors = 0usize;
+            // Started here rather than at the first execution: the clock is a
+            // bound on the whole run, and the first model round trip is part
+            // of what it bounds. A run resuming from an approval picks the
+            // parked budget back up instead of starting over.
+            let mut budget = InvocationBudget::resume_or_start(&self.config, session.as_ref());
             // Usage summed over every model call this loop makes, applied to
             // whichever response is returned so the caller sees the cost of the
             // whole run and not just its final iteration.
@@ -601,6 +742,17 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             for _ in 0..self.config.max_iterations {
                 options.tools = live_tools.snapshot();
                 let tools = executable_tools(&options);
+                // Checked before the approval replay below, not only after
+                // execution: a run resumed from an approval whose budget was
+                // already spent must not execute the approved call either.
+                let budget_spent = budget.spent();
+                if let Some(reason) = budget_spent.as_deref() {
+                    tracing::info!(
+                        reason,
+                        "function-invocation budget spent; disabling tools for this request"
+                    );
+                    options.tool_choice = Some(ToolMode::None);
+                }
                 // Process any function-approval responses supplied in the input:
                 // execute the approved calls and splice their results into the
                 // conversation (mirrors Python's `_collect_approval_responses` +
@@ -610,11 +762,28 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     let mut approved_results: HashMap<String, FunctionResultContent> =
                         HashMap::new();
                     let mut had_error = false;
+                    let mut executed = 0usize;
                     for resp in &approval_responses {
                         if !resp.approved {
                             continue;
                         }
                         let call = &resp.function_call;
+                        // The budget was spent while this approval was
+                        // outstanding. The call still needs a result — leaving
+                        // the approval unresolved would send approval content
+                        // back to the provider — so it gets one saying why it
+                        // did not run, the same shape a rejection gets.
+                        if budget_spent.is_some() {
+                            let key = call.id.clone().unwrap_or_else(|| call.call_id.clone());
+                            approved_results.insert(
+                                key,
+                                FunctionResultContent::new(
+                                    call.call_id.clone(),
+                                    Some(Value::String(BUDGET_EXHAUSTED_MESSAGE.to_string())),
+                                ),
+                            );
+                            continue;
+                        }
                         let tool = tools.iter().find(|t| t.name == call.name).cloned();
                         let (is_error, content) = execute_tool_call(
                             tool,
@@ -637,7 +806,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         // call that predates occurrence ids.
                         let key = call.id.clone().unwrap_or_else(|| content.call_id.clone());
                         approved_results.insert(key, content);
+                        executed += 1;
                     }
+                    budget.record(executed);
                     replace_approval_contents_with_results(&mut conversation, &approved_results);
                     if had_error {
                         consecutive_errors += 1;
@@ -645,6 +816,29 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                             options.tool_choice = Some(ToolMode::None);
                         }
                     }
+                }
+
+                // Out of budget: leave the loop, having resolved any inbound
+                // approvals above, and let the failsafe below make one final
+                // tools-disabled call. Setting `tool_choice` and continuing to
+                // iterate would not be a ceiling at all — a provider that
+                // ignores the hint (or a model that emits a call anyway) would
+                // have its calls executed, which is the one thing a spent
+                // budget must not allow.
+                //
+                // Re-checked rather than reusing `budget_spent`, because the
+                // approval replay just above may itself have spent the last of
+                // it; without this the resumed leg would get one more full
+                // tool-calling iteration for free.
+                if let Some(reason) = budget.spent() {
+                    if budget_spent.is_none() {
+                        tracing::info!(
+                            reason,
+                            "function-invocation budget spent; disabling tools for this request"
+                        );
+                    }
+                    options.tool_choice = Some(ToolMode::None);
+                    break;
                 }
 
                 let response = self
@@ -675,6 +869,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     .collect();
 
                 if calls.is_empty() {
+                    // The run is over, so nothing is left to budget: a later,
+                    // unrelated run on this session starts with a full one.
+                    InvocationBudget::clear(session.as_ref());
                     // Prepend the accumulated tool-interaction messages so the final
                     // assistant message stays last.
                     let mut final_resp = response;
@@ -767,6 +964,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         resp.messages
                             .push(Message::with_contents(Role::assistant(), approval_contents));
                     }
+                    // The one exit that is a *pause*, not an end: park the
+                    // budget so the resumed leg keeps spending the same one.
+                    budget.park(session.as_ref());
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
                     resp.messages = msgs;
@@ -791,6 +991,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         .any(|t| t.name == c.name && is_declaration_only(t))
                 });
                 if has_declaration_only {
+                    InvocationBudget::clear(session.as_ref());
                     let mut resp = response;
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut resp.messages);
@@ -832,6 +1033,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 });
 
                 let outcomes = futures::future::try_join_all(invocations).await?;
+                budget.record(outcomes.len());
                 let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
                 let mut had_error = false;
                 for (is_error, content) in outcomes {
@@ -874,6 +1076,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             }
 
             // Failsafe: one final call with tools disabled.
+            InvocationBudget::clear(session.as_ref());
             options.tool_choice = Some(ToolMode::None);
             let mut final_resp = self.inner_get_response(conversation, options).await?;
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());

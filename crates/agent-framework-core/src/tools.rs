@@ -807,10 +807,40 @@ fn typed_parameters_schema<Args: schemars::JsonSchema>() -> Value {
 /// Configuration for the automatic function-invocation loop.
 ///
 /// Mirrors `FunctionInvocationConfiguration`.
+///
+/// # The three bounds are complementary
+///
+/// [`max_iterations`](Self::max_iterations) caps model round trips,
+/// [`max_function_calls`](Self::max_function_calls) caps how many tool bodies
+/// run in total however they are distributed across those trips, and
+/// [`max_duration_seconds`](Self::max_duration_seconds) caps elapsed wall
+/// time. A run that alternates one cheap call per iteration is bounded by the
+/// first; one that emits twenty parallel calls per iteration by the second;
+/// one whose tools are slow, or that waits on a human approval, by the third.
 #[derive(Debug, Clone)]
 pub struct FunctionInvocationConfig {
     pub enabled: bool,
     pub max_iterations: usize,
+    /// Total tool executions allowed per request, cumulative across
+    /// iterations and across approval round trips. `None` (the default) is
+    /// unbounded.
+    ///
+    /// Best-effort, checked **after** each batch completes: a model that
+    /// requests twenty parallel calls when four remain in the budget runs all
+    /// twenty, and the loop stops afterwards. Reaching the limit does not
+    /// fail the run — tools are disabled ([`ToolMode::None`]) and the model
+    /// is asked to answer with what it has, so the caller gets an answer
+    /// rather than an error.
+    pub max_function_calls: Option<usize>,
+    /// Wall-clock budget for the whole invocation loop, in seconds. `None`
+    /// (the default) is unbounded.
+    ///
+    /// Measured from the loop's start and checked after each batch, with the
+    /// same graceful degradation as
+    /// [`max_function_calls`](Self::max_function_calls). Time spent waiting
+    /// for a human approval counts, deliberately: that is what bounds an
+    /// unattended run whose approvals nobody answers.
+    pub max_duration_seconds: Option<f64>,
     pub max_consecutive_errors_per_request: usize,
     pub terminate_on_unknown_calls: bool,
     pub include_detailed_errors: bool,
@@ -821,6 +851,8 @@ impl Default for FunctionInvocationConfig {
         Self {
             enabled: true,
             max_iterations: 40,
+            max_function_calls: None,
+            max_duration_seconds: None,
             max_consecutive_errors_per_request: 3,
             terminate_on_unknown_calls: false,
             include_detailed_errors: false,
@@ -832,6 +864,21 @@ impl FunctionInvocationConfig {
     pub fn validate(&self) -> Result<()> {
         if self.max_iterations < 1 {
             return Err(Error::Configuration("max_iterations must be >= 1".into()));
+        }
+        if self.max_function_calls == Some(0) {
+            return Err(Error::Configuration(
+                "max_function_calls must be >= 1, or None for unbounded".into(),
+            ));
+        }
+        // Rejects zero, a negative, and NaN: `partial_cmp` is `None` for NaN,
+        // so a budget that can never be compared is refused rather than
+        // silently meaning "never expires".
+        if self.max_duration_seconds.is_some_and(|seconds| {
+            !matches!(seconds.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
+        }) {
+            return Err(Error::Configuration(
+                "max_duration_seconds must be greater than zero, or None for unbounded".into(),
+            ));
         }
         Ok(())
     }

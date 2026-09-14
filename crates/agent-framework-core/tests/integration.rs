@@ -3152,3 +3152,434 @@ async fn tool_loop_reports_usage_from_the_iterations_that_had_it() {
 }
 
 // endregion
+
+// region: function-invocation budgets (max_function_calls / max_duration_seconds)
+
+/// A counting tool that always succeeds, for the budget tests.
+fn counting_tool(counter: Arc<Mutex<u32>>) -> ToolDefinition {
+    FunctionTool::new(
+        "ping",
+        "Return pong.",
+        json!({ "type": "object", "properties": {} }),
+        move |_args| {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().unwrap() += 1;
+                Ok(json!("pong"))
+            }
+        },
+    )
+    .into_definition()
+}
+
+/// One assistant turn requesting `n` parallel `ping` calls.
+fn ping_calls(n: usize) -> ChatResponse {
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            (0..n)
+                .map(|i| {
+                    Content::FunctionCall(FunctionCallContent::new(
+                        format!("call_{i}"),
+                        "ping",
+                        Some(FunctionArguments::Raw("{}".into())),
+                    ))
+                })
+                .collect(),
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+fn budgeted_client(
+    responses: Vec<ChatResponse>,
+    configure: impl FnOnce(&mut FunctionInvocationConfig),
+) -> FunctionInvokingChatClient<MockClient> {
+    let mut config = FunctionInvocationConfig::default();
+    configure(&mut config);
+    FunctionInvokingChatClient::new(MockClient::new(responses)).with_config(config)
+}
+
+#[tokio::test]
+async fn max_function_calls_disables_tools_and_still_answers() {
+    let counter = Arc::new(Mutex::new(0));
+    let inner = MockClient::new(vec![
+        ping_calls(1),
+        ping_calls(1),
+        ChatResponse::from_text("done"),
+    ]);
+    let client =
+        FunctionInvokingChatClient::new(inner.clone()).with_config(FunctionInvocationConfig {
+            max_function_calls: Some(2),
+            ..Default::default()
+        });
+
+    let response = client
+        .get_response(
+            vec![Message::user("ping twice")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+
+    // Reaching the limit is not a failure: the model is asked to answer with
+    // what it has, and the caller gets that answer.
+    assert_eq!(response.text(), "done");
+    assert_eq!(
+        *counter.lock().unwrap(),
+        2,
+        "exactly the budgeted calls ran"
+    );
+    // The third model call is the one made with tools off.
+    let choices: Vec<_> = inner
+        .all_options()
+        .iter()
+        .map(|o| o.tool_choice.clone())
+        .collect();
+    assert_eq!(choices.len(), 3);
+    assert_eq!(choices[0], Some(ToolMode::Auto));
+    assert_eq!(choices[1], Some(ToolMode::Auto));
+    assert_eq!(
+        choices[2],
+        Some(ToolMode::None),
+        "tools must be off once the call budget is spent"
+    );
+}
+
+#[tokio::test]
+async fn a_parallel_batch_completes_even_when_it_overshoots_the_budget() {
+    // Documented as best-effort: the check is between batches, because a
+    // half-executed batch would leave calls without results, which providers
+    // reject.
+    let counter = Arc::new(Mutex::new(0));
+    let client = budgeted_client(
+        vec![ping_calls(5), ChatResponse::from_text("done")],
+        |config| config.max_function_calls = Some(2),
+    );
+
+    let response = client
+        .get_response(
+            vec![Message::user("ping")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "done");
+    assert_eq!(*counter.lock().unwrap(), 5, "the whole batch ran");
+}
+
+#[tokio::test]
+async fn an_unbudgeted_run_keeps_calling_tools() {
+    // The negative control for both budget tests: the same script without a
+    // budget executes every call the model asks for.
+    let counter = Arc::new(Mutex::new(0));
+    let inner = MockClient::new(vec![
+        ping_calls(1),
+        ping_calls(1),
+        ping_calls(1),
+        ChatResponse::from_text("done"),
+    ]);
+    let client = FunctionInvokingChatClient::new(inner.clone());
+
+    let response = client
+        .get_response(
+            vec![Message::user("ping")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "done");
+    assert_eq!(*counter.lock().unwrap(), 3);
+    assert!(
+        inner
+            .all_options()
+            .iter()
+            .all(|o| o.tool_choice != Some(ToolMode::None)),
+        "tools were never disabled without a budget"
+    );
+}
+
+#[tokio::test]
+async fn max_duration_seconds_stops_the_loop_after_a_slow_batch() {
+    let slow = FunctionTool::new(
+        "slow",
+        "Take a while.",
+        json!({ "type": "object", "properties": {} }),
+        move |_args| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            Ok(json!("ok"))
+        },
+    )
+    .into_definition();
+    let inner = MockClient::new(vec![
+        ChatResponse {
+            messages: vec![Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "call_0",
+                    "slow",
+                    Some(FunctionArguments::Raw("{}".into())),
+                ))],
+            )],
+            finish_reason: Some(FinishReason::tool_calls()),
+            ..Default::default()
+        },
+        ChatResponse::from_text("out of time"),
+    ]);
+    let client =
+        FunctionInvokingChatClient::new(inner.clone()).with_config(FunctionInvocationConfig {
+            max_duration_seconds: Some(0.05),
+            ..Default::default()
+        });
+
+    let response = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(slow),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "out of time");
+    assert_eq!(
+        inner.all_options().last().unwrap().tool_choice,
+        Some(ToolMode::None),
+        "the wall-clock budget must disable tools"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_resumed_past_the_budget_is_not_executed() {
+    // The budget has to hold across the approval round trip: otherwise a run
+    // that is out of budget still executes whatever a human approves later,
+    // and an unattended approve-and-continue loop never hits a limit at all.
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let client = budgeted_client(
+        vec![secret_call(), ChatResponse::from_text("no budget left")],
+        |config| config.max_duration_seconds = Some(0.05),
+    );
+    // The session is where the budget is parked between the two requests.
+    let session = AgentSession::new();
+    let mut options = ChatOptions::new().with_tool(tool);
+    options.session = Some(session.clone());
+
+    let resp1 = client
+        .get_response(vec![Message::user("what is the secret?")], options.clone())
+        .await
+        .unwrap();
+    let requests = resp1.user_input_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(*counter.lock().unwrap(), 0);
+
+    // The human takes longer than the budget to answer.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let approval = requests[0].create_response(true);
+    let mut conversation = vec![Message::user("what is the secret?")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(Message::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(approval)],
+    ));
+    let resp2 = client.get_response(conversation, options).await.unwrap();
+
+    assert_eq!(resp2.text(), "no budget left");
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "an approved call must not run once the budget is spent"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_resumed_within_the_budget_still_executes() {
+    // The negative control for the test above: the same shape, with time left.
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let client = budgeted_client(
+        vec![secret_call(), ChatResponse::from_text("The secret is 42.")],
+        |config| config.max_duration_seconds = Some(30.0),
+    );
+    let session = AgentSession::new();
+    let mut options = ChatOptions::new().with_tool(tool);
+    options.session = Some(session.clone());
+
+    let resp1 = client
+        .get_response(vec![Message::user("what is the secret?")], options.clone())
+        .await
+        .unwrap();
+    let approval = resp1.user_input_requests()[0].create_response(true);
+    let mut conversation = vec![Message::user("what is the secret?")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(Message::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(approval)],
+    ));
+    let resp2 = client.get_response(conversation, options).await.unwrap();
+
+    assert!(resp2.text().contains("42"), "got: {}", resp2.text());
+    assert_eq!(*counter.lock().unwrap(), 1);
+    // And the finished run left no budget behind for the next one.
+    assert!(
+        !session
+            .state
+            .contains_key("__af_function_invocation_budget__"),
+        "a terminal exit must clear the parked budget"
+    );
+}
+
+#[tokio::test]
+async fn the_call_budget_is_parked_across_an_approval_pause() {
+    // One call runs before the pause and the approved call runs after it,
+    // which together spend a budget of two — but only if the count survives
+    // the pause. If it reset, the resumed leg would still have a full budget
+    // and would go on calling tools.
+    let executed = Arc::new(Mutex::new(0));
+    let counter = executed.clone();
+    let ping = counting_tool(executed.clone());
+    let approval = approval_tool(executed.clone());
+    let inner = MockClient::new(vec![
+        ping_calls(1),
+        secret_call(),
+        ChatResponse::from_text("out of calls"),
+    ]);
+    let client =
+        FunctionInvokingChatClient::new(inner.clone()).with_config(FunctionInvocationConfig {
+            max_function_calls: Some(2),
+            ..Default::default()
+        });
+    let session = AgentSession::new();
+    let mut options = ChatOptions::new().with_tool(ping).with_tool(approval);
+    options.session = Some(session.clone());
+
+    let resp1 = client
+        .get_response(vec![Message::user("go")], options.clone())
+        .await
+        .unwrap();
+    let requests = resp1.user_input_requests();
+    assert_eq!(requests.len(), 1, "paused on the approval-gated call");
+    assert_eq!(*counter.lock().unwrap(), 1, "only `ping` ran");
+    let parked = session
+        .state
+        .get("__af_function_invocation_budget__")
+        .expect("the pause parks the budget");
+    assert_eq!(parked["executed"], 1);
+
+    let mut conversation = vec![Message::user("go")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(Message::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(
+            requests[0].create_response(true),
+        )],
+    ));
+    let resp2 = client.get_response(conversation, options).await.unwrap();
+
+    assert_eq!(resp2.text(), "out of calls");
+    assert_eq!(*counter.lock().unwrap(), 2, "ping plus the approved call");
+    // The discriminating assertion: the resumed leg's final model call has
+    // tools off, which only happens because the *resumed* budget was already
+    // at 2 after the approval replay. A budget that reset at the pause would
+    // have been at 1 and asked for tools again.
+    assert_eq!(
+        inner.all_options().last().unwrap().tool_choice,
+        Some(ToolMode::None)
+    );
+    assert!(
+        !session
+            .state
+            .contains_key("__af_function_invocation_budget__"),
+        "the finished run clears the parked budget"
+    );
+}
+
+#[test]
+fn budget_configuration_is_validated() {
+    let config = FunctionInvocationConfig {
+        max_function_calls: Some(0),
+        ..Default::default()
+    };
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("max_function_calls"));
+
+    let mut config = FunctionInvocationConfig {
+        max_duration_seconds: Some(0.0),
+        ..Default::default()
+    };
+    assert!(config.validate().is_err());
+    config.max_duration_seconds = Some(-1.0);
+    assert!(config.validate().is_err());
+    // NaN is rejected by the same comparison, rather than silently meaning
+    // "never expires".
+    config.max_duration_seconds = Some(f64::NAN);
+    assert!(config.validate().is_err());
+    config.max_duration_seconds = Some(0.5);
+    assert!(config.validate().is_ok());
+}
+
+// endregion
+
+#[tokio::test]
+async fn an_agent_can_set_its_tool_loop_budget() {
+    // The builder wraps the client itself, so without this the budget is
+    // unreachable for anyone using `Agent` — which is most callers.
+    let counter = Arc::new(Mutex::new(0));
+    let inner = MockClient::new(vec![ping_calls(1), ChatResponse::from_text("done")]);
+    let agent = Agent::builder(inner.clone())
+        .function_invocation_config(FunctionInvocationConfig {
+            max_function_calls: Some(1),
+            ..Default::default()
+        })
+        .tool(counting_tool(counter.clone()))
+        .build();
+
+    let response = agent.run_once("go").await.unwrap();
+    assert_eq!(response.text(), "done");
+    assert_eq!(*counter.lock().unwrap(), 1);
+    assert_eq!(
+        inner.all_options().last().unwrap().tool_choice,
+        Some(ToolMode::None)
+    );
+}
+
+#[tokio::test]
+async fn a_spent_budget_stops_executing_even_when_the_provider_ignores_tool_choice() {
+    // `tool_choice: none` is a hint to the provider, and this mock ignores it
+    // exactly as a provider that does not honor it would. The budget has to
+    // be a ceiling on *executions*, not just a request to stop asking, so the
+    // loop must not execute the calls that come back anyway.
+    let counter = Arc::new(Mutex::new(0));
+    let inner = MockClient::new(vec![
+        ping_calls(1),
+        ping_calls(1),
+        ChatResponse::from_text("done"),
+    ]);
+    let client =
+        FunctionInvokingChatClient::new(inner.clone()).with_config(FunctionInvocationConfig {
+            max_function_calls: Some(1),
+            ..Default::default()
+        });
+
+    let _ = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "the budget is a ceiling on executions, not a hint"
+    );
+    assert_eq!(
+        inner.all_options().len(),
+        2,
+        "one tool-calling iteration, then the final tools-off call"
+    );
+}
