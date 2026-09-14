@@ -24,7 +24,7 @@
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
-//! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory | no |
+//! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
@@ -116,7 +116,8 @@ pub use agent_framework_mem0 as mem0;
 #[cfg(feature = "foundry")]
 pub use agent_framework_foundry as foundry;
 
-/// Azure AI Search context provider (enable the `azure-ai-search` feature).
+/// Azure AI Search context provider and vector store (enable the
+/// `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
 
@@ -191,7 +192,9 @@ pub mod prelude {
     pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient, FoundryEmbeddingClient};
 
     #[cfg(feature = "azure-ai-search")]
-    pub use agent_framework_azure_ai_search::AzureAISearchProvider;
+    pub use agent_framework_azure_ai_search::{
+        AzureAISearchCollection, AzureAISearchProvider, AzureAISearchStore,
+    };
 
     #[cfg(feature = "cosmos")]
     pub use agent_framework_cosmos::CosmosChatMessageStore;

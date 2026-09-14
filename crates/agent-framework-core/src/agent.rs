@@ -1042,6 +1042,7 @@ pub struct AgentBuilder {
     /// Governs the tool-loop spans; `None` leaves the wrapper reading the
     /// environment. See [`AgentBuilder::observability_config`].
     observability: Option<crate::observability::ObservabilityConfig>,
+    function_invocation_config: Option<crate::tools::FunctionInvocationConfig>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
 }
 
@@ -1059,6 +1060,7 @@ impl AgentBuilder {
             chat_middleware: Vec::new(),
             function_middleware: Vec::new(),
             observability: None,
+            function_invocation_config: None,
             tool_sources: Vec::new(),
         }
     }
@@ -1183,6 +1185,38 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the [`FunctionInvocationConfig`](crate::tools::FunctionInvocationConfig)
+    /// for this agent's tool loop: iteration cap, the per-request call and
+    /// wall-clock budgets, the consecutive-error limit, and how unknown calls
+    /// and tool errors are reported.
+    ///
+    /// Like [`observability_config`](Self::observability_config), this is the
+    /// only way to reach that config: the builder wraps the caller's client in
+    /// a [`FunctionInvokingChatClient`] itself, so configuring one before
+    /// handing it over would just be wrapped again.
+    ///
+    /// ```no_run
+    /// # use agent_framework_core::prelude::*;
+    /// # fn demo<C: ChatClient + 'static>(client: C) {
+    /// let config = FunctionInvocationConfig {
+    ///     // Bound an unattended run three ways.
+    ///     max_iterations: 10,
+    ///     max_function_calls: Some(25),
+    ///     max_duration_seconds: Some(120.0),
+    ///     ..Default::default()
+    /// };
+    /// let agent = Agent::builder(client).function_invocation_config(config).build();
+    /// # let _ = agent;
+    /// # }
+    /// ```
+    pub fn function_invocation_config(
+        mut self,
+        config: crate::tools::FunctionInvocationConfig,
+    ) -> Self {
+        self.function_invocation_config = Some(config);
+        self
+    }
+
     /// Override the whole chat options object (advanced).
     pub fn chat_options(mut self, options: ChatOptions) -> Self {
         // Preserve tools/instructions collected so far by merging.
@@ -1207,6 +1241,9 @@ impl AgentBuilder {
             .with_function_middleware(self.function_middleware);
         if let Some(config) = self.observability {
             invoking = invoking.with_observability_config(config);
+        }
+        if let Some(config) = self.function_invocation_config {
+            invoking = invoking.with_config(config);
         }
         let client: Arc<dyn ChatClient> = Arc::new(invoking);
         Agent {

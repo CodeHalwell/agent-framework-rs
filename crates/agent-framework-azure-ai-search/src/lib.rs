@@ -34,6 +34,10 @@
 //! # }
 //! ```
 
+mod vector_store;
+
+pub use vector_store::{AzureAISearchCollection, AzureAISearchStore};
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,11 +64,21 @@ type EmbeddingFn = Arc<dyn Fn(&str) -> BoxFuture<Result<Vec<f32>>> + Send + Sync
 
 /// How a search request authenticates.
 #[derive(Clone)]
-enum SearchAuth {
+pub(crate) enum SearchAuth {
     /// `api-key: <key>` header.
     ApiKey(String),
     /// `Authorization: Bearer <token>` from a [`TokenCredential`].
     Credential(Arc<dyn TokenCredential>),
+}
+
+impl SearchAuth {
+    /// Which mode this is, for a `Debug` impl that must not print the key.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::ApiKey(_) => "api-key",
+            Self::Credential(_) => "token-credential",
+        }
+    }
 }
 
 /// A context provider backed by an Azure AI Search index.

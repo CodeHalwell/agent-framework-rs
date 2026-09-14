@@ -30,12 +30,19 @@
 //! [`VectorStoreCollectionDefinition::to_storage`] and
 //! [`VectorStoreCollectionDefinition::from_storage`] perform that renaming.
 
+pub mod filters;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
+
+pub use filters::{
+    Filter, FilterExpression, FilterGroup, FilterGroupOperator, FilterOperator, MAX_FILTER_DEPTH,
+    MAX_FILTER_NODES,
+};
 
 /// How a vector index is built. Open value wrapper — the constants cover
 /// upstream's list, and any other string a provider understands is accepted.
@@ -276,6 +283,25 @@ impl VectorStoreCollectionDefinition {
         &self.fields
     }
 
+    /// The field declared under `name`, or `None` when the collection has no
+    /// such field.
+    ///
+    /// Lookup is by **logical** name, which is what a
+    /// [`filters::Filter`] carries.
+    pub fn try_get_field(&self, name: &str) -> Option<&VectorStoreField> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Map a logical field name onto the storage name a record is keyed by,
+    /// for [`FilterExpression::matches`].
+    ///
+    /// Returns `None` for a field the collection does not declare, which
+    /// `matches` reports as an error rather than a non-match.
+    pub fn storage_name_for(&self, name: &str) -> Option<String> {
+        self.try_get_field(name)
+            .map(|f| f.effective_storage_name().to_string())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.fields.is_empty() {
             return Err(Error::Configuration(
@@ -494,13 +520,21 @@ pub struct VectorSearchOptions {
     pub include_vectors: bool,
     /// Which vector field to search, when the collection has several.
     pub vector_field_name: Option<String>,
-    /// Provider-specific filter expression, passed through verbatim.
+    /// A portable filter, translated by each connector into its own dialect.
     ///
-    /// Upstream accepts a Python lambda and parses its AST into each
-    /// provider's filter dialect. That has no Rust counterpart — there is no
-    /// runtime AST to walk — so a filter here is the provider's own
-    /// expression, and a provider documents its dialect.
-    pub filter: Option<String>,
+    /// See [`filters`] for the operator set and its semantics. A connector
+    /// that cannot express an operator refuses the search rather than
+    /// dropping the condition — a dropped filter reads as a passing retrieval
+    /// test while scoping is silently broken.
+    pub filter: Option<FilterExpression>,
+    /// A filter in the provider's own dialect, passed through verbatim.
+    ///
+    /// The escape hatch for what the portable operator set cannot say —
+    /// Azure AI Search's `search.ismatch`, a geo predicate, a provider
+    /// function. It is not portable: a collection swapped for another
+    /// provider's will reject it. When both this and [`Self::filter`] are
+    /// set, a connector conjoins them.
+    pub provider_filter: Option<String>,
 }
 
 impl Default for VectorSearchOptions {
@@ -513,6 +547,7 @@ impl Default for VectorSearchOptions {
             include_vectors: false,
             vector_field_name: None,
             filter: None,
+            provider_filter: None,
         }
     }
 }
@@ -540,8 +575,15 @@ impl VectorSearchOptions {
         self
     }
 
-    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
+    /// Scope the search with a portable [`FilterExpression`].
+    pub fn with_filter(mut self, filter: impl Into<FilterExpression>) -> Self {
         self.filter = Some(filter.into());
+        self
+    }
+
+    /// Scope the search with a filter in the provider's own dialect.
+    pub fn with_provider_filter(mut self, filter: impl Into<String>) -> Self {
+        self.provider_filter = Some(filter.into());
         self
     }
 
@@ -563,12 +605,57 @@ impl VectorSearchOptions {
 pub struct VectorSearchResult {
     /// The record, keyed by logical field name.
     pub record: Value,
-    /// The provider's similarity or distance score. Whether a higher value is
-    /// a closer match depends on the collection's
-    /// [`DistanceFunction::higher_is_closer`]; `None` when the provider
-    /// reports no score.
+    /// The provider's similarity or distance score, or `None` when the
+    /// provider reports none.
+    ///
+    /// Read the direction from [`Self::score_kind`] when it is set, and only
+    /// otherwise from the collection's
+    /// [`DistanceFunction::higher_is_closer`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub score: Option<f64>,
+    /// What kind of number [`Self::score`] is, when the declared distance
+    /// function does not describe it.
+    ///
+    /// The collection's distance function is a request — *rank by this* — and
+    /// on several services it does not describe what comes back. Azure AI
+    /// Search answers a vector query with a relevance score where higher is
+    /// better whatever metric the profile declares, and answers a hybrid
+    /// query with a reciprocal-rank-fusion score that is not a distance at
+    /// all. A caller thresholding or fusing on `score` under the definition's
+    /// `higher_is_closer` would invert the ranking, so the connector says
+    /// what it actually returned. Mirrors upstream's `score_kind` result
+    /// metadata.
+    ///
+    /// `None` means the score is in the collection's declared distance
+    /// function, as [`InMemoryVectorStore`] returns. The values this workspace
+    /// emits are [`Self::SCORE_KIND_RELEVANCE`] and
+    /// [`Self::SCORE_KIND_RRF`], both higher-is-closer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub score_kind: Option<String>,
+}
+
+impl VectorSearchResult {
+    /// A provider relevance score: higher is a better match, and the value is
+    /// not a distance in the declared metric.
+    pub const SCORE_KIND_RELEVANCE: &'static str = "relevance";
+    /// A reciprocal-rank-fusion score from a hybrid query: higher is a better
+    /// match, and it is a rank combination rather than any distance.
+    pub const SCORE_KIND_RRF: &'static str = "rrf";
+
+    /// Whether a higher [`Self::score`] means a closer match, given the
+    /// collection's declared distance function.
+    ///
+    /// Prefers [`Self::score_kind`] over `distance`, which is the whole point
+    /// of the field: on a service that ignores the declared metric when
+    /// scoring, the definition is the wrong thing to read. `None` when
+    /// neither answers.
+    pub fn higher_is_closer(&self, distance: Option<&DistanceFunction>) -> Option<bool> {
+        match self.score_kind.as_deref() {
+            Some(Self::SCORE_KIND_RELEVANCE) | Some(Self::SCORE_KIND_RRF) => Some(true),
+            Some(_) => None,
+            None => distance.and_then(DistanceFunction::higher_is_closer),
+        }
+    }
 }
 
 /// One collection's data plane: create/drop, read/write, and search.
@@ -826,14 +913,20 @@ impl VectorCollection for InMemoryCollection {
         options: &VectorSearchOptions,
     ) -> Result<Vec<VectorSearchResult>> {
         options.validate()?;
-        // Silently ignoring a filter would return every record as a match,
-        // which reads as a passing retrieval test while scoping is broken.
-        if options.filter.is_some() {
+        // A portable filter is evaluated below, against each record. A
+        // provider-dialect one has no dialect to be written in here, and
+        // silently ignoring it would return every record as a match — which
+        // reads as a passing retrieval test while scoping is broken.
+        if options.provider_filter.is_some() {
             return Err(Error::Configuration(
-                "InMemoryVectorStore does not support `VectorSearchOptions::filter`: it has no \
-                 filter dialect. Drop the filter, or use a provider-backed collection."
+                "InMemoryVectorStore does not support `VectorSearchOptions::provider_filter`: it \
+                 has no filter dialect. Use `filter` with a portable expression, or a \
+                 provider-backed collection."
                     .into(),
             ));
+        }
+        if let Some(filter) = options.filter.as_ref() {
+            filter.validate()?;
         }
         let field = self
             .definition
@@ -889,6 +982,17 @@ impl VectorCollection for InMemoryCollection {
         let records: Vec<Value> = self.with_data(|d| d.records.values().cloned().collect());
         let mut scored: Vec<(f64, Value)> = Vec::new();
         for record in records {
+            // Filtering comes before scoring: a record the filter excludes
+            // must not occupy one of the `top` slots, which is what applying
+            // the filter to an already-truncated result would do.
+            if let Some(filter) = options.filter.as_ref() {
+                // Records are held in storage form, so the filter's logical
+                // names are resolved through the definition — the same
+                // mapping `from_storage` performs on the way out.
+                if !filter.matches(&record, &|name| self.definition.storage_name_for(name))? {
+                    continue;
+                }
+            }
             let Some(stored_vector) = record.get(&field_name).and_then(Value::as_array) else {
                 continue;
             };
@@ -939,6 +1043,10 @@ impl VectorCollection for InMemoryCollection {
                         .definition
                         .from_storage(&record, options.include_vectors)?,
                     score: Some(score),
+                    // This store scores with the collection's own distance
+                    // function, so the definition describes the number and
+                    // there is nothing to override.
+                    score_kind: None,
                 })
             })
             .collect()
@@ -1414,7 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_rejects_a_filter_it_cannot_apply() {
+    async fn search_rejects_a_provider_dialect_filter_it_cannot_apply() {
         // Ignoring the filter returned every record, which reads as a passing
         // retrieval test while scoping is silently broken.
         let store = InMemoryVectorStore::new();
@@ -1425,11 +1533,111 @@ mod tests {
         let err = c
             .search(
                 vec![1.0, 0.0, 0.0],
-                &VectorSearchOptions::new(5).with_filter("text eq 'nothing'"),
+                &VectorSearchOptions::new(5).with_provider_filter("text eq 'nothing'"),
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("filter"), "{err}");
+        assert!(err.to_string().contains("provider_filter"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_applies_a_portable_filter() {
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            record("a", "alpha", [1.0, 0.0, 0.0]),
+            record("b", "beta", [0.9, 0.1, 0.0]),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(5).with_filter(Filter::eq("text", "beta").unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], "b");
+
+        // Negative control: without the filter both records come back, so the
+        // single hit above is the filter working rather than the data.
+        let all = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_filter_excludes_records_before_top_is_applied() {
+        // Filtering after truncation would let excluded records consume the
+        // `top` slots and return fewer — or no — matching hits.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            record("near", "skip", [1.0, 0.0, 0.0]),
+            record("far", "keep", [0.0, 1.0, 0.0]),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(1).with_filter(Filter::eq("text", "keep").unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], "far");
+    }
+
+    #[tokio::test]
+    async fn a_filter_resolves_renamed_storage_names() {
+        // Records are held in storage form, so a filter naming the logical
+        // field has to be mapped through the definition; matching on the
+        // logical name directly would find nothing and return no hits at all.
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::data("text").with_storage_name("stored_text"),
+            VectorStoreField::vector("embedding", 3),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition).unwrap();
+        c.upsert(vec![record("a", "alpha", [1.0, 0.0, 0.0])])
+            .await
+            .unwrap();
+
+        let hits = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(5).with_filter(Filter::eq("text", "alpha").unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_filter_naming_an_undeclared_field_is_an_error() {
+        // Not a silent empty result: it is a mistake in the filter, and a
+        // caller that gets zero hits back cannot tell the two apart.
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![record("a", "alpha", [1.0, 0.0, 0.0])])
+            .await
+            .unwrap();
+        let err = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(5).with_filter(Filter::eq("nope", "x").unwrap()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not part of"), "{err}");
     }
 
     #[tokio::test]

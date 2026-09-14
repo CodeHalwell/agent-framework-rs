@@ -342,6 +342,10 @@ name = "azure_ai_search"
 path = "memory/azure_ai_search.rs"
 
 [[example]]
+name = "azure_ai_search_vector_store"
+path = "memory/azure_ai_search_vector_store.rs"
+
+[[example]]
 name = "a2a_client"
 path = "a2a/a2a_client.rs"
 

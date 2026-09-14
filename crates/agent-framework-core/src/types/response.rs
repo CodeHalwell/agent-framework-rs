@@ -445,7 +445,29 @@ fn coalesce_text(contents: &mut Vec<Content>) {
             (Some(Content::Text(prev)), Content::Text(cur)) if prev.refusal == cur.refusal => {
                 prev.text.push_str(&cur.text)
             }
-            (Some(Content::TextReasoning(prev)), Content::TextReasoning(cur)) => {
+            // Reasoning fragments merge only within one provider block, and
+            // two things close a block.
+            //
+            // A **signature** signs exactly the text accumulated when it
+            // arrives — Anthropic validates it against that text — so a
+            // fragment after one belongs to the next block. Merging across
+            // that line concatenates two blocks under the later signature,
+            // which then signs neither, and the replayed turn is rejected
+            // with one block missing.
+            //
+            // A **raw provider item already on the accumulator** means a
+            // whole block landed in one fragment (`redacted_thinking` arrives
+            // that way, encrypted and textless); text after it is the next
+            // block's, and merging would replay that text under the redacted
+            // block's raw form and lose it.
+            //
+            // A raw item on the *incoming* fragment is not a boundary: OpenAI
+            // Responses attaches the verbatim reasoning item to the **last**
+            // summary fragment, so it has to merge back onto the item its
+            // summary belongs to.
+            (Some(Content::TextReasoning(prev)), Content::TextReasoning(cur))
+                if prev.protected_data.is_none() && prev.raw_representation.is_none() =>
+            {
                 prev.text.push_str(&cur.text);
                 if let Some(token) = cur.protected_data.as_ref().filter(|t| !t.is_empty()) {
                     prev.protected_data = Some(token.clone());

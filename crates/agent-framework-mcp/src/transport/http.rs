@@ -21,6 +21,54 @@ use crate::transport::McpTransport;
 
 const SESSION_ID_HEADER: &str = "mcp-session-id";
 
+/// How many redirects this transport follows before giving up. Matches
+/// `reqwest`'s own default cap.
+const MAX_REDIRECTS: usize = 10;
+
+/// An origin: scheme, host, and port, with the port defaulted from the scheme.
+///
+/// Two URLs are same-origin when all three match. Mirrors upstream's
+/// `_url_origin` (#8285), including defaulting the port — without which
+/// `https://h/` and `https://h:443/` read as different origins and the
+/// headers a server just authenticated with would be dropped on its own
+/// redirect.
+type Origin = (String, String, u16);
+
+/// The origin of `url`, or an error when it is not an absolute HTTP(S) URL
+/// with a host.
+///
+/// Rejecting anything else is upstream's rule, and it is what makes the
+/// same-origin comparison meaningful at all: a `file:` or relative URL has no
+/// origin to compare against, so headers attached to it could not be scoped.
+fn url_origin(url: &reqwest::Url) -> Result<Origin> {
+    let scheme = url.scheme();
+    let default_port = match scheme {
+        "https" => 443,
+        "http" => 80,
+        other => {
+            return Err(Error::Configuration(format!(
+                "MCP URL must be an absolute HTTP(S) URL, got scheme '{other}'"
+            )))
+        }
+    };
+    let host = url.host_str().ok_or_else(|| {
+        Error::Configuration("MCP URL must be an absolute HTTP(S) URL with a host".into())
+    })?;
+    Ok((
+        scheme.to_string(),
+        host.to_ascii_lowercase(),
+        url.port().unwrap_or(default_port),
+    ))
+}
+
+/// Parse and validate an MCP endpoint URL.
+pub(crate) fn parse_endpoint(url: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| Error::Configuration(format!("invalid MCP URL '{url}': {e}")))?;
+    url_origin(&parsed)?;
+    Ok(parsed)
+}
+
 /// An MCP transport that POSTs JSON-RPC messages to a streamable-HTTP endpoint.
 ///
 /// Captures the `Mcp-Session-Id` response header (typically returned from
@@ -39,7 +87,10 @@ const SESSION_ID_HEADER: &str = "mcp-session-id";
 /// to arrive embedded in the SSE response to a call already in flight.
 pub struct McpStreamableHttpTransport {
     http: reqwest::Client,
-    url: String,
+    url: reqwest::Url,
+    /// The configured endpoint's origin. Every request's headers are scoped
+    /// to it — see [`Self::post`].
+    origin: Origin,
     headers: HeaderMap,
     timeout: Option<Duration>,
     session_id: RwLock<Option<String>>,
@@ -56,17 +107,36 @@ pub struct McpStreamableHttpTransport {
 impl McpStreamableHttpTransport {
     /// Create a transport posting to `url`, with optional extra headers
     /// (e.g. `Authorization`) and a per-request timeout.
-    pub fn new(url: impl Into<String>, headers: HeaderMap, timeout: Option<Duration>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            url: url.into(),
+    ///
+    /// `url` must be an absolute HTTP(S) URL with a host: those headers are
+    /// scoped to its origin, and a URL without one has no origin to scope
+    /// them to.
+    pub fn new(
+        url: impl Into<String>,
+        headers: HeaderMap,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let url = parse_endpoint(&url.into())?;
+        let origin = url_origin(&url)?;
+        Ok(Self {
+            // Redirects are followed by `post` rather than by `reqwest`,
+            // which cannot drop a header per hop: it strips `Authorization`,
+            // `Cookie` and `Proxy-Authorization` on a cross-*host* redirect
+            // and nothing else, so an MCP server's `X-Api-Key` — or the
+            // session id — would be handed to whatever host it redirected to.
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| Error::Configuration(format!("MCP HTTP client: {e}")))?,
+            url,
+            origin,
             headers,
             timeout,
             session_id: RwLock::new(None),
             next_id: IdGenerator::new(),
             server_request_handler: StdMutex::new(None),
             notification_handler: StdMutex::new(None),
-        }
+        })
     }
 
     /// Build a [`HeaderMap`] from `(name, value)` pairs, for use with [`Self::new`].
@@ -88,27 +158,105 @@ impl McpStreamableHttpTransport {
         self.session_id.read().await.clone()
     }
 
+    /// POST `body` to the endpoint, following redirects ourselves so the
+    /// configured headers can be scoped to the configured origin.
+    ///
+    /// The headers a caller attaches here are credentials — an
+    /// `Authorization: Bearer`, an `X-Api-Key` — and the MCP session id is one
+    /// too. A redirect to another origin must not receive any of them: that
+    /// is a credential handed to a host the caller never configured, on the
+    /// say-so of the host that redirected. `reqwest`'s own redirect handling
+    /// cannot express this (it strips three well-known header names on a
+    /// cross-host hop and passes everything else through), so this follows
+    /// redirects itself and re-attaches the headers only while the target is
+    /// same-origin.
+    ///
+    /// The method is preserved across every hop. A 303 — or a legacy 301/302
+    /// rewritten to GET, which is what `reqwest` would have done — turns a
+    /// JSON-RPC request into a body-less GET, which no MCP server can answer;
+    /// re-POSTing is the only reading that keeps the protocol intact.
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
-        let mut req = self
-            .http
-            .post(&self.url)
-            .header(ACCEPT, "application/json, text/event-stream")
-            .header(CONTENT_TYPE, "application/json")
-            .headers(self.headers.clone())
-            .json(body);
-        if let Some(timeout) = self.timeout {
-            req = req.timeout(timeout);
-        }
-        if let Some(session_id) = self.session_id.read().await.clone() {
-            req = req.header(SESSION_ID_HEADER, session_id);
-        }
-        req.send()
-            .await
-            .map_err(|e| Error::service(format!("MCP HTTP request failed: {e}")))
+        self.send_scoped(|http, url| {
+            http.post(url)
+                .header(ACCEPT, "application/json, text/event-stream")
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+        })
+        .await
     }
 
-    async fn capture_session_id(&self, headers: &HeaderMap) {
-        if let Some(v) = headers.get(SESSION_ID_HEADER).and_then(|v| v.to_str().ok()) {
+    /// Send the request `build` produces, following redirects ourselves so the
+    /// configured headers stay scoped to the configured origin.
+    ///
+    /// Every verb this transport uses goes through here, not just the POST
+    /// that carries the JSON-RPC traffic: with a `Policy::none()` client a
+    /// caller that does not follow redirects itself reads the 3xx as its
+    /// answer, so a request to a server that redirects within its own origin
+    /// silently never reaches the endpoint at all.
+    async fn send_scoped<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn(&reqwest::Client, reqwest::Url) -> reqwest::RequestBuilder,
+    {
+        let mut url = self.url.clone();
+        let mut same_origin = true;
+        for _ in 0..=MAX_REDIRECTS {
+            let mut req = build(&self.http, url.clone());
+            if same_origin {
+                req = req.headers(self.headers.clone());
+                if let Some(session_id) = self.session_id.read().await.clone() {
+                    req = req.header(SESSION_ID_HEADER, session_id);
+                }
+            }
+            if let Some(timeout) = self.timeout {
+                req = req.timeout(timeout);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| Error::service(format!("MCP HTTP request failed: {e}")))?;
+            if !resp.status().is_redirection() {
+                return Ok(resp);
+            }
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                // A redirect status with no `Location` is not a redirect this
+                // can follow; hand it back as the response it is rather than
+                // silently retrying the same URL forever.
+                return Ok(resp);
+            };
+            let next = url.join(location).map_err(|e| {
+                Error::service(format!("MCP server redirected to an invalid URL: {e}"))
+            })?;
+            // A non-HTTP(S) redirect target (`file:`, a custom scheme) has no
+            // origin, so it can never be same-origin; refused outright rather
+            // than followed without headers.
+            let next_origin = url_origin(&next)?;
+            same_origin = same_origin && next_origin == self.origin;
+            url = next;
+        }
+        Err(Error::service(format!(
+            "MCP server redirected more than {MAX_REDIRECTS} times"
+        )))
+    }
+
+    /// Adopt a `Mcp-Session-Id` from a response.
+    ///
+    /// Only ever called with a response from the configured origin: a session
+    /// id is a bearer token replayed on every later request, so honoring one
+    /// set by a redirect target would let any host the server redirects to
+    /// fix this client's session.
+    async fn capture_session_id(&self, resp: &reqwest::Response) {
+        if url_origin(resp.url()).ok() != Some(self.origin.clone()) {
+            return;
+        }
+        if let Some(v) = resp
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
             *self.session_id.write().await = Some(v.to_string());
         }
     }
@@ -124,7 +272,7 @@ impl McpTransport for McpStreamableHttpTransport {
         let id = self.next_request_id();
         let body = protocol::build_request(id, method, params);
         let resp = self.post(&body).await?;
-        self.capture_session_id(resp.headers()).await;
+        self.capture_session_id(&resp).await;
 
         let status = resp.status();
         let content_type = resp
@@ -153,7 +301,7 @@ impl McpTransport for McpStreamableHttpTransport {
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         let body = protocol::build_notification(method, params);
         let resp = self.post(&body).await?;
-        self.capture_session_id(resp.headers()).await;
+        self.capture_session_id(&resp).await;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -163,16 +311,17 @@ impl McpTransport for McpStreamableHttpTransport {
     }
 
     async fn close(&self) -> Result<()> {
-        if let Some(session_id) = self.session_id().await {
+        if self.session_id().await.is_some() {
             // Best effort: the server may not support/require an explicit
             // session teardown, so failures here are not propagated.
-            let result = self
-                .http
-                .delete(&self.url)
-                .header(SESSION_ID_HEADER, session_id)
-                .headers(self.headers.clone())
-                .send()
-                .await;
+            // Through the same scoped-redirect path as every other request:
+            // this client does not follow redirects on its own, so a bare
+            // `send()` here would read a same-origin 3xx as a delivered
+            // teardown and leave the server session open. The session id is
+            // attached by `send_scoped` (and dropped if a redirect leaves the
+            // origin), so it is not read here — only its presence decides
+            // whether there is a session to tear down at all.
+            let result = self.send_scoped(|http, url| http.delete(url)).await;
             if let Err(e) = result {
                 tracing::debug!(error = %e, "MCP: best-effort session DELETE failed");
             }

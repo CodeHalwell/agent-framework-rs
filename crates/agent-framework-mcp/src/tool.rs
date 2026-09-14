@@ -696,7 +696,7 @@ impl McpStreamableHttpTool {
             .get_or_try_init(|| async {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
                 let transport =
-                    McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout);
+                    McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout)?;
                 let mut client = McpClient::new(Arc::new(transport));
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());

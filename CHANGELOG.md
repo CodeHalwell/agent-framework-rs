@@ -7,6 +7,236 @@ may break APIs).
 
 ## [Unreleased]
 
+Portable vector filters and an Azure AI Search vector store, bounds on the
+tool loop, and three isolation fixes.
+
+**Breaking, in five places.** `VectorSearchOptions::filter` is now a
+`FilterExpression` rather than a provider-dialect `String`; the string form
+moved to `provider_filter` / `with_provider_filter`.
+`McpStreamableHttpTransport::new` returns a `Result` (it validates the URL).
+`SecretString` no longer implements `Serialize`, so a `#[derive(Serialize)]`
+on a struct holding one stops compiling — deliberately; see below. And every
+workflow graph signature changes, so a checkpoint written by 0.6.x is refused
+on resume with a message naming the scheme change (and
+`run_from_checkpoint_unchecked` still resumes it). Finally,
+`VectorSearchResult` gains a `score_kind` field, so code constructing one
+with struct-literal syntax needs updating (it does not derive `Default`).
+Reading one is unaffected.
+
+Two behavior changes to look for. Redis keys are now derived through an
+injective encoding: a literal-safe prefix and session id — the default prefix
+and any UUID — produce exactly the keys they always did, so existing data is
+unaffected, but an identifier containing `:`, uppercase, or a glob character
+now addresses a different key than before. And an Anthropic reasoning content
+with no signature is no longer sent as a thinking block; with extended
+thinking enabled the API rejects one, so this turns a 400 into a request that
+works.
+
+### Added
+
+- **Portable vector filters** (`agent_framework_core::vectors::filters`):
+  `Filter` leaves and `FilterGroup` nodes across 18 operators, validated at
+  construction (operand shape per operator, depth ≤ 8, ≤ 64 nodes), with a
+  namespaced escape hatch (`azure_ai_search.match`) for anything a connector
+  defines itself. `InMemoryVectorStore` evaluates them instead of refusing
+  every filter. The semantics are upstream's: a missing field is a non-match
+  for every operator except `exists` (so `ne` and `not(eq)` differ), a boolean
+  never equals a number, and two numbers compare by value — so a record that
+  round-tripped through JSON as `1` still matches `eq: 1.0`.
+
+- **An Azure AI Search vector store**: `AzureAISearchStore` and
+  `AzureAISearchCollection` in `agent-framework-azure-ai-search`. Index
+  create/exists/delete from a `VectorStoreCollectionDefinition` (EDM types,
+  vector profiles, hnsw vs exhaustiveKnn, metric mapping), document
+  upsert/get/delete, vector search with the portable filter translated to
+  OData, keyword-hybrid search, and index aliases. `build_index()` and
+  `prepare_filter()` are public so a caller driving the REST API themselves
+  can reuse either. An operator Azure cannot express is refused with the
+  alternative named, never silently dropped.
+
+- **Bounds on the function-invocation loop**:
+  `FunctionInvocationConfig::max_function_calls` caps total tool executions
+  per request and `max_duration_seconds` caps elapsed wall time, both
+  cumulative across approval round trips (the budget is parked in the session)
+  and both graceful — tools are disabled and the model answers with what it
+  has. `AgentBuilder::function_invocation_config` reaches the whole config
+  from an agent for the first time, `max_iterations` included.
+
+- `agent_framework_core::storage_keys::storage_key_segment`, the derivation
+  behind the Redis key fix below.
+
+- `agent_framework_azure::DEFAULT_CHAT_API_VERSION` /
+  `DEFAULT_EMBEDDING_API_VERSION`, both public.
+
+### Fixed
+
+- **MCP HTTP headers leaked across a redirect.** Headers attached to an
+  `McpStreamableHttpTool` went onto a client that follows redirects and strips
+  only `Authorization`, `Cookie` and `Proxy-Authorization` on a cross-*host*
+  hop — so an `X-Api-Key` reached whatever host the server redirected to, and
+  even `Authorization` survived a redirect to a different port or scheme. The
+  `Mcp-Session-Id` was both sent to and adopted from a redirect target. The
+  transport now follows redirects itself, scoped to scheme/host/port, and
+  preserves the POST method and body across every hop.
+
+- **Anthropic extended-thinking signatures were dropped**, on both the
+  buffered and streaming paths, and `redacted_thinking` blocks vanished
+  entirely. With extended thinking enabled the Messages API requires a
+  replayed thinking block to carry its signature, so a conversation that used
+  it could not be continued — the tool-result turn was rejected. Signatures
+  now ride in `protected_data`, and a decoded block is replayed verbatim
+  (the signature covers the exact text).
+
+- **The workflow graph signature was not injective.** Executor ids were joined
+  with `,` and `->`, so a fan-out to `["x", "y"]` and one to `"x,y"` signed
+  identically and a checkpoint from either was accepted for the other. Now
+  JSON-encoded; the scheme tag is `v2`, and a `v1` checkpoint is reported as a
+  scheme mismatch rather than as a graph change.
+
+- **Redis keys were ambiguous.** `{key_prefix}:{session_id}` addressed one
+  list for `("chat", "a:b")` and `("chat:a", "b")`, so two conversations that
+  should be isolated shared a history — one tenant reading another's, where
+  the prefix is the tenant boundary. The context provider had a second
+  variant: a prefix containing `:entry:` put one provider's entries inside
+  another's `SCAN MATCH`, which `clear()` would then delete.
+
+- **`SecretString` serialized its secret in cleartext.** The derive is
+  removed rather than masked, because a masked `Serialize` round-trips the
+  mask back as the value.
+
+- The wall-clock tool-loop budget is re-checked **after** each model call, not
+  only before it: a provider response slower than the remaining budget that
+  came back asking for tools had its whole batch executed on a budget that
+  expired while the model was thinking.
+
+- A `max_duration_seconds` a `Duration` cannot hold (`f64::INFINITY`, or
+  anything past ~5.8e18 seconds) is refused by `validate` instead of reaching
+  `Duration::from_secs_f64`, which **panics** on those — a configuration value
+  could take the process down.
+
+- `AzureAISearchCollection::upsert` sends `upload` rather than `mergeOrUpload`:
+  the trait contract is insert-or-*replace*, and merge semantics kept a field
+  the new record omitted, so a cleared field stayed live in filters and search
+  results.
+
+- `McpStreamableHttpTransport::close` sends its teardown `DELETE` through the
+  same scoped-redirect path as every other request. With redirects no longer
+  followed by `reqwest`, a bare send read a same-origin 3xx as a delivered
+  teardown and left the server session open.
+
+- `AzureAISearchCollection` sent the **SDK's** vector-field property names
+  (`vectorSearchDimensions` / `vectorSearchProfileName`) where the REST index
+  schema defines `dimensions` / `vectorSearchProfile`. Creating a vector index
+  would have been rejected by a real Search service; every SDK serializes to
+  the REST names, and this client speaks REST directly.
+
+- `FilterExpression::matches` no longer panics on an expression that never
+  passed through a constructor — `Deserialize` bypasses them, and an empty
+  `not` group or a one-bound `between` indexed out of range. Both now report
+  the malformed filter as the error the signature already promised.
+
+- The Anthropic converter replayed a raw `thinking` block even when it carried
+  no `signature`, contradicting the unsigned-block rule beside it. A raw block
+  is replayed verbatim only when signed (`redacted_thinking`, which has no
+  signature by construction, still is); otherwise the signed rebuild applies.
+
+- A parked tool-loop budget no longer survives a failed run. If a run resumed
+  from an approval hit a provider error, the parked clock outlived it and the
+  next, unrelated run on that session resumed it — possibly already spent.
+
+- An abandoned approval no longer spends the next run's budget. The parked
+  state is restored only when the request actually carries the approval
+  responses it was parked for; a caller who walks away from a pending approval
+  and starts an unrelated request on the same session was inheriting that
+  run's elapsed clock, and could find the new request's tools disabled before
+  it made a single call.
+
+- `max_function_calls` charges only calls that reached a tool. A hallucinated
+  tool name or unparseable arguments produce a result without the executor or
+  the middleware ever running, and charging those let one bad name from the
+  model spend a budget of one — forcing the tools-off failsafe before the
+  model could correct itself. `InvocationBudget::record` documented this
+  behaviour; the two call sites did not implement it.
+
+- `FilterExpression::matches` requires an operand for `eq` and `ne`, as it
+  already did for every other value-taking operator and as `validate` says.
+  Defaulting an absent one to null turned a malformed `eq` into a working
+  null-matching predicate.
+
+- `FilterExpression::matches` rejects an empty group for every operator, not
+  just `not`. An empty `and` is vacuously true, so a malformed predicate that
+  never went through `validate` silently became match-all.
+
+- `storage_key_segment` marks an encoded segment in every build. The `~` that
+  keeps encoded and literal segments in separate namespaces was enforced by a
+  `debug_assert!`, which is compiled out of release — where an unmarked prefix
+  turns `encode("A")` into `41` and collides with the literal id `41`.
+
+- A budget that expires mid-response keeps what the provider already resolved,
+  and hands it to the final model call. A hosted tool the provider ran itself
+  returns its call *and* result in that response; dropping the whole thing left
+  the tools-off failsafe answering without the lookup it had just paid for.
+  Only the unresolved local calls are stripped, and the rest goes into the
+  conversation the failsafe sends (or, for a service-managed client, the
+  conversation id that already holds it) rather than only into the returned
+  transcript.
+
+- The RediSearch index watches the namespace entries are actually written
+  under. With a key prefix that the storage-key encoding touches, `FT.CREATE`
+  was given the raw prefix while entries were written under the encoded one,
+  so every write succeeded and every search came back empty.
+
+- Azure AI Search indexing batches are bounded by serialized payload size as
+  well as action count. The 1,000-action limit is not the binding one for
+  vector data — a 1536-dimension embedding serializes to roughly 18 KB, so a
+  full batch is ~18 MB and the service answers 413 rather than upserting.
+
+- Filter comparisons routed both operands through `f64`, which rounds past
+  2^53 — `9007199254740992` and `9007199254740993` compared equal, so `eq`,
+  `ne`, membership and the ordered operators could match or order the wrong
+  record on large integer ids. Integers now compare as integers; `f64` is used
+  only when both operands are non-integral. A mixed integer/float comparison
+  is exact in the other direction: a finite float's integer part converts to
+  `i128` without loss and its fraction breaks the tie, so a large integer no
+  longer equals a nearby float either.
+
+- Streamed reasoning fragments no longer merge across provider block
+  boundaries. A message with two Anthropic thinking blocks coalesced into one,
+  concatenating the text under the later signature — which then signed neither
+  — and losing a block, so the replayed turn was rejected. A signature, or a
+  raw provider item already on the accumulator, now closes a block.
+
+- Azure AI Search index and alias names are percent-encoded into the path. A
+  name containing `?`, `#` or `/` previously changed the shape of the request
+  — the first of those detaches `api-version`.
+
+- The `SecretString` module docs still claimed it serializes to the real
+  value, which stopped being true when the `Serialize` impl was removed.
+
+- **The Azure chat api-version was pinned to GA `2024-10-21`**, which rejects
+  request fields this client sends (`store` first among them) with
+  "Unrecognized request argument supplied". Now `2024-12-01-preview` for chat,
+  matching upstream, with embeddings left on GA as upstream also has it.
+
+### Changed
+
+- `VectorSearchResult` gains `score_kind` and `higher_is_closer(..)`. A
+  collection's distance function is a *request*, and on several services it
+  does not describe what comes back: Azure AI Search returns a
+  higher-is-better relevance score whatever metric the profile declares, and a
+  reciprocal-rank-fusion score for a hybrid query. A caller reading direction
+  from `DistanceFunction::higher_is_closer` — false for the distance metrics,
+  which are the usual declaration — would have ranked every result backwards.
+  `InMemoryVectorStore` leaves it `None`, meaning the declared function does
+  describe the score. Mirrors upstream's `score_kind` result metadata.
+
+- `VectorStoreCollectionDefinition` gains `try_get_field` and
+  `storage_name_for`.
+- `AzureAISearchStore::collection` returns the concrete collection type, for
+  the surfaces (`search_hybrid`, `build_index`) the object-safe
+  `VectorCollection` trait cannot declare.
+
+
 ## [0.6.0] — 2026-09-09
 
 Provider refusals handled properly end to end, Entra ID authentication for

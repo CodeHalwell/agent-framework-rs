@@ -563,6 +563,22 @@ fn parse_stream_event(
                     annotations: None,
                     ..Default::default()
                 }),
+                // The signature arrives *after* the thinking text it signs,
+                // in its own delta. Carried as an empty-text reasoning
+                // fragment so `coalesce_text` folds it onto the thinking
+                // block it belongs to — the same merge that already carries a
+                // Gemini thought signature across fragments. Without this the
+                // signature is dropped, and a replayed assistant turn is then
+                // rejected by the Messages API whenever extended thinking is
+                // on (an unsigned thinking block is not accepted).
+                "signature_delta" => Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    protected_data: delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    ..Default::default()
+                }),
                 "input_json_delta" => {
                     let call_id = tool_use_ids.get(&index).cloned().unwrap_or_default();
                     let partial = delta
@@ -741,6 +757,170 @@ mod tests {
                 "model_context_window_exceeded"
             ))
         );
+    }
+
+    /// A streamed thinking block is signed by a `signature_delta` that
+    /// arrives *after* the text it signs. Dropping it (which this port did)
+    /// leaves the block unsigned, and the Messages API rejects an unsigned
+    /// thinking block in a replayed assistant turn whenever extended thinking
+    /// is on — so a streamed reasoning turn could not be continued at all.
+    #[tokio::test]
+    async fn stream_attaches_a_signature_delta_to_its_thinking_block() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-x", "usage": { "input_tokens": 1, "output_tokens": 1 } }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "first " }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "second" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "signature_delta", "signature": "c2lnbmF0dXJl" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        ));
+
+        let resp = ChatResponse::from_updates(collect_updates(text).await);
+        let reasoning: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                agent_framework_core::types::Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1, "fragments coalesce into one block");
+        assert_eq!(reasoning[0].text, "first second");
+        assert_eq!(
+            reasoning[0].protected_data.as_deref(),
+            Some("c2lnbmF0dXJl"),
+            "the signature must land on the block it signs"
+        );
+    }
+
+    /// A message can carry more than one thinking block — interleaved
+    /// thinking puts one on each side of a tool call, and a redacted block
+    /// can sit beside a regular one. Each is signed separately over its own
+    /// text, so coalescing them into one block produces text that no
+    /// signature covers and drops a block outright; the replayed turn is then
+    /// rejected.
+    #[tokio::test]
+    async fn stream_keeps_two_thinking_blocks_apart() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-x", "usage": { "input_tokens": 1, "output_tokens": 1 } }
+            }),
+        ));
+        for (index, (body, signature)) in [("first", "c2lnMA"), ("second", "c2lnMQ")]
+            .into_iter()
+            .enumerate()
+        {
+            text.push_str(&sse_frame(
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            ));
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": { "type": "thinking_delta", "thinking": body }
+                }),
+            ));
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": { "type": "signature_delta", "signature": signature }
+                }),
+            ));
+        }
+        text.push_str(&sse_frame(
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        ));
+
+        let resp = ChatResponse::from_updates(collect_updates(text).await);
+        let reasoning: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                agent_framework_core::types::Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 2, "two blocks, not one merged one");
+        assert_eq!(reasoning[0].text, "first");
+        assert_eq!(reasoning[0].protected_data.as_deref(), Some("c2lnMA"));
+        assert_eq!(reasoning[1].text, "second");
+        assert_eq!(reasoning[1].protected_data.as_deref(), Some("c2lnMQ"));
+
+        // …and, the surface that actually decides whether the next turn is
+        // accepted: what goes back on the wire. Asserting only on the
+        // coalesced response leaves the replay untested, and the replay is
+        // where the signatures have to line up with their text — a merge that
+        // survived this far would produce one block signed by neither.
+        let replayed = convert::messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                resp.messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter().cloned())
+                    .collect(),
+            ),
+        ]);
+        let blocks: Vec<&Value> = replayed[1]["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "two thinking blocks on the wire: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["thinking"], "first");
+        assert_eq!(blocks[0]["signature"], "c2lnMA");
+        assert_eq!(blocks[1]["thinking"], "second");
+        assert_eq!(blocks[1]["signature"], "c2lnMQ");
     }
 
     #[tokio::test]

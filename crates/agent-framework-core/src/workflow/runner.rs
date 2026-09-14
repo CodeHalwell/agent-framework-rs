@@ -46,8 +46,20 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// only their *kind* — whether a condition/selection is present, plus any
 /// declared switch-case labels — never their behavior. Target and source lists
 /// are sorted so the descriptor is independent of declaration order.
+///
+/// **JSON-encoded, not string-joined.** Executor ids are only required to be
+/// non-empty, so a descriptor built by joining them with `,` and `->` is not
+/// injective: a fan-in from sources `["a", "b"]` and one from the single
+/// source `["a,b"]` render identically, as do `["x->t", "y"]` and
+/// `["x", "t,y"]` into the right target. Two different graphs would then hash
+/// to one signature, and a checkpoint taken against either would be accepted
+/// for the other — resuming a run onto a topology it was never written for,
+/// which is the precise failure the signature exists to prevent. Upstream hit
+/// the same collision in its edge-state keys (#7948) and fixed it the same
+/// way. JSON quotes and escapes each id, so no id can impersonate a
+/// separator.
 fn edge_group_descriptor(group: &EdgeGroup) -> String {
-    match group {
+    let value = match group {
         EdgeGroup::Single {
             source,
             target,
@@ -58,7 +70,7 @@ fn edge_group_descriptor(group: &EdgeGroup) -> String {
             } else {
                 "plain"
             };
-            format!("single:{source}->{target}:{kind}")
+            serde_json::json!(["single", source, target, kind])
         }
         EdgeGroup::FanOut {
             source,
@@ -73,25 +85,22 @@ fn edge_group_descriptor(group: &EdgeGroup) -> String {
             } else {
                 "broadcast"
             };
-            let labels = case_labels
-                .as_ref()
-                .map(|labels| {
-                    let mut labels = labels.clone();
-                    labels.sort_unstable();
-                    labels.join(",")
-                })
-                .unwrap_or_default();
-            format!(
-                "fanout:{source}->[{}]:{kind}:labels=[{labels}]",
-                targets.join(",")
-            )
+            let labels = case_labels.as_ref().map(|labels| {
+                let mut labels = labels.clone();
+                labels.sort_unstable();
+                labels
+            });
+            serde_json::json!(["fanout", source, targets, kind, labels])
         }
         EdgeGroup::FanIn { sources, target } => {
             let mut sources = sources.clone();
             sources.sort_unstable();
-            format!("fanin:[{}]->{target}", sources.join(","))
+            serde_json::json!(["fanin", sources, target])
         }
-    }
+    };
+    // Arrays and strings only, so serialization cannot fail on a map whose
+    // key order varies.
+    value.to_string()
 }
 
 /// Compute a deterministic signature of a built workflow's graph.
@@ -105,6 +114,15 @@ fn edge_group_descriptor(group: &EdgeGroup) -> String {
 /// changing only a predicate's *body* (same presence, same labels) does not
 /// change the signature — documented, and acceptable for a
 /// resume-compatibility guard.
+/// The signature scheme's version tag.
+///
+/// Bumped from `v1` when the canonical rendering became JSON: every signature
+/// changes, so a checkpoint written by an earlier version cannot match. The
+/// tag is what lets [`WorkflowRun::check_graph_signature`] say *that* rather
+/// than reporting it as a graph change, which is what the mismatch message
+/// would otherwise claim — and would be wrong about.
+const SIGNATURE_SCHEME: &str = "v2";
+
 pub(crate) fn compute_graph_signature(
     executors: &HashMap<String, Arc<dyn Executor>>,
     edge_groups: &[EdgeGroup],
@@ -116,18 +134,20 @@ pub(crate) fn compute_graph_signature(
     let mut edges: Vec<String> = edge_groups.iter().map(edge_group_descriptor).collect();
     edges.sort_unstable();
 
-    let mut canonical = String::new();
-    canonical.push_str("start=");
-    canonical.push_str(start);
-    canonical.push_str("\nnodes=");
-    canonical.push_str(&ids.join(","));
-    canonical.push_str("\nedges=");
-    for edge in &edges {
-        canonical.push('\n');
-        canonical.push_str(edge);
-    }
+    // JSON throughout, for the reason `edge_group_descriptor` documents: an
+    // executor id may contain whatever a caller put in it, including the
+    // separators a joined rendering relies on. Node ids joined with `,` had
+    // the same collision as the edge descriptors — `{"a", "b"}` and `{"a,b"}`
+    // render identically — so both are encoded rather than only the half
+    // upstream's own fix touched.
+    let canonical = serde_json::json!({
+        "start": start,
+        "nodes": ids,
+        "edges": edges,
+    })
+    .to_string();
 
-    format!("v1-{:016x}", fnv1a_64(canonical.as_bytes()))
+    format!("{SIGNATURE_SCHEME}-{:016x}", fnv1a_64(canonical.as_bytes()))
 }
 
 /// Immutable, shared definition of a built workflow graph. Held behind an `Arc`
@@ -566,7 +586,22 @@ impl Workflow {
         if &cp.graph_signature == expected {
             return Ok(());
         }
+        // A checkpoint from an older signature *scheme* has not necessarily
+        // been written for a different graph — the encoding changed under it.
+        // Saying "your graph changed" there sends the reader looking for a
+        // change that is not in their code.
+        let scheme_prefix = format!("{SIGNATURE_SCHEME}-");
         if validate {
+            if !cp.graph_signature.starts_with(&scheme_prefix) {
+                return Err(Error::Workflow(format!(
+                    "checkpoint graph signature scheme mismatch: checkpoint '{}' carries \
+                     signature '{}', written by an older version of this library whose signature \
+                     encoding differed, so it cannot be compared against this workflow's '{}'. \
+                     The graph itself may well be identical. Finish the run on the version that \
+                     wrote it, or call `run_from_checkpoint_unchecked` to resume it here.",
+                    cp.checkpoint_id, cp.graph_signature, expected
+                )));
+            }
             return Err(Error::Workflow(format!(
                 "checkpoint graph signature mismatch: checkpoint '{}' was saved for graph \
                  signature '{}', but this workflow's graph signature is '{}'. The workflow's \

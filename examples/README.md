@@ -180,6 +180,7 @@ Azure AI Search.
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
+| `azure_ai_search_vector_store` | Azure AI Search as a vector store: create the index, upsert records, portable-filtered vector search, keyword-hybrid search | `AZURE_SEARCH_*` (admin key), `OPENAI_API_KEY` (skips gracefully) |
 
 ## Observability (`observability/`)
 
