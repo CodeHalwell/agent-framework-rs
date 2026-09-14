@@ -16,7 +16,7 @@
 //! (`azure/_responses_client.py:99-146`), which:
 //! * forces `default_api_version="preview"` when building its settings
 //!   (`_responses_client.py:112`) — distinct from every other Azure OpenAI
-//!   client's `"2024-10-21"` default (`azure/_shared.py:28`,
+//!   client's dated default (`DEFAULT_AZURE_OPENAI_CHAT_COMPLETION_API_VERSION`,
 //!   [`crate::AzureOpenAIClient`]'s own default);
 //! * auto-derives `base_url = urljoin(endpoint, "/openai/v1/")` for standard
 //!   `*.openai.azure.com` endpoints when no explicit `base_url` is given
@@ -96,7 +96,8 @@ use crate::{Auth, TokenCredential};
 /// v1-surface identifier upstream forces today
 /// (`azure/_responses_client.py:112`, `default_api_version="preview"`),
 /// distinct from [`AzureOpenAIClient`](crate::AzureOpenAIClient)'s Chat
-/// Completions default (`"2024-10-21"`, `azure/_shared.py:28`). Overridable
+/// Completions default ([`crate::DEFAULT_CHAT_API_VERSION`]'s value).
+/// Overridable
 /// via [`with_api_version`](AzureOpenAIResponsesClient::with_api_version) or
 /// `AZURE_OPENAI_API_VERSION`.
 const DEFAULT_API_VERSION: &str = "preview";

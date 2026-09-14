@@ -92,7 +92,24 @@ use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
-pub(crate) const DEFAULT_API_VERSION: &str = "2024-10-21";
+/// The `api-version` the chat-completions client sends when the caller sets
+/// none.
+///
+/// Matches upstream's `DEFAULT_AZURE_OPENAI_CHAT_COMPLETION_API_VERSION`.
+/// This is a *preview* version deliberately: the last GA one (`2024-10-21`)
+/// rejects request fields this framework sends — `store` is the one that
+/// bites first, answered with "Unrecognized request argument supplied" rather
+/// than ignored — so pinning GA quietly narrows what the client can express.
+/// Override with `AZURE_OPENAI_API_VERSION` or `with_api_version` to pin a
+/// version your deployment has been validated against.
+pub const DEFAULT_CHAT_API_VERSION: &str = "2024-12-01-preview";
+
+/// The `api-version` the embeddings client sends when the caller sets none.
+///
+/// Matches upstream's `DEFAULT_AZURE_OPENAI_EMBEDDING_API_VERSION`. The
+/// embeddings surface has not moved past GA, so unlike the chat one this
+/// stays on `2024-10-21`.
+pub const DEFAULT_EMBEDDING_API_VERSION: &str = "2024-10-21";
 
 /// Parse a `Retry-After` header into a delay in seconds.
 ///
@@ -172,7 +189,7 @@ impl AzureOpenAIClient {
                 http: reqwest::Client::new(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: DEFAULT_CHAT_API_VERSION.to_string(),
                 auth: Auth::ApiKey(api_key.into()),
             }),
         }
@@ -190,7 +207,7 @@ impl AzureOpenAIClient {
                 http: reqwest::Client::new(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: DEFAULT_CHAT_API_VERSION.to_string(),
                 auth: Auth::Credential(credential),
             }),
         }
@@ -214,7 +231,7 @@ impl AzureOpenAIClient {
         Ok(client)
     }
 
-    /// Override the API version (default `"2024-10-21"`).
+    /// Override the API version (default [`DEFAULT_CHAT_API_VERSION`]).
     pub fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.inner).api_version = api_version.into();
         self
@@ -360,8 +377,20 @@ mod tests {
         let c = client();
         assert_eq!(
             c.url(),
-            "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+            "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions\
+             ?api-version=2024-12-01-preview"
         );
+    }
+
+    #[test]
+    fn the_default_api_versions_match_upstreams_per_surface() {
+        // Not one constant for both: upstream's chat surface is on a preview
+        // version because the last GA one rejects fields this framework sends
+        // (`store` first among them), while its embeddings surface is still
+        // GA. Collapsing them onto one value silently breaks whichever it is
+        // wrong for.
+        assert_eq!(DEFAULT_CHAT_API_VERSION, "2024-12-01-preview");
+        assert_eq!(DEFAULT_EMBEDDING_API_VERSION, "2024-10-21");
     }
 
     #[test]
@@ -538,7 +567,7 @@ mod tests {
             std::env::remove_var("AZURE_OPENAI_API_VERSION");
         }
         let client = AzureOpenAIClient::from_env().unwrap();
-        assert_eq!(client.inner.api_version, DEFAULT_API_VERSION);
+        assert_eq!(client.inner.api_version, DEFAULT_CHAT_API_VERSION);
         unsafe {
             std::env::remove_var("AZURE_OPENAI_ENDPOINT");
             std::env::remove_var("AZURE_OPENAI_API_KEY");
