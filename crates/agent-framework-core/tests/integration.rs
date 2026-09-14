@@ -3855,6 +3855,24 @@ async fn a_spent_budget_keeps_what_the_provider_already_resolved() {
 
     assert_eq!(*counter.lock().unwrap(), 0, "the local call must not run");
 
+    // The messages the *final* model call actually received. Asserting on the
+    // returned transcript alone is not enough: the transcript is assembled
+    // from `carried`, so a fix that preserved the result only there would
+    // pass this test while still asking the model to answer without it.
+    let final_call = inner.all_seen().last().cloned().expect("a failsafe call");
+    let sent: Vec<&Content> = final_call.iter().flat_map(|m| m.contents.iter()).collect();
+    assert!(
+        sent.iter()
+            .any(|c| matches!(c, Content::FunctionResult(r) if r.call_id == "hosted_1")),
+        "the model composing the answer must see the hosted result: {sent:?}"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|c| matches!(c, Content::FunctionCall(f) if f.call_id == "call_local")),
+        "and must not see a call that will never be answered: {sent:?}"
+    );
+
     let all: Vec<&Content> = response
         .messages
         .iter()

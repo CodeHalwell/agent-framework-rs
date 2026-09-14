@@ -160,11 +160,14 @@ works.
   `debug_assert!`, which is compiled out of release — where an unmarked prefix
   turns `encode("A")` into `41` and collides with the literal id `41`.
 
-- A budget that expires mid-response keeps what the provider already resolved.
-  A hosted tool the provider ran itself returns its call *and* result in that
-  response; dropping the whole thing left the tools-off failsafe answering
-  without the lookup it had just paid for. Only the unresolved local calls are
-  stripped now.
+- A budget that expires mid-response keeps what the provider already resolved,
+  and hands it to the final model call. A hosted tool the provider ran itself
+  returns its call *and* result in that response; dropping the whole thing left
+  the tools-off failsafe answering without the lookup it had just paid for.
+  Only the unresolved local calls are stripped, and the rest goes into the
+  conversation the failsafe sends (or, for a service-managed client, the
+  conversation id that already holds it) rather than only into the returned
+  transcript.
 
 - The RediSearch index watches the namespace entries are actually written
   under. With a key prefix that the storage-key encoding touches, `FT.CREATE`

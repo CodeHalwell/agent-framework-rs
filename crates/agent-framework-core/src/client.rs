@@ -966,6 +966,24 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     // A message left with nothing in it would be an empty turn
                     // in the conversation, which some providers reject.
                     kept.messages.retain(|m| !m.contents.is_empty());
+                    // Into the *conversation* as well as the transcript,
+                    // mirroring what the normal path does with a response it
+                    // keeps. `carried` is only what the caller gets back;
+                    // the failsafe's model call reads `conversation`, so
+                    // extending `carried` alone would preserve the hosted
+                    // result in the returned messages while still asking the
+                    // model to answer without it — the exact outcome this is
+                    // supposed to prevent.
+                    match kept.conversation_id.clone() {
+                        // Service-managed: the provider already holds this
+                        // response in its own stored history, so forwarding
+                        // the id is what makes the result visible to the
+                        // failsafe. Re-sending the messages would duplicate
+                        // it.
+                        Some(cid) => options.conversation_id = Some(cid),
+                        // Stateless: the model sees only what we send.
+                        None => conversation.extend(kept.messages.iter().cloned()),
+                    }
                     carried.extend(kept.messages);
                     options.tool_choice = Some(ToolMode::None);
                     break;
