@@ -151,12 +151,19 @@ works.
   run's elapsed clock, and could find the new request's tools disabled before
   it made a single call.
 
+- Azure AI Search indexing batches are bounded by serialized payload size as
+  well as action count. The 1,000-action limit is not the binding one for
+  vector data — a 1536-dimension embedding serializes to roughly 18 KB, so a
+  full batch is ~18 MB and the service answers 413 rather than upserting.
+
 - Filter comparisons routed both operands through `f64`, which rounds past
   2^53 — `9007199254740992` and `9007199254740993` compared equal, so `eq`,
   `ne`, membership and the ordered operators could match or order the wrong
   record on large integer ids. Integers now compare as integers; `f64` is used
-  only when an operand is genuinely non-integral, which is the case the
-  conversion existed for.
+  only when both operands are non-integral. A mixed integer/float comparison
+  is exact in the other direction: a finite float's integer part converts to
+  `i128` without loss and its fraction breaks the tie, so a large integer no
+  longer equals a nearby float either.
 
 - Streamed reasoning fragments no longer merge across provider block
   boundaries. A message with two Anthropic thinking blocks coalesced into one,

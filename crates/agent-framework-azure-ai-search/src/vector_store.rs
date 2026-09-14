@@ -56,6 +56,15 @@ const MAX_RESULT_WINDOW: usize = 10_000;
 /// indexing batch. Upserts and deletes are chunked to this.
 const MAX_BATCH_ACTIONS: usize = 1_000;
 
+/// The payload budget for one indexing batch, under the service's 16 MB
+/// limit with room for the envelope and the HTTP framing.
+///
+/// The action count is not the binding constraint for vector data: a 1536-
+/// dimension embedding serializes to roughly 18 KB, so a batch hits 16 MB at
+/// around 900 documents — inside the 1,000-action limit, and answered with a
+/// 413 rather than an upsert.
+const MAX_BATCH_BYTES: usize = 14 * 1024 * 1024;
+
 /// A connection to an Azure AI Search service.
 ///
 /// Hands out [`AzureAISearchCollection`]s (one per index) and manages the
@@ -810,10 +819,40 @@ impl AzureAISearchCollection {
             .await
     }
 
+    /// Split `actions` into batches the service will accept: at most
+    /// [`MAX_BATCH_ACTIONS`] documents *and* at most [`MAX_BATCH_BYTES`] of
+    /// serialized payload.
+    ///
+    /// A single document larger than the byte budget is sent on its own
+    /// rather than dropped or split: the service's own error names the
+    /// document, which is more use than anything this could invent.
+    fn batch_actions(actions: Vec<Value>) -> Vec<Vec<Value>> {
+        let mut batches: Vec<Vec<Value>> = Vec::new();
+        let mut current: Vec<Value> = Vec::new();
+        let mut current_bytes = 0usize;
+        for action in actions {
+            // The serialized length of this action, plus a byte for the comma
+            // that joins it to the previous one.
+            let size = action.to_string().len() + 1;
+            let full = current.len() >= MAX_BATCH_ACTIONS
+                || (!current.is_empty() && current_bytes + size > MAX_BATCH_BYTES);
+            if full {
+                batches.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes += size;
+            current.push(action);
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+        batches
+    }
+
     /// Post an indexing batch, chunked to what the service accepts, and fail
     /// on any per-document error the batch reports.
     async fn index_documents(&self, actions: Vec<Value>) -> Result<()> {
-        for chunk in actions.chunks(MAX_BATCH_ACTIONS) {
+        for chunk in Self::batch_actions(actions) {
             let resp = self
                 .store
                 .send(
@@ -1684,5 +1723,51 @@ mod tests {
             store.url("indexes?$select=name"),
             "https://s.search.windows.net/indexes?$select=name&api-version=2024-07-01"
         );
+    }
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+
+    fn action(bytes: usize) -> Value {
+        json!({ "@search.action": "upload", "id": "x", "text": "y".repeat(bytes) })
+    }
+
+    #[test]
+    fn a_batch_is_bounded_by_payload_size_as_well_as_count() {
+        // The action count is not the binding constraint for vector data: a
+        // 1536-dimension embedding serializes to roughly 18 KB, so 1,000 of
+        // them is ~18 MB — inside the action limit and past the service's
+        // payload limit, which answers 413 rather than upserting.
+        let big = 1024 * 1024; // ~1 MiB each
+        let batches =
+            AzureAISearchCollection::batch_actions((0..20).map(|_| action(big)).collect());
+        assert!(batches.len() > 1, "20 MiB must not go out as one request");
+        for batch in &batches {
+            let bytes: usize = batch.iter().map(|a| a.to_string().len() + 1).sum();
+            assert!(bytes <= MAX_BATCH_BYTES, "{bytes} over budget");
+            assert!(batch.len() <= MAX_BATCH_ACTIONS);
+        }
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 20);
+    }
+
+    #[test]
+    fn the_action_count_still_bounds_small_documents() {
+        let batches =
+            AzureAISearchCollection::batch_actions((0..2_500).map(|_| action(1)).collect());
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), MAX_BATCH_ACTIONS);
+        assert_eq!(batches[2].len(), 500);
+    }
+
+    #[test]
+    fn one_oversized_document_is_sent_alone() {
+        // Splitting it is not this layer's call, and dropping it would lose a
+        // write silently; the service's own error names the document.
+        let actions = vec![action(1), action(MAX_BATCH_BYTES + 1024), action(1)];
+        let batches = AzureAISearchCollection::batch_actions(actions);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[1].len(), 1);
     }
 }

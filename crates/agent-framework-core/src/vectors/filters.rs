@@ -881,40 +881,74 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 /// non-integral, which is the case that needed the cross-type comparison in
 /// the first place.
 fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return x == y;
+    compare_numbers(a, b) == Some(std::cmp::Ordering::Equal)
+}
+
+/// The integer value of a JSON number, when it has one.
+///
+/// `i128` so that both `i64` and `u64` fit without a lossy step.
+fn as_integer(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+/// Order an integer against a float **exactly**.
+///
+/// Converting the integer to `f64` — the obvious way — rounds it past 2^53,
+/// so `9007199254740993` would compare equal to the distinct float
+/// `9007199254740992.0`. Comparing in the other direction instead is exact:
+/// a finite float's integer part converts to `i128` without loss, and its
+/// fraction then breaks the tie.
+fn compare_integer_to_float(integer: i128, float: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if float.is_nan() {
+        return None;
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
-        return x == y;
+    // Outside `i128`'s range (infinities included) the float decides the
+    // comparison on its own: no integer this function can receive reaches
+    // that far.
+    const I128_MAX_AS_F64: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if float >= I128_MAX_AS_F64 {
+        return Some(Ordering::Less);
     }
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
-        // A number no `f64` can hold (an arbitrary-precision literal) keeps
-        // its exact comparison rather than being coerced into a lossy one.
-        _ => a == b,
+    if float < -I128_MAX_AS_F64 {
+        return Some(Ordering::Greater);
     }
+    let truncated = float.trunc();
+    Some(match integer.cmp(&(truncated as i128)) {
+        // Same integer part, so the fraction decides: `3` is less than `3.5`
+        // and greater than `3.0` only if that fraction is non-zero.
+        Ordering::Equal => match (float - truncated).partial_cmp(&0.0)? {
+            Ordering::Greater => Ordering::Less,
+            Ordering::Less => Ordering::Greater,
+            Ordering::Equal => Ordering::Equal,
+        },
+        other => other,
+    })
 }
 
 /// Order two JSON numbers by value, with the same exact-integer rule as
 /// [`numbers_equal`]: `gt`/`lt`/`between` on large integers must not be
 /// decided by a rounded `f64`.
 fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
-    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-        return Some(x.cmp(&y));
+    match (as_integer(a), as_integer(b)) {
+        // Both integers, including a negative `i64` against a `u64` past
+        // `i64::MAX`: `i128` holds both, so one comparison covers it.
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => compare_integer_to_float(x, b.as_f64()?),
+        (None, Some(y)) => {
+            compare_integer_to_float(y, a.as_f64()?).map(std::cmp::Ordering::reverse)
+        }
+        // Two floats, or a number no `f64` can hold (an arbitrary-precision
+        // literal), which keeps its exact representational comparison rather
+        // than being coerced into a lossy one.
+        (None, None) => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            _ if a == b => Some(std::cmp::Ordering::Equal),
+            _ => None,
+        },
     }
-    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
-        return Some(x.cmp(&y));
-    }
-    // One side is negative and the other past `i64::MAX`, or one is a float:
-    // a negative integer is always the smaller, and anything else falls to
-    // the float comparison.
-    if a.as_i64().is_some_and(|x| x < 0) && b.as_u64().is_some() {
-        return Some(std::cmp::Ordering::Less);
-    }
-    if b.as_i64().is_some_and(|y| y < 0) && a.as_u64().is_some() {
-        return Some(std::cmp::Ordering::Greater);
-    }
-    a.as_f64()?.partial_cmp(&b.as_f64()?)
 }
 
 /// Order two values, or `None` when they are not comparable.
@@ -1396,6 +1430,78 @@ mod numeric_precision_tests {
             Some(std::cmp::Ordering::Greater)
         );
         assert!(!values_equal(&json!(1), &json!(true)));
+    }
+
+    /// The other half of the rounding problem: one integer operand and one
+    /// float. Converting the *integer* to `f64` to compare them rounds it
+    /// just the same, so the comparison goes the other way — a finite float's
+    /// integer part is exact in `i128`, and its fraction breaks the tie.
+    #[test]
+    fn a_large_integer_does_not_equal_a_nearby_float() {
+        let integer = json!(9_007_199_254_740_993_i64);
+        let float = json!(9_007_199_254_740_992.0_f64);
+        assert_eq!(
+            integer.as_f64(),
+            float.as_f64(),
+            "the f64 round-trip really does collide"
+        );
+
+        assert!(!values_equal(&integer, &float));
+        assert_eq!(
+            compare_values(&integer, &float),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_values(&float, &integer),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    /// …and the fraction decides when the integer parts match.
+    #[test]
+    fn an_integer_orders_against_a_fractional_float() {
+        assert_eq!(
+            compare_values(&json!(3), &json!(3.5)),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&json!(3), &json!(2.5)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_values(&json!(-3), &json!(-2.5)),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&json!(3), &json!(3.0)),
+            Some(std::cmp::Ordering::Equal)
+        );
+    }
+
+    /// A float no integer can be compared against by truncation — an
+    /// infinity, a NaN, or a value past `i128` — still answers sensibly.
+    #[test]
+    fn extreme_floats_are_handled() {
+        assert_eq!(
+            compare_values(&json!(1), &json!(f64::MAX)),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&json!(1), &json!(-f64::MAX)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        // `serde_json` cannot hold a NaN or an infinity in a `Number`, so the
+        // only way one reaches the comparator is through a float operand the
+        // caller built directly — which must not panic.
+        assert!(compare_integer_to_float(1, f64::NAN).is_none());
+        assert_eq!(
+            compare_integer_to_float(1, f64::INFINITY),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_integer_to_float(1, f64::NEG_INFINITY),
+            Some(std::cmp::Ordering::Greater)
+        );
     }
 
     /// A negative `i64` against a `u64` past `i64::MAX` has no common integer
