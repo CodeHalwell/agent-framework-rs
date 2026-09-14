@@ -9,9 +9,12 @@
 //! the two reusable primitives:
 //!
 //! - [`SecretString`] — a `String` newtype whose [`Debug`]/[`Display`](std::fmt::Display) impls
-//!   mask the value so secrets never leak into logs, while still
-//!   (de)serializing to the real value and round-tripping through
-//!   `serde_json`.
+//!   mask the value so secrets never leak into logs. It deserializes from a
+//!   plain string — reading a secret in from config is what it is for — and
+//!   deliberately does **not** implement `Serialize`, so a struct holding one
+//!   cannot be JSON-encoded into a log line or a checkpoint by accident; see
+//!   the type's own docs for why a masked `Serialize` would be worse than
+//!   none.
 //! - [`load_setting`] — a single-value loader implementing the same
 //!   precedence as upstream's `load_settings`: explicit override, then a
 //!   `.env` file, then the process environment, then a default.

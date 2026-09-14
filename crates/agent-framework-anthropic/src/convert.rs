@@ -248,6 +248,17 @@ fn append_response_format_instructions(
 ///   caller synthesized; either way the API refuses it, so sending it turns
 ///   a working request into a 400. Dropping loses nothing a model can use —
 ///   thinking is not context for the next turn, the signature is.
+///
+/// The rebuild takes `protected_data` at face value, which is the one place
+/// this can still be wrong: the field is deliberately provider-opaque (Gemini
+/// puts a `thoughtSignature` in it), so a reasoning content carried in from
+/// another provider *with* a signature and *without* a raw block is rebuilt
+/// as an Anthropic thinking block and rejected by the API. Nothing in the
+/// content model records provenance — upstream's does not either — and the
+/// alternative, dropping every signed block that has no Anthropic raw form,
+/// would discard the case this path exists for. A caller moving one
+/// conversation between providers should drop reasoning content at that
+/// boundary.
 fn thinking_block(content: &TextReasoningContent) -> Option<Value> {
     if let Some(raw) = content.raw_representation.as_ref() {
         match raw.get("type").and_then(Value::as_str) {

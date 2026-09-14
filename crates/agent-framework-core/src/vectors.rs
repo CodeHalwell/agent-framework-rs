@@ -605,12 +605,57 @@ impl VectorSearchOptions {
 pub struct VectorSearchResult {
     /// The record, keyed by logical field name.
     pub record: Value,
-    /// The provider's similarity or distance score. Whether a higher value is
-    /// a closer match depends on the collection's
-    /// [`DistanceFunction::higher_is_closer`]; `None` when the provider
-    /// reports no score.
+    /// The provider's similarity or distance score, or `None` when the
+    /// provider reports none.
+    ///
+    /// Read the direction from [`Self::score_kind`] when it is set, and only
+    /// otherwise from the collection's
+    /// [`DistanceFunction::higher_is_closer`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub score: Option<f64>,
+    /// What kind of number [`Self::score`] is, when the declared distance
+    /// function does not describe it.
+    ///
+    /// The collection's distance function is a request — *rank by this* — and
+    /// on several services it does not describe what comes back. Azure AI
+    /// Search answers a vector query with a relevance score where higher is
+    /// better whatever metric the profile declares, and answers a hybrid
+    /// query with a reciprocal-rank-fusion score that is not a distance at
+    /// all. A caller thresholding or fusing on `score` under the definition's
+    /// `higher_is_closer` would invert the ranking, so the connector says
+    /// what it actually returned. Mirrors upstream's `score_kind` result
+    /// metadata.
+    ///
+    /// `None` means the score is in the collection's declared distance
+    /// function, as [`InMemoryVectorStore`] returns. The values this workspace
+    /// emits are [`Self::SCORE_KIND_RELEVANCE`] and
+    /// [`Self::SCORE_KIND_RRF`], both higher-is-closer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub score_kind: Option<String>,
+}
+
+impl VectorSearchResult {
+    /// A provider relevance score: higher is a better match, and the value is
+    /// not a distance in the declared metric.
+    pub const SCORE_KIND_RELEVANCE: &'static str = "relevance";
+    /// A reciprocal-rank-fusion score from a hybrid query: higher is a better
+    /// match, and it is a rank combination rather than any distance.
+    pub const SCORE_KIND_RRF: &'static str = "rrf";
+
+    /// Whether a higher [`Self::score`] means a closer match, given the
+    /// collection's declared distance function.
+    ///
+    /// Prefers [`Self::score_kind`] over `distance`, which is the whole point
+    /// of the field: on a service that ignores the declared metric when
+    /// scoring, the definition is the wrong thing to read. `None` when
+    /// neither answers.
+    pub fn higher_is_closer(&self, distance: Option<&DistanceFunction>) -> Option<bool> {
+        match self.score_kind.as_deref() {
+            Some(Self::SCORE_KIND_RELEVANCE) | Some(Self::SCORE_KIND_RRF) => Some(true),
+            Some(_) => None,
+            None => distance.and_then(DistanceFunction::higher_is_closer),
+        }
+    }
 }
 
 /// One collection's data plane: create/drop, read/write, and search.
@@ -998,6 +1043,10 @@ impl VectorCollection for InMemoryCollection {
                         .definition
                         .from_storage(&record, options.include_vectors)?,
                     score: Some(score),
+                    // This store scores with the collection's own distance
+                    // function, so the definition describes the number and
+                    // there is nothing to override.
+                    score_kind: None,
                 })
             })
             .collect()

@@ -827,6 +827,71 @@ mod tests {
         );
     }
 
+    /// A message can carry more than one thinking block — interleaved
+    /// thinking puts one on each side of a tool call, and a redacted block
+    /// can sit beside a regular one. Each is signed separately over its own
+    /// text, so coalescing them into one block produces text that no
+    /// signature covers and drops a block outright; the replayed turn is then
+    /// rejected.
+    #[tokio::test]
+    async fn stream_keeps_two_thinking_blocks_apart() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-x", "usage": { "input_tokens": 1, "output_tokens": 1 } }
+            }),
+        ));
+        for (index, (body, signature)) in [("first", "c2lnMA"), ("second", "c2lnMQ")]
+            .into_iter()
+            .enumerate()
+        {
+            text.push_str(&sse_frame(
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            ));
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": { "type": "thinking_delta", "thinking": body }
+                }),
+            ));
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": { "type": "signature_delta", "signature": signature }
+                }),
+            ));
+        }
+        text.push_str(&sse_frame(
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        ));
+
+        let resp = ChatResponse::from_updates(collect_updates(text).await);
+        let reasoning: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                agent_framework_core::types::Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 2, "two blocks, not one merged one");
+        assert_eq!(reasoning[0].text, "first");
+        assert_eq!(reasoning[0].protected_data.as_deref(), Some("c2lnMA"));
+        assert_eq!(reasoning[1].text, "second");
+        assert_eq!(reasoning[1].protected_data.as_deref(), Some("c2lnMQ"));
+    }
+
     #[tokio::test]
     async fn stream_usage_is_not_double_counted_when_deltas_repeat_input_tokens() {
         // Anthropic streams *cumulative* usage: `message_delta` repeats the

@@ -619,6 +619,16 @@ impl AzureAISearchCollection {
                 } else {
                     // `ne null` keeps a missing field out of the negation:
                     // without it every record lacking the field would match.
+                    //
+                    // It also excludes a field that is *explicitly* null,
+                    // where the portable evaluator matches — the field is
+                    // present, and null is in no list of values. That
+                    // divergence cannot be closed here: an Azure index has a
+                    // fixed schema in which every declared field exists with
+                    // a value or null, so "absent" and "null" are one state,
+                    // and this is upstream's translation for the same reason.
+                    // `ne` itself stays refused because there the wrong
+                    // answer is the *common* case rather than the null one.
                     format!("({name} ne null and not ({contained}))")
                 })
             }
@@ -729,7 +739,16 @@ impl AzureAISearchCollection {
         Ok(Value::Object(body))
     }
 
-    async fn run_search(&self, body: Value) -> Result<Vec<VectorSearchResult>> {
+    /// POST a search body and map the hits.
+    ///
+    /// `score_kind` says what `@search.score` *is* for this query, because the
+    /// collection's declared distance function does not: Azure returns a
+    /// relevance score where higher is better whatever metric the vector
+    /// profile declares, and a hybrid query returns a reciprocal-rank-fusion
+    /// score that is not a distance at all. A caller reading direction from
+    /// `DistanceFunction::higher_is_closer` — false for the distance metrics,
+    /// which are the usual declaration — would rank every result backwards.
+    async fn run_search(&self, body: Value, score_kind: &str) -> Result<Vec<VectorSearchResult>> {
         let resp = self
             .store
             .send(
@@ -764,6 +783,7 @@ impl AzureAISearchCollection {
             out.push(VectorSearchResult {
                 record: self.definition.from_storage(&stored, true)?,
                 score,
+                score_kind: Some(score_kind.to_string()),
             });
         }
         Ok(out)
@@ -784,7 +804,10 @@ impl AzureAISearchCollection {
         options: &VectorSearchOptions,
     ) -> Result<Vec<VectorSearchResult>> {
         let body = self.search_body(&vector, options, Some(text))?;
-        self.run_search(body).await
+        // The service fuses the vector and text rankings with RRF, so the
+        // score is a rank combination rather than any distance.
+        self.run_search(body, VectorSearchResult::SCORE_KIND_RRF)
+            .await
     }
 
     /// Post an indexing batch, chunked to what the service accepts, and fail
@@ -966,7 +989,8 @@ impl VectorCollection for AzureAISearchCollection {
         options: &VectorSearchOptions,
     ) -> Result<Vec<VectorSearchResult>> {
         let body = self.search_body(&vector, options, None)?;
-        self.run_search(body).await
+        self.run_search(body, VectorSearchResult::SCORE_KIND_RELEVANCE)
+            .await
     }
 }
 
@@ -1126,8 +1150,27 @@ fn odata_literal_typed(value: &Value, type_: &str) -> Result<String> {
 }
 
 /// Escape a value going into an OData key path segment (`indexes('name')`).
+///
+/// Two escapings, and both are needed. Doubling `'` keeps the name inside the
+/// OData string literal. Percent-encoding everything outside the unreserved
+/// set keeps it inside the *path segment*: a name carrying `?`, `#` or `/`
+/// would otherwise start the query string, the fragment, or a new path
+/// segment — and the first of those detaches `api-version`, turning a request
+/// against a strangely-named index into a differently-shaped request against
+/// the service. Azure's own index-name grammar (lowercase letters, digits and
+/// dashes) is entirely unreserved, so a valid name is unchanged by this and
+/// only a name the service would reject anyway is encoded.
 fn escape_path(value: &str) -> String {
-    value.replace('\'', "''")
+    value
+        .replace('\'', "''")
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'\'' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 /// Percent-encode a query-string value.

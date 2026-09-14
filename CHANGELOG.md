@@ -10,7 +10,7 @@ may break APIs).
 Portable vector filters and an Azure AI Search vector store, bounds on the
 tool loop, and three isolation fixes.
 
-**Breaking, in four places.** `VectorSearchOptions::filter` is now a
+**Breaking, in five places.** `VectorSearchOptions::filter` is now a
 `FilterExpression` rather than a provider-dialect `String`; the string form
 moved to `provider_filter` / `with_provider_filter`.
 `McpStreamableHttpTransport::new` returns a `Result` (it validates the URL).
@@ -18,7 +18,10 @@ moved to `provider_filter` / `with_provider_filter`.
 on a struct holding one stops compiling — deliberately; see below. And every
 workflow graph signature changes, so a checkpoint written by 0.6.x is refused
 on resume with a message naming the scheme change (and
-`run_from_checkpoint_unchecked` still resumes it).
+`run_from_checkpoint_unchecked` still resumes it). Finally,
+`VectorSearchResult` gains a `score_kind` field, so code constructing one
+with struct-literal syntax needs updating (it does not derive `Default`).
+Reading one is unaffected.
 
 Two behavior changes to look for. Redis keys are now derived through an
 injective encoding: a literal-safe prefix and session id — the default prefix
@@ -141,12 +144,42 @@ works.
   from an approval hit a provider error, the parked clock outlived it and the
   next, unrelated run on that session resumed it — possibly already spent.
 
+- Filter comparisons routed both operands through `f64`, which rounds past
+  2^53 — `9007199254740992` and `9007199254740993` compared equal, so `eq`,
+  `ne`, membership and the ordered operators could match or order the wrong
+  record on large integer ids. Integers now compare as integers; `f64` is used
+  only when an operand is genuinely non-integral, which is the case the
+  conversion existed for.
+
+- Streamed reasoning fragments no longer merge across provider block
+  boundaries. A message with two Anthropic thinking blocks coalesced into one,
+  concatenating the text under the later signature — which then signed neither
+  — and losing a block, so the replayed turn was rejected. A signature, or a
+  raw provider item already on the accumulator, now closes a block.
+
+- Azure AI Search index and alias names are percent-encoded into the path. A
+  name containing `?`, `#` or `/` previously changed the shape of the request
+  — the first of those detaches `api-version`.
+
+- The `SecretString` module docs still claimed it serializes to the real
+  value, which stopped being true when the `Serialize` impl was removed.
+
 - **The Azure chat api-version was pinned to GA `2024-10-21`**, which rejects
   request fields this client sends (`store` first among them) with
   "Unrecognized request argument supplied". Now `2024-12-01-preview` for chat,
   matching upstream, with embeddings left on GA as upstream also has it.
 
 ### Changed
+
+- `VectorSearchResult` gains `score_kind` and `higher_is_closer(..)`. A
+  collection's distance function is a *request*, and on several services it
+  does not describe what comes back: Azure AI Search returns a
+  higher-is-better relevance score whatever metric the profile declares, and a
+  reciprocal-rank-fusion score for a hybrid query. A caller reading direction
+  from `DistanceFunction::higher_is_closer` — false for the distance metrics,
+  which are the usual declaration — would have ranked every result backwards.
+  `InMemoryVectorStore` leaves it `None`, meaning the declared function does
+  describe the score. Mirrors upstream's `score_kind` result metadata.
 
 - `VectorStoreCollectionDefinition` gains `try_get_field` and
   `storage_name_for`.

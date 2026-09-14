@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use agent_framework_azure_ai_search::AzureAISearchStore;
 use agent_framework_core::vectors::{
-    Filter, VectorSearchOptions, VectorStore, VectorStoreCollectionDefinition, VectorStoreField,
+    DistanceFunction, Filter, VectorCollection, VectorSearchOptions, VectorSearchResult,
+    VectorStore, VectorStoreCollectionDefinition, VectorStoreField,
 };
 use serde_json::{json, Value};
 
@@ -428,4 +429,45 @@ async fn a_service_error_carries_the_status_and_the_service_message() {
         .to_string();
     assert!(err.contains("404"), "{err}");
     assert!(err.contains("No index with the name"), "{err}");
+}
+
+#[tokio::test]
+async fn a_search_says_what_kind_of_score_it_returned() {
+    // Azure scores a vector query by relevance (higher is better) whatever
+    // metric the profile declares, and a hybrid query by RRF — so a caller
+    // reading direction from a `cosine_distance` declaration, whose
+    // `higher_is_closer` is false, would rank every result backwards.
+    let server = FakeSearch::start(|_| {
+        (
+            200,
+            json!({ "value": [{ "id": "a", "text": "alpha", "@search.score": 0.87 }] }).to_string(),
+        )
+    });
+    let store = AzureAISearchStore::with_api_key(&server.addr, "k");
+    let docs = store.collection("docs", definition()).unwrap();
+
+    let vector_hits = docs
+        .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        vector_hits[0].score_kind.as_deref(),
+        Some(VectorSearchResult::SCORE_KIND_RELEVANCE)
+    );
+    assert_eq!(
+        vector_hits[0].higher_is_closer(Some(&DistanceFunction::new(
+            DistanceFunction::COSINE_DISTANCE
+        ))),
+        Some(true),
+        "the score kind overrides the declared metric, which does not describe it"
+    );
+
+    let hybrid_hits = docs
+        .search_hybrid("alpha", vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        hybrid_hits[0].score_kind.as_deref(),
+        Some(VectorSearchResult::SCORE_KIND_RRF)
+    );
 }

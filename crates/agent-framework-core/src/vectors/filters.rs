@@ -858,12 +858,7 @@ fn evaluate_filter(
 ///   match nothing.
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
-            (Some(a), Some(b)) => a == b,
-            // A number too large for an f64 (an i128/u128 literal) keeps its
-            // exact comparison rather than being coerced into a lossy one.
-            _ => a == b,
-        },
+        (Value::Number(a), Value::Number(b)) => numbers_equal(a, b),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
         }
@@ -876,6 +871,52 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// Compare two JSON numbers by value.
+///
+/// Integers are compared **as integers**. Routing them through `f64` — the
+/// obvious way to make `1` equal `1.0` — silently rounds past 2^53, so
+/// `9007199254740992` and `9007199254740993` become the same number and a
+/// filter on an id, a timestamp in nanoseconds, or any other large key
+/// matches the wrong record. `f64` is used only when an operand is genuinely
+/// non-integral, which is the case that needed the cross-type comparison in
+/// the first place.
+fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return x == y;
+    }
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        // A number no `f64` can hold (an arbitrary-precision literal) keeps
+        // its exact comparison rather than being coerced into a lossy one.
+        _ => a == b,
+    }
+}
+
+/// Order two JSON numbers by value, with the same exact-integer rule as
+/// [`numbers_equal`]: `gt`/`lt`/`between` on large integers must not be
+/// decided by a rounded `f64`.
+fn compare_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return Some(x.cmp(&y));
+    }
+    // One side is negative and the other past `i64::MAX`, or one is a float:
+    // a negative integer is always the smaller, and anything else falls to
+    // the float comparison.
+    if a.as_i64().is_some_and(|x| x < 0) && b.as_u64().is_some() {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if b.as_i64().is_some_and(|y| y < 0) && a.as_u64().is_some() {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
 /// Order two values, or `None` when they are not comparable.
 ///
 /// Numbers compare numerically and strings lexicographically. Booleans,
@@ -883,7 +924,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 /// connector and this evaluator agree on what an ordered comparison means.
 fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        (Value::Number(a), Value::Number(b)) => compare_numbers(a, b),
         (Value::String(a), Value::String(b)) => Some(a.as_str().cmp(b.as_str())),
         _ => None,
     }
@@ -1320,5 +1361,57 @@ mod unvalidated_input_tests {
         assert!(short_between
             .matches(&json!({ "a": 1 }), &identity)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod numeric_precision_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Routing every numeric comparison through `f64` — the obvious way to
+    /// make `1` equal `1.0` — rounds past 2^53, so two adjacent 64-bit ids
+    /// compare equal and a filter matches the wrong record.
+    #[test]
+    fn large_integers_compare_exactly() {
+        let a = json!(9_007_199_254_740_992_i64);
+        let b = json!(9_007_199_254_740_993_i64);
+        assert_eq!(
+            a.as_f64(),
+            b.as_f64(),
+            "the f64 round-trip really does collide"
+        );
+
+        assert!(!values_equal(&a, &b));
+        assert_eq!(compare_values(&a, &b), Some(std::cmp::Ordering::Less));
+        assert!(values_equal(&a, &json!(9_007_199_254_740_992_i64)));
+    }
+
+    /// …while the cross-type rule the module documents still holds.
+    #[test]
+    fn an_integer_still_equals_the_same_float() {
+        assert!(values_equal(&json!(1), &json!(1.0)));
+        assert_eq!(
+            compare_values(&json!(2), &json!(1.5)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert!(!values_equal(&json!(1), &json!(true)));
+    }
+
+    /// A negative `i64` against a `u64` past `i64::MAX` has no common integer
+    /// type; it must still order correctly rather than falling through.
+    #[test]
+    fn mixed_sign_integers_order_correctly() {
+        let negative = json!(-1_i64);
+        let huge = json!(u64::MAX);
+        assert_eq!(
+            compare_values(&negative, &huge),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&huge, &negative),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert!(!values_equal(&negative, &huge));
     }
 }
