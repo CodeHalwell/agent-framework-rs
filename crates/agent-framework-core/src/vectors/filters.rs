@@ -672,44 +672,56 @@ impl FilterExpression {
         resolve: &dyn Fn(&str) -> Option<String>,
     ) -> Result<bool> {
         match self {
-            Self::Group(group) => match group.operator {
-                FilterGroupOperator::And => {
-                    for child in &group.filters {
-                        if !child.matches(record, resolve)? {
-                            return Ok(false);
+            Self::Group(group) => {
+                // Checked for *every* operator, before any of them: an empty
+                // `and` is vacuously true and an empty `or` vacuously false,
+                // so a malformed group silently becomes match-all or
+                // match-nothing instead of the error `validate` would give.
+                // A scoping predicate that quietly matches everything is the
+                // worst outcome available here.
+                //
+                // Reachable because `matches` is public and
+                // `FilterExpression` is `Deserialize`: a tree that never went
+                // through a constructor (or `validate`) arrives here as-is.
+                if group.filters.is_empty() {
+                    return Err(Error::Configuration(
+                        "a filter group requires at least one filter".into(),
+                    ));
+                }
+                match group.operator {
+                    FilterGroupOperator::And => {
+                        for child in &group.filters {
+                            if !child.matches(record, resolve)? {
+                                return Ok(false);
+                            }
                         }
+                        Ok(true)
                     }
-                    Ok(true)
-                }
-                FilterGroupOperator::Or => {
-                    for child in &group.filters {
-                        if child.matches(record, resolve)? {
-                            return Ok(true);
+                    FilterGroupOperator::Or => {
+                        for child in &group.filters {
+                            if child.matches(record, resolve)? {
+                                return Ok(true);
+                            }
                         }
+                        Ok(false)
                     }
-                    Ok(false)
+                    FilterGroupOperator::Not => {
+                        // Exactly one, not "the first of however many": taking
+                        // `filters[0]` and ignoring the rest would answer a
+                        // *different* predicate than the caller wrote, which is
+                        // the failure mode this whole branch exists to avoid.
+                        // Silently narrowing an authorization filter is worse
+                        // than refusing it.
+                        let [inner] = group.filters.as_slice() else {
+                            return Err(Error::Configuration(format!(
+                                "a 'not' filter group requires exactly one filter, got {}",
+                                group.filters.len()
+                            )));
+                        };
+                        Ok(!inner.matches(record, resolve)?)
+                    }
                 }
-                // Indexing would panic, and this is reachable: `matches` is
-                // public and `FilterExpression` is `Deserialize`, so a tree
-                // that never went through a constructor (or `validate`) can
-                // arrive here empty. An error is what the rest of this
-                // method does with malformed input.
-                FilterGroupOperator::Not => {
-                    // Exactly one, not "the first of however many": taking
-                    // `filters[0]` and ignoring the rest would answer a
-                    // *different* predicate than the caller wrote, which is
-                    // the failure mode this whole branch exists to avoid.
-                    // Silently narrowing an authorization filter is worse
-                    // than refusing it.
-                    let [inner] = group.filters.as_slice() else {
-                        return Err(Error::Configuration(format!(
-                            "a 'not' filter group requires exactly one filter, got {}",
-                            group.filters.len()
-                        )));
-                    };
-                    Ok(!inner.matches(record, resolve)?)
-                }
-            },
+            }
             Self::Condition(filter) => evaluate_filter(filter, record, resolve),
         }
     }
@@ -1393,6 +1405,17 @@ mod unvalidated_input_tests {
             empty_not.matches(&json!({ "a": 1 }), &identity).is_err(),
             "and matches must not panic on the same input"
         );
+
+        // An empty `and` is vacuously true and an empty `or` vacuously
+        // false, so a malformed scoping predicate silently becomes match-all
+        // or match-nothing — the worst outcomes available here.
+        let empty_and: FilterExpression =
+            serde_json::from_value(json!({ "operator": "and", "filters": [] })).unwrap();
+        assert!(empty_and.validate().is_err());
+        assert!(empty_and.matches(&json!({ "a": 1 }), &identity).is_err());
+        let empty_or: FilterExpression =
+            serde_json::from_value(json!({ "operator": "or", "filters": [] })).unwrap();
+        assert!(empty_or.matches(&json!({ "a": 1 }), &identity).is_err());
 
         // Two children is the sharper case: taking the first and ignoring the
         // rest answers a different predicate than the caller wrote, which is

@@ -934,9 +934,16 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 // the budget is spent this loop stops asking for tools at all,
                 // and opening a human-approval round trip whose calls could
                 // only come back unexecuted is worse than ending the run.
-                // Breaking here drops this response rather than carrying it,
-                // so no unanswered function call is left in the conversation;
-                // the failsafe below then asks the model once with tools off.
+                // What the response already achieved is kept; only the local
+                // calls that will now never run are dropped. A provider that
+                // ran a hosted tool itself — an Anthropic server-side web
+                // search, say — put the call *and its result* in this same
+                // response, and that work is done and paid for: discarding it
+                // would make the failsafe answer from a conversation missing
+                // the very thing it just looked up. Stripping only the
+                // unresolved calls keeps that, and still leaves no unanswered
+                // function call behind; the failsafe below then asks the
+                // model once with tools off.
                 if let Some(reason) = budget.spent() {
                     if budget_spent.is_none() {
                         tracing::info!(
@@ -945,6 +952,21 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                              disabling tools for this request"
                         );
                     }
+                    let resolved_owned: std::collections::HashSet<String> = resolved_call_ids
+                        .iter()
+                        .map(|id| (*id).to_string())
+                        .collect();
+                    let mut kept = response;
+                    for message in kept.messages.iter_mut() {
+                        message.contents.retain(|content| match content {
+                            Content::FunctionCall(fc) => resolved_owned.contains(&fc.call_id),
+                            _ => true,
+                        });
+                    }
+                    // A message left with nothing in it would be an empty turn
+                    // in the conversation, which some providers reject.
+                    kept.messages.retain(|m| !m.contents.is_empty());
+                    carried.extend(kept.messages);
                     options.tool_choice = Some(ToolMode::None);
                     break;
                 }

@@ -3802,3 +3802,77 @@ async fn an_abandoned_approval_does_not_spend_the_next_runs_budget() {
     );
     assert_eq!(response.text(), "done");
 }
+
+#[tokio::test]
+async fn a_spent_budget_keeps_what_the_provider_already_resolved() {
+    // A provider that runs a hosted tool itself puts the call *and its
+    // result* in the same response. When the budget expires during that
+    // response, the hosted work is done and paid for — dropping the whole
+    // response would leave the failsafe answering from a conversation missing
+    // the thing the provider just looked up. Only the unresolved local call,
+    // which will never run now, is stripped.
+    let counter = Arc::new(Mutex::new(0));
+    let mixed = ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionCall(FunctionCallContent::new(
+                    "hosted_1",
+                    "web_search",
+                    Some(FunctionArguments::Raw("{}".into())),
+                )),
+                Content::FunctionResult(FunctionResultContent::new(
+                    "hosted_1",
+                    Some(json!("the capital is Paris")),
+                )),
+                Content::FunctionCall(FunctionCallContent::new(
+                    "call_local",
+                    "ping",
+                    Some(FunctionArguments::Raw("{}".into())),
+                )),
+            ],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    };
+    let inner = MockClient::new(vec![mixed, ChatResponse::from_text("Paris")]);
+    let client = FunctionInvokingChatClient::new(SlowClient {
+        inner: inner.clone(),
+        delay: Duration::from_millis(60),
+    })
+    .with_config(FunctionInvocationConfig {
+        max_duration_seconds: Some(0.05),
+        ..Default::default()
+    });
+
+    let response = client
+        .get_response(
+            vec![Message::user("what is the capital of France?")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(*counter.lock().unwrap(), 0, "the local call must not run");
+
+    let all: Vec<&Content> = response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .collect();
+    assert!(
+        all.iter()
+            .any(|c| matches!(c, Content::FunctionResult(r) if r.call_id == "hosted_1")),
+        "the provider-resolved result survives: {all:?}"
+    );
+    assert!(
+        all.iter()
+            .any(|c| matches!(c, Content::FunctionCall(f) if f.call_id == "hosted_1")),
+        "paired with the call it answers"
+    );
+    assert!(
+        !all.iter()
+            .any(|c| matches!(c, Content::FunctionCall(f) if f.call_id == "call_local")),
+        "but the unresolved local call is not left dangling: {all:?}"
+    );
+}

@@ -35,9 +35,14 @@ fn is_literal_safe(value: &str) -> bool {
 /// Render `value` as one unambiguous storage-key segment.
 ///
 /// `encoded_prefix` distinguishes components that might encode the same
-/// identifier (a prefix segment and a session segment, say); it must start
-/// with `~`, which the literal alphabet excludes, so an encoded segment can
-/// never be mistaken for a literal one.
+/// identifier (a prefix segment and a session segment, say). A leading `~` is
+/// added if the caller does not supply one, because that character — excluded
+/// from the literal alphabet — is the entire reason an encoded segment can
+/// never be mistaken for a literal one. Enforcing it with a `debug_assert!`
+/// would have left it unenforced in release builds, where an empty or
+/// unmarked prefix turns `encode("A")` into `41` and collides with the
+/// literal-safe identifier `41`: exactly the isolation failure this function
+/// exists to prevent, in the builds that matter.
 ///
 /// A literal-safe value is returned as-is, so the common case — a key prefix
 /// like `chat_messages` and a UUID session id — keeps producing exactly the
@@ -57,15 +62,12 @@ fn is_literal_safe(value: &str) -> bool {
 /// upstream's implementation in any case (its scoped format differs
 /// wholesale).
 pub fn storage_key_segment(value: &str, encoded_prefix: &str) -> String {
-    debug_assert!(
-        encoded_prefix.starts_with('~'),
-        "an encoded-segment prefix must start with '~' to stay outside the literal namespace"
-    );
     if is_literal_safe(value) {
         return value.to_string();
     }
-    let mut out = String::with_capacity(encoded_prefix.len() + value.len() * 2);
-    out.push_str(encoded_prefix);
+    let mut out = String::with_capacity(encoded_prefix.len() + value.len() * 2 + 1);
+    out.push('~');
+    out.push_str(encoded_prefix.trim_start_matches('~'));
     for byte in value.as_bytes() {
         out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
         out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
@@ -135,6 +137,23 @@ mod tests {
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex pair"))
             .collect();
         assert_eq!(String::from_utf8(bytes).unwrap(), "a:b/ Ünicode");
+    }
+
+    #[test]
+    fn the_marker_is_added_whatever_the_caller_passes() {
+        // The `~` is the whole isolation mechanism, so it cannot depend on
+        // the caller remembering it — nor on a `debug_assert!`, which is
+        // compiled out of exactly the builds where a collision would matter.
+        for prefix in ["", "p-", "~p-", "~~p-"] {
+            let encoded = storage_key_segment("A", prefix);
+            assert!(encoded.starts_with('~'), "{prefix:?} -> {encoded}");
+            assert_ne!(
+                encoded, "41",
+                "an unmarked prefix would collide with the literal id '41'"
+            );
+        }
+        // And a literal-safe value is still untouched, marker or not.
+        assert_eq!(storage_key_segment("41", ""), "41");
     }
 
     #[test]

@@ -151,6 +151,21 @@ works.
   run's elapsed clock, and could find the new request's tools disabled before
   it made a single call.
 
+- `FilterExpression::matches` rejects an empty group for every operator, not
+  just `not`. An empty `and` is vacuously true, so a malformed predicate that
+  never went through `validate` silently became match-all.
+
+- `storage_key_segment` marks an encoded segment in every build. The `~` that
+  keeps encoded and literal segments in separate namespaces was enforced by a
+  `debug_assert!`, which is compiled out of release — where an unmarked prefix
+  turns `encode("A")` into `41` and collides with the literal id `41`.
+
+- A budget that expires mid-response keeps what the provider already resolved.
+  A hosted tool the provider ran itself returns its call *and* result in that
+  response; dropping the whole thing left the tools-off failsafe answering
+  without the lookup it had just paid for. Only the unresolved local calls are
+  stripped now.
+
 - The RediSearch index watches the namespace entries are actually written
   under. With a key prefix that the storage-key encoding touches, `FT.CREATE`
   was given the raw prefix while entries were written under the encoded one,
