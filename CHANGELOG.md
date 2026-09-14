@@ -144,6 +144,13 @@ works.
   from an approval hit a provider error, the parked clock outlived it and the
   next, unrelated run on that session resumed it — possibly already spent.
 
+- An abandoned approval no longer spends the next run's budget. The parked
+  state is restored only when the request actually carries the approval
+  responses it was parked for; a caller who walks away from a pending approval
+  and starts an unrelated request on the same session was inheriting that
+  run's elapsed clock, and could find the new request's tools disabled before
+  it made a single call.
+
 - Filter comparisons routed both operands through `f64`, which rounds past
   2^53 — `9007199254740992` and `9007199254740993` compared equal, so `eq`,
   `ne`, membership and the ordered operators could match or order the wrong

@@ -288,7 +288,19 @@ struct InvocationBudget {
 
 impl InvocationBudget {
     /// Resume the session's budget, or start one.
-    fn resume_or_start(config: &FunctionInvocationConfig, session: Option<&AgentSession>) -> Self {
+    ///
+    /// `resuming_approval` says whether this request actually carries the
+    /// approval responses the parked budget was parked for. It has to: a
+    /// caller who abandons a pending approval and starts an unrelated request
+    /// on the same session would otherwise inherit that run's elapsed clock
+    /// and call count, and find the new request's tools disabled before it
+    /// made a single call. The parked state belongs to one paused run, and
+    /// a request that is not resuming it discards it.
+    fn resume_or_start(
+        config: &FunctionInvocationConfig,
+        session: Option<&AgentSession>,
+        resuming_approval: bool,
+    ) -> Self {
         let mut budget = Self {
             started_millis: epoch_millis(),
             executed: 0,
@@ -304,6 +316,12 @@ impl InvocationBudget {
                 .max_duration_seconds
                 .map(|seconds| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)),
         };
+        if !resuming_approval {
+            // Not a resumption, so anything parked is from a run this request
+            // has nothing to do with.
+            Self::clear(session);
+            return budget;
+        }
         // The limits always come from the live config, never from the parked
         // state: a caller who lowered a limit between runs means it, and a
         // resumed run must not keep spending against the old one.
@@ -739,7 +757,15 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             // bound on the whole run, and the first model round trip is part
             // of what it bounds. A run resuming from an approval picks the
             // parked budget back up instead of starting over.
-            let mut budget = InvocationBudget::resume_or_start(&self.config, session.as_ref());
+            // Checked against the request's *own* input: only a request
+            // carrying approval responses is resuming the paused run whose
+            // budget is parked on this session.
+            let resuming_approval = !collect_approval_responses(&conversation).is_empty();
+            let mut budget = InvocationBudget::resume_or_start(
+                &self.config,
+                session.as_ref(),
+                resuming_approval,
+            );
             // Usage summed over every model call this loop makes, applied to
             // whichever response is returned so the caller sees the cost of the
             // whole run and not just its final iteration.

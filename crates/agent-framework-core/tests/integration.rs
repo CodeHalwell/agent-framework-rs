@@ -3747,3 +3747,58 @@ async fn a_failed_run_does_not_leave_its_budget_parked_on_the_session() {
         "a failed run must not leave its budget behind for the next one"
     );
 }
+
+#[tokio::test]
+async fn an_abandoned_approval_does_not_spend_the_next_runs_budget() {
+    // A pending approval that is never answered leaves a parked budget on the
+    // session, and its clock keeps running. A later, unrelated request on that
+    // session has nothing to do with the paused run, so inheriting that clock
+    // — and finding its own tools disabled before it makes a single call — is
+    // the wrong outcome.
+    let session = AgentSession::new();
+    let counter = Arc::new(Mutex::new(0));
+    let config = || FunctionInvocationConfig {
+        max_duration_seconds: Some(0.05),
+        ..Default::default()
+    };
+
+    let pausing =
+        FunctionInvokingChatClient::new(MockClient::new(vec![secret_call()])).with_config(config());
+    let mut options = ChatOptions::new().with_tool(approval_tool(counter.clone()));
+    options.session = Some(session.clone());
+    let _paused = pausing
+        .get_response(vec![Message::user("go")], options)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .state
+            .get("__af_function_invocation_budget__")
+            .is_some(),
+        "the paused run parked its budget"
+    );
+
+    // Long enough that the abandoned run's clock is now spent.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // A fresh request on the same session, carrying no approval response.
+    let ping_counter = Arc::new(Mutex::new(0));
+    let fresh = FunctionInvokingChatClient::new(MockClient::new(vec![
+        ping_calls(1),
+        ChatResponse::from_text("done"),
+    ]))
+    .with_config(config());
+    let mut fresh_options = ChatOptions::new().with_tool(counting_tool(ping_counter.clone()));
+    fresh_options.session = Some(session.clone());
+    let response = fresh
+        .get_response(vec![Message::user("unrelated")], fresh_options)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *ping_counter.lock().unwrap(),
+        1,
+        "the new run gets its own clock, not the abandoned run's spent one"
+    );
+    assert_eq!(response.text(), "done");
+}
