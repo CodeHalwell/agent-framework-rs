@@ -110,6 +110,7 @@ use uuid::Uuid;
 
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::storage_keys::storage_key_segment;
 use agent_framework_core::types::{Message, Role};
 
 use crate::internal::{map_redis_err, LazyConnection};
@@ -667,19 +668,32 @@ impl RedisContextProvider {
         }
     }
 
+    /// The configured prefix, rendered as one unambiguous key segment.
+    ///
+    /// A raw prefix makes the key space ambiguous in two ways at once. A
+    /// prefix containing `:entry:` puts one provider's entries inside
+    /// another's `SCAN MATCH` pattern — so it reads, and `clear()` deletes,
+    /// memories that are not its own — and a prefix containing a glob
+    /// metacharacter (`*`, `?`, `[`) makes that pattern match something else
+    /// again. Encoding the prefix closes both; a literal-safe prefix (the
+    /// common case) is unchanged, so existing keys still resolve.
+    fn key_segment(&self) -> String {
+        storage_key_segment(&self.key_prefix, "~p-")
+    }
+
     fn entry_key(&self, id: &str) -> String {
-        format!("{}:entry:{}", self.key_prefix, id)
+        format!("{}:entry:{}", self.key_segment(), id)
     }
 
     fn scan_pattern(&self) -> String {
-        format!("{}:entry:*", self.key_prefix)
+        format!("{}:entry:*", self.key_segment())
     }
 
     /// RediSearch index name for this provider's `key_prefix` — one index
     /// per prefix, so distinct [`Self::with_key_prefix`] configurations
     /// never collide on the same server.
     fn index_name(&self) -> String {
-        format!("{}_idx", self.key_prefix)
+        format!("{}_idx", self.key_segment())
     }
 
     /// `SCAN MATCH {key_prefix}:entry:*`, then `MGET` the matched keys and
@@ -1533,4 +1547,39 @@ mod tests {
     }
 
     // endregion
+}
+
+#[cfg(test)]
+mod key_scoping_tests {
+    use super::*;
+
+    fn provider_with(prefix: &str) -> RedisContextProvider {
+        RedisContextProvider::new("redis://127.0.0.1:6379")
+            .expect("provider")
+            .with_key_prefix(prefix)
+    }
+
+    #[test]
+    fn a_prefix_containing_the_entry_marker_cannot_capture_another_providers_entries() {
+        // `SCAN MATCH a:entry:*` also matches `a:entry:b:entry:<uuid>`, so a
+        // provider scoped to `a` would read — and `clear()` would delete —
+        // the memories of one scoped to `a:entry:b`.
+        let outer = provider_with("a");
+        let inner = provider_with("a:entry:b");
+        let captured = inner.entry_key("0000");
+        let pattern = outer.scan_pattern();
+        let literal_prefix = pattern.trim_end_matches('*');
+        assert!(
+            !captured.starts_with(literal_prefix),
+            "{captured} is still inside {pattern}"
+        );
+    }
+
+    #[test]
+    fn a_literal_safe_prefix_keeps_its_existing_keys_and_index_name() {
+        let p = provider_with("myapp");
+        assert_eq!(p.entry_key("id1"), "myapp:entry:id1");
+        assert_eq!(p.scan_pattern(), "myapp:entry:*");
+        assert_eq!(p.index_name(), "myapp_idx");
+    }
 }

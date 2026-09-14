@@ -54,6 +54,7 @@ pub mod observability;
 pub mod session;
 pub mod settings;
 pub mod skills;
+pub mod storage_keys;
 pub mod streaming;
 pub mod tools;
 pub mod types;

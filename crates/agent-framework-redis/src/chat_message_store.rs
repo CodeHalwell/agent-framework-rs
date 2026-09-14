@@ -27,6 +27,7 @@ use uuid::Uuid;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::history::HistoryProvider;
 use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::storage_keys::storage_key_segment;
 use agent_framework_core::types::Message;
 
 use crate::internal::{map_redis_err, LazyConnection};
@@ -116,9 +117,24 @@ impl RedisChatMessageStore {
         self.max_messages
     }
 
-    /// The Redis key holding this session's messages: `{key_prefix}:{session_id}`.
+    /// The Redis key holding this session's messages:
+    /// `{key_prefix}:{session_id}`, with each half rendered through
+    /// [`storage_key_segment`] first.
+    ///
+    /// Without that, the two halves are ambiguous: nothing stops a session id
+    /// from containing the separator, so `key_prefix="chat"` +
+    /// `session_id="a:b"` and `key_prefix="chat:a"` + `session_id="b"`
+    /// address one list, and two conversations that should be isolated share
+    /// a history. Where the prefix is a tenant boundary, that is one tenant
+    /// reading another's (upstream #8236). A literal-safe value — the common
+    /// case, including every UUID and the default prefix — passes through
+    /// unchanged, so existing keys are unaffected.
     pub fn redis_key(&self) -> String {
-        format!("{}:{}", self.key_prefix, self.session_id)
+        format!(
+            "{}:{}",
+            storage_key_segment(&self.key_prefix, "~p-"),
+            storage_key_segment(&self.session_id, "~s-")
+        )
     }
 
     /// Remove all messages for this session (`DEL` on [`Self::redis_key`]).
@@ -535,4 +551,49 @@ mod tests {
     }
 
     // endregion
+}
+
+#[cfg(test)]
+mod key_scoping_tests {
+    use super::*;
+
+    fn store_with(prefix: &str, session: &str) -> RedisChatMessageStore {
+        RedisChatMessageStore::new("redis://127.0.0.1:6379", Some(session.to_string()))
+            .expect("store")
+            .with_key_prefix(prefix)
+    }
+
+    #[test]
+    fn the_common_case_keeps_the_keys_it_always_had() {
+        // The passthrough is what makes this change safe for existing data: a
+        // default prefix and a UUID session id are both literal-safe.
+        let store = store_with("chat_messages", "3f2a9b1c-4d5e-6f70-8192-a3b4c5d6e7f8");
+        assert_eq!(
+            store.redis_key(),
+            "chat_messages:3f2a9b1c-4d5e-6f70-8192-a3b4c5d6e7f8"
+        );
+    }
+
+    #[test]
+    fn a_separator_in_an_id_cannot_reach_another_stores_list() {
+        // Two stores that should be isolated: one scoped to `chat` holding a
+        // session literally named `a:b`, and one scoped to the tenant prefix
+        // `chat:a` holding session `b`. Joined raw, both are `chat:a:b`.
+        let a = store_with("chat", "a:b");
+        let b = store_with("chat:a", "b");
+        assert_eq!(
+            format!("{}:{}", "chat", "a:b"),
+            format!("{}:{}", "chat:a", "b"),
+            "the raw join really does collide"
+        );
+        assert_ne!(a.redis_key(), b.redis_key());
+    }
+
+    #[test]
+    fn a_glob_metacharacter_in_a_prefix_is_encoded() {
+        // Not only a collision: an unencoded `*` changes what a `SCAN MATCH`
+        // over the key space selects.
+        let store = store_with("chat*", "s");
+        assert!(!store.redis_key().contains('*'), "{}", store.redis_key());
+    }
 }
