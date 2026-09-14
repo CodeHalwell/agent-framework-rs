@@ -563,6 +563,22 @@ fn parse_stream_event(
                     annotations: None,
                     ..Default::default()
                 }),
+                // The signature arrives *after* the thinking text it signs,
+                // in its own delta. Carried as an empty-text reasoning
+                // fragment so `coalesce_text` folds it onto the thinking
+                // block it belongs to — the same merge that already carries a
+                // Gemini thought signature across fragments. Without this the
+                // signature is dropped, and a replayed assistant turn is then
+                // rejected by the Messages API whenever extended thinking is
+                // on (an unsigned thinking block is not accepted).
+                "signature_delta" => Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    protected_data: delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    ..Default::default()
+                }),
                 "input_json_delta" => {
                     let call_id = tool_use_ids.get(&index).cloned().unwrap_or_default();
                     let partial = delta
@@ -740,6 +756,74 @@ mod tests {
             Some(agent_framework_core::types::FinishReason::new(
                 "model_context_window_exceeded"
             ))
+        );
+    }
+
+    /// A streamed thinking block is signed by a `signature_delta` that
+    /// arrives *after* the text it signs. Dropping it (which this port did)
+    /// leaves the block unsigned, and the Messages API rejects an unsigned
+    /// thinking block in a replayed assistant turn whenever extended thinking
+    /// is on — so a streamed reasoning turn could not be continued at all.
+    #[tokio::test]
+    async fn stream_attaches_a_signature_delta_to_its_thinking_block() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-x", "usage": { "input_tokens": 1, "output_tokens": 1 } }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "first " }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "second" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "signature_delta", "signature": "c2lnbmF0dXJl" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_stop",
+            &serde_json::json!({ "type": "message_stop" }),
+        ));
+
+        let resp = ChatResponse::from_updates(collect_updates(text).await);
+        let reasoning: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                agent_framework_core::types::Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1, "fragments coalesce into one block");
+        assert_eq!(reasoning[0].text, "first second");
+        assert_eq!(
+            reasoning[0].protected_data.as_deref(),
+            Some("c2lnbmF0dXJl"),
+            "the signature must land on the block it signs"
         );
     }
 
