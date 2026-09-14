@@ -870,15 +870,25 @@ impl FunctionInvocationConfig {
                 "max_function_calls must be >= 1, or None for unbounded".into(),
             ));
         }
-        // Rejects zero, a negative, and NaN: `partial_cmp` is `None` for NaN,
-        // so a budget that can never be compared is refused rather than
-        // silently meaning "never expires".
-        if self.max_duration_seconds.is_some_and(|seconds| {
-            !matches!(seconds.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
-        }) {
-            return Err(Error::Configuration(
-                "max_duration_seconds must be greater than zero, or None for unbounded".into(),
-            ));
+        if let Some(seconds) = self.max_duration_seconds {
+            // Rejects zero, a negative, and NaN: `partial_cmp` is `None` for
+            // NaN, so a budget that can never be compared is refused rather
+            // than silently meaning "never expires".
+            if !matches!(seconds.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+                return Err(Error::Configuration(
+                    "max_duration_seconds must be greater than zero, or None for unbounded".into(),
+                ));
+            }
+            // And rejects the positive values a `Duration` cannot hold —
+            // `f64::INFINITY` and anything past ~5.8e18 seconds — which the
+            // comparison above lets through. `Duration::from_secs_f64`
+            // *panics* on those, so without this a caller's configuration
+            // value takes the process down rather than returning an error.
+            if std::time::Duration::try_from_secs_f64(seconds).is_err() {
+                return Err(Error::Configuration(format!(
+                    "max_duration_seconds must be a finite duration, got {seconds}"
+                )));
+            }
         }
         Ok(())
     }

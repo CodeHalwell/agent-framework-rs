@@ -224,7 +224,7 @@ async fn deleting_an_absent_index_succeeds() {
 }
 
 #[tokio::test]
-async fn upsert_posts_a_merge_or_upload_batch_in_storage_form() {
+async fn upsert_posts_a_replacing_upload_batch_in_storage_form() {
     let server = FakeSearch::start(|_| {
         (
             200,
@@ -252,7 +252,9 @@ async fn upsert_posts_a_merge_or_upload_batch_in_storage_form() {
     );
     let body: Value = serde_json::from_slice(&body).unwrap();
     let doc = &body["value"][0];
-    assert_eq!(doc["@search.action"], "mergeOrUpload");
+    // `upload` replaces the stored document; `mergeOrUpload` would keep
+    // fields the new record omits, which is not what `upsert` promises.
+    assert_eq!(doc["@search.action"], "upload");
     assert_eq!(doc["id"], "a");
     // Renamed on the way out, as `to_storage` defines it.
     assert_eq!(doc["vec"], json!([1.0, 0.0, 0.0]));

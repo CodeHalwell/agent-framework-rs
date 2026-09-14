@@ -101,6 +101,26 @@ works.
   removed rather than masked, because a masked `Serialize` round-trips the
   mask back as the value.
 
+- The wall-clock tool-loop budget is re-checked **after** each model call, not
+  only before it: a provider response slower than the remaining budget that
+  came back asking for tools had its whole batch executed on a budget that
+  expired while the model was thinking.
+
+- A `max_duration_seconds` a `Duration` cannot hold (`f64::INFINITY`, or
+  anything past ~5.8e18 seconds) is refused by `validate` instead of reaching
+  `Duration::from_secs_f64`, which **panics** on those — a configuration value
+  could take the process down.
+
+- `AzureAISearchCollection::upsert` sends `upload` rather than `mergeOrUpload`:
+  the trait contract is insert-or-*replace*, and merge semantics kept a field
+  the new record omitted, so a cleared field stayed live in filters and search
+  results.
+
+- `McpStreamableHttpTransport::close` sends its teardown `DELETE` through the
+  same scoped-redirect path as every other request. With redirects no longer
+  followed by `reqwest`, a bare send read a same-origin 3xx as a delivered
+  teardown and left the server session open.
+
 - **The Azure chat api-version was pinned to GA `2024-10-21`**, which rejects
   request fields this client sends (`store` first among them) with
   "Unrecognized request argument supplied". Now `2024-12-01-preview` for chat,

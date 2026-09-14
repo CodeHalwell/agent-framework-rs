@@ -176,15 +176,31 @@ impl McpStreamableHttpTransport {
     /// JSON-RPC request into a body-less GET, which no MCP server can answer;
     /// re-POSTing is the only reading that keeps the protocol intact.
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
+        self.send_scoped(|http, url| {
+            http.post(url)
+                .header(ACCEPT, "application/json, text/event-stream")
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+        })
+        .await
+    }
+
+    /// Send the request `build` produces, following redirects ourselves so the
+    /// configured headers stay scoped to the configured origin.
+    ///
+    /// Every verb this transport uses goes through here, not just the POST
+    /// that carries the JSON-RPC traffic: with a `Policy::none()` client a
+    /// caller that does not follow redirects itself reads the 3xx as its
+    /// answer, so a request to a server that redirects within its own origin
+    /// silently never reaches the endpoint at all.
+    async fn send_scoped<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn(&reqwest::Client, reqwest::Url) -> reqwest::RequestBuilder,
+    {
         let mut url = self.url.clone();
         let mut same_origin = true;
         for _ in 0..=MAX_REDIRECTS {
-            let mut req = self
-                .http
-                .post(url.clone())
-                .header(ACCEPT, "application/json, text/event-stream")
-                .header(CONTENT_TYPE, "application/json")
-                .json(body);
+            let mut req = build(&self.http, url.clone());
             if same_origin {
                 req = req.headers(self.headers.clone());
                 if let Some(session_id) = self.session_id.read().await.clone() {
@@ -295,16 +311,17 @@ impl McpTransport for McpStreamableHttpTransport {
     }
 
     async fn close(&self) -> Result<()> {
-        if let Some(session_id) = self.session_id().await {
+        if self.session_id().await.is_some() {
             // Best effort: the server may not support/require an explicit
             // session teardown, so failures here are not propagated.
-            let result = self
-                .http
-                .delete(self.url.clone())
-                .header(SESSION_ID_HEADER, session_id)
-                .headers(self.headers.clone())
-                .send()
-                .await;
+            // Through the same scoped-redirect path as every other request:
+            // this client does not follow redirects on its own, so a bare
+            // `send()` here would read a same-origin 3xx as a delivered
+            // teardown and leave the server session open. The session id is
+            // attached by `send_scoped` (and dropped if a redirect leaves the
+            // origin), so it is not read here — only its presence decides
+            // whether there is a session to tear down at all.
+            let result = self.send_scoped(|http, url| http.delete(url)).await;
             if let Err(e) = result {
                 tracing::debug!(error = %e, "MCP: best-effort session DELETE failed");
             }

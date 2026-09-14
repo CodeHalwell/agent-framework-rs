@@ -293,10 +293,16 @@ impl InvocationBudget {
             started_millis: epoch_millis(),
             executed: 0,
             max_calls: config.max_function_calls,
-            // Validated as finite and positive by
-            // `FunctionInvocationConfig::validate`, which every run calls
-            // before reaching here.
-            max_duration: config.max_duration_seconds.map(Duration::from_secs_f64),
+            // `FunctionInvocationConfig::validate` — which every run calls
+            // before reaching here — rejects everything `try_from_secs_f64`
+            // does. The fallback is not dead weight for all that:
+            // `from_secs_f64` would *panic* on such a value, so a budget
+            // built by some future path that skipped validation degrades to
+            // an effectively unbounded one instead of taking the process
+            // down.
+            max_duration: config
+                .max_duration_seconds
+                .map(|seconds| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)),
         };
         // The limits always come from the live config, never from the parked
         // state: a caller who lowered a limit between runs means it, and a
@@ -880,6 +886,34 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     final_resp.messages = msgs;
                     final_resp.usage_details = aggregated_usage;
                     return Ok(final_resp);
+                }
+
+                // The wall-clock budget is checked again *here*, after the
+                // model call, because that call is itself part of the elapsed
+                // time it bounds. A provider response that takes longer than
+                // the remaining budget and comes back asking for tools would
+                // otherwise have its whole batch executed — the check above
+                // ran before the request, when the budget was still alive —
+                // which is the one thing a spent budget must not allow.
+                //
+                // Placed before the approval and declaration-only branches for
+                // the same reason the top-of-loop check precedes them: once
+                // the budget is spent this loop stops asking for tools at all,
+                // and opening a human-approval round trip whose calls could
+                // only come back unexecuted is worse than ending the run.
+                // Breaking here drops this response rather than carrying it,
+                // so no unanswered function call is left in the conversation;
+                // the failsafe below then asks the model once with tools off.
+                if let Some(reason) = budget.spent() {
+                    if budget_spent.is_none() {
+                        tracing::info!(
+                            reason,
+                            "function-invocation budget spent while the model was responding; \
+                             disabling tools for this request"
+                        );
+                    }
+                    options.tool_choice = Some(ToolMode::None);
+                    break;
                 }
 
                 // Human-in-the-loop gate: if *any* requested tool requires approval,

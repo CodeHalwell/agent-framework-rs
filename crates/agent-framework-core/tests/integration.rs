@@ -2,6 +2,7 @@
 //! mock chat client (no network).
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_framework_core::agent::AsToolOptions;
 use agent_framework_core::prelude::*;
@@ -3582,4 +3583,102 @@ async fn a_spent_budget_stops_executing_even_when_the_provider_ignores_tool_choi
         2,
         "one tool-calling iteration, then the final tools-off call"
     );
+}
+
+/// A chat client that takes `delay` to answer, wrapping another client.
+///
+/// The point is the *model call itself* consuming wall-clock budget, which no
+/// slow-tool test can exercise: a tool's time is charged after its batch runs,
+/// a provider's is charged while the loop is blocked waiting for it.
+#[derive(Clone)]
+struct SlowClient {
+    inner: MockClient,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl ChatClient for SlowClient {
+    async fn get_response(
+        &self,
+        messages: Vec<Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_response(messages, options).await
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        self.inner.get_streaming_response(messages, options).await
+    }
+}
+
+#[tokio::test]
+async fn a_slow_model_call_spends_the_duration_budget_before_its_tools_run() {
+    // The budget is a bound on the whole loop, and the model call is part of
+    // the loop. Checking only *before* each request means a provider that
+    // takes longer than the remaining budget and comes back asking for tools
+    // gets its entire batch executed on a budget that expired while it was
+    // thinking.
+    let counter = Arc::new(Mutex::new(0));
+    let inner = MockClient::new(vec![
+        ping_calls(1),
+        ChatResponse::from_text("answered without tools"),
+    ]);
+    let client = FunctionInvokingChatClient::new(SlowClient {
+        inner: inner.clone(),
+        delay: Duration::from_millis(60),
+    })
+    .with_config(FunctionInvocationConfig {
+        max_duration_seconds: Some(0.05),
+        ..Default::default()
+    });
+
+    let response = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "the budget expired during the model call, so its tools must not run"
+    );
+    assert_eq!(response.text(), "answered without tools");
+    assert_eq!(
+        inner.all_options().last().unwrap().tool_choice,
+        Some(ToolMode::None),
+        "the failsafe call asks the model to answer with what it has"
+    );
+}
+
+#[test]
+fn a_duration_budget_a_duration_cannot_hold_is_refused() {
+    // `f64::INFINITY` is greater than zero, so a bare positivity check lets it
+    // through — and `Duration::from_secs_f64` then *panics*, taking the
+    // process down over a configuration value.
+    for seconds in [f64::INFINITY, 1e30] {
+        let config = FunctionInvocationConfig {
+            max_duration_seconds: Some(seconds),
+            ..Default::default()
+        };
+        let err = match config.validate() {
+            Ok(()) => panic!("{seconds} should be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("finite duration"), "{seconds}: {err}");
+    }
+    // A very large but representable budget is still fine.
+    assert!(FunctionInvocationConfig {
+        max_duration_seconds: Some(86_400.0),
+        ..Default::default()
+    }
+    .validate()
+    .is_ok());
 }

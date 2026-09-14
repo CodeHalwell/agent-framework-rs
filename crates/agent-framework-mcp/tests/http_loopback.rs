@@ -293,3 +293,70 @@ async fn a_non_http_url_is_refused_at_construction() {
     }
     assert!(McpStreamableHttpTransport::new("https://h/mcp", Default::default(), None).is_ok());
 }
+
+#[tokio::test]
+async fn a_session_teardown_follows_a_same_origin_redirect() {
+    // `close()` is best effort, but "best effort" means the request reaches
+    // the endpoint. With a client that does not follow redirects, a bare send
+    // reads the 3xx as a delivered teardown and the server session stays open
+    // forever.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+
+    let server = std::thread::spawn(move || {
+        // 1: the JSON-RPC call that establishes the session.
+        let mut first = accept_with_timeout(&listener);
+        let (_, _) = read_request_parts(&mut first);
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-42\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        first.write_all(response.as_bytes()).expect("write");
+        first.flush().expect("flush");
+
+        // 2: the DELETE, answered with a same-origin redirect.
+        let mut second = accept_with_timeout(&listener);
+        let (redirected, _) = read_request_parts(&mut second);
+        write_redirect(&mut second, "/mcp/v2");
+
+        // 3: the DELETE again, at the redirect target.
+        let mut third = accept_with_timeout(&listener);
+        let (followed, _) = read_request_parts(&mut third);
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        third.write_all(ok.as_bytes()).expect("write");
+        third.flush().expect("flush");
+        (redirected, followed)
+    });
+
+    let transport = McpStreamableHttpTransport::new(
+        format!("http://{addr}/mcp"),
+        Default::default(),
+        Some(Duration::from_secs(10)),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), transport.call("ping", json!({})))
+        .await
+        .expect("client call timed out")
+        .expect("client call failed");
+    assert_eq!(transport.session_id().await.as_deref(), Some("sess-42"));
+
+    tokio::time::timeout(Duration::from_secs(10), transport.close())
+        .await
+        .expect("close timed out")
+        .expect("close failed");
+
+    let (redirected, followed) = server.join().expect("server panicked");
+    assert!(redirected.starts_with("DELETE /mcp"), "{redirected}");
+    assert!(
+        followed.starts_with("DELETE /mcp/v2"),
+        "the teardown must reach the redirect target: {followed}"
+    );
+    assert!(
+        followed
+            .to_ascii_lowercase()
+            .contains("mcp-session-id: sess-42"),
+        "and must still carry the session it is tearing down: {followed}"
+    );
+}

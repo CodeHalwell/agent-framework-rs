@@ -890,10 +890,17 @@ impl VectorCollection for AzureAISearchCollection {
             self.key_string(&key)?;
             keys.push(key);
             let mut stored = self.definition.to_storage(record)?;
+            // `upload`, not `mergeOrUpload`: the trait contract is insert-or-
+            // **replace**, and `InMemoryVectorStore` replaces wholesale. Merge
+            // semantics keep a field the new record omits, so a record whose
+            // optional field was cleared would keep its old value here and
+            // nowhere else — still matching filters and still coming back in
+            // search results, which is a divergence a caller would only find
+            // in production.
             stored
                 .as_object_mut()
                 .ok_or_else(|| Error::Configuration("record is not a JSON object".into()))?
-                .insert("@search.action".into(), json!("mergeOrUpload"));
+                .insert("@search.action".into(), json!("upload"));
             actions.push(stored);
         }
         if actions.is_empty() {
