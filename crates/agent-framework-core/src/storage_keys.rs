@@ -36,7 +36,7 @@ fn is_literal_safe(value: &str) -> bool {
 ///
 /// `encoded_prefix` distinguishes components that might encode the same
 /// identifier (a prefix segment and a session segment, say); it must start
-/// with `~`, which [`is_literal_safe`] rejects, so an encoded segment can
+/// with `~`, which the literal alphabet excludes, so an encoded segment can
 /// never be mistaken for a literal one.
 ///
 /// A literal-safe value is returned as-is, so the common case — a key prefix

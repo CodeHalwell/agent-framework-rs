@@ -828,7 +828,7 @@ pub struct FunctionInvocationConfig {
     /// Best-effort, checked **after** each batch completes: a model that
     /// requests twenty parallel calls when four remain in the budget runs all
     /// twenty, and the loop stops afterwards. Reaching the limit does not
-    /// fail the run — tools are disabled ([`ToolMode::None`]) and the model
+    /// fail the run — tools are disabled ([`ToolMode::None`](crate::types::ToolMode)) and the model
     /// is asked to answer with what it has, so the caller gets an answer
     /// rather than an error.
     pub max_function_calls: Option<usize>,
