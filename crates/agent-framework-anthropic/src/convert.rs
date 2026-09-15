@@ -228,6 +228,62 @@ fn append_response_format_instructions(
     })
 }
 
+/// Render a reasoning content back as an Anthropic thinking block, or `None`
+/// when there is nothing the API would accept.
+///
+/// A thinking block is **signed**: with extended thinking enabled, the
+/// Messages API validates the `signature` against the block's exact text, and
+/// rejects a thinking block that has no signature at all. Three cases follow
+/// from that:
+///
+/// * A block this client decoded is replayed **verbatim** from its
+///   `raw_representation` — re-serializing from `text` would reproduce it
+///   only by luck (any field Anthropic adds, any escaping difference, and the
+///   signature no longer matches what it signed). This also covers
+///   `redacted_thinking`, whose payload is encrypted and has no text at all.
+/// * A block carrying a signature but no raw form (one restored from a
+///   serialized session, say) is rebuilt from `text` + `signature`.
+/// * An **unsigned** reasoning content is dropped. It is either reasoning
+///   from another provider that this conversation carried over, or text a
+///   caller synthesized; either way the API refuses it, so sending it turns
+///   a working request into a 400. Dropping loses nothing a model can use —
+///   thinking is not context for the next turn, the signature is.
+///
+/// The rebuild takes `protected_data` at face value, which is the one place
+/// this can still be wrong: the field is deliberately provider-opaque (Gemini
+/// puts a `thoughtSignature` in it), so a reasoning content carried in from
+/// another provider *with* a signature and *without* a raw block is rebuilt
+/// as an Anthropic thinking block and rejected by the API. Nothing in the
+/// content model records provenance — upstream's does not either — and the
+/// alternative, dropping every signed block that has no Anthropic raw form,
+/// would discard the case this path exists for. A caller moving one
+/// conversation between providers should drop reasoning content at that
+/// boundary.
+fn thinking_block(content: &TextReasoningContent) -> Option<Value> {
+    if let Some(raw) = content.raw_representation.as_ref() {
+        match raw.get("type").and_then(Value::as_str) {
+            // Encrypted and signature-free by construction: replaying it
+            // verbatim is the only thing anyone can do with it.
+            Some("redacted_thinking") => return Some(raw.clone()),
+            // Verbatim *only when signed*, which is the same rule the
+            // rebuilt path below applies. A raw block whose signature was
+            // stripped — or one a caller hand-built — is refused by the API
+            // exactly like any other unsigned thinking block, so it must not
+            // take a shortcut past that rule just for being raw.
+            Some("thinking") if raw.get("signature").and_then(Value::as_str).is_some() => {
+                return Some(raw.clone())
+            }
+            _ => {}
+        }
+    }
+    let signature = content.protected_data.as_ref()?;
+    Some(json!({
+        "type": "thinking",
+        "thinking": content.text,
+        "signature": signature,
+    }))
+}
+
 /// Convert framework messages into Anthropic's `messages` array.
 ///
 /// Anthropic has no `system` or `tool` role: everything that isn't
@@ -246,7 +302,9 @@ pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
             match content {
                 Content::Text(t) => blocks.push(json!({ "type": "text", "text": t.text })),
                 Content::TextReasoning(t) => {
-                    blocks.push(json!({ "type": "thinking", "thinking": t.text }))
+                    if let Some(block) = thinking_block(t) {
+                        blocks.push(block);
+                    }
                 }
                 Content::FunctionCall(fc) => blocks.push(function_call_block(fc)),
                 Content::FunctionResult(fr) => blocks.push(function_result_block(fr)),
@@ -687,6 +745,14 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                     Some(nested.cloned().unwrap_or(Value::Null)),
                 )));
             }
+            // The `signature` is not decoration: with extended thinking on,
+            // the Messages API requires every thinking block in a replayed
+            // assistant turn to carry the one it was issued with, and
+            // validates it against the block's exact text. Kept in
+            // `protected_data` (the same field a Gemini thought signature
+            // uses) and the whole block in `raw_representation`, so
+            // `messages_to_anthropic` can replay it byte-for-byte rather than
+            // re-serializing text the signature would no longer match.
             "thinking" => {
                 out.push(Content::TextReasoning(TextReasoningContent {
                     text: block
@@ -695,6 +761,24 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                         .unwrap_or_default()
                         .to_string(),
                     annotations: None,
+                    protected_data: block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    raw_representation: Some(block.clone()),
+                }));
+            }
+            // An encrypted thinking block: no readable text, and replaying it
+            // verbatim is the only thing a caller can do with it. Dropping it
+            // (which is what the catch-all below used to do) breaks a
+            // tool-call turn that followed one, because the API expects the
+            // assistant turn it replays to start with the thinking blocks it
+            // produced.
+            "redacted_thinking" => {
+                out.push(Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    annotations: None,
+                    raw_representation: Some(block.clone()),
                     ..Default::default()
                 }));
             }
@@ -2279,6 +2363,179 @@ mod tests {
             }
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    // endregion
+
+    // region: extended-thinking signatures
+
+    #[test]
+    fn a_thinking_block_keeps_its_signature() {
+        let contents = parse_content_blocks(&[json!({
+            "type": "thinking",
+            "thinking": "let me work through this",
+            "signature": "c2lnbmF0dXJl",
+        })]);
+        match &contents[0] {
+            Content::TextReasoning(t) => {
+                assert_eq!(t.text, "let me work through this");
+                assert_eq!(t.protected_data.as_deref(), Some("c2lnbmF0dXJl"));
+                assert_eq!(t.raw_representation.as_ref().unwrap()["type"], "thinking");
+            }
+            other => panic!("expected reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_signed_thinking_block_replays_verbatim() {
+        // The signature is validated against the block's exact text, so the
+        // replay has to be the block the API sent, not a re-serialization of
+        // the fields this port happened to decode.
+        let block = json!({
+            "type": "thinking",
+            "thinking": "step one",
+            "signature": "c2ln",
+            "some_future_field": 7,
+        });
+        let contents = parse_content_blocks(std::slice::from_ref(&block));
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(Role::assistant(), contents),
+        ]);
+        assert_eq!(out[1]["content"][0], block);
+    }
+
+    #[test]
+    fn a_redacted_thinking_block_survives_the_round_trip() {
+        // Encrypted, textless, and still required: a tool-call turn that
+        // followed one is rejected if the replayed assistant turn is missing
+        // it. The catch-all used to drop it.
+        let block = json!({ "type": "redacted_thinking", "data": "EncryptedPayload" });
+        let contents = parse_content_blocks(std::slice::from_ref(&block));
+        assert_eq!(contents.len(), 1);
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(Role::assistant(), contents),
+        ]);
+        assert_eq!(out[1]["content"][0], block);
+    }
+
+    #[test]
+    fn a_signature_without_a_raw_block_is_rebuilt() {
+        // What a session restored from a serialized blob looks like: the
+        // fields survived, the raw JSON did not.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(TextReasoningContent {
+                    text: "recalled".into(),
+                    protected_data: Some("c2ln".into()),
+                    ..Default::default()
+                })],
+            ),
+        ]);
+        assert_eq!(
+            out[1]["content"][0],
+            json!({ "type": "thinking", "thinking": "recalled", "signature": "c2ln" })
+        );
+    }
+
+    #[test]
+    fn an_unsigned_raw_thinking_block_is_not_replayed_either() {
+        // The verbatim-replay shortcut exists because a signature covers the
+        // block's exact text — not as a way past the unsigned rule. A raw
+        // block whose signature was stripped is refused by the API like any
+        // other, so it must not ride through just for being raw.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![
+                    Content::TextReasoning(TextReasoningContent {
+                        text: "tampered".into(),
+                        raw_representation: Some(json!({
+                            "type": "thinking",
+                            "thinking": "tampered",
+                        })),
+                        ..Default::default()
+                    }),
+                    Content::text("the answer"),
+                ],
+            ),
+        ]);
+        assert_eq!(out[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out[1]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn a_raw_thinking_block_without_a_signature_falls_back_to_the_rebuilt_form() {
+        // …and when the signature survived on the content even though the raw
+        // block lost it, the rebuilt form is sent rather than nothing.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(TextReasoningContent {
+                    text: "recalled".into(),
+                    protected_data: Some("c2ln".into()),
+                    raw_representation: Some(json!({
+                        "type": "thinking",
+                        "thinking": "recalled",
+                    })),
+                    ..Default::default()
+                })],
+            ),
+        ]);
+        assert_eq!(
+            out[1]["content"][0],
+            json!({ "type": "thinking", "thinking": "recalled", "signature": "c2ln" })
+        );
+    }
+
+    #[test]
+    fn an_unsigned_thinking_block_is_dropped_rather_than_sent() {
+        // The API rejects an unsigned thinking block outright when extended
+        // thinking is on, so emitting one turns a working request into a 400.
+        // This is reasoning carried in from another provider, or synthesized
+        // by a caller — neither is something Anthropic will accept.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![
+                    Content::TextReasoning(TextReasoningContent {
+                        text: "unsigned musing".into(),
+                        ..Default::default()
+                    }),
+                    Content::text("the answer"),
+                ],
+            ),
+        ]);
+        assert_eq!(out[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out[1]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn a_reasoning_raw_representation_from_another_provider_is_not_replayed() {
+        // `raw_representation` is provider-shaped: an OpenAI Responses
+        // reasoning item in that field must not be forwarded to Anthropic as
+        // though it were a thinking block.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::TextReasoning(TextReasoningContent {
+                    text: "summary".into(),
+                    raw_representation: Some(json!({ "type": "reasoning", "id": "rs_1" })),
+                    ..Default::default()
+                })],
+            ),
+        ]);
+        // No signature either, so nothing is sent and the assistant message
+        // is skipped entirely (Anthropic rejects an empty content array).
+        assert_eq!(out.len(), 1, "got {out:?}");
+        assert_eq!(out[0]["role"], "user");
     }
 
     // endregion

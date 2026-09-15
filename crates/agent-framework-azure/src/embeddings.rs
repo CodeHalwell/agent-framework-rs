@@ -15,7 +15,7 @@ use agent_framework_core::types::{EmbeddingGenerationOptions, GeneratedEmbedding
 use serde_json::{json, Map, Value};
 
 use crate::credential::TokenCredential;
-use crate::{parse_retry_after, DEFAULT_API_VERSION};
+use crate::{parse_retry_after, DEFAULT_EMBEDDING_API_VERSION};
 
 enum Auth {
     ApiKey(String),
@@ -50,7 +50,7 @@ impl AzureOpenAIEmbeddingClient {
                 http: reqwest::Client::new(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: DEFAULT_EMBEDDING_API_VERSION.to_string(),
                 auth: Auth::ApiKey(api_key.into()),
             }),
         }
@@ -68,7 +68,7 @@ impl AzureOpenAIEmbeddingClient {
                 http: reqwest::Client::new(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
-                api_version: DEFAULT_API_VERSION.to_string(),
+                api_version: DEFAULT_EMBEDDING_API_VERSION.to_string(),
                 auth: Auth::Credential(credential),
             }),
         }
@@ -92,9 +92,8 @@ impl AzureOpenAIEmbeddingClient {
         Ok(client)
     }
 
-    /// Override the API version (default [`DEFAULT_API_VERSION`]).
+    /// Override the API version (default [`DEFAULT_EMBEDDING_API_VERSION`]).
     ///
-    /// [`DEFAULT_API_VERSION`]: crate::AzureOpenAIClient::api_version
     pub fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
         arc_inner(&mut self.inner).api_version = api_version.into();
         self
