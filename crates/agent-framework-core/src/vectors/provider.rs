@@ -275,6 +275,8 @@ impl VectorCollectionContextProviderBuilder {
                 })
             })?;
 
+        let key_type = definition.key_field().type_.clone();
+
         let mut embed_source = None;
         if let Some(name) = &self.embed_from_field {
             let field = definition.try_get_field(name).ok_or_else(|| {
@@ -322,6 +324,7 @@ impl VectorCollectionContextProviderBuilder {
                 Arc::clone(&self.collection),
                 self.scope_filter.clone(),
                 self.max_tool_batch_size,
+                key_type.clone(),
                 name_of(VectorToolKind::Get),
                 approval(VectorToolKind::Get),
             ));
@@ -343,6 +346,7 @@ impl VectorCollectionContextProviderBuilder {
                 Arc::clone(&self.collection),
                 self.scope_filter.clone(),
                 self.max_tool_batch_size,
+                key_type.clone(),
                 name_of(VectorToolKind::Delete),
                 approval(VectorToolKind::Delete),
             ));
@@ -526,14 +530,23 @@ fn in_scope(record: &Value, scope_filter: &Option<FilterExpression>) -> Result<b
     }
 }
 
-fn string_array_schema(description: &str, max_items: usize) -> Value {
+/// The `{ "keys": [...] }` schema for the read and delete tools.
+///
+/// The item type comes from the *key field's* declared type rather than
+/// being hardcoded to `string`: a collection's key is a `serde_json::Value`,
+/// and a key declared `int` is stored and looked up as the JSON number `42`,
+/// not the string `"42"` — `InMemoryVectorStore` keys its map on
+/// `Value::to_string()`, so the two do not collide, they simply never match.
+/// Telling the model `string` on such a collection guarantees every read and
+/// delete silently finds nothing. An undeclared key type stays unconstrained.
+fn keys_schema(description: &str, max_items: usize, key_type: Option<&str>) -> Value {
     json!({
         "type": "object",
         "properties": {
             "keys": {
                 "type": "array",
                 "description": description,
-                "items": { "type": "string" },
+                "items": { "type": json_type_for(key_type) },
                 "maxItems": max_items,
             }
         },
@@ -624,10 +637,15 @@ fn build_get_tool(
     collection: Arc<dyn VectorCollection>,
     scope_filter: Option<FilterExpression>,
     max_batch_size: usize,
+    key_type: Option<String>,
     name: String,
     approval: ApprovalMode,
 ) -> ToolDefinition {
-    let schema = string_array_schema("The keys of the records to read.", max_batch_size);
+    let schema = keys_schema(
+        "The keys of the records to read.",
+        max_batch_size,
+        key_type.as_deref(),
+    );
     FunctionTool::new(
         name,
         "Read stored records by key.",
@@ -789,10 +807,15 @@ fn build_delete_tool(
     collection: Arc<dyn VectorCollection>,
     scope_filter: Option<FilterExpression>,
     max_batch_size: usize,
+    key_type: Option<String>,
     name: String,
     approval: ApprovalMode,
 ) -> ToolDefinition {
-    let schema = string_array_schema("The keys of the records to delete.", max_batch_size);
+    let schema = keys_schema(
+        "The keys of the records to delete.",
+        max_batch_size,
+        key_type.as_deref(),
+    );
     FunctionTool::new(
         name,
         "Delete stored records by key.",
@@ -1156,6 +1179,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("limit of 2"), "{err}");
+    }
+
+    #[test]
+    fn the_key_schema_follows_the_key_fields_declared_type() {
+        // A collection keyed by an integer stores and looks up the JSON
+        // number `42`; `InMemoryVectorStore` keys its map on
+        // `Value::to_string()`, so a model told `string` sends `"42"`, which
+        // does not collide with `42` — it simply never matches, and every
+        // read and delete silently finds nothing.
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("int"),
+            VectorStoreField::data("text").with_type("str"),
+            VectorStoreField::vector("embedding", 3),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let collection: Arc<dyn VectorCollection> =
+            Arc::from(store.get_collection("notes", definition).unwrap());
+        let provider = builder(collection).build().unwrap();
+        for name in ["get", "delete"] {
+            let tool = provider.tools().iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                tool.parameters["properties"]["keys"]["items"]["type"],
+                json!("integer"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_key_still_reads_as_a_string() {
+        let provider = builder(collection()).build().unwrap();
+        let tool = provider.tools().iter().find(|t| t.name == "get").unwrap();
+        assert_eq!(
+            tool.parameters["properties"]["keys"]["items"]["type"],
+            json!("string")
+        );
     }
 
     #[test]

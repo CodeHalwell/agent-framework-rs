@@ -72,7 +72,26 @@ pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<S
 /// type added after this was written must not arrive unevaluated. Mirrors
 /// upstream's `_serialize_for_evaluation` (#8370).
 fn serialize_for_evaluation(content: &Content) -> String {
-    serde_json::to_string(content).unwrap_or_else(|_| format!("{content:?}"))
+    let mut value = match serde_json::to_value(content) {
+        Ok(value) => value,
+        Err(_) => return format!("{content:?}"),
+    };
+    // `FunctionResultContent::exception` redacts to a fixed marker when it is
+    // serialized, which is right for persistence (#8235) and exactly wrong
+    // here: a failing tool's diagnostic is one of the likeliest places for a
+    // connection string or a quoted row to appear, which is what this check
+    // exists to catch. Evaluating the marker instead would let a tool failure
+    // carry data straight past the policy. The real text goes to Purview and
+    // nowhere else — this string is submitted, never stored.
+    if let Content::FunctionResult(result) = content {
+        if let (Some(exception), Some(object)) = (&result.exception, value.as_object_mut()) {
+            object.insert(
+                "exception".to_string(),
+                serde_json::Value::String(exception.clone()),
+            );
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| format!("{content:?}"))
 }
 
 /// The raw bytes behind a base64 `data:` URI, or `None` when it is not one.
@@ -118,8 +137,20 @@ fn map_content(content: &Content) -> Option<PurviewContent> {
         // Token counts, not user data.
         Content::Usage(_) => None,
         Content::Text(t) => (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into()),
+        // Not `text.is_empty()` alone: a reasoning item can carry its payload
+        // in `protected_data` or `raw_representation` with no text at all —
+        // which is exactly the shape Chat Completions' `reasoning_details`
+        // takes — and some providers put plain reasoning text in there.
+        // Dropping it would leave a content type this same change introduced
+        // unevaluated, against this module's own contract.
         Content::TextReasoning(t) => {
-            (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into())
+            if !t.text.is_empty() {
+                Some(PurviewTextContent::new(&t.text).into())
+            } else if t.protected_data.is_some() || t.raw_representation.is_some() {
+                Some(PurviewTextContent::new(serialize_for_evaluation(content)).into())
+            } else {
+                None
+            }
         }
         Content::Data(d) => match decode_data_uri(&d.uri) {
             // Graph rejects an empty payload, and an empty one cannot violate
@@ -526,6 +557,57 @@ mod tests {
         let mapped = entries(&message);
         assert_eq!(mapped.len(), 2);
         assert_eq!(text_of(&mapped[0]), "the part I did answer");
+    }
+
+    #[test]
+    fn a_tool_failures_diagnostic_reaches_purview_despite_being_redacted_on_disk() {
+        // `FunctionResultContent::exception` serializes to a fixed marker so
+        // it is never persisted (#8235). That redaction must not reach the
+        // DLP check: a failing tool's diagnostic is one of the likeliest
+        // places for a connection string or a quoted row to surface, which is
+        // precisely what this middleware exists to catch.
+        let mut result = agent_framework_core::types::FunctionResultContent::new("c1", None);
+        result.exception =
+            Some("connect failed: Server=db1;Password=hunter2 while reading row 17".into());
+        let message =
+            Message::with_contents(Role::tool(), vec![Content::FunctionResult(result.clone())]);
+        let submitted = text_of(&entries(&message)[0]);
+        assert!(submitted.contains("hunter2"), "{submitted}");
+        assert!(
+            !submitted.contains(agent_framework_core::types::FUNCTION_INVOCATION_ERROR_MARKER),
+            "the marker must not stand in for the text here: {submitted}"
+        );
+
+        // And the redaction still holds everywhere else.
+        let persisted = serde_json::to_string(&result).unwrap();
+        assert!(!persisted.contains("hunter2"), "{persisted}");
+    }
+
+    #[test]
+    fn reasoning_whose_payload_is_not_its_text_is_still_evaluated() {
+        // Chat Completions' `reasoning_details` rides in `protected_data`
+        // with an empty `text`, so an `is_empty()` check on the text alone
+        // dropped a content type this same change introduced.
+        let reasoning = agent_framework_core::types::TextReasoningContent {
+            protected_data: Some(
+                r#"[{"type":"reasoning.text","text":"the account number is 12345"}]"#.into(),
+            ),
+            ..Default::default()
+        };
+        let message =
+            Message::with_contents(Role::assistant(), vec![Content::TextReasoning(reasoning)]);
+        let mapped = entries(&message);
+        assert_eq!(mapped.len(), 1);
+        assert!(text_of(&mapped[0]).contains("12345"));
+    }
+
+    #[test]
+    fn reasoning_with_neither_text_nor_payload_has_nothing_to_evaluate() {
+        let message = Message::with_contents(
+            Role::assistant(),
+            vec![Content::TextReasoning(Default::default())],
+        );
+        assert!(entries(&message).is_empty());
     }
 
     #[test]

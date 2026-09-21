@@ -73,12 +73,24 @@ async fn main() -> Result<()> {
     ])?;
 
     let store = CosmosVectorStore::new(endpoint, key, database)?;
-    let docs = store.collection("af-vector-demo", definition)?;
+    // A fresh container per run. The cleanup at the end of this example
+    // deletes it, and a fixed name would mean deleting whatever was already
+    // sitting at that name in the account — which is not the example's to
+    // destroy.
+    let container = format!(
+        "af-vector-demo-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+    let docs = store.collection(&container, definition)?;
 
     // Creates the container with its vector and indexing policies, or — when
-    // it already exists — checks that what is there can serve the searches
-    // below. A vector policy cannot be changed after creation, so a mismatch
-    // is reported here rather than discovered as a wrongly-ranked result.
+    // it already exists, which for the fresh name above it will not — checks
+    // that what is there can serve the searches below. A vector policy cannot
+    // be changed after creation, so a mismatch is reported here rather than
+    // discovered as a wrongly-ranked result.
     docs.ensure_collection_exists().await?;
 
     let corpus = [
@@ -152,7 +164,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Leave the account as we found it.
+    // Leave the account as we found it: this container is this run's own, so
+    // deleting it takes nothing with it.
     docs.ensure_collection_deleted().await?;
+    println!("\ndeleted {container}");
     Ok(())
 }

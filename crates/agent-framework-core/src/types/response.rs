@@ -445,6 +445,26 @@ impl ChatResponse {
 ///   merging on a hunch.
 ///
 /// Mirrors upstream's `_merge_function_call_content` (#8337).
+/// Whether an existing call and an incoming delta can be the same occurrence.
+///
+/// A shared provider `call_id` is not proof of that, because a provider is
+/// free to reuse one. The occurrence id, when both sides carry it, is:
+///
+/// * neither identified, or only the incoming one — nothing contradicts the
+///   merge, so the `call_id` decides;
+/// * the existing call identified and the delta not — an untagged chunk must
+///   not be absorbed by a call already pinned to an occurrence;
+/// * both identified — they have to name the *same* occurrence. Different
+///   ids are different calls, and merging them appends one call's arguments
+///   onto the other's.
+fn same_occurrence(existing: Option<&str>, incoming: Option<&str>) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 fn merge_target_for_call(contents: &[Content], incoming: &FunctionCallContent) -> Option<usize> {
     if incoming.call_id.is_empty() {
         return match contents.last() {
@@ -459,7 +479,7 @@ fn merge_target_for_call(contents: &[Content], incoming: &FunctionCallContent) -
         .find_map(|(i, c)| match c {
             Content::FunctionCall(existing)
                 if existing.call_id == incoming.call_id
-                    && !(existing.id.is_some() && incoming.id.is_none()) =>
+                    && same_occurrence(existing.id.as_deref(), incoming.id.as_deref()) =>
             {
                 Some(i)
             }
@@ -1306,6 +1326,41 @@ mod tests {
         ]);
         let calls = calls_of(&response);
         assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].1, "{\"x\":1}");
+    }
+
+    #[test]
+    fn two_occurrences_sharing_a_call_id_never_merge() {
+        // The guard used to read "exclude only when the incoming delta has no
+        // id", so two calls that both carried ids — different ones — still
+        // merged on a shared provider call_id, appending the second's
+        // arguments onto the first.
+        let mut first = raw_call("a", "one", "{\"x\":1}");
+        first.id = Some("af-call-1".into());
+        let mut second = raw_call("a", "two", "{\"y\":2}");
+        second.id = Some("af-call-2".into());
+        let response = ChatResponse::from_updates(vec![call_update(first), call_update(second)]);
+        let calls = calls_of(&response);
+        assert_eq!(
+            calls.len(),
+            2,
+            "different occurrences stay apart: {calls:?}"
+        );
+        assert_eq!(calls[0].1, "{\"x\":1}");
+        assert_eq!(calls[1].1, "{\"y\":2}");
+    }
+
+    #[test]
+    fn deltas_naming_the_same_occurrence_still_merge() {
+        // The other half: matching ids are the strongest evidence there is
+        // that two fragments belong together, so they must not be split.
+        let mut first = raw_call("a", "one", "{\"x\":");
+        first.id = Some("af-call-1".into());
+        let mut rest = raw_call("a", "", "1}");
+        rest.id = Some("af-call-1".into());
+        let response = ChatResponse::from_updates(vec![call_update(first), call_update(rest)]);
+        let calls = calls_of(&response);
+        assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].1, "{\"x\":1}");
     }
 

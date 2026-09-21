@@ -78,10 +78,12 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Three corrections from review
+#### Eight corrections from review
 
-Codex reviewed the PR and raised four findings; three were right and are
-folded into the rows above.
+Codex and Copilot reviewed the PR and raised eleven distinct findings between
+them; eight were right and are folded into the rows above. Two of the eight
+were *interactions between changes in this same pass* — the kind a per-change
+review does not see.
 
 * **The Purview catch-all was a bypass, not a fix** (row above, rewritten).
   The first attempt optimized for the `ignore_exceptions = true` case and
@@ -97,8 +99,40 @@ folded into the rows above.
   so the Cosmos rule broke the portability promise the `VectorStore` pair
   exists for, and contradicted the upsert tool in the same PR, whose schema
   requires only the key and the embedding source.
+* **The exception redaction blinded the DLP check** — the first of the two
+  self-inflicted interactions. Purview evaluates a tool result by serializing
+  it, and serializing is exactly what now replaces `exception` with a marker,
+  so a failing tool's diagnostic reached the policy as the word
+  `FunctionInvocationError`. Both changes are right on their own and wrong
+  together: the text is the likeliest place for a connection string to
+  appear, which is why it is redacted *and* why it must be evaluated. Purview
+  now builds an evaluation-only view carrying the real text; persistence is
+  untouched.
+* **Reasoning carried in `protected_data` went unevaluated** — the second.
+  The `reasoning_details` support added in this same pass stores its payload
+  with an empty `text`, and Purview's mapper skipped a reasoning item on
+  `text.is_empty()`. So the pass introduced a content type and a hole for it
+  in the same breath, against the module's own "everything but `usage`"
+  contract.
+* **Two streamed calls sharing a `call_id` merged when both were
+  identified.** The guard excluded an *untagged* delta from an identified
+  call but said nothing about two different occurrence ids, so the second
+  call's arguments were appended onto the first's — reproduced as
+  `{"x":1}{"y":2}` before fixing.
+* **The generated key schema always said `string`.** A collection keyed by an
+  integer stores `42`, and `InMemoryVectorStore` keys on
+  `Value::to_string()`, so a model told `string` sends `"42"`, which does not
+  collide — it never matches, and every read and delete silently finds
+  nothing. The item type now comes from the key field's declared type.
+* **The Cosmos example deleted a pre-existing container.** Its cleanup was
+  unconditional on a fixed name, so running it against an account that
+  already had `af-vector-demo` destroyed it and its records — under a comment
+  reading "leave the account as we found it". It now uses a fresh name per
+  run, so cleanup can only remove what that run created.
 
-The fourth, a P1 claiming Cosmos `VectorDistance` returns a lower-is-closer
+Three findings were rejected. Two were Copilot repeating, on the pre-fix
+commit, the multi-vector and Cosmos-upsert findings already fixed above. The
+third, a Codex P1 claiming Cosmos `VectorDistance` returns a lower-is-closer
 distance for cosine and dot product, is **wrong**, and was rejected against
 Microsoft's documentation rather than on judgement: `VECTORDISTANCE`
 "returns the similarity score", the container policy reference gives cosine
