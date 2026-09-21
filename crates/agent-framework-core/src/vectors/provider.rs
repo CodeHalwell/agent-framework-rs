@@ -240,14 +240,6 @@ impl VectorCollectionContextProviderBuilder {
         }
         let definition = self.collection.definition().clone();
 
-        // A filter naming a field the collection does not declare would fail
-        // at the first tool call rather than here, where the caller can see
-        // it. `matches` reports it as an error for the same reason.
-        if let Some(filter) = &self.scope_filter {
-            filter.validate()?;
-            validate_filter_fields(filter, &definition)?;
-        }
-
         let key_type = definition.key_field().type_.clone();
 
         let mut embed_source = None;
@@ -284,6 +276,16 @@ impl VectorCollectionContextProviderBuilder {
                 }
             }
             embed_source = Some(name.clone());
+        }
+
+        // A filter the enabled tools cannot honor would fail — or silently
+        // match nothing — at the first tool call rather than here, where the
+        // caller can see it.
+        if let Some(filter) = &self.scope_filter {
+            filter.validate()?;
+            let locally_evaluated =
+                self.include_get || self.include_delete || embed_source.is_some();
+            validate_filter_fields(filter, &definition, locally_evaluated)?;
         }
 
         // Only search and upsert touch a vector; get and delete work by key.
@@ -514,22 +516,60 @@ fn default_instructions(tools: &[ToolDefinition]) -> Vec<String> {
     out
 }
 
-/// Refuse a scope filter naming a field the collection does not declare.
+/// Refuse a scope filter the enabled tools cannot actually honor.
+///
+/// Every leaf must name a declared field. Beyond that, `locally_evaluated`
+/// asks for more, because `get`, `delete` and `upsert` check the scope by
+/// running [`FilterExpression::matches`] over a record in this process rather
+/// than handing the filter to the store:
+///
+/// * A **provider operator** (`azure_ai_search.match`) has no local meaning —
+///   `matches` errors on it — so those tools would fail on every call while
+///   search, which passes the filter to the connector, worked fine.
+/// * A **vector field** predicate cannot be answered either: `get` and
+///   `delete` fetch with `include_vectors = false`, and `upsert` checks the
+///   scope before the embedding it is about to derive exists. A missing field
+///   is a non-match, so instead of failing, those tools would quietly report
+///   every record as out of scope — hiding reads and refusing writes with no
+///   error to explain it.
+///
+/// Refused here rather than discovered there. A search-only provider may
+/// still carry either, since nothing evaluates it locally.
 fn validate_filter_fields(
     filter: &FilterExpression,
     definition: &VectorStoreCollectionDefinition,
+    locally_evaluated: bool,
 ) -> Result<()> {
     match filter {
         FilterExpression::Group(group) => {
             for child in &group.filters {
-                validate_filter_fields(child, definition)?;
+                validate_filter_fields(child, definition, locally_evaluated)?;
             }
             Ok(())
         }
         FilterExpression::Condition(condition) => {
-            if definition.try_get_field(&condition.field_name).is_none() {
+            let Some(field) = definition.try_get_field(&condition.field_name) else {
                 return Err(Error::Configuration(format!(
                     "scope filter names field '{}', which the collection does not declare",
+                    condition.field_name
+                )));
+            };
+            if !locally_evaluated {
+                return Ok(());
+            }
+            if !condition.operator.is_standard() {
+                return Err(Error::Configuration(format!(
+                    "scope filter uses the provider-specific operator '{}', which the get, \
+                     delete and upsert tools cannot evaluate; use a portable operator, or turn \
+                     those tools off and keep only search",
+                    condition.operator.as_str()
+                )));
+            }
+            if field.field_type == FieldType::Vector {
+                return Err(Error::Configuration(format!(
+                    "scope filter tests the vector field '{}', which the get, delete and upsert \
+                     tools cannot evaluate — they never hold the vector — so every record would \
+                     read as out of scope; scope on a data field instead",
                     condition.field_name
                 )));
             }
@@ -1128,6 +1168,61 @@ mod tests {
     fn a_single_vector_collection_still_needs_no_naming() {
         let provider = builder(collection()).build().unwrap();
         assert!(provider.tools().iter().any(|t| t.name == "search"));
+    }
+
+    #[test]
+    fn a_provider_operator_scope_is_refused_when_a_local_tool_needs_it() {
+        // `matches` errors on a provider operator, so get/delete/upsert would
+        // fail on every call while search worked — a split that only shows up
+        // at runtime.
+        let filter: FilterExpression = Filter::new(
+            "tenant",
+            crate::vectors::FilterOperator::provider("azure_ai_search.match").unwrap(),
+            Some(json!("acme")),
+        )
+        .unwrap()
+        .into();
+        let err = builder(collection())
+            .scope_filter(filter.clone())
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider-specific operator"), "{err}");
+
+        // A search-only provider hands the filter to the connector and never
+        // evaluates it here, so it is fine.
+        assert!(builder(collection())
+            .scope_filter(filter)
+            .include_get(false)
+            .include_delete(false)
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn a_vector_field_scope_is_refused_when_a_local_tool_needs_it() {
+        // `get`/`delete` fetch without vectors and `upsert` checks the scope
+        // before deriving one, so a missing field would read as a non-match:
+        // every record silently out of scope, with no error to explain it.
+        let filter: FilterExpression =
+            Filter::new("embedding", crate::vectors::FilterOperator::Exists, None)
+                .unwrap()
+                .into();
+        let err = builder(collection())
+            .scope_filter(filter)
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vector field"), "{err}");
+    }
+
+    #[test]
+    fn an_ordinary_scope_filter_is_still_accepted() {
+        assert!(builder(collection())
+            .scope_filter(Filter::eq("tenant", "acme").unwrap())
+            .embed_from_field("text")
+            .build()
+            .is_ok());
     }
 
     #[test]

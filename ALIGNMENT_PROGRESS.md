@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Fourteen corrections from review
+#### Fifteen corrections from review
 
-Across five review rounds, Codex and Copilot raised eighteen distinct
-findings; **fourteen were right** and are folded into the rows above. Two were
+Across six review rounds, Codex and Copilot raised nineteen distinct
+findings; **fifteen were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -172,6 +172,15 @@ a later fragment's payload onto the accumulated text.
   while the in-memory evaluator reported the bounds as incomparable.
   Differing bound types are refused now, and matching ones emit one guard
   rather than one per bound.
+* **A scope filter the local tools could not honor was accepted.** `get`,
+  `delete` and `upsert` check the scope by running `matches` over a record in
+  this process, where search hands the filter to the store. So a provider
+  operator (`azure_ai_search.match`), which `matches` errors on, would fail
+  those three on every call while search worked; and a vector-field
+  predicate, which they can never answer — they fetch without vectors, and
+  `upsert` checks before deriving one — would quietly report every record as
+  out of scope. Both refused at `build` now, and still allowed for a
+  search-only provider, which never evaluates the filter locally.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an
