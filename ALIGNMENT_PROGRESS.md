@@ -78,14 +78,23 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Eleven corrections from review
+#### Twelve corrections from review
 
-Across three review rounds, Codex and Copilot raised fourteen distinct
-findings; **eleven were right** and are folded into the rows above. Two were
+Across four review rounds, Codex and Copilot raised sixteen distinct
+findings; **twelve were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
 clean.
+
+One shape accounted for four of the twelve on its own: **a payload that does
+not live in the field the reader reads.** A tool failure's text sits in
+`exception`, a citation's in `snippet`, a reasoning item's in
+`protected_data` — and the Purview mapper read `text`. Each was found
+separately, one round apart, which is the argument for fixing a class rather
+than an instance: the last of them (a reasoning item carrying *both* text and
+payload) was the ordinary post-streaming shape, because `coalesce_text` folds
+a later fragment's payload onto the accumulated text.
 
 * **The Purview catch-all was a bypass, not a fix** (row above, rewritten).
   The first attempt optimized for the `ignore_exceptions = true` case and
@@ -144,6 +153,13 @@ clean.
   matched on another. It now translates to the `IS_NULL` form the `is_null`
   operator already emits, presence semantics included; non-scalar literals
   are still refused.
+* **Auxiliary fields went unevaluated whenever text was present.** The fix
+  for the two findings above keyed on the text being *empty*, which is the
+  wrong question: a citation's snippet and a reasoning item's
+  `protected_data` are data whether or not there is text beside them, and
+  after stream aggregation there usually is. Both branches now ask whether
+  anything beside the text holds data. A bare text item still goes as
+  itself.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an
@@ -151,11 +167,25 @@ clean.
   upsert failing at runtime. Refused at `build` now; an *undeclared* type is
   still left alone, since guessing would reject a good untyped text field.
 
-Three findings were rejected, all of them duplicates or wrong rather than
+Four findings were rejected, all of them duplicates or wrong rather than
 matters of taste. Two were a reviewer repeating, against a commit that had
-already moved, a finding fixed in the round before. The third, a Codex P1
-claiming Cosmos `VectorDistance` returns a lower-is-closer distance for
-cosine and dot product, is **wrong**, and was rejected against
+already moved, a finding fixed in the round before.
+
+A third claimed the Cosmos membership filters diverge from the portable
+evaluator on stored nulls — that `any_of(f, [null])` and `none_of(f, [1])`
+both match a present null in memory while Cosmos refuses them. They do not:
+`filters.rs` guards every operator but `Eq`/`Ne` with `if actual.is_null() {
+return Ok(false) }`, so a present null is a non-match for `In`/`NotIn` on
+both sides, and the Cosmos emit already mirrors it exactly — as it does the
+*other* half, where `Ne` emits `IS_NULL(x) OR x != p` precisely because a
+stored null does match there. Applying the suggestion would have created the
+divergence it was written to prevent. The neighbouring null finding, on
+`Eq`/`Ne`, was right and was fixed; being right about one is not evidence
+about the next.
+
+The fourth, a Codex P1 claiming Cosmos `VectorDistance` returns a
+lower-is-closer distance for cosine and dot product, is **wrong**, and was
+rejected against
 Microsoft's documentation rather than on judgement: `VECTORDISTANCE`
 "returns the similarity score", the container policy reference gives cosine
 as "-1 (least similar) to +1 (most similar)" and euclidean as "0 (most

@@ -123,6 +123,11 @@ fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Whether an annotation list carries anything. `Some([])` is not data.
+fn has_annotations(annotations: Option<&[agent_framework_core::types::Annotation]>) -> bool {
+    annotations.is_some_and(|a| !a.is_empty())
+}
+
 /// Map one content item onto the Purview content entry that fits it, or
 /// `None` when it carries no user data at all.
 ///
@@ -136,31 +141,32 @@ fn map_content(content: &Content) -> Option<PurviewContent> {
     match content {
         // Token counts, not user data.
         Content::Usage(_) => None,
-        // Annotations are not decoration: a citation carries a `snippet` of
-        // the source it quotes, plus a title and a URL. Sending only `t.text`
-        // leaves that quoted content unevaluated — and an annotated item with
-        // empty text unevaluated entirely — against this module's contract.
-        // The plain case still sends just the text, which is both cheaper and
-        // what upstream does.
-        Content::Text(t) => match t.annotations.as_deref() {
-            Some([_, ..]) => {
-                Some(PurviewTextContent::new(serialize_for_evaluation(content)).into())
-            }
-            _ => (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into()),
-        },
-        // Not `text.is_empty()` alone: a reasoning item can carry its payload
-        // in `protected_data` or `raw_representation` with no text at all —
-        // which is exactly the shape Chat Completions' `reasoning_details`
-        // takes — and some providers put plain reasoning text in there.
-        // Dropping it would leave a content type this same change introduced
-        // unevaluated, against this module's own contract.
-        Content::TextReasoning(t) => {
-            if !t.text.is_empty() {
-                Some(PurviewTextContent::new(&t.text).into())
-            } else if t.protected_data.is_some() || t.raw_representation.is_some() {
+        // Text and reasoning both carry payload *beside* their text, and the
+        // text being present says nothing about whether the rest is. A
+        // citation quotes its source in `snippet`, with a title and a URL; a
+        // reasoning item carries `reasoning_details` in `protected_data`.
+        // Streaming makes the combined shape the ordinary one rather than an
+        // edge case, because `coalesce_text` folds a later fragment's payload
+        // onto the accumulated text — so the test is "does anything beside
+        // the text hold data", not "is the text empty".
+        //
+        // The plain case still sends the bare text: cheaper, and what
+        // upstream does.
+        Content::Text(t) => {
+            if has_annotations(t.annotations.as_deref()) {
                 Some(PurviewTextContent::new(serialize_for_evaluation(content)).into())
             } else {
-                None
+                (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into())
+            }
+        }
+        Content::TextReasoning(t) => {
+            if has_annotations(t.annotations.as_deref())
+                || t.protected_data.is_some()
+                || t.raw_representation.is_some()
+            {
+                Some(PurviewTextContent::new(serialize_for_evaluation(content)).into())
+            } else {
+                (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into())
             }
         }
         Content::Data(d) => match decode_data_uri(&d.uri) {
@@ -637,6 +643,49 @@ mod tests {
         let mapped = entries(&message);
         assert_eq!(mapped.len(), 1);
         assert!(text_of(&mapped[0]).contains("12345"));
+    }
+
+    #[test]
+    fn reasoning_with_both_text_and_payload_submits_both() {
+        // The ordinary post-streaming shape: `coalesce_text` folds a later
+        // fragment's `protected_data` onto the accumulated text, so a summary
+        // being present is no reason to stop looking at the payload beside
+        // it.
+        let reasoning = agent_framework_core::types::TextReasoningContent {
+            text: "weighing the options".to_string(),
+            protected_data: Some(
+                r#"[{"type":"reasoning.text","text":"the account number is 12345"}]"#.into(),
+            ),
+            ..Default::default()
+        };
+        let message =
+            Message::with_contents(Role::assistant(), vec![Content::TextReasoning(reasoning)]);
+        let submitted = text_of(&entries(&message)[0]);
+        assert!(submitted.contains("12345"), "{submitted}");
+        assert!(submitted.contains("weighing the options"), "{submitted}");
+    }
+
+    #[test]
+    fn reasoning_with_only_text_is_submitted_as_itself() {
+        let reasoning = agent_framework_core::types::TextReasoningContent {
+            text: "just thinking".to_string(),
+            ..Default::default()
+        };
+        let message =
+            Message::with_contents(Role::assistant(), vec![Content::TextReasoning(reasoning)]);
+        assert_eq!(text_of(&entries(&message)[0]), "just thinking");
+    }
+
+    #[test]
+    fn an_empty_annotation_list_is_not_data() {
+        // `Some([])` must not push the plain case onto the serializing path.
+        let text = agent_framework_core::types::TextContent {
+            text: "plain".to_string(),
+            annotations: Some(Vec::new()),
+            ..Default::default()
+        };
+        let message = Message::with_contents(Role::user(), vec![Content::Text(text)]);
+        assert_eq!(text_of(&entries(&message)[0]), "plain");
     }
 
     #[test]
