@@ -118,9 +118,49 @@ fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     {
         return None;
     }
+    // Percent-decode before base64-decoding. RFC 2397's data segment is
+    // URL characters, so the payload may arrive escaped —
+    // `%63%32%56%6A%63%6D%56%30` is a legal spelling of `c2VjcmV0`, i.e.
+    // "secret". Decoding the escaped form as base64 fails (`%` is not in the
+    // alphabet), and `map_content` then evaluates the *serialized URI* as
+    // text: Purview classifies percent-encoded gibberish while any compliant
+    // consumer downstream extracts the real bytes. Whitespace goes the same
+    // way — producers wrap long payloads, and a strict decoder rejects what a
+    // lenient one accepts.
+    let payload = percent_decode(payload);
+    let payload: Vec<u8> = payload
+        .into_iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
     base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
+        .decode(payload)
         .ok()
+}
+
+/// Decode `%XX` escapes into bytes, leaving anything else as-is.
+///
+/// A malformed escape is left literal rather than dropped: this feeds a
+/// base64 decode that will reject it, which is the right outcome for a
+/// payload nobody can read.
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Whether an annotation list carries anything. `Some([])` is not data.
@@ -714,6 +754,47 @@ mod tests {
         let mapped = entries(&message);
         assert_eq!(mapped.len(), 1);
         match &mapped[0] {
+            crate::models::PurviewContent::Binary(b) => assert_eq!(b.data, "c2VjcmV0"),
+            other => panic!("expected binary content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_percent_escaped_payload_is_evaluated_as_its_real_bytes() {
+        // RFC 2397's data segment is URL characters, so the payload may
+        // arrive escaped. `%63%32%56%6A%63%6D%56%30` is a legal spelling of
+        // `c2VjcmV0` — "secret". Decoding the escaped form as base64 fails,
+        // and the item then went to Purview as *text*: the classifier saw
+        // percent-encoded gibberish while any compliant consumer downstream
+        // read the real bytes.
+        let message = Message::with_contents(
+            Role::user(),
+            vec![Content::Data(agent_framework_core::types::DataContent {
+                uri: "data:text/plain;base64,%63%32%56%6A%63%6D%56%30".to_string(),
+                media_type: Some("text/plain".to_string()),
+            })],
+        );
+        let mapped = entries(&message);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            crate::models::PurviewContent::Binary(b) => assert_eq!(b.data, "c2VjcmV0"),
+            other => panic!("expected binary content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wrapped_payload_is_evaluated_as_its_real_bytes() {
+        // Producers wrap long payloads; a strict decoder rejects what a
+        // lenient one accepts, which is the same divergence one character
+        // over.
+        let message = Message::with_contents(
+            Role::user(),
+            vec![Content::Data(agent_framework_core::types::DataContent {
+                uri: "data:text/plain;base64,c2Vj\n cmV0".to_string(),
+                media_type: Some("text/plain".to_string()),
+            })],
+        );
+        match &entries(&message)[0] {
             crate::models::PurviewContent::Binary(b) => assert_eq!(b.data, "c2VjcmV0"),
             other => panic!("expected binary content, got {other:?}"),
         }

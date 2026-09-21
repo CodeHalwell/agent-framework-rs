@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Twenty corrections from review
+#### Twenty-one corrections from review
 
-Across nine review rounds, Codex and Copilot raised twenty-five distinct
-findings; **twenty were right** and are folded into the rows above. Two were
+Across ten review rounds, Codex and Copilot raised twenty-seven distinct
+findings; **twenty-one were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -212,6 +212,15 @@ a later fragment's payload onto the accumulated text.
   signature stays over the raw link as Cosmos's auth scheme requires — a
   divergence the client's `resource_link`/`url_path` split already existed
   for.
+* **A percent-escaped data URI was evaluated as its own escaping.** RFC
+  2397's data segment is URL characters, so `%63%32%56%6A%63%6D%56%30` is a
+  legal spelling of `c2VjcmV0` — "secret". Decoding that as base64 fails, and
+  the mapper then submitted the *serialized URI* as text: Purview classified
+  percent-encoded gibberish while any compliant consumer downstream read the
+  real bytes. The payload is percent-decoded and unwrapped before the base64
+  decode now. The same shape as the media-type finding earlier in this list —
+  a decoder stricter than the producers it has to read, in a check where
+  failing to decode means failing to evaluate.
 * **A multi-vector upsert destroyed the sibling embeddings.** The generated
   upsert derives exactly one vector — the one `embed_from_field` names — and
   an upsert replaces the whole document, so on a collection with several
