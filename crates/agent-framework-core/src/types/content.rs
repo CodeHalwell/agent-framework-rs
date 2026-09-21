@@ -467,13 +467,58 @@ impl FunctionCallContent {
     }
 }
 
+/// The marker a redacted [`FunctionResultContent::exception`] serializes as.
+///
+/// Chosen to preserve *failure state* across a round trip: a deserialized
+/// result still reports that the call failed, just not with what text.
+/// Matches upstream's `_SERIALIZED_EXCEPTION_MARKER`.
+pub const FUNCTION_INVOCATION_ERROR_MARKER: &str = "FunctionInvocationError";
+
+/// Write a present exception as [`FUNCTION_INVOCATION_ERROR_MARKER`] rather
+/// than its text. See [`FunctionResultContent::exception`].
+fn serialize_redacted_exception<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(_) => serializer.serialize_some(FUNCTION_INVOCATION_ERROR_MARKER),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// The result of executing a tool/function.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionResultContent {
     pub call_id: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// Host-internal diagnostic text for a failed call.
+    ///
+    /// **Redacted on serialization** to
+    /// [`FUNCTION_INVOCATION_ERROR_MARKER`], because its contents are not
+    /// under this framework's control: it may come from a tool, middleware, a
+    /// provider or a caller, and a connection string, a SQL error quoting the
+    /// row it failed on, or a stack trace naming an internal host are all
+    /// ordinary things to find in one. Serialization is what persists a
+    /// conversation — the Redis, Cosmos and file history stores, workflow
+    /// checkpoints — so without this, every one of those durably stores
+    /// whatever a failing tool happened to say. Mirrors upstream #8235.
+    ///
+    /// The *model* still sees the real text: every provider converter reads
+    /// this field directly when building the wire result, rather than going
+    /// through `serde`. Channel-visible error text belongs in
+    /// [`Self::result`].
+    ///
+    /// Deserialization is unchanged, so a value stored before this (or the
+    /// marker itself) reads back as-is.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "serialize_redacted_exception"
+    )]
     pub exception: Option<String>,
 }
 
@@ -484,6 +529,12 @@ impl FunctionResultContent {
             result,
             exception: None,
         }
+    }
+
+    /// Whether this result reports a failure, whether or not its diagnostic
+    /// text survived a serialization round trip.
+    pub fn is_error(&self) -> bool {
+        self.exception.is_some()
     }
 }
 
@@ -1129,6 +1180,7 @@ mod tests {
 #[cfg(test)]
 mod occurrence_id_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn ensure_occurrence_id_is_idempotent_and_prefixed() {
@@ -1231,5 +1283,54 @@ mod occurrence_id_tests {
         assert!(wire["id"].as_str().unwrap().starts_with("af-call-"));
         let restored: FunctionCallContent = serde_json::from_value(wire).unwrap();
         assert_eq!(restored.id, identified.id);
+    }
+
+    // region: tool-failure diagnostics (upstream #8235)
+
+    #[test]
+    fn a_tool_exception_is_redacted_on_the_way_into_storage() {
+        // Serialization is what persists a conversation — the Redis, Cosmos
+        // and file history stores, workflow checkpoints — and a tool's
+        // exception text is not under this framework's control: a connection
+        // string, a SQL error quoting the row it failed on, a stack trace
+        // naming an internal host are all ordinary things to find in one.
+        let mut result = FunctionResultContent::new("c1", None);
+        result.exception =
+            Some("connect failed: Server=db1;Password=hunter2 while reading row 17".into());
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["exception"], json!(FUNCTION_INVOCATION_ERROR_MARKER));
+        assert!(!wire.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn redaction_preserves_failure_state_across_a_round_trip() {
+        // The marker is not cosmetic: a restored result still reports that
+        // the call failed, which is what a resumed workflow reads.
+        let mut result = FunctionResultContent::new("c1", None);
+        result.exception = Some("boom".into());
+        let restored: FunctionResultContent =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert!(restored.is_error());
+        assert_eq!(
+            restored.exception.as_deref(),
+            Some(FUNCTION_INVOCATION_ERROR_MARKER)
+        );
+    }
+
+    #[test]
+    fn a_successful_result_grows_no_exception_field() {
+        let result = FunctionResultContent::new("c1", Some(json!("ok")));
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(wire.get("exception").is_none());
+        assert!(!result.is_error());
+    }
+
+    #[test]
+    fn deserialization_is_unchanged_so_stored_text_reads_back() {
+        // Conversations written before this keep whatever they stored; only
+        // new writes are redacted.
+        let restored: FunctionResultContent =
+            serde_json::from_value(json!({ "call_id": "c1", "exception": "old text" })).unwrap();
+        assert_eq!(restored.exception.as_deref(), Some("old text"));
     }
 }
