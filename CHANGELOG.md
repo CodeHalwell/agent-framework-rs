@@ -10,8 +10,9 @@ may break APIs).
 ## [0.8.0] — 2026-09-21
 
 An Azure Cosmos DB vector store and a provider that hands any vector
-collection to an agent as tools, plus three faults in the Purview middleware
-that each let content past unevaluated.
+collection to an agent as tools, plus four faults in the Purview middleware
+that each let content reach the model without being evaluated — or, in one
+case, evaluated as its own escaping.
 
 **Breaking, in four places.** `Error::ServiceContentFilter` gains a `detail`
 field, so a struct-variant destructuring without `..` stops compiling.
@@ -21,17 +22,20 @@ literal without `..Default::default()` needs it. `DlpAction` gains
 `ProcessConversationMetadata::content` is now a `PurviewContent` rather than
 a `PurviewTextContent`, because an attachment is submitted as binary.
 
-**Three behaviour changes to look for**, all in compliance paths. Purview now
-**fails closed** when no Entra user id can be resolved: previously it reported
-the content as allowed, which is an unevaluated message reported as a cleared
-one. `ignore_exceptions` still trades that for availability, deliberately and
-for every error rather than only this one. Purview also submits **every
-content item** rather than each message's text, so a deployment will see more
-`processContent` calls and, correctly, more verdicts. And
+**Two behaviour changes in the Purview middleware.** It now **fails closed**
+when no Entra user id can be resolved: previously it reported the content as
+allowed, which is an unevaluated message reported as a cleared one.
+`ignore_exceptions` still trades that for availability, deliberately and for
+every error rather than only this one. And it submits **every content item**
+rather than each message's text, so a deployment will see more
+`processContent` calls and, correctly, more verdicts.
+
+**One behaviour change in core serialization**, unrelated to Purview:
 `FunctionResultContent::exception` now serializes to a fixed marker, so a
 conversation persisted from here on keeps the *fact* of a tool failure but not
-its diagnostic text; conversations already stored are unaffected, and the
-model still sees the real text.
+its diagnostic text. Conversations already stored are unaffected, the model
+still sees the real text, and Purview still evaluates the real text — the
+evaluation path reads the live value rather than the serialized one.
 
 ### Added
 
