@@ -78,12 +78,14 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Eight corrections from review
+#### Eleven corrections from review
 
-Codex and Copilot reviewed the PR and raised eleven distinct findings between
-them; eight were right and are folded into the rows above. Two of the eight
-were *interactions between changes in this same pass* — the kind a per-change
-review does not see.
+Across three review rounds, Codex and Copilot raised fourteen distinct
+findings; **eleven were right** and are folded into the rows above. Two were
+*interactions between changes in this same pass* — a correct change meeting
+another correct change — which is the class a per-change review cannot see,
+and the reason this section exists rather than a line saying review was
+clean.
 
 * **The Purview catch-all was a bypass, not a fix** (row above, rewritten).
   The first attempt optimized for the `ignore_exceptions = true` case and
@@ -129,11 +131,31 @@ review does not see.
   already had `af-vector-demo` destroyed it and its records — under a comment
   reading "leave the account as we found it". It now uses a fresh name per
   run, so cleanup can only remove what that run created.
+* **A citation's snippet went unevaluated.** The Purview mapper sent a text
+  item's `text` and dropped its annotations, and a citation quotes its source
+  in `snippet` — so if the quoted span was the sensitive part, everything
+  around it was checked and it was not. An annotated item now serializes
+  whole; plain text still goes as itself, which is cheaper and is what
+  upstream does.
+* **Cosmos refused a portable null equality.** `Filter::eq(field, null)` is
+  constructible and, as `filters.rs` documents in as many words, "works as a
+  null test" in the in-memory evaluator — while the Cosmos scalar guard
+  rejected it outright. The same filter therefore errored on one backend and
+  matched on another. It now translates to the `IS_NULL` form the `is_null`
+  operator already emits, presence semantics included; non-scalar literals
+  are still refused.
+* **An embedding source declared non-string could never work.** `build`
+  checked that `embed_from_field` names a *data* field but not its declared
+  type, so naming an `int` field produced a schema asking the model for an
+  integer and an executor reading it with `as_str` — every schema-valid
+  upsert failing at runtime. Refused at `build` now; an *undeclared* type is
+  still left alone, since guessing would reject a good untyped text field.
 
-Three findings were rejected. Two were Copilot repeating, on the pre-fix
-commit, the multi-vector and Cosmos-upsert findings already fixed above. The
-third, a Codex P1 claiming Cosmos `VectorDistance` returns a lower-is-closer
-distance for cosine and dot product, is **wrong**, and was rejected against
+Three findings were rejected, all of them duplicates or wrong rather than
+matters of taste. Two were a reviewer repeating, against a commit that had
+already moved, a finding fixed in the round before. The third, a Codex P1
+claiming Cosmos `VectorDistance` returns a lower-is-closer distance for
+cosine and dot product, is **wrong**, and was rejected against
 Microsoft's documentation rather than on judgement: `VECTORDISTANCE`
 "returns the similarity score", the container policy reference gives cosine
 as "-1 (least similar) to +1 (most similar)" and euclidean as "0 (most

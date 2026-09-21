@@ -291,6 +291,25 @@ impl VectorCollectionContextProviderBuilder {
                     field.field_type
                 )));
             }
+            // A declared non-string type cannot work: the generated schema
+            // would ask the model for that type, and the executor reads the
+            // field with `as_str`, so every schema-valid upsert would fail at
+            // runtime. Refused here instead, where the caller can see it. An
+            // *undeclared* type is left alone — the executor's own check
+            // covers it, and guessing would reject a perfectly good untyped
+            // text field.
+            if let Some(declared) = field.type_.as_deref() {
+                if !matches!(
+                    declared.trim().to_ascii_lowercase().as_str(),
+                    "str" | "string"
+                ) {
+                    return Err(Error::Configuration(format!(
+                        "embed_from_field names '{name}', which the collection declares as \
+                         '{declared}'; an embedding is derived from text, so this field has to \
+                         be a string"
+                    )));
+                }
+            }
             embed_source = Some(name.clone());
         }
 
@@ -1179,6 +1198,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("limit of 2"), "{err}");
+    }
+
+    #[test]
+    fn an_embedding_source_declared_non_string_is_refused_at_build() {
+        // The generated schema would ask the model for an integer and the
+        // executor reads the field with `as_str`, so every schema-valid
+        // upsert would fail at runtime — a contradiction the caller can only
+        // see here.
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("str"),
+            VectorStoreField::data("rank").with_type("int"),
+            VectorStoreField::vector("embedding", 3),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let collection: Arc<dyn VectorCollection> =
+            Arc::from(store.get_collection("notes", definition).unwrap());
+        let err = builder(collection)
+            .embed_from_field("rank")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has to be a string"), "{err}");
+    }
+
+    #[test]
+    fn an_undeclared_source_type_is_left_alone() {
+        // Guessing here would reject a perfectly good untyped text field;
+        // the executor's own check covers it.
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("str"),
+            VectorStoreField::data("text"),
+            VectorStoreField::vector("embedding", 3),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let collection: Arc<dyn VectorCollection> =
+            Arc::from(store.get_collection("notes", definition).unwrap());
+        let provider = builder(collection)
+            .embed_from_field("text")
+            .build()
+            .expect("an untyped text field is fine");
+        assert!(provider.tools().iter().any(|t| t.name == "upsert"));
     }
 
     #[test]

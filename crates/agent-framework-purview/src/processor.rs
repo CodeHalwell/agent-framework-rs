@@ -136,7 +136,18 @@ fn map_content(content: &Content) -> Option<PurviewContent> {
     match content {
         // Token counts, not user data.
         Content::Usage(_) => None,
-        Content::Text(t) => (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into()),
+        // Annotations are not decoration: a citation carries a `snippet` of
+        // the source it quotes, plus a title and a URL. Sending only `t.text`
+        // leaves that quoted content unevaluated — and an annotated item with
+        // empty text unevaluated entirely — against this module's contract.
+        // The plain case still sends just the text, which is both cheaper and
+        // what upstream does.
+        Content::Text(t) => match t.annotations.as_deref() {
+            Some([_, ..]) => {
+                Some(PurviewTextContent::new(serialize_for_evaluation(content)).into())
+            }
+            _ => (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into()),
+        },
         // Not `text.is_empty()` alone: a reasoning item can carry its payload
         // in `protected_data` or `raw_representation` with no text at all —
         // which is exactly the shape Chat Completions' `reasoning_details`
@@ -581,6 +592,33 @@ mod tests {
         // And the redaction still holds everywhere else.
         let persisted = serde_json::to_string(&result).unwrap();
         assert!(!persisted.contains("hunter2"), "{persisted}");
+    }
+
+    #[test]
+    fn a_citations_snippet_is_evaluated_along_with_the_text() {
+        // A citation quotes its source. If the quoted span is the sensitive
+        // part, sending only the surrounding prose evaluates everything
+        // except the thing that matters.
+        let text = agent_framework_core::types::TextContent {
+            text: "see the reference".to_string(),
+            annotations: Some(vec![agent_framework_core::types::Annotation {
+                snippet: Some("patient MRN 55512345".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let message = Message::with_contents(Role::assistant(), vec![Content::Text(text)]);
+        let submitted = text_of(&entries(&message)[0]);
+        assert!(submitted.contains("55512345"), "{submitted}");
+        assert!(submitted.contains("see the reference"), "{submitted}");
+    }
+
+    #[test]
+    fn plain_text_is_still_submitted_as_itself() {
+        // The common case stays cheap and identical to upstream: no JSON
+        // wrapper when there is nothing but text.
+        let message = Message::with_contents(Role::user(), vec![Content::text("just words")]);
+        assert_eq!(text_of(&entries(&message)[0]), "just words");
     }
 
     #[test]

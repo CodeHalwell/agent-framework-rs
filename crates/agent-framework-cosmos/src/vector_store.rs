@@ -990,8 +990,26 @@ impl CosmosVectorCollection {
             }
             op @ (FilterOperator::Eq | FilterOperator::Ne) => {
                 let v = require_value()?;
-                scalar(v)?;
                 let is_eq = matches!(op, FilterOperator::Eq);
+                // A null literal is a null *test*, not a scalar comparison.
+                // `is_null` is the operator to prefer, but a filter built with
+                // an explicit null operand works as one in the in-memory
+                // evaluator (see `filters.rs`), so refusing it here would make
+                // the same portable filter succeed on one backend and error on
+                // another — the divergence the portable filter exists to
+                // prevent. Translated to the same SQL `IsNull`/`IsNotNull`
+                // emit, which already carries the presence semantics: a
+                // missing field is a non-match for every operator but
+                // `exists`. Handled before the declared-type shortcut, since
+                // null is not a value any declared type "accepts".
+                if v.is_null() {
+                    return Ok(if is_eq {
+                        format!("(IS_DEFINED({access}) AND IS_NULL({access}))")
+                    } else {
+                        format!("(IS_DEFINED({access}) AND NOT IS_NULL({access}))")
+                    });
+                }
+                scalar(v)?;
                 if !declared.accepts(v) {
                     // The literal cannot equal any value this field can hold,
                     // so the comparison is decided statically. `ne` still
@@ -1558,6 +1576,45 @@ mod tests {
         let mut parameters = Vec::new();
         let clause = collection.prepare_filter(&options, &mut parameters)?;
         Ok((clause.unwrap_or_default(), parameters))
+    }
+
+    #[test]
+    fn a_null_equality_translates_rather_than_being_refused() {
+        // `is_null` is the operator to prefer, but a filter *built* with an
+        // explicit null operand works as a null test in the in-memory
+        // evaluator (see `filters.rs`), so refusing it here would make the
+        // same portable filter succeed on one backend and error on another.
+        let (clause, parameters) = translate(
+            Filter::new("text", FilterOperator::Eq, Some(Value::Null))
+                .unwrap()
+                .into(),
+        )
+        .expect("a null equality is a null test, not a bad literal");
+        assert_eq!(clause, r#"(IS_DEFINED(c["text"]) AND IS_NULL(c["text"]))"#);
+        assert!(parameters.is_empty(), "nothing to bind: {parameters:?}");
+
+        let (clause, _) = translate(
+            Filter::new("text", FilterOperator::Ne, Some(Value::Null))
+                .unwrap()
+                .into(),
+        )
+        .expect("and so is its negation");
+        assert_eq!(
+            clause,
+            r#"(IS_DEFINED(c["text"]) AND NOT IS_NULL(c["text"]))"#
+        );
+    }
+
+    #[test]
+    fn a_non_scalar_literal_is_still_refused() {
+        // Relaxing null must not admit objects and arrays, which Cosmos has
+        // no comparison for.
+        assert!(translate(
+            Filter::new("text", FilterOperator::Eq, Some(json!({ "a": 1 })))
+                .unwrap()
+                .into()
+        )
+        .is_err());
     }
 
     // region: schema
