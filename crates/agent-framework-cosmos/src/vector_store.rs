@@ -1325,18 +1325,21 @@ impl VectorCollection for CosmosVectorCollection {
             let object = stored.as_object().ok_or_else(|| {
                 Error::Configuration("a vector store record must be a JSON object".into())
             })?;
-            // Every declared field must be present: a partial record would
-            // silently *replace* the stored one with fewer fields, because an
-            // upsert is a whole-document write.
+            // Only the fields actually present are checked. An upsert is a
+            // whole-document write, so omitting a field means the stored
+            // document has no such field — which is a state this model
+            // already has: the portable filter defines what a comparison
+            // against a missing field does, and both `InMemoryVectorStore`
+            // and the Azure AI Search collection require nothing beyond the
+            // key. Demanding every declared field here would make a record
+            // that round-trips in a test fail against Cosmos in production,
+            // and would contradict the upsert tool
+            // `VectorCollectionContextProvider` generates, whose schema
+            // requires only the key and the embedding source.
             for field in self.definition.fields() {
                 let storage_name = field.effective_storage_name();
                 let Some(value) = object.get(storage_name) else {
-                    return Err(Error::Configuration(format!(
-                        "record at index {index} is missing field '{}'; an Azure Cosmos DB upsert \
-                         replaces the whole document, so a partial record would drop the fields \
-                         it omits",
-                        field.name
-                    )));
+                    continue;
                 };
                 match field.field_type {
                     FieldType::Vector => {
@@ -1360,7 +1363,14 @@ impl VectorCollection for CosmosVectorCollection {
                 }
                 validate_json(value, &format!("record[{index}].{storage_name}"), 0)?;
             }
-            let key = validate_key(object.get("id").unwrap_or(&Value::Null))?;
+            // The key is the one field an upsert cannot do without: it is the
+            // document id and the partition key both.
+            let key = validate_key(object.get("id").ok_or_else(|| {
+                Error::Configuration(format!(
+                    "record at index {index} is missing its key field '{}'",
+                    self.definition.key_field().name
+                ))
+            })?)?;
             let encoded = serde_json::to_vec(&stored)?;
             if encoded.len() > ITEM_SIZE_LIMIT {
                 return Err(Error::Configuration(format!(

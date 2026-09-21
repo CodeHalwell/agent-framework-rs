@@ -111,6 +111,7 @@ pub struct VectorCollectionContextProviderBuilder {
     include_get: bool,
     include_delete: bool,
     embed_from_field: Option<String>,
+    vector_field: Option<String>,
     approvals: Vec<(VectorToolKind, ApprovalMode)>,
     max_tool_batch_size: usize,
     search_top: usize,
@@ -163,6 +164,17 @@ impl VectorCollectionContextProviderBuilder {
     /// owns an embedding generator and does this itself.
     pub fn embed_from_field(mut self, field_name: impl Into<String>) -> Self {
         self.embed_from_field = Some(field_name.into());
+        self
+    }
+
+    /// Name the vector field the generated tools use.
+    ///
+    /// Only needed when the collection declares more than one, where there is
+    /// no safe default: searching the wrong embedding returns confident
+    /// nonsense rather than an error, so [`build`](Self::build) refuses a
+    /// multi-vector collection that does not name one.
+    pub fn vector_field(mut self, name: impl Into<String>) -> Self {
+        self.vector_field = Some(name.into());
         self
     }
 
@@ -236,15 +248,31 @@ impl VectorCollectionContextProviderBuilder {
             validate_filter_fields(filter, &definition)?;
         }
 
+        // Resolved once, here, where the caller can still fix it. Picking the
+        // first of several silently would search or write whichever field
+        // happened to be declared first; leaving it unset would instead fail
+        // at every single tool call, since `VectorCollection::search` refuses
+        // an unnamed field on a multi-vector collection.
         let vector_field = definition
-            .vector_fields()
-            .first()
-            .map(|f| (*f).clone())
+            .try_get_vector_field(self.vector_field.as_deref())
+            .cloned()
             .ok_or_else(|| {
-                Error::Configuration(
-                    "a vector collection context provider needs a collection with a vector field"
-                        .into(),
-                )
+                Error::Configuration(match &self.vector_field {
+                    Some(name) => format!(
+                        "vector_field names '{name}', which is not one of this collection's \
+                         vector fields"
+                    ),
+                    None if definition.vector_fields().is_empty() => {
+                        "a vector collection context provider needs a collection with a vector \
+                         field"
+                            .into()
+                    }
+                    None => format!(
+                        "this collection declares {} vector fields, so the tools have to be told \
+                         which one to use: set `vector_field`",
+                        definition.vector_fields().len()
+                    ),
+                })
             })?;
 
         let mut embed_source = None;
@@ -284,6 +312,7 @@ impl VectorCollectionContextProviderBuilder {
                 Arc::clone(&self.embedder),
                 self.scope_filter.clone(),
                 self.search_top,
+                vector_field.name.clone(),
                 name_of(VectorToolKind::Search),
                 approval(VectorToolKind::Search),
             ));
@@ -388,6 +417,7 @@ impl VectorCollectionContextProvider {
             include_get: true,
             include_delete: true,
             embed_from_field: None,
+            vector_field: None,
             approvals: Vec::new(),
             max_tool_batch_size: DEFAULT_MAX_TOOL_BATCH_SIZE,
             search_top: DEFAULT_SEARCH_TOP,
@@ -472,8 +502,12 @@ fn validate_filter_fields(
 fn scoped_options(
     top: usize,
     scope_filter: &Option<FilterExpression>,
+    vector_field: &str,
 ) -> Result<VectorSearchOptions> {
-    let mut options = VectorSearchOptions::new(top);
+    // Always named, even on a single-vector collection: it costs nothing
+    // there and it is the difference between working and failing on a
+    // collection with several.
+    let mut options = VectorSearchOptions::new(top).with_vector_field_name(vector_field);
     if let Some(filter) = scope_filter {
         options = options.with_filter(filter.clone());
     }
@@ -525,11 +559,13 @@ fn keys_argument(args: &Value, max_batch_size: usize) -> Result<Vec<Value>> {
     Ok(keys.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_search_tool(
     collection: Arc<dyn VectorCollection>,
     embedder: Arc<dyn EmbeddingClient>,
     scope_filter: Option<FilterExpression>,
     top: usize,
+    vector_field: String,
     name: String,
     approval: ApprovalMode,
 ) -> ToolDefinition {
@@ -551,6 +587,7 @@ fn build_search_tool(
             let collection = Arc::clone(&collection);
             let embedder = Arc::clone(&embedder);
             let scope_filter = scope_filter.clone();
+            let vector_field = vector_field.clone();
             async move {
                 let query = args
                     .get("query")
@@ -568,7 +605,7 @@ fn build_search_tool(
                         Error::Tool("the embedding service returned no vector for the query".into())
                     })?
                     .vector;
-                let options = scoped_options(top, &scope_filter)?;
+                let options = scoped_options(top, &scope_filter, &vector_field)?;
                 let hits = collection.search(vector, &options).await?;
                 Ok(json!({
                     "results": hits
@@ -924,6 +961,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("named 'search'"), "{err}");
+    }
+
+    fn two_vector_definition() -> VectorStoreCollectionDefinition {
+        VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("str"),
+            VectorStoreField::data("text").with_type("str"),
+            VectorStoreField::vector("title_embedding", 3),
+            VectorStoreField::vector("body_embedding", 3),
+        ])
+        .unwrap()
+    }
+
+    fn two_vector_collection() -> Arc<dyn VectorCollection> {
+        let store = InMemoryVectorStore::new();
+        Arc::from(
+            store
+                .get_collection("notes", two_vector_definition())
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_multi_vector_collection_must_say_which_field_the_tools_use() {
+        // Picking the first silently would search or write whichever field
+        // happened to be declared first; leaving it unset fails at every
+        // single search call instead, because `VectorCollection::search`
+        // refuses an unnamed field when there are several. Neither is
+        // something the caller can see, so `build` refuses it here.
+        let err = builder(two_vector_collection())
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("which one to use"), "{err}");
+
+        let err = builder(two_vector_collection())
+            .vector_field("nope")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not one of this collection's"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_named_vector_field_reaches_the_search() {
+        let collection = two_vector_collection();
+        collection
+            .upsert(vec![json!({
+                "id": "n1",
+                "text": "hello",
+                "title_embedding": [1.0, 0.0, 0.0],
+                "body_embedding": [0.0, 1.0, 0.0],
+            })])
+            .await
+            .unwrap();
+        let provider = builder(Arc::clone(&collection))
+            .vector_field("body_embedding")
+            .build()
+            .unwrap();
+        // Searching at all proves the field was named: an unnamed one is a
+        // hard error on this collection.
+        let found = call(&provider, "search", json!({ "query": "hel" })).await;
+        assert_eq!(found["results"][0]["record"]["id"], json!("n1"));
+    }
+
+    #[test]
+    fn a_single_vector_collection_still_needs_no_naming() {
+        let provider = builder(collection()).build().unwrap();
+        assert!(provider.tools().iter().any(|t| t.name == "search"));
     }
 
     #[test]

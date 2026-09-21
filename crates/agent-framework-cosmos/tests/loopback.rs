@@ -1705,15 +1705,57 @@ async fn upsert_writes_each_record_in_its_own_partition_and_returns_its_key() {
 }
 
 #[tokio::test]
-async fn a_record_missing_a_declared_field_is_refused_before_the_request() {
-    // An upsert replaces the whole document, so writing a partial record
-    // would drop the fields it omits rather than leave them alone.
-    let collection = vector_collection("http://127.0.0.1:1".to_string());
-    let err = collection
+async fn a_record_may_omit_a_non_key_field() {
+    // An upsert is a whole-document write, so omitting a field means the
+    // stored document has no such field — a state the portable filter already
+    // defines a meaning for, and one both sibling stores accept. Refusing it
+    // here would make a record that round-trips against
+    // `InMemoryVectorStore` in a test fail against Cosmos in production, and
+    // would contradict the upsert tool `VectorCollectionContextProvider`
+    // generates, whose schema requires only the key and the embedding source.
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (200, "OK", vec![], json!({ "id": "m1", "text": "hello" }))
+    });
+    let collection = vector_collection(base_url);
+    let keys = collection
         .upsert(vec![json!({ "id": "m1", "text": "hello" })])
         .await
-        .expect_err("incomplete record");
-    assert!(err.to_string().contains("embedding"), "{err}");
+        .expect("a record without the optional vector is written as-is");
+    assert_eq!(keys, vec![json!("m1")]);
+
+    // And it goes to Cosmos without the omitted field invented for it.
+    let requests = handle.join().expect("server thread");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["id"], json!("m1"));
+    assert!(
+        body.get("embedding").is_none(),
+        "an omitted field must not be materialized as null: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_record_missing_its_key_is_refused_before_any_request() {
+    // The key is the one field an upsert cannot do without: it is both the
+    // document id and the partition key. Port 1 never accepts a connection,
+    // so reaching the network at all would surface as a transport error.
+    let collection = vector_collection("http://127.0.0.1:1".to_string());
+    let err = collection
+        .upsert(vec![json!({ "text": "hello" })])
+        .await
+        .expect_err("a keyless record");
+    assert!(err.to_string().contains("key field"), "{err}");
+}
+
+#[tokio::test]
+async fn a_present_field_of_the_wrong_type_is_still_refused() {
+    // Relaxing "every field must be present" must not relax the check on the
+    // fields that *are* present.
+    let collection = vector_collection("http://127.0.0.1:1".to_string());
+    let err = collection
+        .upsert(vec![json!({ "id": "m1", "text": 42 })])
+        .await
+        .expect_err("a mistyped field");
+    assert!(err.to_string().contains("declared type"), "{err}");
 }
 
 #[tokio::test]

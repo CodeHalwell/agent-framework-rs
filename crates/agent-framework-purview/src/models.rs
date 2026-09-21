@@ -246,31 +246,39 @@ pub struct ProcessContentRequest {
 
 /// A DLP action Purview returned. Mirrors Python's `DlpAction`.
 ///
-/// `Other` is a **catch-all** for a value this port does not name, not just
-/// the literal `"other"`. That matters more than it looks: without it, a
-/// response carrying an action Purview added after this was written fails to
-/// deserialize, so the whole verdict is lost — and a deployment running with
-/// `ignore_exceptions` (the documented availability setting) then lets the
-/// content through unevaluated. A new enforcement action must not be able to
-/// turn enforcement off. `restrictAccess` is named because upstream added it
-/// (#8370), and, as there, it is not by itself a block — see
-/// [`ProcessContentResponse::should_block`].
+/// `Other` is the literal `"other"` value and **not** a catch-all: an action
+/// this port does not name fails to deserialize, which is deliberate.
+///
+/// The tempting alternative — `#[serde(other)]`, so an unrecognized value
+/// lands in `Other` — is a policy bypass.
+/// [`ProcessContentResponse::should_block`] would answer `false` for it, so a
+/// *blocking* action Graph adds after this was written would read as
+/// permission to proceed, and no configuration could recover: a verdict is
+/// not an error, so
+/// [`ignore_exceptions`](crate::settings::PurviewSettings::ignore_exceptions)
+/// never reaches it. Failing the parse instead surfaces an error, which with
+/// the default `ignore_exceptions = false` stops the request — the whole
+/// point of a middleware that fails closed. A deployment that prefers
+/// availability still opts out explicitly, for this as for every other error.
+///
+/// So the fix for a new Graph action is to name it here, the way upstream
+/// named `restrictAccess` (#8370). Naming one is not the same as blocking on
+/// it — see [`ProcessContentResponse::should_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DlpAction {
     BlockAccess,
     RestrictAccess,
-    #[serde(other)]
     Other,
 }
 
-/// `block` vs. anything else. Mirrors Python's `RestrictionAction`; `Other`
-/// is a catch-all for the same reason as [`DlpAction::Other`].
+/// `block` vs. the literal `"other"`. Mirrors Python's `RestrictionAction`.
+/// An unrecognized value fails the parse, for the reason spelled out on
+/// [`DlpAction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RestrictionAction {
     Block,
-    #[serde(other)]
     Other,
 }
 
@@ -325,6 +333,13 @@ impl ProcessContentResponse {
     /// Mirrors `ScopedContentProcessor.process_messages`'s check:
     /// `action == DlpAction.BLOCK_ACCESS or restriction_action ==
     /// RestrictionAction.BLOCK` on any entry of `policy_actions`.
+    ///
+    /// [`DlpAction::RestrictAccess`] is deliberately **not** a block by
+    /// itself: it carries a `restrictionAction` that selects the enforcement
+    /// mode, and only `block` withholds the content. This is a verdict rather
+    /// than an error, so nothing downstream can override it — which is why an
+    /// action or mode this port does not name fails the parse instead of
+    /// arriving here as a `false`. See [`DlpAction`].
     pub fn should_block(&self) -> bool {
         self.policy_actions.as_deref().is_some_and(|actions| {
             actions.iter().any(|a| {
@@ -352,34 +367,39 @@ mod tests {
     }
 
     #[test]
-    fn an_action_this_port_does_not_name_parses_rather_than_failing_the_response() {
-        // Without the catch-all, a response carrying an action Purview added
-        // later fails to deserialize — so the verdict is lost, and a
-        // deployment running with `ignore_exceptions` lets the content
-        // through unevaluated. A new enforcement action must not be able to
-        // turn enforcement off.
-        let response: ProcessContentResponse = serde_json::from_str(
-            r#"{"policyActions":[{"action":"someFutureAzureAction"},
-                                 {"restrictionAction":"someFutureMode"}]}"#,
-        )
-        .expect("an unknown action still parses");
-        let actions = response.policy_actions.as_ref().unwrap();
-        assert_eq!(actions[0].action, Some(DlpAction::Other));
+    fn an_action_this_port_does_not_name_fails_the_parse_rather_than_reading_as_allowed() {
+        // A catch-all variant would be a policy bypass: `should_block` would
+        // answer `false` for a *blocking* action Graph adds later, and no
+        // setting could recover it, because a verdict is not an error.
+        // Failing the parse surfaces an error, which the default
+        // `ignore_exceptions = false` turns into a stopped request.
+        for body in [
+            r#"{"policyActions":[{"action":"someFutureAzureAction"}]}"#,
+            r#"{"policyActions":[{"restrictionAction":"someFutureMode"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProcessContentResponse>(body).is_err(),
+                "an unrecognized enforcement action must not read as permission: {body}"
+            );
+        }
+        // The literal "other" is a real Graph value and still parses.
+        let known: ProcessContentResponse =
+            serde_json::from_str(r#"{"policyActions":[{"action":"other"}]}"#).unwrap();
         assert_eq!(
-            actions[1].restriction_action,
-            Some(RestrictionAction::Other)
+            known.policy_actions.as_ref().unwrap()[0].action,
+            Some(DlpAction::Other)
         );
-        // And it is not treated as a block on a guess either way.
-        assert!(!response.should_block());
+        assert!(!known.should_block());
     }
 
     #[test]
     fn restrict_access_is_not_by_itself_a_block() {
         // It carries a separate `restrictionAction` that selects the
-        // enforcement mode, which may be audit, warn or allow. Only an
-        // explicit block mode withholds the content.
+        // enforcement mode. Only `block` withholds the content; every other
+        // mode Graph models — audit, warn, allow — arrives as `other`, which
+        // is why that value is a real one rather than a catch-all.
         let audited: ProcessContentResponse = serde_json::from_str(
-            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"audit"}]}"#,
+            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"other"}]}"#,
         )
         .unwrap();
         assert_eq!(

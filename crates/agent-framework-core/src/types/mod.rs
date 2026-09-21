@@ -13,6 +13,7 @@ pub use content::{
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
+    FUNCTION_INVOCATION_ERROR_MARKER,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};

@@ -42,7 +42,7 @@ upstream PR, and they are worth reading apart.
 | #8186 | **An Azure Cosmos DB for NoSQL vector store.** The largest Azure item on the books after last pass's AI Search work, and the one that makes `core::vectors` worth having on two providers rather than one. A container becomes a collection: the `vectorEmbeddingPolicy` and `indexingPolicy` at creation, point reads and upserts in the item's own partition (`/id`, so a read by key never fans out), and a `VectorDistance` query with every filter literal bound as a parameter. Four details are right rather than plausible. **The vector surface needs its own api-version** — `2018-12-31`, which the history and checkpoint stores speak, predates vector search entirely, so a container created under it would come back without the policy it asked for and the search would be a syntax error; `DEFAULT_VECTOR_API_VERSION` is split out and public, the same split the Azure OpenAI crate needed last pass for the same reason. **A distance function Cosmos cannot compute is refused**, not substituted: Cosmos computes cosine as a *similarity*, so accepting `cosine_distance` would return a score whose direction the caller's own `higher_is_closer` reads backwards — and because the three it does have each agree with the portable name's direction, a result needs no `score_kind` override at all. **`skip` rides in the limit** rather than being dropped from an already-truncated page, since Cosmos will not take `OFFSET` beside an `ORDER BY VectorDistance`. And an **ordered filter on an untyped field carries a SQL type guard**: Cosmos SQL orders *across* types, so `loose > 5` would otherwise match every string in that field. Upstream refuses an ordered filter on an untyped field outright; here the type hint is optional and usually unset, so the guard the refusal exists to provide is emitted instead. | `cosmos/vector_store.rs` (new), `cosmos/client.rs` (container read/create/delete/list), `cosmos/tests/loopback.rs`, `examples/memory/cosmos_vector_store.rs` |
 | #8421 | **A vector collection, handed to an agent as tools.** Upstream's new `VectorCollectionContextProvider`, which is what turns the two Azure stores this port now has into something a model can use rather than something a caller drives. Four decisions carry the weight. Writes require approval by default and reads do not, matching upstream — a delete the model gets wrong is not recoverable from the conversation. The scope filter is applied *everywhere*: conjoined into search, and checked on the records a read, write or delete touches. An out-of-scope record reads as **absent** rather than as a refusal, because "you may not read that" confirms it exists; an out-of-scope write is **refused** rather than rewritten into scope, which would let the model launder a record through the provider. The model never authors an embedding — `embed_from_field` names the field the vector is derived from, and the vector field is not in the tool schema at all; without it there is no upsert tool rather than one that cannot work (upstream needs no equivalent, because its collection owns an embedding generator). And tool names take an optional prefix: upstream's plain `search`/`get` collide the moment an agent holds two of these. The `VectorStoreHistoryProvider` half of the same PR is not ported — it is a second schema and a second lifecycle, and the port already has four history providers. | `core/vectors/provider.rs` (new), `examples/memory/vector_collection_tools.rs` |
 | #8370 | **Purview was evaluating a fraction of each message.** It submitted `Message::text()` and nothing else, so a function result — which is exactly where exfiltrated data shows up — an attachment, a reasoning block and a tool call all reached the model unevaluated. Every content item is now mapped, one `processContent` request per entry as upstream: an attachment's bytes go as Graph `binaryContent` (handing a classifier the base64 *string* instead reads as gibberish and passes every policy, which is worse than sending nothing because it looks like coverage — and the data-URI parse has to accept RFC 2397's `;parameter=value` segments or that is exactly what happens), and everything else is serialized whole, which keeps `additional_properties` under evaluation too. Only `usage` is skipped. The port had a hole **on top of** upstream's: `text()` returns `""` whenever a refusal is present (the #7992 marking), so a partly-declined turn submitted nothing at all. | `purview/processor.rs` (`map_content`, `build_requests`), `purview/models.rs` (`PurviewBinaryContent`, `PurviewContent`) |
-| #8370 | **A new enforcement action turned enforcement off.** `DlpAction` and `RestrictionAction` named their two known values and nothing else, so a response carrying `restrictAccess` — which upstream added this window — failed to deserialize, losing the whole verdict; under `ignore_exceptions`, the documented availability setting, the content then went through unevaluated. Both are `#[serde(other)]` catch-alls now and `restrictAccess` is named. It is deliberately *not* a block on its own: its `restrictionAction` selects the mode, which may be audit or warn. Upstream's own enums still raise on an unknown *severity*, which is the same bug one field over. | `purview/models.rs` |
+| #8370 | **A verdict carrying `restrictAccess` could not be parsed.** Upstream added that action this same window, and `DlpAction` named only `blockAccess`/`other`, so a response carrying it failed to deserialize and the whole verdict was lost. `restrictAccess` is now named — and, as upstream has it, is deliberately *not* a block on its own: it carries a `restrictionAction` that selects the enforcement mode, and only `block` withholds content. The enums stay **strict**, which is the correction to a first attempt at this that made both `#[serde(other)]` catch-alls; Codex caught it on the PR. A catch-all is a policy bypass here: `should_block` would answer `false` for a *blocking* action Graph adds later, and nothing could recover it, because a verdict is not an error and `ignore_exceptions` never reaches one. Failing the parse raises an error instead, which the default `ignore_exceptions = false` turns into a stopped request — fail-closed, which is the posture a DLP middleware exists to hold. | `purview/models.rs` |
 | #8370 | **No user id reported "allowed".** Purview evaluates policy for a specific user, so no resolvable user means nothing was evaluated — which is not the same as nothing being found, and reporting it as a clear verdict is the one failure mode this middleware exists to prevent. It now fails, as upstream's does; `ignore_exceptions` still trades that for availability, explicitly and for every error rather than only this one. The crate docs gained the security section upstream wrote alongside it: both identity sources are host-supplied and unverified, so a host that populates either from anything that crossed a trust boundary lets that party select a weaker policy. | `purview/processor.rs`, `purview/lib.rs`, `purview/middleware.rs` |
 | #8235 | **A failing tool's diagnostics were persisted forever.** `FunctionResultContent::exception` is host-internal text whose contents this framework does not control — it may come from a tool, middleware, a provider or a caller, and a connection string, a SQL error quoting the row it failed on, or a stack trace naming an internal host are all ordinary things to find in one. Serialization is exactly what persists a conversation (the Redis, Cosmos and file history stores; workflow checkpoints), so every one of those was durably storing it. It now serializes as a fixed marker. Failure *state* survives, which is what a resumed workflow reads; deserialization is untouched, so a conversation written before this keeps what it stored; and the model is unaffected either way, because every provider converter reads the field directly rather than through `serde`. One deliberate divergence: the AG-UI router still sends the diagnostic to its frontend, since this port's tool loop puts a failure's only text in `exception` and leaves `result` empty — redacting there would leave a frontend with nothing rather than with something safer. | `core/types/content.rs` (`FUNCTION_INVOCATION_ERROR_MARKER`) |
 | #8393 | **An Azure content-filter refusal said only that it was one.** The classification was right and the detail was gone: a caller held a message string and could not tell a self-harm block from a jailbreak detection, or a prompt block from a completion block — which is the whole of what an application does with this error. Azure's nested `innererror` (the policy code, the per-category verdicts, the `param`) now rides on `Error::ServiceContentFilter`, reaching Azure OpenAI chat, Responses and embeddings, all three of which share the classifier. Every value is an **open string**: upstream parses the code and the severity into enums, which raise on a value Azure has not shipped yet — the bug its own fix closed for the code and still has for the severity. A plain OpenAI refusal, which carries nothing beyond the marker, grows no empty detail. | `core/error.rs` (`ContentFilterDetail`, `ContentFilterCategory`), `openai/lib.rs` (`parse_content_filter_detail`) |
@@ -62,8 +62,10 @@ flag) clean, `cargo fmt --check` clean, `cargo doc` clean.
 
 Each behavioral test was probed against the code it pins rather than merely
 written beside it. Restoring the shared checkpoint temp path fails the
-concurrent-save test with the same `NotFound` upstream reported. Closing the
-two Purview action enums fails both open-enum tests. Reverting the
+concurrent-save test with the same `NotFound` upstream reported. Opening
+either Purview action enum to a catch-all fails the fail-closed test.
+Dropping the vector-field name from the generated search options fails the
+multi-vector test with the exact "no vector field to search" error. Reverting the
 merge-target helper fails the untagged-delta test *and* the reused-`call_id`
 test, and does so by producing exactly the old wrong answer. The two
 metrics tests and the four Purview fail-open tests were the previous
@@ -72,8 +74,41 @@ code it used to pass against, which is the strongest form this probe takes.
 Negative controls throughout: a plain OpenAI content-filter body still grows
 no detail, a message with no reasoning payload still grows no
 `reasoning_details` field, a declared-type field still needs no SQL type
-guard, and a successful tool result still serializes without an `exception`
-key.
+guard, an omitted non-key field still reaches Cosmos without being
+materialized as null, and a successful tool result still serializes without
+an `exception` key.
+
+#### Three corrections from review
+
+Codex reviewed the PR and raised four findings; three were right and are
+folded into the rows above.
+
+* **The Purview catch-all was a bypass, not a fix** (row above, rewritten).
+  The first attempt optimized for the `ignore_exceptions = true` case and
+  made the default worse.
+* **A multi-vector collection could not be searched at all.** The provider
+  took the first declared vector field for upserts and named none for
+  search, so on a collection with two vectors every search call failed with
+  "no vector field to search". `vector_field` names it and `build` refuses
+  the ambiguity where the caller can still see it.
+* **Cosmos refused an upsert omitting any declared field.** Both sibling
+  stores require only the key, and the comment in the Azure AI Search
+  collection argues explicitly that omission means "this field is absent" —
+  so the Cosmos rule broke the portability promise the `VectorStore` pair
+  exists for, and contradicted the upsert tool in the same PR, whose schema
+  requires only the key and the embedding source.
+
+The fourth, a P1 claiming Cosmos `VectorDistance` returns a lower-is-closer
+distance for cosine and dot product, is **wrong**, and was rejected against
+Microsoft's documentation rather than on judgement: `VECTORDISTANCE`
+"returns the similarity score", the container policy reference gives cosine
+as "-1 (least similar) to +1 (most similar)" and euclidean as "0 (most
+similar) to +inf (least similar)", and the vector-search page's bare
+`ORDER BY VectorDistance(...)` is documented as sorting "most-similar to
+least-similar". All three metrics therefore agree with the portable name's
+direction, `higher_is_closer` from the definition is already right, and
+setting `score_kind` to a distance would have inverted cosine and dot-product
+scores — introducing the bug the finding was written to prevent.
 
 ### Already ahead of upstream (3)
 
