@@ -7,6 +7,165 @@ may break APIs).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-21
+
+An Azure Cosmos DB vector store and a provider that hands any vector
+collection to an agent as tools, plus four faults in the Purview middleware
+that each let content reach the model without being evaluated — or, in one
+case, evaluated as its own escaping.
+
+**Breaking, in four places.** `Error::ServiceContentFilter` gains a `detail`
+field, so a struct-variant destructuring without `..` stops compiling.
+`FunctionInvocationConfig` gains `allow_concurrent_invocation`, so a struct
+literal without `..Default::default()` needs it. `DlpAction` gains
+`RestrictAccess`, so an exhaustive match over it needs an arm. And
+`ProcessConversationMetadata::content` is now a `PurviewContent` rather than
+a `PurviewTextContent`, because an attachment is submitted as binary.
+
+**Two behaviour changes in the Purview middleware.** It now **fails closed**
+when no Entra user id can be resolved: previously it reported the content as
+allowed, which is an unevaluated message reported as a cleared one.
+`ignore_exceptions` still trades that for availability, deliberately and for
+every error rather than only this one. And it submits **every content item**
+rather than each message's text, so a deployment will see more
+`processContent` calls and, correctly, more verdicts.
+
+**One behaviour change in core serialization**, unrelated to Purview:
+`FunctionResultContent::exception` now serializes to a fixed marker, so a
+conversation persisted from here on keeps the *fact* of a tool failure but not
+its diagnostic text. Conversations already stored are unaffected, the model
+still sees the real text, and Purview still evaluates the real text — the
+evaluation path reads the live value rather than the serialized one.
+
+### Added
+
+- **An Azure Cosmos DB for NoSQL vector store**: `CosmosVectorStore` and
+  `CosmosVectorCollection` in `agent-framework-cosmos`. A container becomes a
+  collection — the `vectorEmbeddingPolicy` and `indexingPolicy` at creation,
+  point reads and upserts in the item's own partition, and a `VectorDistance`
+  query with every filter literal bound as a parameter.
+
+  Four details are decisions rather than defaults. The vector surface needs
+  its own api-version (`DEFAULT_VECTOR_API_VERSION`, `2020-07-15`): the
+  `2018-12-31` the history and checkpoint stores speak predates vector search,
+  so a container created under it comes back without the policy it asked for.
+  A distance function Cosmos cannot compute is **refused** rather than
+  substituted, since Cosmos computes cosine as a *similarity* and a silent
+  substitution ranks by a metric the caller's `higher_is_closer` then reads
+  backwards. `skip` rides in the limit, because Cosmos will not take `OFFSET`
+  beside an `ORDER BY VectorDistance`. And an ordered filter on an untyped
+  field carries a SQL type guard, because Cosmos SQL orders *across* types.
+
+- **`VectorCollectionContextProvider`** (`agent_framework_core::vectors`):
+  generates search / get / upsert / delete tools over any `VectorCollection`,
+  so the in-memory, Azure AI Search and Cosmos DB stores become things an
+  agent can use rather than things a caller drives.
+
+  Writes require approval by default and reads do not. The `scope_filter` is
+  applied everywhere — conjoined into search, checked on the records a read,
+  write or delete touches, and checked against the *existing* record on an
+  upsert so a scoped agent cannot overwrite another group's record by naming
+  its key. An out-of-scope record reads as absent rather than as a refusal,
+  since "you may not read that" confirms it exists. It remains grouping rather
+  than an authorization boundary, and the module docs say so in those words.
+
+  The model never authors an embedding: `embed_from_field` names the field the
+  vector is derived from, and the vector field is not in the tool schema at
+  all. Without it there is no upsert tool rather than one that cannot work —
+  the same reason a multi-vector collection gets no upsert tool, since one
+  embedding source cannot maintain several vectors and a whole-document write
+  would drop the rest.
+
+- **Azure content-filter detail** on `Error::ServiceContentFilter`:
+  `ContentFilterDetail` carries the policy code, the `param`, and the
+  per-category verdicts from Azure's nested `innererror`, reaching Azure
+  OpenAI chat, Responses and embeddings. Every value is an open string —
+  upstream parses the code and severity into enums, which raise on a value
+  Azure has not shipped yet.
+
+- **`reasoning_details` on Chat Completions**, in both directions. A
+  reasoning-capable provider on that surface (DeepSeek in thinking mode,
+  OpenRouter, vLLM) requires the payload back on the next request of the same
+  turn, so a conversation that used reasoning could not be continued. It rides
+  in `TextReasoningContent::protected_data`, and fragments split across a
+  stream concatenate in order.
+
+- **`FunctionInvocationConfig::allow_concurrent_invocation`**: runs one model
+  response's tool calls in model order when `false`. The point is the side
+  effects rather than the result order — a tool holding a non-reentrant handle
+  behaves differently when two invocations overlap.
+
+- **`FUNCTION_INVOCATION_ERROR_MARKER`** and
+  `FunctionResultContent::is_error`.
+
+### Fixed
+
+- **Purview evaluated a fraction of each message.** It submitted
+  `Message::text()` and nothing else, so a function result — where exfiltrated
+  data actually appears — an attachment, a reasoning block and a tool call all
+  reached the model unevaluated. Every content item is mapped now, one request
+  per entry: an attachment's bytes go as Graph `binaryContent` (handing a
+  classifier the base64 *string* reads as gibberish and passes every policy),
+  and everything else is serialized whole. Only `usage` is skipped. This port
+  had a hole on top of upstream's: `text()` returns `""` whenever a refusal is
+  present, so a partly-declined turn submitted nothing at all.
+
+- **Purview could not parse a verdict carrying `restrictAccess`**, losing it
+  entirely. The action is named now; it is deliberately not a block on its
+  own, since its `restrictionAction` selects the mode. The enums stay strict:
+  an unrecognized value fails the parse, which the default
+  `ignore_exceptions = false` turns into a stopped request, rather than
+  landing in a catch-all that `should_block` would answer `false` for.
+
+- **Purview reported an unevaluated message as allowed** when no user id
+  resolved. See the behaviour note above.
+
+- **A failing tool's diagnostics were persisted verbatim** into every history
+  store and workflow checkpoint. `FunctionResultContent::exception` is
+  host-internal text this framework does not control — a connection string or
+  a SQL error quoting the row it failed on are ordinary things to find in one.
+  It serializes as a fixed marker now; failure state survives, deserialization
+  is untouched, and the model is unaffected because every provider converter
+  reads the field directly.
+
+- **`gen_ai.client.operation.duration` omitted failed calls**, which leaves no
+  error rate at all and skews the latency distribution. All three failure
+  paths record with `error.type` now, including the stream that fails midway —
+  which ends before its completion arm and so was missing entirely.
+
+- **A streamed `function_call` fragment could land on the wrong call.** An
+  untagged continuation delta went to the *first* in-flight call rather than
+  the one still streaming; an untagged chunk could be absorbed by a call
+  already carrying an occurrence id; two calls sharing a provider `call_id`
+  but carrying *different* occurrence ids merged, appending one call's
+  arguments onto the other's; and a failed merge dropped the fragment silently.
+
+- **A handoff dropped the user's attachments.** An image or file is the
+  request as much as the words beside it. Multimodal content is kept on user
+  messages and still dropped elsewhere, since providers reject input-only
+  parts replayed on an assistant turn. The same pass stops an approval
+  *response* riding on a user message through to the next agent.
+
+- **Concurrent checkpoint saves collided on one temp file.** Two saves of the
+  same id wrote into the same file, so the survivor could be a blend of both,
+  and the loser's rename failed with `NotFound`.
+
+- **A Cosmos id containing `%` stored but could not be read back.** The id is
+  percent-encoded as a path segment now while the signature stays over the raw
+  link, as Cosmos's auth scheme requires. Previously a point read 404'd and a
+  delete reported success while leaving the record.
+
+- **A percent-escaped data URI was evaluated as its own escaping.** RFC 2397's
+  data segment is URL characters, so the payload may arrive escaped; decoding
+  that as base64 fails and the item went to Purview as text. Payloads are
+  percent-decoded and unwrapped before the base64 decode.
+
+### Changed
+
+- The Cosmos chat store documents that a thread id **selects** history rather
+  than protecting it: distinct ids prevent accidental overlap without
+  restricting a client whose credentials already authorize the container.
+
 ## [0.7.0] — 2026-09-15
 
 Portable vector filters and an Azure AI Search vector store, bounds on the
