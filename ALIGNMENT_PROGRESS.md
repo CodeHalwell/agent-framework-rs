@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Fifteen corrections from review
+#### Seventeen corrections from review
 
-Across six review rounds, Codex and Copilot raised nineteen distinct
-findings; **fifteen were right** and are folded into the rows above. Two were
+Across seven review rounds, Codex and Copilot raised twenty-one distinct
+findings; **seventeen were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -181,6 +181,19 @@ a later fragment's payload onto the accumulated text.
   `upsert` checks before deriving one — would quietly report every record as
   out of scope. Both refused at `build` now, and still allowed for a
   search-only provider, which never evaluates the filter locally.
+* **An upsert could overwrite another group's record by naming its key.**
+  The scope check ran on the *payload*, which says nothing about the record
+  it lands on — an upsert replaces the whole document. So a scoped agent
+  could destroy a record `get` and `delete` refuse to even show it, by
+  submitting an in-scope payload at that key. Laundering by key collision
+  rather than by payload, and the one hole in the scope story that was a
+  genuine hole rather than a documented limit. The existing record is read
+  and checked first now, as delete already did.
+* **Delete reported absent keys as deleted.** The unscoped path skipped the
+  read, so `deleted` was simply the input length — contradicting the
+  response's own documented meaning two lines below it, where an
+  already-absent key counts as *not* deleted. Both paths read first now, and
+  a key named twice counts once.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an

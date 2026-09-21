@@ -630,6 +630,20 @@ fn keys_schema(description: &str, max_items: usize, key_type: Option<&str>) -> V
     })
 }
 
+/// Drop repeated keys, preserving order.
+///
+/// A model that names the same record twice would otherwise have it counted
+/// twice in the delete tally, reporting two deletions for one record.
+/// Compared by JSON rendering, which is how `InMemoryVectorStore` keys its
+/// own map — `"42"` and `42` are different keys there and stay different
+/// here.
+fn dedup_keys(keys: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    keys.into_iter()
+        .filter(|key| seen.insert(key.to_string()))
+        .collect()
+}
+
 /// Read a `keys` argument, enforcing the batch cap.
 fn keys_argument(args: &Value, max_batch_size: usize) -> Result<Vec<Value>> {
     let keys = args
@@ -766,6 +780,7 @@ fn build_upsert_tool(
     approval: ApprovalMode,
 ) -> Result<ToolDefinition> {
     let definition = collection.definition().clone();
+    let key_field = definition.key_field().name.clone();
     let mut properties = Map::new();
     let mut required = Vec::new();
     for field in definition.fields() {
@@ -811,6 +826,7 @@ fn build_upsert_tool(
             let scope_filter = scope_filter.clone();
             let text_field = text_field.clone();
             let vector_field = vector_field.clone();
+            let key_field = key_field.clone();
             async move {
                 let records = args
                     .get("records")
@@ -850,6 +866,32 @@ fn build_upsert_tool(
                             ))
                         })?;
                     texts.push(text.to_string());
+                }
+
+                // An upsert *replaces* the whole document at its key, so a
+                // payload that is in scope says nothing about the record it
+                // lands on. Without this, a scoped agent overwrites another
+                // group's record by naming its key — laundering by key
+                // collision rather than by payload, and destroying a record
+                // `get` and `delete` refuse to show it. Read, check, then
+                // write; not atomic, for the reason the module docs give.
+                if scope_filter.is_some() {
+                    let keys: Vec<Value> = records
+                        .iter()
+                        .map(|record| record.get(&key_field).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    let existing = collection.get(keys, false).await?;
+                    for (index, current) in existing.into_iter().enumerate() {
+                        let Some(current) = current else {
+                            continue;
+                        };
+                        if !in_scope(&current, &scope_filter)? {
+                            return Err(Error::Tool(format!(
+                                "the record at index {index} would replace an existing record \
+                                 outside this tool's scope"
+                            )));
+                        }
+                    }
                 }
 
                 let embeddings = embedder.get_embeddings(texts, None).await?;
@@ -900,24 +942,22 @@ fn build_delete_tool(
             let collection = Arc::clone(&collection);
             let scope_filter = scope_filter.clone();
             async move {
-                let keys = keys_argument(&args, max_batch_size)?;
-                let deletable = if scope_filter.is_some() {
-                    // Read, check, then delete. Not atomic — a record can move
-                    // out of scope between the two — which is why the module
-                    // docs call this grouping rather than authorization.
-                    let found = collection.get(keys.clone(), false).await?;
-                    let mut allowed = Vec::new();
-                    for (key, record) in keys.iter().zip(found) {
-                        if let Some(record) = record {
-                            if in_scope(&record, &scope_filter)? {
-                                allowed.push(key.clone());
-                            }
+                let keys = dedup_keys(keys_argument(&args, max_batch_size)?);
+                // Read, check, then delete — on both paths. Not atomic, a
+                // record can move out of scope or be removed in between,
+                // which is why the module docs call this grouping rather than
+                // authorization. The read is not only for the scope check:
+                // without it an absent key counts as deleted, which is the
+                // opposite of what the counts below promise.
+                let found = collection.get(keys.clone(), false).await?;
+                let mut deletable = Vec::new();
+                for (key, record) in keys.iter().zip(found) {
+                    if let Some(record) = record {
+                        if in_scope(&record, &scope_filter)? {
+                            deletable.push(key.clone());
                         }
                     }
-                    allowed
-                } else {
-                    keys.clone()
-                };
+                }
                 let deleted = deletable.len();
                 if !deletable.is_empty() {
                     collection.delete(deletable).await?;
@@ -1309,6 +1349,104 @@ mod tests {
         assert_eq!(deleted["deleted"], json!(1));
         assert_eq!(deleted["not_deleted"], json!(1));
         assert!(collection.get(vec![json!("theirs")], false).await.unwrap()[0].is_some());
+    }
+
+    #[tokio::test]
+    async fn an_upsert_cannot_overwrite_another_groups_record_by_key() {
+        // Laundering by key collision rather than by payload: the *payload*
+        // is in scope, so the earlier check passes, but the record it lands
+        // on is another group's — one `get` and `delete` refuse to touch.
+        let collection = collection();
+        collection
+            .upsert(vec![json!({
+                "id": "theirs",
+                "text": "b",
+                "tenant": "other",
+                "embedding": [1.0, 1.0, 0.0],
+            })])
+            .await
+            .unwrap();
+        let provider = builder(Arc::clone(&collection))
+            .scope_filter(Filter::eq("tenant", "acme").unwrap())
+            .embed_from_field("text")
+            .build()
+            .unwrap();
+        let tool = provider
+            .tools()
+            .iter()
+            .find(|t| t.name == "upsert")
+            .unwrap();
+        let err = tool
+            .executor
+            .as_ref()
+            .unwrap()
+            .invoke(json!({
+                "records": [{ "id": "theirs", "text": "mine now", "tenant": "acme" }]
+            }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside this tool's scope"), "{err}");
+
+        // And the record it aimed at is untouched.
+        let stored = collection.get(vec![json!("theirs")], false).await.unwrap();
+        assert_eq!(stored[0].as_ref().unwrap()["tenant"], json!("other"));
+    }
+
+    #[tokio::test]
+    async fn an_upsert_over_a_free_key_still_works() {
+        let collection = collection();
+        let provider = builder(Arc::clone(&collection))
+            .scope_filter(Filter::eq("tenant", "acme").unwrap())
+            .embed_from_field("text")
+            .build()
+            .unwrap();
+        let written = call(
+            &provider,
+            "upsert",
+            json!({ "records": [{ "id": "fresh", "text": "hello", "tenant": "acme" }] }),
+        )
+        .await;
+        assert_eq!(written["keys"], json!(["fresh"]));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_absent_key_does_not_report_it_as_deleted() {
+        // Without a read on the unscoped path, `deleted` was simply the input
+        // length — so a key that never existed came back as a deletion, which
+        // is the opposite of what the counts promise.
+        let collection = collection();
+        collection
+            .upsert(vec![json!({
+                "id": "real",
+                "text": "a",
+                "tenant": "acme",
+                "embedding": [1.0, 1.0, 0.0],
+            })])
+            .await
+            .unwrap();
+        let provider = builder(Arc::clone(&collection)).build().unwrap();
+        let result = call(&provider, "delete", json!({ "keys": ["real", "ghost"] })).await;
+        assert_eq!(result["deleted"], json!(1));
+        assert_eq!(result["not_deleted"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn a_key_named_twice_counts_once() {
+        let collection = collection();
+        collection
+            .upsert(vec![json!({
+                "id": "real",
+                "text": "a",
+                "tenant": "acme",
+                "embedding": [1.0, 1.0, 0.0],
+            })])
+            .await
+            .unwrap();
+        let provider = builder(Arc::clone(&collection)).build().unwrap();
+        let result = call(&provider, "delete", json!({ "keys": ["real", "real"] })).await;
+        assert_eq!(result["deleted"], json!(1), "one record, one deletion");
+        assert_eq!(result["not_deleted"], json!(0));
     }
 
     #[tokio::test]
