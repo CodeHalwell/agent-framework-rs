@@ -84,6 +84,29 @@ fn doc_link(database_id: &str, container_id: &str, doc_id: &str) -> String {
     format!("{}/{doc_id}", docs_link(database_id, container_id))
 }
 
+/// The request URI path for one document, with the id percent-encoded as a
+/// path segment.
+///
+/// Not the same string as [`doc_link`], and deliberately so. Cosmos forbids
+/// `/`, `\`, `?` and `#` in an id but allows everything else — including
+/// `%`. An id like `a%2Fb` stores fine (the id travels in the request *body*
+/// on an upsert), and then a point read built from the raw link asks for
+/// `.../docs/a%2Fb`, which the server percent-decodes into a path with a
+/// slash in it: a different resource, which 404s. The record becomes
+/// unreachable, and `delete_document` — which treats 404 as "already gone" —
+/// reports success while leaving it in place.
+///
+/// The signature is still computed over the **raw** link, because that is
+/// what Cosmos's auth scheme specifies; the split between `resource_link` and
+/// `url_path` on [`RequestSpec`] exists for exactly this kind of divergence.
+fn doc_url_path(database_id: &str, container_id: &str, doc_id: &str) -> String {
+    format!(
+        "{}/{}",
+        docs_link(database_id, container_id),
+        crate::auth::percent_encode(doc_id)
+    )
+}
+
 /// The `x-ms-documentdb-partitionkey` header value for a single-value
 /// (non-hierarchical) partition key: a JSON array containing just that one
 /// value, e.g. `["thread-42"]`. `serde_json::to_string` both quotes and
@@ -772,13 +795,14 @@ impl CosmosRestClient {
         doc_id: &str,
     ) -> Result<Option<Value>> {
         let resource_link = doc_link(database_id, container_id, doc_id);
+        let url_path = doc_url_path(database_id, container_id, doc_id);
         let pk_header = partition_key_header_value(partition_key)?;
         let resp = self
             .send(RequestSpec {
                 method: reqwest::Method::GET,
                 resource_type: "docs",
                 resource_link: &resource_link,
-                url_path: &resource_link,
+                url_path: &url_path,
                 body: None,
                 content_type: None,
                 extra_headers: &[("x-ms-documentdb-partitionkey", pk_header)],
@@ -857,13 +881,14 @@ impl CosmosRestClient {
         doc_id: &str,
     ) -> Result<()> {
         let resource_link = doc_link(database_id, container_id, doc_id);
+        let url_path = doc_url_path(database_id, container_id, doc_id);
         let pk_header = partition_key_header_value(partition_key)?;
         let resp = self
             .send(RequestSpec {
                 method: reqwest::Method::DELETE,
                 resource_type: "docs",
                 resource_link: &resource_link,
-                url_path: &resource_link,
+                url_path: &url_path,
                 body: None,
                 content_type: None,
                 extra_headers: &[("x-ms-documentdb-partitionkey", pk_header)],
@@ -946,6 +971,32 @@ mod tests {
     fn doc_link_format() {
         assert_eq!(
             doc_link("mydb", "mycoll", "msg-1"),
+            "dbs/mydb/colls/mycoll/docs/msg-1"
+        );
+    }
+
+    #[test]
+    fn a_percent_in_an_id_is_encoded_in_the_url_but_not_in_the_signed_link() {
+        // Cosmos allows `%` in an id. Sent raw, `a%2Fb` decodes server-side
+        // into a path with a slash in it — a different resource, which 404s,
+        // leaving the record unreachable and a delete reporting success.
+        assert_eq!(
+            doc_url_path("mydb", "mycoll", "a%2Fb"),
+            "dbs/mydb/colls/mycoll/docs/a%252Fb",
+            "the literal % must itself be escaped"
+        );
+        // The signature is computed over the raw link, which Cosmos's auth
+        // scheme requires — the two strings differ on purpose.
+        assert_eq!(
+            doc_link("mydb", "mycoll", "a%2Fb"),
+            "dbs/mydb/colls/mycoll/docs/a%2Fb"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_id_reaches_the_url_unchanged() {
+        assert_eq!(
+            doc_url_path("mydb", "mycoll", "msg-1"),
             "dbs/mydb/colls/mycoll/docs/msg-1"
         );
     }

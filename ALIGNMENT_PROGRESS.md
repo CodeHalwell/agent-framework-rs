@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Seventeen corrections from review
+#### Nineteen corrections from review
 
-Across seven review rounds, Codex and Copilot raised twenty-one distinct
-findings; **seventeen were right** and are folded into the rows above. Two were
+Across eight review rounds, Codex and Copilot raised twenty-three distinct
+findings; **nineteen were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -194,6 +194,24 @@ a later fragment's payload onto the accumulated text.
   response's own documented meaning two lines below it, where an
   already-absent key counts as *not* deleted. Both paths read first now, and
   a key named twice counts once.
+* **A streamed reasoning payload was replayed as its last fragment only.**
+  `reasoning_details` arrives over several deltas, each parsed into its own
+  content — and `coalesce_text` leaves them separate *because* each carries
+  `protected_data`. The request builder took the last, so a provider
+  requiring the whole payload back got the tail of the reasoning and nothing
+  before it. Fragments now concatenate in stream order. The comment asserting
+  "a provider emits the payload once per turn" was true of the buffered path
+  and false of the streamed one, which is where a turn gets split.
+* **A Cosmos id containing `%` stored but could not be read back.** Cosmos
+  forbids `/`, `\\`, `?` and `#` in an id and allows everything else, so
+  `a%2Fb` is legal and upserts fine — the id rides in the request body. A
+  point read then built the URI from the raw link, and the server decoded
+  `%2F` into a slash: a different resource, 404. Worse, `delete_document`
+  treats 404 as "already gone", so the delete reported success and left the
+  record. The id is percent-encoded as a path segment now, while the
+  signature stays over the raw link as Cosmos's auth scheme requires — a
+  divergence the client's `resource_link`/`url_path` split already existed
+  for.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an

@@ -103,15 +103,28 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         // The provider's own reasoning payload, replayed verbatim. See
         // `reasoning_details_of` — a reasoning model that requires it rejects
         // the tool-result turn without it.
-        let mut reasoning_details: Option<Value> = None;
+        //
+        // Accumulated across every reasoning content rather than taking the
+        // last: a streamed turn splits the payload over several deltas, each
+        // parsed into its own `TextReasoningContent`, and `coalesce_text`
+        // leaves them separate precisely *because* each carries
+        // `protected_data`. Keeping only the last would replay the tail of
+        // the reasoning and drop everything before it.
+        let mut reasoning_details: Vec<Value> = Vec::new();
 
         for content in &msg.contents {
             match content {
                 Content::TextReasoning(t) => {
                     if let Some(details) = reasoning_details_of(t) {
-                        // A later block wins: a provider emits the payload
-                        // once per turn, and the last one is the current one.
-                        reasoning_details = Some(details);
+                        // The payload is an array of reasoning blocks, so
+                        // fragments concatenate in stream order. A payload
+                        // that is not an array is kept whole rather than
+                        // dropped — the provider is the authority on its own
+                        // shape.
+                        match details {
+                            Value::Array(blocks) => reasoning_details.extend(blocks),
+                            other => reasoning_details.push(other),
+                        }
                     }
                 }
                 Content::Text(t) if t.refusal => {
@@ -175,7 +188,8 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         // Only ever emitted when the provider gave us one: OpenAI proper
         // never sets `reasoning_details`, and answers a field its api-version
         // does not know with an error rather than ignoring it.
-        if let Some(details) = reasoning_details {
+        if !reasoning_details.is_empty() {
+            let details = Value::Array(reasoning_details);
             if obj.contains_key("content") || obj.contains_key("tool_calls") {
                 obj.insert("reasoning_details".into(), details);
             }
@@ -636,6 +650,56 @@ mod tests {
         );
         assert_eq!(wire[0]["content"], json!("the answer"));
         assert!(wire[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn reasoning_payloads_split_across_a_stream_are_replayed_whole() {
+        // A streamed turn emits `reasoning_details` over several deltas, each
+        // parsed into its own content — and `coalesce_text` leaves them
+        // separate precisely because each carries `protected_data`. Taking
+        // the last would replay the tail and drop everything before it, which
+        // is exactly what a provider requiring the full payload rejects.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    protected_data: Some(r#"[{"type":"reasoning.text","text":"first"}]"#.into()),
+                    ..Default::default()
+                }),
+                Content::TextReasoning(TextReasoningContent {
+                    protected_data: Some(r#"[{"type":"reasoning.text","text":"second"}]"#.into()),
+                    ..Default::default()
+                }),
+                Content::Text(TextContent::new("the answer")),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        assert_eq!(
+            wire[0]["reasoning_details"],
+            json!([
+                {"type": "reasoning.text", "text": "first"},
+                {"type": "reasoning.text", "text": "second"},
+            ]),
+            "fragments concatenate in stream order"
+        );
+    }
+
+    #[test]
+    fn a_non_array_reasoning_payload_is_kept_whole() {
+        // The provider is the authority on its own shape; dropping an
+        // unexpected one would lose the replay token it needs back.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    protected_data: Some(r#"{"opaque":"blob"}"#.into()),
+                    ..Default::default()
+                }),
+                Content::Text(TextContent::new("the answer")),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        assert_eq!(wire[0]["reasoning_details"], json!([{"opaque": "blob"}]));
     }
 
     #[test]
