@@ -334,13 +334,38 @@ mod tests {
     // -- resolve_user_id short-circuits allow (no network) ------------------
 
     #[tokio::test]
-    async fn agent_middleware_allows_when_no_resolvable_user_id() {
+    async fn agent_middleware_fails_closed_when_no_user_id_resolves() {
         // Valid settings, but the message carries no GUID-shaped user_id or
-        // author_name -- resolve_user_id returns None, which the processor
-        // treats as "cannot evaluate; allow" *without* an HTTP call. If it
-        // did attempt one, this test would hang/fail trying to reach
-        // graph.microsoft.com.
+        // author_name. Purview evaluates policy *for a user*, so with no user
+        // nothing was evaluated — and this used to report that as "allowed",
+        // which is the exact failure this middleware exists to prevent
+        // (upstream #8370). No HTTP call is attempted either way: if one were,
+        // this test would hang trying to reach graph.microsoft.com.
         let middleware = agent_middleware(valid_settings());
+        let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
+        let called = Arc::new(AtomicBool::new(false));
+        let ctx = AgentContext::new(
+            vec![Message::user("hello, nothing identifying here")],
+            false,
+        );
+
+        let Err(err) = pipeline
+            .execute(ctx, agent_terminal(called.clone(), "real response"))
+            .await
+        else {
+            panic!("an unevaluated message must not be reported as cleared");
+        };
+        assert!(err.to_string().contains("user id"), "{err}");
+        assert!(!called.load(Ordering::SeqCst), "the model was never called");
+    }
+
+    #[tokio::test]
+    async fn ignore_exceptions_still_trades_enforcement_for_availability() {
+        // The documented escape hatch covers the fail-closed case too: a
+        // deployment that would rather answer than enforce keeps that choice,
+        // and makes it explicitly.
+        let settings = valid_settings().with_ignore_exceptions(true);
+        let middleware = agent_middleware(settings);
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = AgentContext::new(
@@ -353,7 +378,6 @@ mod tests {
             .await
             .unwrap();
         assert!(called.load(Ordering::SeqCst));
-        assert!(!result_ctx.terminate);
         assert_eq!(result_ctx.result.unwrap().text(), "real response");
     }
 
@@ -361,7 +385,9 @@ mod tests {
     async fn agent_middleware_skips_post_check_when_streaming() {
         // is_streaming = true -> the response-phase check must never run,
         // so even a config-broken response phase can't surface an error.
-        let middleware = agent_middleware(valid_settings());
+        // `ignore_exceptions` keeps the *prompt* phase from failing closed on
+        // the unidentifiable message, which is what this test is not about.
+        let middleware = agent_middleware(valid_settings().with_ignore_exceptions(true));
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
         let ctx = AgentContext::new(vec![Message::user("hello, nothing identifying here")], true);
@@ -375,7 +401,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_middleware_allows_when_no_resolvable_user_id() {
+    async fn chat_middleware_fails_closed_when_no_user_id_resolves() {
+        // Same as the agent middleware: the chat-level one must not clear
+        // what it could not evaluate either.
         let middleware = chat_middleware(valid_settings());
         let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
         let called = Arc::new(AtomicBool::new(false));
@@ -385,13 +413,14 @@ mod tests {
             false,
         );
 
-        let result_ctx = pipeline
+        let Err(err) = pipeline
             .execute(ctx, chat_terminal(called.clone(), "real response"))
             .await
-            .unwrap();
-        assert!(called.load(Ordering::SeqCst));
-        assert!(!result_ctx.terminate);
-        assert_eq!(result_ctx.result.unwrap().text(), "real response");
+        else {
+            panic!("an unevaluated message must not be reported as cleared");
+        };
+        assert!(err.to_string().contains("user id"), "{err}");
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

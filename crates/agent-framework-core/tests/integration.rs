@@ -3202,6 +3202,92 @@ fn budgeted_client(
     FunctionInvokingChatClient::new(MockClient::new(responses)).with_config(config)
 }
 
+/// A tool that records when each of its invocations is entered and left, so
+/// a test can tell overlapping executions from sequential ones. It yields
+/// once in the middle, which is where two concurrent invocations interleave.
+fn overlap_tracking_tool(log: Arc<Mutex<Vec<&'static str>>>) -> ToolDefinition {
+    FunctionTool::new(
+        "ping",
+        "Return pong.",
+        json!({ "type": "object", "properties": {} }),
+        move |_args| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push("enter");
+                tokio::task::yield_now().await;
+                log.lock().unwrap().push("exit");
+                Ok(json!("pong"))
+            }
+        },
+    )
+    .into_definition()
+}
+
+#[tokio::test]
+async fn parallel_calls_overlap_by_default_and_serialize_when_asked() {
+    // Concurrent (the default): both invocations are in flight at once, so
+    // the second enters before the first leaves.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let client = budgeted_client(
+        vec![ping_calls(2), ChatResponse::from_text("done")],
+        |_config| {},
+    );
+    client
+        .get_response(
+            vec![Message::user("ping twice")],
+            ChatOptions::new().with_tool(overlap_tracking_tool(log.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["enter", "enter", "exit", "exit"],
+        "parallel tool calls should overlap by default"
+    );
+
+    // Sequential: each invocation completes before the next begins, which is
+    // the whole point — a tool with a side effect sees them in model order.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let client = budgeted_client(
+        vec![ping_calls(2), ChatResponse::from_text("done")],
+        |config| config.allow_concurrent_invocation = false,
+    );
+    let response = client
+        .get_response(
+            vec![Message::user("ping twice")],
+            ChatOptions::new().with_tool(overlap_tracking_tool(log.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["enter", "exit", "enter", "exit"],
+        "with concurrency off no two invocations may overlap"
+    );
+    assert_eq!(response.text(), "done");
+}
+
+#[tokio::test]
+async fn sequential_results_reach_the_model_in_model_order() {
+    // Ordering of the *results* is not what sequencing buys — it holds
+    // either way — but a regression that reordered them would be invisible
+    // without this.
+    let client = budgeted_client(
+        vec![ping_calls(3), ChatResponse::from_text("done")],
+        |config| config.allow_concurrent_invocation = false,
+    );
+    let counter = Arc::new(Mutex::new(0));
+    let response = client
+        .get_response(
+            vec![Message::user("ping thrice")],
+            ChatOptions::new().with_tool(counting_tool(counter.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "done");
+    assert_eq!(*counter.lock().unwrap(), 3);
+}
+
 #[tokio::test]
 async fn max_function_calls_disables_tools_and_still_answers() {
     let counter = Arc::new(Mutex::new(0));

@@ -19,6 +19,8 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Graph's `binaryContent` carries base64 of the raw bytes.
+base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

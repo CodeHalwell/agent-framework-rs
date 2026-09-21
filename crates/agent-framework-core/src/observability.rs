@@ -40,7 +40,9 @@
 //! (mirroring `observability.py:788-803`, bucket boundaries at `:65-96`):
 //! [`metrics::TOKEN_USAGE_METRIC`] (`gen_ai.client.token.usage`, unit
 //! `"tokens"`) and [`metrics::OPERATION_DURATION_METRIC`]
-//! (`gen_ai.client.operation.duration`, unit `"s"`). A third histogram,
+//! (`gen_ai.client.operation.duration`, unit `"s"`). The duration histogram
+//! records a **failed** call too, carrying `error.type`, so error latency and
+//! error rate are both readable from it. A third histogram,
 //! [`metrics::FUNCTION_INVOCATION_DURATION_METRIC`]
 //! (`agent_framework.function.invocation.duration`), times tool calls and is
 //! recorded by [`FunctionInvokingChatClient`] around each tool invocation.
@@ -625,6 +627,14 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                 }
                 Err(err) => {
                     record_error(&span, err);
+                    #[cfg(feature = "otel-metrics")]
+                    metrics::record_chat_error(
+                        &self.system,
+                        &request_model,
+                        &error_type(err),
+                        start.elapsed(),
+                        config.use_latest_experimental_gen_ai_semconv(),
+                    );
                 }
             }
             result
@@ -649,6 +659,8 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
         }
         let config = self.config.clone();
+        #[cfg(feature = "otel-metrics")]
+        let start = std::time::Instant::now();
         // Instrument the initiation future with the span (never hold an
         // `enter()` guard across an await); attribute recording happens as
         // the stream drains and completes.
@@ -662,6 +674,14 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             Ok(s) => s,
             Err(err) => {
                 record_error(&span, &err);
+                #[cfg(feature = "otel-metrics")]
+                metrics::record_chat_error(
+                    &self.system,
+                    &request_model,
+                    &error_type(&err),
+                    start.elapsed(),
+                    config.use_latest_experimental_gen_ai_semconv(),
+                );
                 return Err(err);
             }
         };
@@ -676,7 +696,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             #[cfg(feature = "otel-metrics")]
             request_model: request_model.clone(),
             #[cfg(feature = "otel-metrics")]
-            start: std::time::Instant::now(),
+            start,
         };
         let state = (inner, ChatResponse::default(), Some(span), false, telemetry);
         let stream = futures::stream::unfold(
@@ -694,6 +714,18 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                         if let Some(span) = &span {
                             record_error(span, &err);
                         }
+                        // This ends the stream, so the completion arm below
+                        // never runs: without recording here, a call that
+                        // failed halfway through its answer is missing from
+                        // the duration histogram entirely.
+                        #[cfg(feature = "otel-metrics")]
+                        metrics::record_chat_error(
+                            &telemetry.system,
+                            &telemetry.request_model,
+                            &error_type(&err),
+                            telemetry.start.elapsed(),
+                            telemetry.config.use_latest_experimental_gen_ai_semconv(),
+                        );
                         Some((Err(err), (inner, agg, span.take(), true, telemetry)))
                     }
                     None => {
@@ -937,8 +969,9 @@ pub mod metrics {
     /// `_capture_response` (`observability.py:1525-1543`): the token-usage
     /// histogram records once per token type present on the response; the
     /// operation-duration histogram always records. Only called from the
-    /// success path of [`super::ObservableChatClient`] — like upstream, a
-    /// failed call records neither histogram.
+    /// success path of [`super::ObservableChatClient`]; a failed call records
+    /// its duration through [`record_chat_error`] instead, and no token
+    /// histogram at all.
     pub(super) fn record_chat_completion(
         provider: &str,
         request_model: &str,
@@ -975,6 +1008,42 @@ pub mod metrics {
             m.token_usage.record(output, &attrs);
         }
         m.operation_duration.record(duration.as_secs_f64(), &base);
+    }
+
+    /// Record one **failed** chat call's operation-duration histogram.
+    ///
+    /// The GenAI semantic conventions define
+    /// `gen_ai.client.operation.duration` for failed operations as well as
+    /// successful ones, with `error.type` naming the failure. Recording only
+    /// successes leaves error latency out of the metric entirely — and with
+    /// it any error *rate*, since a histogram with no failed observations
+    /// cannot be divided by one. It also skews the latency distribution the
+    /// wrong way: a call that times out after thirty seconds is exactly the
+    /// observation a p99 needs, and it was the one being dropped.
+    ///
+    /// No token histogram here: a failed call reported no usage, and a zero
+    /// is not the same as "not reported". Mirrors upstream's
+    /// `_capture_operation_error` (#8347).
+    pub(super) fn record_chat_error(
+        provider: &str,
+        request_model: &str,
+        error_type: &str,
+        duration: Duration,
+        latest_semconv: bool,
+    ) {
+        let m = instruments();
+        let provider_key = if latest_semconv {
+            attr::PROVIDER_NAME
+        } else {
+            attr::SYSTEM
+        };
+        let attrs = vec![
+            KeyValue::new(attr::OPERATION, op::CHAT),
+            KeyValue::new(provider_key, provider.to_string()),
+            KeyValue::new(attr::REQUEST_MODEL, request_model.to_string()),
+            KeyValue::new(attr::ERROR_TYPE, error_type.to_string()),
+        ];
+        m.operation_duration.record(duration.as_secs_f64(), &attrs);
     }
 
     /// Record the function-invocation-duration histogram for one tool call.

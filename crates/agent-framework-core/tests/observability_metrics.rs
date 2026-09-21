@@ -72,6 +72,37 @@ impl ChatClient for StubClient {
     }
 }
 
+/// A client whose stream opens, yields one update, and then fails — the
+/// shape that ends a stream without reaching its completion arm.
+#[derive(Clone, Default)]
+struct FailingStream;
+
+#[async_trait]
+impl ChatClient for FailingStream {
+    async fn get_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        Err(Error::service("boom"))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _messages: Vec<Message>,
+        _options: ChatOptions,
+    ) -> Result<ChatStream> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ChatResponseUpdate::text("par")),
+            Err(Error::service("boom")),
+        ])))
+    }
+
+    fn model(&self) -> Option<&str> {
+        Some("stub-model")
+    }
+}
+
 static METRICS_TEST_MUTEX: Mutex<()> = Mutex::new(());
 static HARNESS: OnceLock<(SdkMeterProvider, InMemoryMetricExporter)> = OnceLock::new();
 
@@ -234,7 +265,7 @@ fn chat_completion_records_token_usage_and_operation_duration() {
 }
 
 #[test]
-fn failed_chat_completion_records_neither_histogram() {
+fn a_failed_chat_call_records_its_duration_with_an_error_type() {
     let _guard = METRICS_TEST_MUTEX.lock().unwrap();
     let (provider, exporter) = harness();
     exporter.reset();
@@ -255,10 +286,38 @@ fn failed_chat_completion_records_neither_histogram() {
 
     provider.force_flush().unwrap();
     let finished = exporter.get_finished_metrics().unwrap();
-    // Mirrors upstream: `_trace_get_response`'s exception branch never calls
-    // `_capture_response`, so a failed call records no histogram data points
-    // (the instruments may still appear if a prior test in this process
-    // already recorded into them, but this run must not have added any).
+
+    // The GenAI conventions define the duration histogram for failed calls
+    // too. Recording only successes leaves error latency out of the metric
+    // and gives no error rate at all — this test previously pinned the
+    // opposite (upstream #8347).
+    let duration = find_metric(&finished, OPERATION_DURATION_METRIC)
+        .unwrap_or_else(|| panic!("{OPERATION_DURATION_METRIC} not recorded"));
+    let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+        opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
+    ) = duration.data()
+    else {
+        panic!("expected an f64 histogram");
+    };
+    let points: Vec<_> = hist.data_points().collect();
+    assert_eq!(points.len(), 1);
+    let attrs: Vec<_> = points[0].attributes().cloned().collect();
+    assert_eq!(
+        attr_value(&attrs, "error.type").as_deref(),
+        Some("service"),
+        "the failure has to be distinguishable from a success in the same histogram"
+    );
+    assert_eq!(
+        attr_value(&attrs, "gen_ai.request.model").as_deref(),
+        Some("request-model")
+    );
+    assert_eq!(
+        attr_value(&attrs, "gen_ai.operation.name").as_deref(),
+        Some("chat")
+    );
+    // No response model: there was no response. And no token histogram — a
+    // failed call reported no usage, and a zero is not "not reported".
+    assert!(attr_value(&attrs, "gen_ai.response.model").is_none());
     if let Some(token_usage) = find_metric(&finished, TOKEN_USAGE_METRIC) {
         let opentelemetry_sdk::metrics::data::AggregatedMetrics::U64(
             opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
@@ -268,15 +327,50 @@ fn failed_chat_completion_records_neither_histogram() {
         };
         assert_eq!(hist.data_points().count(), 0);
     }
-    if let Some(duration) = find_metric(&finished, OPERATION_DURATION_METRIC) {
-        let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
-            opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
-        ) = duration.data()
-        else {
-            panic!("expected an f64 histogram");
-        };
-        assert_eq!(hist.data_points().count(), 0);
-    }
+}
+
+#[test]
+fn a_stream_that_fails_midway_still_records_its_duration() {
+    let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+    let (provider, exporter) = harness();
+    exporter.reset();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let client = ObservableChatClient::new(FailingStream, "stub-provider");
+        let mut stream = client
+            .get_streaming_response(
+                vec![Message::user("hi")],
+                ChatOptions::new().with_model("request-model"),
+            )
+            .await
+            .expect("the stream opens");
+        // Drain it: the failure arrives as an item, which ends the stream
+        // before its completion arm can run.
+        while let Some(item) = futures::StreamExt::next(&mut stream).await {
+            if item.is_err() {
+                break;
+            }
+        }
+    });
+
+    provider.force_flush().unwrap();
+    let finished = exporter.get_finished_metrics().unwrap();
+    let duration = find_metric(&finished, OPERATION_DURATION_METRIC)
+        .unwrap_or_else(|| panic!("{OPERATION_DURATION_METRIC} not recorded"));
+    let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+        opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
+    ) = duration.data()
+    else {
+        panic!("expected an f64 histogram");
+    };
+    let points: Vec<_> = hist.data_points().collect();
+    assert_eq!(points.len(), 1);
+    let attrs: Vec<_> = points[0].attributes().cloned().collect();
+    assert_eq!(attr_value(&attrs, "error.type").as_deref(), Some("service"));
 }
 
 #[test]

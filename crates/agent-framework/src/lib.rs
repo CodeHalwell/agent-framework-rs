@@ -25,7 +25,7 @@
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
-//! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store | no |
+//! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
 //!
@@ -121,7 +121,8 @@ pub use agent_framework_foundry as foundry;
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
 
-/// Azure Cosmos DB NoSQL chat-message store (enable the `cosmos` feature).
+/// Azure Cosmos DB NoSQL chat-message store, checkpoint storage, and
+/// vector store (enable the `cosmos` feature).
 #[cfg(feature = "cosmos")]
 pub use agent_framework_cosmos as cosmos;
 

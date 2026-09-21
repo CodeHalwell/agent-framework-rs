@@ -32,6 +32,10 @@
 
 pub mod filters;
 
+/// A collection exposed to an agent as tools — see
+/// [`VectorCollectionContextProvider`].
+pub mod provider;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -42,6 +46,10 @@ use crate::error::{Error, Result};
 pub use filters::{
     Filter, FilterExpression, FilterGroup, FilterGroupOperator, FilterOperator, MAX_FILTER_DEPTH,
     MAX_FILTER_NODES,
+};
+pub use provider::{
+    VectorCollectionContextProvider, VectorCollectionContextProviderBuilder, VectorToolKind,
+    DEFAULT_MAX_TOOL_BATCH_SIZE, DEFAULT_SEARCH_TOP,
 };
 
 /// How a vector index is built. Open value wrapper — the constants cover

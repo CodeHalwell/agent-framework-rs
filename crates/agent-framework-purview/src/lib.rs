@@ -62,6 +62,32 @@
 //!   the bearer token and is faithfully ported; see
 //!   [`processor::resolve_user_id`].
 //!
+//! ## Identity is a trusted input, and no identity fails closed
+//!
+//! Purview evaluates policy **for a specific user**, so the id resolved here
+//! decides *which* policy applies. Both sources this crate reads —
+//! `additional_properties["user_id"]` and `author_name` — are supplied by the
+//! hosting application and are not verified. A host must not populate them
+//! from anything that has crossed a trust boundary: if an end user, an
+//! upstream service or a model response can influence either, that party can
+//! select a different user's policy (typically a weaker one) and evade
+//! enforcement. Derive identity from a validated token on the server.
+//! [`PurviewSettings::purview_app_location`] is trusted the same way — it
+//! selects which policy locations apply.
+//!
+//! When no user id resolves, evaluation **fails** rather than reporting the
+//! content as allowed: no user means no policy, which is not the same as no
+//! violation. [`PurviewSettings::ignore_exceptions`] still trades that for
+//! availability, deliberately and for every error rather than only this one.
+//!
+//! ## What is evaluated
+//!
+//! Every content item of a message, not only its text: an attachment goes as
+//! Purview binary content, and function calls, function results and anything
+//! else are serialized whole (which keeps `additional_properties` — a data
+//! channel in its own right — under evaluation). Only `usage` content is
+//! skipped, because it carries token counts rather than user data.
+//!
 //! ## A curious fidelity note: both directions check `UploadText`
 //!
 //! Python's `Activity` enum has both `UPLOAD_TEXT` and `DOWNLOAD_TEXT`

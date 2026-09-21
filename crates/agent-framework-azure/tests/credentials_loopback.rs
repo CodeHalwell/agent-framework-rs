@@ -387,6 +387,23 @@ async fn azure_openai_maps_content_filter_400_to_content_filter() {
         matches!(err, Error::ServiceContentFilter { .. }),
         "error: {err:?}"
     );
+
+    // And the breakdown survives the whole path, which is the part a caller
+    // acts on: which policy, which category, on the prompt or the completion.
+    // Classified as a content filter but with only a message string, an
+    // application cannot tell one refusal from another.
+    let detail = err
+        .content_filter_detail()
+        .expect("Azure's innererror carries a breakdown");
+    assert_eq!(
+        detail.code.as_deref(),
+        Some(agent_framework_core::error::ContentFilterDetail::RESPONSIBLE_AI_POLICY_VIOLATION)
+    );
+    assert_eq!(detail.filtered_categories(), vec!["violence"]);
+    assert_eq!(
+        detail.categories["violence"].severity.as_deref(),
+        Some("medium")
+    );
 }
 
 /// Same classification, proven through `AzureOpenAIResponsesClient` too (a

@@ -130,6 +130,18 @@ fn seq_base() -> i64 {
 /// the module docs for the wire shape and this port's divergences
 /// from .NET's `CosmosChatMessageStore`.
 ///
+/// # The thread id selects history; it does not protect it
+///
+/// Two stores over the same account, database and container with the same
+/// `thread_id` read, write and clear the same history — which is what makes
+/// a conversation resumable across processes. It follows that the thread id
+/// is a *selector*, not an authorization boundary: distinct ids prevent
+/// accidental overlap, and they do not restrict a client whose Cosmos DB
+/// credentials already authorize the container. Bind the id to authenticated
+/// context, and where isolation has to hold against a hostile party, give
+/// each party its own container or account. (Upstream added the same note in
+/// #8391.)
+///
 /// ```no_run
 /// use agent_framework_cosmos::CosmosChatMessageStore;
 /// use agent_framework_core::types::Message;

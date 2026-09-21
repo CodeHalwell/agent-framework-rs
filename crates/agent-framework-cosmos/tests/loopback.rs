@@ -1419,3 +1419,409 @@ async fn master_key_state_still_round_trips_unchanged() {
 }
 
 // endregion
+
+// region: vector store
+//
+// The vector surface goes over the same signed REST path as the stores
+// above, so these exercise the parts that are new: the container-creation
+// body (the vector and indexing policies), the `VectorDistance` query text
+// and its bound parameters, and the point-read/upsert/delete round trips.
+
+use agent_framework_core::vectors::{
+    DistanceFunction, Filter, VectorCollection, VectorSearchOptions, VectorStore,
+    VectorStoreCollectionDefinition, VectorStoreField,
+};
+use agent_framework_cosmos::CosmosVectorStore;
+
+fn vector_definition() -> VectorStoreCollectionDefinition {
+    VectorStoreCollectionDefinition::new(vec![
+        VectorStoreField::key("id").with_type("str"),
+        VectorStoreField::data("text").with_type("str"),
+        VectorStoreField::vector("embedding", 3)
+            .with_distance_function(DistanceFunction::new(DistanceFunction::COSINE_SIMILARITY)),
+    ])
+    .expect("valid definition")
+}
+
+fn vector_collection(base_url: String) -> agent_framework_cosmos::CosmosVectorCollection {
+    CosmosVectorStore::new(base_url, test_key(), "agent-framework")
+        .expect("store")
+        .collection("memories", vector_definition())
+        .expect("collection")
+}
+
+#[tokio::test]
+async fn ensure_collection_exists_creates_with_the_vector_policies_then_reads_back() {
+    let (base_url, handle) = serve_sequence(3, |i, request| match i {
+        // The existence probe: not there yet.
+        0 => (404, "Not Found", vec![], json!({"code": "NotFound"})),
+        // The create.
+        1 => (201, "Created", vec![], request.body_json()),
+        // The read-back, echoing what a real service would return.
+        _ => (
+            200,
+            "OK",
+            vec![],
+            json!({
+                "id": "memories",
+                "partitionKey": { "paths": ["/id"], "kind": "Hash" },
+                "indexingPolicy": {
+                    "indexingMode": "consistent",
+                    "automatic": true,
+                    "includedPaths": [{ "path": "/*" }],
+                    "excludedPaths": [
+                        { "path": "/_etag/?" },
+                        { "path": "/\"embedding\"/*" },
+                    ],
+                    "vectorIndexes": [{ "path": "/embedding", "type": "quantizedFlat" }],
+                },
+                "vectorEmbeddingPolicy": {
+                    "vectorEmbeddings": [{
+                        "path": "/embedding",
+                        "dataType": "float32",
+                        "distanceFunction": "cosine",
+                        "dimensions": 3,
+                    }],
+                },
+            }),
+        ),
+    });
+
+    let collection = vector_collection(base_url);
+    collection
+        .ensure_collection_exists()
+        .await
+        .expect("created");
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/dbs/agent-framework/colls/memories");
+
+    // The vector surface speaks a newer api-version than the item surface:
+    // `2018-12-31` has no vector policy and no `VectorDistance`.
+    assert_eq!(
+        requests[1].header("x-ms-version").as_deref(),
+        Some("2020-07-15")
+    );
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/dbs/agent-framework/colls");
+    let body = requests[1].body_json();
+    assert_eq!(body["id"], json!("memories"));
+    assert_eq!(body["partitionKey"]["paths"], json!(["/id"]));
+    assert_eq!(
+        body["vectorEmbeddingPolicy"]["vectorEmbeddings"][0]["distanceFunction"],
+        json!("cosine")
+    );
+    assert_eq!(
+        body["indexingPolicy"]["vectorIndexes"][0]["path"],
+        json!("/embedding")
+    );
+
+    // The read-back is what makes a tolerated `409` safe: the container that
+    // now exists is checked against the definition rather than assumed.
+    assert_eq!(requests[2].method, "GET");
+}
+
+#[tokio::test]
+async fn an_existing_container_with_the_wrong_metric_is_refused_rather_than_searched() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({
+                "id": "memories",
+                "partitionKey": { "paths": ["/id"], "kind": "Hash" },
+                "indexingPolicy": {
+                    "excludedPaths": [{ "path": "/embedding/*" }],
+                    "vectorIndexes": [{ "path": "/embedding", "type": "quantizedFlat" }],
+                },
+                // The container ranks by euclidean; the definition asks for
+                // cosine. The query would succeed and rank by the wrong
+                // metric, which is worse than failing.
+                "vectorEmbeddingPolicy": {
+                    "vectorEmbeddings": [{
+                        "path": "/embedding",
+                        "dataType": "float32",
+                        "distanceFunction": "euclidean",
+                        "dimensions": 3,
+                    }],
+                },
+            }),
+        )
+    });
+
+    let collection = vector_collection(base_url);
+    let err = collection
+        .ensure_collection_exists()
+        .await
+        .expect_err("incompatible policy");
+    assert!(err.to_string().contains("vector embedding policy"), "{err}");
+    handle.join().expect("server thread panicked");
+}
+
+#[tokio::test]
+async fn search_sends_a_vector_distance_query_with_bound_parameters() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({
+                "Documents": [
+                    { "record": { "id": "m1", "text": "hello" }, "score": 0.93 },
+                    { "record": { "id": "m2", "text": "hi" }, "score": 0.81 },
+                ],
+                "_count": 2,
+            }),
+        )
+    });
+
+    let collection = vector_collection(base_url);
+    let options = VectorSearchOptions::new(2).with_filter(Filter::eq("text", "hello").unwrap());
+    let hits = collection
+        .search(vec![0.1, 0.2, 0.3], &options)
+        .await
+        .expect("search");
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].record["id"], json!("m1"));
+    assert_eq!(hits[0].score, Some(0.93));
+    // Cosine is a similarity here, and the definition says so, so the caller
+    // reading direction off its own definition gets it right.
+    assert_eq!(
+        hits[0].higher_is_closer(Some(&DistanceFunction::new(
+            DistanceFunction::COSINE_SIMILARITY
+        ))),
+        Some(true)
+    );
+
+    let requests = handle.join().expect("server thread panicked");
+    let body = requests[0].body_json();
+    let query = body["query"].as_str().unwrap();
+    assert!(
+        query.contains("VectorDistance(c[\"embedding\"], @vector)"),
+        "{query}"
+    );
+    assert!(query.contains("SELECT TOP @top VALUE"), "{query}");
+    assert!(
+        query.ends_with("ORDER BY VectorDistance(c[\"embedding\"], @vector)"),
+        "{query}"
+    );
+    // The filter literal is a parameter, never query text.
+    assert!(!query.contains("hello"), "{query}");
+    let parameters = body["parameters"].as_array().unwrap();
+    assert_eq!(parameters[0]["name"], json!("@vector"));
+    // The literal is bound under whatever name the binder allocated; what
+    // matters is that the query references that name and not the value.
+    let bound = parameters
+        .iter()
+        .find(|p| p["value"] == json!("hello"))
+        .expect("the filter literal is a bound parameter");
+    let bound_name = bound["name"].as_str().unwrap();
+    assert!(bound_name.starts_with("@filter_"), "{bound_name}");
+    assert!(query.contains(bound_name), "{query}");
+    assert!(parameters
+        .iter()
+        .any(|p| p["name"] == json!("@top") && p["value"] == json!(2)));
+    // A similarity search spans partitions: there is no partition to narrow
+    // to when the question is "which vectors are nearest".
+    assert_eq!(
+        requests[0]
+            .header("x-ms-documentdb-query-enablecrosspartition")
+            .as_deref(),
+        Some("True")
+    );
+}
+
+#[tokio::test]
+async fn skip_is_applied_after_a_limit_that_covers_it() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({
+                "Documents": [
+                    { "record": { "id": "m1" }, "score": 0.9 },
+                    { "record": { "id": "m2" }, "score": 0.8 },
+                    { "record": { "id": "m3" }, "score": 0.7 },
+                ],
+            }),
+        )
+    });
+
+    let collection = vector_collection(base_url);
+    let options = VectorSearchOptions::new(2).with_skip(1);
+    let hits = collection
+        .search(vec![0.1, 0.2, 0.3], &options)
+        .await
+        .expect("search");
+
+    // Asking the service for `top` alone and then dropping `skip` of them
+    // would have returned one record instead of two.
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].record["id"], json!("m2"));
+    let requests = handle.join().expect("server thread panicked");
+    let parameters = requests[0].body_json()["parameters"].clone();
+    assert!(parameters
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == json!("@top") && p["value"] == json!(3)));
+}
+
+#[tokio::test]
+async fn upsert_writes_each_record_in_its_own_partition_and_returns_its_key() {
+    let (base_url, handle) =
+        serve_sequence(1, |_i, request| (200, "OK", vec![], request.body_json()));
+
+    let collection = vector_collection(base_url);
+    let keys = collection
+        .upsert(vec![json!({
+            "id": "m1",
+            "text": "hello",
+            "embedding": [0.1, 0.2, 0.3],
+        })])
+        .await
+        .expect("upsert");
+    assert_eq!(keys, vec![json!("m1")]);
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].header("x-ms-documentdb-is-upsert").as_deref(),
+        Some("True")
+    );
+    // The partition key is the item's own id, so the write never fans out.
+    assert_eq!(
+        requests[0]
+            .header("x-ms-documentdb-partitionkey")
+            .as_deref(),
+        Some("[\"m1\"]")
+    );
+    assert_eq!(requests[0].body_json()["text"], json!("hello"));
+}
+
+#[tokio::test]
+async fn a_record_may_omit_a_non_key_field() {
+    // An upsert is a whole-document write, so omitting a field means the
+    // stored document has no such field — a state the portable filter already
+    // defines a meaning for, and one both sibling stores accept. Refusing it
+    // here would make a record that round-trips against
+    // `InMemoryVectorStore` in a test fail against Cosmos in production, and
+    // would contradict the upsert tool `VectorCollectionContextProvider`
+    // generates, whose schema requires only the key and the embedding source.
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (200, "OK", vec![], json!({ "id": "m1", "text": "hello" }))
+    });
+    let collection = vector_collection(base_url);
+    let keys = collection
+        .upsert(vec![json!({ "id": "m1", "text": "hello" })])
+        .await
+        .expect("a record without the optional vector is written as-is");
+    assert_eq!(keys, vec![json!("m1")]);
+
+    // And it goes to Cosmos without the omitted field invented for it.
+    let requests = handle.join().expect("server thread");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["id"], json!("m1"));
+    assert!(
+        body.get("embedding").is_none(),
+        "an omitted field must not be materialized as null: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_record_missing_its_key_is_refused_before_any_request() {
+    // The key is the one field an upsert cannot do without: it is both the
+    // document id and the partition key. Port 1 never accepts a connection,
+    // so reaching the network at all would surface as a transport error.
+    let collection = vector_collection("http://127.0.0.1:1".to_string());
+    let err = collection
+        .upsert(vec![json!({ "text": "hello" })])
+        .await
+        .expect_err("a keyless record");
+    assert!(err.to_string().contains("key field"), "{err}");
+}
+
+#[tokio::test]
+async fn a_present_field_of_the_wrong_type_is_still_refused() {
+    // Relaxing "every field must be present" must not relax the check on the
+    // fields that *are* present.
+    let collection = vector_collection("http://127.0.0.1:1".to_string());
+    let err = collection
+        .upsert(vec![json!({ "id": "m1", "text": 42 })])
+        .await
+        .expect_err("a mistyped field");
+    assert!(err.to_string().contains("declared type"), "{err}");
+}
+
+#[tokio::test]
+async fn get_aligns_a_missing_record_with_its_key() {
+    let (base_url, handle) = serve_sequence(2, |i, _request| {
+        if i == 0 {
+            (
+                200,
+                "OK",
+                vec![],
+                json!({ "id": "m1", "text": "hello", "embedding": [0.1, 0.2, 0.3] }),
+            )
+        } else {
+            (404, "Not Found", vec![], json!({ "code": "NotFound" }))
+        }
+    });
+
+    let collection = vector_collection(base_url);
+    let found = collection
+        .get(vec![json!("m1"), json!("gone")], false)
+        .await
+        .expect("get");
+
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].as_ref().unwrap()["text"], json!("hello"));
+    // Vectors are dropped unless asked for.
+    assert!(found[0].as_ref().unwrap().get("embedding").is_none());
+    assert!(found[1].is_none());
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(
+        requests[0].path,
+        "/dbs/agent-framework/colls/memories/docs/m1"
+    );
+}
+
+#[tokio::test]
+async fn delete_tolerates_a_key_that_is_already_gone() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (404, "Not Found", vec![], json!({ "code": "NotFound" }))
+    });
+    let collection = vector_collection(base_url);
+    collection
+        .delete(vec![json!("gone")])
+        .await
+        .expect("delete");
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests[0].method, "DELETE");
+}
+
+#[tokio::test]
+async fn listing_collections_reads_the_database_containers() {
+    let (base_url, handle) = serve_sequence(1, |_i, _request| {
+        (
+            200,
+            "OK",
+            vec![],
+            json!({
+                "DocumentCollections": [{ "id": "memories" }, { "id": "other" }],
+                "_count": 2,
+            }),
+        )
+    });
+    let store = CosmosVectorStore::new(base_url, test_key(), "agent-framework").unwrap();
+    let names = store.list_collection_names().await.expect("list");
+    assert_eq!(names, vec!["memories".to_string(), "other".to_string()]);
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests[0].path, "/dbs/agent-framework/colls");
+}

@@ -50,6 +50,54 @@ impl PurviewTextContent {
     }
 }
 
+/// `microsoft.graph.binaryContent`: an attachment's bytes, base64-encoded on
+/// the wire.
+///
+/// A classifier reads the bytes; handing it the base64 *string* as text would
+/// be evaluated as gibberish and pass every policy, which is worse than not
+/// sending it at all because it looks like coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurviewBinaryContent {
+    #[serde(rename = "@odata.type")]
+    pub data_type: String,
+    /// Base64 of the raw bytes, as Graph expects.
+    pub data: String,
+}
+
+impl PurviewBinaryContent {
+    pub fn new(bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            data_type: "microsoft.graph.binaryContent".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+}
+
+/// One content entry's payload: text for anything a classifier can read as
+/// text, binary for an attachment's bytes.
+///
+/// Untagged because each variant carries its own `@odata.type`, which is the
+/// discriminator Graph itself uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PurviewContent {
+    Text(PurviewTextContent),
+    Binary(PurviewBinaryContent),
+}
+
+impl From<PurviewTextContent> for PurviewContent {
+    fn from(value: PurviewTextContent) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<PurviewBinaryContent> for PurviewContent {
+    fn from(value: PurviewBinaryContent) -> Self {
+        Self::Binary(value)
+    }
+}
+
 /// `microsoft.graph.processConversationMetadata`: one message's content plus
 /// identity metadata. `ContentToProcess::content_entries` carries a list of
 /// these, though this port's [`ContentProcessor`](crate::processor::ContentProcessor)
@@ -62,7 +110,7 @@ pub struct ProcessConversationMetadata {
     #[serde(rename = "@odata.type")]
     pub data_type: String,
     pub identifier: String,
-    pub content: PurviewTextContent,
+    pub content: PurviewContent,
     pub name: String,
     #[serde(rename = "isTruncated")]
     pub is_truncated: bool,
@@ -74,10 +122,19 @@ impl ProcessConversationMetadata {
         text: impl Into<String>,
         name: impl Into<String>,
     ) -> Self {
+        Self::with_content(identifier, PurviewTextContent::new(text), name)
+    }
+
+    /// As [`Self::new`], for a content entry that is not plain text.
+    pub fn with_content(
+        identifier: impl Into<String>,
+        content: impl Into<PurviewContent>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             data_type: "microsoft.graph.processConversationMetadata".to_string(),
             identifier: identifier.into(),
-            content: PurviewTextContent::new(text),
+            content: content.into(),
             name: name.into(),
             is_truncated: false,
         }
@@ -187,15 +244,37 @@ pub struct ProcessContentRequest {
     pub correlation_id: Option<String>,
 }
 
-/// `blockAccess` vs. anything else. Mirrors Python's `DlpAction`.
+/// A DLP action Purview returned. Mirrors Python's `DlpAction`.
+///
+/// `Other` is the literal `"other"` value and **not** a catch-all: an action
+/// this port does not name fails to deserialize, which is deliberate.
+///
+/// The tempting alternative — `#[serde(other)]`, so an unrecognized value
+/// lands in `Other` — is a policy bypass.
+/// [`ProcessContentResponse::should_block`] would answer `false` for it, so a
+/// *blocking* action Graph adds after this was written would read as
+/// permission to proceed, and no configuration could recover: a verdict is
+/// not an error, so
+/// [`ignore_exceptions`](crate::settings::PurviewSettings::ignore_exceptions)
+/// never reaches it. Failing the parse instead surfaces an error, which with
+/// the default `ignore_exceptions = false` stops the request — the whole
+/// point of a middleware that fails closed. A deployment that prefers
+/// availability still opts out explicitly, for this as for every other error.
+///
+/// So the fix for a new Graph action is to name it here, the way upstream
+/// named `restrictAccess` (#8370). Naming one is not the same as blocking on
+/// it — see [`ProcessContentResponse::should_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DlpAction {
     BlockAccess,
+    RestrictAccess,
     Other,
 }
 
-/// `block` vs. anything else. Mirrors Python's `RestrictionAction`.
+/// `block` vs. the literal `"other"`. Mirrors Python's `RestrictionAction`.
+/// An unrecognized value fails the parse, for the reason spelled out on
+/// [`DlpAction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RestrictionAction {
@@ -254,6 +333,13 @@ impl ProcessContentResponse {
     /// Mirrors `ScopedContentProcessor.process_messages`'s check:
     /// `action == DlpAction.BLOCK_ACCESS or restriction_action ==
     /// RestrictionAction.BLOCK` on any entry of `policy_actions`.
+    ///
+    /// [`DlpAction::RestrictAccess`] is deliberately **not** a block by
+    /// itself: it carries a `restrictionAction` that selects the enforcement
+    /// mode, and only `block` withholds the content. This is a verdict rather
+    /// than an error, so nothing downstream can override it — which is why an
+    /// action or mode this port does not name fails the parse instead of
+    /// arriving here as a `false`. See [`DlpAction`].
     pub fn should_block(&self) -> bool {
         self.policy_actions.as_deref().is_some_and(|actions| {
             actions.iter().any(|a| {
@@ -278,6 +364,55 @@ mod tests {
             serde_json::to_value(Activity::DownloadText).unwrap(),
             serde_json::json!("downloadText")
         );
+    }
+
+    #[test]
+    fn an_action_this_port_does_not_name_fails_the_parse_rather_than_reading_as_allowed() {
+        // A catch-all variant would be a policy bypass: `should_block` would
+        // answer `false` for a *blocking* action Graph adds later, and no
+        // setting could recover it, because a verdict is not an error.
+        // Failing the parse surfaces an error, which the default
+        // `ignore_exceptions = false` turns into a stopped request.
+        for body in [
+            r#"{"policyActions":[{"action":"someFutureAzureAction"}]}"#,
+            r#"{"policyActions":[{"restrictionAction":"someFutureMode"}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ProcessContentResponse>(body).is_err(),
+                "an unrecognized enforcement action must not read as permission: {body}"
+            );
+        }
+        // The literal "other" is a real Graph value and still parses.
+        let known: ProcessContentResponse =
+            serde_json::from_str(r#"{"policyActions":[{"action":"other"}]}"#).unwrap();
+        assert_eq!(
+            known.policy_actions.as_ref().unwrap()[0].action,
+            Some(DlpAction::Other)
+        );
+        assert!(!known.should_block());
+    }
+
+    #[test]
+    fn restrict_access_is_not_by_itself_a_block() {
+        // It carries a separate `restrictionAction` that selects the
+        // enforcement mode. Only `block` withholds the content; every other
+        // mode Graph models — audit, warn, allow — arrives as `other`, which
+        // is why that value is a real one rather than a catch-all.
+        let audited: ProcessContentResponse = serde_json::from_str(
+            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"other"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            audited.policy_actions.as_ref().unwrap()[0].action,
+            Some(DlpAction::RestrictAccess)
+        );
+        assert!(!audited.should_block());
+
+        let blocked: ProcessContentResponse = serde_json::from_str(
+            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"block"}]}"#,
+        )
+        .unwrap();
+        assert!(blocked.should_block());
     }
 
     #[test]

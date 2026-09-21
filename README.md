@@ -80,14 +80,20 @@ parity with the Python and .NET implementations.
   `/v1/chat/completions`.
 - **Memory & storage** — Redis-backed history and long-term memory (BM25 via
   RediSearch, SCAN fallback on plain Redis), Mem0, Azure Cosmos DB message
-  store and workflow checkpoints (master key or Entra ID), and Azure AI Search
-  both as a context provider and as a full vector store.
+  store, workflow checkpoints and vector store (master key or Entra ID), and
+  Azure AI Search both as a context provider and as a full vector store. Any
+  collection can be handed to an agent as tools with
+  `VectorCollectionContextProvider`.
 - **Vector stores** — a provider-agnostic `VectorStore`/`VectorCollection`
   pair with a **portable filter** (`Filter::gte("year", 2020)`) each connector
   translates into its own dialect, so the same retrieval code runs against the
-  in-memory store in a test and against Azure AI Search in production.
-- **Compliance** — Purview middleware evaluates prompts and responses against
-  Microsoft Graph `processContent` and blocks on DLP verdicts.
+  in-memory store in a test and against Azure AI Search or Azure Cosmos DB in
+  production. `VectorCollectionContextProvider` turns any of them into agent
+  tools, with writes gated on approval by default.
+- **Compliance** — Purview middleware evaluates every content item of each
+  prompt and response against Microsoft Graph `processContent` — text,
+  attachments, tool calls and tool results alike — and blocks on DLP
+  verdicts.
 - **Observability** — `ObservableChatClient` emits `tracing` spans following
   OpenTelemetry GenAI semantic conventions, ready to bridge into any OTel
   exporter.
@@ -108,7 +114,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-hosting`](crates/agent-framework-hosting) | HTTP serving (axum): DevUI-style API + embedded debug UI, A2A, AG-UI, OpenAI-compatible. |
 | [`agent-framework-redis`](crates/agent-framework-redis) | Redis-backed `ChatMessageStore` and long-term-memory `ContextProvider` (RediSearch BM25). |
 | [`agent-framework-mem0`](crates/agent-framework-mem0) | Mem0 hosted-API long-term-memory `ContextProvider`. |
-| [`agent-framework-cosmos`](crates/agent-framework-cosmos) | Azure Cosmos DB NoSQL `ChatMessageStore` (master-key HMAC REST). |
+| [`agent-framework-cosmos`](crates/agent-framework-cosmos) | Azure Cosmos DB NoSQL `ChatMessageStore`, workflow checkpoints, and vector store (master key or Entra ID, REST). |
 | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) | Microsoft Copilot Studio agent client (Direct-to-Engine). |
 | [`agent-framework-purview`](crates/agent-framework-purview) | Microsoft Purview compliance middleware (`processContent` DLP checks). |
 | [`agent-framework`](crates/agent-framework) | Umbrella crate re-exporting the core plus everything above behind cargo features. |
@@ -197,7 +203,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
 | `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
-| `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store | no |
+| `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store, checkpoints, and vector store | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
 | `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
@@ -212,7 +218,7 @@ agent-framework = { version = "0.1", features = ["anthropic"] }
 
 ## Examples
 
-96 runnable examples live in [`examples/`](examples), organized by topic
+99 runnable examples live in [`examples/`](examples), organized by topic
 (agents, providers, workflows, orchestrations, mcp, hosting, memory,
 observability, a2a, declarative, compliance). See
 [`examples/README.md`](examples/README.md) for the full gallery — every
@@ -343,7 +349,7 @@ Done — everything else, including:
 - [x] Redis (BM25), Mem0, Cosmos DB, Azure AI Search; Purview middleware
 - [x] Observability: OTel GenAI spans (request + tool attributes) and
       optional GenAI metrics histograms (`otel-metrics`)
-- [x] 96 runnable examples in [`examples/`](examples)
+- [x] 99 runnable examples in [`examples/`](examples)
 
 ## Development
 

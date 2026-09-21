@@ -249,29 +249,73 @@ impl HandoffResolution {
 
 /// Remove tool-call plumbing from a conversation for clean display / routing.
 /// Rust analogue of `clean_conversation_for_handoff`.
+///
+/// Two things have to survive this, and they pull in opposite directions.
+///
+/// Tool-control state — calls, results, approval requests and responses —
+/// must **not** be replayed into the next agent's model turn: the receiving
+/// agent did not make those calls, and a provider rejects a request carrying
+/// a call with no matching result (or a result with no call). It is runtime
+/// plumbing, not conversation.
+///
+/// The user's own input must survive, including the parts that are not text.
+/// An image or a file the user attached is the request as much as the words
+/// beside it, and an agent receiving the handoff with only the words is
+/// answering a different question (upstream #8551 / #7822).
+///
+/// So multimodal content is kept on **user** messages and dropped elsewhere:
+/// providers treat image and file parts as input-only and reject them on an
+/// assistant turn, so replaying an assistant's attachment trades one rejected
+/// request for another.
 fn clean_conversation(conversation: &[Message]) -> Vec<Message> {
+    /// Whether `content` is the user's own input rather than runtime state.
+    /// `is_user` widens this past text: everything here is input-only.
+    fn is_semantic(content: &Content, is_user: bool) -> bool {
+        match content {
+            Content::Text(_) => true,
+            Content::Data(_)
+            | Content::Uri(_)
+            | Content::HostedFile(_)
+            | Content::HostedVectorStore(_) => is_user,
+            _ => false,
+        }
+    }
+
     let mut cleaned = Vec::new();
     for msg in conversation {
+        // A tool message is results and nothing else, so it never survives
+        // the filter below; skipping it outright just says so.
         if msg.role == Role::tool() {
             continue;
         }
-        let has_tool_content = msg.contents.iter().any(|c| {
-            matches!(
-                c,
-                Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
-            )
-        });
-        if !has_tool_content {
+        let is_user = msg.role == Role::user();
+        let kept: Vec<Content> = msg
+            .contents
+            .iter()
+            .filter(|c| is_semantic(c, is_user))
+            .cloned()
+            .collect();
+        // Nothing left: an assistant turn that was only a tool call carries
+        // no conversation, and an empty message reads to the next agent as a
+        // turn that said nothing.
+        if kept.is_empty() {
+            continue;
+        }
+        if kept.len() == msg.contents.len() {
             cleaned.push(msg.clone());
             continue;
         }
-        let text = msg.text();
-        if !text.trim().is_empty() {
-            let mut fresh = Message::new(msg.role.clone(), text);
-            fresh.author_name = msg.author_name.clone();
-            fresh.additional_properties = msg.additional_properties.clone();
-            cleaned.push(fresh);
+        // Same, for a turn whose only surviving content is blank text.
+        if kept
+            .iter()
+            .all(|c| matches!(c, Content::Text(t) if t.text.trim().is_empty()))
+        {
+            continue;
         }
+        let mut fresh = Message::with_contents(msg.role.clone(), kept);
+        fresh.author_name = msg.author_name.clone();
+        fresh.additional_properties = msg.additional_properties.clone();
+        cleaned.push(fresh);
     }
     cleaned
 }
@@ -751,6 +795,92 @@ impl HandoffBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: conversation cleaning for handoff (upstream #8551/#7822)
+
+    fn image(uri: &str) -> Content {
+        Content::Uri(crate::types::UriContent {
+            uri: uri.to_string(),
+            media_type: "image/png".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_users_attachment_survives_the_handoff() {
+        // The image *is* the request. An agent receiving only the words is
+        // answering a different question.
+        let conversation = vec![Message::with_contents(
+            Role::user(),
+            vec![
+                Content::text("what is in this?"),
+                image("data:image/png;base64,AA"),
+            ],
+        )];
+        let cleaned = clean_conversation(&conversation);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].contents.len(), 2);
+        assert!(matches!(cleaned[0].contents[1], Content::Uri(_)));
+    }
+
+    #[test]
+    fn an_assistants_attachment_does_not() {
+        // Providers treat image parts as input-only and reject them on an
+        // assistant turn, so replaying one trades one rejected request for
+        // another.
+        let conversation = vec![Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::text("here it is"),
+                image("data:image/png;base64,AA"),
+            ],
+        )];
+        let cleaned = clean_conversation(&conversation);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].contents.len(), 1);
+        assert_eq!(cleaned[0].text(), "here it is");
+    }
+
+    #[test]
+    fn tool_control_state_is_left_behind_whatever_role_carries_it() {
+        // An approval response rides on a *user* message, which is exactly
+        // the shape that used to pass through untouched — replaying it hands
+        // the next agent an approval for a call it never made.
+        let approval =
+            Content::FunctionApprovalResponse(crate::types::FunctionApprovalResponseContent {
+                id: "r1".into(),
+                approved: true,
+                function_call: FunctionCallContent::new("c1", "charge", None),
+            });
+        let conversation = vec![
+            Message::with_contents(Role::user(), vec![Content::text("yes, go ahead"), approval]),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    "c1", "charge", None,
+                ))],
+            ),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(
+                    crate::types::FunctionResultContent::new("c1", Some(json!("ok"))),
+                )],
+            ),
+        ];
+        let cleaned = clean_conversation(&conversation);
+        // Only the user's words survive: the approval, the call and the
+        // result are all runtime plumbing.
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].text(), "yes, go ahead");
+        assert_eq!(cleaned[0].contents.len(), 1);
+    }
+
+    #[test]
+    fn an_untouched_message_is_passed_through_as_it_is() {
+        let conversation = vec![Message::user("plain"), Message::assistant("reply")];
+        let cleaned = clean_conversation(&conversation);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(cleaned[1].text(), "reply");
+    }
 
     /// Empty `handoff_map` means full mesh: any source may reach any target,
     /// matching pre-mesh-enforcement behavior for callers that never declare

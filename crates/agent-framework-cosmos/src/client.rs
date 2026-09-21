@@ -45,6 +45,24 @@ const SCOPE_OVERRIDE_ENV: &str = "AZURE_COSMOS_AAD_SCOPE_OVERRIDE";
 /// reason to support anything older.
 pub const DEFAULT_API_VERSION: &str = "2018-12-31";
 
+/// Cosmos DB REST API version the **vector** surface speaks.
+///
+/// Split from [`DEFAULT_API_VERSION`] for the same reason the Azure OpenAI
+/// crate carries one api-version per surface: a pin that is right for one
+/// surface silently narrows what another can express. `2018-12-31` predates
+/// vector search entirely — neither `vectorEmbeddingPolicy` on *Create
+/// Collection* nor `VectorDistance` in a query exists in it — so a container
+/// created under it would come back without the vector policy it was asked
+/// for, and the search query would be a syntax error rather than a slow
+/// answer. `2020-07-15` is what the official `azure-cosmos` Python SDK sends
+/// (`Versions.CurrentVersion`), which is the version upstream's connector
+/// runs against.
+///
+/// Public so a caller pinning a validated version can see what they are
+/// moving away from; override with
+/// [`CosmosVectorStore::with_api_version`](crate::CosmosVectorStore::with_api_version).
+pub const DEFAULT_VECTOR_API_VERSION: &str = "2020-07-15";
+
 /// Partition key path used for every container this crate creates —
 /// `threadId`, matching [`crate::CosmosChatMessageStore`]'s partitioning
 /// (one partition per conversation thread).
@@ -64,6 +82,29 @@ fn docs_link(database_id: &str, container_id: &str) -> String {
 
 fn doc_link(database_id: &str, container_id: &str, doc_id: &str) -> String {
     format!("{}/{doc_id}", docs_link(database_id, container_id))
+}
+
+/// The request URI path for one document, with the id percent-encoded as a
+/// path segment.
+///
+/// Not the same string as [`doc_link`], and deliberately so. Cosmos forbids
+/// `/`, `\`, `?` and `#` in an id but allows everything else — including
+/// `%`. An id like `a%2Fb` stores fine (the id travels in the request *body*
+/// on an upsert), and then a point read built from the raw link asks for
+/// `.../docs/a%2Fb`, which the server percent-decodes into a path with a
+/// slash in it: a different resource, which 404s. The record becomes
+/// unreachable, and `delete_document` — which treats 404 as "already gone" —
+/// reports success while leaving it in place.
+///
+/// The signature is still computed over the **raw** link, because that is
+/// what Cosmos's auth scheme specifies; the split between `resource_link` and
+/// `url_path` on [`RequestSpec`] exists for exactly this kind of divergence.
+fn doc_url_path(database_id: &str, container_id: &str, doc_id: &str) -> String {
+    format!(
+        "{}/{}",
+        docs_link(database_id, container_id),
+        crate::auth::percent_encode(doc_id)
+    )
 }
 
 /// The `x-ms-documentdb-partitionkey` header value for a single-value
@@ -137,7 +178,7 @@ fn normalize_endpoint(account_endpoint: String) -> Result<String> {
 /// clippy's `too_many_arguments` happy — this has no behavior of its own.
 struct RequestSpec<'a> {
     method: reqwest::Method,
-    /// Feeds the auth signature (see [`crate::auth`]) — RediSearch's
+    /// Feeds the auth signature (see [`crate::auth`]) — the REST API's
     /// `dbs`/`colls`/`docs`.
     resource_type: &'a str,
     /// Feeds the auth signature; the resource (or, for list/create
@@ -229,6 +270,16 @@ impl CosmosRestClient {
             auth: CosmosAuth::Credential { credential, scope },
             api_version: DEFAULT_API_VERSION.to_string(),
         })
+    }
+
+    /// Override the `x-ms-version` this client sends.
+    ///
+    /// The default is right for the item/query surface the history and
+    /// checkpoint stores use; the vector surface needs a newer one (see
+    /// [`DEFAULT_VECTOR_API_VERSION`]).
+    pub(crate) fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
+        self.api_version = api_version.into();
+        self
     }
 
     /// Whether this client authenticates with Entra ID rather than a master
@@ -357,6 +408,176 @@ impl CosmosRestClient {
             let text = resp.text().await.unwrap_or_default();
             Err(self.management_error(status, &text, "creating a database"))
         }
+    }
+
+    /// `POST /dbs/{database_id}/colls` with the same envelope as
+    /// [`Self::create_container_if_not_exists`] plus `extra` merged into the
+    /// body — the `indexingPolicy` / `vectorEmbeddingPolicy` a vector
+    /// collection needs, which cannot be added after the fact: Cosmos DB
+    /// accepts an indexing-policy *replace* on an existing container but
+    /// rejects one that changes the vector policy, so the policy has to be
+    /// right at creation. Tolerates `409 Conflict` as success, same as the
+    /// plain form.
+    pub(crate) async fn create_container_with_body(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        partition_key_path: &str,
+        extra: &serde_json::Map<String, Value>,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        body.insert("id".into(), serde_json::json!(container_id));
+        body.insert(
+            "partitionKey".into(),
+            serde_json::json!({ "paths": [partition_key_path], "kind": "Hash" }),
+        );
+        for (k, v) in extra {
+            body.insert(k.clone(), v.clone());
+        }
+        let body = Value::Object(body);
+        let resource_link = db_link(database_id);
+        let url_path = format!("{resource_link}/colls");
+        let resp = self
+            .send(RequestSpec {
+                method: reqwest::Method::POST,
+                resource_type: "colls",
+                resource_link: &resource_link,
+                url_path: &url_path,
+                body: Some(&body),
+                content_type: None,
+                extra_headers: &[],
+            })
+            .await?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(self.management_error(status, &text, "creating a container"))
+        }
+    }
+
+    /// `GET /dbs/{db}/colls/{coll}` — the container's own properties
+    /// (partition key, indexing policy, vector embedding policy). `Ok(None)`
+    /// on `404`, so "does it exist" and "what is it" are one round trip
+    /// rather than two.
+    pub(crate) async fn read_container(
+        &self,
+        database_id: &str,
+        container_id: &str,
+    ) -> Result<Option<Value>> {
+        let resource_link = coll_link(database_id, container_id);
+        let resp = self
+            .send(RequestSpec {
+                method: reqwest::Method::GET,
+                resource_type: "colls",
+                resource_link: &resource_link,
+                url_path: &resource_link,
+                body: None,
+                content_type: None,
+                extra_headers: &[],
+            })
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::service(format!("failed reading Cosmos DB response body: {e}")))?;
+        if !status.is_success() {
+            return Err(map_error_response(status, &text));
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|e| {
+            Error::service(format!(
+                "invalid Cosmos DB response JSON: {e} (body: {text})"
+            ))
+        })?;
+        Ok(Some(value))
+    }
+
+    /// `DELETE /dbs/{db}/colls/{coll}`. `404 Not Found` (already gone) is
+    /// treated as success, mirroring [`Self::delete_document`].
+    pub(crate) async fn delete_container(
+        &self,
+        database_id: &str,
+        container_id: &str,
+    ) -> Result<()> {
+        let resource_link = coll_link(database_id, container_id);
+        let resp = self
+            .send(RequestSpec {
+                method: reqwest::Method::DELETE,
+                resource_type: "colls",
+                resource_link: &resource_link,
+                url_path: &resource_link,
+                body: None,
+                content_type: None,
+                extra_headers: &[],
+            })
+            .await?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(self.management_error(status, &text, "deleting a container"))
+        }
+    }
+
+    /// `GET /dbs/{db}/colls` — every container id in the database, following
+    /// `x-ms-continuation` until exhausted.
+    pub(crate) async fn list_container_ids(&self, database_id: &str) -> Result<Vec<String>> {
+        let resource_link = db_link(database_id);
+        let url_path = format!("{resource_link}/colls");
+        let mut out = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let headers: Vec<(&str, String)> = match &continuation {
+                Some(token) => vec![("x-ms-continuation", token.clone())],
+                None => Vec::new(),
+            };
+            let resp = self
+                .send(RequestSpec {
+                    method: reqwest::Method::GET,
+                    resource_type: "colls",
+                    resource_link: &resource_link,
+                    url_path: &url_path,
+                    body: None,
+                    content_type: None,
+                    extra_headers: &headers,
+                })
+                .await?;
+            let status = resp.status();
+            continuation = resp
+                .headers()
+                .get("x-ms-continuation")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let text = resp.text().await.map_err(|e| {
+                Error::service(format!("failed reading Cosmos DB response body: {e}"))
+            })?;
+            if !status.is_success() {
+                return Err(map_error_response(status, &text));
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|e| {
+                Error::service(format!(
+                    "invalid Cosmos DB response JSON: {e} (body: {text})"
+                ))
+            })?;
+            if let Some(items) = value.get("DocumentCollections").and_then(Value::as_array) {
+                out.extend(
+                    items
+                        .iter()
+                        .filter_map(|c| c.get("id").and_then(Value::as_str))
+                        .map(String::from),
+                );
+            }
+            if continuation.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// `POST /dbs/{database_id}/colls` with `{"id": container_id,
@@ -574,13 +795,14 @@ impl CosmosRestClient {
         doc_id: &str,
     ) -> Result<Option<Value>> {
         let resource_link = doc_link(database_id, container_id, doc_id);
+        let url_path = doc_url_path(database_id, container_id, doc_id);
         let pk_header = partition_key_header_value(partition_key)?;
         let resp = self
             .send(RequestSpec {
                 method: reqwest::Method::GET,
                 resource_type: "docs",
                 resource_link: &resource_link,
-                url_path: &resource_link,
+                url_path: &url_path,
                 body: None,
                 content_type: None,
                 extra_headers: &[("x-ms-documentdb-partitionkey", pk_header)],
@@ -659,13 +881,14 @@ impl CosmosRestClient {
         doc_id: &str,
     ) -> Result<()> {
         let resource_link = doc_link(database_id, container_id, doc_id);
+        let url_path = doc_url_path(database_id, container_id, doc_id);
         let pk_header = partition_key_header_value(partition_key)?;
         let resp = self
             .send(RequestSpec {
                 method: reqwest::Method::DELETE,
                 resource_type: "docs",
                 resource_link: &resource_link,
-                url_path: &resource_link,
+                url_path: &url_path,
                 body: None,
                 content_type: None,
                 extra_headers: &[("x-ms-documentdb-partitionkey", pk_header)],
@@ -748,6 +971,32 @@ mod tests {
     fn doc_link_format() {
         assert_eq!(
             doc_link("mydb", "mycoll", "msg-1"),
+            "dbs/mydb/colls/mycoll/docs/msg-1"
+        );
+    }
+
+    #[test]
+    fn a_percent_in_an_id_is_encoded_in_the_url_but_not_in_the_signed_link() {
+        // Cosmos allows `%` in an id. Sent raw, `a%2Fb` decodes server-side
+        // into a path with a slash in it — a different resource, which 404s,
+        // leaving the record unreachable and a delete reporting success.
+        assert_eq!(
+            doc_url_path("mydb", "mycoll", "a%2Fb"),
+            "dbs/mydb/colls/mycoll/docs/a%252Fb",
+            "the literal % must itself be escaped"
+        );
+        // The signature is computed over the raw link, which Cosmos's auth
+        // scheme requires — the two strings differ on purpose.
+        assert_eq!(
+            doc_link("mydb", "mycoll", "a%2Fb"),
+            "dbs/mydb/colls/mycoll/docs/a%2Fb"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_id_reaches_the_url_unchanged() {
+        assert_eq!(
+            doc_url_path("mydb", "mycoll", "msg-1"),
             "dbs/mydb/colls/mycoll/docs/msg-1"
         );
     }

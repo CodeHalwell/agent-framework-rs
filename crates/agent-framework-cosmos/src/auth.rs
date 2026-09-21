@@ -61,7 +61,7 @@ fn signing_payload(verb: &str, resource_type: &str, resource_link: &str, date: &
 /// header value — confirmed against the reference C#/Node.js examples in
 /// Microsoft's docs, which wrap the whole string in
 /// `WebUtility.UrlEncode`/`encodeURIComponent`.
-fn percent_encode(input: &str) -> String {
+pub(crate) fn percent_encode(input: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {

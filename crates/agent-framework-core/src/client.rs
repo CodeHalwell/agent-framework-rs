@@ -1141,8 +1141,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 carried.extend(response.messages.iter().cloned());
                 let response_conversation_id = response.conversation_id.clone();
 
-                // Execute all calls concurrently: the model may emit several
-                // parallel tool calls, and I/O-bound tools should not be serialized.
+                // The model may emit several parallel tool calls, and
+                // I/O-bound tools should not be serialized — unless the
+                // caller asked for that, which
+                // `FunctionInvocationConfig::allow_concurrent_invocation`
+                // turns off.
                 let invocations = calls.iter().map(|call| {
                     let tool = tools.iter().find(|t| t.name == call.name).cloned();
                     let call = call.clone();
@@ -1169,9 +1172,32 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     }
                 });
 
-                let outcomes = futures::future::try_join_all(invocations)
-                    .await
-                    .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
+                let outcomes = if self.config.allow_concurrent_invocation {
+                    futures::future::try_join_all(invocations)
+                        .await
+                        .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?
+                } else {
+                    // One at a time, in the order the model emitted them. A
+                    // failure stops the batch, so the calls after it never
+                    // run: a caller who sequenced these asked for each to see
+                    // the previous one's effect, and running the rest after
+                    // one was refused is the opposite of that.
+                    let invocations: Vec<_> = invocations.collect();
+                    let mut sequential = Vec::with_capacity(invocations.len());
+                    for invocation in invocations {
+                        match invocation.await {
+                            Ok(outcome) => sequential.push(outcome),
+                            Err(err) => {
+                                // Same as the concurrent path: the run ends
+                                // here, so the budget is discarded rather
+                                // than charged for the calls that did run.
+                                InvocationBudget::clear(session.as_ref());
+                                return Err(err);
+                            }
+                        }
+                    }
+                    sequential
+                };
                 budget.record(outcomes.iter().filter(|o| o.executed).count());
                 let mut result_contents: Vec<Content> = Vec::with_capacity(outcomes.len());
                 let mut had_error = false;

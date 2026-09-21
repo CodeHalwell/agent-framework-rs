@@ -192,6 +192,8 @@ Azure AI Search.
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
 | `azure_ai_search_vector_store` | Azure AI Search as a vector store: create the index, upsert records, portable-filtered vector search, keyword-hybrid search | `AZURE_SEARCH_*` (admin key), `OPENAI_API_KEY` (skips gracefully) |
+| `cosmos_vector_store` | Azure Cosmos DB (NoSQL) as a vector store: create the container with its vector policy, upsert, portable-filtered `VectorDistance` search, point reads | `AZURE_COSMOS_ENDPOINT`, `AZURE_COSMOS_KEY`, `OPENAI_API_KEY` (skips gracefully) |
+| `vector_collection_tools` | Hand a vector collection to an agent as tools: scoped search / get / upsert / delete, writes gated on approval | `OPENAI_API_KEY` (skips gracefully) |
 
 ## Observability (`observability/`)
 
@@ -233,5 +235,5 @@ calls.
 
 ---
 
-96 examples total. See the root [`README.md`](../README.md) for the
+99 examples total. See the root [`README.md`](../README.md) for the
 project-level overview, feature-flag table, and workspace layout.

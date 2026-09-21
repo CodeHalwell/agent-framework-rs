@@ -844,6 +844,25 @@ pub struct FunctionInvocationConfig {
     pub max_consecutive_errors_per_request: usize,
     pub terminate_on_unknown_calls: bool,
     pub include_detailed_errors: bool,
+    /// Whether the executable calls of one model response may run
+    /// concurrently. `true` (the default) is what a model asking for parallel
+    /// calls is asking for; `false` runs them one at a time, in the order the
+    /// model emitted them.
+    ///
+    /// Sequencing is not only about ordering the *results* — those come back
+    /// in model order either way. It is about the side effects: a tool that
+    /// writes to a shared resource, holds a non-reentrant handle, or is rate
+    /// limited per caller behaves differently when two of its invocations
+    /// overlap, and a model emitting "create the record, then update it" in
+    /// one batch means them in that order.
+    ///
+    /// One consequence worth stating, because it is the reason to want this:
+    /// with concurrency off, a call that fails the batch (a middleware
+    /// refusal) stops it, so the calls after it never run at all. With
+    /// concurrency on, they were already in flight and are cancelled instead.
+    ///
+    /// Mirrors upstream's `allow_concurrent_invocation` (#8453).
+    pub allow_concurrent_invocation: bool,
 }
 
 impl Default for FunctionInvocationConfig {
@@ -856,6 +875,7 @@ impl Default for FunctionInvocationConfig {
             max_consecutive_errors_per_request: 3,
             terminate_on_unknown_calls: false,
             include_detailed_errors: false,
+            allow_concurrent_invocation: true,
         }
     }
 }
