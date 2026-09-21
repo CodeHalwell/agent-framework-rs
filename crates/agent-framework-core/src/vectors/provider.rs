@@ -248,33 +248,6 @@ impl VectorCollectionContextProviderBuilder {
             validate_filter_fields(filter, &definition)?;
         }
 
-        // Resolved once, here, where the caller can still fix it. Picking the
-        // first of several silently would search or write whichever field
-        // happened to be declared first; leaving it unset would instead fail
-        // at every single tool call, since `VectorCollection::search` refuses
-        // an unnamed field on a multi-vector collection.
-        let vector_field = definition
-            .try_get_vector_field(self.vector_field.as_deref())
-            .cloned()
-            .ok_or_else(|| {
-                Error::Configuration(match &self.vector_field {
-                    Some(name) => format!(
-                        "vector_field names '{name}', which is not one of this collection's \
-                         vector fields"
-                    ),
-                    None if definition.vector_fields().is_empty() => {
-                        "a vector collection context provider needs a collection with a vector \
-                         field"
-                            .into()
-                    }
-                    None => format!(
-                        "this collection declares {} vector fields, so the tools have to be told \
-                         which one to use: set `vector_field`",
-                        definition.vector_fields().len()
-                    ),
-                })
-            })?;
-
         let key_type = definition.key_field().type_.clone();
 
         let mut embed_source = None;
@@ -313,6 +286,42 @@ impl VectorCollectionContextProviderBuilder {
             embed_source = Some(name.clone());
         }
 
+        // Only search and upsert touch a vector; get and delete work by key.
+        // Resolving unconditionally would refuse a read/delete-only provider
+        // over a collection with no vector field, or with several and none
+        // named — configurations the underlying `VectorCollection` serves
+        // perfectly well. Resolved here rather than at each tool call,
+        // because picking the first of several silently would search or write
+        // whichever happened to be declared first, and leaving it unset would
+        // fail every search on a multi-vector collection.
+        let vector_field = if self.include_search || embed_source.is_some() {
+            Some(
+                definition
+                    .try_get_vector_field(self.vector_field.as_deref())
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Configuration(match &self.vector_field {
+                            Some(name) => format!(
+                                "vector_field names '{name}', which is not one of this \
+                                 collection's vector fields"
+                            ),
+                            None if definition.vector_fields().is_empty() => {
+                                "a search or upsert tool needs a collection with a vector field; \
+                                 turn them off to build a read/delete-only provider"
+                                    .into()
+                            }
+                            None => format!(
+                                "this collection declares {} vector fields, so the tools have to \
+                                 be told which one to use: set `vector_field`",
+                                definition.vector_fields().len()
+                            ),
+                        })
+                    })?,
+            )
+        } else {
+            None
+        };
+
         let approval = |kind: VectorToolKind| {
             self.approvals
                 .iter()
@@ -333,7 +342,11 @@ impl VectorCollectionContextProviderBuilder {
                 Arc::clone(&self.embedder),
                 self.scope_filter.clone(),
                 self.search_top,
-                vector_field.name.clone(),
+                vector_field
+                    .as_ref()
+                    .expect("search implies a resolved vector field")
+                    .name
+                    .clone(),
                 name_of(VectorToolKind::Search),
                 approval(VectorToolKind::Search),
             ));
@@ -355,7 +368,11 @@ impl VectorCollectionContextProviderBuilder {
                 self.scope_filter.clone(),
                 self.max_tool_batch_size,
                 text_field,
-                vector_field.name.clone(),
+                vector_field
+                    .as_ref()
+                    .expect("an embedding source implies a resolved vector field")
+                    .name
+                    .clone(),
                 name_of(VectorToolKind::Upsert),
                 approval(VectorToolKind::Upsert),
             )?);
@@ -1043,6 +1060,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not one of this collection's"), "{err}");
+    }
+
+    #[test]
+    fn a_read_delete_only_provider_needs_no_vector_field() {
+        // Neither `get` nor `delete` touches a vector — they work by key — so
+        // a collection with several vectors and none named, or with none at
+        // all, is perfectly serviceable for them.
+        let provider = builder(two_vector_collection())
+            .include_search(false)
+            .build()
+            .expect("get and delete need no vector field");
+        let names: Vec<_> = provider.tools().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["get", "delete"]);
+
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("str"),
+            VectorStoreField::data("text").with_type("str"),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let vectorless: Arc<dyn VectorCollection> =
+            Arc::from(store.get_collection("notes", definition).unwrap());
+        assert!(builder(vectorless).include_search(false).build().is_ok());
+    }
+
+    #[test]
+    fn asking_for_search_on_a_vectorless_collection_still_says_so() {
+        let definition = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id").with_type("str"),
+            VectorStoreField::data("text").with_type("str"),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let vectorless: Arc<dyn VectorCollection> =
+            Arc::from(store.get_collection("notes", definition).unwrap());
+        let err = builder(vectorless).build().unwrap_err().to_string();
+        assert!(
+            err.contains("needs a collection with a vector field"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

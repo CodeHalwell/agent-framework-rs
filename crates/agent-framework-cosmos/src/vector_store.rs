@@ -1051,6 +1051,9 @@ impl CosmosVectorCollection {
                     format!("IS_DEFINED({access})"),
                     format!("NOT IS_NULL({access})"),
                 ];
+                // The type guard every operand must agree on, for an untyped
+                // field. See the mismatch check below.
+                let mut type_guard: Option<&'static str> = None;
                 for operand in &operands {
                     scalar(operand)?;
                     if !declared.accepts(operand) {
@@ -1073,7 +1076,27 @@ impl CosmosVectorCollection {
                                 "an ordered comparison needs a string or numeric literal".into(),
                             )
                         })?;
-                        guards.push(format!("{guard}({access})"));
+                        // `between(f, 1, "z")` would otherwise emit both
+                        // `IS_NUMBER` and `IS_STRING`, a predicate no record
+                        // can satisfy — so an invalid comparison would come
+                        // back as an empty page here while the in-memory
+                        // evaluator reports the bounds as incomparable. Same
+                        // answer on both, and only one guard is emitted when
+                        // the bounds agree.
+                        match type_guard {
+                            Some(existing) if existing != guard => {
+                                return Err(Error::Configuration(format!(
+                                    "the 'between' bounds for field '{}' are of different types, \
+                                     which cannot be ordered against each other",
+                                    field.name
+                                )));
+                            }
+                            Some(_) => {}
+                            None => {
+                                type_guard = Some(guard);
+                                guards.push(format!("{guard}({access})"));
+                            }
+                        }
                     }
                 }
                 if matches!(op, FilterOperator::Between) {
@@ -1602,6 +1625,38 @@ mod tests {
         assert_eq!(
             clause,
             r#"(IS_DEFINED(c["text"]) AND NOT IS_NULL(c["text"]))"#
+        );
+    }
+
+    #[test]
+    fn between_bounds_of_different_types_are_refused() {
+        // Emitting both `IS_NUMBER` and `IS_STRING` makes a predicate no
+        // record can satisfy, so an invalid comparison would come back as an
+        // empty page here while the in-memory evaluator reports the bounds as
+        // incomparable. `loose` is the untyped field, which is the only place
+        // this can arise — a declared type rejects the odd bound already.
+        let err = translate(
+            Filter::new("loose", FilterOperator::Between, Some(json!([1, "z"])))
+                .unwrap()
+                .into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("different types"), "{err}");
+    }
+
+    #[test]
+    fn between_bounds_of_one_type_emit_one_guard() {
+        let (clause, _) = translate(
+            Filter::new("loose", FilterOperator::Between, Some(json!([1, 5])))
+                .unwrap()
+                .into(),
+        )
+        .expect("matching bounds are fine");
+        assert_eq!(
+            clause.matches("IS_NUMBER").count(),
+            1,
+            "one guard, not one per bound: {clause}"
         );
     }
 

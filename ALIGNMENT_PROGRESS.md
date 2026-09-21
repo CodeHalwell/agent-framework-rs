@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Twelve corrections from review
+#### Fourteen corrections from review
 
-Across four review rounds, Codex and Copilot raised sixteen distinct
-findings; **twelve were right** and are folded into the rows above. Two were
+Across five review rounds, Codex and Copilot raised eighteen distinct
+findings; **fourteen were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -160,12 +160,30 @@ a later fragment's payload onto the accumulated text.
   after stream aggregation there usually is. Both branches now ask whether
   anything beside the text holds data. A bare text item still goes as
   itself.
+* **A read/delete-only provider was refused without a vector field.**
+  `build` resolved the vector field unconditionally, but only search and
+  upsert touch a vector — `get` and `delete` work by key. So a collection
+  with no vector field, or several and none named, could not get a
+  read/delete provider even though the underlying `VectorCollection` serves
+  one fine. Resolved only when a tool that needs it is enabled.
+* **Mixed `between` bounds compiled to a false predicate.** On an untyped
+  field, `between(f, 1, "z")` emitted `IS_NUMBER(f) AND IS_STRING(f)` — which
+  no record satisfies — so an invalid comparison came back as an empty page
+  while the in-memory evaluator reported the bounds as incomparable.
+  Differing bound types are refused now, and matching ones emit one guard
+  rather than one per bound.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an
   integer and an executor reading it with `as_str` — every schema-valid
   upsert failing at runtime. Refused at `build` now; an *undeclared* type is
   still left alone, since guessing would reject a good untyped text field.
+
+The two rounds that followed each found the *same* thing one level out: a
+validation stricter than the configuration needed (the vector field) and a
+translation quietly disagreeing with the portable evaluator (the `between`
+bounds). Both are the classes already named above, which is the argument for
+reading a review for its class rather than its instance.
 
 Four findings were rejected, all of them duplicates or wrong rather than
 matters of taste. Two were a reviewer repeating, against a commit that had
