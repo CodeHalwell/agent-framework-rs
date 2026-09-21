@@ -288,6 +288,27 @@ impl VectorCollectionContextProviderBuilder {
             validate_filter_fields(filter, &definition, locally_evaluated)?;
         }
 
+        // An upsert replaces the whole document and this tool can derive
+        // exactly one embedding — the one `embed_from_field` names. On a
+        // collection with several vector fields that is not a limitation, it
+        // is data loss: updating a record would drop its other embeddings,
+        // and a record created through the tool would never have them at all.
+        // Carrying the existing ones over would fix only the first half, and
+        // only at the cost of reading full vectors on every write.
+        //
+        // Reachable because naming a `vector_field` made multi-vector
+        // collections buildable at all; search, get and delete are still fine
+        // on them, so the refusal is scoped to the tool that cannot work.
+        if embed_source.is_some() && definition.vector_fields().len() > 1 {
+            return Err(Error::Configuration(format!(
+                "this collection declares {} vector fields and the generated upsert tool can \
+                 only maintain one, so it would drop the others on every write; write those \
+                 records through the collection directly, or add your own tool with \
+                 `additional_tool`",
+                definition.vector_fields().len()
+            )));
+        }
+
         // Only search and upsert touch a vector; get and delete work by key.
         // Resolving unconditionally would refuse a read/delete-only provider
         // over a collection with no vector field, or with several and none
@@ -1180,6 +1201,38 @@ mod tests {
             err.contains("needs a collection with a vector field"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_multi_vector_collection_gets_no_upsert_tool() {
+        // The tool derives one embedding, and an upsert replaces the whole
+        // document — so on a two-vector collection it would drop the other
+        // embedding on every write, and never set it on a new record. Only
+        // reachable once `vector_field` made these collections buildable.
+        let err = builder(two_vector_collection())
+            .vector_field("body_embedding")
+            .embed_from_field("text")
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only maintain one"), "{err}");
+
+        // Search, get and delete are unaffected — they never write a vector.
+        let provider = builder(two_vector_collection())
+            .vector_field("body_embedding")
+            .build()
+            .expect("the read tools are fine on a multi-vector collection");
+        let names: Vec<_> = provider.tools().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["search", "get", "delete"]);
+    }
+
+    #[test]
+    fn a_single_vector_collection_still_gets_its_upsert_tool() {
+        let provider = builder(collection())
+            .embed_from_field("text")
+            .build()
+            .unwrap();
+        assert!(provider.tools().iter().any(|t| t.name == "upsert"));
     }
 
     #[tokio::test]

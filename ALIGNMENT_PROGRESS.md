@@ -78,10 +78,10 @@ guard, an omitted non-key field still reaches Cosmos without being
 materialized as null, and a successful tool result still serializes without
 an `exception` key.
 
-#### Nineteen corrections from review
+#### Twenty corrections from review
 
-Across eight review rounds, Codex and Copilot raised twenty-three distinct
-findings; **nineteen were right** and are folded into the rows above. Two were
+Across nine review rounds, Codex and Copilot raised twenty-five distinct
+findings; **twenty were right** and are folded into the rows above. Two were
 *interactions between changes in this same pass* — a correct change meeting
 another correct change — which is the class a per-change review cannot see,
 and the reason this section exists rather than a line saying review was
@@ -212,6 +212,14 @@ a later fragment's payload onto the accumulated text.
   signature stays over the raw link as Cosmos's auth scheme requires — a
   divergence the client's `resource_link`/`url_path` split already existed
   for.
+* **A multi-vector upsert destroyed the sibling embeddings.** The generated
+  upsert derives exactly one vector — the one `embed_from_field` names — and
+  an upsert replaces the whole document, so on a collection with several
+  vector fields it dropped the others on every write and never set them on a
+  new record. Reachable only because naming a `vector_field` (an earlier
+  correction in this same list) made those collections buildable at all: a
+  fix opening a door onto a second bug. The upsert tool is refused there now;
+  search, get and delete never write a vector and are unaffected.
 * **An embedding source declared non-string could never work.** `build`
   checked that `embed_from_field` names a *data* field but not its declared
   type, so naming an `int` field produced a schema asking the model for an
