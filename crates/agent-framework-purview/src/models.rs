@@ -50,6 +50,54 @@ impl PurviewTextContent {
     }
 }
 
+/// `microsoft.graph.binaryContent`: an attachment's bytes, base64-encoded on
+/// the wire.
+///
+/// A classifier reads the bytes; handing it the base64 *string* as text would
+/// be evaluated as gibberish and pass every policy, which is worse than not
+/// sending it at all because it looks like coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurviewBinaryContent {
+    #[serde(rename = "@odata.type")]
+    pub data_type: String,
+    /// Base64 of the raw bytes, as Graph expects.
+    pub data: String,
+}
+
+impl PurviewBinaryContent {
+    pub fn new(bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            data_type: "microsoft.graph.binaryContent".to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+}
+
+/// One content entry's payload: text for anything a classifier can read as
+/// text, binary for an attachment's bytes.
+///
+/// Untagged because each variant carries its own `@odata.type`, which is the
+/// discriminator Graph itself uses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PurviewContent {
+    Text(PurviewTextContent),
+    Binary(PurviewBinaryContent),
+}
+
+impl From<PurviewTextContent> for PurviewContent {
+    fn from(value: PurviewTextContent) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<PurviewBinaryContent> for PurviewContent {
+    fn from(value: PurviewBinaryContent) -> Self {
+        Self::Binary(value)
+    }
+}
+
 /// `microsoft.graph.processConversationMetadata`: one message's content plus
 /// identity metadata. `ContentToProcess::content_entries` carries a list of
 /// these, though this port's [`ContentProcessor`](crate::processor::ContentProcessor)
@@ -62,7 +110,7 @@ pub struct ProcessConversationMetadata {
     #[serde(rename = "@odata.type")]
     pub data_type: String,
     pub identifier: String,
-    pub content: PurviewTextContent,
+    pub content: PurviewContent,
     pub name: String,
     #[serde(rename = "isTruncated")]
     pub is_truncated: bool,
@@ -74,10 +122,19 @@ impl ProcessConversationMetadata {
         text: impl Into<String>,
         name: impl Into<String>,
     ) -> Self {
+        Self::with_content(identifier, PurviewTextContent::new(text), name)
+    }
+
+    /// As [`Self::new`], for a content entry that is not plain text.
+    pub fn with_content(
+        identifier: impl Into<String>,
+        content: impl Into<PurviewContent>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             data_type: "microsoft.graph.processConversationMetadata".to_string(),
             identifier: identifier.into(),
-            content: PurviewTextContent::new(text),
+            content: content.into(),
             name: name.into(),
             is_truncated: false,
         }
@@ -187,19 +244,33 @@ pub struct ProcessContentRequest {
     pub correlation_id: Option<String>,
 }
 
-/// `blockAccess` vs. anything else. Mirrors Python's `DlpAction`.
+/// A DLP action Purview returned. Mirrors Python's `DlpAction`.
+///
+/// `Other` is a **catch-all** for a value this port does not name, not just
+/// the literal `"other"`. That matters more than it looks: without it, a
+/// response carrying an action Purview added after this was written fails to
+/// deserialize, so the whole verdict is lost — and a deployment running with
+/// `ignore_exceptions` (the documented availability setting) then lets the
+/// content through unevaluated. A new enforcement action must not be able to
+/// turn enforcement off. `restrictAccess` is named because upstream added it
+/// (#8370), and, as there, it is not by itself a block — see
+/// [`ProcessContentResponse::should_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DlpAction {
     BlockAccess,
+    RestrictAccess,
+    #[serde(other)]
     Other,
 }
 
-/// `block` vs. anything else. Mirrors Python's `RestrictionAction`.
+/// `block` vs. anything else. Mirrors Python's `RestrictionAction`; `Other`
+/// is a catch-all for the same reason as [`DlpAction::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RestrictionAction {
     Block,
+    #[serde(other)]
     Other,
 }
 
@@ -278,6 +349,50 @@ mod tests {
             serde_json::to_value(Activity::DownloadText).unwrap(),
             serde_json::json!("downloadText")
         );
+    }
+
+    #[test]
+    fn an_action_this_port_does_not_name_parses_rather_than_failing_the_response() {
+        // Without the catch-all, a response carrying an action Purview added
+        // later fails to deserialize — so the verdict is lost, and a
+        // deployment running with `ignore_exceptions` lets the content
+        // through unevaluated. A new enforcement action must not be able to
+        // turn enforcement off.
+        let response: ProcessContentResponse = serde_json::from_str(
+            r#"{"policyActions":[{"action":"someFutureAzureAction"},
+                                 {"restrictionAction":"someFutureMode"}]}"#,
+        )
+        .expect("an unknown action still parses");
+        let actions = response.policy_actions.as_ref().unwrap();
+        assert_eq!(actions[0].action, Some(DlpAction::Other));
+        assert_eq!(
+            actions[1].restriction_action,
+            Some(RestrictionAction::Other)
+        );
+        // And it is not treated as a block on a guess either way.
+        assert!(!response.should_block());
+    }
+
+    #[test]
+    fn restrict_access_is_not_by_itself_a_block() {
+        // It carries a separate `restrictionAction` that selects the
+        // enforcement mode, which may be audit, warn or allow. Only an
+        // explicit block mode withholds the content.
+        let audited: ProcessContentResponse = serde_json::from_str(
+            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"audit"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            audited.policy_actions.as_ref().unwrap()[0].action,
+            Some(DlpAction::RestrictAccess)
+        );
+        assert!(!audited.should_block());
+
+        let blocked: ProcessContentResponse = serde_json::from_str(
+            r#"{"policyActions":[{"action":"restrictAccess","restrictionAction":"block"}]}"#,
+        )
+        .unwrap();
+        assert!(blocked.should_block());
     }
 
     #[test]

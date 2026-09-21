@@ -411,6 +411,7 @@ version = "0.7.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
+ "base64",
  "futures",
  "reqwest 0.12.28",
  "serde",

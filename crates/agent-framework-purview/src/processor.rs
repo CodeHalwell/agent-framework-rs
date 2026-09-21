@@ -4,19 +4,20 @@
 //! A scoped-down port of Python's `ScopedContentProcessor` — see
 //! [`crate::client`]'s module docs for exactly what's cut (the protection-
 //! scopes precheck, caching, and background content-activity logging) and
-//! why. What *is* ported faithfully: per-message request construction
-//! (the internal `build_request`) and the GUID-based user-id resolution algorithm
+//! why. What *is* ported faithfully: per-content-entry request construction
+//! (the internal `build_requests`) and the GUID-based user-id resolution algorithm
 //! (mirrors `ScopedContentProcessor._map_messages`'s
 //! `additional_properties["user_id"]` / `author_name` scan, minus the
 //! bearer-token-JWT fallback — see the crate docs).
 
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::Message;
+use agent_framework_core::types::{Content, Message};
 
 use crate::client::PurviewClient;
 use crate::models::{
     Activity, ActivityMetadata, ContentToProcess, DeviceMetadata, IntegratedAppMetadata,
-    ProcessContentRequest, ProcessConversationMetadata, ProtectedAppMetadata,
+    ProcessContentRequest, ProcessConversationMetadata, ProtectedAppMetadata, PurviewBinaryContent,
+    PurviewContent, PurviewTextContent,
 };
 use crate::settings::PurviewSettings;
 
@@ -64,26 +65,124 @@ pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<S
     author_name_fallback.or_else(|| provided.filter(|p| is_valid_guid(p)).map(str::to_string))
 }
 
-/// Build one `processContent` request for a single message. Mirrors the body
-/// of `ScopedContentProcessor._map_messages`'s per-message loop (device
-/// metadata is always `"Unknown"`/`"Unknown"`, matching Python's hardcoded
-/// values there).
-fn build_request(
+/// Render an arbitrary content item as text a classifier can read.
+///
+/// The whole item is serialized rather than named fields picked out of it:
+/// `additional_properties` is a data channel in its own right, and a content
+/// type added after this was written must not arrive unevaluated. Mirrors
+/// upstream's `_serialize_for_evaluation` (#8370).
+fn serialize_for_evaluation(content: &Content) -> String {
+    serde_json::to_string(content).unwrap_or_else(|_| format!("{content:?}"))
+}
+
+/// The raw bytes behind a base64 `data:` URI, or `None` when it is not one.
+///
+/// RFC 2397 allows any number of `;parameter=value` segments between the
+/// media type and `;base64`, so `data:text/plain;charset=utf-8;base64,...`
+/// has to decode too — miss it and the payload goes to Purview as a base64
+/// *string*, which every classifier reads as gibberish and every policy
+/// passes. That is worse than sending nothing, because it looks like
+/// coverage.
+fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let rest = uri.strip_prefix("data:").or_else(|| {
+        // Case-insensitive scheme, per the URI spec.
+        uri.get(..5)
+            .filter(|p| p.eq_ignore_ascii_case("data:"))
+            .map(|_| &uri[5..])
+    })?;
+    let (metadata, payload) = rest.split_once(',')?;
+    if !metadata
+        .rsplit(';')
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()
+}
+
+/// Map one content item onto the Purview content entry that fits it, or
+/// `None` when it carries no user data at all.
+///
+/// Everything a message carries is evaluated, not only its text. A tool
+/// result is exactly where exfiltrated data shows up, an attachment is the
+/// payload a DLP policy exists to catch, and this port had a hole of its own
+/// on top of upstream's: it submitted `Message::text()`, which returns `""`
+/// for a message carrying a refusal — so a whole message went unevaluated
+/// because part of it was declined.
+fn map_content(content: &Content) -> Option<PurviewContent> {
+    match content {
+        // Token counts, not user data.
+        Content::Usage(_) => None,
+        Content::Text(t) => (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into()),
+        Content::TextReasoning(t) => {
+            (!t.text.is_empty()).then(|| PurviewTextContent::new(&t.text).into())
+        }
+        Content::Data(d) => match decode_data_uri(&d.uri) {
+            // Graph rejects an empty payload, and an empty one cannot violate
+            // a policy.
+            Some(bytes) if bytes.is_empty() => None,
+            Some(bytes) => Some(PurviewBinaryContent::new(&bytes).into()),
+            // Not a base64 data URI after all: evaluate its serialized form
+            // rather than drop it.
+            None => Some(PurviewTextContent::new(serialize_for_evaluation(content)).into()),
+        },
+        other => Some(PurviewTextContent::new(serialize_for_evaluation(other)).into()),
+    }
+}
+
+/// Build one `processContent` request per content entry of a message.
+///
+/// Upstream splits the same way, keeping Graph's `contentEntries` array
+/// contract with one entry in it. Device metadata is always
+/// `"Unknown"`/`"Unknown"`, matching Python's hardcoded values.
+fn build_requests(
     message: &Message,
     user_id: &str,
     tenant_id: &str,
     app_name: &str,
     app_location: &crate::models::PolicyLocation,
-) -> ProcessContentRequest {
+) -> Vec<ProcessContentRequest> {
     let message_id = message
         .message_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let entry = ProcessConversationMetadata::new(
-        message_id.clone(),
-        message.text(),
-        format!("Agent Framework Message {message_id}"),
-    );
+    message
+        .contents
+        .iter()
+        .filter_map(map_content)
+        .enumerate()
+        .map(|(index, content)| {
+            let identifier = if index == 0 {
+                message_id.clone()
+            } else {
+                format!("{message_id}-{index}")
+            };
+            build_request_for(
+                ProcessConversationMetadata::with_content(
+                    identifier,
+                    content,
+                    format!("Agent Framework Message {message_id}"),
+                ),
+                user_id,
+                tenant_id,
+                app_name,
+                app_location,
+            )
+        })
+        .collect()
+}
+
+fn build_request_for(
+    entry: ProcessConversationMetadata,
+    user_id: &str,
+    tenant_id: &str,
+    app_name: &str,
+    app_location: &crate::models::PolicyLocation,
+) -> ProcessContentRequest {
     let content_to_process = ContentToProcess {
         content_entries: vec![entry],
         // Both the prompt (pre) and response (post) checks use `UploadText`
@@ -172,22 +271,34 @@ impl ContentProcessor {
             .to_policy_location();
 
         let Some(user_id) = resolve_user_id(messages, provided_user_id) else {
-            // No resolvable user id: fail open, matching Python (an empty
-            // `pc_requests` list never enters the block-checking loop).
-            return Ok((false, None));
+            // Fail **closed**: Purview evaluates policy for a specific user,
+            // so with no user there is no policy and nothing was evaluated.
+            // Returning "not blocked" here reported an unevaluated message as
+            // a cleared one, which is the failure mode this middleware exists
+            // to prevent. Upstream changed the same behavior in #8370. A
+            // deployment that would rather have availability than enforcement
+            // still has `ignore_exceptions`, which now covers this case too.
+            return Err(Error::Configuration(
+                "no Entra user id could be resolved for the Purview request, so no policy can be \
+                 evaluated. Provide one in each message's `additional_properties[\"user_id\"]` or \
+                 `author_name`, pass one to the processor, or authenticate the credential as a \
+                 user."
+                    .into(),
+            ));
         };
 
         for message in messages {
-            let request = build_request(
+            for request in build_requests(
                 message,
                 &user_id,
                 tenant_id,
                 &settings.app_name,
                 &app_location,
-            );
-            let response = self.client.process_content(&request).await?;
-            if response.should_block() {
-                return Ok((true, Some(user_id)));
+            ) {
+                let response = self.client.process_content(&request).await?;
+                if response.should_block() {
+                    return Ok((true, Some(user_id)));
+                }
             }
         }
         Ok((false, Some(user_id)))
@@ -321,10 +432,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_returns_allow_without_any_network_call_when_no_user_id_resolvable() {
-        // Config is valid, but no message/author/provided id is GUID-shaped
-        // -- if this attempted an HTTP call, it would hang/fail trying to
-        // reach graph.microsoft.com.
+    async fn evaluate_fails_closed_without_any_network_call_when_no_user_id_resolvable() {
+        // Config is valid, but no message/author/provided id is GUID-shaped.
+        // This used to answer "not blocked", which reports an *unevaluated*
+        // message as a cleared one. If it attempted an HTTP call instead, the
+        // test would hang trying to reach graph.microsoft.com.
         let settings = PurviewSettings::new("App")
             .with_tenant_id("12345678-1234-1234-1234-123456789012")
             .with_purview_app_location(crate::settings::PurviewAppLocation::new(
@@ -335,15 +447,154 @@ mod tests {
             crate::auth::StaticTokenProvider::new("t"),
             &settings,
         ));
-        let (should_block, user_id) = processor
+        let err = processor
             .evaluate(
                 &[Message::user("hi, no identifying info here")],
                 &settings,
                 None,
             )
             .await
-            .unwrap();
-        assert!(!should_block);
-        assert!(user_id.is_none());
+            .expect_err("no user means no policy, which is not the same as no violation");
+        assert!(err.to_string().contains("user id"), "{err}");
+    }
+
+    // region: content coverage (upstream #8370)
+
+    fn app_location() -> crate::models::PolicyLocation {
+        crate::settings::PurviewAppLocation::new(
+            crate::settings::PurviewLocationType::Application,
+            "app-1",
+        )
+        .to_policy_location()
+    }
+
+    fn entries(message: &Message) -> Vec<crate::models::PurviewContent> {
+        build_requests(
+            message,
+            "12345678-1234-1234-1234-123456789012",
+            "12345678-1234-1234-1234-123456789012",
+            "App",
+            &app_location(),
+        )
+        .into_iter()
+        .map(|r| r.content_to_process.content_entries[0].content.clone())
+        .collect()
+    }
+
+    fn text_of(content: &crate::models::PurviewContent) -> String {
+        match content {
+            crate::models::PurviewContent::Text(t) => t.data.clone(),
+            crate::models::PurviewContent::Binary(_) => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn a_tool_result_is_evaluated_rather_than_skipped() {
+        // A tool result is exactly where exfiltrated data shows up, and it
+        // is not part of `Message::text()`.
+        let message = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::text("here you go"),
+                Content::FunctionResult(agent_framework_core::types::FunctionResultContent::new(
+                    "c1",
+                    Some(serde_json::json!({ "ssn": "123-45-6789" })),
+                )),
+            ],
+        );
+        let mapped = entries(&message);
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(text_of(&mapped[0]), "here you go");
+        assert!(text_of(&mapped[1]).contains("123-45-6789"));
+    }
+
+    #[test]
+    fn a_message_carrying_a_refusal_still_has_its_text_evaluated() {
+        // `Message::text()` returns "" whenever a refusal is present, so
+        // submitting the message text alone sent *nothing* for a partly
+        // declined turn — a hole this port had on top of upstream's.
+        let message = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::text("the part I did answer"),
+                Content::Text(agent_framework_core::types::TextContent::refusal(
+                    "I can't do the rest",
+                )),
+            ],
+        );
+        assert_eq!(message.text(), "", "the premise of this test");
+        let mapped = entries(&message);
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(text_of(&mapped[0]), "the part I did answer");
+    }
+
+    #[test]
+    fn an_attachment_is_sent_as_bytes_not_as_its_base64_text() {
+        // A classifier reads bytes; handed the base64 string it reads
+        // gibberish and passes every policy, which looks like coverage.
+        let message = Message::with_contents(
+            Role::user(),
+            // "secret" in base64, with a parameterised media type — RFC
+            // 2397 allows any number of `;parameter=value` segments, and
+            // missing them is what sends the payload as text.
+            vec![Content::Data(agent_framework_core::types::DataContent {
+                uri: "data:text/plain;charset=utf-8;base64,c2VjcmV0".to_string(),
+                media_type: Some("text/plain".to_string()),
+            })],
+        );
+        let mapped = entries(&message);
+        assert_eq!(mapped.len(), 1);
+        match &mapped[0] {
+            crate::models::PurviewContent::Binary(b) => assert_eq!(b.data, "c2VjcmV0"),
+            other => panic!("expected binary content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_base64_uri_is_evaluated_as_text_rather_than_dropped() {
+        let message = Message::with_contents(
+            Role::user(),
+            vec![Content::Data(agent_framework_core::types::DataContent {
+                uri: "https://example.com/secret-report.pdf".to_string(),
+                media_type: None,
+            })],
+        );
+        assert!(text_of(&entries(&message)[0]).contains("secret-report.pdf"));
+    }
+
+    #[test]
+    fn usage_is_the_only_content_with_nothing_to_evaluate() {
+        let message = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::Usage(agent_framework_core::types::UsageContent {
+                    details: agent_framework_core::types::UsageDetails::new(),
+                }),
+                // Empty text has nothing to classify and Graph rejects it.
+                Content::text(""),
+            ],
+        );
+        assert!(entries(&message).is_empty());
+    }
+
+    #[test]
+    fn each_content_entry_gets_its_own_request_with_a_distinct_identifier() {
+        let mut message = Message::with_contents(
+            Role::user(),
+            vec![Content::text("one"), Content::text("two")],
+        );
+        message.message_id = Some("m1".to_string());
+        let requests = build_requests(
+            &message,
+            "12345678-1234-1234-1234-123456789012",
+            "12345678-1234-1234-1234-123456789012",
+            "App",
+            &app_location(),
+        );
+        let ids: Vec<_> = requests
+            .iter()
+            .map(|r| r.content_to_process.content_entries[0].identifier.clone())
+            .collect();
+        assert_eq!(ids, vec!["m1".to_string(), "m1-1".to_string()]);
     }
 }
