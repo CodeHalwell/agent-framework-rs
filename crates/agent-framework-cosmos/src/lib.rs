@@ -61,9 +61,11 @@ mod chat_message_store;
 mod checkpoint_storage;
 mod client;
 mod dates;
+mod vector_store;
 
 pub use chat_message_store::{CosmosChatMessageStore, DEFAULT_PARTITION_KEY_PATH};
 pub use checkpoint_storage::{
     CosmosCheckpointStorage, DEFAULT_PARTITION_KEY_PATH as DEFAULT_CHECKPOINT_PARTITION_KEY_PATH,
 };
-pub use client::DEFAULT_API_VERSION;
+pub use client::{DEFAULT_API_VERSION, DEFAULT_VECTOR_API_VERSION};
+pub use vector_store::{CosmosVectorCollection, CosmosVectorStore, VECTOR_PARTITION_KEY_PATH};

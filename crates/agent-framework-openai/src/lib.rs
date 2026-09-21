@@ -40,7 +40,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
-use agent_framework_core::error::{Error, Result};
+use agent_framework_core::error::{ContentFilterCategory, ContentFilterDetail, Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason, FunctionArguments,
@@ -116,7 +116,10 @@ pub fn classify_service_error(
         401 | 403 => Error::service_invalid_auth(message),
         400 | 404 | 422 => {
             if body_signals_content_filter(body) {
-                Error::service_content_filter(message)
+                match parse_content_filter_detail(body) {
+                    Some(detail) => Error::service_content_filter_with_detail(message, detail),
+                    None => Error::service_content_filter(message),
+                }
             } else {
                 Error::service_invalid_request(message)
             }
@@ -146,9 +149,84 @@ fn body_signals_content_filter(body: &str) -> bool {
             .is_some_and(is_content_filter_marker)
 }
 
+/// Read Azure OpenAI's content-filter breakdown out of an error body.
+///
+/// Azure answers a filtered request with a nested `innererror` naming the
+/// policy that fired (`ResponsibleAIPolicyViolation`, `ContentFiltered`) and a
+/// `content_filter_result` map of category verdicts. Without it the caller has
+/// a message string and cannot tell a self-harm block from a jailbreak
+/// detection, or an input block from an output one — the distinctions an
+/// application acts on.
+///
+/// Returns `None` when the body carries nothing beyond the marker, so a plain
+/// OpenAI content-filter refusal stays a plain error rather than growing an
+/// empty detail. Every value is copied through verbatim: unlike upstream's
+/// enums, a code or severity Azure has not shipped yet arrives as itself
+/// instead of raising while classifying an error (upstream #8393 fixed that
+/// for the code; its severity parse still has it).
+fn parse_content_filter_detail(body: &str) -> Option<ContentFilterDetail> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let inner = error.get("innererror");
+
+    let code = inner
+        .and_then(|i| i.get("code"))
+        .or_else(|| inner.and_then(|i| i.get("type")))
+        .and_then(Value::as_str)
+        // The outer code is the *marker* (`content_filter`), not the policy,
+        // so it is never read as one.
+        .filter(|c| *c != CONTENT_FILTER_MARKER)
+        .map(String::from);
+    let param = error
+        .get("param")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+
+    let mut categories = std::collections::BTreeMap::new();
+    let results = inner
+        .and_then(|i| i.get("content_filter_result"))
+        .or_else(|| error.get("content_filter_result"))
+        .and_then(Value::as_object);
+    if let Some(results) = results {
+        for (name, verdict) in results {
+            let Some(verdict) = verdict.as_object() else {
+                continue;
+            };
+            categories.insert(
+                name.clone(),
+                ContentFilterCategory {
+                    filtered: verdict
+                        .get("filtered")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    detected: verdict.get("detected").and_then(Value::as_bool),
+                    severity: verdict
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                },
+            );
+        }
+    }
+
+    if code.is_none() && param.is_none() && categories.is_empty() {
+        return None;
+    }
+    Some(ContentFilterDetail {
+        code,
+        param,
+        categories,
+    })
+}
+
+/// The wire marker that classifies an error as a content-filter refusal, as
+/// opposed to the *policy* code beside it.
+const CONTENT_FILTER_MARKER: &str = "content_filter";
+
 fn is_content_filter_marker(v: &Value) -> bool {
-    v.get("code").and_then(Value::as_str) == Some("content_filter")
-        || v.get("type").and_then(Value::as_str) == Some("content_filter")
+    v.get("code").and_then(Value::as_str) == Some(CONTENT_FILTER_MARKER)
+        || v.get("type").and_then(Value::as_str) == Some(CONTENT_FILTER_MARKER)
 }
 
 /// An OpenAI (or OpenAI-compatible) chat client.
@@ -430,6 +508,11 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
                     contents.push(Content::Text(TextContent::refusal(text)));
                 }
             }
+            // Streamed reasoning payload, on the same channel as the
+            // buffered one. See `convert::reasoning_details_of`.
+            if let Some(reasoning) = crate::convert::parse_reasoning_details(delta) {
+                contents.push(reasoning);
+            }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
@@ -491,6 +574,28 @@ mod tests {
     // Canned status+body combinations run through the exact classification
     // `OpenAIChatCompletionClient::post` and `responses::OpenAIChatClient::post`
     // both delegate to.
+
+    #[test]
+    fn a_streamed_reasoning_payload_survives_to_the_aggregated_response() {
+        // The payload arrives on its own delta channel; the aggregated
+        // response is what the next request is built from, so it has to reach
+        // that far to be replayable at all.
+        let mut ids = HashMap::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"role": "assistant",
+                "reasoning_details": [{"type": "reasoning.text", "text": "think"}]}}]}),
+            serde_json::json!({"choices": [{"delta": {"content": "answer"}}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .collect();
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        let wire = crate::convert::messages_to_openai(&resp.messages);
+        assert_eq!(
+            wire[0]["reasoning_details"],
+            serde_json::json!([{"type": "reasoning.text", "text": "think"}])
+        );
+    }
 
     #[test]
     fn a_streamed_chat_refusal_is_parsed_and_marked() {
@@ -575,6 +680,75 @@ mod tests {
             r#"{"error":{"message":"filtered","innererror":{"code":"content_filter"}}}"#;
         let err = classify_service_error(400, nested_only, "err", None);
         assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_azure_content_filter_error_carries_which_category_fired() {
+        // The distinction an application acts on: a self-harm block is not a
+        // jailbreak detection, and a prompt block is not an output block.
+        // With only a message string, none of it is reachable.
+        let body = r#"{"error":{"message":"The response was filtered","code":"content_filter",
+            "param":"prompt","innererror":{"code":"ResponsibleAIPolicyViolation",
+            "content_filter_result":{
+                "hate":{"filtered":false,"severity":"safe"},
+                "self_harm":{"filtered":true,"severity":"medium"},
+                "jailbreak":{"filtered":false,"detected":true}}}}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        let detail = err
+            .content_filter_detail()
+            .expect("an Azure content-filter body carries a breakdown");
+        assert_eq!(
+            detail.code.as_deref(),
+            Some(ContentFilterDetail::RESPONSIBLE_AI_POLICY_VIOLATION)
+        );
+        assert_eq!(detail.param.as_deref(), Some("prompt"));
+        assert_eq!(detail.filtered_categories(), vec!["jailbreak", "self_harm"]);
+        assert_eq!(
+            detail.categories["self_harm"].severity.as_deref(),
+            Some("medium")
+        );
+        assert!(!detail.categories["hate"].filtered);
+    }
+
+    #[test]
+    fn an_unrecognized_policy_code_or_severity_is_carried_rather_than_rejected() {
+        // Upstream parsed both into enums, so a value Azure had not shipped
+        // yet raised *while building the error* — #8393 fixed that for the
+        // code and left it for the severity. An open string has no such mode.
+        let body = r#"{"error":{"code":"content_filter","innererror":{
+            "code":"SomeFutureAzurePolicy",
+            "content_filter_result":{"novel_category":{"filtered":true,"severity":"extreme"}}}}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        let detail = err.content_filter_detail().expect("still classified");
+        assert_eq!(detail.code.as_deref(), Some("SomeFutureAzurePolicy"));
+        assert_eq!(
+            detail.categories["novel_category"].severity.as_deref(),
+            Some("extreme")
+        );
+    }
+
+    #[test]
+    fn a_plain_openai_content_filter_error_grows_no_empty_breakdown() {
+        // Nothing beyond the marker: a detail full of `None` would suggest
+        // the provider reported something it did not.
+        let body = r#"{"error":{"message":"flagged","code":"content_filter"}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        assert!(matches!(err, Error::ServiceContentFilter { .. }), "{err:?}");
+        assert!(err.content_filter_detail().is_none());
+    }
+
+    #[test]
+    fn the_outer_marker_is_never_read_as_the_policy_code() {
+        // `error.code` is "content_filter" on the Azure shape; the policy
+        // lives in `innererror.code`. Reading the marker as the policy would
+        // report every Azure refusal as the same one.
+        let body = r#"{"error":{"code":"content_filter","param":"prompt"}}"#;
+        let err = classify_service_error(400, body, "err", None);
+        let detail = err
+            .content_filter_detail()
+            .expect("param alone is a detail");
+        assert_eq!(detail.code, None);
+        assert_eq!(detail.param.as_deref(), Some("prompt"));
     }
 
     #[test]

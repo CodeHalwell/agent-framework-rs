@@ -386,18 +386,22 @@ impl ChatResponse {
                     entry.add_assign(&u.details);
                 }
                 Content::FunctionCall(fc) => {
-                    // Merge with an existing partial call of the same call_id.
-                    let existing = self.messages[msg_idx].contents.iter_mut().find_map(|c| {
-                        if let Content::FunctionCall(e) = c {
-                            if e.call_id == fc.call_id || fc.call_id.is_empty() {
-                                return Some(e);
+                    match merge_target_for_call(&self.messages[msg_idx].contents, &fc) {
+                        Some(i) => {
+                            let Content::FunctionCall(existing) =
+                                &mut self.messages[msg_idx].contents[i]
+                            else {
+                                unreachable!("merge_target_for_call only returns function calls")
+                            };
+                            if existing.merge(&fc).is_err() {
+                                // The two turned out not to belong together
+                                // after all. Appending keeps the fragment;
+                                // swallowing the error, as this did, drops a
+                                // whole call's arguments on the floor.
+                                self.messages[msg_idx]
+                                    .contents
+                                    .push(Content::FunctionCall(fc));
                             }
-                        }
-                        None
-                    });
-                    match existing {
-                        Some(e) => {
-                            let _ = e.merge(&fc);
                         }
                         None => self.messages[msg_idx]
                             .contents
@@ -415,6 +419,52 @@ impl ChatResponse {
             coalesce_text(&mut msg.contents);
         }
     }
+}
+
+/// Which in-progress call a streamed `function_call` fragment continues, as an
+/// index into `contents` — or `None` when it starts a new one.
+///
+/// Providers stream tool calls in parallel, so the next fragment is not
+/// necessarily a continuation of the last one appended. Three rules, each of
+/// which silently corrupts a call when it is missing:
+///
+/// * A fragment **with** a `call_id` matches the call carrying that id,
+///   searched from the end so the most recent occurrence wins. A fragment
+///   that matches none is a *new* call: letting it fall through to the
+///   trailing item would have it absorbed by an unrelated call, adopting that
+///   call's id and mashing two argument streams together.
+/// * A fragment with **no** `call_id` — the continuation deltas some
+///   providers only stamp on the first chunk — continues the trailing call,
+///   which is the one still being streamed. Matching the *first* call instead,
+///   as this did, sends every such delta to whichever call happened to open
+///   first.
+/// * A fragment with no occurrence id cannot be absorbed by a call that
+///   already has one. Sharing a `call_id` is not proof of being the same
+///   occurrence — a provider is free to reuse one for a later call — and the
+///   earlier call is already identified, so the scan continues rather than
+///   merging on a hunch.
+///
+/// Mirrors upstream's `_merge_function_call_content` (#8337).
+fn merge_target_for_call(contents: &[Content], incoming: &FunctionCallContent) -> Option<usize> {
+    if incoming.call_id.is_empty() {
+        return match contents.last() {
+            Some(Content::FunctionCall(_)) => Some(contents.len() - 1),
+            _ => None,
+        };
+    }
+    contents
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, c)| match c {
+            Content::FunctionCall(existing)
+                if existing.call_id == incoming.call_id
+                    && !(existing.id.is_some() && incoming.id.is_none()) =>
+            {
+                Some(i)
+            }
+            _ => None,
+        })
 }
 
 /// Merge adjacent text / reasoning fragments produced by streaming into single
@@ -763,7 +813,9 @@ impl AgentResponseUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FunctionResultContent, ResponseFormat, TextContent, TextReasoningContent};
+    use crate::types::{
+        FunctionArguments, FunctionResultContent, ResponseFormat, TextContent, TextReasoningContent,
+    };
     use serde_json::json;
 
     fn text_update(text: &str) -> ChatResponseUpdate {
@@ -1157,6 +1209,104 @@ mod tests {
         let resp =
             AgentResponse::from_updates_with_format(updates, Some(&ResponseFormat::JsonObject));
         assert_eq!(resp.value, Some(json!({"n": 42})));
+    }
+
+    // region: streamed parallel tool calls (upstream #8337)
+
+    /// One streamed `function_call` fragment as its own update.
+    fn raw_call(call_id: &str, name: &str, arguments: &str) -> FunctionCallContent {
+        FunctionCallContent::new(
+            call_id,
+            name,
+            Some(FunctionArguments::Raw(arguments.to_string())),
+        )
+    }
+
+    fn call_update(call: FunctionCallContent) -> ChatResponseUpdate {
+        ChatResponseUpdate {
+            contents: vec![Content::FunctionCall(call)],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        }
+    }
+
+    fn calls_of(response: &ChatResponse) -> Vec<(String, String)> {
+        response
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::FunctionCall(fc) => Some((
+                    fc.call_id.clone(),
+                    match &fc.arguments {
+                        Some(FunctionArguments::Raw(raw)) => raw.clone(),
+                        _ => String::new(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interleaved_fragments_land_on_the_call_that_carries_their_id() {
+        let response = ChatResponse::from_updates(vec![
+            call_update(raw_call("a", "one", "")),
+            call_update(raw_call("b", "two", "")),
+            call_update(raw_call("a", "", "{\"x\":1}")),
+            call_update(raw_call("b", "", "{\"y\":2}")),
+        ]);
+        assert_eq!(
+            calls_of(&response),
+            vec![
+                ("a".to_string(), "{\"x\":1}".to_string()),
+                ("b".to_string(), "{\"y\":2}".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_untagged_delta_continues_the_call_still_being_streamed() {
+        // Two calls in flight; the untagged continuation belongs to the
+        // second, not to whichever opened first.
+        let response = ChatResponse::from_updates(vec![
+            call_update(raw_call("a", "one", "{\"x\":")),
+            call_update(raw_call("b", "two", "{\"y\":")),
+            call_update(raw_call("", "", "2}")),
+        ]);
+        assert_eq!(
+            calls_of(&response),
+            vec![
+                ("a".to_string(), "{\"x\":".to_string()),
+                ("b".to_string(), "{\"y\":2}".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tagged_fragment_matching_nothing_opens_a_new_call() {
+        let response = ChatResponse::from_updates(vec![
+            call_update(raw_call("", "one", "{}")),
+            call_update(raw_call("b", "two", "{}")),
+        ]);
+        // The untagged trailing item must not absorb a chunk that named a
+        // call id of its own — it would adopt that id and merge two calls.
+        assert_eq!(calls_of(&response).len(), 2);
+    }
+
+    #[test]
+    fn an_untagged_chunk_cannot_be_absorbed_by_an_already_identified_call() {
+        // A provider that reuses a call_id for a later, unrelated call would
+        // otherwise corrupt the finished one's arguments.
+        let mut identified = raw_call("a", "one", "{\"x\":1}");
+        identified.id = Some("af-call-1".into());
+        let response = ChatResponse::from_updates(vec![
+            call_update(identified),
+            call_update(raw_call("a", "two", "{\"y\":2}")),
+        ]);
+        let calls = calls_of(&response);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].1, "{\"x\":1}");
     }
 
     // region: task 8 — streaming update metadata

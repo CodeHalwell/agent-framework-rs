@@ -4,7 +4,8 @@
 use agent_framework_core::tools::ToolKind;
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Message, Role, TextContent, ToolMode, UsageDetails,
+    FunctionCallContent, FunctionResultContent, Message, Role, TextContent, TextReasoningContent,
+    ToolMode, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -99,8 +100,20 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         // schema, which declares `refusal: Optional[str]`.
         let mut refusal = String::new();
 
+        // The provider's own reasoning payload, replayed verbatim. See
+        // `reasoning_details_of` — a reasoning model that requires it rejects
+        // the tool-result turn without it.
+        let mut reasoning_details: Option<Value> = None;
+
         for content in &msg.contents {
             match content {
+                Content::TextReasoning(t) => {
+                    if let Some(details) = reasoning_details_of(t) {
+                        // A later block wins: a provider emits the payload
+                        // once per turn, and the last one is the current one.
+                        reasoning_details = Some(details);
+                    }
+                }
                 Content::Text(t) if t.refusal => {
                     refusal.push_str(&t.text);
                 }
@@ -158,6 +171,14 @@ pub fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
         }
         if !tool_calls.is_empty() {
             obj.insert("tool_calls".into(), json!(tool_calls));
+        }
+        // Only ever emitted when the provider gave us one: OpenAI proper
+        // never sets `reasoning_details`, and answers a field its api-version
+        // does not know with an error rather than ignoring it.
+        if let Some(details) = reasoning_details {
+            if obj.contains_key("content") || obj.contains_key("tool_calls") {
+                obj.insert("reasoning_details".into(), details);
+            }
         }
         out.push(Value::Object(obj));
     }
@@ -362,6 +383,9 @@ pub fn parse_response(value: &Value) -> ChatResponse {
                     contents.push(Content::Text(TextContent::refusal(refusal)));
                 }
             }
+            if let Some(reasoning) = parse_reasoning_details(msg) {
+                contents.push(reasoning);
+            }
             if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     if let Some(fc) = parse_tool_call(call) {
@@ -383,6 +407,55 @@ pub fn parse_response(value: &Value) -> ChatResponse {
         response.usage_details = Some(parse_usage(usage));
     }
     response
+}
+
+/// The provider reasoning payload to replay for a reasoning content, or
+/// `None` when it carries none this client can send.
+///
+/// Reasoning-capable providers on the Chat Completions surface — DeepSeek in
+/// thinking mode, OpenRouter, vLLM — return a `reasoning_details` array
+/// alongside the answer and **require it back** on the next request of the
+/// same turn, which in a tool loop is the tool-result follow-up. Dropping it
+/// turns a working conversation into a rejected one at exactly the point the
+/// model was about to use its own work (upstream #8382/#8405). It rides in
+/// [`TextReasoningContent::protected_data`], the same field the Anthropic
+/// thinking signature and the Gemini thought signature use, because it is the
+/// same kind of thing: opaque provider state that is replayed, never read.
+///
+/// A payload that is not JSON is skipped rather than sent: it did not come
+/// from this client's parser, and a non-JSON `reasoning_details` is a request
+/// the provider rejects — dropping one reasoning block is recoverable, a
+/// rejected request is not.
+fn reasoning_details_of(content: &TextReasoningContent) -> Option<Value> {
+    let raw = content
+        .protected_data
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "dropping a reasoning payload that is not JSON rather than sending it"
+            );
+            None
+        }
+    }
+}
+
+/// Read a `reasoning_details` payload off a choice's message or delta into a
+/// reasoning content. The text stays empty — the payload is opaque provider
+/// state, not something to show a user or count as an answer.
+pub(crate) fn parse_reasoning_details(message_or_delta: &Value) -> Option<Content> {
+    let details = message_or_delta.get("reasoning_details")?;
+    if details.is_null() || matches!(details, Value::Array(a) if a.is_empty()) {
+        return None;
+    }
+    Some(Content::TextReasoning(TextReasoningContent {
+        text: String::new(),
+        protected_data: Some(details.to_string()),
+        ..Default::default()
+    }))
 }
 
 fn parse_tool_call(call: &Value) -> Option<FunctionCallContent> {
@@ -511,8 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn text_plus_reasoning_stays_string_reasoning_skipped() {
-        // TextReasoning has no chat-completions wire mapping: it is skipped and
+    fn unsigned_reasoning_text_is_not_sent() {
+        // Reasoning *text* has no chat-completions wire mapping — only the
+        // opaque `reasoning_details` payload below does — so it is skipped and
         // the message keeps the plain-string content form.
         let msg = user_with(vec![
             Content::Text(TextContent::new("hi")),
@@ -526,6 +600,119 @@ mod tests {
             messages_to_openai(&[msg])[0],
             json!({ "role": "user", "content": "hi" })
         );
+    }
+
+    // region: reasoning_details round trip (upstream #8382/#8405)
+
+    #[test]
+    fn a_reasoning_payload_rides_back_out_on_the_message_that_carries_the_turn() {
+        // DeepSeek-in-thinking-mode and friends reject the tool-result
+        // follow-up when the assistant message that carried the turn arrives
+        // without the reasoning payload they issued with it.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    protected_data: Some(r#"[{"type":"reasoning.text","text":"think"}]"#.into()),
+                    ..Default::default()
+                }),
+                Content::Text(TextContent::new("the answer")),
+                Content::FunctionCall(FunctionCallContent::new(
+                    "c1",
+                    "f",
+                    Some(FunctionArguments::Raw("{}".into())),
+                )),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        // One assistant message carries content, tool_calls and the payload
+        // together — splitting them is what left the reasoning on the wrong
+        // half upstream.
+        assert_eq!(wire.len(), 1);
+        assert_eq!(
+            wire[0]["reasoning_details"],
+            json!([{"type": "reasoning.text", "text": "think"}])
+        );
+        assert_eq!(wire[0]["content"], json!("the answer"));
+        assert!(wire[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn a_message_with_no_reasoning_payload_grows_no_field() {
+        // OpenAI proper does not know `reasoning_details` and answers an
+        // unrecognized request field with an error rather than ignoring it.
+        let wire = messages_to_openai(&[Message::user("hi")]);
+        assert!(wire[0].get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn a_reasoning_payload_that_is_not_json_is_dropped_rather_than_sent() {
+        // An Anthropic thinking signature shares the field and is not JSON;
+        // sending it would turn a working request into a 400.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: String::new(),
+                    protected_data: Some("ErUBCkYIBxgCKkA".into()),
+                    ..Default::default()
+                }),
+                Content::Text(TextContent::new("answer")),
+            ],
+        );
+        let wire = messages_to_openai(&[msg]);
+        assert!(wire[0].get("reasoning_details").is_none());
+        assert_eq!(wire[0]["content"], json!("answer"));
+    }
+
+    #[test]
+    fn a_reasoning_payload_round_trips_through_the_parser() {
+        let response = parse_response(&json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "think"}],
+                },
+                "finish_reason": "stop",
+            }],
+        }));
+        let reasoning = response.messages[0]
+            .contents
+            .iter()
+            .find_map(|c| match c {
+                Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .expect("the payload is parsed into reasoning content");
+        // Empty text: the payload is opaque provider state, not an answer.
+        assert!(reasoning.text.is_empty());
+        // And it survives a full round trip, which is the property that makes
+        // the follow-up request valid.
+        let wire = messages_to_openai(&response.messages);
+        assert_eq!(
+            wire[0]["reasoning_details"],
+            json!([{"type": "reasoning.text", "text": "think"}])
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_reasoning_payload_parses_to_nothing() {
+        for details in [json!(null), json!([])] {
+            let response = parse_response(&json!({
+                "choices": [{ "message": { "role": "assistant", "content": "a",
+                                           "reasoning_details": details } }],
+            }));
+            assert!(
+                !response.messages[0]
+                    .contents
+                    .iter()
+                    .any(|c| matches!(c, Content::TextReasoning(_))),
+                "{details} should produce no reasoning content"
+            );
+        }
     }
 
     #[test]

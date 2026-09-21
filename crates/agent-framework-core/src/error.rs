@@ -107,6 +107,13 @@ pub enum Error {
     ServiceContentFilter {
         /// A human-readable message (typically the response body).
         message: String,
+        /// The provider's structured breakdown of *why*, when the body
+        /// carried one. See [`ContentFilterDetail`].
+        ///
+        /// Boxed so the common `None` costs one pointer rather than the
+        /// whole map — this variant sits in an enum every fallible call
+        /// returns.
+        detail: Option<Box<ContentFilterDetail>>,
     },
 
     /// Function middleware signalled an unrecoverable failure: the run must
@@ -193,6 +200,28 @@ impl Error {
     pub fn service_content_filter(msg: impl fmt::Display) -> Self {
         Error::ServiceContentFilter {
             message: msg.to_string(),
+            detail: None,
+        }
+    }
+
+    /// As [`Self::service_content_filter`], carrying the provider's
+    /// structured breakdown of which categories tripped.
+    pub fn service_content_filter_with_detail(
+        msg: impl fmt::Display,
+        detail: ContentFilterDetail,
+    ) -> Self {
+        Error::ServiceContentFilter {
+            message: msg.to_string(),
+            detail: Some(Box::new(detail)),
+        }
+    }
+
+    /// The content-filter breakdown, when this is an
+    /// [`Error::ServiceContentFilter`] that carried one.
+    pub fn content_filter_detail(&self) -> Option<&ContentFilterDetail> {
+        match self {
+            Error::ServiceContentFilter { detail, .. } => detail.as_deref(),
+            _ => None,
         }
     }
 
@@ -286,4 +315,71 @@ mod tests {
             assert_eq!(err.retry_after(), None, "{err:?}");
         }
     }
+}
+
+/// Why a content filter refused a request, as the provider reported it.
+///
+/// Azure OpenAI answers a filtered request with a nested `innererror` naming
+/// the policy that fired and a per-category breakdown; without it a caller
+/// holds only a message string and cannot tell a self-harm block from a
+/// jailbreak detection, or a prompt block from a completion block — which is
+/// the whole of what an application does with this error (re-prompt, escalate,
+/// log the category).
+///
+/// Mirrors upstream's `OpenAIContentFilterException` fields. Every field here
+/// is an **open** value rather than an enum: upstream parses the code and the
+/// severity into `Enum(...)`, which raises on a value Azure has not shipped
+/// yet — the bug its #8393 fixed for the code and still has for the severity.
+/// A string cannot have that failure mode, so a new Azure category or
+/// severity arrives as itself rather than as an error while classifying an
+/// error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentFilterDetail {
+    /// The provider's inner error code, verbatim — e.g.
+    /// [`Self::RESPONSIBLE_AI_POLICY_VIOLATION`] or
+    /// [`Self::CONTENT_FILTERED`].
+    pub code: Option<String>,
+    /// Which request parameter tripped the filter, when the provider says —
+    /// `"prompt"` for input, absent for a filtered completion. The one bit
+    /// that tells a caller whether to change the request or the expectation.
+    pub param: Option<String>,
+    /// Per-category results, keyed by the provider's category name
+    /// (`hate`, `self_harm`, `sexual`, `violence`, `jailbreak`,
+    /// `profanity`, ...). A `BTreeMap` so a rendered error is stable across
+    /// runs.
+    pub categories: std::collections::BTreeMap<String, ContentFilterCategory>,
+}
+
+impl ContentFilterDetail {
+    /// Azure's code for a Responsible AI policy block.
+    pub const RESPONSIBLE_AI_POLICY_VIOLATION: &'static str = "ResponsibleAIPolicyViolation";
+    /// Azure's code for content removed by the filter.
+    pub const CONTENT_FILTERED: &'static str = "ContentFiltered";
+
+    /// The names of the categories that actually fired, in name order.
+    ///
+    /// A filtered request reports every category it evaluated, most of them
+    /// `filtered: false`; this is the subset a caller is asking about when
+    /// they ask "why".
+    pub fn filtered_categories(&self) -> Vec<&str> {
+        self.categories
+            .iter()
+            .filter(|(_, r)| r.filtered || r.detected == Some(true))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+}
+
+/// One content-filter category's verdict.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentFilterCategory {
+    /// Whether this category caused content to be filtered.
+    pub filtered: bool,
+    /// Whether this category was *detected* without necessarily filtering —
+    /// reported for the detection-only categories (jailbreak, protected
+    /// material) rather than the severity-scored ones.
+    pub detected: Option<bool>,
+    /// The severity the provider assigned (`safe`, `low`, `medium`, `high`),
+    /// verbatim. `None` for a detection-only category, which carries none.
+    pub severity: Option<String>,
 }
