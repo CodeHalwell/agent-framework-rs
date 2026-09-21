@@ -350,6 +350,10 @@ name = "cosmos_vector_store"
 path = "memory/cosmos_vector_store.rs"
 
 [[example]]
+name = "vector_collection_tools"
+path = "memory/vector_collection_tools.rs"
+
+[[example]]
 name = "a2a_client"
 path = "a2a/a2a_client.rs"
 

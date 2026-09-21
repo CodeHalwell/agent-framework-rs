@@ -646,7 +646,8 @@ impl CosmosVectorStore {
     /// Open one container as a typed collection.
     ///
     /// No I/O: the definition is validated against what Cosmos DB can express
-    /// (see [`prepare_schema`]), but nothing is created or read. Call
+    /// (the key must be stored as `id`, the distance function must be one
+    /// Cosmos computes), but nothing is created or read. Call
     /// [`VectorCollection::ensure_collection_exists`] for that.
     pub fn collection(
         &self,

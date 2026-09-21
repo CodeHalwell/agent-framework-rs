@@ -318,14 +318,30 @@ impl CheckpointStorage for FileCheckpointStorage {
         let path = self.path_for(&id)?;
         let json = serde_json::to_vec_pretty(&checkpoint)
             .map_err(|e| Error::Workflow(format!("failed to serialize checkpoint: {e}")))?;
-        // Write atomically via a temp file + rename.
-        let tmp = path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &json)
-            .await
-            .map_err(|e| Error::Workflow(format!("failed to write checkpoint: {e}")))?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| Error::Workflow(format!("failed to finalize checkpoint: {e}")))?;
+        // Write atomically via a temp file + rename. The temp name carries a
+        // nonce rather than being derived from the checkpoint id alone: two
+        // saves of the *same* id would otherwise share one temp path, so one
+        // would write into the file the other was still writing (a checkpoint
+        // that parses as neither) and then fail its own rename with
+        // `NotFound`, because the first save had already moved that file away.
+        // With a name per save, each writes its own file and the renames are
+        // atomic, so a reader sees one complete checkpoint or the other —
+        // whichever renamed last, which is what concurrent saves of one id
+        // mean. Mirrors upstream #7757.
+        let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        if let Err(e) = tokio::fs::write(&tmp, &json).await {
+            // Best effort: a partial temp file left in the checkpoint
+            // directory is never read (`list` matches `.json` only), but it
+            // is still litter.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(Error::Workflow(format!("failed to write checkpoint: {e}")));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(Error::Workflow(format!(
+                "failed to finalize checkpoint: {e}"
+            )));
+        }
         Ok(id)
     }
 
@@ -460,6 +476,65 @@ mod tests {
         assert!(storage.load(&id).await.unwrap().is_some());
         assert!(storage.delete(&id).await.unwrap());
         assert!(storage.load(&id).await.unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_of_one_checkpoint_id_do_not_corrupt_it() {
+        // A shared temp path made two saves of the same id write into one
+        // file — so the survivor could be a mix of both, and the loser's
+        // rename failed with `NotFound` because the winner had already moved
+        // that file away (upstream #7757).
+        let dir = tmp_dir();
+        let storage = FileCheckpointStorage::new(&dir).unwrap();
+        let checkpoint = |iteration: usize| {
+            let mut cp = WorkflowCheckpoint::new(
+                "wf-1".to_string(),
+                None,
+                iteration,
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                String::new(),
+            );
+            // One id, many writers.
+            cp.checkpoint_id = "same-id".to_string();
+            // Big enough that a write cannot land in one atomic chunk, which
+            // is what makes an interleaved write visible at all.
+            cp.metadata.insert(
+                "filler".to_string(),
+                serde_json::json!("x".repeat(200_000 + iteration)),
+            );
+            cp
+        };
+
+        let saves = (0..8).map(|i| storage.save(checkpoint(i)));
+        let results = futures::future::join_all(saves).await;
+        for result in &results {
+            assert!(result.is_ok(), "no save may fail: {result:?}");
+        }
+
+        // Whichever renamed last wins, and what it wrote is one whole
+        // checkpoint rather than a blend of several.
+        let loaded = storage
+            .load("same-id")
+            .await
+            .expect("the surviving checkpoint parses")
+            .expect("it is there");
+        let filler = loaded.metadata["filler"].as_str().unwrap();
+        assert_eq!(filler.len(), 200_000 + loaded.iteration_count);
+
+        // And no temp files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
