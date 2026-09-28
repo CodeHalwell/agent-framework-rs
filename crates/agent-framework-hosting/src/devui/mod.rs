@@ -358,9 +358,17 @@ impl AgentStreamFraming {
             let output_len = completed.output_text.as_deref().unwrap_or_default().len();
             completed.usage = Some(usage_estimate(self.input_len, output_len));
         }
+        // OpenAI pairs an incomplete response with its own terminal event
+        // name, so a client switching on the event type — rather than reading
+        // `status` out of the payload — still sees that the turn was cut off.
+        let event_type = if completed.incomplete_details.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         let seq = self.next();
         json!({
-            "type": "response.completed",
+            "type": event_type,
             "sequence_number": seq,
             "response": serde_json::to_value(completed).unwrap_or(Value::Null),
         })
@@ -431,6 +439,9 @@ fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str)
         created_at: util::now_ts(),
         model: model.to_string(),
         status: "completed",
+        // A workflow run has no single model turn to be cut off in; the
+        // per-agent reasons, when there are any, belong to the executors.
+        incomplete_details: None,
         output,
         output_text: Some(text),
         usage: None,
@@ -500,6 +511,7 @@ fn workflow_stream_events(
         created_at: util::now_ts(),
         model: model.to_string(),
         status: "completed",
+        incomplete_details: None,
         output,
         output_text: Some(text),
         usage: None,

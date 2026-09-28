@@ -1,9 +1,22 @@
-//! Azure AI Foundry Models embeddings client.
+//! Azure AI Foundry embeddings client.
 //!
 //! Rust equivalent of upstream's `RawFoundryEmbeddingClient`
-//! (`agent_framework_foundry/_embedding_client.py`): the Foundry **Models**
-//! inference endpoint (`POST {models_endpoint}/embeddings`), which upstream
-//! reaches through `azure.ai.inference`'s `EmbeddingsClient`.
+//! (`agent_framework_foundry/_embedding_client.py`), which reaches text
+//! embeddings over **two** surfaces:
+//!
+//! - the Foundry **Models** inference endpoint (`POST
+//!   {models_endpoint}/embeddings`), which upstream reaches through
+//!   `azure.ai.inference`'s `EmbeddingsClient`
+//!   ([`FoundryEmbeddingClient::new`] / [`FoundryEmbeddingClient::with_credential`]);
+//! - a Foundry **project**'s OpenAI model deployments (upstream #8454), by
+//!   deriving the resource-scoped `POST {resource}/openai/v1/embeddings` route
+//!   from the project endpoint ([`FoundryEmbeddingClient::with_project_endpoint`],
+//!   [`openai_model_base_url`]).
+//!
+//! The second matters because the project endpoint is the one a Foundry user
+//! already has — [`crate::FoundryChatClient`] takes it. Without it, a project
+//! with an embedding deployment still needed a separately-provisioned Models
+//! inference endpoint before it could be used for embeddings.
 //!
 //! This is a different surface from
 //! [`agent_framework_azure::AzureOpenAIEmbeddingClient`], which is
@@ -44,6 +57,61 @@ pub const FOUNDRY_MODELS_ENDPOINT_ENV: &str = "FOUNDRY_MODELS_ENDPOINT";
 pub const FOUNDRY_MODELS_API_KEY_ENV: &str = "FOUNDRY_MODELS_API_KEY";
 /// The default text embedding model (deployment) name.
 pub const FOUNDRY_EMBEDDING_MODEL_ENV: &str = "FOUNDRY_EMBEDDING_MODEL";
+/// The Foundry **project** endpoint (e.g.
+/// `https://<resource>.services.ai.azure.com/api/projects/<project>`) — the
+/// same endpoint [`crate::FoundryChatClient`] takes.
+pub const FOUNDRY_PROJECT_ENDPOINT_ENV: &str = "FOUNDRY_PROJECT_ENDPOINT";
+/// Alias for [`FOUNDRY_PROJECT_ENDPOINT_ENV`], read second.
+///
+/// [`crate::FoundryChatClient::from_env`] takes this as its *primary* name,
+/// so an environment configured for the chat client is picked up here too
+/// rather than reporting that no endpoint is set while one plainly is.
+pub const FOUNDRY_ENDPOINT_ENV: &str = "FOUNDRY_ENDPOINT";
+
+/// Derive the resource-scoped OpenAI **v1** model route from a Foundry
+/// project endpoint, as upstream's `_get_openai_model_base_url` does.
+///
+/// `https://<resource>.services.ai.azure.com/api/projects/<project>`
+/// becomes `https://<resource>.openai.azure.com/openai/v1`. The project path
+/// is dropped: the model route is scoped to the *resource*, not to the
+/// project underneath it.
+///
+/// A host that does not carry `.services.ai.` is passed through unchanged
+/// apart from the path, matching upstream — a custom or sovereign-cloud
+/// domain is a caller's business, and refusing it here would reject a
+/// deployment that works.
+pub fn openai_model_base_url(project_endpoint: &str) -> Result<String> {
+    let trimmed = project_endpoint.trim();
+    let invalid = || {
+        Error::Configuration(format!(
+            "invalid Foundry project endpoint: {project_endpoint:?}"
+        ))
+    };
+    let (scheme, rest) = trimmed.split_once("://").ok_or_else(invalid)?;
+    if scheme.is_empty() {
+        return Err(invalid());
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    let host = host.replacen(".services.ai.", ".openai.", 1);
+    Ok(format!("{scheme}://{host}/openai/v1"))
+}
+
+/// Which Foundry surface a [`FoundryEmbeddingClient`] talks to.
+///
+/// The two differ in more than a hostname: the Models endpoint is
+/// query-versioned (`?api-version=`) while the project's OpenAI route is
+/// path-versioned (`/openai/v1`) and rejects the query parameter — the same
+/// split [`crate::FoundryChatClient`] handles with `without_api_version`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// `POST {models_endpoint}/embeddings?api-version=…`
+    Models,
+    /// `POST {resource}/openai/v1/embeddings`
+    ProjectOpenAI,
+}
 
 /// The `api-version` sent when none is set, mirroring the default in
 /// `azure-ai-inference` 1.0.0b9 — the version upstream's `foundry` package
@@ -108,6 +176,7 @@ struct Inner {
     api_version: String,
     scope: String,
     auth: Auth,
+    route: Route,
 }
 
 impl std::fmt::Debug for FoundryEmbeddingClient {
@@ -156,6 +225,15 @@ impl FoundryEmbeddingClient {
     }
 
     fn build(endpoint: impl Into<String>, model: impl Into<String>, auth: Auth) -> Self {
+        Self::build_on(endpoint, model, auth, Route::Models)
+    }
+
+    fn build_on(
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        auth: Auth,
+        route: Route,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 http: reqwest::Client::new(),
@@ -164,8 +242,35 @@ impl FoundryEmbeddingClient {
                 api_version: DEFAULT_API_VERSION.to_string(),
                 scope: DEFAULT_SCOPE.to_string(),
                 auth,
+                route,
             }),
         }
+    }
+
+    /// Create a client against a Foundry **project** endpoint, reaching the
+    /// resource's OpenAI v1 model route (upstream #8454).
+    ///
+    /// This is the endpoint a Foundry user already has — the one
+    /// [`crate::FoundryChatClient`] takes. Before this, embeddings were
+    /// reachable only through a separately-provisioned Foundry *Models*
+    /// inference endpoint, so a project that had an embedding deployment
+    /// still could not be used for embeddings from here.
+    ///
+    /// Entra ID only: the project route has no API-key form, which is why
+    /// there is no key-taking counterpart. The token is requested for
+    /// [`DEFAULT_SCOPE`] — the Azure OpenAI data-plane audience the derived
+    /// `*.openai.azure.com` host expects, *not* [`crate::FOUNDRY_SCOPE`].
+    pub fn with_project_endpoint(
+        project_endpoint: &str,
+        model: impl Into<String>,
+        credential: Arc<dyn TokenCredential>,
+    ) -> Result<Self> {
+        Ok(Self::build_on(
+            openai_model_base_url(project_endpoint)?,
+            model,
+            Auth::Credential(credential),
+            Route::ProjectOpenAI,
+        ))
     }
 
     /// Build a client from `FOUNDRY_MODELS_ENDPOINT`,
@@ -183,9 +288,19 @@ impl FoundryEmbeddingClient {
     /// [`crate::FoundryChatClient::from_env`], so a managed-identity or
     /// `az login` environment works with no key configured.
     pub fn from_env(model: Option<String>) -> Result<Self> {
-        let endpoint = std::env::var(FOUNDRY_MODELS_ENDPOINT_ENV).map_err(|_| {
-            Error::Configuration(format!("{FOUNDRY_MODELS_ENDPOINT_ENV} is not set"))
-        })?;
+        let models_endpoint = std::env::var(FOUNDRY_MODELS_ENDPOINT_ENV)
+            .ok()
+            .filter(|e| !e.trim().is_empty());
+        let project_endpoint = std::env::var(FOUNDRY_PROJECT_ENDPOINT_ENV)
+            .ok()
+            .or_else(|| std::env::var(FOUNDRY_ENDPOINT_ENV).ok())
+            .filter(|e| !e.trim().is_empty());
+        if models_endpoint.is_none() && project_endpoint.is_none() {
+            return Err(Error::Configuration(format!(
+                "a Foundry endpoint is required: set {FOUNDRY_MODELS_ENDPOINT_ENV} for a Models \
+                 inference endpoint, or {FOUNDRY_PROJECT_ENDPOINT_ENV} for a project"
+            )));
+        }
         let model = model
             .or_else(|| std::env::var(FOUNDRY_EMBEDDING_MODEL_ENV).ok())
             .filter(|m| !m.trim().is_empty())
@@ -194,6 +309,18 @@ impl FoundryEmbeddingClient {
                     "an embedding model is required: pass one or set {FOUNDRY_EMBEDDING_MODEL_ENV}"
                 ))
             })?;
+
+        // The Models endpoint wins when both are set, which is the
+        // conservative order: it is the surface this client has always spoken,
+        // so an environment that already worked keeps working unchanged, and
+        // it is the only one of the two with an API-key path.
+        let Some(endpoint) = models_endpoint else {
+            let project_endpoint = project_endpoint.expect("checked above");
+            let credential: Arc<dyn TokenCredential> = Arc::new(
+                agent_framework_azure::DefaultAzureCredential::new(DEFAULT_SCOPE),
+            );
+            return Self::with_project_endpoint(&project_endpoint, model, credential);
+        };
         match std::env::var(FOUNDRY_MODELS_API_KEY_ENV) {
             Ok(api_key) if !api_key.trim().is_empty() => Ok(Self::new(endpoint, model, api_key)),
             _ => {
@@ -225,11 +352,17 @@ impl FoundryEmbeddingClient {
     }
 
     /// The full request URL.
+    ///
+    /// The project route is path-versioned, so it carries no `api-version`
+    /// query parameter; appending one there is rejected by the service.
     fn url(&self) -> String {
-        format!(
-            "{}/embeddings?api-version={}",
-            self.inner.endpoint, self.inner.api_version
-        )
+        match self.inner.route {
+            Route::Models => format!(
+                "{}/embeddings?api-version={}",
+                self.inner.endpoint, self.inner.api_version
+            ),
+            Route::ProjectOpenAI => format!("{}/embeddings", self.inner.endpoint),
+        }
     }
 
     /// The option key upstream maps onto the Azure AI Inference SDK's
@@ -314,6 +447,7 @@ fn arc_inner(inner: &mut Arc<Inner>) -> &mut Inner {
                 Auth::ApiKey(key) => Auth::ApiKey(key.clone()),
                 Auth::Credential(cred) => Auth::Credential(cred.clone()),
             },
+            route: inner.route,
         });
     }
     Arc::get_mut(inner).expect("just ensured unique")
@@ -550,8 +684,9 @@ mod tests {
             // request time.
             let err = FoundryEmbeddingClient::from_env(None).expect_err("no endpoint");
             assert!(
-                err.to_string().contains(FOUNDRY_MODELS_ENDPOINT_ENV),
-                "{err}"
+                err.to_string().contains(FOUNDRY_MODELS_ENDPOINT_ENV)
+                    && err.to_string().contains(FOUNDRY_PROJECT_ENDPOINT_ENV),
+                "the error should name both endpoints a caller could set: {err}"
             );
 
             std::env::set_var(FOUNDRY_MODELS_ENDPOINT_ENV, "https://e/models");
@@ -603,11 +738,118 @@ mod tests {
     /// Run `f` with the three Foundry embedding variables unset, restoring
     /// whatever was there before. Tests in one binary share a process
     /// environment, so this is deliberately narrow.
+    /// The derivation upstream #8454 added: the model route is scoped to the
+    /// *resource*, so the project path is dropped and the host moves from
+    /// `.services.ai.` to `.openai.`.
+    #[test]
+    fn a_project_endpoint_becomes_the_resource_openai_v1_route() {
+        assert_eq!(
+            openai_model_base_url("https://myres.services.ai.azure.com/api/projects/proj").unwrap(),
+            "https://myres.openai.azure.com/openai/v1"
+        );
+        // Trailing slashes, queries and fragments are all part of the path
+        // being replaced, not of the host.
+        assert_eq!(
+            openai_model_base_url("https://myres.services.ai.azure.com/api/projects/proj/?x=1#f")
+                .unwrap(),
+            "https://myres.openai.azure.com/openai/v1"
+        );
+        // A host without the Foundry marker keeps its name, as upstream's
+        // single-shot replace does — a custom domain is not an error.
+        assert_eq!(
+            openai_model_base_url("https://custom.example.com/api/projects/p").unwrap(),
+            "https://custom.example.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn a_malformed_project_endpoint_is_refused() {
+        for bad in [
+            "",
+            "   ",
+            "myres.services.ai.azure.com",
+            "https://",
+            "://host",
+        ] {
+            let err = openai_model_base_url(bad).expect_err("{bad:?} should be refused");
+            assert!(err.to_string().contains("invalid Foundry project endpoint"));
+        }
+    }
+
+    /// The project route is path-versioned. Carrying the Models endpoint's
+    /// `?api-version=` onto it is rejected by the service, so the two URLs
+    /// differ in more than their host.
+    #[test]
+    fn the_project_route_sends_no_api_version() {
+        let client = FoundryEmbeddingClient::with_project_endpoint(
+            "https://myres.services.ai.azure.com/api/projects/proj",
+            "text-embedding-3-small",
+            Arc::new(agent_framework_azure::StaticTokenCredential::new("t")),
+        )
+        .unwrap();
+        assert_eq!(
+            client.url(),
+            "https://myres.openai.azure.com/openai/v1/embeddings"
+        );
+        assert!(!client.url().contains("api-version"));
+
+        // The Models route is unchanged.
+        let models = FoundryEmbeddingClient::new("https://e/models", "m", "k");
+        assert!(models.url().contains("api-version"));
+    }
+
+    /// A project endpoint alone is now enough to build a client; before this
+    /// the only way in was a separately-provisioned Models endpoint.
+    #[test]
+    fn from_env_accepts_a_project_endpoint_and_prefers_a_models_one() {
+        temp_env_absent(|| {
+            std::env::set_var(FOUNDRY_EMBEDDING_MODEL_ENV, "text-embedding-3-small");
+            std::env::set_var(
+                FOUNDRY_PROJECT_ENDPOINT_ENV,
+                "https://myres.services.ai.azure.com/api/projects/proj",
+            );
+            let client = FoundryEmbeddingClient::from_env(None).expect("project endpoint suffices");
+            assert_eq!(
+                client.url(),
+                "https://myres.openai.azure.com/openai/v1/embeddings"
+            );
+            assert!(matches!(client.inner.auth, Auth::Credential(_)));
+
+            // The chat client's own primary name works too, so one Foundry
+            // environment configures both clients.
+            std::env::remove_var(FOUNDRY_PROJECT_ENDPOINT_ENV);
+            std::env::set_var(
+                FOUNDRY_ENDPOINT_ENV,
+                "https://myres.services.ai.azure.com/api/projects/proj",
+            );
+            let aliased = FoundryEmbeddingClient::from_env(None).expect("alias is accepted");
+            assert_eq!(
+                aliased.url(),
+                "https://myres.openai.azure.com/openai/v1/embeddings"
+            );
+
+            // With both set the Models endpoint wins, so an environment that
+            // already worked is untouched.
+            std::env::set_var(FOUNDRY_MODELS_ENDPOINT_ENV, "https://e/models");
+            let client = FoundryEmbeddingClient::from_env(None).expect("models endpoint wins");
+            assert!(client.url().starts_with("https://e/models/embeddings?"));
+        });
+    }
+
+    /// `std::env::set_var` mutates process-global state, so two tests using
+    /// this helper on different threads see each other's variables. Taking one
+    /// lock makes them sequential; a poisoned lock is recovered rather than
+    /// propagating one test's panic into every other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_env_absent(f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let keys = [
             FOUNDRY_MODELS_ENDPOINT_ENV,
             FOUNDRY_MODELS_API_KEY_ENV,
             FOUNDRY_EMBEDDING_MODEL_ENV,
+            FOUNDRY_PROJECT_ENDPOINT_ENV,
+            FOUNDRY_ENDPOINT_ENV,
         ];
         let saved: Vec<(&str, Option<String>)> =
             keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();

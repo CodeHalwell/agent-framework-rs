@@ -197,7 +197,13 @@ impl Message {
 pub fn prepare_messages(messages: Vec<Message>, system_instructions: Option<&str>) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len() + 1);
     if let Some(instr) = system_instructions {
-        if !instr.is_empty() {
+        // Whitespace counts as absent, not as an instruction. `""` was already
+        // skipped, but the usual unset-options default reaches here as any
+        // blank string a caller or a merge produced — and a system message
+        // holding only spaces or a newline is a contentless turn prepended
+        // ahead of the real conversation, which some providers bill for and
+        // others reject.
+        if !instr.trim().is_empty() {
             out.push(Message::system(instr));
         }
     }
@@ -240,6 +246,39 @@ impl IntoMessages for Vec<String> {
 impl IntoMessages for Vec<&str> {
     fn into_messages(self) -> Vec<Message> {
         self.into_iter().map(Message::user).collect()
+    }
+}
+
+#[cfg(test)]
+mod prepare_messages_tests {
+    use super::*;
+
+    /// A real instruction is prepended verbatim — including its surrounding
+    /// whitespace, which is only used to decide *whether* to prepend.
+    #[test]
+    fn a_real_instruction_is_prepended_verbatim() {
+        let out = prepare_messages(vec![Message::user("hi")], Some("  Be terse.  "));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, Role::system());
+        assert_eq!(out[0].text(), "  Be terse.  ");
+    }
+
+    /// The regression this pins: a blank instruction used to reach the
+    /// provider as a contentless system turn ahead of the conversation.
+    #[test]
+    fn blank_instructions_add_no_system_message() {
+        for blank in ["", " ", "\n", "\t  \r\n"] {
+            let out = prepare_messages(vec![Message::user("hi")], Some(blank));
+            assert_eq!(out.len(), 1, "blank {blank:?} should add nothing");
+            assert_eq!(out[0].role, Role::user());
+        }
+    }
+
+    #[test]
+    fn absent_instructions_add_no_system_message() {
+        let out = prepare_messages(vec![Message::user("hi")], None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::user());
     }
 }
 

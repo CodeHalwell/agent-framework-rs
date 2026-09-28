@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use agent_framework_core::types::{AgentResponse, Message, Role, UsageDetails};
+use agent_framework_core::types::{AgentResponse, FinishReason, Message, Role, UsageDetails};
 
 /// `POST /v1/responses` request — a subset of DevUI's `AgentFrameworkRequest`
 /// (itself an OpenAI `ResponseCreateParams` superset). Unknown fields are
@@ -121,6 +121,29 @@ impl OutputMessage {
     }
 }
 
+/// Why a response stopped short of a complete answer — mirrors OpenAI
+/// `Response.incomplete_details`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IncompleteDetails {
+    pub reason: &'static str,
+}
+
+/// Map a run's finish reason onto an OpenAI-Responses `incomplete_details`
+/// reason, or `None` when the turn ran to a genuine end.
+///
+/// Only the two *truncating* reasons produce one. `stop` is a complete answer,
+/// and `tool_calls` is a turn that continues — neither is incomplete in the
+/// sense this field reports. The names differ from the core vocabulary on one
+/// of the two: OpenAI calls a token-budget cut-off `max_output_tokens` here,
+/// while the chat-completions `finish_reason` for the same event is `length`.
+pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&'static str> {
+    match finish_reason?.as_str() {
+        FinishReason::CONTENT_FILTER => Some("content_filter"),
+        FinishReason::LENGTH => Some("max_output_tokens"),
+        _ => None,
+    }
+}
+
 /// The aggregated final response — mirrors OpenAI `Response`.
 ///
 /// Divergences from DevUI: adds a convenience top-level `output_text` (the
@@ -134,6 +157,9 @@ pub struct ResponseObject {
     pub created_at: f64,
     pub model: String,
     pub status: &'static str,
+    /// Present only when `status` is `"incomplete"`, as OpenAI has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
     pub output: Vec<OutputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_text: Option<String>,
@@ -158,6 +184,7 @@ impl ResponseObject {
             created_at: crate::util::now_ts(),
             model: model.into(),
             status: "in_progress",
+            incomplete_details: None,
             output: Vec::new(),
             output_text: None,
             usage: None,
@@ -278,12 +305,23 @@ fn role_from(role: &str) -> Role {
 pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> ResponseObject {
     let text = resp.text();
     let mid = crate::util::msg_id();
+    // A turn the model was cut off in — an Azure OpenAI content-filter block,
+    // or the token budget running out — reads as an ordinary finished answer
+    // in its text alone. Reporting it as `completed` left a caller matching
+    // the provider's canned refusal string as the only way to tell, so the
+    // status and `incomplete_details` carry it instead.
+    let incomplete = incomplete_reason(resp.finish_reason.as_ref());
     ResponseObject {
         id: id.to_string(),
         object: "response",
         created_at: crate::util::now_ts(),
         model: model.to_string(),
-        status: "completed",
+        status: if incomplete.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        },
+        incomplete_details: incomplete.map(|reason| IncompleteDetails { reason }),
         output: vec![OutputMessage::assistant_text(mid, text.clone())],
         output_text: Some(text),
         usage: resp.usage_details.as_ref().map(usage_from_details),
@@ -343,6 +381,68 @@ mod tests {
         );
         r.metadata = Some(meta);
         assert_eq!(r.entity_id(), Some("from-meta".to_string()));
+    }
+
+    fn run_finishing_with(reason: Option<FinishReason>) -> AgentResponse {
+        AgentResponse {
+            messages: vec![Message::assistant("here is what I can say")],
+            finish_reason: reason,
+            ..Default::default()
+        }
+    }
+
+    /// A turn the Azure OpenAI content filter cut off used to be reported as
+    /// `completed`, leaving the canned refusal text as the only signal.
+    #[test]
+    fn a_content_filtered_run_is_reported_incomplete() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::CONTENT_FILTER))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert_eq!(
+            obj.incomplete_details,
+            Some(IncompleteDetails {
+                reason: "content_filter"
+            })
+        );
+    }
+
+    /// `length` is OpenAI's `max_output_tokens` on this surface — the one
+    /// place the two vocabularies disagree.
+    #[test]
+    fn a_length_capped_run_is_reported_as_max_output_tokens() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::LENGTH))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert_eq!(
+            obj.incomplete_details,
+            Some(IncompleteDetails {
+                reason: "max_output_tokens"
+            })
+        );
+    }
+
+    /// The negative controls: a turn that genuinely ended, one that continues
+    /// into tools, and one whose provider reported nothing are all complete —
+    /// and none of them grows an `incomplete_details` key.
+    #[test]
+    fn a_run_that_was_not_cut_off_stays_completed() {
+        for reason in [
+            Some(FinishReason::stop()),
+            Some(FinishReason::tool_calls()),
+            None,
+        ] {
+            let obj = responses_from_run(&run_finishing_with(reason.clone()), "resp_1", "gpt-4o");
+            assert_eq!(obj.status, "completed", "{reason:?}");
+            assert_eq!(obj.incomplete_details, None, "{reason:?}");
+            let encoded = serde_json::to_value(&obj).unwrap();
+            assert!(encoded.get("incomplete_details").is_none(), "{reason:?}");
+        }
     }
 
     #[test]

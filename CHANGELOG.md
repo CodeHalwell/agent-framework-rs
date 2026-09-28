@@ -7,6 +7,65 @@ may break APIs).
 
 ## [Unreleased]
 
+Four values the code already had and never read, plus a Foundry surface it
+could not reach. Three of the four failed in the permissive direction.
+
+**Breaking, in two places.** `AgentResponse` and `AgentResponseUpdate` each
+gain a `finish_reason` field, so a struct literal for either without
+`..Default::default()` needs it. `agent_framework_hosting::ResponseObject`
+gains `incomplete_details` on the same terms.
+
+**One behaviour change worth calling out.** The in-memory vector store's
+`hamming` score is now the *fraction* of differing coordinates rather than the
+raw count, matching upstream. Ranking is unchanged; a `score_threshold` tuned
+against the old raw count needs dividing by the vector width.
+
+### Added
+
+- **Foundry embeddings from a project endpoint.** `FoundryEmbeddingClient`
+  previously spoke only the Foundry *Models* inference endpoint, so a Foundry
+  project holding an embedding deployment could not be embedded against
+  without provisioning a second surface. `with_project_endpoint` derives the
+  resource-scoped `{resource}/openai/v1/embeddings` route from a project
+  endpoint (`openai_model_base_url`), path-versioned and Entra-only. `from_env`
+  reads `FOUNDRY_PROJECT_ENDPOINT` (and `FOUNDRY_ENDPOINT`, the name
+  `FoundryChatClient` takes first) and still prefers `FOUNDRY_MODELS_ENDPOINT`
+  when both are set (upstream #8454).
+- `AgentResponse::finish_reason` / `AgentResponseUpdate::finish_reason`, and
+  `incomplete_details` on the hosting `ResponseObject`.
+
+### Fixed
+
+- **An empty hosted-MCP allowlist enabled every tool on the server**
+  (Anthropic). `allowed_tools: Some(vec![])` means "expose none", and was
+  treated as "no allowlist" — leaving the API default, which enables all of
+  them. Now encoded as `tool_configuration: {"enabled": false}`. The OpenAI,
+  Azure and Foundry paths were already correct (upstream #8576).
+- **A cut-off turn was reported as a completed one.** `finish_reason` never
+  reached the agent types, so an Azure OpenAI content-filter block or a
+  token-budget truncation was indistinguishable from a finished answer. The
+  OpenAI-compatible surface no longer hardcodes `finish_reason: "stop"`, and
+  the Responses surface emits `status: "incomplete"` with
+  `incomplete_details.reason` (`content_filter` / `max_output_tokens`) and a
+  `response.incomplete` terminal event (upstream #8478).
+- **Hamming distance could not distinguish integers above 2^24.** Stored
+  vector coordinates were narrowed to `f32` before comparison, so distinct
+  large integers — ids, timestamps, hashes — compared equal and a
+  non-matching record scored as an exact match. Coordinates are now compared
+  at `f64` (upstream #8637).
+- **A whitespace-only instruction became a contentless system message.**
+  `prepare_messages` skipped `""` but not `" "` or `"\n"`. A real instruction
+  still prepends verbatim (upstream #8524).
+
+### Documentation
+
+- `StandardMagenticManager` now documents that its cached task ledger is
+  shared by every run holding the same manager, and that the two readers of
+  that cache are the plan-review and stall-intervention requests — so
+  concurrent runs can show a human reviewer the other run's plan. Prefer
+  `standard_manager`, which takes the manager by value (upstream #8581).
+
+
 ## [0.8.0] — 2026-09-21
 
 An Azure Cosmos DB vector store and a provider that hands any vector

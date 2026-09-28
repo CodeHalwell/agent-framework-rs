@@ -784,15 +784,11 @@ fn key_string(key: &Value) -> String {
 /// Only the metrics [`DistanceFunction::higher_is_closer`] knows the
 /// direction of are computed; `search` rejects anything else rather than
 /// ranking it arbitrarily.
-fn score_vectors(distance: &DistanceFunction, a: &[f32], b: &[f32]) -> Option<f64> {
+fn score_vectors(distance: &DistanceFunction, a: &[f64], b: &[f64]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let pairs = || {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (f64::from(*x), f64::from(*y)))
-    };
+    let pairs = || a.iter().zip(b.iter()).map(|(x, y)| (*x, *y));
     let dot: f64 = pairs().map(|(x, y)| x * y).sum();
 
     match distance.as_str() {
@@ -819,7 +815,23 @@ fn score_vectors(distance: &DistanceFunction, a: &[f32], b: &[f32]) -> Option<f6
             Some(pairs().map(|(x, y)| (x - y).powi(2)).sum())
         }
         DistanceFunction::MANHATTAN => Some(pairs().map(|(x, y)| (x - y).abs()).sum()),
-        DistanceFunction::HAMMING => Some(pairs().filter(|(x, y)| x != y).count() as f64),
+        // Hamming is the one metric that asks whether two coordinates are the
+        // *same* rather than how far apart they are, so it is the one that
+        // rounding breaks outright: stored vectors used to be narrowed to
+        // `f32` before comparison, and `f32` carries 24 bits of mantissa, so
+        // two distinct integers above 2^24 (ids, timestamps, hashes — exactly
+        // the values a Hamming collection holds) compared equal and the
+        // distance came back understated, often as an exact match. The
+        // operands reaching here are now unrounded.
+        //
+        // The count is normalized by the vector's width, as upstream does, so
+        // a `score_threshold` means the same fraction of differing
+        // coordinates on every collection regardless of its dimensionality.
+        // Ranking is unaffected either way — dividing by a constant is
+        // monotonic — but a raw count made a portable threshold meaningless.
+        DistanceFunction::HAMMING => {
+            Some(pairs().filter(|(x, y)| x != y).count() as f64 / a.len() as f64)
+        }
         _ => None,
     }
 }
@@ -987,6 +999,11 @@ impl VectorCollection for InMemoryCollection {
             ))
         })?;
 
+        // The trait hands the query in as `f32`; widen it once here so the
+        // comparison against stored `f64` coordinates is exact rather than
+        // performed at the narrower width.
+        let query: Vec<f64> = vector.iter().map(|v| f64::from(*v)).collect();
+
         let records: Vec<Value> = self.with_data(|d| d.records.values().cloned().collect());
         let mut scored: Vec<(f64, Value)> = Vec::new();
         for record in records {
@@ -1008,10 +1025,14 @@ impl VectorCollection for InMemoryCollection {
             // away silently reshapes the vector — `[1, "bad", 0, 0]` becomes
             // `[1, 0, 0]`, which then matches a three-dimensional query
             // perfectly — so schema-invalid data ranked as a top result.
+            // Read at `f64`, the widest `serde_json` offers. Narrowing to
+            // `f32` here — which this did — silently collapsed distinct large
+            // integers onto one value before any metric saw them; see the
+            // Hamming arm of `score_vectors` for what that cost.
             let Some(stored) = stored_vector
                 .iter()
-                .map(|v| v.as_f64().map(|f| f as f32))
-                .collect::<Option<Vec<f32>>>()
+                .map(Value::as_f64)
+                .collect::<Option<Vec<f64>>>()
             else {
                 continue;
             };
@@ -1027,7 +1048,7 @@ impl VectorCollection for InMemoryCollection {
             if stored.iter().any(|v| !v.is_finite()) {
                 continue;
             }
-            match score_vectors(&distance, &vector, &stored) {
+            match score_vectors(&distance, &query, &stored) {
                 // Belt and braces: overflow on very large finite inputs can
                 // still produce a non-finite score, which must not be ranked
                 // or handed back as JSON.
@@ -1410,6 +1431,73 @@ mod tests {
         assert!(hits[0].score.unwrap() < hits[1].score.unwrap());
     }
 
+    /// Two records that differ only above `f32`'s 24-bit mantissa. Narrowing
+    /// stored coordinates to `f32` before comparing them — which the search
+    /// did — made `16_777_217` and `16_777_216` the same number, so the record
+    /// that does *not* match came back scored as an exact match. Hamming is
+    /// where this shows, because it asks whether coordinates are equal rather
+    /// than how far apart they are.
+    #[tokio::test]
+    async fn hamming_search_distinguishes_integers_beyond_f32_precision() {
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 2)
+                .with_distance_function(DistanceFunction::new(DistanceFunction::HAMMING)),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("ids", d).unwrap();
+        c.upsert(vec![
+            json!({"id": "exact", "embedding": [16_777_216, 0]}),
+            json!({"id": "off_by_one", "embedding": [16_777_217, 0]}),
+        ])
+        .await
+        .unwrap();
+
+        // 2^24 is exactly representable in `f32`, so the query itself loses
+        // nothing — the rounding under test is entirely on the stored side.
+        let hits = c
+            .search(vec![16_777_216.0, 0.0], &VectorSearchOptions::new(2))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].record["id"], json!("exact"));
+        assert_eq!(hits[0].score, Some(0.0));
+        assert_eq!(hits[1].record["id"], json!("off_by_one"));
+        // Half of the two coordinates differ. Previously both records scored
+        // 0.0 and the ranking between them was a coin toss.
+        assert_eq!(hits[1].score, Some(0.5));
+    }
+
+    /// The Hamming score is the *fraction* of differing coordinates, not the
+    /// raw count, so a `score_threshold` carries the same meaning across
+    /// collections of different widths.
+    #[tokio::test]
+    async fn hamming_score_is_normalized_by_the_vector_width() {
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 4)
+                .with_distance_function(DistanceFunction::new(DistanceFunction::HAMMING)),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("bits", d).unwrap();
+        c.upsert(vec![
+            json!({"id": "one_off", "embedding": [1, 0, 0, 0]}),
+            json!({"id": "all_off", "embedding": [1, 1, 1, 1]}),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(vec![0.0, 0.0, 0.0, 0.0], &VectorSearchOptions::new(2))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].record["id"], json!("one_off"));
+        assert_eq!(hits[0].score, Some(0.25));
+        assert_eq!(hits[1].record["id"], json!("all_off"));
+        assert_eq!(hits[1].score, Some(1.0));
+    }
+
     #[tokio::test]
     async fn search_refuses_a_distance_function_it_cannot_rank() {
         let d = VectorStoreCollectionDefinition::new(vec![
@@ -1482,26 +1570,33 @@ mod tests {
         }
     }
 
+    /// A record whose *score* comes out non-finite must not be ranked, because
+    /// the score is handed back as JSON and JSON cannot spell infinity.
+    ///
+    /// The route to that used to be the stored-vector parse narrowing to
+    /// `f32`, where `1e39` overflows to infinity. Stored coordinates are now
+    /// read at `f64` (see the Hamming arm of `score_vectors`), so that
+    /// magnitude is an ordinary finite number and is ranked like any other —
+    /// which is the improvement, not a hole. The overflow that remains is in
+    /// the arithmetic: squaring `1e200` leaves `f64` range.
     #[tokio::test]
-    async fn a_stored_non_finite_vector_is_not_ranked() {
+    async fn a_record_whose_score_overflows_is_not_ranked() {
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 3).with_distance_function(DistanceFunction::new(
+                DistanceFunction::EUCLIDEAN_SQUARED_DISTANCE,
+            )),
+        ])
+        .unwrap();
         let store = InMemoryVectorStore::new();
-        let c = store.get_collection("docs", definition()).unwrap();
+        let c = store.get_collection("docs", d).unwrap();
         c.upsert(vec![
-            json!({"id": "nan", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
-            json!({"id": "ok", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
+            json!({"id": "ok", "embedding": [1.0, 0.0, 0.0]}),
+            json!({"id": "overflows", "embedding": [1e200, 0.0, 0.0]}),
         ])
         .await
         .unwrap();
-        // JSON cannot spell Infinity, but it does not need to: a magnitude
-        // that is finite as `f64` overflows when narrowed to `f32`, which is
-        // exactly what the stored-vector parse does. This is the realistic
-        // way a non-finite value gets into a store.
-        assert!((1e39_f64 as f32).is_infinite());
-        c.upsert(vec![json!({
-            "id": "nan", "text": "t", "embedding": [1e39, 0.0, 0.0]
-        })])
-        .await
-        .unwrap();
+        assert!((1e200_f64 * 1e200_f64).is_infinite());
 
         let hits = c
             .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
@@ -1509,7 +1604,33 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record["id"], json!("ok"));
-        // Every returned score must be serializable.
+        for hit in &hits {
+            assert!(hit.score.unwrap().is_finite());
+            assert!(serde_json::to_value(hit).is_ok());
+        }
+    }
+
+    /// The counterpart to the row above, and the behaviour change the `f64`
+    /// widening brought: a magnitude that only overflowed *because* stored
+    /// coordinates were narrowed to `f32` is now ranked normally.
+    #[tokio::test]
+    async fn a_magnitude_that_only_overflowed_f32_is_ranked() {
+        assert!((1e39_f64 as f32).is_infinite());
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            json!({"id": "huge", "text": "t", "embedding": [1e39, 0.0, 0.0]}),
+            json!({"id": "ok", "text": "t", "embedding": [1.0, 0.0, 0.0]}),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(5))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "neither record should be discarded");
+        // Cosine normalizes, so both point the same way and score 1.0.
         for hit in &hits {
             assert!(hit.score.unwrap().is_finite());
             assert!(serde_json::to_value(hit).is_ok());

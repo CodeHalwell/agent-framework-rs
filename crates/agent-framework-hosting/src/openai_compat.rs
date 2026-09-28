@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use agent_framework_core::agent::SupportsAgentRun;
-use agent_framework_core::types::{AgentResponse, Message, Role, UsageDetails};
+use agent_framework_core::types::{AgentResponse, FinishReason, Message, Role, UsageDetails};
 
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_response_stream;
@@ -127,9 +127,17 @@ async fn chat_completions(
                 }
                 match agent.run_stream(messages, None, None).await {
                     Ok(mut stream) => {
+                        // Whichever update carries a reason carries it; the
+                        // last one wins, matching how `ChatResponse` aggregates
+                        // a stream. Held across the loop so the terminal chunk
+                        // can report it instead of asserting `"stop"`.
+                        let mut finish_reason: Option<FinishReason> = None;
                         while let Some(item) = stream.next().await {
                             match item {
                                 Ok(update) => {
+                                    if update.finish_reason.is_some() {
+                                        finish_reason = update.finish_reason.clone();
+                                    }
                                     let text = update.text();
                                     if !text.is_empty()
                                         && tx
@@ -153,13 +161,16 @@ async fn chat_completions(
                             }
                         }
                         // Terminal chunk.
+                        let reason = finish_reason
+                            .as_ref()
+                            .map_or(FinishReason::STOP, FinishReason::as_str);
                         let _ = tx
                             .send(chunk(
                                 &id,
                                 created,
                                 &model,
                                 json!({}),
-                                Value::String("stop".to_string()),
+                                Value::String(reason.to_string()),
                             ))
                             .await;
                     }
@@ -207,7 +218,7 @@ fn completion_object(
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": text },
-            "finish_reason": "stop",
+            "finish_reason": finish_reason_of(resp),
         }],
         "usage": {
             "prompt_tokens": prompt,
@@ -215,6 +226,25 @@ fn completion_object(
             "total_tokens": prompt + completion,
         },
     })
+}
+
+/// The chat-completions `finish_reason` for a run.
+///
+/// Hardcoding `"stop"` — which this did — told every client that a turn cut
+/// off by the Azure OpenAI content filter, or by the token budget, had ended
+/// normally. Those are precisely the two cases an OpenAI-compatible client
+/// branches on, and neither is distinguishable from the text alone.
+///
+/// The core vocabulary is already OpenAI's (`stop` / `length` /
+/// `content_filter` / `tool_calls`), so a known reason passes through as-is.
+/// A provider-specific one does too, rather than being flattened to `stop`:
+/// an unfamiliar value a client ignores is recoverable, whereas a wrong
+/// familiar one is not. `"stop"` remains the default only when the provider
+/// reported nothing at all.
+fn finish_reason_of(resp: &AgentResponse) -> &str {
+    resp.finish_reason
+        .as_ref()
+        .map_or(FinishReason::STOP, FinishReason::as_str)
 }
 
 /// Build one streaming `chat.completion.chunk` with the given `delta` and

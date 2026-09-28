@@ -454,6 +454,26 @@ pub trait MagenticManager: Send + Sync {
 }
 
 /// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
+///
+/// # One manager per concurrent run
+///
+/// This manager is **stateful**: it caches the decomposed task ledger it last
+/// planned, and [`MagenticBuilder`] holds it behind an `Arc`. Building a
+/// workflow consumes the builder, so two workflows cannot accidentally share
+/// one — but two things still can, and both surface the same way.
+///
+/// A caller can hand the same `Arc` to two builders, and
+/// [`Workflow::run`](crate::workflow::Workflow::run) takes `&self`, so one
+/// Magentic workflow can have two runs in flight at once. Either way the
+/// second run's `plan`/`replan` overwrites the cached ledger, and the ledger
+/// is read back by exactly the two surfaces where being wrong is expensive:
+/// the plan-review request and the stall-intervention request. A human
+/// reviewer can therefore be shown — and asked to approve — the *other* run's
+/// facts and plan. The runs' own execution state is unaffected; it lives on
+/// the orchestrator, per run.
+///
+/// Give each concurrent run its own manager (and its own workflow). Upstream
+/// (#8581) made the same guarantee by creating a manager per build.
 pub struct StandardMagenticManager {
     agent: Arc<dyn SupportsAgentRun>,
     task_ledger: Mutex<Option<MagenticTaskLedger>>,
@@ -1389,6 +1409,11 @@ impl MagenticBuilder {
     }
 
     /// Use a custom [`MagenticManager`].
+    ///
+    /// The `Arc` is shared, so a manager that keeps state across calls — as
+    /// [`StandardMagenticManager`] does — must not be handed to two builders
+    /// whose workflows run concurrently. See that type's documentation for
+    /// what interleaves.
     pub fn manager(mut self, manager: Arc<dyn MagenticManager>) -> Self {
         self.manager = Some(manager);
         self
@@ -1396,6 +1421,10 @@ impl MagenticBuilder {
 
     /// Use a [`StandardMagenticManager`] (convenience wrapper around
     /// [`MagenticBuilder::manager`]).
+    ///
+    /// Takes the manager by value, so each builder configured this way owns
+    /// its own — the shape to prefer when several Magentic workflows run at
+    /// once. See [`StandardMagenticManager`] for why that matters.
     pub fn standard_manager(mut self, manager: StandardMagenticManager) -> Self {
         self.manager = Some(Arc::new(manager));
         self

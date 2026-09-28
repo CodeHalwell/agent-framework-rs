@@ -6,8 +6,99 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `6606bef` (2026-09-21).** Sections are newest
+**Current upstream baseline: `dc8e226` (2026-09-28).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`6606bef` drift + Azure-ecosystem review (checked against `dc8e226`, 2026-09-28)
+
+Upstream moved **89 non-merge commits** in this window (2026-09-21 → 09-28).
+**Six land on this port.** Four of the six are one shape: *a value the code
+already had, and never read.* An explicit empty allowlist read as "no
+allowlist"; a finish reason was carried to the edge of the agent types and
+dropped there; stored vector coordinates were narrowed before being compared
+for equality; a blank instruction was checked for emptiness but not for
+whitespace. None of these fail loudly, and three of them fail in the
+permissive direction — which is why the window reads as small and is not.
+
+The Azure surface accounts for three: a Foundry **project** can now be used
+for embeddings at all, an Azure OpenAI content-filter block is no longer
+reported to hosting clients as a normal completion, and the standing Azure
+table gains one new upstream connector.
+
+### Ported this pass (6 upstream changes, all with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #8576 | **An empty hosted-MCP allowlist enabled every tool on the server.** `allowed_tools: Some(vec![])` means "expose none of this server's tools". The Anthropic converter treated it like `None` and omitted `tool_configuration` entirely, which leaves the API default in place — and the API default is *all tools enabled*. So the one input a caller uses to lock a server down was the input that unlocked it, and a test pinned that behaviour ("…`_is_omitted`"). It is now encoded rather than dropped. Deliberately as `enabled: false` rather than upstream's literal `allowed_tools: []`: only `enabled` has documented semantics for "no tools" on Anthropic's `tool_configuration`, whereas an empty array is undocumented there and could be read back as unset — which would reintroduce the bug in the one place it must not recur. Upstream emits the empty array because the OpenAI/Foundry shape it fixes has no `enabled` field. **The other two providers were already right** and are pinned as negative controls: `openai/responses.rs` emits `[]`, and Foundry and Azure both delegate to it rather than converting for themselves. | `anthropic/convert.rs` (`tools_to_anthropic`) |
+| #8478 | **A turn the model was cut off in was reported as a turn that finished.** Upstream's bug was a hosting loop that never read `AgentResponseUpdate.finish_reason`; here the field **did not exist on the agent types at all**. `AgentResponse::from_chat_response` mapped every other field across and dropped this one, and `into_chat_update` dropped it again on the streaming path — so the aggregation that computes it threw it away immediately afterwards. The consequence is the same in both languages and worst on Azure: `content_filter` (an Azure OpenAI content-filter block) and `length` produce a response whose *text* reads like a finished answer, so an application's only signal was matching the provider's canned refusal string. Three surfaces were wrong as a result. `openai_compat.rs` hardcoded `"finish_reason": "stop"` on both the buffered and streaming paths, asserting normal completion to every OpenAI-compatible client. `responses_from_run` hardcoded `status: "completed"` and had no `incomplete_details` field. And DevUI's terminal event was always `response.completed`. All four now carry the real reason, with `length` mapped to `max_output_tokens` on the Responses surface (the one point the two OpenAI vocabularies disagree) and an unfamiliar provider reason passed through rather than flattened to `stop` — a value a client ignores is recoverable, a wrong familiar one is not. The inbound half already worked: `finish_reason_from_response` has parsed Azure's `incomplete_details.reason` since the Responses client was built, so this closes a round trip rather than opening one. | `core/types/response.rs` (`AgentResponse`, `AgentResponseUpdate`), `hosting/responses.rs` (`IncompleteDetails`, `incomplete_reason`), `hosting/openai_compat.rs` (`finish_reason_of`), `hosting/devui/mod.rs` |
+| #8637 | **Hamming distance could not tell two large integers apart.** Stored vectors were read as `f64` and then narrowed to `f32` before scoring. `f32` carries 24 bits of mantissa, so any two distinct integers above 2^24 — ids, timestamps, hashes, which is exactly what a Hamming collection holds — compared **equal**, and the record that did not match came back scored as an exact match. Hamming is where this surfaces because it is the one metric asking whether coordinates are the *same* rather than how far apart they are. Coordinates are now read at `f64` and the query widened once, which also stops every other metric losing precision it was never meant to lose. Two details ride along. The score is now **normalized** by the vector width, as upstream has it: ranking was unaffected (dividing by a constant is monotonic) but a raw count made `score_threshold` mean a different thing on every collection. And the sibling test that pinned the *old* narrowing — it fed `1e39`, finite in `f64` and infinite in `f32`, to prove a non-finite stored vector is dropped — was rewritten rather than deleted: the property it protects (a score that cannot be serialized is never ranked) is real, but its route is now arithmetic overflow, so it squares `1e200` instead, and a second test pins that `1e39` is ranked normally now. Worth noting the port was *already* ahead of this class elsewhere: `vectors/filters.rs` documents refusing `f64` for integer comparison for the same reason. | `core/vectors.rs` (`score_vectors`, `InMemoryCollection::search`) |
+| #8454 | **A Foundry project could not be used for embeddings.** `FoundryEmbeddingClient` spoke only the Foundry **Models** inference endpoint, a separately-provisioned surface. The endpoint a Foundry user actually has is the *project* endpoint — the one `FoundryChatClient` already takes — so a project holding an embedding deployment still could not be embedded against from here. Upstream's route is now derived: `https://<res>.services.ai.azure.com/api/projects/<proj>` becomes `https://<res>.openai.azure.com/openai/v1`, scoped to the **resource** rather than the project, which is why the project path is dropped. Three details are right rather than plausible. The project route is **path-versioned**, so it must not carry the Models endpoint's `?api-version=` — the same split `FoundryChatClient` handles with `without_api_version`, and the reason `url()` now branches instead of formatting one string. The token audience stays `cognitiveservices.azure.com` (the derived host is Azure OpenAI data plane), *not* `FOUNDRY_SCOPE`. And the project route is **Entra-only**, which is why there is no api-key counterpart. `from_env` prefers the Models endpoint when both are set, so an environment that already worked is untouched, and accepts `FOUNDRY_ENDPOINT` beside `FOUNDRY_PROJECT_ENDPOINT` so one Foundry environment configures both clients — an alias upstream does not need and this crate does, because its chat client reads the other name first. | `foundry/embeddings.rs` (`openai_model_base_url`, `Route`, `with_project_endpoint`, `from_env`) |
+| #8524 | **A whitespace-only instruction became a contentless system turn.** `prepare_messages` skipped `""` but not `" "` or `"\n"`, so a blank instruction — the shape an unset options default or an instruction merge produces — was prepended to the conversation as a system message some providers bill for and others reject. A real instruction still prepends **verbatim**, whitespace included; the trim decides only whether to prepend. | `core/types/message.rs` (`prepare_messages`) |
+| #8581 | **A shared Magentic manager interleaves two runs' plans.** Upstream created a manager per build. Rust's `build(self)` consumes the builder, so the case upstream was fixing cannot arise here — but two others can, and they surface identically: a caller can hand one `Arc` to two builders, and `Workflow::run` takes `&self`, so one Magentic workflow can have two runs in flight. `StandardMagenticManager` caches the decomposed task ledger, and that cache is read back by exactly the two surfaces where being wrong is expensive — the plan-review request and the stall-intervention request — so a human reviewer can be shown, and asked to approve, the *other* run's facts and plan. The runs' own execution state is unaffected; it lives per-run on the orchestrator. **Documented rather than fixed**, which is the honest scope: the fix is to move the cache per-run, and `standard_manager` (which takes the manager by value, so each builder owns one) is already the shape that avoids it. Recorded below as a standing gap. | `core/workflow/orchestration/magentic.rs` (docs on `StandardMagenticManager`, `manager`, `standard_manager`) |
+
+Verified across all six: full workspace build, `cargo test --workspace
+--all-features` (**2082 passing, 0 failing**), `cargo clippy --all-targets
+--all-features` under `-D warnings` (CI's own flag) clean, `cargo fmt --check`
+clean, `cargo doc --workspace` clean.
+
+Each behavioural test was probed against the code it pins rather than merely
+written beside it. Restoring the `f32` narrowing fails the Hamming test with
+exactly the old wrong answer (`0.0` where the record differs, against the
+expected `0.5`). Restoring `if !instr.is_empty()` fails the blank-instruction
+test on the first whitespace case. Zeroing either `finish_reason` hand-off —
+the buffered one or the streamed one — fails its own test while the
+negative control still passes. The Anthropic allowlist test is the previous
+behaviour's own test rewritten in place, so it fails against the code it used
+to pass against, which is the strongest form this probe takes. Negative
+controls throughout: an *absent* allowlist still emits no `tool_configuration`,
+a `stop` / `tool_calls` / unreported run still serializes with no
+`incomplete_details` key, a run with no finish reason still grows no
+`finish_reason` key, the Foundry Models route still carries its
+`?api-version=`, and a real instruction still prepends with its whitespace
+intact.
+
+One test-only fault was found and fixed while adding the Foundry tests: the
+crate's `temp_env_absent` helper mutates process-global environment variables
+and had only ever had one caller, so a second one raced it under the default
+multi-threaded harness — passing alone and failing in the suite. It now takes
+a lock, and recovers a poisoned one so a single panicking test does not fail
+every other.
+
+### The Azure-ecosystem review
+
+Rechecked against the standing table in the previous section; **one row is
+new** and two changed.
+
+| Azure surface | Upstream | Here | Change this pass |
+|---|---|---|---|
+| Foundry — embeddings | ✅ | ✅ (was 🚧) | **Closed for text.** Project endpoints now work (above). What remains of the old 🚧 is the *image* half only: upstream splits a batch across an image-embeddings endpoint, which the core `EmbeddingClient` signature (`Vec<String>`) cannot express without widening a shared trait. That is a core change, not a Foundry one. |
+| Azure OpenAI — content filter, reported to hosting clients | ✅ | ✅ (was ❌, untracked) | **Closed.** A filtered turn reaches an OpenAI-compatible client as `content_filter` / `incomplete` rather than as a normal stop (above). No table row tracked this before, because the inbound parse was right and only the outbound half was wrong. |
+| Azure SQL / SQL Server native vector store | ✅ (`sql-server`, #8686, new this window) | ❌ | **New gap.** SQL Server 2025 / Azure SQL's native `VECTOR` type as a `VectorStore` pair. Genuinely portable in shape — the `VectorStore`/`VectorCollection` traits and the portable filter compiler both already exist, and the Cosmos and AI Search collections are the template — but blocked in this workspace the same way MongoDB and DocumentDB are: it speaks **TDS**, and there is no TDS driver here. Unlike those two the block is soft (`tiberius` is a pure-Rust async TDS client that supports Azure SQL and Entra auth), so this is a dependency decision rather than an impossibility. Recorded, not attempted: a connector aimed at a wire protocol this workspace cannot exercise would be untestable. |
+| Azure DocumentDB | ✅ | ❌ | Unchanged. #8654 (null fields in membership filters) lands on a connector that does not exist here, still blocked on the MongoDB wire protocol. |
+| Foundry hosting | ✅ | ❌ | Unchanged. #8565 (no `response.completed` after a cancelled run) is a `foundry_hosting` change; standing gap. |
+
+Everything else in the standing table is unchanged. The largest unblocked
+Azure item remains **Azure AI Content Understanding** — a REST surface, so
+portable, and still the biggest one not waiting on something else.
+
+### Standing gaps this pass surfaced (not closed)
+
+- **A switch/case predicate cannot report failure** (#8490). Upstream stopped
+  swallowing predicate exceptions, which were routing a broken predicate's
+  message to the default branch — silent misrouting rather than a visible
+  failure. The port has no analogue to *remove*, because `Condition` returns
+  `bool`: there is no error channel, so a fallible predicate (one that
+  deserializes the payload, say) has nowhere to put the error and must return
+  `false` — which produces exactly the behaviour upstream just fixed. Closing
+  it means widening `Condition` to `Result<bool>`, a breaking change across
+  every builder method that takes one.
+- **Magentic's task-ledger cache is per-manager, not per-run** (#8581, above).
+  Documented this pass; the fix is to move the cache onto the run.
+- **The in-memory vector search clones every record before paging** (#8544).
+  Upstream narrowed its `deepcopy` to the requested page. Here the whole
+  collection is cloned out under the lock before scoring, so the equivalent
+  saving is larger — but it is a performance property of a store meant for
+  tests and development, not a correctness one.
 
 ## Post-`061dc28` drift + Azure-ecosystem review (checked against `6606bef`, 2026-09-21)
 
