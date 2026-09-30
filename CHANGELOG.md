@@ -104,6 +104,12 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **The scope cache never came back down after a burst.** Keeping in-flight
+  scopes alive (below) lets the cache exceed its bound, but eviction ran
+  only when inserting a *new* scope and dropped at most one slot — so a
+  burst of concurrent sessions stayed resident permanently. Trimming now
+  runs on every touch and loops until the bound is met, making the overrun
+  temporary, which is the only thing that made it acceptable.
 - **Evicting a scope with a request in flight defeated per-scope locking.**
   The LRU dropped the least-recently-used slot unconditionally, so a slow
   run could have its slot evicted, the next run for that scope would build

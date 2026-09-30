@@ -183,22 +183,40 @@ impl State {
     fn touch(&mut self, scope: &str, capacity: usize) -> Arc<Mutex<ScopeState>> {
         self.tick += 1;
         let tick = self.tick;
-        if self.scopes.len() >= capacity && !self.scopes.contains_key(scope) {
-            if let Some(victim) = self
+        let slot = self.scopes.entry(scope.to_string()).or_default();
+        slot.last_used = tick;
+        // Cloned before trimming, so this scope is never its own victim.
+        let handle = slot.state.clone();
+        self.trim(capacity);
+        handle
+    }
+
+    /// Evict idle slots, least recently used first, until the cache is back
+    /// within `capacity`.
+    ///
+    /// Run on **every** touch, and looping rather than dropping one slot.
+    /// Gating eviction on inserting a new scope, and stopping after a single
+    /// victim, left no way back down: a burst that outgrew the bound because
+    /// every slot was busy stayed oversized for good, since later touches of
+    /// existing scopes skipped eviction entirely and each new-scope touch
+    /// removed one and added one. Trimming here means the overrun that
+    /// keeping in-flight scopes alive requires is temporary, which is the
+    /// only thing that makes it acceptable.
+    fn trim(&mut self, capacity: usize) {
+        while self.scopes.len() > capacity {
+            let victim = self
                 .scopes
                 .iter()
                 // A count of one means this map holds the only reference, so
                 // no run is inside that scope's lock.
                 .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
                 .min_by_key(|(_, slot)| slot.last_used)
-                .map(|(name, _)| name.clone())
-            {
-                self.scopes.remove(&victim);
-            }
+                .map(|(name, _)| name.clone());
+            // Every remaining slot is in use: stay over capacity for now and
+            // come back to it on a later touch.
+            let Some(victim) = victim else { break };
+            self.scopes.remove(&victim);
         }
-        let slot = self.scopes.entry(scope.to_string()).or_default();
-        slot.last_used = tick;
-        slot.state.clone()
     }
 }
 
@@ -665,6 +683,41 @@ mod tests {
         assert_eq!(memory_contents(&body), vec!["likes tea", "lives in Leeds"]);
         // A response with no memories key at all is empty, not an error.
         assert!(memory_contents(&json!({"search_id": "s"})).is_empty());
+    }
+
+    /// Keeping in-flight scopes alive means the cache can exceed its bound.
+    /// That is only acceptable if it comes back down — which it did not: the
+    /// old rule evicted at most one slot, and only when inserting a new
+    /// scope, so a burst of concurrent sessions stayed resident for good.
+    #[tokio::test]
+    async fn the_scope_cache_returns_to_capacity_after_a_burst() {
+        let p = provider().with_max_cached_scopes(2);
+        let mut state = p.state.lock().await;
+
+        // Four scopes, all "in flight" — the handles stand in for runs
+        // holding their locks, so none may be evicted.
+        let held: Vec<_> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| state.touch(s, p.max_cached_scopes))
+            .collect();
+        assert_eq!(
+            state.scopes.len(),
+            4,
+            "an in-flight scope is never evicted, so the bound gives way"
+        );
+
+        // The runs finish.
+        drop(held);
+
+        // The next touch must bring it back within the bound: `e` plus one
+        // survivor, the most recently used of the idle four.
+        let _e = state.touch("e", p.max_cached_scopes);
+        assert_eq!(state.scopes.len(), 2, "the overrun must be temporary");
+        assert!(state.scopes.contains_key("e"));
+        assert!(
+            state.scopes.contains_key("d"),
+            "eviction is least-recently-used, so the newest survivor stays"
+        );
     }
 
     /// Nothing to scope by must not become a request with a missing required

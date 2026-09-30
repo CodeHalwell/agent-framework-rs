@@ -135,6 +135,22 @@ it is **pre-existing and untouched by this pass**: `responses_from_run` has
 always built a text-only output item, and a tool turn reported `completed`
 before this work as it does after. Recorded, not fixed here.
 
+A tenth round raised one, and it is the other half of the ninth. Pinning
+in-flight slots lets the cache exceed its bound — fine, provided the
+overrun is temporary, and it was not. Eviction ran only when inserting a
+new scope and dropped at most one slot, so a touch of an existing scope
+trimmed nothing and a new-scope touch removed one and added one. A burst of
+concurrent sessions therefore stayed resident for good, which is the
+unbounded growth the cache was added to prevent, reached by a different
+road. Trimming now runs on every touch and loops until the bound is met.
+
+Worth recording that the first probe for this fix **did not compile** — the
+mutation put a `break` inside an `if` — and produced no output rather than
+a failure, which reads identically to a passing probe if the output is
+skimmed. The second, valid mutation failed at four entries against two.
+That is the second vacuous probe in this exchange; a probe that proves
+nothing is worse than none, because it is recorded as evidence.
+
 ### Capability gap recorded, not closed
 
 **Neither hosting surface serializes tool calls.** Core keeps
@@ -152,7 +168,7 @@ call reaches the client with no id, name or arguments. That surface needs
 `function_call` output items and their streaming events — a second wire
 format, on the same footing as the first, and the same decision applies.
 
-Thirty-four tests added across the twenty-two findings. Six review rounds;
+Thirty-five tests added across the twenty-three findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same
 session**, four of them introduced by the fix for a previous round. The
 pattern is worth stating rather than burying: each fix was locally correct
