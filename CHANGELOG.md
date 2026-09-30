@@ -60,17 +60,38 @@ against the old raw count needs dividing by the vector width.
   as siblings of the assistant message, announced once over the stream as
   `response.output_item.added` and then fed
   `response.function_call_arguments.delta`. A call streamed across several
-  updates is announced once and reassembled by index/item id, per OpenAI's
-  delta contract, and the terminal payload reuses the ids the client already
-  saw. Arguments go out as a JSON *string* on both surfaces, as the wire
-  format has it. Consequently a `tool_calls` / `function_call` finish reason
+  updates is announced once, with its fragments reassembled, and the
+  terminal payload reuses the ids the client already saw. Arguments go out
+  as a JSON *string* on both surfaces, as the wire format has it. Consequently a `tool_calls` / `function_call` finish reason
   now passes through whenever the response actually carries a call, instead
   of degrading to `stop`; it still degrades when the turn declares none.
+
+  Only calls that are still **unanswered** are serialized. Core keeps a
+  call and its `FunctionResultContent` together in the response — after a
+  local tool ran, and when a provider executed a hosted tool itself — and
+  advertising those would ask the client to re-run work already done. The
+  streaming surfaces hold calls until the stream ends to make that
+  decision, because with local tools the result arrives in a later update
+  than the call; a call's arguments therefore arrive in one delta rather
+  than forming incrementally.
+
+  The inbound half works too: `/v1/chat/completions` reads `tool_calls` and
+  `tool_call_id` off the follow-up request, and `/v1/responses` reads
+  `function_call` and `function_call_output` input items, so an executed
+  call reaches the agent as a `FunctionCallContent` / `FunctionResultContent`
+  pair rather than as empty text.
 - `agent_framework_hosting::{OutputItem, OutputFunctionCall}`.
 - `AgentResponse::finish_reason` / `AgentResponseUpdate::finish_reason`, and
   `incomplete_details` on the hosting `ResponseObject`.
 
 ### Fixed
+
+- **A truncated Responses stream lost its terminal metadata** (`openai`
+  crate). `parse_responses_event` handled `response.completed` but not
+  `response.incomplete`, so a stream cut off by the content filter or the
+  token budget delivered no finish reason, usage or response id — exactly
+  the information the distinct event name exists to report. Both are now
+  handled on the same arm.
 
 - **An empty hosted-MCP allowlist enabled every tool on the server**
   (Anthropic). `allowed_tools: Some(vec![])` means "expose none", and was

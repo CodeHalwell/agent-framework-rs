@@ -68,26 +68,63 @@ itself from there; dropping it would shift each call one index away from the
 event that announced it. The terminal payload also reuses the item ids the
 client already saw, or it cannot correlate the two.
 
+### Codex review on the same PR — five findings, all real
+
+The outbound half above shipped first and drew a review. All five findings
+held up, and three of them were in what had just landed.
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| **P1** A resolved call is re-advertised | **Real, and mine.** Core keeps a `FunctionCallContent` *and* its `FunctionResultContent` in the response — after a local tool ran, and when a provider executed a hosted tool itself. `function_calls_of` collected every historical call, so the client was asked to re-run work already done. `FunctionInvokingChatClient` filters exactly this way, for exactly this reason, twenty lines from code I had read: the precedent was already in the repo. | Both surfaces now serialize only calls with no matching result. |
+| **P1** `function_call_output` is not parsed | **Real.** The Responses protocol returns a tool result as a *top-level* item with `call_id` and `output` — no `role`, no `content` — so `item_to_message` turned it into an empty user turn and dropped the result. | `function_call_output` → `FunctionResultContent`, `function_call` → `FunctionCallContent`. |
+| **P1** Chat Completions tool-result messages are not parsed | **Real.** The client's follow-up replays the assistant turn with `tool_calls` and adds a `role: "tool"` message with `tool_call_id`; `IncomingMessage` read neither, and every provider converter builds its wire tool messages from `FunctionResultContent` rather than tool-role text. | `IncomingMessage` gains both fields and rebuilds the call/result contents. |
+| **P2** An argumentless announcement emits `{}` | **Real, and mine.** A streamed call is often announced before any arguments exist — this repository's own Responses parser builds exactly that, `arguments: None`. Mapping it to `"{}"` put a literal `{}` at the head of the fragment sequence, so a client concatenating deltas parsed `{}{"city":"Oslo"}`. | `arguments_delta` returns `None` there; `"{}"` stays the *buffered* default, where it is the whole value rather than the first of several. |
+| **P2** The client ignores `response.incomplete` | **Real, and from the pass above**, which added the event to the host without adding the arm to `parse_responses_event`. A client pointed at this endpoint lost the finish reason, usage and response id for every truncated or filtered stream — exactly what the distinct event name exists to report. | Handled on the same arm as `response.completed`. |
+
+**The first finding turned out to be worse than reported, and the obvious
+fix did not close it.** Filtering per update works on the buffered path,
+where the whole response is in hand. On the streaming path the result
+arrives *after* the call: with local tools,
+`FunctionInvokingChatClient::get_streaming_response` runs the entire loop
+and then replays each message as its own update, so the call update always
+precedes the tool-result update answering it. A per-update filter has
+already put the call on the wire, and no later event can recall it — so the
+common case, an agent with local tools, still told the client to re-execute
+them. A test written to the reported shape passed; one written to the
+replay shape failed.
+
+So the streaming paths now **hold calls until the stream ends** and emit
+only those still unanswered. The cost is that a call's arguments arrive in
+one delta rather than forming incrementally — a presentation detail, since
+a client cannot execute a call before it has the whole argument object.
+Duplicating a tool's side effects is not a presentation detail, which is
+what settles the trade.
+
 ### Verification
 
-Eleven tests added: buffered serialization and `content: null`, streaming
-index stability across an interleaved multi-fragment script, the function
-call output items, the announce-once/delta-many event sequence with
-monotonic sequence numbers and id correlation into the terminal payload, and
-three no-regression tests pinning that an ordinary turn is unchanged on both
-surfaces.
+Twenty-seven tests across both rounds: buffered serialization and
+`content: null`, index stability and fragment reassembly, the function call
+output items, the announce-then-fill event sequence with monotonic sequence
+numbers and id correlation into the terminal payload, the resolved-call
+filter on both surfaces and both paths, both inbound round trips (JSON and
+non-JSON results), the `response.incomplete` terminal arm, and six
+no-regression tests pinning that an ordinary turn is unchanged.
 
-Each behaviour was mutation-probed — eight probes, each reintroducing one
-specific bug (drop `tool_calls`; never send `content: null`; re-announce
-every fragment as a new call on each surface; ungate the tool finish reason;
-drop the call output items; mint fresh item ids in the terminal payload;
-drop the announced message item) — and each failed exactly the test written
-for it, and only that test. Full workspace: **2131 passing, 0 failing**,
-clippy `-D warnings`, rustfmt and `cargo doc` clean.
+Sixteen mutation probes, each reintroducing one specific bug and each
+failing exactly the test written for it and only that test. Full workspace:
+**2147 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
+clean.
 
 `ResponseObject::output` changes type from `Vec<OutputMessage>` to
 `Vec<OutputItem>`, which is a breaking change for callers that read it;
 `OutputItem::as_message()` recovers the old view.
+
+The lesson, and it is the same one this session keeps relearning: the fix
+was written to the shape the report described rather than to the invariant
+it named. "A resolved call must never be advertised" does not stop being
+true because the result arrives late, and the test that would have caught
+it was the one modelling how the framework actually streams — not the one
+modelling the example in the finding.
 
 ## Review round on PR #28 (same upstream baseline, `dc8e226`)
 

@@ -230,6 +230,14 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
                                 }
                             }
                         }
+                        // Flushed before the terminal event, so a client
+                        // sees each call announced and filled in before the
+                        // payload that lists them.
+                        for ev in framing.call_events() {
+                            if tx.send(ev).await.is_err() {
+                                return;
+                            }
+                        }
                         let _ = tx.send(framing.completed()).await;
                     }
                     Err(e) => {
@@ -278,10 +286,13 @@ struct AgentStreamFraming {
     /// Updates collected so the terminal `response.completed` can aggregate the
     /// full text and usage via [`AgentResponse::from_updates`].
     collected: Vec<AgentResponseUpdate>,
-    /// Function calls announced so far, as `(call_id, item_id)` in the order
-    /// they appeared. The message occupies `output_index` 0, so a call's
-    /// index is its position here plus one.
-    calls: Vec<(String, String)>,
+    /// Function calls seen so far, held until the stream ends so a call
+    /// the agent answered itself is never advertised.
+    pending: util::StreamingCalls,
+    /// The item ids minted for the calls actually announced, in order. The
+    /// message occupies `output_index` 0, so a call's index is its
+    /// position here plus one.
+    calls: Vec<String>,
 }
 
 impl AgentStreamFraming {
@@ -293,6 +304,7 @@ impl AgentStreamFraming {
             mid: util::msg_id(),
             seq: 0,
             collected: Vec::new(),
+            pending: util::StreamingCalls::default(),
             calls: Vec::new(),
         }
     }
@@ -348,36 +360,52 @@ impl AgentStreamFraming {
             }));
         }
 
-        // A declaration-only call is a sibling output item: announced when
-        // first seen, then fed argument fragments. A provider may stream one
-        // call across several updates, and re-announcing the item each time
-        // would read to a client as several distinct calls.
-        for call in util::function_calls(&update.contents) {
-            let arguments = util::arguments_string(call);
-            let (output_index, item_id) =
-                match self.calls.iter().position(|(id, _)| *id == call.call_id) {
-                    Some(position) => (position + 1, self.calls[position].1.clone()),
-                    None => {
-                        let item_id = util::msg_id();
-                        self.calls.push((call.call_id.clone(), item_id.clone()));
-                        let output_index = self.calls.len();
-                        let seq = self.next();
-                        events.push(json!({
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "sequence_number": seq,
-                            "item": {
-                                "type": "function_call",
-                                "id": item_id,
-                                "call_id": call.call_id,
-                                "name": call.name,
-                                "arguments": "",
-                                "status": "in_progress",
-                            }
-                        }));
-                        (output_index, item_id)
-                    }
-                };
+        // Calls are *not* emitted here. A call the agent answers itself
+        // arrives with its result in a later update — with local tools,
+        // `FunctionInvokingChatClient` runs the loop and then replays each
+        // message as its own update — so announcing one on sight would ask
+        // the client to re-run work already done, and no later event can
+        // recall it. They are held and flushed by `call_events` once the
+        // stream has ended and the outstanding set is known.
+        self.pending.push(&update.contents);
+
+        events
+    }
+
+    /// The call events held back during the stream, emitted once it has
+    /// ended: each outstanding call is announced as its own output item and
+    /// then given its (complete) arguments.
+    ///
+    /// The arguments arrive in one delta rather than forming incrementally,
+    /// which is a presentation detail — a client cannot execute a call
+    /// before it has the whole argument object. See [`util::StreamingCalls`]
+    /// for why that trade is worth making.
+    fn call_events(&mut self) -> Vec<Value> {
+        let outstanding: Vec<(String, String, String)> = self
+            .pending
+            .outstanding()
+            .into_iter()
+            .map(|(id, name, args)| (id.to_string(), name.to_string(), args.to_string()))
+            .collect();
+        let mut events = Vec::with_capacity(outstanding.len() * 2);
+        for (call_id, name, arguments) in outstanding {
+            let item_id = util::msg_id();
+            self.calls.push(item_id.clone());
+            let output_index = self.calls.len();
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "sequence_number": seq,
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+            }));
             let seq = self.next();
             events.push(json!({
                 "type": "response.function_call_arguments.delta",
@@ -419,7 +447,7 @@ impl AgentStreamFraming {
         // Reuse the item ids already announced, for the same reason the
         // message does: a client correlating the terminal payload with the
         // events it saw must find the same ids.
-        let mut announced = self.calls.iter().map(|(_, item)| item.clone());
+        let mut announced = self.calls.iter().cloned();
         output.extend(completed.output.into_iter().filter_map(|item| match item {
             OutputItem::Message(_) => None,
             OutputItem::FunctionCall(mut call) => {

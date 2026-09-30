@@ -9,7 +9,8 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use common::{
-    echo_workflow, get_json, parse_sse, parse_sse_json, post_json, post_raw, MockAgent, StreamStep,
+    echo_workflow, get_json, parse_sse, parse_sse_json, post_json, post_raw,
+    AnnounceThenStreamAgent, MockAgent, RecordingAgent, ResolvedCallAgent, StreamStep,
     StreamingAgent, ToolCallingAgent,
 };
 
@@ -425,10 +426,11 @@ async fn an_ordinary_turn_still_serializes_one_message_item() {
     assert_eq!(output[0]["content"][0]["text"], "echo: hi");
 }
 
-/// Streaming announces each call once as a sibling output item, then feeds
-/// it argument fragments. A provider may stream one call across several
+/// Streaming announces each call once as a sibling output item and then
+/// gives it its arguments. A provider may stream one call across several
 /// updates, and re-announcing the item each time would read to a client as
-/// several distinct calls.
+/// several distinct calls; the fragments are reassembled before they are
+/// sent, so one call yields one announcement and one delta.
 #[tokio::test]
 async fn streamed_calls_are_announced_once_then_fed_argument_deltas() {
     let host = AgentHost::new().agent(
@@ -493,20 +495,19 @@ async fn streamed_calls_are_announced_once_then_fed_argument_deltas() {
         .iter()
         .filter(|e| e["type"] == "response.function_call_arguments.delta")
         .collect();
-    assert_eq!(arg_deltas.len(), 3, "one delta per scripted fragment");
-    assert_eq!(arg_deltas[0]["delta"], r#"{"city":"#);
+    assert_eq!(arg_deltas.len(), 2, "one delta per call, not per fragment");
+    assert_eq!(
+        arg_deltas[0]["delta"], r#"{"city":"Oslo"}"#,
+        "call_1's two fragments are reassembled before they are sent"
+    );
     assert_eq!(arg_deltas[1]["delta"], r#"{"tz":"UTC"}"#);
-    assert_eq!(arg_deltas[2]["delta"], r#""Oslo"}"#);
 
-    // A later fragment routes back to the item that was announced for it.
+    // Each delta routes to the item that was announced for its call.
     let call_1_item = added[0]["item"]["id"].as_str().unwrap();
     assert_eq!(arg_deltas[0]["item_id"], call_1_item);
-    assert_eq!(
-        arg_deltas[2]["item_id"], call_1_item,
-        "the second fragment of call_1 belongs to call_1's item"
-    );
-    assert_eq!(arg_deltas[2]["output_index"], 1);
+    assert_eq!(arg_deltas[0]["output_index"], 1);
     assert_ne!(arg_deltas[1]["item_id"], call_1_item);
+    assert_eq!(arg_deltas[1]["output_index"], 2);
 
     // Sequence numbers stay monotonic across the interleaved event kinds.
     let seqs: Vec<u64> = events
@@ -605,4 +606,235 @@ async fn an_ordinary_stream_emits_no_call_events() {
         1,
         "only the preamble's message item"
     );
+}
+
+/// A call that already carries its result is not work for the client. Core
+/// keeps the pair in the response — after a local tool ran, and when a
+/// provider executed a hosted tool itself — so serializing every historical
+/// call would ask the client to re-run something already done.
+#[tokio::test]
+async fn an_already_resolved_call_is_not_re_advertised() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        ResolvedCallAgent::new("a1")
+            .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+            .arc(),
+    );
+    let body = json!({ "input": "go", "metadata": { "entity_id": "assistant" } });
+    let (_, resp) = post_json(host.into_router(), "/v1/responses", &body).await;
+    let output = resp["output"].as_array().expect("output array");
+    assert!(
+        output.iter().all(|i| i["type"] != "function_call"),
+        "the only call was already answered: {output:?}"
+    );
+}
+
+/// The other half: an outstanding call alongside a resolved one survives.
+#[tokio::test]
+async fn an_outstanding_call_survives_alongside_a_resolved_one() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        ResolvedCallAgent::new("a1")
+            .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+            .with_outstanding("call_todo", "send_receipt", r#"{"to":"a@b.c"}"#)
+            .arc(),
+    );
+    let body = json!({ "input": "go", "metadata": { "entity_id": "assistant" } });
+    let (_, resp) = post_json(host.into_router(), "/v1/responses", &body).await;
+    let calls: Vec<&serde_json::Value> = resp["output"]
+        .as_array()
+        .expect("output array")
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["call_id"], "call_todo");
+}
+
+/// The same on the streaming path, where the result arrives in a *later*
+/// update than the call it answers — the shape
+/// `FunctionInvokingChatClient` produces, since it runs the tool loop and
+/// then replays each message as its own update. Emitting a call on sight
+/// would have already put it on the wire.
+#[tokio::test]
+async fn a_resolved_call_is_not_streamed_either() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        ResolvedCallAgent::new("a1")
+            .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+            .with_outstanding("call_todo", "send_receipt", r#"{"to":"a@b.c"}"#)
+            .arc(),
+    );
+    let body = json!({
+        "input": "go",
+        "stream": true,
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (_, text) = post_raw(host.into_router(), "/v1/responses", body.to_string()).await;
+    let events = parse_sse_json(&text);
+
+    let announced: Vec<&str> = events
+        .iter()
+        .filter(|e| {
+            e["type"] == "response.output_item.added" && e["item"]["type"] == "function_call"
+        })
+        .filter_map(|e| e["item"]["call_id"].as_str())
+        .collect();
+    assert_eq!(announced, vec!["call_todo"]);
+
+    let completed = events.last().unwrap();
+    let calls: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .expect("output array")
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .filter_map(|i| i["call_id"].as_str())
+        .collect();
+    assert_eq!(
+        calls,
+        vec!["call_todo"],
+        "the terminal payload agrees with the events"
+    );
+}
+
+/// A streamed call is often announced before any arguments exist — this
+/// repository's own Responses parser builds exactly that from
+/// `response.output_item.added`. Treating the absent arguments as `"{}"`
+/// would prefix the reassembled value with a literal `{}`.
+#[tokio::test]
+async fn an_argumentless_announcement_does_not_inject_empty_braces() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        AnnounceThenStreamAgent::new(
+            "a1",
+            "call_1",
+            "get_weather",
+            vec![r#"{"city":"#, r#""Oslo"}"#],
+        )
+        .arc(),
+    );
+    let body = json!({
+        "input": "go",
+        "stream": true,
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (_, text) = post_raw(host.into_router(), "/v1/responses", body.to_string()).await;
+    let events = parse_sse_json(&text);
+
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "response.function_call_arguments.delta")
+        .filter_map(|e| e["delta"].as_str())
+        .collect();
+    assert_eq!(deltas, vec![r#"{"city":"Oslo"}"#]);
+    serde_json::from_str::<serde_json::Value>(deltas[0])
+        .expect("the reassembled arguments are valid JSON");
+
+    // The name from the announcement survives the nameless fragments.
+    let completed = events.last().unwrap();
+    let call = completed["response"]["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("function call item");
+    assert_eq!(call["name"], "get_weather");
+    assert_eq!(call["arguments"], r#"{"city":"Oslo"}"#);
+}
+
+/// The Responses protocol returns a tool result as a top-level
+/// `function_call_output` item — no `role`, no `content`. Read as an
+/// ordinary message it became an empty user turn and the result was lost,
+/// so a call this surface advertises could never be completed.
+#[tokio::test]
+async fn a_function_call_output_reaches_the_agent_as_a_result() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let host = AgentHost::new().agent("assistant", agent.arc());
+
+    let body = json!({
+        "input": [
+            { "role": "user", "content": "weather in Oslo?" },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Oslo\"}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "{\"temp_c\":7}",
+            },
+        ],
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (status, _) = post_json(host.into_router(), "/v1/responses", &body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let messages = seen.lock().unwrap().clone();
+    assert_eq!(messages.len(), 3);
+
+    let call = messages[1]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_call())
+        .expect("the replayed call survived");
+    assert_eq!(call.call_id, "call_1");
+    assert_eq!(call.name, "get_weather");
+
+    let result = messages[2]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_result())
+        .expect("the output item became a function result, not an empty user turn");
+    assert_eq!(result.call_id, "call_1");
+    assert_eq!(
+        result.result,
+        Some(json!({ "temp_c": 7 })),
+        "a JSON-shaped output is stored as the value it represents"
+    );
+}
+
+/// A non-JSON output stays a string rather than being mangled or dropped.
+#[tokio::test]
+async fn a_non_json_function_call_output_stays_a_string() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let host = AgentHost::new().agent("assistant", agent.arc());
+    let body = json!({
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "7 degrees and raining",
+        }],
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (_, _) = post_json(host.into_router(), "/v1/responses", &body).await;
+
+    let messages = seen.lock().unwrap().clone();
+    let result = messages[0]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_result())
+        .expect("function result");
+    assert_eq!(result.result, Some(json!("7 degrees and raining")));
+}
+
+/// An ordinary input item is unaffected by the new branches.
+#[tokio::test]
+async fn an_ordinary_input_item_still_reaches_the_agent_as_text() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let host = AgentHost::new().agent("assistant", agent.arc());
+    let body = json!({ "input": "ping", "metadata": { "entity_id": "assistant" } });
+    let (_, _) = post_json(host.into_router(), "/v1/responses", &body).await;
+
+    let messages = seen.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text(), "ping");
+    assert!(messages[0]
+        .contents
+        .iter()
+        .all(|c| c.as_function_result().is_none()));
 }

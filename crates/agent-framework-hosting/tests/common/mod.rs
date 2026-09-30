@@ -17,7 +17,7 @@ use agent_framework_core::error::Result;
 use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
     AgentResponse, AgentResponseUpdate, Content, FinishReason, FunctionArguments,
-    FunctionCallContent, Message, Role, UsageDetails,
+    FunctionCallContent, FunctionResultContent, Message, Role, UsageDetails,
 };
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
 
@@ -440,6 +440,281 @@ impl SupportsAgentRun for ToolCallingAgent {
                 })
             })
             .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// An agent that records the messages it was handed, so a test can assert
+/// what a request *reached the agent as* rather than only what came back.
+pub struct RecordingAgent {
+    id: String,
+    seen: Arc<std::sync::Mutex<Vec<Message>>>,
+}
+
+impl RecordingAgent {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Handle to the recorded messages, readable after the run.
+    pub fn seen(&self) -> Arc<std::sync::Mutex<Vec<Message>>> {
+        self.seen.clone()
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for RecordingAgent {
+    async fn run(
+        &self,
+        messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        *self.seen.lock().unwrap() = messages;
+        Ok(AgentResponse {
+            messages: vec![Message::assistant("ok")],
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        *self.seen.lock().unwrap() = messages;
+        Ok(futures::stream::iter(vec![Ok(AgentResponseUpdate {
+            contents: vec![Content::text("ok")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        })])
+        .boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// An agent whose turn carries a function call that has **already been
+/// answered** — the shape core leaves behind after a local tool ran, and
+/// the shape a provider returns for a hosted tool it executed itself.
+pub struct ResolvedCallAgent {
+    id: String,
+    text: String,
+    /// `(call_id, name, arguments, result)`.
+    resolved: Vec<(String, String, String, Value)>,
+    /// A call left genuinely outstanding, if any.
+    outstanding: Option<(String, String, String)>,
+}
+
+impl ResolvedCallAgent {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            text: "done".to_string(),
+            resolved: Vec::new(),
+            outstanding: None,
+        }
+    }
+
+    pub fn with_resolved(
+        mut self,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+        result: Value,
+    ) -> Self {
+        self.resolved
+            .push((call_id.into(), name.into(), arguments.into(), result));
+        self
+    }
+
+    pub fn with_outstanding(
+        mut self,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        self.outstanding = Some((call_id.into(), name.into(), arguments.into()));
+        self
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+
+    /// The call/result pairs, plus any outstanding call, as core leaves
+    /// them: the pair split across two messages, which is how a tool round
+    /// trip folds back into a conversation.
+    fn messages(&self) -> Vec<Message> {
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for (call_id, name, arguments, result) in &self.resolved {
+            calls.push(Content::FunctionCall(FunctionCallContent::new(
+                call_id,
+                name,
+                Some(FunctionArguments::Raw(arguments.clone())),
+            )));
+            results.push(Content::FunctionResult(FunctionResultContent::new(
+                call_id,
+                Some(result.clone()),
+            )));
+        }
+        if let Some((call_id, name, arguments)) = &self.outstanding {
+            calls.push(Content::FunctionCall(FunctionCallContent::new(
+                call_id,
+                name,
+                Some(FunctionArguments::Raw(arguments.clone())),
+            )));
+        }
+        vec![
+            message_with(Role::assistant(), calls),
+            message_with(Role::tool(), results),
+            Message::assistant(&self.text),
+        ]
+    }
+}
+
+fn message_with(role: Role, contents: Vec<Content>) -> Message {
+    Message {
+        role,
+        contents,
+        author_name: None,
+        message_id: None,
+        additional_properties: Default::default(),
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for ResolvedCallAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
+            messages: self.messages(),
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        // One update per message, so the result arrives in the same update
+        // as nothing else — the ordering a streaming filter has to survive.
+        let updates: Vec<Result<AgentResponseUpdate>> = self
+            .messages()
+            .into_iter()
+            .map(|m| {
+                Ok(AgentResponseUpdate {
+                    contents: m.contents,
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// An agent that announces a call with **no arguments yet** and then
+/// streams its argument fragments — the shape this repository's own
+/// Responses parser produces from `response.output_item.added` followed by
+/// `response.function_call_arguments.delta`.
+pub struct AnnounceThenStreamAgent {
+    id: String,
+    call_id: String,
+    name: String,
+    fragments: Vec<String>,
+}
+
+impl AnnounceThenStreamAgent {
+    pub fn new(
+        id: impl Into<String>,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        fragments: Vec<&str>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_id: call_id.into(),
+            name: name.into(),
+            fragments: fragments.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for AnnounceThenStreamAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
+            messages: vec![message_with(
+                Role::assistant(),
+                vec![Content::FunctionCall(FunctionCallContent::new(
+                    &self.call_id,
+                    &self.name,
+                    Some(FunctionArguments::Raw(self.fragments.concat())),
+                ))],
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        // The announcement carries no arguments at all — `None`, not `""`.
+        let mut updates: Vec<Result<AgentResponseUpdate>> = vec![Ok(AgentResponseUpdate {
+            contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                &self.call_id,
+                &self.name,
+                None,
+            ))],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        })];
+        updates.extend(self.fragments.iter().map(|f| {
+            Ok(AgentResponseUpdate {
+                contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                    &self.call_id,
+                    "",
+                    Some(FunctionArguments::Raw(f.clone())),
+                ))],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            })
+        }));
         Ok(futures::stream::iter(updates).boxed())
     }
 

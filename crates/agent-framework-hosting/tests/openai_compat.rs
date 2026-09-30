@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use common::{
-    parse_sse, parse_sse_json, post_json, post_raw, CancelTrackingAgent, MockAgent, StreamStep,
-    StreamingAgent, ToolCallingAgent,
+    parse_sse, parse_sse_json, post_json, post_raw, AnnounceThenStreamAgent, CancelTrackingAgent,
+    MockAgent, RecordingAgent, ResolvedCallAgent, StreamStep, StreamingAgent, ToolCallingAgent,
 };
 
 fn router() -> axum::Router {
@@ -366,10 +366,11 @@ async fn an_ordinary_completion_carries_no_tool_calls_key() {
     );
 }
 
-/// Streaming deltas follow OpenAI's contract: a call is identified once, and
-/// later fragments of its arguments are keyed by the same `index` so the
-/// client can concatenate them. Re-sending `id`/`name` per fragment would
-/// have a client either ignore them or treat them as further calls.
+/// Streaming deltas follow OpenAI's contract: each call is identified by a
+/// stable `index`, and a call streamed across several updates arrives as
+/// one delta with its fragments reassembled. Emitting them per fragment
+/// would have had to send each call before knowing whether the agent would
+/// answer it itself, so they are held until the stream ends.
 #[tokio::test]
 async fn streamed_call_fragments_share_one_stable_index() {
     let agent = ToolCallingAgent::new("a1")
@@ -415,34 +416,29 @@ async fn streamed_call_fragments_share_one_stable_index() {
         })
         .flatten()
         .collect();
-    assert_eq!(deltas.len(), 3, "one delta per scripted fragment");
+    assert_eq!(deltas.len(), 2, "one delta per call, not per fragment");
 
-    // First sighting of each call identifies it.
+    // Index is position, and each call is identified exactly once.
     assert_eq!(deltas[0]["index"], 0);
     assert_eq!(deltas[0]["id"], "call_1");
     assert_eq!(deltas[0]["function"]["name"], "get_weather");
-    assert_eq!(deltas[0]["function"]["arguments"], r#"{"city":"#);
+    assert_eq!(
+        deltas[0]["function"]["arguments"], r#"{"city":"Oslo"}"#,
+        "call_1's two fragments are reassembled, in order"
+    );
     assert_eq!(deltas[1]["index"], 1);
     assert_eq!(deltas[1]["id"], "call_2");
+    assert_eq!(deltas[1]["function"]["arguments"], r#"{"tz":"UTC"}"#);
 
-    // The second fragment of call_1 returns to index 0 and identifies
-    // nothing — concatenating by index is what reassembles the arguments.
-    assert_eq!(
-        deltas[2]["index"], 0,
-        "a later fragment reuses its call's index, not the next one"
-    );
-    assert!(
-        deltas[2]["id"].is_null() && deltas[2]["function"]["name"].is_null(),
-        "only the first sighting identifies the call"
-    );
-    assert_eq!(deltas[2]["function"]["arguments"], r#""Oslo"}"#);
-
-    // And the terminal chunk can now keep the tool promise.
-    let last = parse_sse_json(&text)
-        .into_iter()
-        .last()
-        .expect("terminal chunk");
+    // The deltas precede the terminal chunk, which can now keep the
+    // tool promise.
+    let chunks = parse_sse_json(&text);
+    let last = chunks.last().expect("terminal chunk");
     assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+    assert!(
+        last["choices"][0]["delta"]["tool_calls"].is_null(),
+        "the terminal chunk carries the reason, not the calls"
+    );
 }
 
 /// A streamed turn that reports `tool_calls` but streams no call gets the
@@ -467,4 +463,229 @@ async fn a_streamed_tool_reason_without_calls_degrades_too() {
         .last()
         .expect("terminal chunk");
     assert_eq!(last["choices"][0]["finish_reason"], "stop");
+}
+
+/// A call that already carries its result is **not** work for the client.
+/// Core keeps the pair in the response — after a local tool ran, and when a
+/// provider executed a hosted tool itself — so serializing every historical
+/// call would ask the client to re-run something already done, duplicating
+/// whatever side effects it had.
+#[tokio::test]
+async fn an_already_resolved_call_is_not_re_advertised() {
+    let agent = ResolvedCallAgent::new("a1")
+        .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+    let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    let choice = &resp["choices"][0];
+    assert!(
+        choice["message"]["tool_calls"].is_null(),
+        "the only call was already answered, so nothing is outstanding"
+    );
+    assert_eq!(
+        choice["finish_reason"], "stop",
+        "and no tool reason is implied"
+    );
+}
+
+/// The other half: an outstanding call alongside a resolved one is still
+/// advertised. The filter must not swallow real work.
+#[tokio::test]
+async fn an_outstanding_call_survives_alongside_a_resolved_one() {
+    let agent = ResolvedCallAgent::new("a1")
+        .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+        .with_outstanding("call_todo", "send_receipt", r#"{"to":"a@b.c"}"#)
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+    let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    let calls = resp["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("the outstanding call is serialized");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_todo");
+}
+
+/// The same filter on the streaming path, where the result arrives in a
+/// later update than the call it answers.
+#[tokio::test]
+async fn a_resolved_call_is_not_streamed_either() {
+    let agent = ResolvedCallAgent::new("a1")
+        .with_resolved("call_done", "charge_card", r#"{"amount":50}"#, json!("ok"))
+        .with_outstanding("call_todo", "send_receipt", r#"{"to":"a@b.c"}"#)
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({
+        "model": "assistant",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let (_, text) = post_raw(
+        router,
+        "/v1/chat/completions",
+        serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    let ids: Vec<String> = parse_sse_json(&text)
+        .into_iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array().cloned())
+        .flatten()
+        .filter_map(|d| d["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["call_todo".to_string()],
+        "the resolved call is filtered; the outstanding one is not"
+    );
+}
+
+/// A streamed call is often announced before any arguments exist — this
+/// repository's own Responses parser builds exactly that shape. Emitting
+/// `"{}"` for the announcement would put a literal `{}` at the head of the
+/// fragment sequence, and a client concatenating deltas by index would then
+/// parse `{}{"city":"Oslo"}`.
+#[tokio::test]
+async fn an_argumentless_announcement_does_not_inject_empty_braces() {
+    let agent = AnnounceThenStreamAgent::new(
+        "a1",
+        "call_1",
+        "get_weather",
+        vec![r#"{"city":"#, r#""Oslo"}"#],
+    )
+    .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({
+        "model": "assistant",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let (_, text) = post_raw(
+        router,
+        "/v1/chat/completions",
+        serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+
+    let deltas: Vec<serde_json::Value> = parse_sse_json(&text)
+        .into_iter()
+        .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array().cloned())
+        .flatten()
+        .collect();
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0]["id"], "call_1");
+    assert_eq!(
+        deltas[0]["function"]["name"], "get_weather",
+        "the name from the announcement survives the argumentless fragments"
+    );
+
+    let arguments = deltas[0]["function"]["arguments"]
+        .as_str()
+        .expect("arguments string");
+    assert_eq!(
+        arguments, r#"{"city":"Oslo"}"#,
+        "the argumentless announcement contributes nothing, not `{{}}`"
+    );
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .expect("the reassembled arguments are valid JSON");
+}
+
+/// A client that executes an advertised call sends the whole turn back: the
+/// assistant message with `tool_calls`, then one `role: "tool"` message per
+/// result. Reading only `content` turned that result into an empty tool
+/// message and lost the correlation, so the call could never be completed.
+#[tokio::test]
+async fn a_tool_result_round_trip_reaches_the_agent_as_call_and_result() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let router = OpenAiRouter::for_agent("assistant", agent.arc()).into_router();
+
+    let body = json!({
+        "model": "assistant",
+        "messages": [
+            { "role": "user", "content": "weather in Oslo?" },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}" },
+                }],
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "{\"temp_c\":7}" },
+        ],
+    });
+    let (status, _) = post_json(router, "/v1/chat/completions", &body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let messages = seen.lock().unwrap().clone();
+    assert_eq!(messages.len(), 3);
+
+    let call = messages[1]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_call())
+        .expect("the assistant's call survived the round trip");
+    assert_eq!(call.call_id, "call_1");
+    assert_eq!(call.name, "get_weather");
+
+    let result = messages[2]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_result())
+        .expect("the tool message became a function result, not text");
+    assert_eq!(result.call_id, "call_1");
+    assert_eq!(
+        result.result,
+        Some(json!({ "temp_c": 7 })),
+        "a JSON-shaped result is stored as the value it represents"
+    );
+}
+
+/// A tool result that is not JSON stays a string rather than being lost or
+/// mangled into one.
+#[tokio::test]
+async fn a_non_json_tool_result_stays_a_string() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let router = OpenAiRouter::for_agent("assistant", agent.arc()).into_router();
+    let body = json!({
+        "model": "assistant",
+        "messages": [
+            { "role": "tool", "tool_call_id": "call_1", "content": "7 degrees and raining" },
+        ],
+    });
+    let (_, _) = post_json(router, "/v1/chat/completions", &body).await;
+
+    let messages = seen.lock().unwrap().clone();
+    let result = messages[0]
+        .contents
+        .iter()
+        .find_map(|c| c.as_function_result())
+        .expect("function result");
+    assert_eq!(result.result, Some(json!("7 degrees and raining")));
+}
+
+/// An ordinary request is unaffected: no calls, no results, just text.
+#[tokio::test]
+async fn an_ordinary_request_still_reaches_the_agent_as_text() {
+    let agent = RecordingAgent::new("a1");
+    let seen = agent.seen();
+    let router = OpenAiRouter::for_agent("assistant", agent.arc()).into_router();
+    let body = json!({
+        "model": "assistant",
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let (_, _) = post_json(router, "/v1/chat/completions", &body).await;
+
+    let messages = seen.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text(), "ping");
+    assert!(messages[0]
+        .contents
+        .iter()
+        .all(|c| c.as_function_call().is_none() && c.as_function_result().is_none()));
 }

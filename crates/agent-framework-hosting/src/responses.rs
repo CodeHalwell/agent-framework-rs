@@ -12,7 +12,10 @@
 //! A response's `output` is heterogeneous, as OpenAI's is: an assistant
 //! message and a function call are sibling [`OutputItem`]s rather than a
 //! message with calls attached, so a turn that declares client-side calls
-//! carries each one's id, name and arguments for the caller to execute.
+//! carries each one's id, name and arguments for the caller to execute. A
+//! call the agent answered itself is not one of those and is not
+//! serialized. Coming back the other way, a `function_call_output` input
+//! item becomes the `FunctionResultContent` that completes the round trip.
 //!
 //! [`crate::devui`] is the only current caller; it layers DevUI-specific
 //! concerns (entity routing, the `~4-chars-per-token` usage estimate for runs
@@ -21,7 +24,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use agent_framework_core::types::{AgentResponse, FinishReason, Message, Role, UsageDetails};
+use agent_framework_core::types::{
+    AgentResponse, Content, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, UsageDetails,
+};
 
 /// `POST /v1/responses` request — a subset of DevUI's `AgentFrameworkRequest`
 /// (itself an OpenAI `ResponseCreateParams` superset). Unknown fields are
@@ -390,11 +396,47 @@ pub(crate) fn input_to_messages(input: &Value) -> Vec<Message> {
     }
 }
 
-/// Convert one input item into a chat message, if it carries text.
+/// Convert one input item into a chat message, if it carries text — or a
+/// function call or its result, which are items in their own right.
+///
+/// The Responses protocol does not put a tool result inside a message the
+/// way Chat Completions does: a caller that executes a `function_call`
+/// output item sends back a top-level `function_call_output` item carrying
+/// `call_id` and `output`, with no `role` and no `content`. Read as a
+/// message that would be an empty user turn, and the result — the entire
+/// point of the round trip — would be lost. `function_call` is accepted on
+/// the way in for the same reason: a caller replaying the turn it was
+/// given must not have the call silently dropped from the conversation.
 fn item_to_message(item: &Value) -> Option<Message> {
     match item {
         Value::String(s) => Some(Message::user(s.clone())),
         Value::Object(map) => {
+            match map.get("type").and_then(Value::as_str) {
+                Some("function_call_output") => {
+                    let call_id = map.get("call_id").and_then(Value::as_str)?;
+                    return Some(single(
+                        Role::tool(),
+                        Content::FunctionResult(FunctionResultContent::new(
+                            call_id,
+                            Some(function_result_value(map.get("output"))),
+                        )),
+                    ));
+                }
+                Some("function_call") => {
+                    let call_id = map.get("call_id").and_then(Value::as_str)?;
+                    return Some(single(
+                        Role::assistant(),
+                        Content::FunctionCall(FunctionCallContent::new(
+                            call_id,
+                            map.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            map.get("arguments")
+                                .and_then(Value::as_str)
+                                .map(|a| FunctionArguments::Raw(a.to_string())),
+                        )),
+                    ));
+                }
+                _ => {}
+            }
             let role = map
                 .get("role")
                 .and_then(Value::as_str)
@@ -404,6 +446,32 @@ fn item_to_message(item: &Value) -> Option<Message> {
             Some(Message::new(role, text))
         }
         _ => None,
+    }
+}
+
+fn single(role: Role, content: Content) -> Message {
+    Message {
+        role,
+        contents: vec![content],
+        author_name: None,
+        message_id: None,
+        additional_properties: Default::default(),
+    }
+}
+
+/// A `function_call_output`'s `output` as a result value.
+///
+/// The wire field is typed as a string, and tools overwhelmingly return
+/// JSON in it, so a string that parses is stored as the structured value it
+/// represents and anything else stays a string — a tool expecting its own
+/// shape back should not be handed an opaque blob.
+fn function_result_value(output: Option<&Value>) -> Value {
+    match output {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+        }
+        Some(other) => other.clone(),
+        None => Value::String(String::new()),
     }
 }
 

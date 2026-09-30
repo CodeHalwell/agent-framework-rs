@@ -1265,7 +1265,14 @@ fn parse_responses_event(
                 None => EventOutcome::None,
             }
         }
-        "response.completed" => {
+        // `response.incomplete` is the terminal event for a turn cut off by
+        // the content filter or the token budget — the same payload as
+        // `response.completed`, under a name that says it did not finish.
+        // Handled here rather than ignored, or a truncated or filtered
+        // stream would lose its finish reason, usage and response id
+        // entirely, which is exactly the information the distinct event
+        // name exists to deliver.
+        "response.completed" | "response.incomplete" => {
             let resp = value.get("response");
             let response_id = resp
                 .and_then(|r| r.get("id"))
@@ -1715,6 +1722,67 @@ mod tests {
             resp.finish_reason,
             Some(FinishReason::new(FinishReason::LENGTH))
         );
+    }
+
+    /// `response.incomplete` is the terminal event for a stream cut off by
+    /// the content filter or the token budget. Ignoring it — which this
+    /// did — dropped the finish reason, usage and response id for exactly
+    /// the streams whose distinct event name exists to report them, and
+    /// left a client unable to tell a truncated answer from a complete one.
+    #[test]
+    fn a_streamed_response_incomplete_carries_its_terminal_metadata() {
+        let mut call_ids = HashMap::new();
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_123",
+                "model": "gpt-4o",
+                "status": "incomplete",
+                "incomplete_details": { "reason": "content_filter" },
+                "output": [],
+                "usage": { "input_tokens": 3, "output_tokens": 5, "total_tokens": 8 },
+            },
+        });
+        let EventOutcome::Update(update) = parse_responses_event(&event, &mut call_ids, None)
+        else {
+            panic!("response.incomplete must produce a terminal update");
+        };
+        assert_eq!(
+            update.finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+        assert_eq!(update.response_id.as_deref(), Some("resp_123"));
+        assert_eq!(update.model.as_deref(), Some("gpt-4o"));
+        let usage = update
+            .contents
+            .iter()
+            .find_map(|c| match c {
+                Content::Usage(u) => Some(&u.details),
+                _ => None,
+            })
+            .expect("usage rides the terminal update");
+        assert_eq!(usage.input_token_count, Some(3));
+        assert_eq!(usage.output_token_count, Some(5));
+    }
+
+    /// And a `response.completed` is unchanged by sharing the arm.
+    #[test]
+    fn a_streamed_response_completed_still_carries_its_metadata() {
+        let mut call_ids = HashMap::new();
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_456",
+                "status": "completed",
+                "output": [],
+            },
+        });
+        let EventOutcome::Update(update) = parse_responses_event(&event, &mut call_ids, None)
+        else {
+            panic!("response.completed produces a terminal update");
+        };
+        assert_eq!(update.finish_reason, Some(FinishReason::stop()));
+        assert_eq!(update.response_id.as_deref(), Some("resp_456"));
     }
 
     #[test]

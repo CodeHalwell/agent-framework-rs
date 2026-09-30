@@ -14,10 +14,13 @@
 //!
 //! # Tool calls
 //! A turn whose agent declares client-side calls serializes them as
-//! `message.tool_calls` (buffered) or `delta.tool_calls` fragments keyed by
-//! a stable per-call `index` (streaming), so the client receives the id,
-//! name and arguments it needs to execute them. Arguments go out as a JSON
-//! *string*, as the wire format has it.
+//! `message.tool_calls` (buffered) or `delta.tool_calls` keyed by a stable
+//! per-call `index` (streaming), so the client receives the id, name and
+//! arguments it needs to execute them; arguments go out as a JSON *string*,
+//! as the wire format has it. A call the agent answered itself is not one
+//! of these and is never serialized. The follow-up request is read back the
+//! same way: `tool_calls` on the assistant message and `tool_call_id` on a
+//! `role: "tool"` message become the call/result pair the agent needs.
 
 use std::sync::Arc;
 
@@ -30,7 +33,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use agent_framework_core::agent::SupportsAgentRun;
-use agent_framework_core::types::{AgentResponse, FinishReason, Message, Role, UsageDetails};
+use agent_framework_core::types::{
+    AgentResponse, Content, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, UsageDetails,
+};
 
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_response_stream;
@@ -89,6 +95,34 @@ struct IncomingMessage {
     role: String,
     #[serde(default)]
     content: Value,
+    /// The assistant's own calls, replayed on the follow-up request. A
+    /// client that executes a call sends the whole turn back — the
+    /// assistant message carrying `tool_calls`, then one `role: "tool"`
+    /// message per result — and dropping these would leave the results
+    /// below answering calls the conversation no longer contains.
+    #[serde(default)]
+    tool_calls: Option<Vec<IncomingToolCall>>,
+    /// Which call a `role: "tool"` message answers.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IncomingToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    function: IncomingToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct IncomingToolCallFunction {
+    #[serde(default)]
+    name: String,
+    /// A JSON **string**, as the wire format has it — kept raw rather than
+    /// parsed, so a fragment or a provider's exact formatting survives.
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 async fn chat_completions(
@@ -143,7 +177,7 @@ async fn chat_completions(
                         // streamed call arrives as fragments sharing one id,
                         // and OpenAI keys its deltas by a stable `index`, so
                         // the position here *is* that index.
-                        let mut call_index: Vec<String> = Vec::new();
+                        let mut calls = util::StreamingCalls::default();
                         while let Some(item) = stream.next().await {
                             match item {
                                 Ok(update) => {
@@ -165,22 +199,11 @@ async fn chat_completions(
                                     {
                                         return;
                                     }
-                                    let deltas =
-                                        tool_call_deltas(&update.contents, &mut call_index);
-                                    if !deltas.is_empty()
-                                        && tx
-                                            .send(chunk(
-                                                &id,
-                                                created,
-                                                &model,
-                                                json!({ "tool_calls": deltas }),
-                                                Value::Null,
-                                            ))
-                                            .await
-                                            .is_err()
-                                    {
-                                        return;
-                                    }
+                                    // Held rather than sent: a call the
+                                    // agent answers itself arrives with its
+                                    // result in a *later* update, and an
+                                    // already-sent delta cannot be recalled.
+                                    calls.push(&update.contents);
                                 }
                                 Err(e) => {
                                     let _ = tx.send(stream_error(&e.to_string())).await;
@@ -188,12 +211,29 @@ async fn chat_completions(
                                 }
                             }
                         }
+                        // Now that the stream has ended, the calls left
+                        // unanswered are the ones the client must run.
+                        let deltas = tool_call_deltas(&calls);
+                        if !deltas.is_empty()
+                            && tx
+                                .send(chunk(
+                                    &id,
+                                    created,
+                                    &model,
+                                    json!({ "tool_calls": deltas }),
+                                    Value::Null,
+                                ))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
                         // Terminal chunk. The same closed-enum rule as the
                         // buffered path: an unfamiliar provider reason is
                         // reported as `length` with the raw value alongside,
                         // never emitted into the enum itself.
                         let (reason, raw) =
-                            finish_reason_of(finish_reason.as_ref(), !call_index.is_empty());
+                            finish_reason_of(finish_reason.as_ref(), !deltas.is_empty());
                         let raw = raw.map(str::to_string);
                         let _ = tx
                             .send(chunk_with_raw_reason(
@@ -350,38 +390,25 @@ fn finish_reason_of(
     }
 }
 
-/// Streaming `tool_calls` deltas for one update, assigning each call the
-/// `index` OpenAI keys its fragments by.
+/// The streaming `tool_calls` deltas for a finished stream, one per
+/// outstanding call, in the order OpenAI keys fragments by.
 ///
-/// A provider may stream one call across several updates, with `arguments`
-/// arriving in pieces — which is exactly OpenAI's delta contract, where a
-/// client concatenates fragments sharing an `index`. So the first sighting
-/// of a `call_id` carries the identifying fields and any later one carries
-/// only the next argument fragment; sending `id`/`name` again would have a
-/// strict client either ignore them or, worse, treat them as a second call.
-fn tool_call_deltas(
-    contents: &[agent_framework_core::types::Content],
-    seen: &mut Vec<String>,
-) -> Vec<Value> {
-    util::function_calls(contents)
+/// Each call gets a single delta carrying its complete arguments, since
+/// [`util::StreamingCalls`] reassembled the fragments before the client
+/// could see them. The `index` is still what correlates a delta with a
+/// call, and is still what a client accumulating by index expects.
+fn tool_call_deltas(calls: &util::StreamingCalls) -> Vec<Value> {
+    calls
+        .outstanding()
         .into_iter()
-        .map(|call| {
-            let arguments = util::arguments_string(call);
-            match seen.iter().position(|id| *id == call.call_id) {
-                Some(index) => json!({
-                    "index": index,
-                    "function": { "arguments": arguments },
-                }),
-                None => {
-                    seen.push(call.call_id.clone());
-                    json!({
-                        "index": seen.len() - 1,
-                        "id": call.call_id,
-                        "type": "function",
-                        "function": { "name": call.name, "arguments": arguments },
-                    })
-                }
-            }
+        .enumerate()
+        .map(|(index, (call_id, name, arguments))| {
+            json!({
+                "index": index,
+                "id": call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments },
+            })
         })
         .collect()
 }
@@ -442,11 +469,71 @@ fn error_response(message: String) -> Response {
         .into_response()
 }
 
+/// Convert incoming OpenAI chat messages to core [`Message`]s.
+///
+/// Text alone is not enough once this surface advertises tool calls: the
+/// client's follow-up replays the assistant turn with `tool_calls` and adds
+/// a `role: "tool"` message per result, and every provider converter builds
+/// its wire tool messages from [`FunctionResultContent`] rather than from
+/// tool-role text. Reading only `content` turned that result into an empty
+/// tool message and lost the correlation, so a call advertised here could
+/// never be completed.
 fn to_chat_messages(messages: &[IncomingMessage]) -> Vec<Message> {
-    messages
-        .iter()
-        .map(|m| Message::new(role_from(&m.role), content_text(&m.content)))
-        .collect()
+    messages.iter().map(to_chat_message).collect()
+}
+
+fn to_chat_message(m: &IncomingMessage) -> Message {
+    let role = role_from(&m.role);
+    let text = content_text(&m.content);
+    let mut contents = Vec::new();
+
+    // A tool message's `content` *is* the result, so it becomes the result
+    // rather than text beside it.
+    if let Some(call_id) = &m.tool_call_id {
+        contents.push(Content::FunctionResult(FunctionResultContent::new(
+            call_id.clone(),
+            Some(function_result_value(&m.content)),
+        )));
+    } else if !text.is_empty() {
+        contents.push(Content::text(text));
+    }
+
+    contents.extend(m.tool_calls.iter().flatten().map(|call| {
+        Content::FunctionCall(FunctionCallContent::new(
+            call.id.clone(),
+            call.function.name.clone(),
+            call.function.arguments.clone().map(FunctionArguments::Raw),
+        ))
+    }));
+
+    // An assistant turn that was only a tool call arrives as
+    // `content: null`, and a message with no contents at all would be
+    // dropped by some converters.
+    if contents.is_empty() {
+        contents.push(Content::text(String::new()));
+    }
+    Message {
+        role,
+        contents,
+        author_name: None,
+        message_id: None,
+        additional_properties: Default::default(),
+    }
+}
+
+/// A tool message's content as a result value.
+///
+/// OpenAI types the field as a string, and tools overwhelmingly return JSON
+/// in it, so a string that parses is stored as the structured value it
+/// represents and anything else stays a string. Storing the raw text
+/// unconditionally would make every result an opaque blob to a tool
+/// expecting its own shape back.
+fn function_result_value(content: &Value) -> Value {
+    match content {
+        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+        Value::Null => Value::String(String::new()),
+        other => other.clone(),
+    }
 }
 
 fn role_from(role: &str) -> Role {
