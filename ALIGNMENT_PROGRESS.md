@@ -43,7 +43,16 @@ is a divergence this port now makes deliberately:
 | A run with no searchable input loses its memories | **Real, and it was *this port's own* inconsistency.** Upstream returns early here too, so the behaviour was faithful — but the fix one round earlier made the *search-failed* path inject the cached profile, and this path still did not. Two degraded paths, the same profile in hand, opposite answers. Resolved toward injecting in both: a **deliberate divergence from upstream**, recorded here, on the grounds that the profile is already fetched and dropping it silently loses managed memory on a valid run. | Skip the request, keep the injection. |
 | The state lock is held across HTTP calls | **Real, and known when written.** It was accepted for simplicity — but the round before had just made this provider safe to *share*, which makes serializing unrelated scopes behind one lock exactly the wrong trade. | Snapshot under the lock, release, request, re-acquire to record. Two concurrent first-runs for one scope may now both fetch the profile: an idempotent read, against stalling every other session. |
 
-Fifteen tests added across the ten findings. Three of the fixes were probed by
+A fourth round raised **one** more, and it is the mirror image of the
+round before: splitting the embedding properties per route pruned
+`input_type` correctly, and pruned `user` with it — but `user` is a field
+OpenAI *defines*, which the derived project endpoint accepts and the Models
+endpoint does not, and which `agent-framework-openai` and
+`agent-framework-azure` already forward on exactly that surface. Having
+noticed that the two routes differ, the fix had only looked in one
+direction. The lists now differ both ways, and the test asserts both.
+
+Sixteen tests added across the eleven findings. Three of the fixes were probed by
 mutation — disabling the integer comparison, the ambiguity detection, or the
 latch each reproduces the reported symptom exactly. Full workspace:
 **2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`

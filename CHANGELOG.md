@@ -104,6 +104,12 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **The project embeddings route dropped the OpenAI `user` option.** The
+  per-route allowlist added below pruned Inference-only fields but also
+  pruned `user`, which the derived `/openai/v1/embeddings` endpoint *does*
+  accept and which `agent-framework-openai` and `agent-framework-azure` both
+  forward on the same surface. The two routes now differ in both directions:
+  `input_type` is Models-only, `user` is project-only.
 - **The project embeddings route forwarded Azure AI Inference-only fields.**
   Selecting the project route changed the URL but not the payload, so
   `input_type` — an Inference field with no OpenAI equivalent — was still

@@ -154,10 +154,14 @@ const SUPPORTED_PROPERTIES: &[&str] = &["encoding_format", "input_type"];
 /// Option keys forwarded on the **project** OpenAI v1 route.
 ///
 /// The derived `/openai/v1/embeddings` endpoint is Azure OpenAI, not Azure
-/// AI Inference, so it rejects the Inference-only fields outright — sending
-/// `input_type` there turns an otherwise valid request into a 400. Only the
-/// keys OpenAI actually defines survive the crossing.
-const SUPPORTED_PROJECT_PROPERTIES: &[&str] = &["encoding_format"];
+/// AI Inference, and the two lists differ in *both* directions. It rejects
+/// the Inference-only fields outright — sending `input_type` there turns an
+/// otherwise valid request into a 400 — while `user`, the end-user
+/// identifier, is a field OpenAI defines and the Models endpoint does not
+/// take. `agent-framework-openai` and `agent-framework-azure` both forward
+/// `["encoding_format", "user"]` on exactly this surface, so this matches
+/// them rather than inventing a third answer.
+const SUPPORTED_PROJECT_PROPERTIES: &[&str] = &["encoding_format", "user"];
 
 enum Auth {
     ApiKey(String),
@@ -837,6 +841,9 @@ mod tests {
         options
             .additional_properties
             .insert("input_type".into(), json!("query"));
+        options
+            .additional_properties
+            .insert("user".into(), json!("alice"));
 
         let project = FoundryEmbeddingClient::with_project_endpoint(
             "https://res.services.ai.azure.com/api/projects/p",
@@ -854,12 +861,21 @@ mod tests {
             body.get("input_type").is_none(),
             "Inference-only field must not cross to the OpenAI v1 route"
         );
+        // ...and the traffic runs the other way too: `user` is a field
+        // OpenAI defines and the Models endpoint rejects, so it belongs
+        // here and only here.
+        assert_eq!(
+            body["user"],
+            json!("alice"),
+            "the sibling OpenAI and Azure clients forward this on the same surface"
+        );
 
-        // The Models route is unchanged and still forwards both.
+        // The Models route is unchanged: its own two fields, and no `user`.
         let models = FoundryEmbeddingClient::new("https://e/models", "m", "k");
         let (body, _) = models.body_for(&["hello".into()], Some(&options));
         assert_eq!(body["encoding_format"], json!("float"));
         assert_eq!(body["input_type"], json!("query"));
+        assert!(body.get("user").is_none());
     }
 
     /// A project endpoint alone is now enough to build a client; before this
