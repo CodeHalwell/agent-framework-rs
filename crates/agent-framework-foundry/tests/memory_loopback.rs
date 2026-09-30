@@ -350,3 +350,33 @@ async fn a_pinned_scope_keeps_writing_across_many_sessions() {
     assert!(update.start_line.contains(":update_memories"));
     assert_eq!(update.body["scope"], serde_json::json!("tenant-7"));
 }
+
+/// A transient failure of the *contextual* search must not throw away the
+/// static profile the *static* search already succeeded in fetching. The
+/// provider swallows memory-service failures by design; returning early
+/// dropped known-good context along with the failure.
+#[tokio::test]
+async fn a_failed_contextual_search_still_injects_the_cached_profile() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s-static", &["lives in Leeds"])),
+        (500, r#"{"error":"transient"}"#.to_string()),
+    ]);
+    let p = provider(&endpoint).with_scope("user-42");
+
+    let mut ctx = SessionContext::new(vec![Message::user("how far is it?")]);
+    p.before_run(&mut ctx)
+        .await
+        .expect("before_run must not fail");
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "both searches were attempted"
+    );
+    assert_eq!(
+        ctx.messages.len(),
+        1,
+        "the profile survives the contextual failure"
+    );
+    assert!(ctx.messages[0].text().contains("lives in Leeds"));
+}

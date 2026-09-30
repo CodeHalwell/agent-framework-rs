@@ -82,6 +82,25 @@ against the old raw count needs dividing by the vector width.
   as `stop`/`completed` on those paths. It now rides the final update, and a
   reason with no messages emits one, matching what `client.rs` does for
   `ChatResponse`.
+- **An unfamiliar finish reason was reported as a completed turn.** The
+  Responses surface mapped only `content_filter` and `length`, defaulting
+  everything else to `completed`. `FinishReason` is an open string and
+  providers use it — the Anthropic converter deliberately preserves
+  `model_context_window_exceeded` — so the abnormal endings that matter most
+  were the ones swallowed. Completion is now an allowlist (absent, `stop`,
+  `tool_calls`); every other reason is reported incomplete and passes through
+  verbatim.
+- **The project embeddings route forwarded Azure AI Inference-only fields.**
+  Selecting the project route changed the URL but not the payload, so
+  `input_type` — an Inference field with no OpenAI equivalent — was still
+  sent to the derived `/openai/v1/embeddings` endpoint, which rejects it.
+  Request properties and the `extra-parameters` pass-through header are now
+  chosen per route.
+- **A failed contextual search discarded the cached profile.** In
+  `FoundryMemoryProvider::before_run`, a transient failure of the second
+  search returned early and dropped the static memories the first had
+  already fetched. It is now treated as an empty contextual result, so the
+  known-good profile is still injected.
 - **A blank `FOUNDRY_PROJECT_ENDPOINT` shadowed the `FOUNDRY_ENDPOINT`
   alias.** The fallback was selected before the blank check, so an env
   template declaring the optional variable as `""` suppressed a perfectly

@@ -433,9 +433,13 @@ impl ContextProvider for FoundryMemoryProvider {
             }
             Err(e) => {
                 // Retrieval is an enhancement: a memory store that is down
-                // must not take the agent down with it.
+                // must not take the agent down with it. Returning here would
+                // also drop the static memories already fetched for this
+                // scope, so a transient failure of the *second* request threw
+                // away the profile the *first* had succeeded in getting.
+                // Treat it as an empty contextual result and carry on.
                 tracing::warn!(error = %e, "Foundry memory: contextual search failed");
-                return Ok(());
+                Vec::new()
             }
         };
 

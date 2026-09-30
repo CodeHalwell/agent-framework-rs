@@ -125,22 +125,34 @@ impl OutputMessage {
 /// `Response.incomplete_details`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct IncompleteDetails {
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 /// Map a run's finish reason onto an OpenAI-Responses `incomplete_details`
 /// reason, or `None` when the turn ran to a genuine end.
 ///
-/// Only the two *truncating* reasons produce one. `stop` is a complete answer,
-/// and `tool_calls` is a turn that continues — neither is incomplete in the
-/// sense this field reports. The names differ from the core vocabulary on one
-/// of the two: OpenAI calls a token-budget cut-off `max_output_tokens` here,
-/// while the chat-completions `finish_reason` for the same event is `length`.
-pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&'static str> {
+/// Completion is the **allowlist**, not the default: only an absent reason,
+/// `stop` and `tool_calls` mean the turn finished. `stop` is a complete
+/// answer and `tool_calls` is a turn that continues; every other reason is
+/// something a provider went out of its way to report, and defaulting those
+/// to `completed` is the false success this whole field exists to remove.
+/// `FinishReason` is an open string — Anthropic's converter deliberately
+/// preserves `model_context_window_exceeded`, for one — so a wildcard
+/// mapping to `None` would silently swallow exactly the abnormal endings
+/// that matter most.
+///
+/// The two reasons OpenAI names get OpenAI's spelling: a token-budget
+/// cut-off is `max_output_tokens` here, though the chat-completions
+/// `finish_reason` for the same event is `length`. Anything else passes
+/// through verbatim, on the same reasoning `finish_reason_of` uses on the
+/// chat-completions surface — a client can ignore a value it does not know,
+/// but it cannot recover from a wrong familiar one.
+pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&str> {
     match finish_reason?.as_str() {
+        FinishReason::STOP | FinishReason::TOOL_CALLS => None,
         FinishReason::CONTENT_FILTER => Some("content_filter"),
         FinishReason::LENGTH => Some("max_output_tokens"),
-        _ => None,
+        other => Some(other),
     }
 }
 
@@ -321,7 +333,9 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
         } else {
             "completed"
         },
-        incomplete_details: incomplete.map(|reason| IncompleteDetails { reason }),
+        incomplete_details: incomplete.map(|reason| IncompleteDetails {
+            reason: reason.to_string(),
+        }),
         output: vec![OutputMessage::assistant_text(mid, text.clone())],
         output_text: Some(text),
         usage: resp.usage_details.as_ref().map(usage_from_details),
@@ -391,6 +405,41 @@ mod tests {
         }
     }
 
+    /// `FinishReason` is an open string, and providers use it: Anthropic's
+    /// converter deliberately preserves `model_context_window_exceeded`
+    /// rather than flattening it. A wildcard that mapped every unfamiliar
+    /// reason to `None` reported those as `completed` — the same false
+    /// success this field was added to remove. Completion is an allowlist.
+    #[test]
+    fn an_unfamiliar_finish_reason_is_reported_incomplete_not_completed() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new("model_context_window_exceeded"))),
+            "resp_1",
+            "claude",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert_eq!(
+            obj.incomplete_details.as_ref().map(|d| d.reason.as_str()),
+            Some("model_context_window_exceeded"),
+            "an unknown reason passes through rather than being renamed"
+        );
+    }
+
+    /// The other half of that allowlist: the two reasons that really are
+    /// completions must not start being reported as incomplete.
+    #[test]
+    fn stop_and_tool_calls_remain_completions() {
+        for reason in [FinishReason::STOP, FinishReason::TOOL_CALLS] {
+            let obj = responses_from_run(
+                &run_finishing_with(Some(FinishReason::new(reason))),
+                "resp_1",
+                "gpt-4o",
+            );
+            assert_eq!(obj.status, "completed", "{reason} is a completion");
+            assert!(obj.incomplete_details.is_none());
+        }
+    }
+
     /// A turn the Azure OpenAI content filter cut off used to be reported as
     /// `completed`, leaving the canned refusal text as the only signal.
     #[test]
@@ -404,7 +453,7 @@ mod tests {
         assert_eq!(
             obj.incomplete_details,
             Some(IncompleteDetails {
-                reason: "content_filter"
+                reason: "content_filter".to_string()
             })
         );
     }
@@ -422,7 +471,7 @@ mod tests {
         assert_eq!(
             obj.incomplete_details,
             Some(IncompleteDetails {
-                reason: "max_output_tokens"
+                reason: "max_output_tokens".to_string()
             })
         );
     }

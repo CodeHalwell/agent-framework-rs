@@ -24,7 +24,17 @@ a boundary and was written up as if it had removed one.
 | `response_to_updates` drops `finish_reason` | **Real, and mine.** The pass above added the field and threaded it through `client.rs`, but `agent.rs`'s helper destructures `AgentResponse` with `..` and rebuilds updates with `..Default::default()`. So the buffered `run_stream` and middleware streaming paths still lost it, and hosting still said `stop` there — the half of the fix that was tested was the half that worked. | The reason rides the final update, and a reason with no messages now emits one, exactly as `client.rs` does. |
 | A blank `FOUNDRY_PROJECT_ENDPOINT` blocks the `FOUNDRY_ENDPOINT` alias | **Real, and mine.** `.ok().or_else(...).filter(...)` checks for blank *after* choosing, so a present-but-empty primary satisfies the fallback and is then discarded, and the alias is never read. The `models_endpoint` line two above it filters correctly, which is what makes this a slip rather than a design choice. | Each candidate is filtered before the fallback. |
 
-Seven tests added across the four. Three of the fixes were probed by
+**A second Codex round on the fixed head raised three more, all real**, and
+all the same shape as the first batch — a change that handled the cases it
+was written for and defaulted the rest wrongly:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| The Responses surface reports an unfamiliar finish reason as `completed` | **Real.** `incomplete_reason` mapped `content_filter` and `length` and sent everything else to `None`. But `FinishReason` is an open string and providers use it — this port's own Anthropic converter goes out of its way to preserve `model_context_window_exceeded`, with a test pinning that it is no longer flattened. So the abnormal endings most worth reporting were exactly the ones turned back into false successes. Worse, the sibling function `finish_reason_of` on the chat-completions surface already got this right, and its doc comment states the principle — an unfamiliar value a client ignores is recoverable, a wrong familiar one is not. The two surfaces disagreed. | Completion is now an allowlist: absent, `stop` and `tool_calls`. Everything else is incomplete, with OpenAI's spelling for the two it names and the provider's own string otherwise. |
+| The project embeddings route forwards Inference-only request fields | **Real.** Selecting `Route::ProjectOpenAI` changed the URL and nothing else, so `input_type` — an Azure AI Inference field with no OpenAI equivalent — still went to the derived `/openai/v1/embeddings`, which rejects it. The `extra-parameters` pass-through header had the same problem. | Supported properties and that header are now chosen per route. |
+| A failed contextual search discards the cached profile | **Real.** The error branch returned early, which also skipped injecting the static memories the *first* search had already fetched — so a transient failure of the second request threw away known-good context, in a provider whose whole error posture is to degrade rather than fail. | Treated as an empty contextual result; the profile is still injected. |
+
+Eleven tests added across the seven findings. Three of the fixes were probed by
 mutation — disabling the integer comparison, the ambiguity detection, or the
 latch each reproduces the reported symptom exactly. Full workspace:
 **2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
