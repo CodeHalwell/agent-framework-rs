@@ -119,9 +119,25 @@ better argument: that round established `function_call` should not be
 rewritten to `length`, and this one establishes that the destination is
 `stop`, not the reason itself.
 
+A ninth round raised two. One is a defect in the round-seven fix, and the
+code comment I wrote there states the opposite of the truth: it called an
+eviction-while-held harmless, reasoning that the run "completes against
+state nobody reads again". It does not — the *next* run for that scope
+builds a second mutex, races the first, and both resume one cursor, which
+is the fork per-scope locking exists to prevent. Only a slot with no other
+holder is evictable now (`Arc::strong_count == 1`), and a cache whose every
+candidate is busy runs briefly over capacity, because the bound exists to
+stop unbounded growth rather than to be honoured at the cost of
+correctness.
+
+The other extends the tool-call gap below to the Responses surface, where
+it is **pre-existing and untouched by this pass**: `responses_from_run` has
+always built a text-only output item, and a tool turn reported `completed`
+before this work as it does after. Recorded, not fixed here.
+
 ### Capability gap recorded, not closed
 
-**The OpenAI-compatible host does not serialize tool calls.** Core keeps
+**Neither hosting surface serializes tool calls.** Core keeps
 `FunctionCallContent` intact for the caller to execute, and
 `completion_object` reads only `resp.text()`; the streaming path is the
 same. Making `/v1/chat/completions` support tool calling — `message.tool_calls`
@@ -130,7 +146,13 @@ is a feature this surface has never had, not a defect introduced here, and
 deliberately not bolted on at the end of a review cycle. The degradation
 above is what keeps the surface honest until it is built.
 
-Thirty-three tests added across the twenty findings. Six review rounds;
+The same is true of `/v1/responses`: `responses_from_run` builds one
+assistant text item and the streaming path rebuilds it, so a declaration-only
+call reaches the client with no id, name or arguments. That surface needs
+`function_call` output items and their streaming events — a second wire
+format, on the same footing as the first, and the same decision applies.
+
+Thirty-four tests added across the twenty-two findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same
 session**, four of them introduced by the fix for a previous round. The
 pattern is worth stating rather than burying: each fix was locally correct

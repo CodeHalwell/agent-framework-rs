@@ -615,3 +615,44 @@ async fn concurrent_updates_on_different_scopes_are_not_serialized() {
         started.elapsed()
     );
 }
+
+/// Eviction must skip a scope a run is still inside. Dropping its slot lets
+/// the next run for that scope build a second mutex and race the first,
+/// which is exactly what per-scope locking exists to prevent.
+#[tokio::test]
+async fn a_scope_with_a_request_in_flight_is_not_evicted() {
+    let ms = std::time::Duration::from_millis;
+    let (endpoint, seen) = slow_server_seq(vec![
+        (200, search_body("s-alice", &["alice"]), ms(200)), // alice, in flight
+        (200, search_body("s-bob", &["bob"]), ms(10)),      // bob, arrives during
+        (200, search_body("s-ctx", &[]), ms(10)),           // alice's second run
+    ]);
+    // Capacity 1: under the old rule bob's arrival would evict alice.
+    let p = std::sync::Arc::new(provider(&endpoint).with_max_cached_scopes(1));
+
+    let run = |session: &'static str, text: &'static str| {
+        let p = p.clone();
+        async move {
+            let mut ctx = SessionContext::new(vec![Message::user(text)]);
+            ctx.session_id = Some(session.into());
+            p.before_run(&mut ctx).await.expect("before_run");
+        }
+    };
+    // Alice's static fetch is slow; bob runs while she is inside her lock.
+    tokio::join!(run("alice", ""), run("bob", ""));
+    let after_both = seen.lock().unwrap().len();
+    assert_eq!(after_both, 2, "one static fetch each");
+
+    // Alice again: her slot must have survived, so no second static fetch.
+    run("alice", "hello").await;
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(
+        reqs.len(),
+        3,
+        "alice was evicted mid-flight and had to re-initialize"
+    );
+    assert!(
+        reqs[2].body.get("items").is_some(),
+        "the third request is alice's contextual search, not a repeat static fetch"
+    );
+}

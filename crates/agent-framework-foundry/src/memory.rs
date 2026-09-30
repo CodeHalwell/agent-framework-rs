@@ -169,9 +169,17 @@ impl State {
     /// least recently used slot if the cache is full.
     ///
     /// Returns an `Arc`, so the caller holds the scope's lock without
-    /// holding this one. A slot evicted while someone still holds its `Arc`
-    /// simply stops being shared — that run completes against state nobody
-    /// reads again, which costs a re-fetch and never corrupts anything.
+    /// holding this one.
+    ///
+    /// Only a slot **nobody is using** may be evicted, which an earlier
+    /// version of this comment got wrong by calling an in-flight eviction
+    /// harmless. It is not: drop a slot a run still holds and the next run
+    /// for that scope builds a *second* mutex, races the first, and both
+    /// resume the same cursor — defeating precisely the per-scope
+    /// serialization this cache sits behind. When every candidate is busy
+    /// the map simply runs over capacity until one frees up, which is the
+    /// right trade: the bound exists to stop unbounded growth, not to be
+    /// honoured at the cost of correctness.
     fn touch(&mut self, scope: &str, capacity: usize) -> Arc<Mutex<ScopeState>> {
         self.tick += 1;
         let tick = self.tick;
@@ -179,6 +187,9 @@ impl State {
             if let Some(victim) = self
                 .scopes
                 .iter()
+                // A count of one means this map holds the only reference, so
+                // no run is inside that scope's lock.
+                .filter(|(_, slot)| Arc::strong_count(&slot.state) == 1)
                 .min_by_key(|(_, slot)| slot.last_used)
                 .map(|(name, _)| name.clone())
             {

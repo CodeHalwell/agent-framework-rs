@@ -104,6 +104,13 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **Evicting a scope with a request in flight defeated per-scope locking.**
+  The LRU dropped the least-recently-used slot unconditionally, so a slow
+  run could have its slot evicted, the next run for that scope would build
+  a *second* mutex, and the two would race and fork the cursor — the exact
+  failure per-scope locking exists to prevent. Only a slot nobody holds is
+  now evictable; when every candidate is busy the cache runs briefly over
+  capacity instead.
 - **A tool finish reason was advertised without the tool calls.** Reporting
   `tool_calls` / `function_call` tells a client to execute the call in
   `message.tool_calls`, and the OpenAI-compatible host serializes text only
