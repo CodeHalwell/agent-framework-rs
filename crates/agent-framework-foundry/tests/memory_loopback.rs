@@ -556,3 +556,62 @@ async fn the_scope_cache_evicts_rather_than_growing_without_limit() {
     // her second run re-fetches rather than the map holding both forever.
     assert_eq!(seen.lock().unwrap().len(), 3);
 }
+
+/// Two turns for one scope must chain their updates, not fork them. Both
+/// snapshotting the same `previous_update_id` and both writing back leaves
+/// one branch orphaned from the incremental chain the service maintains.
+#[tokio::test]
+async fn concurrent_updates_on_one_scope_chain_rather_than_fork() {
+    let ms = std::time::Duration::from_millis;
+    let (endpoint, seen) = slow_server_seq(vec![
+        (200, r#"{"update_id":"u-1"}"#.to_string(), ms(80)),
+        (200, r#"{"update_id":"u-2"}"#.to_string(), ms(10)),
+    ]);
+    let p = std::sync::Arc::new(provider(&endpoint).with_scope("user-42"));
+
+    let run = || {
+        let p = p.clone();
+        async move {
+            p.after_run(&[Message::user("remember this")], &[], None)
+                .await
+                .expect("after_run");
+        }
+    };
+    tokio::join!(run(), run());
+
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    // The first write starts the chain; the second must resume from it.
+    assert!(reqs[0].body.get("previous_update_id").is_none());
+    assert_eq!(
+        reqs[1].body["previous_update_id"],
+        serde_json::json!("u-1"),
+        "the second update forked instead of chaining"
+    );
+}
+
+/// The other half of per-scope locking: one scope's slow request must still
+/// not hold up another's. (Same guarantee as the search path.)
+#[tokio::test]
+async fn concurrent_updates_on_different_scopes_are_not_serialized() {
+    let (endpoint, _seen) = slow_server(
+        vec![
+            (200, r#"{"update_id":"u-1"}"#.to_string()),
+            (200, r#"{"update_id":"u-2"}"#.to_string()),
+        ],
+        std::time::Duration::from_millis(120),
+    );
+    let a = std::sync::Arc::new(provider(&endpoint).with_scope("alice"));
+    let b = std::sync::Arc::new(provider(&endpoint).with_scope("bob"));
+
+    let started = std::time::Instant::now();
+    tokio::join!(
+        async { a.after_run(&[Message::user("x")], &[], None).await.unwrap() },
+        async { b.after_run(&[Message::user("y")], &[], None).await.unwrap() },
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(220),
+        "independent scopes serialized: {:?}",
+        started.elapsed()
+    );
+}

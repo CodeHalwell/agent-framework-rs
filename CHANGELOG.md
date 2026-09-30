@@ -104,6 +104,15 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **Concurrent turns on one memory scope forked the update chain.** The
+  provider snapshotted `previous_update_id`, released its lock for the
+  request and wrote back, so two turns for the same scope both resumed from
+  the same cursor and one branch fell out of the service's incremental
+  chain. The provider now holds **one lock per scope** rather than one per
+  provider: the snapshot → request → commit sequence is atomic within a
+  scope, and unrelated scopes still never wait on each other. The same
+  change removes the duplicate profile fetch the previous release note
+  described as merely idempotent.
 - **A `function_call` turn was reported as a failure.** OpenAI's finish
   vocabulary has five values, not four: `function_call` is the deprecated
   spelling of `tool_calls` and, like it, marks a turn that *succeeded*. It

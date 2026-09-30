@@ -84,7 +84,24 @@ had been cut off. The `finish_reason_of` doc comment had listed all five
 correctly while its match handled four, which is the whole bug in one line.
 `FinishReason::FUNCTION_CALL` now exists and both surfaces use it.
 
-Twenty-eight tests added across the eighteen findings. Six review rounds;
+A third finding in that round — **not delivered as a notification, and
+found only by reading the threads directly** — was the one that mattered:
+two turns on one scope both snapshot `previous_update_id`, both post, and
+one falls out of the service's incremental chain.
+
+That is the third round in which this provider's concurrency model was
+wrong, and the three are one mistake seen from three sides. One lock per
+*provider* is wrong in both positions: held across the requests it
+serializes unrelated scopes (round five), released across them it lets two
+runs for one scope race (rounds six and seven). The unit the operations
+actually need is the **scope**. The provider now takes one lock per scope —
+the provider-wide lock is held only long enough to hand back the scope's —
+so snapshot → request → commit is atomic within a scope while scopes stay
+parallel. That is a root-cause fix rather than a fourth point patch, and it
+retires the duplicate-profile-fetch race this document previously excused
+as "an idempotent read".
+
+Thirty-two tests added across the nineteen findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same
 session**, four of them introduced by the fix for a previous round. The
 pattern is worth stating rather than burying: each fix was locally correct
