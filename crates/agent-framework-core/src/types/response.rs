@@ -20,6 +20,10 @@ impl FinishReason {
     pub const LENGTH: &'static str = "length";
     pub const STOP: &'static str = "stop";
     pub const TOOL_CALLS: &'static str = "tool_calls";
+    /// The deprecated predecessor of [`Self::TOOL_CALLS`]. Still emitted by
+    /// OpenAI-compatible backends and still part of the wire enum, and like
+    /// `tool_calls` it marks a turn that **succeeded** and continues.
+    pub const FUNCTION_CALL: &'static str = "function_call";
 
     pub fn new(v: impl Into<String>) -> Self {
         FinishReason(v.into())

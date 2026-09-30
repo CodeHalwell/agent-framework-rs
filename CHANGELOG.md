@@ -104,6 +104,14 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **A `function_call` turn was reported as a failure.** OpenAI's finish
+  vocabulary has five values, not four: `function_call` is the deprecated
+  spelling of `tool_calls` and, like it, marks a turn that *succeeded*. It
+  was missing from core's `FinishReason` constants, so the Responses surface
+  called it incomplete and the Chat Completions surface rewrote it to
+  `length` — telling clients a working tool call had been truncated.
+  `FinishReason::FUNCTION_CALL` now exists and both surfaces treat it as the
+  completion it is.
 - **The DevUI stream closed an incomplete response with
   `response.completed`.** The terminal event was chosen from
   `incomplete_details`, which the fix below makes absent for an unfamiliar

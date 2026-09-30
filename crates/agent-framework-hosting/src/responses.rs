@@ -143,8 +143,9 @@ pub struct IncompleteDetails {
 
 /// Whether a run ended abnormally — the question `status` answers.
 ///
-/// Completion is an **allowlist**: an absent reason, `stop` and `tool_calls`.
-/// `stop` is a complete answer and `tool_calls` is a turn that continues;
+/// Completion is an **allowlist**: an absent reason, `stop`, `tool_calls`
+/// and its deprecated predecessor `function_call`. `stop` is a complete
+/// answer and the two tool reasons are a turn that continues;
 /// every other reason is something a provider went out of its way to report.
 /// `FinishReason` is an open string and providers use it — Anthropic's
 /// converter deliberately preserves `model_context_window_exceeded` — so
@@ -153,7 +154,9 @@ pub struct IncompleteDetails {
 pub fn is_incomplete(finish_reason: Option<&FinishReason>) -> bool {
     !matches!(
         finish_reason.map(FinishReason::as_str),
-        None | Some(FinishReason::STOP) | Some(FinishReason::TOOL_CALLS)
+        None | Some(FinishReason::STOP)
+            | Some(FinishReason::TOOL_CALLS)
+            | Some(FinishReason::FUNCTION_CALL)
     )
 }
 
@@ -539,7 +542,14 @@ mod tests {
     /// completions must not start being reported as incomplete.
     #[test]
     fn stop_and_tool_calls_remain_completions() {
-        for reason in [FinishReason::STOP, FinishReason::TOOL_CALLS] {
+        // `function_call` is the deprecated spelling of `tool_calls` and,
+        // like it, marks a turn that succeeded — reporting it as incomplete
+        // told clients a working tool call had been cut off.
+        for reason in [
+            FinishReason::STOP,
+            FinishReason::TOOL_CALLS,
+            FinishReason::FUNCTION_CALL,
+        ] {
             let obj = responses_from_run(
                 &run_finishing_with(Some(FinishReason::new(reason))),
                 "resp_1",

@@ -244,8 +244,10 @@ fn completion_object(
 /// branches on, and neither is distinguishable from the text alone.
 ///
 /// The wire field is a **closed** set (`stop` / `length` / `tool_calls` /
-/// `content_filter` / `function_call`), and the core vocabulary is already
-/// OpenAI's, so a known reason passes straight through. A provider-specific
+/// `content_filter` / `function_call`), and the core vocabulary now names
+/// all five, so a known reason passes straight through. This comment listed
+/// five while the match handled four, which is how `function_call` — a
+/// *successful* tool turn — came to be reported as a truncation. A provider-specific
 /// one cannot — Anthropic's converter deliberately preserves
 /// `model_context_window_exceeded` — because a generated client whose enum
 /// is strict can reject the entire response over a value outside that set,
@@ -267,6 +269,7 @@ fn finish_reason_of(finish_reason: Option<&FinishReason>) -> (&'static str, Opti
         FinishReason::LENGTH => (FinishReason::LENGTH, None),
         FinishReason::CONTENT_FILTER => (FinishReason::CONTENT_FILTER, None),
         FinishReason::TOOL_CALLS => (FinishReason::TOOL_CALLS, None),
+        FinishReason::FUNCTION_CALL => (FinishReason::FUNCTION_CALL, None),
         other => (FinishReason::LENGTH, Some(other)),
     }
 }

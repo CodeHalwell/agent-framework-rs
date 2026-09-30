@@ -74,7 +74,17 @@ an unfamiliar reason is reported as `length` with the raw value in
 `x_finish_reason`, the wrong-familiar-value objection having lost its force
 once the real value stopped being discarded.
 
-Twenty-eight tests added across the sixteen findings. Six review rounds;
+A seventh round raised two, and they are one mistake: OpenAI's finish
+vocabulary has **five** values and core's `FinishReason` named four.
+`function_call` — the deprecated spelling of `tool_calls`, and like it a
+*successful* turn — was therefore classed as abnormal by the new
+`is_incomplete` allowlist and rewritten to `length` by the new
+chat-completions mapping, both of which told clients a working tool call
+had been cut off. The `finish_reason_of` doc comment had listed all five
+correctly while its match handled four, which is the whole bug in one line.
+`FinishReason::FUNCTION_CALL` now exists and both surfaces use it.
+
+Twenty-eight tests added across the eighteen findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same
 session**, four of them introduced by the fix for a previous round. The
 pattern is worth stating rather than burying: each fix was locally correct

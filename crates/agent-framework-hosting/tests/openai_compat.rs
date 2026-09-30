@@ -229,7 +229,16 @@ async fn an_unfamiliar_finish_reason_stays_inside_the_closed_enum() {
 /// extension field to explain away.
 #[tokio::test]
 async fn schema_named_finish_reasons_pass_through_unchanged() {
-    for reason in ["stop", "length", "content_filter", "tool_calls"] {
+    // Five, not four: `function_call` is deprecated but still schema-valid,
+    // and rewriting it to `length` told clients a successful tool turn had
+    // been truncated.
+    for reason in [
+        "stop",
+        "length",
+        "content_filter",
+        "tool_calls",
+        "function_call",
+    ] {
         let agent = MockAgent::new("a1").with_finish_reason(reason).arc();
         let router = OpenAiRouter::for_agent("assistant", agent).into_router();
         let body =
