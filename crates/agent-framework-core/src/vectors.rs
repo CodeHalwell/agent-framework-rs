@@ -784,11 +784,62 @@ fn key_string(key: &Value) -> String {
 /// Only the metrics [`DistanceFunction::higher_is_closer`] knows the
 /// direction of are computed; `search` rejects anything else rather than
 /// ranking it arbitrarily.
-fn score_vectors(distance: &DistanceFunction, a: &[f64], b: &[f64]) -> Option<f64> {
+/// One stored coordinate, keeping the exact integer JSON carried alongside
+/// the `f64` the arithmetic metrics need.
+///
+/// `f64` cannot hold every `i64`/`u64`: above 2^53 it rounds, so `2^53` and
+/// `2^53 + 1` become the same number. Every metric but one is measuring
+/// *distance*, where that rounding is ordinary floating-point error — but
+/// Hamming asks whether two coordinates are the **same**, and a collection
+/// keyed on ids, timestamps or hashes is exactly where 64-bit integers live.
+/// Rounding first makes two different records indistinguishable and scores
+/// the wrong one as an exact match, which is the bug this type exists to
+/// prevent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Coord {
+    /// The integer JSON carried, when it carried one. `i128` holds the whole
+    /// of both `i64` and `u64`, so neither end needs a special case.
+    exact: Option<i128>,
+    /// The same coordinate as `f64`, for the metrics that do arithmetic.
+    value: f64,
+}
+
+impl Coord {
+    /// Read a coordinate from JSON, keeping its integer identity when it has
+    /// one. `None` for a non-number, which the caller skips.
+    pub(crate) fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            exact: v
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| v.as_u64().map(i128::from)),
+            value: v.as_f64()?,
+        })
+    }
+
+    /// Whether this coordinate differs from a query coordinate.
+    ///
+    /// When both name an integer the comparison happens in integer space,
+    /// because `f64` is precisely what cannot mediate it. Anything else —
+    /// a fractional stored value, a fractional query — falls back to `f64`,
+    /// where equality is the ordinary thing to ask.
+    fn differs_from(&self, query: f64) -> bool {
+        match self.exact {
+            Some(exact) if query.is_finite() && query.fract() == 0.0 => {
+                // `as` saturates at the bounds, so a query far outside i128
+                // compares unequal to any real coordinate — which is right.
+                (query as i128) != exact
+            }
+            _ => self.value != query,
+        }
+    }
+}
+
+fn score_vectors(distance: &DistanceFunction, a: &[f64], b: &[Coord]) -> Option<f64> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let pairs = || a.iter().zip(b.iter()).map(|(x, y)| (*x, *y));
+    let pairs = || a.iter().zip(b.iter()).map(|(x, y)| (*x, y.value));
     let dot: f64 = pairs().map(|(x, y)| x * y).sum();
 
     match distance.as_str() {
@@ -821,8 +872,9 @@ fn score_vectors(distance: &DistanceFunction, a: &[f64], b: &[f64]) -> Option<f6
         // `f32` before comparison, and `f32` carries 24 bits of mantissa, so
         // two distinct integers above 2^24 (ids, timestamps, hashes — exactly
         // the values a Hamming collection holds) compared equal and the
-        // distance came back understated, often as an exact match. The
-        // operands reaching here are now unrounded.
+        // distance came back understated, often as an exact match. Widening
+        // to `f64` only moved that boundary to 2^53; [`Coord`] removes it, by
+        // comparing integers as integers.
         //
         // The count is normalized by the vector's width, as upstream does, so
         // a `score_threshold` means the same fraction of differing
@@ -830,7 +882,15 @@ fn score_vectors(distance: &DistanceFunction, a: &[f64], b: &[f64]) -> Option<f6
         // Ranking is unaffected either way — dividing by a constant is
         // monotonic — but a raw count made a portable threshold meaningless.
         DistanceFunction::HAMMING => {
-            Some(pairs().filter(|(x, y)| x != y).count() as f64 / a.len() as f64)
+            // Note this reads `b` directly rather than through `pairs()`:
+            // `pairs()` has already flattened each coordinate to `f64`, which
+            // is the rounding this arm must not inherit.
+            let differing = a
+                .iter()
+                .zip(b.iter())
+                .filter(|(query, stored)| stored.differs_from(**query))
+                .count();
+            Some(differing as f64 / a.len() as f64)
         }
         _ => None,
     }
@@ -1025,14 +1085,15 @@ impl VectorCollection for InMemoryCollection {
             // away silently reshapes the vector — `[1, "bad", 0, 0]` becomes
             // `[1, 0, 0]`, which then matches a three-dimensional query
             // perfectly — so schema-invalid data ranked as a top result.
-            // Read at `f64`, the widest `serde_json` offers. Narrowing to
-            // `f32` here — which this did — silently collapsed distinct large
-            // integers onto one value before any metric saw them; see the
-            // Hamming arm of `score_vectors` for what that cost.
+            // Each coordinate keeps its integer identity as well as its
+            // `f64` value. This used to narrow to `f32`, which collapsed
+            // distinct large integers onto one value before any metric saw
+            // them; reading at `f64` alone still collapses them above 2^53.
+            // See [`Coord`] for why only Hamming notices.
             let Some(stored) = stored_vector
                 .iter()
-                .map(Value::as_f64)
-                .collect::<Option<Vec<f64>>>()
+                .map(Coord::from_json)
+                .collect::<Option<Vec<Coord>>>()
             else {
                 continue;
             };
@@ -1045,7 +1106,7 @@ impl VectorCollection for InMemoryCollection {
             }
             // A stored non-finite element poisons the score the same way a
             // query one does; skip the record rather than rank it.
-            if stored.iter().any(|v| !v.is_finite()) {
+            if stored.iter().any(|c| !c.value.is_finite()) {
                 continue;
             }
             match score_vectors(&distance, &query, &stored) {
@@ -1436,6 +1497,52 @@ mod tests {
     /// did — made `16_777_217` and `16_777_216` the same number, so the record
     /// that does *not* match came back scored as an exact match. Hamming is
     /// where this shows, because it asks whether coordinates are equal rather
+    /// The same class one boundary up. Widening stored coordinates to `f64`
+    /// moved the collision from 2^24 to 2^53; it did not remove it, because
+    /// `f64` cannot represent `2^53 + 1` either. A store keyed on 64-bit ids
+    /// lives right here, so Hamming compares integers as integers.
+    #[tokio::test]
+    async fn hamming_search_distinguishes_integers_beyond_f64_precision() {
+        // The premise: these two distinct integers are one `f64`.
+        assert_eq!(9_007_199_254_740_992_f64, 9_007_199_254_740_993_u64 as f64);
+
+        let d = VectorStoreCollectionDefinition::new(vec![
+            VectorStoreField::key("id"),
+            VectorStoreField::vector("embedding", 2)
+                .with_distance_function(DistanceFunction::new(DistanceFunction::HAMMING)),
+        ])
+        .unwrap();
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("ids", d).unwrap();
+        c.upsert(vec![
+            json!({"id": "exact", "embedding": [9_007_199_254_740_992_u64, 0]}),
+            json!({"id": "off_by_one", "embedding": [9_007_199_254_740_993_u64, 0]}),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(
+                vec![9_007_199_254_740_992_f32, 0.0],
+                &VectorSearchOptions::new(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let by_id = |id: &str| {
+            hits.iter()
+                .find(|h| h.record["id"] == json!(id))
+                .and_then(|h| h.score)
+                .unwrap()
+        };
+        assert_eq!(by_id("exact"), 0.0, "every coordinate matches");
+        assert_eq!(
+            by_id("off_by_one"),
+            0.5,
+            "one of two coordinates differs; rounding would have said 0.0"
+        );
+    }
+
     /// than how far apart they are.
     #[tokio::test]
     async fn hamming_search_distinguishes_integers_beyond_f32_precision() {

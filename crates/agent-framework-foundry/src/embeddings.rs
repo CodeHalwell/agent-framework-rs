@@ -290,11 +290,19 @@ impl FoundryEmbeddingClient {
     pub fn from_env(model: Option<String>) -> Result<Self> {
         let models_endpoint = std::env::var(FOUNDRY_MODELS_ENDPOINT_ENV)
             .ok()
-            .filter(|e| !e.trim().is_empty());
-        let project_endpoint = std::env::var(FOUNDRY_PROJECT_ENDPOINT_ENV)
-            .ok()
-            .or_else(|| std::env::var(FOUNDRY_ENDPOINT_ENV).ok())
-            .filter(|e| !e.trim().is_empty());
+            .filter(|e: &String| !e.trim().is_empty());
+        // Each candidate is filtered *before* the fallback is considered: a
+        // present-but-blank primary would otherwise satisfy `or_else` and then
+        // be dropped by a trailing filter, so the alias would never be read.
+        // Env templates that declare optional variables as `""` make that the
+        // normal case, not a corner one.
+        let non_blank = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .filter(|e: &String| !e.trim().is_empty())
+        };
+        let project_endpoint =
+            non_blank(FOUNDRY_PROJECT_ENDPOINT_ENV).or_else(|| non_blank(FOUNDRY_ENDPOINT_ENV));
         if models_endpoint.is_none() && project_endpoint.is_none() {
             return Err(Error::Configuration(format!(
                 "a Foundry endpoint is required: set {FOUNDRY_MODELS_ENDPOINT_ENV} for a Models \
@@ -841,6 +849,27 @@ mod tests {
     /// lock makes them sequential; a poisoned lock is recovered rather than
     /// propagating one test's panic into every other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A present-but-blank primary must not shadow the alias. Env templates
+    /// routinely declare optional variables as `""`, so this is the ordinary
+    /// case rather than a corner one.
+    #[test]
+    fn a_blank_project_endpoint_falls_through_to_the_alias() {
+        temp_env_absent(|| {
+            std::env::set_var(FOUNDRY_EMBEDDING_MODEL_ENV, "m");
+            std::env::set_var(FOUNDRY_PROJECT_ENDPOINT_ENV, "   ");
+            std::env::set_var(
+                FOUNDRY_ENDPOINT_ENV,
+                "https://res.services.ai.azure.com/api/projects/p",
+            );
+            let client =
+                FoundryEmbeddingClient::from_env(None).expect("the alias must still be read");
+            assert_eq!(
+                client.url(),
+                "https://res.openai.azure.com/openai/v1/embeddings"
+            );
+        });
+    }
 
     fn temp_env_absent(f: impl FnOnce()) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -30,9 +30,13 @@ against the old raw count needs dividing by the vector width.
   `api-version=v1`, bearer-scoped to `FOUNDRY_SCOPE`). Memories are isolated
   by scope — `with_scope` pins one, otherwise the session id is used, and
   nothing is read or written when neither is available. Search and update
-  cursors chain incrementally, the user-profile fetch happens once per
-  provider, and every service failure is logged rather than raised, since
-  `after_run` also runs on the agent's own failure path.
+  cursors chain incrementally, the user-profile fetch happens once per scope,
+  and every service failure is logged rather than raised, since `after_run`
+  also runs on the agent's own failure path. Provider state is keyed by scope,
+  so a provider shared by `Arc` across runs cannot let one session read
+  another's profile or resume its cursor; because `after_run` is handed no
+  session, a provider that has served more than one session declines to write
+  rather than guess a scope — set `with_scope` when sharing one.
 - **Foundry embeddings from a project endpoint.** `FoundryEmbeddingClient`
   previously spoke only the Foundry *Models* inference endpoint, so a Foundry
   project holding an embedding deployment could not be embedded against
@@ -64,6 +68,24 @@ against the old raw count needs dividing by the vector width.
   large integers — ids, timestamps, hashes — compared equal and a
   non-matching record scored as an exact match. Coordinates are now compared
   at `f64` (upstream #8637).
+- **Hamming could not distinguish 64-bit integers.** Widening stored vector
+  coordinates to `f64` moved the collision boundary from 2^24 to 2^53; it did
+  not remove it, since `f64` cannot represent `2^53 + 1` either. Hamming asks
+  whether two coordinates are the *same*, and a store keyed on ids, timestamps
+  or hashes lives exactly there — so stored coordinates now keep the integer
+  JSON carried and Hamming compares integers as integers, while the
+  arithmetic metrics keep using `f64`.
+- **`finish_reason` was dropped by `response_to_updates`.** The buffered
+  `SupportsAgentRun::run_stream` and `Agent` streaming through agent
+  middleware rebuild updates from an `AgentResponse`, and that helper did not
+  carry the reason across — so a content-filtered turn still reached hosting
+  as `stop`/`completed` on those paths. It now rides the final update, and a
+  reason with no messages emits one, matching what `client.rs` does for
+  `ChatResponse`.
+- **A blank `FOUNDRY_PROJECT_ENDPOINT` shadowed the `FOUNDRY_ENDPOINT`
+  alias.** The fallback was selected before the blank check, so an env
+  template declaring the optional variable as `""` suppressed a perfectly
+  good alias. Each candidate is now filtered before the fallback.
 - **A whitespace-only instruction became a contentless system message.**
   `prepare_messages` skipped `""` but not `" "` or `"\n"`. A real instruction
   still prepends verbatim (upstream #8524).

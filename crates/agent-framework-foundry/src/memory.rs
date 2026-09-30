@@ -27,16 +27,23 @@
 //!
 //! # Divergences from upstream
 //!
-//! - **State lives on the provider, not on the run.** Python's hooks receive a
+//! - **State lives on the provider, keyed by scope.** Python's hooks receive a
 //!   per-run `state` dict; the Rust [`ContextProvider`] has no such parameter,
 //!   and [`ContextProvider::after_run`] receives no [`SessionContext`] at all.
-//!   The initialization latch, the static memories, the incremental
-//!   search/update ids *and the session id* therefore live in one
-//!   [`Mutex`]-guarded struct on the provider, with the session id captured
-//!   during `before_run` so `after_run` can still resolve a scope. One
-//!   provider consequently serves one logical session — which is already how
-//!   the sibling [`Mem0Provider`](https://docs.rs/agent-framework-mem0)
-//!   handles the same signature gap.
+//!   The initialization latch, the static memories and the incremental
+//!   search/update ids therefore live in one [`Mutex`]-guarded map on the
+//!   provider, **keyed by scope** — a provider is normally shared by `Arc`
+//!   across an agent's runs, so a single flat state would let one session
+//!   read another's profile and resume its cursor.
+//!
+//!   `after_run` is the harder half, because nothing in the call says which
+//!   session it belongs to. When a scope is configured it is unambiguous.
+//!   When it is derived from the session, the provider will write under that
+//!   session only while it has seen exactly one; once a second appears the
+//!   provider is shared and any write would be a guess, so it warns and
+//!   declines rather than filing one user's conversation against another's.
+//!   **Set [`FoundryMemoryProvider::with_scope`] on a provider shared across
+//!   sessions** — the session fallback is a single-session convenience.
 //! - **The update is awaited, not polled.** Upstream calls
 //!   `begin_update_memories`, which returns a long-running-operation poller,
 //!   and then reads only `update_id` off it without ever polling — a
@@ -77,20 +84,61 @@ pub const DEFAULT_API_VERSION: &str = "v1";
 pub const DEFAULT_CONTEXT_PROMPT: &str =
     "## Memories\nConsider the following memories when answering user questions:";
 
-/// Per-session state. Upstream keeps each of these in the `state` dict its
-/// hooks are handed; the Rust trait has no equivalent, so they live here.
+/// What upstream keeps in the per-run `state` dict its hooks are handed. The
+/// Rust trait has no equivalent, so it lives on the provider — **keyed by
+/// scope**, because a provider is normally shared by `Arc` across an agent's
+/// runs and two scopes must not see each other's memories or resume each
+/// other's cursor.
 #[derive(Debug, Default)]
-struct State {
+struct ScopeState {
     /// Whether the one-off static-memory (user profile) fetch has been
-    /// attempted. Set even when that fetch *fails*, as upstream does, so a
-    /// failing store is not re-queried on every run.
+    /// attempted for this scope. Set even when that fetch *fails*, as
+    /// upstream does, so a failing store is not re-queried on every run.
     initialized: bool,
     static_memories: Vec<String>,
     previous_search_id: Option<String>,
     previous_update_id: Option<String>,
-    /// Captured in `before_run` purely so `after_run`, which is handed no
-    /// [`SessionContext`], can still resolve a scope.
-    session_id: Option<String>,
+}
+
+/// Which session ids have come through `before_run`.
+///
+/// `after_run` is handed no [`SessionContext`], so when the scope is derived
+/// from the session there is nothing in the call itself to correlate a write
+/// to. While one session has been seen that is unambiguous. Once a second
+/// appears, the provider is shared across sessions and any write it made
+/// would be a guess — so it stops writing instead of writing to the wrong
+/// scope. Configuring [`FoundryMemoryProvider::with_scope`] avoids the
+/// question entirely and is the right shape for a shared provider.
+#[derive(Debug, Default, PartialEq)]
+enum SeenSessions {
+    #[default]
+    None,
+    One(String),
+    Many,
+}
+
+impl SeenSessions {
+    fn observe(&mut self, session_id: &str) {
+        match self {
+            Self::None => *self = Self::One(session_id.to_string()),
+            Self::One(existing) if existing == session_id => {}
+            _ => *self = Self::Many,
+        }
+    }
+
+    /// The session to scope by, when exactly one has ever been seen.
+    fn unambiguous(&self) -> Option<&str> {
+        match self {
+            Self::One(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct State {
+    scopes: std::collections::HashMap<String, ScopeState>,
+    sessions: SeenSessions,
 }
 
 /// A [`ContextProvider`] backed by a Foundry memory store.
@@ -203,8 +251,9 @@ impl FoundryMemoryProvider {
         if !self.warned_no_scope.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 store = %self.memory_store_name,
-                "Foundry memory: no scope configured and the session carries no id; \
-                 skipping memory access. Set one with `with_scope`."
+                "Foundry memory: no scope is resolvable — none configured, and the session \
+                 is absent or this provider has served more than one. Skipping memory access; \
+                 set a fixed scope with `with_scope` when sharing one provider."
             );
         }
     }
@@ -320,28 +369,41 @@ fn message_items(messages: &[Message]) -> Vec<Value> {
 impl ContextProvider for FoundryMemoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let mut state = self.state.lock().await;
-        // `after_run` is handed no context, so this is the only chance to
-        // learn the session id it will need to scope its write by.
         if let Some(id) = ctx.session_id.as_deref() {
-            state.session_id = Some(id.to_string());
+            state.sessions.observe(id);
         }
-        let Some(scope) = self.resolve_scope(state.session_id.as_deref()) else {
+        // An explicit scope is authoritative; otherwise this run's own
+        // session id, which is unambiguous here because the context names it.
+        let Some(scope) = self.resolve_scope(ctx.session_id.as_deref()) else {
             self.warn_no_scope();
             return Ok(());
         };
+        let entry = state.scopes.entry(scope.clone()).or_default();
 
-        // First run: fetch the scope's static memories (user profile). The
-        // latch is set even on failure, as upstream does, so one unreachable
-        // store does not mean one failed request per run forever.
-        if !state.initialized {
+        // First run *for this scope*: fetch its static memories (user
+        // profile). The latch is set even on failure, as upstream does, so
+        // one unreachable store does not mean one failed request per run
+        // forever.
+        if !entry.initialized {
             match self.search(&scope, None, None).await {
-                Ok(result) => state.static_memories = result.contents,
+                Ok(result) => {
+                    state
+                        .scopes
+                        .entry(scope.clone())
+                        .or_default()
+                        .static_memories = result.contents
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "Foundry memory: static memory retrieval failed");
-                    state.static_memories.clear();
+                    state
+                        .scopes
+                        .entry(scope.clone())
+                        .or_default()
+                        .static_memories
+                        .clear();
                 }
             }
-            state.initialized = true;
+            state.scopes.entry(scope.clone()).or_default().initialized = true;
         }
 
         let items = message_items(&ctx.input_messages);
@@ -349,17 +411,22 @@ impl ContextProvider for FoundryMemoryProvider {
             return Ok(());
         }
 
-        let contextual = match self
-            .search(&scope, Some(items), state.previous_search_id.as_deref())
-            .await
-        {
+        let previous = state
+            .scopes
+            .get(&scope)
+            .and_then(|e| e.previous_search_id.clone());
+        let contextual = match self.search(&scope, Some(items), previous.as_deref()).await {
             Ok(result) => {
                 // Upstream advances the incremental cursor only when the
                 // search actually returned something, so an empty answer does
                 // not reset the next search's starting point.
                 if !result.contents.is_empty() {
                     if let Some(id) = result.search_id {
-                        state.previous_search_id = Some(id);
+                        state
+                            .scopes
+                            .entry(scope.clone())
+                            .or_default()
+                            .previous_search_id = Some(id);
                     }
                 }
                 result.contents
@@ -372,7 +439,11 @@ impl ContextProvider for FoundryMemoryProvider {
             }
         };
 
-        let mut all = state.static_memories.clone();
+        let mut all = state
+            .scopes
+            .get(&scope)
+            .map(|e| e.static_memories.clone())
+            .unwrap_or_default();
         all.extend(contextual);
         if all.is_empty() {
             return Ok(());
@@ -392,7 +463,15 @@ impl ContextProvider for FoundryMemoryProvider {
         _error: Option<&Error>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
-        let Some(scope) = self.resolve_scope(state.session_id.as_deref()) else {
+        // This call carries no session, so the scope must come from
+        // configuration or from the one session this provider has seen.
+        // Writing under a guessed scope would file one user's conversation
+        // against another's, so ambiguity means not writing.
+        let Some(scope) = self
+            .scope
+            .clone()
+            .or_else(|| state.sessions.unambiguous().map(str::to_string))
+        else {
             self.warn_no_scope();
             return Ok(());
         };
@@ -407,7 +486,11 @@ impl ContextProvider for FoundryMemoryProvider {
         let mut body = Map::new();
         body.insert("scope".into(), json!(scope));
         body.insert("items".into(), json!(items));
-        if let Some(id) = &state.previous_update_id {
+        if let Some(id) = state
+            .scopes
+            .get(&scope)
+            .and_then(|e| e.previous_update_id.clone())
+        {
             body.insert("previous_update_id".into(), json!(id));
         }
         if let Some(delay) = self.update_delay {
@@ -417,7 +500,8 @@ impl ContextProvider for FoundryMemoryProvider {
         match self.post("update_memories", &Value::Object(body)).await {
             Ok(value) => {
                 if let Some(id) = value.get("update_id").and_then(Value::as_str) {
-                    state.previous_update_id = Some(id.to_string());
+                    state.scopes.entry(scope).or_default().previous_update_id =
+                        Some(id.to_string());
                 }
             }
             // Storing is an enhancement too, and `after_run` also runs on the

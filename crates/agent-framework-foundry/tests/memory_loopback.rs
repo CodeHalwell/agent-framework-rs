@@ -255,3 +255,98 @@ async fn a_turn_with_no_storable_text_makes_no_update_call() {
         "a system-only turn has nothing to store"
     );
 }
+
+/// Two sessions through one shared provider must not share a profile or a
+/// cursor: each scope gets its own static fetch and its own search id.
+#[tokio::test]
+async fn two_sessions_through_one_provider_do_not_share_state() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s-static-1", &["alice likes tea"])),
+        (200, search_body("s-ctx-1", &["alice asked about tea"])),
+        (200, search_body("s-static-2", &["bob likes coffee"])),
+        (200, search_body("s-ctx-2", &["bob asked about coffee"])),
+    ]);
+    let p = provider(&endpoint);
+
+    let mut a = SessionContext::new(vec![Message::user("tea?")]);
+    a.session_id = Some("alice".into());
+    p.before_run(&mut a).await.expect("before_run");
+
+    let mut b = SessionContext::new(vec![Message::user("coffee?")]);
+    b.session_id = Some("bob".into());
+    p.before_run(&mut b).await.expect("before_run");
+
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 4, "each scope needs its own static fetch");
+    assert_eq!(reqs[2].body["scope"], serde_json::json!("bob"));
+    assert!(
+        reqs[2].body.get("items").is_none(),
+        "bob's static fetch must not be skipped by alice's latch"
+    );
+    assert!(
+        reqs[3].body.get("previous_search_id").is_none(),
+        "bob must not resume alice's search cursor"
+    );
+
+    // And neither run sees the other's memories.
+    assert!(a.messages[0].text().contains("alice"));
+    assert!(!a.messages[0].text().contains("bob"));
+    assert!(b.messages[0].text().contains("bob"));
+    assert!(!b.messages[0].text().contains("alice"));
+}
+
+/// `after_run` carries no session. Once a provider has served two, a write
+/// would be filing one user's conversation under another's scope — so it
+/// declines instead of guessing.
+#[tokio::test]
+async fn after_run_declines_to_write_once_the_session_is_ambiguous() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s1", &[])),
+        (200, search_body("s2", &[])),
+        (200, r#"{"update_id":"u-1"}"#.to_string()),
+    ]);
+    let p = provider(&endpoint);
+
+    for session in ["alice", "bob"] {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some(session.into());
+        p.before_run(&mut ctx).await.expect("before_run");
+    }
+    let before = seen.lock().unwrap().len();
+
+    p.after_run(&[Message::user("remember this")], &[], None)
+        .await
+        .expect("after_run must not fail");
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "an ambiguous scope must produce no write at all"
+    );
+}
+
+/// The escape hatch the docs point at: a pinned scope is unambiguous however
+/// many sessions share the provider, so writes keep working.
+#[tokio::test]
+async fn a_pinned_scope_keeps_writing_across_many_sessions() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s1", &[])),
+        (200, search_body("s2", &[])),
+        (200, r#"{"update_id":"u-1"}"#.to_string()),
+    ]);
+    let p = provider(&endpoint).with_scope("tenant-7");
+
+    for session in ["alice", "bob"] {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some(session.into());
+        p.before_run(&mut ctx).await.expect("before_run");
+    }
+    p.after_run(&[Message::user("remember this")], &[], None)
+        .await
+        .expect("after_run");
+
+    let reqs = seen.lock().unwrap().clone();
+    let update = reqs.last().expect("an update was sent");
+    assert!(update.start_line.contains(":update_memories"));
+    assert_eq!(update.body["scope"], serde_json::json!("tenant-7"));
+}

@@ -97,6 +97,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         response_id,
         conversation_id,
         usage_details,
+        finish_reason,
         ..
     } = response;
     let last = messages.len().saturating_sub(1);
@@ -138,11 +139,20 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
                 message_id,
                 response_id: response_id.clone(),
                 conversation_id: conversation_id.clone(),
+                // Only the final update carries it, exactly as `client.rs`
+                // does for `ChatResponse`: `AgentResponse::from_updates`
+                // takes the last reason it sees, and tagging every update
+                // would claim each message ended the turn.
+                finish_reason: (i == last).then(|| finish_reason.clone()).flatten(),
                 ..Default::default()
             })
         })
         .collect();
-    if updates.is_empty() && (usage_details.is_some() || response_id.is_some()) {
+    // A reason with no messages is still worth emitting — a turn the content
+    // filter stopped before any text is exactly that shape.
+    if updates.is_empty()
+        && (usage_details.is_some() || response_id.is_some() || finish_reason.is_some())
+    {
         let contents = usage_details
             .map(|u| {
                 vec![crate::types::Content::Usage(crate::types::UsageContent {
@@ -155,6 +165,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
             role: Some(crate::types::Role::assistant()),
             response_id,
             conversation_id,
+            finish_reason,
             ..Default::default()
         }));
     }
@@ -1466,6 +1477,58 @@ impl crate::tools::Tool for AgentAsTool {
 
 #[cfg(test)]
 mod tests {
+    /// `response_to_updates` feeds the buffered `run_stream` and the
+    /// middleware streaming path. It dropped `finish_reason` entirely, so a
+    /// content-filtered turn reached hosting as a normal `stop` on exactly
+    /// the paths that do not go through `client.rs`.
+    #[test]
+    fn response_to_updates_carries_the_finish_reason_on_the_last_update_only() {
+        let response = super::AgentResponse {
+            messages: vec![
+                crate::types::Message::assistant("partial"),
+                crate::types::Message::assistant("cut off here"),
+            ],
+            finish_reason: Some(crate::types::FinishReason::new(
+                crate::types::FinishReason::CONTENT_FILTER,
+            )),
+            ..Default::default()
+        };
+        let updates: Vec<_> = super::response_to_updates(response)
+            .into_iter()
+            .map(|u| u.expect("update"))
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert!(
+            updates[0].finish_reason.is_none(),
+            "only the turn's last update ended the turn"
+        );
+        assert_eq!(
+            updates[1].finish_reason.as_ref().map(|r| r.as_str()),
+            Some(crate::types::FinishReason::CONTENT_FILTER)
+        );
+    }
+
+    /// A turn the filter stopped before any text is a reason with no
+    /// messages; it must still reach the stream rather than vanishing.
+    #[test]
+    fn a_finish_reason_with_no_messages_still_produces_an_update() {
+        let response = super::AgentResponse {
+            finish_reason: Some(crate::types::FinishReason::new(
+                crate::types::FinishReason::CONTENT_FILTER,
+            )),
+            ..Default::default()
+        };
+        let updates: Vec<_> = super::response_to_updates(response)
+            .into_iter()
+            .map(|u| u.expect("update"))
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].finish_reason.as_ref().map(|r| r.as_str()),
+            Some(crate::types::FinishReason::CONTENT_FILTER)
+        );
+    }
+
     use super::*;
     use crate::client::ChatStream;
     use crate::compaction::Truncation;
