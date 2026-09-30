@@ -284,3 +284,69 @@ async fn responses_agent_stream_emits_incremental_deltas() {
     assert_eq!(completed["type"], "response.completed");
     assert_eq!(completed["response"]["output_text"], "Hello world");
 }
+
+/// The terminal event must follow the response's `status`, not the optional
+/// `incomplete_details`. Those two came apart once an unfamiliar provider
+/// reason started producing an `incomplete` response with no
+/// schema-nameable detail — and keying on the detail announced
+/// `response.completed` around exactly the payload this path exists to flag.
+#[tokio::test]
+async fn an_unfamiliar_finish_reason_streams_response_incomplete() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        MockAgent::new("assistant-1")
+            .with_finish_reason("model_context_window_exceeded")
+            .arc(),
+    );
+    let body = json!({
+        "input": "stream me",
+        "stream": true,
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (status, text) = post_raw(host.into_router(), "/v1/responses", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = parse_sse_json(&text);
+    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types.last(),
+        Some(&"response.incomplete"),
+        "a cut-off turn must not close with response.completed"
+    );
+
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["response"]["status"], "incomplete");
+    // No schema-nameable detail for this reason, but the reason survives.
+    assert!(terminal["response"]["incomplete_details"].is_null());
+    assert_eq!(
+        terminal["response"]["x_finish_reason"],
+        "model_context_window_exceeded"
+    );
+}
+
+/// The two OpenAI does name still fill `incomplete_details` and still close
+/// with `response.incomplete`.
+#[tokio::test]
+async fn a_content_filtered_turn_streams_response_incomplete_with_detail() {
+    let host = AgentHost::new().agent(
+        "assistant",
+        MockAgent::new("assistant-1")
+            .with_finish_reason("content_filter")
+            .arc(),
+    );
+    let body = json!({
+        "input": "stream me",
+        "stream": true,
+        "metadata": { "entity_id": "assistant" },
+    });
+    let (status, text) = post_raw(host.into_router(), "/v1/responses", body.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let events = parse_sse_json(&text);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "response.incomplete");
+    assert_eq!(
+        terminal["response"]["incomplete_details"]["reason"],
+        "content_filter"
+    );
+}

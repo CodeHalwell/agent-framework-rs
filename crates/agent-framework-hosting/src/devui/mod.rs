@@ -365,7 +365,13 @@ impl AgentStreamFraming {
         // OpenAI pairs an incomplete response with its own terminal event
         // name, so a client switching on the event type — rather than reading
         // `status` out of the payload — still sees that the turn was cut off.
-        let event_type = if completed.incomplete_details.is_some() {
+        //
+        // Keyed on `status`, not on `incomplete_details`: those two came
+        // apart once an unfamiliar provider reason started producing an
+        // `incomplete` response with no schema-nameable detail. Reading the
+        // optional field would announce `response.completed` around exactly
+        // the payloads this whole path exists to flag.
+        let event_type = if completed.status == "incomplete" {
             "response.incomplete"
         } else {
             "response.completed"

@@ -181,6 +181,7 @@ pub struct MockAgent {
     name: Option<String>,
     prefix: String,
     usage: Option<UsageDetails>,
+    finish_reason: Option<String>,
 }
 
 impl MockAgent {
@@ -190,7 +191,15 @@ impl MockAgent {
             name: None,
             prefix: "echo: ".to_string(),
             usage: None,
+            finish_reason: None,
         }
+    }
+
+    /// Make the agent report a specific finish reason, including one outside
+    /// OpenAI's vocabulary.
+    pub fn with_finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(reason.into());
+        self
     }
 
     pub fn named(mut self, name: impl Into<String>) -> Self {
@@ -234,6 +243,10 @@ impl SupportsAgentRun for MockAgent {
         Ok(AgentResponse {
             messages: vec![Message::assistant(reply)],
             usage_details: self.usage.clone(),
+            finish_reason: self
+                .finish_reason
+                .as_deref()
+                .map(agent_framework_core::types::FinishReason::new),
             ..Default::default()
         })
     }

@@ -62,7 +62,24 @@ recording rather than smoothing over:
 | The scope cache grows without bound | **Real.** Partitioning state by scope — the round-two fix — turned a fixed-size struct into a map with one entry per session and no eviction. | An LRU bounded at 512, overridable. Eviction costs only a re-fetch and a restarted cursor, both already the first-run path. |
 | `incomplete_details.reason` can hold a schema-invalid value | **Real, and in tension with round three.** Round three said: do not swallow abnormal reasons. I satisfied that by passing the provider's string through `incomplete_details.reason` — a field the Responses schema defines as a two-value enum, which a strict generated client can reject outright. Both constraints hold together: the *status* carries the abnormality, the *enum* stays legal. | `is_incomplete` (the status question) is now separate from `incomplete_reason` (the two schema names). An unfamiliar reason yields `incomplete` with no `incomplete_details`, and travels in a new `x_finish_reason` extension. The round-three test asserting the old location was retired, its successor asserting strictly more. |
 
-Twenty-two tests added across the fourteen findings. Three of the fixes were probed by
+A sixth round raised two more, **one of them again created by the round
+before it**: separating `is_incomplete` from `incomplete_reason` meant an
+`incomplete` response can now carry no `incomplete_details`, and the DevUI
+terminal event was still keyed on that optional field — so it announced
+`response.completed` around exactly the payloads the separation existed to
+flag. It now follows `status`. The second extends the same closed-enum
+reasoning to the *chat-completions* surface, which had the identical
+problem and which my own doc comment there had argued the other way about:
+an unfamiliar reason is reported as `length` with the raw value in
+`x_finish_reason`, the wrong-familiar-value objection having lost its force
+once the real value stopped being discarded.
+
+Twenty-eight tests added across the sixteen findings. Six review rounds;
+**nine of the sixteen findings were in code written earlier in the same
+session**, four of them introduced by the fix for a previous round. The
+pattern is worth stating rather than burying: each fix was locally correct
+and globally incomplete, because it reasoned about the case in front of it
+and not about the invariant it had just changed. Three of the fixes were probed by
 mutation — disabling the integer comparison, the ambiguity detection, or the
 latch each reproduces the reported symptom exactly. Full workspace:
 **2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`

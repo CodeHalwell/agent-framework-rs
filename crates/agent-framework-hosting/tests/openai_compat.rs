@@ -199,3 +199,47 @@ async fn streaming_disconnect_cancels_the_agent_run() {
         "producer kept generating after disconnect (produced {count})"
     );
 }
+
+/// Chat Completions' `finish_reason` is a closed set. A provider string
+/// outside it — Anthropic's converter deliberately preserves
+/// `model_context_window_exceeded` — can make a strict generated client
+/// reject the whole response, so it is approximated to a legal non-success
+/// value and carried verbatim beside it rather than lost.
+#[tokio::test]
+async fn an_unfamiliar_finish_reason_stays_inside_the_closed_enum() {
+    let agent = MockAgent::new("a1")
+        .with_finish_reason("model_context_window_exceeded")
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+    let (status, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp["choices"][0]["finish_reason"], "length",
+        "approximated to a legal value that still says 'not a complete answer'"
+    );
+    assert_eq!(
+        resp["choices"][0]["x_finish_reason"], "model_context_window_exceeded",
+        "and the provider's own reason is not lost"
+    );
+}
+
+/// The reasons OpenAI already names pass through untouched, with no
+/// extension field to explain away.
+#[tokio::test]
+async fn schema_named_finish_reasons_pass_through_unchanged() {
+    for reason in ["stop", "length", "content_filter", "tool_calls"] {
+        let agent = MockAgent::new("a1").with_finish_reason(reason).arc();
+        let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+        let body =
+            json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+        let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+        assert_eq!(resp["choices"][0]["finish_reason"], reason);
+        assert!(
+            resp["choices"][0]["x_finish_reason"].is_null(),
+            "{reason} needs no approximation"
+        );
+    }
+}

@@ -104,6 +104,18 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **The DevUI stream closed an incomplete response with
+  `response.completed`.** The terminal event was chosen from
+  `incomplete_details`, which the fix below makes absent for an unfamiliar
+  provider reason — so precisely the cut-off turns this path exists to flag
+  were announced as successes. It now follows the response's `status`.
+- **A provider-only reason could reach the Chat Completions `finish_reason`
+  enum.** That wire field is a closed set, and a strict generated client can
+  reject a response over a value outside it. An unfamiliar reason is now
+  reported as `length` — the only legal value that says "not a complete
+  answer" without asserting a cause — and carried verbatim in a
+  non-standard `x_finish_reason` beside it, on both the buffered and
+  streaming paths.
 - **A failed concurrent profile fetch could erase a scope's memories
   permanently.** Releasing the state lock for the request (below) lets two
   first runs for one scope overlap; the failing one committed an empty

@@ -160,17 +160,20 @@ async fn chat_completions(
                                 }
                             }
                         }
-                        // Terminal chunk.
-                        let reason = finish_reason
-                            .as_ref()
-                            .map_or(FinishReason::STOP, FinishReason::as_str);
+                        // Terminal chunk. The same closed-enum rule as the
+                        // buffered path: an unfamiliar provider reason is
+                        // reported as `length` with the raw value alongside,
+                        // never emitted into the enum itself.
+                        let (reason, raw) = finish_reason_of(finish_reason.as_ref());
+                        let raw = raw.map(str::to_string);
                         let _ = tx
-                            .send(chunk(
+                            .send(chunk_with_raw_reason(
                                 &id,
                                 created,
                                 &model,
                                 json!({}),
                                 Value::String(reason.to_string()),
+                                raw,
                             ))
                             .await;
                     }
@@ -209,6 +212,7 @@ fn completion_object(
     input_len: usize,
 ) -> Value {
     let text = resp.text();
+    let (reason, raw) = finish_reason_of(resp.finish_reason.as_ref());
     let (prompt, completion) = token_counts(&resp.usage_details, input_len, text.len());
     json!({
         "id": id,
@@ -218,7 +222,10 @@ fn completion_object(
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": text },
-            "finish_reason": finish_reason_of(resp),
+            "finish_reason": reason,
+            // Non-standard, and omitted unless the provider's own reason had
+            // to be approximated to keep the enum above legal.
+            "x_finish_reason": raw,
         }],
         "usage": {
             "prompt_tokens": prompt,
@@ -228,34 +235,70 @@ fn completion_object(
     })
 }
 
-/// The chat-completions `finish_reason` for a run.
+/// The chat-completions `finish_reason` for a run, and the provider's own
+/// reason when the two differ.
 ///
 /// Hardcoding `"stop"` — which this did — told every client that a turn cut
 /// off by the Azure OpenAI content filter, or by the token budget, had ended
 /// normally. Those are precisely the two cases an OpenAI-compatible client
 /// branches on, and neither is distinguishable from the text alone.
 ///
-/// The core vocabulary is already OpenAI's (`stop` / `length` /
-/// `content_filter` / `tool_calls`), so a known reason passes through as-is.
-/// A provider-specific one does too, rather than being flattened to `stop`:
-/// an unfamiliar value a client ignores is recoverable, whereas a wrong
-/// familiar one is not. `"stop"` remains the default only when the provider
-/// reported nothing at all.
-fn finish_reason_of(resp: &AgentResponse) -> &str {
-    resp.finish_reason
-        .as_ref()
-        .map_or(FinishReason::STOP, FinishReason::as_str)
+/// The wire field is a **closed** set (`stop` / `length` / `tool_calls` /
+/// `content_filter` / `function_call`), and the core vocabulary is already
+/// OpenAI's, so a known reason passes straight through. A provider-specific
+/// one cannot — Anthropic's converter deliberately preserves
+/// `model_context_window_exceeded` — because a generated client whose enum
+/// is strict can reject the entire response over a value outside that set,
+/// which costs the caller far more than the reason is worth.
+///
+/// So an unfamiliar reason is reported as `length` and carried verbatim in
+/// the non-standard `x_finish_reason` beside it. `length` is a deliberate
+/// approximation: it is the only legal value that says "you did not get a
+/// complete answer" without asserting a specific cause the way
+/// `content_filter` would, and it is accurate for the truncation-shaped
+/// reasons providers actually emit here. The earlier objection to a wrong
+/// familiar value was that it *lost* the real one — which it no longer does.
+fn finish_reason_of(finish_reason: Option<&FinishReason>) -> (&'static str, Option<&str>) {
+    let Some(reason) = finish_reason.map(FinishReason::as_str) else {
+        return (FinishReason::STOP, None);
+    };
+    match reason {
+        FinishReason::STOP => (FinishReason::STOP, None),
+        FinishReason::LENGTH => (FinishReason::LENGTH, None),
+        FinishReason::CONTENT_FILTER => (FinishReason::CONTENT_FILTER, None),
+        FinishReason::TOOL_CALLS => (FinishReason::TOOL_CALLS, None),
+        other => (FinishReason::LENGTH, Some(other)),
+    }
 }
 
 /// Build one streaming `chat.completion.chunk` with the given `delta` and
 /// `finish_reason`.
 fn chunk(id: &str, created: u64, model: &str, delta: Value, finish: Value) -> Value {
+    chunk_with_raw_reason(id, created, model, delta, finish, None)
+}
+
+/// [`chunk`], plus the provider's own finish reason when `finish_reason` had
+/// to be approximated to stay inside the closed enum. Omitted otherwise, so
+/// an ordinary chunk is byte-identical to before.
+fn chunk_with_raw_reason(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: Value,
+    finish: Value,
+    raw: Option<String>,
+) -> Value {
     json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish,
+            "x_finish_reason": raw,
+        }],
     })
 }
 
