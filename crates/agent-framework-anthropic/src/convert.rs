@@ -461,8 +461,9 @@ fn is_image_media_type(media_type: &str) -> bool {
 /// * [`ToolKind::HostedCodeInterpreter`] -> `{"type":"code_execution_20250825","name":"code_execution"}`
 ///   (~405-410), no extra config.
 /// * [`ToolKind::HostedMcp`] -> an `mcp_servers[]` entry
-///   `{"type":"url","name":...,"url":...}`, plus `tool_configuration.allowed_tools`
-///   when non-empty and `authorization_token` when an `"authorization"` header
+///   `{"type":"url","name":...,"url":...}`, plus `tool_configuration` —
+///   `allowed_tools` when the allowlist is non-empty, `enabled: false` when it
+///   is explicitly empty — and `authorization_token` when an `"authorization"` header
 ///   is present (~411-421). Rust's [`ToolKind::HostedMcp`] has no `headers`
 ///   field (core), so the authorization header is read from
 ///   `ToolDefinition::parameters["headers"]["authorization"]` instead.
@@ -509,13 +510,28 @@ pub fn tools_to_anthropic(tools: &[ToolDefinition]) -> (Vec<Value>, Vec<Value>) 
                 server_def.insert("type".into(), json!("url"));
                 server_def.insert("name".into(), json!(t.name));
                 server_def.insert("url".into(), json!(url));
+                // An *explicitly empty* allowlist means "expose none of this
+                // server's tools". Omitting `tool_configuration` for it — which
+                // is what treating `Some(vec![])` like `None` does — inverts
+                // that into the API default, where every tool on the server is
+                // enabled. An allowlist that silently becomes "allow
+                // everything" is the one failure mode this field exists to
+                // prevent, so the empty case is encoded rather than dropped.
+                //
+                // It is encoded as `enabled: false` rather than as
+                // `allowed_tools: []`. Both express the same intent, but only
+                // `enabled` has documented semantics for "no tools"; an empty
+                // `allowed_tools` array is undocumented and could be read back
+                // as unset — reintroducing the bug — or rejected outright.
+                // Upstream (#8576) emits the literal empty array, because the
+                // OpenAI/Foundry shape it fixes has no `enabled` field to use.
                 if let Some(allowed) = allowed_tools {
-                    if !allowed.is_empty() {
-                        server_def.insert(
-                            "tool_configuration".into(),
-                            json!({ "allowed_tools": allowed }),
-                        );
-                    }
+                    let config = if allowed.is_empty() {
+                        json!({ "enabled": false })
+                    } else {
+                        json!({ "allowed_tools": allowed })
+                    };
+                    server_def.insert("tool_configuration".into(), config);
                 }
                 // Case-insensitive: callers may reasonably write
                 // `Authorization` (HTTP header convention) in the map.
@@ -1835,12 +1851,40 @@ mod tests {
         );
     }
 
+    /// An explicitly empty allowlist disables the server's tools. Dropping the
+    /// configuration instead — the previous behaviour — left the API default
+    /// in place, which enables every tool the server exposes.
     #[test]
-    fn tools_to_anthropic_mcp_empty_allowed_tools_is_omitted() {
+    fn tools_to_anthropic_mcp_empty_allowed_tools_disables_the_server() {
         let tool = make_tool(
             ToolKind::HostedMcp {
                 url: "https://example.com/mcp".into(),
                 allowed_tools: Some(vec![]),
+            },
+            "my-mcp",
+            json!({}),
+        );
+        let (_, mcp_servers) = tools_to_anthropic(&[tool]);
+        assert_eq!(
+            mcp_servers[0]["tool_configuration"],
+            json!({ "enabled": false })
+        );
+        // Specifically not an allowlist key: an empty `allowed_tools` array is
+        // the encoding whose reading back as "unset" this test exists to rule
+        // out.
+        assert!(mcp_servers[0]["tool_configuration"]
+            .get("allowed_tools")
+            .is_none());
+    }
+
+    /// The negative control for the row above: *no* allowlist at all still
+    /// means "the server decides", so nothing is emitted.
+    #[test]
+    fn tools_to_anthropic_mcp_absent_allowed_tools_emits_no_configuration() {
+        let tool = make_tool(
+            ToolKind::HostedMcp {
+                url: "https://example.com/mcp".into(),
+                allowed_tools: None,
             },
             "my-mcp",
             json!({}),

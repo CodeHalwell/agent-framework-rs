@@ -9,6 +9,14 @@
 //! standalone conversion surface any host — not just [`crate::devui`] — can use
 //! to speak the OpenAI Responses wire shape.
 //!
+//! A response's `output` is heterogeneous, as OpenAI's is: an assistant
+//! message and a function call are sibling [`OutputItem`]s rather than a
+//! message with calls attached, so a turn that declares client-side calls
+//! carries each one's id, name and arguments for the caller to execute. A
+//! call the agent answered itself is not one of those and is not
+//! serialized. Coming back the other way, a `function_call_output` input
+//! item becomes the `FunctionResultContent` that completes the round trip.
+//!
 //! [`crate::devui`] is the only current caller; it layers DevUI-specific
 //! concerns (entity routing, the `~4-chars-per-token` usage estimate for runs
 //! that report no usage, SSE framing) on top of this module.
@@ -16,7 +24,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use agent_framework_core::types::{AgentResponse, Message, Role, UsageDetails};
+use agent_framework_core::types::{
+    AgentResponse, Content, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, Message, Role, UsageDetails,
+};
 
 /// `POST /v1/responses` request — a subset of DevUI's `AgentFrameworkRequest`
 /// (itself an OpenAI `ResponseCreateParams` superset). Unknown fields are
@@ -98,6 +109,98 @@ impl OutputText {
     }
 }
 
+/// Assemble a response's `output`: the assistant message when there is text
+/// to carry, then one item per declared function call.
+///
+/// A turn that is only a call gets no message item. OpenAI omits it, and an
+/// empty assistant message would read to a client as a blank answer rather
+/// than as work to do.
+pub(crate) fn output_items(
+    text: &str,
+    calls: &[&agent_framework_core::types::FunctionCallContent],
+    message_id: String,
+    status: &'static str,
+) -> Vec<OutputItem> {
+    let mut items = Vec::with_capacity(calls.len() + 1);
+    if !text.is_empty() || calls.is_empty() {
+        items.push(OutputItem::Message(
+            OutputMessage::assistant_text(message_id, text).with_status(status),
+        ));
+    }
+    items.extend(
+        calls
+            .iter()
+            .map(|c| OutputItem::FunctionCall(OutputFunctionCall::new(c))),
+    );
+    items
+}
+
+/// One entry of a response's `output` array.
+///
+/// OpenAI's Responses output is heterogeneous: an assistant message and a
+/// function call are *sibling items*, not a message with calls attached (the
+/// shape Chat Completions uses). Untagged, because each variant already
+/// carries its own `type` discriminator.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum OutputItem {
+    Message(OutputMessage),
+    FunctionCall(OutputFunctionCall),
+}
+
+impl OutputItem {
+    /// This item as an assistant message, or `None` if it is a call.
+    pub fn as_message(&self) -> Option<&OutputMessage> {
+        match self {
+            Self::Message(message) => Some(message),
+            Self::FunctionCall(_) => None,
+        }
+    }
+
+    /// This item as a function call, or `None` if it is a message.
+    pub fn as_function_call(&self) -> Option<&OutputFunctionCall> {
+        match self {
+            Self::FunctionCall(call) => Some(call),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<OutputMessage> for OutputItem {
+    fn from(message: OutputMessage) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A function call the caller is expected to execute — mirrors OpenAI
+/// `ResponseFunctionToolCall`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputFunctionCall {
+    #[serde(rename = "type")]
+    pub item_type: &'static str,
+    pub id: String,
+    /// The provider's id for the call, which the caller echoes back on the
+    /// result. Distinct from `id`, which names this output item.
+    pub call_id: String,
+    pub name: String,
+    /// A JSON **string**, as the wire format has it — not an object.
+    pub arguments: String,
+    pub status: &'static str,
+}
+
+impl OutputFunctionCall {
+    pub fn new(call: &agent_framework_core::types::FunctionCallContent) -> Self {
+        Self {
+            item_type: "function_call",
+            id: crate::util::msg_id(),
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            arguments: crate::util::arguments_string(call),
+            status: "completed",
+        }
+    }
+}
+
 /// An assistant message output item — mirrors OpenAI `ResponseOutputMessage`.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputMessage {
@@ -119,6 +222,68 @@ impl OutputMessage {
             status: "completed",
         }
     }
+
+    /// Mark this item with the status of the response carrying it.
+    ///
+    /// An item's status has to agree with its response's: a `completed`
+    /// message inside an `incomplete` response tells a client that inspects
+    /// item status the opposite of what the response says, and the item is
+    /// the more specific of the two. [`Self::assistant_text`] builds a
+    /// completed item because that is the common case; this is how a
+    /// truncated or filtered one says so.
+    pub fn with_status(mut self, status: &'static str) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+/// Why a response stopped short of a complete answer — mirrors OpenAI
+/// `Response.incomplete_details`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IncompleteDetails {
+    pub reason: String,
+}
+
+/// Whether a run ended abnormally — the question `status` answers.
+///
+/// Completion is an **allowlist**: an absent reason, `stop`, `tool_calls`
+/// and its deprecated predecessor `function_call`. `stop` is a complete
+/// answer and the two tool reasons are a turn that continues;
+/// every other reason is something a provider went out of its way to report.
+/// `FinishReason` is an open string and providers use it — Anthropic's
+/// converter deliberately preserves `model_context_window_exceeded` — so
+/// treating the unfamiliar ones as completions is the false success this
+/// whole area exists to remove.
+pub fn is_incomplete(finish_reason: Option<&FinishReason>) -> bool {
+    !matches!(
+        finish_reason.map(FinishReason::as_str),
+        None | Some(FinishReason::STOP)
+            | Some(FinishReason::TOOL_CALLS)
+            | Some(FinishReason::FUNCTION_CALL)
+    )
+}
+
+/// The OpenAI-Responses `incomplete_details.reason` for a run, when the
+/// schema has a name for it.
+///
+/// This is deliberately **narrower** than [`is_incomplete`]. The Responses
+/// schema admits exactly two values here, and a generated client whose enum
+/// is strict can reject an entire response over a third — so an unfamiliar
+/// provider reason must not be smuggled into this field, and must not be
+/// relabelled as one of the two either, since a wrong familiar value is
+/// worse than an absent one. Such a run is still reported `incomplete`; its
+/// raw reason travels in [`ResponseObject::x_finish_reason`], which is an
+/// extension a strict client ignores rather than a value it must parse.
+///
+/// The naming differs from the core vocabulary on one of the two: a
+/// token-budget cut-off is `max_output_tokens` here, while the
+/// chat-completions `finish_reason` for the same event is `length`.
+pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&'static str> {
+    match finish_reason?.as_str() {
+        FinishReason::CONTENT_FILTER => Some("content_filter"),
+        FinishReason::LENGTH => Some("max_output_tokens"),
+        _ => None,
+    }
 }
 
 /// The aggregated final response — mirrors OpenAI `Response`.
@@ -134,7 +299,19 @@ pub struct ResponseObject {
     pub created_at: f64,
     pub model: String,
     pub status: &'static str,
-    pub output: Vec<OutputMessage>,
+    /// Present only when `status` is `"incomplete"` *and* the Responses
+    /// schema has a name for the reason, as OpenAI has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
+    /// **Extension, not OpenAI.** The provider's own finish reason, verbatim,
+    /// whenever a run ended abnormally. It exists because
+    /// `incomplete_details.reason` is a two-value enum a strict client may
+    /// police, while a provider reason like `model_context_window_exceeded`
+    /// is worth keeping: an unknown *field* is ignored by such clients,
+    /// whereas an unknown *enum value* can sink the whole response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_finish_reason: Option<String>,
+    pub output: Vec<OutputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +335,8 @@ impl ResponseObject {
             created_at: crate::util::now_ts(),
             model: model.into(),
             status: "in_progress",
+            incomplete_details: None,
+            x_finish_reason: None,
             output: Vec::new(),
             output_text: None,
             usage: None,
@@ -217,11 +396,47 @@ pub(crate) fn input_to_messages(input: &Value) -> Vec<Message> {
     }
 }
 
-/// Convert one input item into a chat message, if it carries text.
+/// Convert one input item into a chat message, if it carries text — or a
+/// function call or its result, which are items in their own right.
+///
+/// The Responses protocol does not put a tool result inside a message the
+/// way Chat Completions does: a caller that executes a `function_call`
+/// output item sends back a top-level `function_call_output` item carrying
+/// `call_id` and `output`, with no `role` and no `content`. Read as a
+/// message that would be an empty user turn, and the result — the entire
+/// point of the round trip — would be lost. `function_call` is accepted on
+/// the way in for the same reason: a caller replaying the turn it was
+/// given must not have the call silently dropped from the conversation.
 fn item_to_message(item: &Value) -> Option<Message> {
     match item {
         Value::String(s) => Some(Message::user(s.clone())),
         Value::Object(map) => {
+            match map.get("type").and_then(Value::as_str) {
+                Some("function_call_output") => {
+                    let call_id = map.get("call_id").and_then(Value::as_str)?;
+                    return Some(single(
+                        Role::tool(),
+                        Content::FunctionResult(FunctionResultContent::new(
+                            call_id,
+                            Some(function_result_value(map.get("output"))),
+                        )),
+                    ));
+                }
+                Some("function_call") => {
+                    let call_id = map.get("call_id").and_then(Value::as_str)?;
+                    return Some(single(
+                        Role::assistant(),
+                        Content::FunctionCall(FunctionCallContent::new(
+                            call_id,
+                            map.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            map.get("arguments")
+                                .and_then(Value::as_str)
+                                .map(|a| FunctionArguments::Raw(a.to_string())),
+                        )),
+                    ));
+                }
+                _ => {}
+            }
             let role = map
                 .get("role")
                 .and_then(Value::as_str)
@@ -231,6 +446,32 @@ fn item_to_message(item: &Value) -> Option<Message> {
             Some(Message::new(role, text))
         }
         _ => None,
+    }
+}
+
+fn single(role: Role, content: Content) -> Message {
+    Message {
+        role,
+        contents: vec![content],
+        author_name: None,
+        message_id: None,
+        additional_properties: Default::default(),
+    }
+}
+
+/// A `function_call_output`'s `output` as a result value.
+///
+/// The wire field is typed as a string, and tools overwhelmingly return
+/// JSON in it, so a string that parses is stored as the structured value it
+/// represents and anything else stays a string — a tool expecting its own
+/// shape back should not be handed an opaque blob.
+fn function_result_value(output: Option<&Value>) -> Value {
+    match output {
+        Some(Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone()))
+        }
+        Some(other) => other.clone(),
+        None => Value::String(String::new()),
     }
 }
 
@@ -278,13 +519,42 @@ fn role_from(role: &str) -> Role {
 pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> ResponseObject {
     let text = resp.text();
     let mid = crate::util::msg_id();
+    // A turn the model was cut off in — an Azure OpenAI content-filter block,
+    // or the token budget running out — reads as an ordinary finished answer
+    // in its text alone. Reporting it as `completed` left a caller matching
+    // the provider's canned refusal string as the only way to tell, so the
+    // status and `incomplete_details` carry it instead.
+    let calls = crate::util::function_calls_of(&resp.messages);
+    let incomplete = is_incomplete(resp.finish_reason.as_ref());
+    let status = if incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    // Only the two the schema names reach `incomplete_details`; the raw
+    // reason rides the extension field so nothing is lost either way.
+    let detail = incomplete_reason(resp.finish_reason.as_ref());
+    let raw_reason = incomplete
+        .then(|| resp.finish_reason.as_ref().map(|r| r.as_str().to_string()))
+        .flatten();
     ResponseObject {
         id: id.to_string(),
         object: "response",
         created_at: crate::util::now_ts(),
         model: model.to_string(),
-        status: "completed",
-        output: vec![OutputMessage::assistant_text(mid, text.clone())],
+        status,
+        incomplete_details: detail.map(|reason| IncompleteDetails {
+            reason: reason.to_string(),
+        }),
+        x_finish_reason: raw_reason,
+        // The item's status follows the response's: the two disagreeing is
+        // worse than either being wrong alone.
+        //
+        // A declaration-only call is a sibling item, not an attachment to
+        // the message, and a turn that is *only* a call carries no message
+        // item at all — an empty assistant message would read as a blank
+        // answer rather than as a call to execute.
+        output: output_items(&text, &calls, mid, status),
         output_text: Some(text),
         usage: resp.usage_details.as_ref().map(usage_from_details),
         outputs: None,
@@ -345,6 +615,176 @@ mod tests {
         assert_eq!(r.entity_id(), Some("from-meta".to_string()));
     }
 
+    fn run_finishing_with(reason: Option<FinishReason>) -> AgentResponse {
+        AgentResponse {
+            messages: vec![Message::assistant("here is what I can say")],
+            finish_reason: reason,
+            ..Default::default()
+        }
+    }
+
+    /// The Responses schema names exactly two reasons. A provider's own
+    /// string must still be reported — as `incomplete` status plus the
+    /// extension field — but must not be smuggled into the enum, where a
+    /// strict generated client could reject the whole response over it.
+    #[test]
+    fn an_unfamiliar_reason_is_incomplete_without_an_invalid_detail() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new("model_context_window_exceeded"))),
+            "resp_1",
+            "claude",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert!(
+            obj.incomplete_details.is_none(),
+            "the schema has no name for this reason, so the field stays absent"
+        );
+        assert_eq!(
+            obj.x_finish_reason.as_deref(),
+            Some("model_context_window_exceeded"),
+            "but the reason itself is not lost"
+        );
+        // And it must serialize without an invalid enum value anywhere.
+        let json = serde_json::to_value(&obj).unwrap();
+        assert!(json.get("incomplete_details").is_none());
+        assert_eq!(
+            json["x_finish_reason"],
+            serde_json::json!("model_context_window_exceeded")
+        );
+    }
+
+    /// The two the schema does name keep using it.
+    #[test]
+    fn a_schema_named_reason_still_fills_incomplete_details() {
+        for (reason, expected) in [
+            (FinishReason::CONTENT_FILTER, "content_filter"),
+            (FinishReason::LENGTH, "max_output_tokens"),
+        ] {
+            let obj = responses_from_run(
+                &run_finishing_with(Some(FinishReason::new(reason))),
+                "resp_1",
+                "gpt-4o",
+            );
+            assert_eq!(obj.status, "incomplete");
+            assert_eq!(
+                obj.incomplete_details.as_ref().map(|d| d.reason.as_str()),
+                Some(expected)
+            );
+            assert_eq!(obj.x_finish_reason.as_deref(), Some(reason));
+        }
+    }
+
+    /// A completed turn carries neither.
+    #[test]
+    fn a_completed_turn_carries_no_finish_reason_extension() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::STOP))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "completed");
+        assert!(obj.incomplete_details.is_none());
+        assert!(obj.x_finish_reason.is_none());
+    }
+
+    /// An item's status has to agree with its response's. A `completed`
+    /// message inside an `incomplete` response tells a client that reads item
+    /// status the opposite of what the response says.
+    #[test]
+    fn the_output_item_status_follows_the_response_status() {
+        let cut_off = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::LENGTH))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(cut_off.status, "incomplete");
+        assert_eq!(cut_off.output[0].as_message().unwrap().status, "incomplete");
+
+        let finished = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::STOP))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.output[0].as_message().unwrap().status, "completed");
+    }
+
+    /// The other half of that allowlist: the two reasons that really are
+    /// completions must not start being reported as incomplete.
+    #[test]
+    fn stop_and_tool_calls_remain_completions() {
+        // `function_call` is the deprecated spelling of `tool_calls` and,
+        // like it, marks a turn that succeeded — reporting it as incomplete
+        // told clients a working tool call had been cut off.
+        for reason in [
+            FinishReason::STOP,
+            FinishReason::TOOL_CALLS,
+            FinishReason::FUNCTION_CALL,
+        ] {
+            let obj = responses_from_run(
+                &run_finishing_with(Some(FinishReason::new(reason))),
+                "resp_1",
+                "gpt-4o",
+            );
+            assert_eq!(obj.status, "completed", "{reason} is a completion");
+            assert!(obj.incomplete_details.is_none());
+        }
+    }
+
+    /// A turn the Azure OpenAI content filter cut off used to be reported as
+    /// `completed`, leaving the canned refusal text as the only signal.
+    #[test]
+    fn a_content_filtered_run_is_reported_incomplete() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::CONTENT_FILTER))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert_eq!(
+            obj.incomplete_details,
+            Some(IncompleteDetails {
+                reason: "content_filter".to_string()
+            })
+        );
+    }
+
+    /// `length` is OpenAI's `max_output_tokens` on this surface — the one
+    /// place the two vocabularies disagree.
+    #[test]
+    fn a_length_capped_run_is_reported_as_max_output_tokens() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::LENGTH))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert_eq!(
+            obj.incomplete_details,
+            Some(IncompleteDetails {
+                reason: "max_output_tokens".to_string()
+            })
+        );
+    }
+
+    /// The negative controls: a turn that genuinely ended, one that continues
+    /// into tools, and one whose provider reported nothing are all complete —
+    /// and none of them grows an `incomplete_details` key.
+    #[test]
+    fn a_run_that_was_not_cut_off_stays_completed() {
+        for reason in [
+            Some(FinishReason::stop()),
+            Some(FinishReason::tool_calls()),
+            None,
+        ] {
+            let obj = responses_from_run(&run_finishing_with(reason.clone()), "resp_1", "gpt-4o");
+            assert_eq!(obj.status, "completed", "{reason:?}");
+            assert_eq!(obj.incomplete_details, None, "{reason:?}");
+            let encoded = serde_json::to_value(&obj).unwrap();
+            assert!(encoded.get("incomplete_details").is_none(), "{reason:?}");
+        }
+    }
+
     #[test]
     fn responses_to_run_string_input() {
         let messages = responses_to_run(&req(Value::String("hello".to_string())));
@@ -393,7 +833,10 @@ mod tests {
         assert_eq!(obj.status, "completed");
         assert_eq!(obj.output_text.as_deref(), Some("hello there"));
         assert_eq!(obj.output.len(), 1);
-        assert_eq!(obj.output[0].content[0].text, "hello there");
+        assert_eq!(
+            obj.output[0].as_message().unwrap().content[0].text,
+            "hello there"
+        );
         let usage = obj.usage.expect("usage present");
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 5);

@@ -53,8 +53,8 @@ use agent_framework_core::workflow::WorkflowEvent;
 
 use crate::registry::{AgentRecord, EntityRecord, HostState, WorkflowRecord};
 use crate::responses::{
-    openai_error, responses_from_run, responses_to_run, InputTokensDetails, OutputMessage,
-    OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
+    openai_error, responses_from_run, responses_to_run, InputTokensDetails, OutputItem,
+    OutputMessage, OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
 };
 use crate::sse::{sse_response, sse_response_stream};
 use crate::util;
@@ -230,6 +230,14 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
                                 }
                             }
                         }
+                        // Flushed before the terminal event, so a client
+                        // sees each call announced and filled in before the
+                        // payload that lists them.
+                        for ev in framing.call_events() {
+                            if tx.send(ev).await.is_err() {
+                                return;
+                            }
+                        }
                         let _ = tx.send(framing.completed()).await;
                     }
                     Err(e) => {
@@ -278,6 +286,13 @@ struct AgentStreamFraming {
     /// Updates collected so the terminal `response.completed` can aggregate the
     /// full text and usage via [`AgentResponse::from_updates`].
     collected: Vec<AgentResponseUpdate>,
+    /// Function calls seen so far, held until the stream ends so a call
+    /// the agent answered itself is never advertised.
+    pending: util::StreamingCalls,
+    /// The item ids minted for the calls actually announced, in order. The
+    /// message occupies `output_index` 0, so a call's index is its
+    /// position here plus one.
+    calls: Vec<String>,
 }
 
 impl AgentStreamFraming {
@@ -289,6 +304,8 @@ impl AgentStreamFraming {
             mid: util::msg_id(),
             seq: 0,
             collected: Vec::new(),
+            pending: util::StreamingCalls::default(),
+            calls: Vec::new(),
         }
     }
 
@@ -326,21 +343,79 @@ impl AgentStreamFraming {
     /// text (otherwise nothing). The update is retained for final aggregation.
     fn push_update(&mut self, update: &AgentResponseUpdate) -> Vec<Value> {
         self.collected.push(update.clone());
+        let mut events = Vec::new();
+
         let delta = update.text();
-        if delta.is_empty() {
-            return Vec::new();
+        if !delta.is_empty() {
+            let mid = self.mid.clone();
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": mid,
+                "delta": delta,
+                "logprobs": [],
+                "sequence_number": seq,
+            }));
         }
-        let mid = self.mid.clone();
-        let seq = self.next();
-        vec![json!({
-            "type": "response.output_text.delta",
-            "output_index": 0,
-            "content_index": 0,
-            "item_id": mid,
-            "delta": delta,
-            "logprobs": [],
-            "sequence_number": seq,
-        })]
+
+        // Calls are *not* emitted here. A call the agent answers itself
+        // arrives with its result in a later update — with local tools,
+        // `FunctionInvokingChatClient` runs the loop and then replays each
+        // message as its own update — so announcing one on sight would ask
+        // the client to re-run work already done, and no later event can
+        // recall it. They are held and flushed by `call_events` once the
+        // stream has ended and the outstanding set is known.
+        self.pending.push(&update.contents);
+
+        events
+    }
+
+    /// The call events held back during the stream, emitted once it has
+    /// ended: each outstanding call is announced as its own output item and
+    /// then given its (complete) arguments.
+    ///
+    /// The arguments arrive in one delta rather than forming incrementally,
+    /// which is a presentation detail — a client cannot execute a call
+    /// before it has the whole argument object. See [`util::StreamingCalls`]
+    /// for why that trade is worth making.
+    fn call_events(&mut self) -> Vec<Value> {
+        let outstanding: Vec<(String, String, String)> = self
+            .pending
+            .outstanding()
+            .into_iter()
+            .map(|(id, name, args)| (id.to_string(), name.to_string(), args.to_string()))
+            .collect();
+        let mut events = Vec::with_capacity(outstanding.len() * 2);
+        for (call_id, name, arguments) in outstanding {
+            let item_id = util::msg_id();
+            self.calls.push(item_id.clone());
+            let output_index = self.calls.len();
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "sequence_number": seq,
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+            }));
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": output_index,
+                "item_id": item_id,
+                "delta": arguments,
+                "sequence_number": seq,
+            }));
+        }
+        events
     }
 
     /// The terminal `response.completed`, aggregating all collected updates.
@@ -350,17 +425,60 @@ impl AgentStreamFraming {
         // The streamed response item id (`mid`) was already announced in the
         // preamble; use it here too instead of `responses_from_run`'s freshly
         // generated one, so the completed event refers to the same item.
-        completed.output = vec![OutputMessage::assistant_text(
-            self.mid.clone(),
-            completed.output_text.clone().unwrap_or_default(),
-        )];
+        // Only the *message* item is rebuilt; any function-call items
+        // `responses_from_run` produced are carried through, or the
+        // streaming path would drop the calls the buffered one reports.
+        // Rebuilding also has to preserve the status, or it would reset to
+        // `completed` and contradict an `incomplete` response on this path
+        // alone.
+        //
+        // The message item is emitted unconditionally here, unlike on the
+        // buffered path, which omits it for a turn that is only a call. The
+        // preamble already announced it at `output_index` 0 before any
+        // content was known, and every call event numbered itself from
+        // there; dropping it now would shift each call one index away from
+        // the event that announced it.
+        let text = completed.output_text.clone().unwrap_or_default();
+        let status = completed.status;
+        let mut output = Vec::with_capacity(self.calls.len() + 1);
+        output.push(OutputItem::Message(
+            OutputMessage::assistant_text(self.mid.clone(), text).with_status(status),
+        ));
+        // Reuse the item ids already announced, for the same reason the
+        // message does: a client correlating the terminal payload with the
+        // events it saw must find the same ids.
+        let mut announced = self.calls.iter().cloned();
+        output.extend(completed.output.into_iter().filter_map(|item| match item {
+            OutputItem::Message(_) => None,
+            OutputItem::FunctionCall(mut call) => {
+                if let Some(id) = announced.next() {
+                    call.id = id;
+                }
+                Some(OutputItem::FunctionCall(call))
+            }
+        }));
+        completed.output = output;
         if completed.usage.is_none() {
             let output_len = completed.output_text.as_deref().unwrap_or_default().len();
             completed.usage = Some(usage_estimate(self.input_len, output_len));
         }
+        // OpenAI pairs an incomplete response with its own terminal event
+        // name, so a client switching on the event type — rather than reading
+        // `status` out of the payload — still sees that the turn was cut off.
+        //
+        // Keyed on `status`, not on `incomplete_details`: those two came
+        // apart once an unfamiliar provider reason started producing an
+        // `incomplete` response with no schema-nameable detail. Reading the
+        // optional field would announce `response.completed` around exactly
+        // the payloads this whole path exists to flag.
+        let event_type = if completed.status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         let seq = self.next();
         json!({
-            "type": "response.completed",
+            "type": event_type,
             "sequence_number": seq,
             "response": serde_json::to_value(completed).unwrap_or(Value::Null),
         })
@@ -416,9 +534,14 @@ async fn run_workflow(
 
 /// Build the aggregated (non-streaming) response for a workflow run.
 fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str) -> ResponseObject {
-    let output: Vec<OutputMessage> = outputs
+    let output: Vec<OutputItem> = outputs
         .iter()
-        .map(|o| OutputMessage::assistant_text(util::msg_id(), value_to_text(o)))
+        .map(|o| {
+            OutputItem::Message(OutputMessage::assistant_text(
+                util::msg_id(),
+                value_to_text(o),
+            ))
+        })
         .collect();
     let text = outputs
         .iter()
@@ -431,6 +554,10 @@ fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str)
         created_at: util::now_ts(),
         model: model.to_string(),
         status: "completed",
+        // A workflow run has no single model turn to be cut off in; the
+        // per-agent reasons, when there are any, belong to the executors.
+        incomplete_details: None,
+        x_finish_reason: None,
         output,
         output_text: Some(text),
         usage: None,
@@ -485,9 +612,14 @@ fn workflow_stream_events(
     }
 
     // Completed response aggregates the workflow outputs.
-    let output: Vec<OutputMessage> = outputs
+    let output: Vec<OutputItem> = outputs
         .iter()
-        .map(|o| OutputMessage::assistant_text(util::msg_id(), value_to_text(o)))
+        .map(|o| {
+            OutputItem::Message(OutputMessage::assistant_text(
+                util::msg_id(),
+                value_to_text(o),
+            ))
+        })
         .collect();
     let text = outputs
         .iter()
@@ -500,6 +632,8 @@ fn workflow_stream_events(
         created_at: util::now_ts(),
         model: model.to_string(),
         status: "completed",
+        incomplete_details: None,
+        x_finish_reason: None,
         output,
         output_text: Some(text),
         usage: None,

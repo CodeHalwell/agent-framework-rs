@@ -20,6 +20,10 @@ impl FinishReason {
     pub const LENGTH: &'static str = "length";
     pub const STOP: &'static str = "stop";
     pub const TOOL_CALLS: &'static str = "tool_calls";
+    /// The deprecated predecessor of [`Self::TOOL_CALLS`]. Still emitted by
+    /// OpenAI-compatible backends and still part of the wire enum, and like
+    /// `tool_calls` it marks a turn that **succeeded** and continues.
+    pub const FUNCTION_CALL: &'static str = "function_call";
 
     pub fn new(v: impl Into<String>) -> Self {
         FinishReason(v.into())
@@ -632,6 +636,17 @@ pub struct AgentResponse {
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub usage_details: Option<UsageDetails>,
+    /// Why the underlying model stopped generating, carried up from
+    /// [`ChatResponse::finish_reason`].
+    ///
+    /// This is how a caller learns that a turn was *cut off* rather than
+    /// completed — `content_filter` (an Azure OpenAI content-filter block) and
+    /// `length` (the token budget ran out) both produce a response whose text
+    /// reads as a finished answer. Without it the only signal is matching the
+    /// provider's canned refusal text, which is neither stable nor
+    /// translatable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub finish_reason: Option<FinishReason>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<Value>,
     /// Opaque token to resume this run when it is a background/long-running
@@ -698,6 +713,7 @@ impl AgentResponse {
             conversation_id: resp.conversation_id,
             created_at: resp.created_at,
             usage_details: resp.usage_details,
+            finish_reason: resp.finish_reason,
             value: resp.value,
             continuation_token: resp.continuation_token,
             additional_properties: resp.additional_properties,
@@ -755,6 +771,12 @@ pub struct AgentResponseUpdate {
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
+    /// Why the model stopped, when this update is the one that carries it.
+    /// Preserved so aggregating a streamed run via
+    /// [`AgentResponse::from_updates`] yields the same
+    /// [`AgentResponse::finish_reason`] a non-streaming `run()` returns.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub finish_reason: Option<FinishReason>,
     /// Provider-specific metadata for this update. Merged onto
     /// [`AgentResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -809,6 +831,7 @@ impl AgentResponseUpdate {
             message_id: u.message_id.clone(),
             conversation_id: u.conversation_id.clone(),
             created_at: u.created_at.clone(),
+            finish_reason: u.finish_reason.clone(),
             additional_properties: u.additional_properties.clone(),
             raw_representation: u.raw_representation.clone(),
         }
@@ -823,6 +846,10 @@ impl AgentResponseUpdate {
             message_id: self.message_id,
             conversation_id: self.conversation_id,
             created_at: self.created_at,
+            // Without this the round trip back through `ChatResponse` — which
+            // is how `from_updates` aggregates — dropped the reason on the
+            // floor, so a streamed run always reported none.
+            finish_reason: self.finish_reason,
             additional_properties: self.additional_properties,
             raw_representation: self.raw_representation,
             ..Default::default()
@@ -844,6 +871,56 @@ mod tests {
             role: Some(Role::assistant()),
             ..Default::default()
         }
+    }
+
+    /// The buffered path. `from_chat_response` mapped every other field
+    /// across and dropped this one, so an agent caller could not tell a
+    /// content-filtered turn from an answered one.
+    #[test]
+    fn finish_reason_survives_the_buffered_agent_path() {
+        let mut chat = ChatResponse::from_text("blocked");
+        chat.finish_reason = Some(FinishReason::new(FinishReason::CONTENT_FILTER));
+        let agent = AgentResponse::from_chat_response(chat);
+        assert_eq!(
+            agent.finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+    }
+
+    /// The streamed path. Aggregation round-trips agent updates back through
+    /// `ChatResponse`, so the reason had to survive *both* conversions; it
+    /// previously survived neither.
+    #[test]
+    fn finish_reason_survives_streamed_aggregation() {
+        let mut last = text_update(" cut off");
+        last.finish_reason = Some(FinishReason::new(FinishReason::LENGTH));
+        let updates: Vec<AgentResponseUpdate> = [text_update("a long answer"), last]
+            .iter()
+            .map(AgentResponseUpdate::from_chat_update)
+            .collect();
+        // Carried onto each update on the way out...
+        assert_eq!(updates[0].finish_reason, None);
+        assert_eq!(
+            updates[1].finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+        // ...and onto the aggregate, matching what a buffered run returns.
+        let aggregated = AgentResponse::from_updates(updates);
+        assert_eq!(
+            aggregated.finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+        assert_eq!(aggregated.text(), "a long answer cut off");
+    }
+
+    /// The negative control: a run no provider reported a reason for grows
+    /// none, and does not serialize an empty key.
+    #[test]
+    fn a_run_without_a_finish_reason_reports_none() {
+        let agent = AgentResponse::from_chat_response(ChatResponse::from_text("fine"));
+        assert_eq!(agent.finish_reason, None);
+        let encoded = serde_json::to_value(&agent).unwrap();
+        assert!(encoded.get("finish_reason").is_none());
     }
 
     #[test]

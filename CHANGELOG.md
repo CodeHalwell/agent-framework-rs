@@ -7,6 +7,250 @@ may break APIs).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-09-30
+
+Four values the code already had and never read, a Foundry surface it could
+not reach, and tool calls that neither hosting surface put on the wire.
+Nearly all of it failed in the permissive direction: a cut-off turn reported
+as a completed one, a blocked prompt reported as an answer, a hosted MCP
+allowlist of none reported as all.
+
+**Breaking, in three places.** `AgentResponse` and `AgentResponseUpdate` each
+gain a `finish_reason` field, so a struct literal for either without
+`..Default::default()` needs it. `agent_framework_hosting::ResponseObject`
+gains `incomplete_details` on the same terms, and its `output` changes from
+`Vec<OutputMessage>` to `Vec<OutputItem>` now that a response can carry
+function calls beside its message — `OutputItem::as_message()` recovers the
+old view.
+
+**One behaviour change worth calling out.** The in-memory vector store's
+`hamming` score is now the *fraction* of differing coordinates rather than the
+raw count, matching upstream. Ranking is unchanged; a `score_threshold` tuned
+against the old raw count needs dividing by the vector width.
+
+### Added
+
+- **Microsoft Foundry managed memory** (`FoundryMemoryProvider`, `foundry`
+  crate). A `ContextProvider` that searches a Foundry memory store for
+  relevant memories before a run and writes the turn back after it, spoken
+  directly against the project data plane
+  (`{endpoint}/memory_stores/{name}:search_memories` and `:update_memories`,
+  `api-version=v1`, bearer-scoped to `FOUNDRY_SCOPE`). Memories are isolated
+  by scope — `with_scope` pins one, otherwise the session id is used, and
+  nothing is read or written when neither is available. Search and update
+  cursors chain incrementally, the user-profile fetch happens once per scope,
+  and every service failure is logged rather than raised, since `after_run`
+  also runs on the agent's own failure path. Provider state is keyed by scope,
+  so a provider shared by `Arc` across runs cannot let one session read
+  another's profile or resume its cursor; because `after_run` is handed no
+  session, a provider that has served more than one session declines to write
+  rather than guess a scope — set `with_scope` when sharing one.
+- **Foundry embeddings from a project endpoint.** `FoundryEmbeddingClient`
+  previously spoke only the Foundry *Models* inference endpoint, so a Foundry
+  project holding an embedding deployment could not be embedded against
+  without provisioning a second surface. `with_project_endpoint` derives the
+  resource-scoped `{resource}/openai/v1/embeddings` route from a project
+  endpoint (`openai_model_base_url`), path-versioned and Entra-only. `from_env`
+  reads `FOUNDRY_PROJECT_ENDPOINT` (and `FOUNDRY_ENDPOINT`, the name
+  `FoundryChatClient` takes first) and still prefers `FOUNDRY_MODELS_ENDPOINT`
+  when both are set (upstream #8454).
+- **Tool calls on both hosting surfaces.** Core leaves a
+  `FunctionCallContent` intact for the caller to execute, but neither host
+  put it on the wire: `/v1/chat/completions` and `/v1/responses` serialized
+  text only, so a client was told a call had been requested and given no id,
+  name or arguments to act on. `/v1/chat/completions` now emits
+  `message.tool_calls` (with `content: null` for a call-only turn, as OpenAI
+  sends) and, when streaming, `delta.tool_calls` fragments keyed by a stable
+  per-call `index`. `/v1/responses` now emits `function_call` output items
+  as siblings of the assistant message, announced once over the stream as
+  `response.output_item.added` and then fed
+  `response.function_call_arguments.delta`. A call streamed across several
+  updates is announced once, with its fragments reassembled, and the
+  terminal payload reuses the ids the client already saw. Arguments go out
+  as a JSON *string* on both surfaces, as the wire format has it. Consequently a `tool_calls` / `function_call` finish reason
+  now passes through whenever the response actually carries a call, instead
+  of degrading to `stop`; it still degrades when the turn declares none.
+
+  Only calls that are still **unanswered** are serialized. Core keeps a
+  call and its `FunctionResultContent` together in the response — after a
+  local tool ran, and when a provider executed a hosted tool itself — and
+  advertising those would ask the client to re-run work already done. The
+  streaming surfaces hold calls until the stream ends to make that
+  decision, because with local tools the result arrives in a later update
+  than the call; a call's arguments therefore arrive in one delta rather
+  than forming incrementally.
+
+  The inbound half works too: `/v1/chat/completions` reads `tool_calls` and
+  `tool_call_id` off the follow-up request, and `/v1/responses` reads
+  `function_call` and `function_call_output` input items, so an executed
+  call reaches the agent as a `FunctionCallContent` / `FunctionResultContent`
+  pair rather than as empty text.
+- `agent_framework_hosting::{OutputItem, OutputFunctionCall}`.
+- `AgentResponse::finish_reason` / `AgentResponseUpdate::finish_reason`, and
+  `incomplete_details` on the hosting `ResponseObject`.
+
+### Fixed
+
+- **A truncated Responses stream lost its terminal metadata** (`openai`
+  crate). `parse_responses_event` handled `response.completed` but not
+  `response.incomplete`, so a stream cut off by the content filter or the
+  token budget delivered no finish reason, usage or response id — exactly
+  the information the distinct event name exists to report. Both are now
+  handled on the same arm.
+
+- **An empty hosted-MCP allowlist enabled every tool on the server**
+  (Anthropic). `allowed_tools: Some(vec![])` means "expose none", and was
+  treated as "no allowlist" — leaving the API default, which enables all of
+  them. Now encoded as `tool_configuration: {"enabled": false}`. The OpenAI,
+  Azure and Foundry paths were already correct (upstream #8576).
+- **A cut-off turn was reported as a completed one.** `finish_reason` never
+  reached the agent types, so an Azure OpenAI content-filter block or a
+  token-budget truncation was indistinguishable from a finished answer. The
+  OpenAI-compatible surface no longer hardcodes `finish_reason: "stop"`, and
+  the Responses surface emits `status: "incomplete"` with
+  `incomplete_details.reason` (`content_filter` / `max_output_tokens`) and a
+  `response.incomplete` terminal event (upstream #8478).
+- **Hamming distance could not distinguish integers above 2^24.** Stored
+  vector coordinates were narrowed to `f32` before comparison, so distinct
+  large integers — ids, timestamps, hashes — compared equal and a
+  non-matching record scored as an exact match. Coordinates are now compared
+  at `f64` (upstream #8637).
+- **Hamming could not distinguish 64-bit integers.** Widening stored vector
+  coordinates to `f64` moved the collision boundary from 2^24 to 2^53; it did
+  not remove it, since `f64` cannot represent `2^53 + 1` either. Hamming asks
+  whether two coordinates are the *same*, and a store keyed on ids, timestamps
+  or hashes lives exactly there — so stored coordinates now keep the integer
+  JSON carried and Hamming compares integers as integers, while the
+  arithmetic metrics keep using `f64`.
+- **`finish_reason` was dropped by `response_to_updates`.** The buffered
+  `SupportsAgentRun::run_stream` and `Agent` streaming through agent
+  middleware rebuild updates from an `AgentResponse`, and that helper did not
+  carry the reason across — so a content-filtered turn still reached hosting
+  as `stop`/`completed` on those paths. It now rides the final update, and a
+  reason with no messages emits one, matching what `client.rs` does for
+  `ChatResponse`.
+- **An incomplete response carried a completed output item.**
+  `OutputMessage::assistant_text` hardcodes `status: "completed"`, so a
+  truncated or filtered response contained a message item claiming it
+  finished — on the buffered and DevUI streaming paths alike. The item's
+  status now follows its response's.
+- **A run with no searchable input lost its memories.** An instruction-only
+  run, or one carrying only system turns, returned from
+  `FoundryMemoryProvider::before_run` before injecting the profile already
+  fetched for its scope. The contextual search is still skipped (there is
+  nothing to search with); the injection is not.
+- **The memory provider held its state lock across HTTP calls**, so one slow
+  scope stalled every other session sharing the provider. It now snapshots
+  under the lock, releases it for the request, and re-acquires to record the
+  result.
+- **An unfamiliar finish reason was reported as a completed turn.** The
+  Responses surface mapped only `content_filter` and `length`, defaulting
+  everything else to `completed`. `FinishReason` is an open string and
+  providers use it — the Anthropic converter deliberately preserves
+  `model_context_window_exceeded` — so the abnormal endings that matter most
+  were the ones swallowed. Completion is now an allowlist (absent, `stop`,
+  `tool_calls`); every other reason is reported incomplete and passes through
+  verbatim.
+- **The scope cache never came back down after a burst.** Keeping in-flight
+  scopes alive (below) lets the cache exceed its bound, but eviction ran
+  only when inserting a *new* scope and dropped at most one slot — so a
+  burst of concurrent sessions stayed resident permanently. Trimming now
+  runs on every touch and loops until the bound is met, making the overrun
+  temporary, which is the only thing that made it acceptable.
+- **Evicting a scope with a request in flight defeated per-scope locking.**
+  The LRU dropped the least-recently-used slot unconditionally, so a slow
+  run could have its slot evicted, the next run for that scope would build
+  a *second* mutex, and the two would race and fork the cursor — the exact
+  failure per-scope locking exists to prevent. Only a slot nobody holds is
+  now evictable; when every candidate is busy the cache runs briefly over
+  capacity instead.
+- **A tool finish reason was advertised without the tool calls.** Reporting
+  `tool_calls` / `function_call` tells a client to execute the call in
+  `message.tool_calls`, and the OpenAI-compatible host serializes text only
+  — so the client was handed an instruction with no id, name or arguments.
+  Those two reasons now degrade to `stop` with the real one in
+  `x_finish_reason`, until the surface can serialize the calls it is
+  promising. (Recorded as a capability gap, not a permanent answer.)
+- **Concurrent turns on one memory scope forked the update chain.** The
+  provider snapshotted `previous_update_id`, released its lock for the
+  request and wrote back, so two turns for the same scope both resumed from
+  the same cursor and one branch fell out of the service's incremental
+  chain. The provider now holds **one lock per scope** rather than one per
+  provider: the snapshot → request → commit sequence is atomic within a
+  scope, and unrelated scopes still never wait on each other. The same
+  change removes the duplicate profile fetch the previous release note
+  described as merely idempotent.
+- **A `function_call` turn was reported as a failure.** OpenAI's finish
+  vocabulary has five values, not four: `function_call` is the deprecated
+  spelling of `tool_calls` and, like it, marks a turn that *succeeded*. It
+  was missing from core's `FinishReason` constants, so the Responses surface
+  called it incomplete and the Chat Completions surface rewrote it to
+  `length` — telling clients a working tool call had been truncated.
+  `FinishReason::FUNCTION_CALL` now exists and both surfaces treat it as the
+  completion it is.
+- **The DevUI stream closed an incomplete response with
+  `response.completed`.** The terminal event was chosen from
+  `incomplete_details`, which the fix below makes absent for an unfamiliar
+  provider reason — so precisely the cut-off turns this path exists to flag
+  were announced as successes. It now follows the response's `status`.
+- **A provider-only reason could reach the Chat Completions `finish_reason`
+  enum.** That wire field is a closed set, and a strict generated client can
+  reject a response over a value outside it. An unfamiliar reason is now
+  reported as `length` — the only legal value that says "not a complete
+  answer" without asserting a cause — and carried verbatim in a
+  non-standard `x_finish_reason` beside it, on both the buffered and
+  streaming paths.
+- **A failed concurrent profile fetch could erase a scope's memories
+  permanently.** Releasing the state lock for the request (below) lets two
+  first runs for one scope overlap; the failing one committed an empty
+  profile over the successful one's and set `initialized`, so nothing ever
+  re-fetched it. A failure now leaves the cached profile untouched.
+- **The scope cache grew without bound.** With the session fallback a scope
+  is a session, so a long-lived agent accumulated one `ScopeState` per
+  session forever. It is now an LRU bounded by `DEFAULT_MAX_CACHED_SCOPES`
+  (512), overridable with `with_max_cached_scopes`; eviction costs a scope
+  only a re-fetched profile and a restarted cursor.
+- **`incomplete_details.reason` could carry a value the schema forbids.**
+  The Responses schema names exactly two reasons, and a strict generated
+  client can reject a whole response over a third — so a provider string
+  like `model_context_window_exceeded` no longer goes in that field. Such a
+  run is still reported `incomplete`, and the raw reason moves to the new
+  `x_finish_reason` extension, which a strict client ignores rather than
+  has to parse.
+- **The project embeddings route dropped the OpenAI `user` option.** The
+  per-route allowlist added below pruned Inference-only fields but also
+  pruned `user`, which the derived `/openai/v1/embeddings` endpoint *does*
+  accept and which `agent-framework-openai` and `agent-framework-azure` both
+  forward on the same surface. The two routes now differ in both directions:
+  `input_type` is Models-only, `user` is project-only.
+- **The project embeddings route forwarded Azure AI Inference-only fields.**
+  Selecting the project route changed the URL but not the payload, so
+  `input_type` — an Inference field with no OpenAI equivalent — was still
+  sent to the derived `/openai/v1/embeddings` endpoint, which rejects it.
+  Request properties and the `extra-parameters` pass-through header are now
+  chosen per route.
+- **A failed contextual search discarded the cached profile.** In
+  `FoundryMemoryProvider::before_run`, a transient failure of the second
+  search returned early and dropped the static memories the first had
+  already fetched. It is now treated as an empty contextual result, so the
+  known-good profile is still injected.
+- **A blank `FOUNDRY_PROJECT_ENDPOINT` shadowed the `FOUNDRY_ENDPOINT`
+  alias.** The fallback was selected before the blank check, so an env
+  template declaring the optional variable as `""` suppressed a perfectly
+  good alias. Each candidate is now filtered before the fallback.
+- **A whitespace-only instruction became a contentless system message.**
+  `prepare_messages` skipped `""` but not `" "` or `"\n"`. A real instruction
+  still prepends verbatim (upstream #8524).
+
+### Documentation
+
+- `StandardMagenticManager` now documents that its cached task ledger is
+  shared by every run holding the same manager, and that the two readers of
+  that cache are the plan-review and stall-intervention requests — so
+  concurrent runs can show a human reviewer the other run's plan. Prefer
+  `standard_manager`, which takes the manager by value (upstream #8581).
+
+
 ## [0.8.0] — 2026-09-21
 
 An Azure Cosmos DB vector store and a provider that hands any vector

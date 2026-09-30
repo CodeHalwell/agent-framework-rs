@@ -130,6 +130,10 @@ name = "openai_embeddings"
 path = "providers/openai_embeddings.rs"
 
 [[example]]
+name = "foundry_embeddings"
+path = "providers/foundry_embeddings.rs"
+
+[[example]]
 name = "anthropic"
 path = "providers/anthropic.rs"
 
@@ -328,6 +332,10 @@ path = "hosting/streaming_sse.rs"
 [[example]]
 name = "redis_memory"
 path = "memory/redis_memory.rs"
+
+[[example]]
+name = "foundry_memory"
+path = "memory/foundry_memory.rs"
 
 [[example]]
 name = "mem0_memory"

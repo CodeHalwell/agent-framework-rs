@@ -91,6 +91,7 @@ Studio.
 | `custom_chat_client` | Implementing `ChatClient` for your own backend, and what that owes its callers | offline |
 | `openai_responses` | OpenAI Responses API + `conversation_id` (`previous_response_id`) reuse | `OPENAI_API_KEY` |
 | `openai_embeddings` | `OpenAIEmbeddingClient`: batch text embeddings + cosine similarity (same trait: Azure/Ollama/Mistral) | `OPENAI_API_KEY` |
+| `foundry_embeddings` | `FoundryEmbeddingClient`: Foundry embeddings from a **project** endpoint (derived `/openai/v1` route) or a Models inference endpoint | `FOUNDRY_PROJECT_ENDPOINT` (or `FOUNDRY_MODELS_ENDPOINT`) + `FOUNDRY_EMBEDDING_MODEL` |
 | `openai_compatible_endpoint` | `OpenAIChatCompletionClient` against any OpenAI-Chat-compatible server (llama.cpp, Ollama, vLLM, ...) | `OPENAI_BASE_URL` |
 | `anthropic` | The Anthropic (Claude) Messages API client | `ANTHROPIC_API_KEY` |
 | `anthropic_hosted_tools` | Anthropic hosted web-search / code-execution tools (server-side, no local wiring) | `ANTHROPIC_API_KEY` (skips gracefully) |
@@ -188,10 +189,12 @@ Azure AI Search.
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `redis_memory` | Redis-backed session history (`RedisChatMessageStore`, a `HistoryProvider`) + long-term memory provider | a local Redis server (skips gracefully) |
+| `foundry_memory` | Microsoft Foundry managed memory (`FoundryMemoryProvider`): scope-isolated search + write-back against a project's memory store | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MEMORY_STORE` (skips gracefully) |
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
 | `azure_ai_search_vector_store` | Azure AI Search as a vector store: create the index, upsert records, portable-filtered vector search, keyword-hybrid search | `AZURE_SEARCH_*` (admin key), `OPENAI_API_KEY` (skips gracefully) |
+| `vector_store` | The provider-agnostic `VectorStore` / `VectorCollection` pair over `InMemoryVectorStore`: declare a collection's fields, then upsert, get, filter and search | offline |
 | `cosmos_vector_store` | Azure Cosmos DB (NoSQL) as a vector store: create the container with its vector policy, upsert, portable-filtered `VectorDistance` search, point reads | `AZURE_COSMOS_ENDPOINT`, `AZURE_COSMOS_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `vector_collection_tools` | Hand a vector collection to an agent as tools: scoped search / get / upsert / delete, writes gated on approval | `OPENAI_API_KEY` (skips gracefully) |
 
@@ -235,5 +238,5 @@ calls.
 
 ---
 
-99 examples total. See the root [`README.md`](../README.md) for the
+101 examples total. See the root [`README.md`](../README.md) for the
 project-level overview, feature-flag table, and workspace layout.

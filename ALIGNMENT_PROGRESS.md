@@ -6,8 +6,458 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `6606bef` (2026-09-21).** Sections are newest
+**Current upstream baseline: `dc8e226` (2026-09-28).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
+
+The round below recorded "neither hosting surface serializes tool calls" as
+a capability gap and declined to close it inside a review cycle. The
+repository owner overruled that: close it. This is that work.
+
+### What was broken
+
+Core deliberately leaves a `FunctionCallContent` intact for the *caller* to
+execute — that is the whole point of a client-side tool. Both hosting
+surfaces then serialized only the text:
+
+- `/v1/chat/completions` built its message from `resp.text()`, so a turn
+  whose only content was a call became `content: ""` with no `tool_calls`.
+- `/v1/responses` built exactly one assistant text item, buffered and
+  streaming alike.
+
+The client was told a call had been requested and given nothing to act on:
+no `call_id`, no name, no arguments. The previous round's mitigation was to
+degrade the `tool_calls` finish reason to `stop`, which kept the surface
+honest but left the capability missing.
+
+### What landed
+
+| Surface | Buffered | Streaming |
+|---|---|---|
+| `/v1/chat/completions` | `message.tool_calls` with `id` / `type` / `function.{name,arguments}`; `content: null` for a call-only turn, as OpenAI sends | `delta.tool_calls` fragments keyed by a stable per-`call_id` `index`; the first sighting identifies the call, later ones carry arguments only |
+| `/v1/responses` | `function_call` output items as *siblings* of the message, each with its own item `id` distinct from `call_id` | `response.output_item.added` once per call, then `response.function_call_arguments.delta` per fragment |
+
+Four details were worth getting right rather than approximating:
+
+**Arguments are a JSON string, not an object.** Both wire formats type the
+field as a string and clients `JSON.parse` it. `FunctionArguments` is either
+a raw string (what a provider streams, possibly a fragment) or a parsed
+object, so `util::arguments_string` re-serializes the object case and maps
+absent arguments to `"{}"` rather than `null`.
+
+**A streamed call is one call, not one per fragment.** A provider may stream
+a single call's arguments across several updates. OpenAI's contract is that
+fragments sharing an `index` (chat completions) or an `item_id` (responses)
+concatenate, so both paths remember the calls they have already announced
+and re-announce nothing. Re-sending `id`/`name` per fragment would have a
+strict client either ignore them or read them as further calls.
+
+**The tool finish reason now passes through** whenever the response actually
+carries a call — the promise can be kept. Without one it still degrades to
+`stop` with the provider's reason in `x_finish_reason`, because a turn that
+reports `tool_calls` while declaring none is still an instruction with
+nothing behind it.
+
+**The two Responses paths differ on the message item, deliberately.** The
+buffered path omits it for a call-only turn, as OpenAI does — an empty
+assistant message reads as a blank answer rather than as work to do. The
+streaming path keeps it, because the preamble already announced it at
+`output_index` 0 before any content was known, and every call event numbered
+itself from there; dropping it would shift each call one index away from the
+event that announced it. The terminal payload also reuses the item ids the
+client already saw, or it cannot correlate the two.
+
+### Codex review on the same PR — five findings, all real
+
+The outbound half above shipped first and drew a review. All five findings
+held up, and three of them were in what had just landed.
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| **P1** A resolved call is re-advertised | **Real, and mine.** Core keeps a `FunctionCallContent` *and* its `FunctionResultContent` in the response — after a local tool ran, and when a provider executed a hosted tool itself. `function_calls_of` collected every historical call, so the client was asked to re-run work already done. `FunctionInvokingChatClient` filters exactly this way, for exactly this reason, twenty lines from code I had read: the precedent was already in the repo. | Both surfaces now serialize only calls with no matching result. |
+| **P1** `function_call_output` is not parsed | **Real.** The Responses protocol returns a tool result as a *top-level* item with `call_id` and `output` — no `role`, no `content` — so `item_to_message` turned it into an empty user turn and dropped the result. | `function_call_output` → `FunctionResultContent`, `function_call` → `FunctionCallContent`. |
+| **P1** Chat Completions tool-result messages are not parsed | **Real.** The client's follow-up replays the assistant turn with `tool_calls` and adds a `role: "tool"` message with `tool_call_id`; `IncomingMessage` read neither, and every provider converter builds its wire tool messages from `FunctionResultContent` rather than tool-role text. | `IncomingMessage` gains both fields and rebuilds the call/result contents. |
+| **P2** An argumentless announcement emits `{}` | **Real, and mine.** A streamed call is often announced before any arguments exist — this repository's own Responses parser builds exactly that, `arguments: None`. Mapping it to `"{}"` put a literal `{}` at the head of the fragment sequence, so a client concatenating deltas parsed `{}{"city":"Oslo"}`. | `arguments_delta` returns `None` there; `"{}"` stays the *buffered* default, where it is the whole value rather than the first of several. |
+| **P2** The client ignores `response.incomplete` | **Real, and from the pass above**, which added the event to the host without adding the arm to `parse_responses_event`. A client pointed at this endpoint lost the finish reason, usage and response id for every truncated or filtered stream — exactly what the distinct event name exists to report. | Handled on the same arm as `response.completed`. |
+
+**The first finding turned out to be worse than reported, and the obvious
+fix did not close it.** Filtering per update works on the buffered path,
+where the whole response is in hand. On the streaming path the result
+arrives *after* the call: with local tools,
+`FunctionInvokingChatClient::get_streaming_response` runs the entire loop
+and then replays each message as its own update, so the call update always
+precedes the tool-result update answering it. A per-update filter has
+already put the call on the wire, and no later event can recall it — so the
+common case, an agent with local tools, still told the client to re-execute
+them. A test written to the reported shape passed; one written to the
+replay shape failed.
+
+So the streaming paths now **hold calls until the stream ends** and emit
+only those still unanswered. The cost is that a call's arguments arrive in
+one delta rather than forming incrementally — a presentation detail, since
+a client cannot execute a call before it has the whole argument object.
+Duplicating a tool's side effects is not a presentation detail, which is
+what settles the trade.
+
+### Verification
+
+Twenty-seven tests across both rounds: buffered serialization and
+`content: null`, index stability and fragment reassembly, the function call
+output items, the announce-then-fill event sequence with monotonic sequence
+numbers and id correlation into the terminal payload, the resolved-call
+filter on both surfaces and both paths, both inbound round trips (JSON and
+non-JSON results), the `response.incomplete` terminal arm, and six
+no-regression tests pinning that an ordinary turn is unchanged.
+
+Sixteen mutation probes, each reintroducing one specific bug and each
+failing exactly the test written for it and only that test. Full workspace:
+**2147 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
+clean.
+
+`ResponseObject::output` changes type from `Vec<OutputMessage>` to
+`Vec<OutputItem>`, which is a breaking change for callers that read it;
+`OutputItem::as_message()` recovers the old view.
+
+The lesson, and it is the same one this session keeps relearning: the fix
+was written to the shape the report described rather than to the invariant
+it named. "A resolved call must never be advertised" does not stop being
+true because the result arrives late, and the test that would have caught
+it was the one modelling how the framework actually streams — not the one
+modelling the example in the finding.
+
+## Review round on PR #28 (same upstream baseline, `dc8e226`)
+
+Copilot's review on [#28](https://github.com/CodeHalwell/agent-framework-rs/pull/28)
+raised four findings, two High and two Medium. **All four were real**, and
+two of them were in the two passes above rather than in older code — worth
+recording plainly, because both are the same failure mode: a fix that moved
+a boundary and was written up as if it had removed one.
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| `Value::as_f64` still rounds JSON integers above 2^53, so Hamming equality is not preserved | **Real, and mine.** The pass above widened stored coordinates from `f32` to `f64` and described the class as closed. It was not: `f64` cannot represent `2^53 + 1`, so `2^53` and `2^53 + 1` still collapse and the non-matching record still scores as exact. The write-up was more confident than the change. | Stored coordinates now keep the exact integer JSON carried alongside the `f64` (`Coord`), and Hamming compares in integer space (`i128`, covering all of `i64` and `u64`) while every arithmetic metric keeps using `f64`. Pinned at the 2^53 boundary; disabling the integer path reproduces the old `0.0`-instead-of-`0.5`. The query stays `f32`, which is right for embeddings — the 64-bit case is ids, and those live in the *stored* side. |
+| A shared provider's session-derived scope leaks across runs | **Real, and mine.** The new memory provider documented "one provider serves one logical session" and left nothing enforcing it, while the natural wiring — `Arc` on an agent — shares it. Run B's `before_run` would overwrite the latched session while run A was generating, so A's `after_run` wrote A's messages under **B's scope**; sequential sessions also shared one profile and one cursor. Filing one user's conversation against another's is the worst shape a memory bug takes, and the doc comment was the only thing standing in the way. | State is now a map keyed by scope, so profiles and cursors cannot cross. For `after_run`, which is handed no session at all, the provider writes under a derived scope only while it has seen exactly one; a second session makes any write a guess, so it warns and declines. A configured `with_scope` is unambiguous and keeps working — and the docs now say to set it on a shared provider instead of merely describing the hazard. |
+| `response_to_updates` drops `finish_reason` | **Real, and mine.** The pass above added the field and threaded it through `client.rs`, but `agent.rs`'s helper destructures `AgentResponse` with `..` and rebuilds updates with `..Default::default()`. So the buffered `run_stream` and middleware streaming paths still lost it, and hosting still said `stop` there — the half of the fix that was tested was the half that worked. | The reason rides the final update, and a reason with no messages now emits one, exactly as `client.rs` does. |
+| A blank `FOUNDRY_PROJECT_ENDPOINT` blocks the `FOUNDRY_ENDPOINT` alias | **Real, and mine.** `.ok().or_else(...).filter(...)` checks for blank *after* choosing, so a present-but-empty primary satisfies the fallback and is then discarded, and the alias is never read. The `models_endpoint` line two above it filters correctly, which is what makes this a slip rather than a design choice. | Each candidate is filtered before the fallback. |
+
+**A second Codex round on the fixed head raised three more, all real**, and
+all the same shape as the first batch — a change that handled the cases it
+was written for and defaulted the rest wrongly:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| The Responses surface reports an unfamiliar finish reason as `completed` | **Real.** `incomplete_reason` mapped `content_filter` and `length` and sent everything else to `None`. But `FinishReason` is an open string and providers use it — this port's own Anthropic converter goes out of its way to preserve `model_context_window_exceeded`, with a test pinning that it is no longer flattened. So the abnormal endings most worth reporting were exactly the ones turned back into false successes. Worse, the sibling function `finish_reason_of` on the chat-completions surface already got this right, and its doc comment states the principle — an unfamiliar value a client ignores is recoverable, a wrong familiar one is not. The two surfaces disagreed. | Completion is now an allowlist: absent, `stop` and `tool_calls`. Everything else is incomplete, with OpenAI's spelling for the two it names and the provider's own string otherwise. |
+| The project embeddings route forwards Inference-only request fields | **Real.** Selecting `Route::ProjectOpenAI` changed the URL and nothing else, so `input_type` — an Azure AI Inference field with no OpenAI equivalent — still went to the derived `/openai/v1/embeddings`, which rejects it. The `extra-parameters` pass-through header had the same problem. | Supported properties and that header are now chosen per route. |
+| A failed contextual search discards the cached profile | **Real.** The error branch returned early, which also skipped injecting the static memories the *first* search had already fetched — so a transient failure of the second request threw away known-good context, in a provider whose whole error posture is to degrade rather than fail. | Treated as an empty contextual result; the profile is still injected. |
+
+**A third round on that head raised three more.** All real, and one of them
+is a divergence this port now makes deliberately:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| An `incomplete` response carries a `completed` output item | **Real.** `OutputMessage::assistant_text` hardcodes the item status, and both `responses_from_run` and the DevUI streaming path build their item with it. A client reading item status was told the opposite of what the response said, by the more specific of the two. | The item's status follows the response's, on both paths. |
+| A run with no searchable input loses its memories | **Real, and it was *this port's own* inconsistency.** Upstream returns early here too, so the behaviour was faithful — but the fix one round earlier made the *search-failed* path inject the cached profile, and this path still did not. Two degraded paths, the same profile in hand, opposite answers. Resolved toward injecting in both: a **deliberate divergence from upstream**, recorded here, on the grounds that the profile is already fetched and dropping it silently loses managed memory on a valid run. | Skip the request, keep the injection. |
+| The state lock is held across HTTP calls | **Real, and known when written.** It was accepted for simplicity — but the round before had just made this provider safe to *share*, which makes serializing unrelated scopes behind one lock exactly the wrong trade. | Snapshot under the lock, release, request, re-acquire to record. Two concurrent first-runs for one scope may now both fetch the profile: an idempotent read, against stalling every other session. |
+
+A fourth round raised **one** more, and it is the mirror image of the
+round before: splitting the embedding properties per route pruned
+`input_type` correctly, and pruned `user` with it — but `user` is a field
+OpenAI *defines*, which the derived project endpoint accepts and the Models
+endpoint does not, and which `agent-framework-openai` and
+`agent-framework-azure` already forward on exactly that surface. Having
+noticed that the two routes differ, the fix had only looked in one
+direction. The lists now differ both ways, and the test asserts both.
+
+A fifth round raised three more, **two of them created by the fixes two
+rounds earlier** — which is the honest shape of this exchange and worth
+recording rather than smoothing over:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| A failed concurrent fetch erases the profile | **Real, and caused by my own fix.** Releasing the lock for the request made two first runs for one scope possible; I called that "an idempotent read" in the code comment. It is not idempotent *on failure*: the failing run committed an empty profile over the successful one's and set `initialized`, so nothing re-fetched it and the scope lost its memories for good. | A failure no longer writes `static_memories` at all, and the run reads the entry back rather than trusting its own result. **The first version of this test was vacuous** — with equal delays the harmful ordering is a coin toss, and the test passed against the reintroduced bug. It now forces the failing fetch to commit last. |
+| The scope cache grows without bound | **Real.** Partitioning state by scope — the round-two fix — turned a fixed-size struct into a map with one entry per session and no eviction. | An LRU bounded at 512, overridable. Eviction costs only a re-fetch and a restarted cursor, both already the first-run path. |
+| `incomplete_details.reason` can hold a schema-invalid value | **Real, and in tension with round three.** Round three said: do not swallow abnormal reasons. I satisfied that by passing the provider's string through `incomplete_details.reason` — a field the Responses schema defines as a two-value enum, which a strict generated client can reject outright. Both constraints hold together: the *status* carries the abnormality, the *enum* stays legal. | `is_incomplete` (the status question) is now separate from `incomplete_reason` (the two schema names). An unfamiliar reason yields `incomplete` with no `incomplete_details`, and travels in a new `x_finish_reason` extension. The round-three test asserting the old location was retired, its successor asserting strictly more. |
+
+A sixth round raised two more, **one of them again created by the round
+before it**: separating `is_incomplete` from `incomplete_reason` meant an
+`incomplete` response can now carry no `incomplete_details`, and the DevUI
+terminal event was still keyed on that optional field — so it announced
+`response.completed` around exactly the payloads the separation existed to
+flag. It now follows `status`. The second extends the same closed-enum
+reasoning to the *chat-completions* surface, which had the identical
+problem and which my own doc comment there had argued the other way about:
+an unfamiliar reason is reported as `length` with the raw value in
+`x_finish_reason`, the wrong-familiar-value objection having lost its force
+once the real value stopped being discarded.
+
+A seventh round raised two, and they are one mistake: OpenAI's finish
+vocabulary has **five** values and core's `FinishReason` named four.
+`function_call` — the deprecated spelling of `tool_calls`, and like it a
+*successful* turn — was therefore classed as abnormal by the new
+`is_incomplete` allowlist and rewritten to `length` by the new
+chat-completions mapping, both of which told clients a working tool call
+had been cut off. The `finish_reason_of` doc comment had listed all five
+correctly while its match handled four, which is the whole bug in one line.
+`FinishReason::FUNCTION_CALL` now exists and both surfaces use it.
+
+A third finding in that round — **not delivered as a notification, and
+found only by reading the threads directly** — was the one that mattered:
+two turns on one scope both snapshot `previous_update_id`, both post, and
+one falls out of the service's incremental chain.
+
+That is the third round in which this provider's concurrency model was
+wrong, and the three are one mistake seen from three sides. One lock per
+*provider* is wrong in both positions: held across the requests it
+serializes unrelated scopes (round five), released across them it lets two
+runs for one scope race (rounds six and seven). The unit the operations
+actually need is the **scope**. The provider now takes one lock per scope —
+the provider-wide lock is held only long enough to hand back the scope's —
+so snapshot → request → commit is atomic within a scope while scopes stay
+parallel. That is a root-cause fix rather than a fourth point patch, and it
+retires the duplicate-profile-fetch race this document previously excused
+as "an idempotent read".
+
+An eighth round raised two. One — serialize contextual searches per scope —
+was **already closed by the per-scope locking above**, which landed after
+the commit it reviewed; the same guard covers the search path and the
+update path, which is the point of fixing the shape rather than the site.
+
+The other is the sharpest finding of the whole exchange, because it is
+about a *promise* rather than a value. Reporting `tool_calls` tells a
+client to go and execute the call in `message.tool_calls` — and this host
+serializes text and nothing else, so the client is handed an instruction
+with no id, name or arguments. Before this pass the surface reported
+`stop` for everything, so the bug arrived *with* the finish-reason work:
+making the reason honest made it promise something the surface could not
+keep. Both tool reasons now degrade to `stop` with the real one in
+`x_finish_reason`. Note this partly reverses the round-seven fix, on a
+better argument: that round established `function_call` should not be
+rewritten to `length`, and this one establishes that the destination is
+`stop`, not the reason itself.
+
+A ninth round raised two. One is a defect in the round-seven fix, and the
+code comment I wrote there states the opposite of the truth: it called an
+eviction-while-held harmless, reasoning that the run "completes against
+state nobody reads again". It does not — the *next* run for that scope
+builds a second mutex, races the first, and both resume one cursor, which
+is the fork per-scope locking exists to prevent. Only a slot with no other
+holder is evictable now (`Arc::strong_count == 1`), and a cache whose every
+candidate is busy runs briefly over capacity, because the bound exists to
+stop unbounded growth rather than to be honoured at the cost of
+correctness.
+
+The other extends the tool-call gap below to the Responses surface, where
+it is **pre-existing and untouched by this pass**: `responses_from_run` has
+always built a text-only output item, and a tool turn reported `completed`
+before this work as it does after. Recorded, not fixed here.
+
+A tenth round raised one, and it is the other half of the ninth. Pinning
+in-flight slots lets the cache exceed its bound — fine, provided the
+overrun is temporary, and it was not. Eviction ran only when inserting a
+new scope and dropped at most one slot, so a touch of an existing scope
+trimmed nothing and a new-scope touch removed one and added one. A burst of
+concurrent sessions therefore stayed resident for good, which is the
+unbounded growth the cache was added to prevent, reached by a different
+road. Trimming now runs on every touch and loops until the bound is met.
+
+Worth recording that the first probe for this fix **did not compile** — the
+mutation put a `break` inside an `if` — and produced no output rather than
+a failure, which reads identically to a passing probe if the output is
+skimmed. The second, valid mutation failed at four entries against two.
+That is the second vacuous probe in this exchange; a probe that proves
+nothing is worse than none, because it is recorded as evidence.
+
+### Capability gap recorded, then closed
+
+**Neither hosting surface serialized tool calls.** Core keeps
+`FunctionCallContent` intact for the caller to execute, and
+`completion_object` read only `resp.text()`; the streaming path was the
+same. So a declaration-only call reached the client with no id, name or
+arguments, and the `tool_calls` finish reason had to be degraded to `stop`
+to avoid instructing a client to run something it could not see.
+
+Recorded here as a feature deliberately not bolted on at the end of a
+review cycle — and then built, at the owner's instruction, in the round
+above. Both surfaces now carry the calls; see
+*[Tool-call serialization on both hosting surfaces](#tool-call-serialization-on-both-hosting-surfaces)*.
+
+Thirty-five tests added across the twenty-three findings. Six review rounds;
+**nine of the sixteen findings were in code written earlier in the same
+session**, four of them introduced by the fix for a previous round. The
+pattern is worth stating rather than burying: each fix was locally correct
+and globally incomplete, because it reasoned about the case in front of it
+and not about the invariant it had just changed. Three of the fixes were probed by
+mutation — disabling the integer comparison, the ambiguity detection, or the
+latch each reproduces the reported symptom exactly. Full workspace:
+**2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
+clean.
+
+The lesson worth carrying: three of these four are boundary-moved-not-removed
+or fix-threaded-partway, and in each case the *prose* claimed more than the
+diff delivered. A reviewer caught what the tests did not because the tests
+were written to the same belief as the code.
+
+## Verification pass + the Foundry memory provider (same upstream baseline, `dc8e226`)
+
+A follow-up over the pass above: re-check its six changes against primary
+sources, then spend the rest on the standing-gap list. The re-check held —
+and it turned up that the list's own top entry had been closed off for the
+wrong reason.
+
+### What the re-check confirmed
+
+The riskiest call in the pass above was encoding an empty hosted-MCP
+allowlist as `tool_configuration: {"enabled": false}` rather than upstream's
+literal `allowed_tools: []`. Anthropic's MCP connector documentation settles
+both halves of it. Its migration table off the deprecated beta reads
+`tool_configuration.enabled: false` as a first-class "no tools" and — the
+line that matters — describes **"No `tool_configuration` (all tools
+enabled)"**, which is precisely the inversion the fix removes. So the
+diagnosis was right and the encoding is the documented one, not merely the
+defensible one. The other five were re-read against their diffs; the Hamming
+normalization's one unguarded edge (`a.len()` as a divisor) is unreachable
+because a zero-dimension vector field is rejected at definition validation
+(`vectors.rs:383`).
+
+One genuinely new thing came out of that reading, and it is **not** a bug
+here: `mcp-client-2025-04-04`, the beta this crate sends, is deprecated in
+favour of `mcp-client-2025-11-20`, which moves tool configuration out of
+`mcp_servers[].tool_configuration` and into an `mcp_toolset` entry in
+`tools[]`. Upstream Python sends the same deprecated flag
+(`_chat_client.py`'s `BETA_FLAGS`), so this port is faithful and moving alone
+would be a divergence, not a fix. Recorded below with the mapping so that
+whoever follows upstream across has it ready.
+
+### The standing-gap list was wrong about why it was stuck
+
+Two Azure items — the Foundry memory provider and Content Understanding —
+were recorded as externally blocked on the same premise: the SDKs carrying
+their wire contracts "are not available in this environment", so "the REST
+paths, the api-version and the long-running-operation shape would all be
+guesses."
+
+That premise does not hold: the package index is reachable from this
+environment. `azure-ai-projects` and `azure-ai-contentunderstanding` both
+download and unpack, and their generated request builders state the contract
+outright. The gap was never external; it was an untested assumption, and it
+had been carried forward across passes as settled.
+
+### Ported this pass
+
+| Gap | Change | Rust site |
+|---|---|---|
+| **Foundry managed memory had no provider.** Flagged two passes running as "the most tractable Azure item left", then shelved as unportable. With `azure-ai-projects` readable the contract is explicit: `POST {project_endpoint}/memory_stores/{name}:search_memories` and `:update_memories`, `api-version=v1`, bearer-scoped to `https://ai.azure.com/.default` — already this crate's `FOUNDRY_SCOPE`. Bodies are `{scope, items?, previous_search_id?}` and `{scope, items?, previous_update_id?, update_delay?}` with nulls dropped (the SDK's own `{k: v for k, v in body.items() if v is not None}`); `items` are `{"type":"message","role":…,"content":…}`; the search answers `{search_id, memories[].memory_item.content}`. Three things are faithful rather than invented. The **incremental cursors** only advance on a search that returned something, so an empty answer does not reset where the next one resumes. The **static (user-profile) fetch** runs once per provider and its latch is set even when it *fails*, so an unreachable store costs one request rather than one per run. And **every failure is swallowed and logged**: retrieval and storage are enhancements, and `after_run` also runs on the agent's own failure path, where raising would replace the real error with this one. The one structural divergence is forced by the trait: Python's hooks get a per-run `state` dict and a `SessionContext`, while Rust's `after_run` gets neither — so the cursors, the latch and the session id live in one `Mutex`-guarded struct on the provider, with the session id latched during `before_run` so `after_run` can still resolve a scope. That is the same shape `Mem0Provider` already uses for the same signature gap. Upstream's `begin_update_memories` returns an LRO poller it never polls, reading only `update_id`; the single POST here is exactly that much of the operation. | `foundry/memory.rs` (new), `foundry/lib.rs` |
+
+Ten tests, five of them loopback against a fake data plane on a real socket,
+pinning the routes, the bearer header, the null-dropping, both cursors, the
+once-only static fetch, and that a 500 leaves the run intact. Both halves of
+the risky behaviour were probed by mutation: removing the once-only latch
+breaks the cursor test with the right symptom, and propagating the search
+error instead of logging it breaks the failure test. Full workspace:
+**2093 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
+clean.
+
+### Re-triaged, with the reason corrected
+
+| Gap | Status | Assessment |
+|---|---|---|
+| Foundry — memory provider | ✅ **Closed above** | Was never externally blocked. |
+| Azure AI Content Understanding | ❌, unblocked | `azure-ai-contentunderstanding` reads the same way: `/analyzers`, `/analyzers/{analyzer}`, api-versions `2025-11-01` (GA) and `2026-06-01-preview`. What makes it the larger job is size, not mystery — ~1400 lines upstream across a context provider, a file-search backend pair, and content detection. Now the top item with nothing in its way. |
+| Foundry — evaluations | ❌ | Same SDK, so also readable now; still large, and upstream is still moving it. The "blocked" half of the old reason is gone; the "moving target" half stands. |
+| Anthropic hosted MCP — `mcp-client-2025-11-20` | ❌, deliberate | Not a defect: upstream sends the same deprecated `mcp-client-2025-04-04`, and this port matches it. The mapping when upstream moves: no `tool_configuration` → an `mcp_toolset` with neither `default_config` nor `configs`; `enabled: false` → `default_config.enabled: false`; `allowed_tools: [...]` → `default_config.enabled: false` plus those tools enabled in `configs`. Note the new beta also *requires* the `mcp_toolset` entry — `mcp_servers` alone is rejected — so this is a two-part change, not a rename. |
+| Switch/case predicate cannot report failure (#8490) | ❌ | Re-examined and still declined, now with the blast radius measured: `Condition` returns `bool`, and the `Selection` it feeds returns `Vec<String>`, so neither has an error channel. Making a predicate fallible means widening both public type aliases and every builder that takes one. Worth doing deliberately, not as a side effect of a verification pass. |
+
+## Post-`6606bef` drift + Azure-ecosystem review (checked against `dc8e226`, 2026-09-28)
+
+Upstream moved **89 non-merge commits** in this window (2026-09-21 → 09-28).
+**Six land on this port.** Four of the six are one shape: *a value the code
+already had, and never read.* An explicit empty allowlist read as "no
+allowlist"; a finish reason was carried to the edge of the agent types and
+dropped there; stored vector coordinates were narrowed before being compared
+for equality; a blank instruction was checked for emptiness but not for
+whitespace. None of these fail loudly, and three of them fail in the
+permissive direction — which is why the window reads as small and is not.
+
+The Azure surface accounts for three: a Foundry **project** can now be used
+for embeddings at all, an Azure OpenAI content-filter block is no longer
+reported to hosting clients as a normal completion, and the standing Azure
+table gains one new upstream connector.
+
+### Ported this pass (6 upstream changes, all with regression tests)
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #8576 | **An empty hosted-MCP allowlist enabled every tool on the server.** `allowed_tools: Some(vec![])` means "expose none of this server's tools". The Anthropic converter treated it like `None` and omitted `tool_configuration` entirely, which leaves the API default in place — and the API default is *all tools enabled*. So the one input a caller uses to lock a server down was the input that unlocked it, and a test pinned that behaviour ("…`_is_omitted`"). It is now encoded rather than dropped. Deliberately as `enabled: false` rather than upstream's literal `allowed_tools: []`: only `enabled` has documented semantics for "no tools" on Anthropic's `tool_configuration`, whereas an empty array is undocumented there and could be read back as unset — which would reintroduce the bug in the one place it must not recur. Upstream emits the empty array because the OpenAI/Foundry shape it fixes has no `enabled` field. **The other two providers were already right** and are pinned as negative controls: `openai/responses.rs` emits `[]`, and Foundry and Azure both delegate to it rather than converting for themselves. | `anthropic/convert.rs` (`tools_to_anthropic`) |
+| #8478 | **A turn the model was cut off in was reported as a turn that finished.** Upstream's bug was a hosting loop that never read `AgentResponseUpdate.finish_reason`; here the field **did not exist on the agent types at all**. `AgentResponse::from_chat_response` mapped every other field across and dropped this one, and `into_chat_update` dropped it again on the streaming path — so the aggregation that computes it threw it away immediately afterwards. The consequence is the same in both languages and worst on Azure: `content_filter` (an Azure OpenAI content-filter block) and `length` produce a response whose *text* reads like a finished answer, so an application's only signal was matching the provider's canned refusal string. Three surfaces were wrong as a result. `openai_compat.rs` hardcoded `"finish_reason": "stop"` on both the buffered and streaming paths, asserting normal completion to every OpenAI-compatible client. `responses_from_run` hardcoded `status: "completed"` and had no `incomplete_details` field. And DevUI's terminal event was always `response.completed`. All four now carry the real reason, with `length` mapped to `max_output_tokens` on the Responses surface (the one point the two OpenAI vocabularies disagree) and an unfamiliar provider reason passed through rather than flattened to `stop` — a value a client ignores is recoverable, a wrong familiar one is not. The inbound half already worked: `finish_reason_from_response` has parsed Azure's `incomplete_details.reason` since the Responses client was built, so this closes a round trip rather than opening one. | `core/types/response.rs` (`AgentResponse`, `AgentResponseUpdate`), `hosting/responses.rs` (`IncompleteDetails`, `incomplete_reason`), `hosting/openai_compat.rs` (`finish_reason_of`), `hosting/devui/mod.rs` |
+| #8637 | **Hamming distance could not tell two large integers apart.** Stored vectors were read as `f64` and then narrowed to `f32` before scoring. `f32` carries 24 bits of mantissa, so any two distinct integers above 2^24 — ids, timestamps, hashes, which is exactly what a Hamming collection holds — compared **equal**, and the record that did not match came back scored as an exact match. Hamming is where this surfaces because it is the one metric asking whether coordinates are the *same* rather than how far apart they are. Coordinates are now read at `f64` and the query widened once, which also stops every other metric losing precision it was never meant to lose. Two details ride along. The score is now **normalized** by the vector width, as upstream has it: ranking was unaffected (dividing by a constant is monotonic) but a raw count made `score_threshold` mean a different thing on every collection. And the sibling test that pinned the *old* narrowing — it fed `1e39`, finite in `f64` and infinite in `f32`, to prove a non-finite stored vector is dropped — was rewritten rather than deleted: the property it protects (a score that cannot be serialized is never ranked) is real, but its route is now arithmetic overflow, so it squares `1e200` instead, and a second test pins that `1e39` is ranked normally now. Worth noting the port was *already* ahead of this class elsewhere: `vectors/filters.rs` documents refusing `f64` for integer comparison for the same reason. | `core/vectors.rs` (`score_vectors`, `InMemoryCollection::search`) |
+| #8454 | **A Foundry project could not be used for embeddings.** `FoundryEmbeddingClient` spoke only the Foundry **Models** inference endpoint, a separately-provisioned surface. The endpoint a Foundry user actually has is the *project* endpoint — the one `FoundryChatClient` already takes — so a project holding an embedding deployment still could not be embedded against from here. Upstream's route is now derived: `https://<res>.services.ai.azure.com/api/projects/<proj>` becomes `https://<res>.openai.azure.com/openai/v1`, scoped to the **resource** rather than the project, which is why the project path is dropped. Three details are right rather than plausible. The project route is **path-versioned**, so it must not carry the Models endpoint's `?api-version=` — the same split `FoundryChatClient` handles with `without_api_version`, and the reason `url()` now branches instead of formatting one string. The token audience stays `cognitiveservices.azure.com` (the derived host is Azure OpenAI data plane), *not* `FOUNDRY_SCOPE`. And the project route is **Entra-only**, which is why there is no api-key counterpart. `from_env` prefers the Models endpoint when both are set, so an environment that already worked is untouched, and accepts `FOUNDRY_ENDPOINT` beside `FOUNDRY_PROJECT_ENDPOINT` so one Foundry environment configures both clients — an alias upstream does not need and this crate does, because its chat client reads the other name first. | `foundry/embeddings.rs` (`openai_model_base_url`, `Route`, `with_project_endpoint`, `from_env`) |
+| #8524 | **A whitespace-only instruction became a contentless system turn.** `prepare_messages` skipped `""` but not `" "` or `"\n"`, so a blank instruction — the shape an unset options default or an instruction merge produces — was prepended to the conversation as a system message some providers bill for and others reject. A real instruction still prepends **verbatim**, whitespace included; the trim decides only whether to prepend. | `core/types/message.rs` (`prepare_messages`) |
+| #8581 | **A shared Magentic manager interleaves two runs' plans.** Upstream created a manager per build. Rust's `build(self)` consumes the builder, so the case upstream was fixing cannot arise here — but two others can, and they surface identically: a caller can hand one `Arc` to two builders, and `Workflow::run` takes `&self`, so one Magentic workflow can have two runs in flight. `StandardMagenticManager` caches the decomposed task ledger, and that cache is read back by exactly the two surfaces where being wrong is expensive — the plan-review request and the stall-intervention request — so a human reviewer can be shown, and asked to approve, the *other* run's facts and plan. The runs' own execution state is unaffected; it lives per-run on the orchestrator. **Documented rather than fixed**, which is the honest scope: the fix is to move the cache per-run, and `standard_manager` (which takes the manager by value, so each builder owns one) is already the shape that avoids it. Recorded below as a standing gap. | `core/workflow/orchestration/magentic.rs` (docs on `StandardMagenticManager`, `manager`, `standard_manager`) |
+
+Verified across all six: full workspace build, `cargo test --workspace
+--all-features` (**2082 passing, 0 failing**), `cargo clippy --all-targets
+--all-features` under `-D warnings` (CI's own flag) clean, `cargo fmt --check`
+clean, `cargo doc --workspace` clean.
+
+Each behavioural test was probed against the code it pins rather than merely
+written beside it. Restoring the `f32` narrowing fails the Hamming test with
+exactly the old wrong answer (`0.0` where the record differs, against the
+expected `0.5`). Restoring `if !instr.is_empty()` fails the blank-instruction
+test on the first whitespace case. Zeroing either `finish_reason` hand-off —
+the buffered one or the streamed one — fails its own test while the
+negative control still passes. The Anthropic allowlist test is the previous
+behaviour's own test rewritten in place, so it fails against the code it used
+to pass against, which is the strongest form this probe takes. Negative
+controls throughout: an *absent* allowlist still emits no `tool_configuration`,
+a `stop` / `tool_calls` / unreported run still serializes with no
+`incomplete_details` key, a run with no finish reason still grows no
+`finish_reason` key, the Foundry Models route still carries its
+`?api-version=`, and a real instruction still prepends with its whitespace
+intact.
+
+One test-only fault was found and fixed while adding the Foundry tests: the
+crate's `temp_env_absent` helper mutates process-global environment variables
+and had only ever had one caller, so a second one raced it under the default
+multi-threaded harness — passing alone and failing in the suite. It now takes
+a lock, and recovers a poisoned one so a single panicking test does not fail
+every other.
+
+### The Azure-ecosystem review
+
+Rechecked against the standing table in the previous section; **one row is
+new** and two changed.
+
+| Azure surface | Upstream | Here | Change this pass |
+|---|---|---|---|
+| Foundry — embeddings | ✅ | ✅ (was 🚧) | **Closed for text.** Project endpoints now work (above). What remains of the old 🚧 is the *image* half only: upstream splits a batch across an image-embeddings endpoint, which the core `EmbeddingClient` signature (`Vec<String>`) cannot express without widening a shared trait. That is a core change, not a Foundry one. |
+| Azure OpenAI — content filter, reported to hosting clients | ✅ | ✅ (was ❌, untracked) | **Closed.** A filtered turn reaches an OpenAI-compatible client as `content_filter` / `incomplete` rather than as a normal stop (above). No table row tracked this before, because the inbound parse was right and only the outbound half was wrong. |
+| Azure SQL / SQL Server native vector store | ✅ (`sql-server`, #8686, new this window) | ❌ | **New gap.** SQL Server 2025 / Azure SQL's native `VECTOR` type as a `VectorStore` pair. Genuinely portable in shape — the `VectorStore`/`VectorCollection` traits and the portable filter compiler both already exist, and the Cosmos and AI Search collections are the template — but blocked in this workspace the same way MongoDB and DocumentDB are: it speaks **TDS**, and there is no TDS driver here. Unlike those two the block is soft (`tiberius` is a pure-Rust async TDS client that supports Azure SQL and Entra auth), so this is a dependency decision rather than an impossibility. Recorded, not attempted: a connector aimed at a wire protocol this workspace cannot exercise would be untestable. |
+| Azure DocumentDB | ✅ | ❌ | Unchanged. #8654 (null fields in membership filters) lands on a connector that does not exist here, still blocked on the MongoDB wire protocol. |
+| Foundry hosting | ✅ | ❌ | Unchanged. #8565 (no `response.completed` after a cancelled run) is a `foundry_hosting` change; standing gap. |
+
+Everything else in the standing table is unchanged. The largest unblocked
+Azure item remains **Azure AI Content Understanding** — a REST surface, so
+portable, and still the biggest one not waiting on something else.
+
+### Standing gaps this pass surfaced (not closed)
+
+- **A switch/case predicate cannot report failure** (#8490). Upstream stopped
+  swallowing predicate exceptions, which were routing a broken predicate's
+  message to the default branch — silent misrouting rather than a visible
+  failure. The port has no analogue to *remove*, because `Condition` returns
+  `bool`: there is no error channel, so a fallible predicate (one that
+  deserializes the payload, say) has nowhere to put the error and must return
+  `false` — which produces exactly the behaviour upstream just fixed. Closing
+  it means widening `Condition` to `Result<bool>`, a breaking change across
+  every builder method that takes one.
+- **Magentic's task-ledger cache is per-manager, not per-run** (#8581, above).
+  Documented this pass; the fix is to move the cache onto the run.
+- **The in-memory vector search clones every record before paging** (#8544).
+  Upstream narrowed its `deepcopy` to the requested page. Here the whole
+  collection is cloned out under the lock before scoring, so the equivalent
+  saving is larger — but it is a performance property of a store meant for
+  tests and development, not a correctness one.
 
 ## Post-`061dc28` drift + Azure-ecosystem review (checked against `6606bef`, 2026-09-21)
 
