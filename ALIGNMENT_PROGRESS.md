@@ -101,7 +101,36 @@ parallel. That is a root-cause fix rather than a fourth point patch, and it
 retires the duplicate-profile-fetch race this document previously excused
 as "an idempotent read".
 
-Thirty-two tests added across the nineteen findings. Six review rounds;
+An eighth round raised two. One — serialize contextual searches per scope —
+was **already closed by the per-scope locking above**, which landed after
+the commit it reviewed; the same guard covers the search path and the
+update path, which is the point of fixing the shape rather than the site.
+
+The other is the sharpest finding of the whole exchange, because it is
+about a *promise* rather than a value. Reporting `tool_calls` tells a
+client to go and execute the call in `message.tool_calls` — and this host
+serializes text and nothing else, so the client is handed an instruction
+with no id, name or arguments. Before this pass the surface reported
+`stop` for everything, so the bug arrived *with* the finish-reason work:
+making the reason honest made it promise something the surface could not
+keep. Both tool reasons now degrade to `stop` with the real one in
+`x_finish_reason`. Note this partly reverses the round-seven fix, on a
+better argument: that round established `function_call` should not be
+rewritten to `length`, and this one establishes that the destination is
+`stop`, not the reason itself.
+
+### Capability gap recorded, not closed
+
+**The OpenAI-compatible host does not serialize tool calls.** Core keeps
+`FunctionCallContent` intact for the caller to execute, and
+`completion_object` reads only `resp.text()`; the streaming path is the
+same. Making `/v1/chat/completions` support tool calling — `message.tool_calls`
+on the buffered path, incremental `tool_calls` deltas on the streaming one —
+is a feature this surface has never had, not a defect introduced here, and
+deliberately not bolted on at the end of a review cycle. The degradation
+above is what keeps the surface honest until it is built.
+
+Thirty-three tests added across the twenty findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same
 session**, four of them introduced by the fix for a previous round. The
 pattern is worth stating rather than burying: each fix was locally correct

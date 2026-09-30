@@ -104,6 +104,13 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **A tool finish reason was advertised without the tool calls.** Reporting
+  `tool_calls` / `function_call` tells a client to execute the call in
+  `message.tool_calls`, and the OpenAI-compatible host serializes text only
+  — so the client was handed an instruction with no id, name or arguments.
+  Those two reasons now degrade to `stop` with the real one in
+  `x_finish_reason`, until the surface can serialize the calls it is
+  promising. (Recorded as a capability gap, not a permanent answer.)
 - **Concurrent turns on one memory scope forked the update chain.** The
   provider snapshotted `previous_update_id`, released its lock for the
   request and wrote back, so two turns for the same scope both resumed from

@@ -229,16 +229,7 @@ async fn an_unfamiliar_finish_reason_stays_inside_the_closed_enum() {
 /// extension field to explain away.
 #[tokio::test]
 async fn schema_named_finish_reasons_pass_through_unchanged() {
-    // Five, not four: `function_call` is deprecated but still schema-valid,
-    // and rewriting it to `length` told clients a successful tool turn had
-    // been truncated.
-    for reason in [
-        "stop",
-        "length",
-        "content_filter",
-        "tool_calls",
-        "function_call",
-    ] {
+    for reason in ["stop", "length", "content_filter"] {
         let agent = MockAgent::new("a1").with_finish_reason(reason).arc();
         let router = OpenAiRouter::for_agent("assistant", agent).into_router();
         let body =
@@ -249,6 +240,35 @@ async fn schema_named_finish_reasons_pass_through_unchanged() {
         assert!(
             resp["choices"][0]["x_finish_reason"].is_null(),
             "{reason} needs no approximation"
+        );
+    }
+}
+
+/// A tool finish reason is a promise that `message.tool_calls` carries a
+/// call to execute. This surface serializes text only, so advertising it
+/// would hand the client an instruction with no id, name or arguments. It
+/// degrades to `stop` with the real reason preserved instead.
+#[tokio::test]
+async fn a_tool_finish_reason_is_not_advertised_without_the_calls() {
+    for reason in ["tool_calls", "function_call"] {
+        let agent = MockAgent::new("a1").with_finish_reason(reason).arc();
+        let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+        let body =
+            json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+        let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+        let choice = &resp["choices"][0];
+        assert!(
+            choice["message"]["tool_calls"].is_null(),
+            "precondition: this surface does not serialize tool calls"
+        );
+        assert_eq!(
+            choice["finish_reason"], "stop",
+            "{reason} must not be advertised without the calls it promises"
+        );
+        assert_eq!(
+            choice["x_finish_reason"], reason,
+            "and the real reason is still reported"
         );
     }
 }

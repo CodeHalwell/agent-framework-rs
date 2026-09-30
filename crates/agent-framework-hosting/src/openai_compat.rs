@@ -245,9 +245,13 @@ fn completion_object(
 ///
 /// The wire field is a **closed** set (`stop` / `length` / `tool_calls` /
 /// `content_filter` / `function_call`), and the core vocabulary now names
-/// all five, so a known reason passes straight through. This comment listed
-/// five while the match handled four, which is how `function_call` — a
-/// *successful* tool turn — came to be reported as a truncation. A provider-specific
+/// all five. Three of them pass straight through.
+///
+/// The two tool reasons do not, for a different reason than legality: they
+/// are a *promise* that `message.tool_calls` carries a call to execute, and
+/// this surface does not serialize one. They degrade to `stop`, with the
+/// real reason preserved, rather than instructing a client to run something
+/// it cannot see. A provider-specific
 /// one cannot — Anthropic's converter deliberately preserves
 /// `model_context_window_exceeded` — because a generated client whose enum
 /// is strict can reject the entire response over a value outside that set,
@@ -268,8 +272,17 @@ fn finish_reason_of(finish_reason: Option<&FinishReason>) -> (&'static str, Opti
         FinishReason::STOP => (FinishReason::STOP, None),
         FinishReason::LENGTH => (FinishReason::LENGTH, None),
         FinishReason::CONTENT_FILTER => (FinishReason::CONTENT_FILTER, None),
-        FinishReason::TOOL_CALLS => (FinishReason::TOOL_CALLS, None),
-        FinishReason::FUNCTION_CALL => (FinishReason::FUNCTION_CALL, None),
+        // A tool reason is a *promise*: it tells the client to go and
+        // execute the call in `message.tool_calls`. This surface has never
+        // serialized those — `completion_object` emits text and nothing else
+        // — so advertising it hands the client an instruction with no id,
+        // name or arguments to act on, which is worse than under-reporting.
+        // Degraded to `stop` with the real reason alongside, until the
+        // surface can actually back the promise; when it can, these two
+        // should pass through like the rest.
+        FinishReason::TOOL_CALLS | FinishReason::FUNCTION_CALL => {
+            (FinishReason::STOP, Some(reason))
+        }
         other => (FinishReason::LENGTH, Some(other)),
     }
 }
