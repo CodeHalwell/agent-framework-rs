@@ -106,7 +106,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-openai`](crates/agent-framework-openai) | OpenAI Chat Completions and Responses API clients (also for OpenAI-compatible endpoints). |
 | [`agent-framework-anthropic`](crates/agent-framework-anthropic) | Anthropic (Claude) Messages API client. |
 | [`agent-framework-azure`](crates/agent-framework-azure) | Azure OpenAI client + the Entra ID credential chain (CLI / client-secret / managed-identity / chained). |
-| [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`), client-side Prompt Agents (`FoundryAgent`), and embeddings (`FoundryEmbeddingClient`) over either a Models inference endpoint or a project's OpenAI deployments. |
+| [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`), client-side Prompt Agents (`FoundryAgent`), embeddings (`FoundryEmbeddingClient`) over either a Models inference endpoint or a project's OpenAI deployments, and managed memory (`FoundryMemoryProvider`). |
 | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search: context provider (semantic + optional vector query) and vector store (index management, document CRUD, filtered vector and keyword-hybrid search). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
@@ -201,7 +201,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `hosting` | [`agent-framework-hosting`](crates/agent-framework-hosting) — serve agents over HTTP (DevUI-style, A2A, AG-UI, OpenAI-compatible) | no |
 | `redis` | [`agent-framework-redis`](crates/agent-framework-redis) — Redis chat-message store & context provider | no |
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
-| `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, and embeddings | no |
+| `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, embeddings, and managed memory | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store, checkpoints, and vector store | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
@@ -304,9 +304,9 @@ section (the current source of truth). The remaining gaps:
 - [ ] Vector connectors upstream added alongside the portable filter:
       PostgreSQL/pgvector, Qdrant, Redis HASH/JSON, and SQL Server / Azure SQL
       native vector (the last needs a TDS driver this workspace does not have)
-- [ ] Azure: a Content Understanding context provider, the Foundry memory
-      provider, Foundry evaluations, and the image half of Foundry embeddings
-      (the text half, over both endpoints, ships)
+- [ ] Azure: a Content Understanding context provider, Foundry evaluations,
+      and the image half of Foundry embeddings (the text half, over both
+      endpoints, ships; the Foundry memory provider ships)
 - [ ] The upstream Copilot-Studio declarative *workflow* DSL (declarative
       agents already follow the official schema)
 - [ ] Purview: protection-scopes precheck/caching, background

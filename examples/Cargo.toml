@@ -334,6 +334,10 @@ name = "redis_memory"
 path = "memory/redis_memory.rs"
 
 [[example]]
+name = "foundry_memory"
+path = "memory/foundry_memory.rs"
+
+[[example]]
 name = "mem0_memory"
 path = "memory/mem0_memory.rs"
 

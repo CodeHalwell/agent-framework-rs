@@ -22,6 +22,17 @@ against the old raw count needs dividing by the vector width.
 
 ### Added
 
+- **Microsoft Foundry managed memory** (`FoundryMemoryProvider`, `foundry`
+  crate). A `ContextProvider` that searches a Foundry memory store for
+  relevant memories before a run and writes the turn back after it, spoken
+  directly against the project data plane
+  (`{endpoint}/memory_stores/{name}:search_memories` and `:update_memories`,
+  `api-version=v1`, bearer-scoped to `FOUNDRY_SCOPE`). Memories are isolated
+  by scope — `with_scope` pins one, otherwise the session id is used, and
+  nothing is read or written when neither is available. Search and update
+  cursors chain incrementally, the user-profile fetch happens once per
+  provider, and every service failure is logged rather than raised, since
+  `after_run` also runs on the agent's own failure path.
 - **Foundry embeddings from a project endpoint.** `FoundryEmbeddingClient`
   previously spoke only the Foundry *Models* inference endpoint, so a Foundry
   project holding an embedding deployment could not be embedded against

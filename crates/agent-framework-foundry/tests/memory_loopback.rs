@@ -1,0 +1,257 @@
+//! Hermetic loopback tests for [`FoundryMemoryProvider`]: a fake Foundry
+//! projects data plane on a bare `std::net::TcpListener` exercises the real
+//! `reqwest` path — the two `:search_memories` / `:update_memories` routes,
+//! the bearer token, the request bodies (including the null-dropping the
+//! service contract specifies), and the incremental search/update cursors.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+
+use agent_framework_azure::StaticTokenCredential;
+use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::types::Message;
+use agent_framework_foundry::FoundryMemoryProvider;
+use serde_json::Value;
+
+#[derive(Clone, Debug)]
+struct Recorded {
+    start_line: String,
+    headers: HashMap<String, String>,
+    body: Value,
+}
+
+/// Serve `responses` in order, one per connection, recording each request.
+fn server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let writer = seen.clone();
+    std::thread::spawn(move || {
+        for (status, body) in responses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (mut header_end, mut content_length) = (None, 0usize);
+            loop {
+                let Ok(n) = stream.read(&mut chunk) else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos);
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                        content_length = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                }
+                if let Some(pos) = header_end {
+                    if buf.len() >= pos + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, req_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+            let mut lines = head.lines();
+            let start_line = lines.next().unwrap_or_default().to_string();
+            let headers = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            writer.lock().unwrap().push(Recorded {
+                start_line,
+                headers,
+                body: serde_json::from_str(req_body).unwrap_or(Value::Null),
+            });
+            let reason = if status == 200 { "OK" } else { "ERR" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+fn search_body(search_id: &str, contents: &[&str]) -> String {
+    let memories: Vec<Value> = contents
+        .iter()
+        .map(|c| serde_json::json!({"memory_item": {"content": c}}))
+        .collect();
+    serde_json::json!({"search_id": search_id, "memories": memories, "usage": {}}).to_string()
+}
+
+fn provider(endpoint: &str) -> FoundryMemoryProvider {
+    FoundryMemoryProvider::new(
+        endpoint,
+        "store",
+        Arc::new(StaticTokenCredential::new("tok")),
+    )
+}
+
+/// `before_run` makes two calls on the first run: the static (profile) fetch
+/// with no `items`, then the contextual search with them. Both carry the
+/// bearer token and the `:search_memories` route, and the retrieved memories
+/// arrive as one injected message behind the context prompt.
+#[tokio::test]
+async fn before_run_fetches_static_then_contextual_memories_and_injects_them() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s-static", &["lives in Leeds"])),
+        (200, search_body("s-ctx", &["prefers metric units"])),
+    ]);
+    let p = provider(&endpoint);
+    let mut ctx = SessionContext::new(vec![Message::user("how far is it?")]);
+    ctx.session_id = Some("sess-1".into());
+
+    p.before_run(&mut ctx).await.expect("before_run");
+
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2, "one static fetch, one contextual search");
+
+    assert!(
+        reqs[0]
+            .start_line
+            .contains("/memory_stores/store:search_memories?api-version=v1"),
+        "{}",
+        reqs[0].start_line
+    );
+    assert_eq!(reqs[0].headers.get("authorization").unwrap(), "Bearer tok");
+    // The static fetch is scope-only: no `items`, and no cursor yet.
+    assert_eq!(reqs[0].body["scope"], serde_json::json!("sess-1"));
+    assert!(reqs[0].body.get("items").is_none());
+    assert!(reqs[0].body.get("previous_search_id").is_none());
+
+    // The contextual search carries the turn as one message item.
+    assert_eq!(
+        reqs[1].body["items"][0]["type"],
+        serde_json::json!("message")
+    );
+    assert_eq!(reqs[1].body["items"][0]["role"], serde_json::json!("user"));
+    assert_eq!(
+        reqs[1].body["items"][0]["content"],
+        serde_json::json!("how far is it?")
+    );
+
+    assert_eq!(ctx.messages.len(), 1);
+    let injected = ctx.messages[0].text();
+    assert!(injected.starts_with("## Memories"), "{injected}");
+    assert!(injected.contains("lives in Leeds"));
+    assert!(injected.contains("prefers metric units"));
+}
+
+/// The incremental cursors: a search id is sent on the next contextual
+/// search, and the static fetch happens once per provider rather than once
+/// per run.
+#[tokio::test]
+async fn the_search_cursor_advances_and_the_static_fetch_happens_once() {
+    let (endpoint, seen) = server(vec![
+        (200, search_body("s-static", &["a"])),
+        (200, search_body("s-1", &["b"])),
+        (200, search_body("s-2", &["c"])),
+    ]);
+    let p = provider(&endpoint);
+
+    for text in ["first", "second"] {
+        let mut ctx = SessionContext::new(vec![Message::user(text)]);
+        ctx.session_id = Some("sess-1".into());
+        p.before_run(&mut ctx).await.expect("before_run");
+    }
+
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3, "the static fetch must not repeat");
+    assert!(reqs[1].body.get("previous_search_id").is_none());
+    assert_eq!(
+        reqs[2].body["previous_search_id"],
+        serde_json::json!("s-1"),
+        "the second search resumes from the first's id"
+    );
+}
+
+/// `after_run` writes the turn back and remembers the update id for the next
+/// write, so updates chain incrementally.
+#[tokio::test]
+async fn after_run_posts_the_turn_and_chains_the_update_cursor() {
+    let (endpoint, seen) = server(vec![
+        (200, r#"{"update_id":"u-1","status":"queued"}"#.to_string()),
+        (200, r#"{"update_id":"u-2","status":"queued"}"#.to_string()),
+    ]);
+    let p = provider(&endpoint)
+        .with_scope("user-42")
+        .with_update_delay(0);
+
+    let req = [Message::user("remember I like tea")];
+    let resp = [Message::assistant("noted")];
+    p.after_run(&req, &resp, None).await.expect("after_run");
+    p.after_run(&req, &resp, None).await.expect("after_run");
+
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[0]
+            .start_line
+            .contains("/memory_stores/store:update_memories?api-version=v1"),
+        "{}",
+        reqs[0].start_line
+    );
+    // The pinned scope wins over the (absent) session id.
+    assert_eq!(reqs[0].body["scope"], serde_json::json!("user-42"));
+    assert_eq!(reqs[0].body["update_delay"], serde_json::json!(0));
+    assert_eq!(reqs[0].body["items"].as_array().unwrap().len(), 2);
+    assert!(reqs[0].body.get("previous_update_id").is_none());
+    assert_eq!(reqs[1].body["previous_update_id"], serde_json::json!("u-1"));
+}
+
+/// Memory is an enhancement: a store returning 500 must leave the run intact
+/// rather than surfacing as the agent's error. `after_run` in particular also
+/// runs on the failure path, where raising would mask the real error.
+#[tokio::test]
+async fn a_failing_store_does_not_fail_the_run() {
+    let (endpoint, _seen) = server(vec![
+        (500, r#"{"error":"boom"}"#.to_string()),
+        (500, r#"{"error":"boom"}"#.to_string()),
+        (500, r#"{"error":"boom"}"#.to_string()),
+    ]);
+    let p = provider(&endpoint).with_scope("user-42");
+
+    let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+    p.before_run(&mut ctx)
+        .await
+        .expect("before_run must not fail");
+    assert!(
+        ctx.messages.is_empty(),
+        "nothing to inject when search fails"
+    );
+
+    p.after_run(&[Message::user("hi")], &[], None)
+        .await
+        .expect("after_run must not fail");
+}
+
+/// A run with nothing worth storing makes no call at all — an empty `items`
+/// array would be a wasted round trip the service has nothing to do with.
+#[tokio::test]
+async fn a_turn_with_no_storable_text_makes_no_update_call() {
+    let (endpoint, seen) = server(vec![(200, r#"{"update_id":"u-1"}"#.to_string())]);
+    let p = provider(&endpoint).with_scope("user-42");
+
+    p.after_run(&[Message::system("you are helpful")], &[], None)
+        .await
+        .expect("after_run");
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a system-only turn has nothing to store"
+    );
+}

@@ -189,6 +189,7 @@ Azure AI Search.
 | Example | Shows | Requires |
 | --- | --- | --- |
 | `redis_memory` | Redis-backed session history (`RedisChatMessageStore`, a `HistoryProvider`) + long-term memory provider | a local Redis server (skips gracefully) |
+| `foundry_memory` | Microsoft Foundry managed memory (`FoundryMemoryProvider`): scope-isolated search + write-back against a project's memory store | `FOUNDRY_PROJECT_ENDPOINT`, `FOUNDRY_MEMORY_STORE` (skips gracefully) |
 | `mem0_memory` | Hosted Mem0 long-term memory: persist and retrieve memories per user | `MEM0_API_KEY`, `OPENAI_API_KEY` (skips gracefully) |
 | `cosmos_store` | Azure Cosmos DB (NoSQL) conversation store (works against the emulator too) | `COSMOS_ENDPOINT`, `COSMOS_KEY` (skips gracefully) |
 | `azure_ai_search` | Azure AI Search hybrid/semantic search as a long-term-memory `ContextProvider` | `AZURE_SEARCH_*`, `OPENAI_API_KEY` (skips gracefully) |
@@ -237,5 +238,5 @@ calls.
 
 ---
 
-100 examples total. See the root [`README.md`](../README.md) for the
+101 examples total. See the root [`README.md`](../README.md) for the
 project-level overview, feature-flag table, and workspace layout.

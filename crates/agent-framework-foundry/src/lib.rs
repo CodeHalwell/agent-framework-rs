@@ -73,9 +73,11 @@
 //! ```
 
 pub mod embeddings;
+pub mod memory;
 mod tool_definition_wire;
 
 pub use embeddings::FoundryEmbeddingClient;
+pub use memory::FoundryMemoryProvider;
 
 use std::sync::Arc;
 
