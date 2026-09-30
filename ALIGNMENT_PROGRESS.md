@@ -34,7 +34,16 @@ was written for and defaulted the rest wrongly:
 | The project embeddings route forwards Inference-only request fields | **Real.** Selecting `Route::ProjectOpenAI` changed the URL and nothing else, so `input_type` — an Azure AI Inference field with no OpenAI equivalent — still went to the derived `/openai/v1/embeddings`, which rejects it. The `extra-parameters` pass-through header had the same problem. | Supported properties and that header are now chosen per route. |
 | A failed contextual search discards the cached profile | **Real.** The error branch returned early, which also skipped injecting the static memories the *first* search had already fetched — so a transient failure of the second request threw away known-good context, in a provider whose whole error posture is to degrade rather than fail. | Treated as an empty contextual result; the profile is still injected. |
 
-Eleven tests added across the seven findings. Three of the fixes were probed by
+**A third round on that head raised three more.** All real, and one of them
+is a divergence this port now makes deliberately:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| An `incomplete` response carries a `completed` output item | **Real.** `OutputMessage::assistant_text` hardcodes the item status, and both `responses_from_run` and the DevUI streaming path build their item with it. A client reading item status was told the opposite of what the response said, by the more specific of the two. | The item's status follows the response's, on both paths. |
+| A run with no searchable input loses its memories | **Real, and it was *this port's own* inconsistency.** Upstream returns early here too, so the behaviour was faithful — but the fix one round earlier made the *search-failed* path inject the cached profile, and this path still did not. Two degraded paths, the same profile in hand, opposite answers. Resolved toward injecting in both: a **deliberate divergence from upstream**, recorded here, on the grounds that the profile is already fetched and dropping it silently loses managed memory on a valid run. | Skip the request, keep the injection. |
+| The state lock is held across HTTP calls | **Real, and known when written.** It was accepted for simplicity — but the round before had just made this provider safe to *share*, which makes serializing unrelated scopes behind one lock exactly the wrong trade. | Snapshot under the lock, release, request, re-acquire to record. Two concurrent first-runs for one scope may now both fetch the profile: an idempotent read, against stalling every other session. |
+
+Fifteen tests added across the ten findings. Three of the fixes were probed by
 mutation — disabling the integer comparison, the ambiguity detection, or the
 latch each reproduces the reported symptom exactly. Full workspace:
 **2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`

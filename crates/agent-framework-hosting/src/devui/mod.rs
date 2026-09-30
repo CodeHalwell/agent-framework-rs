@@ -350,10 +350,14 @@ impl AgentStreamFraming {
         // The streamed response item id (`mid`) was already announced in the
         // preamble; use it here too instead of `responses_from_run`'s freshly
         // generated one, so the completed event refers to the same item.
+        // Rebuilding the item here would otherwise reset its status to
+        // `completed`, contradicting an `incomplete` response on the
+        // streaming path only.
         completed.output = vec![OutputMessage::assistant_text(
             self.mid.clone(),
             completed.output_text.clone().unwrap_or_default(),
-        )];
+        )
+        .with_status(completed.status)];
         if completed.usage.is_none() {
             let output_len = completed.output_text.as_deref().unwrap_or_default().len();
             completed.usage = Some(usage_estimate(self.input_len, output_len));

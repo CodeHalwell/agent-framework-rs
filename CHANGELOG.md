@@ -82,6 +82,20 @@ against the old raw count needs dividing by the vector width.
   as `stop`/`completed` on those paths. It now rides the final update, and a
   reason with no messages emits one, matching what `client.rs` does for
   `ChatResponse`.
+- **An incomplete response carried a completed output item.**
+  `OutputMessage::assistant_text` hardcodes `status: "completed"`, so a
+  truncated or filtered response contained a message item claiming it
+  finished — on the buffered and DevUI streaming paths alike. The item's
+  status now follows its response's.
+- **A run with no searchable input lost its memories.** An instruction-only
+  run, or one carrying only system turns, returned from
+  `FoundryMemoryProvider::before_run` before injecting the profile already
+  fetched for its scope. The contextual search is still skipped (there is
+  nothing to search with); the injection is not.
+- **The memory provider held its state lock across HTTP calls**, so one slow
+  scope stalled every other session sharing the provider. It now snapshots
+  under the lock, releases it for the request, and re-acquires to record the
+  result.
 - **An unfamiliar finish reason was reported as a completed turn.** The
   Responses surface mapped only `content_filter` and `length`, defaulting
   everything else to `completed`. `FinishReason` is an open string and

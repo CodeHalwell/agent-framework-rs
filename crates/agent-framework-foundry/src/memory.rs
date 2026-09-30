@@ -368,94 +368,101 @@ fn message_items(messages: &[Message]) -> Vec<Value> {
 #[async_trait]
 impl ContextProvider for FoundryMemoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
-        let mut state = self.state.lock().await;
-        if let Some(id) = ctx.session_id.as_deref() {
-            state.sessions.observe(id);
-        }
-        // An explicit scope is authoritative; otherwise this run's own
-        // session id, which is unambiguous here because the context names it.
-        let Some(scope) = self.resolve_scope(ctx.session_id.as_deref()) else {
-            self.warn_no_scope();
-            return Ok(());
+        // The lock is taken only to snapshot and to mutate, never across a
+        // request. One provider is meant to be shared, so holding it through
+        // two HTTP round trips would let one slow scope stall every other.
+        // The cost is that two concurrent first-runs for the *same* scope can
+        // both fetch the profile — an idempotent read, and a much better
+        // trade than serializing unrelated sessions.
+        let (scope, needs_static, previous_search_id, mut statics) = {
+            let mut state = self.state.lock().await;
+            if let Some(id) = ctx.session_id.as_deref() {
+                state.sessions.observe(id);
+            }
+            // An explicit scope is authoritative; otherwise this run's own
+            // session id, which is unambiguous here because the context
+            // names it.
+            let Some(scope) = self.resolve_scope(ctx.session_id.as_deref()) else {
+                self.warn_no_scope();
+                return Ok(());
+            };
+            let entry = state.scopes.entry(scope.clone()).or_default();
+            (
+                scope,
+                !entry.initialized,
+                entry.previous_search_id.clone(),
+                entry.static_memories.clone(),
+            )
         };
-        let entry = state.scopes.entry(scope.clone()).or_default();
 
         // First run *for this scope*: fetch its static memories (user
         // profile). The latch is set even on failure, as upstream does, so
         // one unreachable store does not mean one failed request per run
         // forever.
-        if !entry.initialized {
-            match self.search(&scope, None, None).await {
-                Ok(result) => {
-                    state
-                        .scopes
-                        .entry(scope.clone())
-                        .or_default()
-                        .static_memories = result.contents
-                }
+        if needs_static {
+            let fetched = match self.search(&scope, None, None).await {
+                Ok(result) => result.contents,
                 Err(e) => {
                     tracing::warn!(error = %e, "Foundry memory: static memory retrieval failed");
-                    state
-                        .scopes
-                        .entry(scope.clone())
-                        .or_default()
-                        .static_memories
-                        .clear();
+                    Vec::new()
                 }
-            }
-            state.scopes.entry(scope.clone()).or_default().initialized = true;
+            };
+            let mut state = self.state.lock().await;
+            let entry = state.scopes.entry(scope.clone()).or_default();
+            entry.static_memories.clone_from(&fetched);
+            entry.initialized = true;
+            statics = fetched;
         }
 
+        // The contextual search needs something to search *with*. An
+        // instruction-only run, or one carrying nothing but system or tool
+        // turns, has nothing — but the profile fetched above still belongs in
+        // the context, so this skips the request rather than the injection.
+        // (Upstream returns outright here, losing the profile; that made the
+        // empty-input path disagree with the search-failed path immediately
+        // below, which does inject it.)
         let items = message_items(&ctx.input_messages);
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let previous = state
-            .scopes
-            .get(&scope)
-            .and_then(|e| e.previous_search_id.clone());
-        let contextual = match self.search(&scope, Some(items), previous.as_deref()).await {
-            Ok(result) => {
-                // Upstream advances the incremental cursor only when the
-                // search actually returned something, so an empty answer does
-                // not reset the next search's starting point.
-                if !result.contents.is_empty() {
-                    if let Some(id) = result.search_id {
-                        state
-                            .scopes
-                            .entry(scope.clone())
-                            .or_default()
-                            .previous_search_id = Some(id);
+        let contextual = if items.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .search(&scope, Some(items), previous_search_id.as_deref())
+                .await
+            {
+                Ok(result) => {
+                    // Upstream advances the incremental cursor only when the
+                    // search actually returned something, so an empty answer
+                    // does not reset the next search's starting point.
+                    if !result.contents.is_empty() {
+                        if let Some(id) = result.search_id {
+                            let mut state = self.state.lock().await;
+                            state
+                                .scopes
+                                .entry(scope.clone())
+                                .or_default()
+                                .previous_search_id = Some(id);
+                        }
                     }
+                    result.contents
                 }
-                result.contents
-            }
-            Err(e) => {
-                // Retrieval is an enhancement: a memory store that is down
-                // must not take the agent down with it. Returning here would
-                // also drop the static memories already fetched for this
-                // scope, so a transient failure of the *second* request threw
-                // away the profile the *first* had succeeded in getting.
-                // Treat it as an empty contextual result and carry on.
-                tracing::warn!(error = %e, "Foundry memory: contextual search failed");
-                Vec::new()
+                Err(e) => {
+                    // Retrieval is an enhancement: a memory store that is
+                    // down must not take the agent down with it, and must not
+                    // cost the run a profile already in hand.
+                    tracing::warn!(error = %e, "Foundry memory: contextual search failed");
+                    Vec::new()
+                }
             }
         };
 
-        let mut all = state
-            .scopes
-            .get(&scope)
-            .map(|e| e.static_memories.clone())
-            .unwrap_or_default();
-        all.extend(contextual);
-        if all.is_empty() {
+        statics.extend(contextual);
+        if statics.is_empty() {
             return Ok(());
         }
         ctx.messages.push(Message::user(format!(
             "{}\n{}",
             self.context_prompt,
-            all.join("\n")
+            statics.join("\n")
         )));
         Ok(())
     }
@@ -466,18 +473,26 @@ impl ContextProvider for FoundryMemoryProvider {
         response_messages: &[Message],
         _error: Option<&Error>,
     ) -> Result<()> {
-        let mut state = self.state.lock().await;
-        // This call carries no session, so the scope must come from
-        // configuration or from the one session this provider has seen.
-        // Writing under a guessed scope would file one user's conversation
-        // against another's, so ambiguity means not writing.
-        let Some(scope) = self
-            .scope
-            .clone()
-            .or_else(|| state.sessions.unambiguous().map(str::to_string))
-        else {
-            self.warn_no_scope();
-            return Ok(());
+        // Same discipline as `before_run`: snapshot, release, then request.
+        let (scope, previous_update_id) = {
+            let state = self.state.lock().await;
+            // This call carries no session, so the scope must come from
+            // configuration or from the one session this provider has seen.
+            // Writing under a guessed scope would file one user's
+            // conversation against another's, so ambiguity means not writing.
+            let Some(scope) = self
+                .scope
+                .clone()
+                .or_else(|| state.sessions.unambiguous().map(str::to_string))
+            else {
+                self.warn_no_scope();
+                return Ok(());
+            };
+            let previous = state
+                .scopes
+                .get(&scope)
+                .and_then(|e| e.previous_update_id.clone());
+            (scope, previous)
         };
 
         let mut all: Vec<Message> = request_messages.to_vec();
@@ -490,11 +505,7 @@ impl ContextProvider for FoundryMemoryProvider {
         let mut body = Map::new();
         body.insert("scope".into(), json!(scope));
         body.insert("items".into(), json!(items));
-        if let Some(id) = state
-            .scopes
-            .get(&scope)
-            .and_then(|e| e.previous_update_id.clone())
-        {
+        if let Some(id) = previous_update_id {
             body.insert("previous_update_id".into(), json!(id));
         }
         if let Some(delay) = self.update_delay {
@@ -504,6 +515,7 @@ impl ContextProvider for FoundryMemoryProvider {
         match self.post("update_memories", &Value::Object(body)).await {
             Ok(value) => {
                 if let Some(id) = value.get("update_id").and_then(Value::as_str) {
+                    let mut state = self.state.lock().await;
                     state.scopes.entry(scope).or_default().previous_update_id =
                         Some(id.to_string());
                 }

@@ -119,6 +119,19 @@ impl OutputMessage {
             status: "completed",
         }
     }
+
+    /// Mark this item with the status of the response carrying it.
+    ///
+    /// An item's status has to agree with its response's: a `completed`
+    /// message inside an `incomplete` response tells a client that inspects
+    /// item status the opposite of what the response says, and the item is
+    /// the more specific of the two. [`Self::assistant_text`] builds a
+    /// completed item because that is the common case; this is how a
+    /// truncated or filtered one says so.
+    pub fn with_status(mut self, status: &'static str) -> Self {
+        self.status = status;
+        self
+    }
 }
 
 /// Why a response stopped short of a complete answer — mirrors OpenAI
@@ -323,20 +336,23 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
     // the provider's canned refusal string as the only way to tell, so the
     // status and `incomplete_details` carry it instead.
     let incomplete = incomplete_reason(resp.finish_reason.as_ref());
+    let status = if incomplete.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
     ResponseObject {
         id: id.to_string(),
         object: "response",
         created_at: crate::util::now_ts(),
         model: model.to_string(),
-        status: if incomplete.is_some() {
-            "incomplete"
-        } else {
-            "completed"
-        },
+        status,
         incomplete_details: incomplete.map(|reason| IncompleteDetails {
             reason: reason.to_string(),
         }),
-        output: vec![OutputMessage::assistant_text(mid, text.clone())],
+        // The item's status follows the response's: the two disagreeing is
+        // worse than either being wrong alone.
+        output: vec![OutputMessage::assistant_text(mid, text.clone()).with_status(status)],
         output_text: Some(text),
         usage: resp.usage_details.as_ref().map(usage_from_details),
         outputs: None,
@@ -403,6 +419,28 @@ mod tests {
             finish_reason: reason,
             ..Default::default()
         }
+    }
+
+    /// An item's status has to agree with its response's. A `completed`
+    /// message inside an `incomplete` response tells a client that reads item
+    /// status the opposite of what the response says.
+    #[test]
+    fn the_output_item_status_follows_the_response_status() {
+        let cut_off = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::LENGTH))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(cut_off.status, "incomplete");
+        assert_eq!(cut_off.output[0].status, "incomplete");
+
+        let finished = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::STOP))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.output[0].status, "completed");
     }
 
     /// `FinishReason` is an open string, and providers use it: Anthropic's

@@ -22,6 +22,58 @@ struct Recorded {
     body: Value,
 }
 
+/// Read one HTTP request off a stream, honouring `Content-Length`.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<Recorded> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let (mut header_end, mut content_length) = (None, 0usize);
+    loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos);
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                content_length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        if let Some(pos) = header_end {
+            if buf.len() >= pos + 4 + content_length {
+                break;
+            }
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let (head, req_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let mut lines = head.lines();
+    let start_line = lines.next().unwrap_or_default().to_string();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    Some(Recorded {
+        start_line,
+        headers,
+        body: serde_json::from_str(req_body).unwrap_or(Value::Null),
+    })
+}
+
+fn write_response(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+    let reason = if status == 200 { "OK" } else { "ERR" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
 /// Serve `responses` in order, one per connection, recording each request.
 fn server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -33,53 +85,44 @@ fn server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Recorded>>>) 
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let (mut header_end, mut content_length) = (None, 0usize);
-            loop {
-                let Ok(n) = stream.read(&mut chunk) else {
+            let Some(req) = read_request(&mut stream) else {
+                return;
+            };
+            writer.lock().unwrap().push(req);
+            write_response(&mut stream, status, &body);
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Like [`server`], but each connection is handled on its own thread and the
+/// reply is delayed. Serving concurrently is the point: a sequential server
+/// would serialize the clients by itself and the test could not tell that
+/// apart from the provider serializing them.
+fn slow_server(
+    responses: Vec<(u16, String)>,
+    delay: std::time::Duration,
+) -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let writer = seen.clone();
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { return };
+            let writer = writer.clone();
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                let Some(req) = read_request(&mut stream) else {
                     return;
                 };
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos);
-                        let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
-                        content_length = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                    }
-                }
-                if let Some(pos) = header_end {
-                    if buf.len() >= pos + 4 + content_length {
-                        break;
-                    }
-                }
-            }
-            let raw = String::from_utf8_lossy(&buf).to_string();
-            let (head, req_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-            let mut lines = head.lines();
-            let start_line = lines.next().unwrap_or_default().to_string();
-            let headers = lines
-                .filter_map(|l| l.split_once(':'))
-                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-                .collect();
-            writer.lock().unwrap().push(Recorded {
-                start_line,
-                headers,
-                body: serde_json::from_str(req_body).unwrap_or(Value::Null),
+                writer.lock().unwrap().push(req);
+                let next = queue.lock().unwrap().pop_front();
+                let (status, body) = next.unwrap_or((200, "{}".to_string()));
+                std::thread::sleep(delay);
+                write_response(&mut stream, status, &body);
             });
-            let reason = if status == 200 { "OK" } else { "ERR" };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            let _ = stream.write_all(response.as_bytes());
         }
     });
     (format!("http://{addr}"), seen)
@@ -379,4 +422,63 @@ async fn a_failed_contextual_search_still_injects_the_cached_profile() {
         "the profile survives the contextual failure"
     );
     assert!(ctx.messages[0].text().contains("lives in Leeds"));
+}
+
+/// A run with no storable input — instruction-only, or carrying nothing but
+/// system turns — has nothing to search *with*, but the profile already
+/// fetched for the scope still belongs in its context. Skipping the request
+/// is right; skipping the injection loses managed memory on a valid run.
+#[tokio::test]
+async fn a_run_with_no_searchable_input_still_gets_the_profile() {
+    let (endpoint, seen) = server(vec![(200, search_body("s-static", &["lives in Leeds"]))]);
+    let p = provider(&endpoint).with_scope("user-42");
+
+    let mut ctx = SessionContext::new(vec![Message::system("you are helpful")]);
+    p.before_run(&mut ctx).await.expect("before_run");
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "only the static fetch — there is nothing to search with"
+    );
+    assert_eq!(ctx.messages.len(), 1, "the profile is still injected");
+    assert!(ctx.messages[0].text().contains("lives in Leeds"));
+}
+
+/// The provider is built to be shared, so it must not hold its one lock
+/// across a request: a slow scope would stall every unrelated one. Two
+/// concurrent runs against a server that answers slowly should overlap
+/// rather than serialize.
+#[tokio::test]
+async fn concurrent_runs_on_different_scopes_are_not_serialized() {
+    // Four slow responses: a static fetch per scope, then a search per scope.
+    let (endpoint, _seen) = slow_server(
+        vec![
+            (200, search_body("s1", &["a"])),
+            (200, search_body("s2", &["b"])),
+            (200, search_body("s3", &["c"])),
+            (200, search_body("s4", &["d"])),
+        ],
+        std::time::Duration::from_millis(120),
+    );
+    let p = std::sync::Arc::new(provider(&endpoint));
+
+    let run = |scope: &'static str| {
+        let p = p.clone();
+        async move {
+            let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+            ctx.session_id = Some(scope.into());
+            p.before_run(&mut ctx).await.expect("before_run");
+        }
+    };
+
+    let started = std::time::Instant::now();
+    tokio::join!(run("alice"), run("bob"));
+    let elapsed = started.elapsed();
+
+    // Serialized, the two runs' four requests cost ~480ms; overlapped, ~240ms.
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "runs on different scopes serialized: {elapsed:?}"
+    );
 }
