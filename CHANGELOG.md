@@ -7,8 +7,13 @@ may break APIs).
 
 ## [Unreleased]
 
-Four values the code already had and never read, plus a Foundry surface it
-could not reach. Three of the four failed in the permissive direction.
+## [0.9.0] — 2026-09-30
+
+Four values the code already had and never read, a Foundry surface it could
+not reach, and tool calls that neither hosting surface put on the wire.
+Nearly all of it failed in the permissive direction: a cut-off turn reported
+as a completed one, a blocked prompt reported as an answer, a hosted MCP
+allowlist of none reported as all.
 
 **Breaking, in three places.** `AgentResponse` and `AgentResponseUpdate` each
 gain a `finish_reason` field, so a struct literal for either without
