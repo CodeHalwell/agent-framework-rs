@@ -16,7 +16,8 @@ use agent_framework_core::agent::{AgentRunOptions, AgentRunStream, SupportsAgent
 use agent_framework_core::error::Result;
 use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::{
-    AgentResponse, AgentResponseUpdate, Content, Message, Role, UsageDetails,
+    AgentResponse, AgentResponseUpdate, Content, FinishReason, FunctionArguments,
+    FunctionCallContent, Message, Role, UsageDetails,
 };
 use agent_framework_core::workflow::{FunctionExecutor, Workflow, WorkflowBuilder};
 
@@ -257,6 +258,193 @@ impl SupportsAgentRun for MockAgent {
 
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+}
+
+/// An agent whose turn declares function calls for the *caller* to execute —
+/// what a real agent produces when its tools are client-side.
+///
+/// `run` returns them all on one assistant message. `run_stream` replays a
+/// script of `(call_id, name, argument_fragment)` updates, so a test can
+/// exercise a call whose arguments arrive across several updates, which is
+/// the shape that makes streaming indices and item ids matter.
+pub struct ToolCallingAgent {
+    id: String,
+    text: String,
+    calls: Vec<(String, String, String)>,
+    stream_script: Vec<StreamStep>,
+    finish_reason: Option<String>,
+}
+
+/// One scripted streaming update: either text, or an argument fragment for a
+/// call named by `call_id`.
+pub enum StreamStep {
+    Text(String),
+    Call {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+impl ToolCallingAgent {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            text: String::new(),
+            calls: Vec::new(),
+            stream_script: Vec::new(),
+            finish_reason: None,
+        }
+    }
+
+    /// Assistant text accompanying the calls. Left empty, the turn is calls
+    /// only — the case where OpenAI sends `content: null`.
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    /// Declare a call on the buffered turn. `arguments` is a raw JSON string,
+    /// as a provider streams it.
+    pub fn with_call(
+        mut self,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        self.calls
+            .push((call_id.into(), name.into(), arguments.into()));
+        self
+    }
+
+    pub fn with_finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.finish_reason = Some(reason.into());
+        self
+    }
+
+    /// Script the streaming path explicitly. Without one, `run_stream` emits
+    /// the text and then each call as a single whole update.
+    pub fn streaming(mut self, script: Vec<StreamStep>) -> Self {
+        self.stream_script = script;
+        self
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+
+    fn reason(&self) -> Option<FinishReason> {
+        self.finish_reason.as_deref().map(FinishReason::new)
+    }
+
+    fn call_contents(&self) -> Vec<Content> {
+        self.calls
+            .iter()
+            .map(|(call_id, name, arguments)| {
+                Content::FunctionCall(FunctionCallContent::new(
+                    call_id,
+                    name,
+                    Some(FunctionArguments::Raw(arguments.clone())),
+                ))
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for ToolCallingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        let mut contents = Vec::new();
+        if !self.text.is_empty() {
+            contents.push(Content::text(&self.text));
+        }
+        contents.extend(self.call_contents());
+        Ok(AgentResponse {
+            messages: vec![Message {
+                role: Role::assistant(),
+                contents,
+                author_name: None,
+                message_id: None,
+                additional_properties: Default::default(),
+            }],
+            finish_reason: self.reason(),
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        let mut script: Vec<StreamStep> = Vec::new();
+        if self.stream_script.is_empty() {
+            if !self.text.is_empty() {
+                script.push(StreamStep::Text(self.text.clone()));
+            }
+            for (call_id, name, arguments) in &self.calls {
+                script.push(StreamStep::Call {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+            }
+        } else {
+            for step in &self.stream_script {
+                script.push(match step {
+                    StreamStep::Text(t) => StreamStep::Text(t.clone()),
+                    StreamStep::Call {
+                        call_id,
+                        name,
+                        arguments,
+                    } => StreamStep::Call {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                });
+            }
+        }
+
+        let last = script.len().saturating_sub(1);
+        let reason = self.reason();
+        let updates: Vec<Result<AgentResponseUpdate>> = script
+            .into_iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let contents = match step {
+                    StreamStep::Text(text) => vec![Content::text(text)],
+                    StreamStep::Call {
+                        call_id,
+                        name,
+                        arguments,
+                    } => vec![Content::FunctionCall(FunctionCallContent::new(
+                        call_id,
+                        name,
+                        Some(FunctionArguments::Raw(arguments)),
+                    ))],
+                };
+                Ok(AgentResponseUpdate {
+                    contents,
+                    role: Some(Role::assistant()),
+                    // Only the last update carries the reason, as
+                    // `response_to_updates` does.
+                    finish_reason: (i == last).then(|| reason.clone()).flatten(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 }
 

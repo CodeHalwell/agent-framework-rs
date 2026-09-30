@@ -53,8 +53,8 @@ use agent_framework_core::workflow::WorkflowEvent;
 
 use crate::registry::{AgentRecord, EntityRecord, HostState, WorkflowRecord};
 use crate::responses::{
-    openai_error, responses_from_run, responses_to_run, InputTokensDetails, OutputMessage,
-    OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
+    openai_error, responses_from_run, responses_to_run, InputTokensDetails, OutputItem,
+    OutputMessage, OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
 };
 use crate::sse::{sse_response, sse_response_stream};
 use crate::util;
@@ -278,6 +278,10 @@ struct AgentStreamFraming {
     /// Updates collected so the terminal `response.completed` can aggregate the
     /// full text and usage via [`AgentResponse::from_updates`].
     collected: Vec<AgentResponseUpdate>,
+    /// Function calls announced so far, as `(call_id, item_id)` in the order
+    /// they appeared. The message occupies `output_index` 0, so a call's
+    /// index is its position here plus one.
+    calls: Vec<(String, String)>,
 }
 
 impl AgentStreamFraming {
@@ -289,6 +293,7 @@ impl AgentStreamFraming {
             mid: util::msg_id(),
             seq: 0,
             collected: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -326,21 +331,63 @@ impl AgentStreamFraming {
     /// text (otherwise nothing). The update is retained for final aggregation.
     fn push_update(&mut self, update: &AgentResponseUpdate) -> Vec<Value> {
         self.collected.push(update.clone());
+        let mut events = Vec::new();
+
         let delta = update.text();
-        if delta.is_empty() {
-            return Vec::new();
+        if !delta.is_empty() {
+            let mid = self.mid.clone();
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": mid,
+                "delta": delta,
+                "logprobs": [],
+                "sequence_number": seq,
+            }));
         }
-        let mid = self.mid.clone();
-        let seq = self.next();
-        vec![json!({
-            "type": "response.output_text.delta",
-            "output_index": 0,
-            "content_index": 0,
-            "item_id": mid,
-            "delta": delta,
-            "logprobs": [],
-            "sequence_number": seq,
-        })]
+
+        // A declaration-only call is a sibling output item: announced when
+        // first seen, then fed argument fragments. A provider may stream one
+        // call across several updates, and re-announcing the item each time
+        // would read to a client as several distinct calls.
+        for call in util::function_calls(&update.contents) {
+            let arguments = util::arguments_string(call);
+            let (output_index, item_id) =
+                match self.calls.iter().position(|(id, _)| *id == call.call_id) {
+                    Some(position) => (position + 1, self.calls[position].1.clone()),
+                    None => {
+                        let item_id = util::msg_id();
+                        self.calls.push((call.call_id.clone(), item_id.clone()));
+                        let output_index = self.calls.len();
+                        let seq = self.next();
+                        events.push(json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "sequence_number": seq,
+                            "item": {
+                                "type": "function_call",
+                                "id": item_id,
+                                "call_id": call.call_id,
+                                "name": call.name,
+                                "arguments": "",
+                                "status": "in_progress",
+                            }
+                        }));
+                        (output_index, item_id)
+                    }
+                };
+            let seq = self.next();
+            events.push(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": output_index,
+                "item_id": item_id,
+                "delta": arguments,
+                "sequence_number": seq,
+            }));
+        }
+        events
     }
 
     /// The terminal `response.completed`, aggregating all collected updates.
@@ -350,14 +397,39 @@ impl AgentStreamFraming {
         // The streamed response item id (`mid`) was already announced in the
         // preamble; use it here too instead of `responses_from_run`'s freshly
         // generated one, so the completed event refers to the same item.
-        // Rebuilding the item here would otherwise reset its status to
-        // `completed`, contradicting an `incomplete` response on the
-        // streaming path only.
-        completed.output = vec![OutputMessage::assistant_text(
-            self.mid.clone(),
-            completed.output_text.clone().unwrap_or_default(),
-        )
-        .with_status(completed.status)];
+        // Only the *message* item is rebuilt; any function-call items
+        // `responses_from_run` produced are carried through, or the
+        // streaming path would drop the calls the buffered one reports.
+        // Rebuilding also has to preserve the status, or it would reset to
+        // `completed` and contradict an `incomplete` response on this path
+        // alone.
+        //
+        // The message item is emitted unconditionally here, unlike on the
+        // buffered path, which omits it for a turn that is only a call. The
+        // preamble already announced it at `output_index` 0 before any
+        // content was known, and every call event numbered itself from
+        // there; dropping it now would shift each call one index away from
+        // the event that announced it.
+        let text = completed.output_text.clone().unwrap_or_default();
+        let status = completed.status;
+        let mut output = Vec::with_capacity(self.calls.len() + 1);
+        output.push(OutputItem::Message(
+            OutputMessage::assistant_text(self.mid.clone(), text).with_status(status),
+        ));
+        // Reuse the item ids already announced, for the same reason the
+        // message does: a client correlating the terminal payload with the
+        // events it saw must find the same ids.
+        let mut announced = self.calls.iter().map(|(_, item)| item.clone());
+        output.extend(completed.output.into_iter().filter_map(|item| match item {
+            OutputItem::Message(_) => None,
+            OutputItem::FunctionCall(mut call) => {
+                if let Some(id) = announced.next() {
+                    call.id = id;
+                }
+                Some(OutputItem::FunctionCall(call))
+            }
+        }));
+        completed.output = output;
         if completed.usage.is_none() {
             let output_len = completed.output_text.as_deref().unwrap_or_default().len();
             completed.usage = Some(usage_estimate(self.input_len, output_len));
@@ -434,9 +506,14 @@ async fn run_workflow(
 
 /// Build the aggregated (non-streaming) response for a workflow run.
 fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str) -> ResponseObject {
-    let output: Vec<OutputMessage> = outputs
+    let output: Vec<OutputItem> = outputs
         .iter()
-        .map(|o| OutputMessage::assistant_text(util::msg_id(), value_to_text(o)))
+        .map(|o| {
+            OutputItem::Message(OutputMessage::assistant_text(
+                util::msg_id(),
+                value_to_text(o),
+            ))
+        })
         .collect();
     let text = outputs
         .iter()
@@ -507,9 +584,14 @@ fn workflow_stream_events(
     }
 
     // Completed response aggregates the workflow outputs.
-    let output: Vec<OutputMessage> = outputs
+    let output: Vec<OutputItem> = outputs
         .iter()
-        .map(|o| OutputMessage::assistant_text(util::msg_id(), value_to_text(o)))
+        .map(|o| {
+            OutputItem::Message(OutputMessage::assistant_text(
+                util::msg_id(),
+                value_to_text(o),
+            ))
+        })
         .collect();
     let text = outputs
         .iter()

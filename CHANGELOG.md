@@ -10,10 +10,13 @@ may break APIs).
 Four values the code already had and never read, plus a Foundry surface it
 could not reach. Three of the four failed in the permissive direction.
 
-**Breaking, in two places.** `AgentResponse` and `AgentResponseUpdate` each
+**Breaking, in three places.** `AgentResponse` and `AgentResponseUpdate` each
 gain a `finish_reason` field, so a struct literal for either without
 `..Default::default()` needs it. `agent_framework_hosting::ResponseObject`
-gains `incomplete_details` on the same terms.
+gains `incomplete_details` on the same terms, and its `output` changes from
+`Vec<OutputMessage>` to `Vec<OutputItem>` now that a response can carry
+function calls beside its message — `OutputItem::as_message()` recovers the
+old view.
 
 **One behaviour change worth calling out.** The in-memory vector store's
 `hamming` score is now the *fraction* of differing coordinates rather than the
@@ -46,6 +49,24 @@ against the old raw count needs dividing by the vector width.
   reads `FOUNDRY_PROJECT_ENDPOINT` (and `FOUNDRY_ENDPOINT`, the name
   `FoundryChatClient` takes first) and still prefers `FOUNDRY_MODELS_ENDPOINT`
   when both are set (upstream #8454).
+- **Tool calls on both hosting surfaces.** Core leaves a
+  `FunctionCallContent` intact for the caller to execute, but neither host
+  put it on the wire: `/v1/chat/completions` and `/v1/responses` serialized
+  text only, so a client was told a call had been requested and given no id,
+  name or arguments to act on. `/v1/chat/completions` now emits
+  `message.tool_calls` (with `content: null` for a call-only turn, as OpenAI
+  sends) and, when streaming, `delta.tool_calls` fragments keyed by a stable
+  per-call `index`. `/v1/responses` now emits `function_call` output items
+  as siblings of the assistant message, announced once over the stream as
+  `response.output_item.added` and then fed
+  `response.function_call_arguments.delta`. A call streamed across several
+  updates is announced once and reassembled by index/item id, per OpenAI's
+  delta contract, and the terminal payload reuses the ids the client already
+  saw. Arguments go out as a JSON *string* on both surfaces, as the wire
+  format has it. Consequently a `tool_calls` / `function_call` finish reason
+  now passes through whenever the response actually carries a call, instead
+  of degrading to `stop`; it still degrades when the turn declares none.
+- `agent_framework_hosting::{OutputItem, OutputFunctionCall}`.
 - `AgentResponse::finish_reason` / `AgentResponseUpdate::finish_reason`, and
   `incomplete_details` on the hosting `ResponseObject`.
 

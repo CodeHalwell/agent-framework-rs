@@ -9,6 +9,11 @@
 //! standalone conversion surface any host — not just [`crate::devui`] — can use
 //! to speak the OpenAI Responses wire shape.
 //!
+//! A response's `output` is heterogeneous, as OpenAI's is: an assistant
+//! message and a function call are sibling [`OutputItem`]s rather than a
+//! message with calls attached, so a turn that declares client-side calls
+//! carries each one's id, name and arguments for the caller to execute.
+//!
 //! [`crate::devui`] is the only current caller; it layers DevUI-specific
 //! concerns (entity routing, the `~4-chars-per-token` usage estimate for runs
 //! that report no usage, SSE framing) on top of this module.
@@ -94,6 +99,98 @@ impl OutputText {
             content_type: "output_text",
             text: text.into(),
             annotations: Vec::new(),
+        }
+    }
+}
+
+/// Assemble a response's `output`: the assistant message when there is text
+/// to carry, then one item per declared function call.
+///
+/// A turn that is only a call gets no message item. OpenAI omits it, and an
+/// empty assistant message would read to a client as a blank answer rather
+/// than as work to do.
+pub(crate) fn output_items(
+    text: &str,
+    calls: &[&agent_framework_core::types::FunctionCallContent],
+    message_id: String,
+    status: &'static str,
+) -> Vec<OutputItem> {
+    let mut items = Vec::with_capacity(calls.len() + 1);
+    if !text.is_empty() || calls.is_empty() {
+        items.push(OutputItem::Message(
+            OutputMessage::assistant_text(message_id, text).with_status(status),
+        ));
+    }
+    items.extend(
+        calls
+            .iter()
+            .map(|c| OutputItem::FunctionCall(OutputFunctionCall::new(c))),
+    );
+    items
+}
+
+/// One entry of a response's `output` array.
+///
+/// OpenAI's Responses output is heterogeneous: an assistant message and a
+/// function call are *sibling items*, not a message with calls attached (the
+/// shape Chat Completions uses). Untagged, because each variant already
+/// carries its own `type` discriminator.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum OutputItem {
+    Message(OutputMessage),
+    FunctionCall(OutputFunctionCall),
+}
+
+impl OutputItem {
+    /// This item as an assistant message, or `None` if it is a call.
+    pub fn as_message(&self) -> Option<&OutputMessage> {
+        match self {
+            Self::Message(message) => Some(message),
+            Self::FunctionCall(_) => None,
+        }
+    }
+
+    /// This item as a function call, or `None` if it is a message.
+    pub fn as_function_call(&self) -> Option<&OutputFunctionCall> {
+        match self {
+            Self::FunctionCall(call) => Some(call),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<OutputMessage> for OutputItem {
+    fn from(message: OutputMessage) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A function call the caller is expected to execute — mirrors OpenAI
+/// `ResponseFunctionToolCall`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputFunctionCall {
+    #[serde(rename = "type")]
+    pub item_type: &'static str,
+    pub id: String,
+    /// The provider's id for the call, which the caller echoes back on the
+    /// result. Distinct from `id`, which names this output item.
+    pub call_id: String,
+    pub name: String,
+    /// A JSON **string**, as the wire format has it — not an object.
+    pub arguments: String,
+    pub status: &'static str,
+}
+
+impl OutputFunctionCall {
+    pub fn new(call: &agent_framework_core::types::FunctionCallContent) -> Self {
+        Self {
+            item_type: "function_call",
+            id: crate::util::msg_id(),
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            arguments: crate::util::arguments_string(call),
+            status: "completed",
         }
     }
 }
@@ -208,7 +305,7 @@ pub struct ResponseObject {
     /// whereas an unknown *enum value* can sink the whole response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_finish_reason: Option<String>,
-    pub output: Vec<OutputMessage>,
+    pub output: Vec<OutputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,6 +456,7 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
     // in its text alone. Reporting it as `completed` left a caller matching
     // the provider's canned refusal string as the only way to tell, so the
     // status and `incomplete_details` carry it instead.
+    let calls = crate::util::function_calls_of(&resp.messages);
     let incomplete = is_incomplete(resp.finish_reason.as_ref());
     let status = if incomplete {
         "incomplete"
@@ -383,7 +481,12 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
         x_finish_reason: raw_reason,
         // The item's status follows the response's: the two disagreeing is
         // worse than either being wrong alone.
-        output: vec![OutputMessage::assistant_text(mid, text.clone()).with_status(status)],
+        //
+        // A declaration-only call is a sibling item, not an attachment to
+        // the message, and a turn that is *only* a call carries no message
+        // item at all — an empty assistant message would read as a blank
+        // answer rather than as a call to execute.
+        output: output_items(&text, &calls, mid, status),
         output_text: Some(text),
         usage: resp.usage_details.as_ref().map(usage_from_details),
         outputs: None,
@@ -527,7 +630,7 @@ mod tests {
             "gpt-4o",
         );
         assert_eq!(cut_off.status, "incomplete");
-        assert_eq!(cut_off.output[0].status, "incomplete");
+        assert_eq!(cut_off.output[0].as_message().unwrap().status, "incomplete");
 
         let finished = responses_from_run(
             &run_finishing_with(Some(FinishReason::new(FinishReason::STOP))),
@@ -535,7 +638,7 @@ mod tests {
             "gpt-4o",
         );
         assert_eq!(finished.status, "completed");
-        assert_eq!(finished.output[0].status, "completed");
+        assert_eq!(finished.output[0].as_message().unwrap().status, "completed");
     }
 
     /// The other half of that allowlist: the two reasons that really are
@@ -662,7 +765,10 @@ mod tests {
         assert_eq!(obj.status, "completed");
         assert_eq!(obj.output_text.as_deref(), Some("hello there"));
         assert_eq!(obj.output.len(), 1);
-        assert_eq!(obj.output[0].content[0].text, "hello there");
+        assert_eq!(
+            obj.output[0].as_message().unwrap().content[0].text,
+            "hello there"
+        );
         let usage = obj.usage.expect("usage present");
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 5);

@@ -11,6 +11,13 @@
 //!   OpenAI streaming protocol.
 //! - `usage` uses the agent's reported token counts when available, otherwise a
 //!   ~4-chars-per-token estimate.
+//!
+//! # Tool calls
+//! A turn whose agent declares client-side calls serializes them as
+//! `message.tool_calls` (buffered) or `delta.tool_calls` fragments keyed by
+//! a stable per-call `index` (streaming), so the client receives the id,
+//! name and arguments it needs to execute them. Arguments go out as a JSON
+//! *string*, as the wire format has it.
 
 use std::sync::Arc;
 
@@ -132,6 +139,11 @@ async fn chat_completions(
                         // a stream. Held across the loop so the terminal chunk
                         // can report it instead of asserting `"stop"`.
                         let mut finish_reason: Option<FinishReason> = None;
+                        // `call_id`s in the order they were first seen. A
+                        // streamed call arrives as fragments sharing one id,
+                        // and OpenAI keys its deltas by a stable `index`, so
+                        // the position here *is* that index.
+                        let mut call_index: Vec<String> = Vec::new();
                         while let Some(item) = stream.next().await {
                             match item {
                                 Ok(update) => {
@@ -153,6 +165,22 @@ async fn chat_completions(
                                     {
                                         return;
                                     }
+                                    let deltas =
+                                        tool_call_deltas(&update.contents, &mut call_index);
+                                    if !deltas.is_empty()
+                                        && tx
+                                            .send(chunk(
+                                                &id,
+                                                created,
+                                                &model,
+                                                json!({ "tool_calls": deltas }),
+                                                Value::Null,
+                                            ))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     let _ = tx.send(stream_error(&e.to_string())).await;
@@ -164,7 +192,8 @@ async fn chat_completions(
                         // buffered path: an unfamiliar provider reason is
                         // reported as `length` with the raw value alongside,
                         // never emitted into the enum itself.
-                        let (reason, raw) = finish_reason_of(finish_reason.as_ref());
+                        let (reason, raw) =
+                            finish_reason_of(finish_reason.as_ref(), !call_index.is_empty());
                         let raw = raw.map(str::to_string);
                         let _ = tx
                             .send(chunk_with_raw_reason(
@@ -212,8 +241,29 @@ fn completion_object(
     input_len: usize,
 ) -> Value {
     let text = resp.text();
-    let (reason, raw) = finish_reason_of(resp.finish_reason.as_ref());
+    let calls = util::function_calls_of(&resp.messages);
+    let (reason, raw) = finish_reason_of(resp.finish_reason.as_ref(), !calls.is_empty());
     let (prompt, completion) = token_counts(&resp.usage_details, input_len, text.len());
+    // OpenAI sends `content: null` when a turn is only a tool call, and a
+    // client that renders `content` verbatim would otherwise print "".
+    let content = if text.is_empty() && !calls.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text.clone())
+    };
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.call_id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": util::arguments_string(call),
+                },
+            })
+        })
+        .collect();
     json!({
         "id": id,
         "object": "chat.completion",
@@ -221,7 +271,13 @@ fn completion_object(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
+            "message": {
+                "role": "assistant",
+                "content": content,
+                // Omitted entirely when the turn declared no call, so an
+                // ordinary completion is byte-identical to before.
+                "tool_calls": (!tool_calls.is_empty()).then_some(tool_calls),
+            },
             "finish_reason": reason,
             // Non-standard, and omitted unless the provider's own reason had
             // to be approximated to keep the enum above legal.
@@ -247,15 +303,18 @@ fn completion_object(
 /// `content_filter` / `function_call`), and the core vocabulary now names
 /// all five. Three of them pass straight through.
 ///
-/// The two tool reasons do not, for a different reason than legality: they
-/// are a *promise* that `message.tool_calls` carries a call to execute, and
-/// this surface does not serialize one. They degrade to `stop`, with the
-/// real reason preserved, rather than instructing a client to run something
-/// it cannot see. A provider-specific
-/// one cannot — Anthropic's converter deliberately preserves
-/// `model_context_window_exceeded` — because a generated client whose enum
-/// is strict can reject the entire response over a value outside that set,
-/// which costs the caller far more than the reason is worth.
+/// The two tool reasons are a *promise* that `message.tool_calls` carries a
+/// call to execute, so they pass through only when `has_tool_calls` says the
+/// response actually carries one. A turn that reports `tool_calls` while
+/// declaring none — a provider quirk, or a message whose call content got
+/// dropped upstream — degrades to `stop` with the real reason preserved,
+/// rather than instructing a client to run something it cannot see.
+///
+/// A provider-specific reason cannot pass through — Anthropic's converter
+/// deliberately preserves `model_context_window_exceeded` — because a
+/// generated client whose enum is strict can reject the entire response
+/// over a value outside that set, which costs the caller far more than the
+/// reason is worth.
 ///
 /// So an unfamiliar reason is reported as `length` and carried verbatim in
 /// the non-standard `x_finish_reason` beside it. `length` is a deliberate
@@ -264,7 +323,10 @@ fn completion_object(
 /// `content_filter` would, and it is accurate for the truncation-shaped
 /// reasons providers actually emit here. The earlier objection to a wrong
 /// familiar value was that it *lost* the real one — which it no longer does.
-fn finish_reason_of(finish_reason: Option<&FinishReason>) -> (&'static str, Option<&str>) {
+fn finish_reason_of(
+    finish_reason: Option<&FinishReason>,
+    has_tool_calls: bool,
+) -> (&'static str, Option<&str>) {
     let Some(reason) = finish_reason.map(FinishReason::as_str) else {
         return (FinishReason::STOP, None);
     };
@@ -273,18 +335,55 @@ fn finish_reason_of(finish_reason: Option<&FinishReason>) -> (&'static str, Opti
         FinishReason::LENGTH => (FinishReason::LENGTH, None),
         FinishReason::CONTENT_FILTER => (FinishReason::CONTENT_FILTER, None),
         // A tool reason is a *promise*: it tells the client to go and
-        // execute the call in `message.tool_calls`. This surface has never
-        // serialized those — `completion_object` emits text and nothing else
-        // — so advertising it hands the client an instruction with no id,
-        // name or arguments to act on, which is worse than under-reporting.
-        // Degraded to `stop` with the real reason alongside, until the
-        // surface can actually back the promise; when it can, these two
-        // should pass through like the rest.
+        // execute the call in `message.tool_calls`. `completion_object`
+        // now serializes those, so the promise passes through whenever the
+        // response actually carries a call. Without one, advertising it
+        // hands the client an instruction with no id, name or arguments to
+        // act on — worse than under-reporting — so it degrades to `stop`
+        // with the real reason alongside.
+        FinishReason::TOOL_CALLS if has_tool_calls => (FinishReason::TOOL_CALLS, None),
+        FinishReason::FUNCTION_CALL if has_tool_calls => (FinishReason::FUNCTION_CALL, None),
         FinishReason::TOOL_CALLS | FinishReason::FUNCTION_CALL => {
             (FinishReason::STOP, Some(reason))
         }
         other => (FinishReason::LENGTH, Some(other)),
     }
+}
+
+/// Streaming `tool_calls` deltas for one update, assigning each call the
+/// `index` OpenAI keys its fragments by.
+///
+/// A provider may stream one call across several updates, with `arguments`
+/// arriving in pieces — which is exactly OpenAI's delta contract, where a
+/// client concatenates fragments sharing an `index`. So the first sighting
+/// of a `call_id` carries the identifying fields and any later one carries
+/// only the next argument fragment; sending `id`/`name` again would have a
+/// strict client either ignore them or, worse, treat them as a second call.
+fn tool_call_deltas(
+    contents: &[agent_framework_core::types::Content],
+    seen: &mut Vec<String>,
+) -> Vec<Value> {
+    util::function_calls(contents)
+        .into_iter()
+        .map(|call| {
+            let arguments = util::arguments_string(call);
+            match seen.iter().position(|id| *id == call.call_id) {
+                Some(index) => json!({
+                    "index": index,
+                    "function": { "arguments": arguments },
+                }),
+                None => {
+                    seen.push(call.call_id.clone());
+                    json!({
+                        "index": seen.len() - 1,
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": { "name": call.name, "arguments": arguments },
+                    })
+                }
+            }
+        })
+        .collect()
 }
 
 /// Build one streaming `chat.completion.chunk` with the given `delta` and

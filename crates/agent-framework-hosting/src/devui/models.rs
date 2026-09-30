@@ -14,8 +14,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 pub use crate::responses::{
-    openai_error, InputTokensDetails, OutputMessage, OutputText, OutputTokensDetails,
-    ResponseObject, ResponsesRequest, Usage,
+    openai_error, InputTokensDetails, OutputFunctionCall, OutputItem, OutputMessage, OutputText,
+    OutputTokensDetails, ResponseObject, ResponsesRequest, Usage,
 };
 
 /// `GET /health` payload — mirrors DevUI's `health_check`.

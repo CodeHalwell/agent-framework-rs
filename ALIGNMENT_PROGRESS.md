@@ -9,6 +9,86 @@ independently verified (full workspace build + `cargo test` + clippy
 **Current upstream baseline: `dc8e226` (2026-09-28).** Sections are newest
 first; each records the upstream revision it was checked against.
 
+## Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
+
+The round below recorded "neither hosting surface serializes tool calls" as
+a capability gap and declined to close it inside a review cycle. The
+repository owner overruled that: close it. This is that work.
+
+### What was broken
+
+Core deliberately leaves a `FunctionCallContent` intact for the *caller* to
+execute — that is the whole point of a client-side tool. Both hosting
+surfaces then serialized only the text:
+
+- `/v1/chat/completions` built its message from `resp.text()`, so a turn
+  whose only content was a call became `content: ""` with no `tool_calls`.
+- `/v1/responses` built exactly one assistant text item, buffered and
+  streaming alike.
+
+The client was told a call had been requested and given nothing to act on:
+no `call_id`, no name, no arguments. The previous round's mitigation was to
+degrade the `tool_calls` finish reason to `stop`, which kept the surface
+honest but left the capability missing.
+
+### What landed
+
+| Surface | Buffered | Streaming |
+|---|---|---|
+| `/v1/chat/completions` | `message.tool_calls` with `id` / `type` / `function.{name,arguments}`; `content: null` for a call-only turn, as OpenAI sends | `delta.tool_calls` fragments keyed by a stable per-`call_id` `index`; the first sighting identifies the call, later ones carry arguments only |
+| `/v1/responses` | `function_call` output items as *siblings* of the message, each with its own item `id` distinct from `call_id` | `response.output_item.added` once per call, then `response.function_call_arguments.delta` per fragment |
+
+Four details were worth getting right rather than approximating:
+
+**Arguments are a JSON string, not an object.** Both wire formats type the
+field as a string and clients `JSON.parse` it. `FunctionArguments` is either
+a raw string (what a provider streams, possibly a fragment) or a parsed
+object, so `util::arguments_string` re-serializes the object case and maps
+absent arguments to `"{}"` rather than `null`.
+
+**A streamed call is one call, not one per fragment.** A provider may stream
+a single call's arguments across several updates. OpenAI's contract is that
+fragments sharing an `index` (chat completions) or an `item_id` (responses)
+concatenate, so both paths remember the calls they have already announced
+and re-announce nothing. Re-sending `id`/`name` per fragment would have a
+strict client either ignore them or read them as further calls.
+
+**The tool finish reason now passes through** whenever the response actually
+carries a call — the promise can be kept. Without one it still degrades to
+`stop` with the provider's reason in `x_finish_reason`, because a turn that
+reports `tool_calls` while declaring none is still an instruction with
+nothing behind it.
+
+**The two Responses paths differ on the message item, deliberately.** The
+buffered path omits it for a call-only turn, as OpenAI does — an empty
+assistant message reads as a blank answer rather than as work to do. The
+streaming path keeps it, because the preamble already announced it at
+`output_index` 0 before any content was known, and every call event numbered
+itself from there; dropping it would shift each call one index away from the
+event that announced it. The terminal payload also reuses the item ids the
+client already saw, or it cannot correlate the two.
+
+### Verification
+
+Eleven tests added: buffered serialization and `content: null`, streaming
+index stability across an interleaved multi-fragment script, the function
+call output items, the announce-once/delta-many event sequence with
+monotonic sequence numbers and id correlation into the terminal payload, and
+three no-regression tests pinning that an ordinary turn is unchanged on both
+surfaces.
+
+Each behaviour was mutation-probed — eight probes, each reintroducing one
+specific bug (drop `tool_calls`; never send `content: null`; re-announce
+every fragment as a new call on each surface; ungate the tool finish reason;
+drop the call output items; mint fresh item ids in the terminal payload;
+drop the announced message item) — and each failed exactly the test written
+for it, and only that test. Full workspace: **2131 passing, 0 failing**,
+clippy `-D warnings`, rustfmt and `cargo doc` clean.
+
+`ResponseObject::output` changes type from `Vec<OutputMessage>` to
+`Vec<OutputItem>`, which is a breaking change for callers that read it;
+`OutputItem::as_message()` recovers the old view.
+
 ## Review round on PR #28 (same upstream baseline, `dc8e226`)
 
 Copilot's review on [#28](https://github.com/CodeHalwell/agent-framework-rs/pull/28)
@@ -151,22 +231,19 @@ skimmed. The second, valid mutation failed at four entries against two.
 That is the second vacuous probe in this exchange; a probe that proves
 nothing is worse than none, because it is recorded as evidence.
 
-### Capability gap recorded, not closed
+### Capability gap recorded, then closed
 
-**Neither hosting surface serializes tool calls.** Core keeps
+**Neither hosting surface serialized tool calls.** Core keeps
 `FunctionCallContent` intact for the caller to execute, and
-`completion_object` reads only `resp.text()`; the streaming path is the
-same. Making `/v1/chat/completions` support tool calling — `message.tool_calls`
-on the buffered path, incremental `tool_calls` deltas on the streaming one —
-is a feature this surface has never had, not a defect introduced here, and
-deliberately not bolted on at the end of a review cycle. The degradation
-above is what keeps the surface honest until it is built.
+`completion_object` read only `resp.text()`; the streaming path was the
+same. So a declaration-only call reached the client with no id, name or
+arguments, and the `tool_calls` finish reason had to be degraded to `stop`
+to avoid instructing a client to run something it could not see.
 
-The same is true of `/v1/responses`: `responses_from_run` builds one
-assistant text item and the streaming path rebuilds it, so a declaration-only
-call reaches the client with no id, name or arguments. That surface needs
-`function_call` output items and their streaming events — a second wire
-format, on the same footing as the first, and the same decision applies.
+Recorded here as a feature deliberately not bolted on at the end of a
+review cycle — and then built, at the owner's instruction, in the round
+above. Both surfaces now carry the calls; see
+*[Tool-call serialization on both hosting surfaces](#tool-call-serialization-on-both-hosting-surfaces)*.
 
 Thirty-five tests added across the twenty-three findings. Six review rounds;
 **nine of the sixteen findings were in code written earlier in the same

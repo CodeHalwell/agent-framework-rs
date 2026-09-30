@@ -7,7 +7,10 @@ use agent_framework_hosting::openai_compat::OpenAiRouter;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{parse_sse, post_json, post_raw, CancelTrackingAgent, MockAgent, StreamingAgent};
+use common::{
+    parse_sse, parse_sse_json, post_json, post_raw, CancelTrackingAgent, MockAgent, StreamStep,
+    StreamingAgent, ToolCallingAgent,
+};
 
 fn router() -> axum::Router {
     OpenAiRouter::for_agent("assistant", MockAgent::new("a1").with_usage(5, 3).arc()).into_router()
@@ -245,9 +248,10 @@ async fn schema_named_finish_reasons_pass_through_unchanged() {
 }
 
 /// A tool finish reason is a promise that `message.tool_calls` carries a
-/// call to execute. This surface serializes text only, so advertising it
-/// would hand the client an instruction with no id, name or arguments. It
-/// degrades to `stop` with the real reason preserved instead.
+/// call to execute. A turn that reports one while declaring no call cannot
+/// keep that promise — advertising it would hand the client an instruction
+/// with no id, name or arguments — so it degrades to `stop` with the real
+/// reason preserved instead.
 #[tokio::test]
 async fn a_tool_finish_reason_is_not_advertised_without_the_calls() {
     for reason in ["tool_calls", "function_call"] {
@@ -260,7 +264,7 @@ async fn a_tool_finish_reason_is_not_advertised_without_the_calls() {
         let choice = &resp["choices"][0];
         assert!(
             choice["message"]["tool_calls"].is_null(),
-            "precondition: this surface does not serialize tool calls"
+            "precondition: this agent declares no call"
         );
         assert_eq!(
             choice["finish_reason"], "stop",
@@ -271,4 +275,196 @@ async fn a_tool_finish_reason_is_not_advertised_without_the_calls() {
             "and the real reason is still reported"
         );
     }
+}
+
+/// The other half of that rule: when the turn *does* declare calls, the
+/// promise is kept. Core leaves a `FunctionCallContent` intact for the
+/// caller to execute, so this surface has to put the id, name and arguments
+/// on the wire — serializing only `resp.text()` would tell the client to run
+/// something it was never shown.
+#[tokio::test]
+async fn declared_calls_are_serialized_and_back_the_tool_finish_reason() {
+    let agent = ToolCallingAgent::new("a1")
+        .with_call("call_1", "get_weather", r#"{"city":"Oslo"}"#)
+        .with_call("call_2", "get_time", r#"{"tz":"UTC"}"#)
+        .with_finish_reason("tool_calls")
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+
+    let (status, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    assert_eq!(status, StatusCode::OK);
+    let choice = &resp["choices"][0];
+    assert_eq!(
+        choice["finish_reason"], "tool_calls",
+        "the calls are there, so the reason passes through"
+    );
+    assert!(
+        choice["x_finish_reason"].is_null(),
+        "nothing was approximated"
+    );
+
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls serialized");
+    assert_eq!(calls.len(), 2, "every declared call, in order");
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(
+        calls[0]["function"]["arguments"], r#"{"city":"Oslo"}"#,
+        "arguments are a JSON *string*, as the wire format has it"
+    );
+    assert_eq!(calls[1]["id"], "call_2");
+    assert_eq!(calls[1]["function"]["name"], "get_time");
+    assert_eq!(calls[1]["function"]["arguments"], r#"{"tz":"UTC"}"#);
+}
+
+/// OpenAI sends `content: null` for a turn that is only a tool call. A
+/// client that renders `content` verbatim would otherwise print an empty
+/// string where the call should be.
+#[tokio::test]
+async fn a_call_only_turn_sends_null_content() {
+    let calls_only = ToolCallingAgent::new("a1")
+        .with_call("call_1", "get_weather", r#"{"city":"Oslo"}"#)
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", calls_only).into_router();
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+    let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    assert!(
+        resp["choices"][0]["message"]["content"].is_null(),
+        "a turn with no text and a call is `content: null`, not \"\""
+    );
+
+    // Text alongside the call keeps the text: `null` is about the absence of
+    // content, not about the presence of a call.
+    let both = ToolCallingAgent::new("a1")
+        .with_text("checking now")
+        .with_call("call_1", "get_weather", r#"{"city":"Oslo"}"#)
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", both).into_router();
+    let (_, resp) = post_json(router, "/v1/chat/completions", &body).await;
+    assert_eq!(resp["choices"][0]["message"]["content"], "checking now");
+    assert_eq!(
+        resp["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
+}
+
+/// An ordinary completion is unchanged: no `tool_calls` key at all, rather
+/// than an empty array a strict client might read as "a call was attempted".
+#[tokio::test]
+async fn an_ordinary_completion_carries_no_tool_calls_key() {
+    let body = json!({ "model": "assistant", "messages": [{ "role": "user", "content": "ping" }] });
+    let (_, resp) = post_json(router(), "/v1/chat/completions", &body).await;
+    let message = resp["choices"][0]["message"]
+        .as_object()
+        .expect("message object");
+    assert!(
+        !message.contains_key("tool_calls") || message["tool_calls"].is_null(),
+        "no calls declared, so the key is absent"
+    );
+}
+
+/// Streaming deltas follow OpenAI's contract: a call is identified once, and
+/// later fragments of its arguments are keyed by the same `index` so the
+/// client can concatenate them. Re-sending `id`/`name` per fragment would
+/// have a client either ignore them or treat them as further calls.
+#[tokio::test]
+async fn streamed_call_fragments_share_one_stable_index() {
+    let agent = ToolCallingAgent::new("a1")
+        .with_finish_reason("tool_calls")
+        .streaming(vec![
+            StreamStep::Call {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments: r#"{"city":"#.into(),
+            },
+            StreamStep::Call {
+                call_id: "call_2".into(),
+                name: "get_time".into(),
+                arguments: r#"{"tz":"UTC"}"#.into(),
+            },
+            StreamStep::Call {
+                call_id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments: r#""Oslo"}"#.into(),
+            },
+        ])
+        .arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({
+        "model": "assistant",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let (status, text) = post_raw(
+        router,
+        "/v1/chat/completions",
+        serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let deltas: Vec<serde_json::Value> = parse_sse_json(&text)
+        .into_iter()
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .cloned()
+        })
+        .flatten()
+        .collect();
+    assert_eq!(deltas.len(), 3, "one delta per scripted fragment");
+
+    // First sighting of each call identifies it.
+    assert_eq!(deltas[0]["index"], 0);
+    assert_eq!(deltas[0]["id"], "call_1");
+    assert_eq!(deltas[0]["function"]["name"], "get_weather");
+    assert_eq!(deltas[0]["function"]["arguments"], r#"{"city":"#);
+    assert_eq!(deltas[1]["index"], 1);
+    assert_eq!(deltas[1]["id"], "call_2");
+
+    // The second fragment of call_1 returns to index 0 and identifies
+    // nothing — concatenating by index is what reassembles the arguments.
+    assert_eq!(
+        deltas[2]["index"], 0,
+        "a later fragment reuses its call's index, not the next one"
+    );
+    assert!(
+        deltas[2]["id"].is_null() && deltas[2]["function"]["name"].is_null(),
+        "only the first sighting identifies the call"
+    );
+    assert_eq!(deltas[2]["function"]["arguments"], r#""Oslo"}"#);
+
+    // And the terminal chunk can now keep the tool promise.
+    let last = parse_sse_json(&text)
+        .into_iter()
+        .last()
+        .expect("terminal chunk");
+    assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+}
+
+/// A streamed turn that reports `tool_calls` but streams no call gets the
+/// same degradation as the buffered path — the two must not disagree.
+#[tokio::test]
+async fn a_streamed_tool_reason_without_calls_degrades_too() {
+    let agent = StreamingAgent::new("a1", vec!["hello"]).arc();
+    let router = OpenAiRouter::for_agent("assistant", agent).into_router();
+    let body = json!({
+        "model": "assistant",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let (_, text) = post_raw(
+        router,
+        "/v1/chat/completions",
+        serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    let last = parse_sse_json(&text)
+        .into_iter()
+        .last()
+        .expect("terminal chunk");
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
 }
