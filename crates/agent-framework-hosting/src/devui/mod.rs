@@ -446,6 +446,7 @@ fn workflow_response_object(outputs: &[Value], pending: Vec<Value>, model: &str)
         // A workflow run has no single model turn to be cut off in; the
         // per-agent reasons, when there are any, belong to the executors.
         incomplete_details: None,
+        x_finish_reason: None,
         output,
         output_text: Some(text),
         usage: None,
@@ -516,6 +517,7 @@ fn workflow_stream_events(
         model: model.to_string(),
         status: "completed",
         incomplete_details: None,
+        x_finish_reason: None,
         output,
         output_text: Some(text),
         usage: None,

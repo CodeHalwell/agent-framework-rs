@@ -104,6 +104,23 @@ against the old raw count needs dividing by the vector width.
   were the ones swallowed. Completion is now an allowlist (absent, `stop`,
   `tool_calls`); every other reason is reported incomplete and passes through
   verbatim.
+- **A failed concurrent profile fetch could erase a scope's memories
+  permanently.** Releasing the state lock for the request (below) lets two
+  first runs for one scope overlap; the failing one committed an empty
+  profile over the successful one's and set `initialized`, so nothing ever
+  re-fetched it. A failure now leaves the cached profile untouched.
+- **The scope cache grew without bound.** With the session fallback a scope
+  is a session, so a long-lived agent accumulated one `ScopeState` per
+  session forever. It is now an LRU bounded by `DEFAULT_MAX_CACHED_SCOPES`
+  (512), overridable with `with_max_cached_scopes`; eviction costs a scope
+  only a re-fetched profile and a restarted cursor.
+- **`incomplete_details.reason` could carry a value the schema forbids.**
+  The Responses schema names exactly two reasons, and a strict generated
+  client can reject a whole response over a third — so a provider string
+  like `model_context_window_exceeded` no longer goes in that field. Such a
+  run is still reported `incomplete`, and the raw reason moves to the new
+  `x_finish_reason` extension, which a strict client ignores rather than
+  has to parse.
 - **The project embeddings route dropped the OpenAI `user` option.** The
   per-route allowlist added below pruned Inference-only fields but also
   pruned `user`, which the derived `/openai/v1/embeddings` endpoint *does*

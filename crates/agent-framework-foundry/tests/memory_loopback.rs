@@ -103,6 +103,14 @@ fn slow_server(
     responses: Vec<(u16, String)>,
     delay: std::time::Duration,
 ) -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    slow_server_seq(responses.into_iter().map(|(s, b)| (s, b, delay)).collect())
+}
+
+/// [`slow_server`] with a delay chosen per response, so a test can force
+/// which of two overlapping requests completes last.
+fn slow_server_seq(
+    responses: Vec<(u16, String, std::time::Duration)>,
+) -> (String, Arc<Mutex<Vec<Recorded>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -119,7 +127,8 @@ fn slow_server(
                 };
                 writer.lock().unwrap().push(req);
                 let next = queue.lock().unwrap().pop_front();
-                let (status, body) = next.unwrap_or((200, "{}".to_string()));
+                let (status, body, delay) =
+                    next.unwrap_or((200, "{}".to_string(), std::time::Duration::ZERO));
                 std::thread::sleep(delay);
                 write_response(&mut stream, status, &body);
             });
@@ -481,4 +490,69 @@ async fn concurrent_runs_on_different_scopes_are_not_serialized() {
         elapsed < std::time::Duration::from_millis(400),
         "runs on different scopes serialized: {elapsed:?}"
     );
+}
+
+/// Releasing the lock for the request lets two first runs for one scope
+/// overlap. If the failing one commits last, an unconditional write would
+/// replace the profile the successful one fetched — and `initialized` would
+/// then stop anyone re-fetching it, losing that scope's profile for good.
+#[tokio::test]
+async fn a_failed_concurrent_fetch_does_not_erase_the_profile() {
+    // Two overlapping first runs for the same scope: one succeeds, one 500s.
+    // The slow server hands responses out in order as connections arrive.
+    // Delays are chosen so the *failing* fetch commits last — the ordering
+    // that loses the profile. With equal delays the harmful interleaving is
+    // a coin toss, and the test passes against the bug about half the time.
+    let ms = std::time::Duration::from_millis;
+    let (endpoint, _seen) = slow_server_seq(vec![
+        (200, search_body("s-static", &["lives in Leeds"]), ms(30)),
+        (500, r#"{"error":"transient"}"#.to_string(), ms(200)),
+        (200, search_body("s-ctx-a", &[]), ms(10)),
+        (200, search_body("s-ctx-b", &[]), ms(10)),
+    ]);
+    let p = std::sync::Arc::new(provider(&endpoint).with_scope("user-42"));
+
+    let run = || {
+        let p = p.clone();
+        async move {
+            let mut ctx = SessionContext::new(vec![Message::user("hi")]);
+            p.before_run(&mut ctx).await.expect("before_run");
+            ctx.messages.len()
+        }
+    };
+    tokio::join!(run(), run());
+
+    // A third run must still see the profile: if the failure had overwritten
+    // it, `initialized` would now be true over an empty cache and nothing
+    // would ever fetch it again.
+    let mut later = SessionContext::new(vec![Message::user("again")]);
+    p.before_run(&mut later).await.expect("before_run");
+    assert_eq!(
+        later.messages.len(),
+        1,
+        "the profile survived a concurrent failure"
+    );
+    assert!(later.messages[0].text().contains("lives in Leeds"));
+}
+
+/// The scope cache is bounded: with the session fallback a scope is a
+/// session, so a long-lived agent would otherwise grow it forever.
+#[tokio::test]
+async fn the_scope_cache_evicts_rather_than_growing_without_limit() {
+    let responses: Vec<(u16, String)> = (0..8)
+        .map(|i| (200, search_body(&format!("s{i}"), &["x"])))
+        .collect();
+    let (endpoint, seen) = server(responses);
+    // Room for one scope only, so each new session evicts the last.
+    let p = provider(&endpoint).with_max_cached_scopes(1);
+
+    for session in ["alice", "bob", "alice"] {
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session_id = Some(session.into());
+        p.before_run(&mut ctx).await.expect("before_run");
+    }
+
+    // Three static fetches, not two: alice's entry was evicted by bob, so
+    // her second run re-fetches rather than the map holding both forever.
+    assert_eq!(seen.lock().unwrap().len(), 3);
 }

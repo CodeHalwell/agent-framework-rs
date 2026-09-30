@@ -141,31 +141,42 @@ pub struct IncompleteDetails {
     pub reason: String,
 }
 
-/// Map a run's finish reason onto an OpenAI-Responses `incomplete_details`
-/// reason, or `None` when the turn ran to a genuine end.
+/// Whether a run ended abnormally — the question `status` answers.
 ///
-/// Completion is the **allowlist**, not the default: only an absent reason,
-/// `stop` and `tool_calls` mean the turn finished. `stop` is a complete
-/// answer and `tool_calls` is a turn that continues; every other reason is
-/// something a provider went out of its way to report, and defaulting those
-/// to `completed` is the false success this whole field exists to remove.
-/// `FinishReason` is an open string — Anthropic's converter deliberately
-/// preserves `model_context_window_exceeded`, for one — so a wildcard
-/// mapping to `None` would silently swallow exactly the abnormal endings
-/// that matter most.
+/// Completion is an **allowlist**: an absent reason, `stop` and `tool_calls`.
+/// `stop` is a complete answer and `tool_calls` is a turn that continues;
+/// every other reason is something a provider went out of its way to report.
+/// `FinishReason` is an open string and providers use it — Anthropic's
+/// converter deliberately preserves `model_context_window_exceeded` — so
+/// treating the unfamiliar ones as completions is the false success this
+/// whole area exists to remove.
+pub fn is_incomplete(finish_reason: Option<&FinishReason>) -> bool {
+    !matches!(
+        finish_reason.map(FinishReason::as_str),
+        None | Some(FinishReason::STOP) | Some(FinishReason::TOOL_CALLS)
+    )
+}
+
+/// The OpenAI-Responses `incomplete_details.reason` for a run, when the
+/// schema has a name for it.
 ///
-/// The two reasons OpenAI names get OpenAI's spelling: a token-budget
-/// cut-off is `max_output_tokens` here, though the chat-completions
-/// `finish_reason` for the same event is `length`. Anything else passes
-/// through verbatim, on the same reasoning `finish_reason_of` uses on the
-/// chat-completions surface — a client can ignore a value it does not know,
-/// but it cannot recover from a wrong familiar one.
-pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&str> {
+/// This is deliberately **narrower** than [`is_incomplete`]. The Responses
+/// schema admits exactly two values here, and a generated client whose enum
+/// is strict can reject an entire response over a third — so an unfamiliar
+/// provider reason must not be smuggled into this field, and must not be
+/// relabelled as one of the two either, since a wrong familiar value is
+/// worse than an absent one. Such a run is still reported `incomplete`; its
+/// raw reason travels in [`ResponseObject::x_finish_reason`], which is an
+/// extension a strict client ignores rather than a value it must parse.
+///
+/// The naming differs from the core vocabulary on one of the two: a
+/// token-budget cut-off is `max_output_tokens` here, while the
+/// chat-completions `finish_reason` for the same event is `length`.
+pub fn incomplete_reason(finish_reason: Option<&FinishReason>) -> Option<&'static str> {
     match finish_reason?.as_str() {
-        FinishReason::STOP | FinishReason::TOOL_CALLS => None,
         FinishReason::CONTENT_FILTER => Some("content_filter"),
         FinishReason::LENGTH => Some("max_output_tokens"),
-        other => Some(other),
+        _ => None,
     }
 }
 
@@ -182,9 +193,18 @@ pub struct ResponseObject {
     pub created_at: f64,
     pub model: String,
     pub status: &'static str,
-    /// Present only when `status` is `"incomplete"`, as OpenAI has it.
+    /// Present only when `status` is `"incomplete"` *and* the Responses
+    /// schema has a name for the reason, as OpenAI has it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// **Extension, not OpenAI.** The provider's own finish reason, verbatim,
+    /// whenever a run ended abnormally. It exists because
+    /// `incomplete_details.reason` is a two-value enum a strict client may
+    /// police, while a provider reason like `model_context_window_exceeded`
+    /// is worth keeping: an unknown *field* is ignored by such clients,
+    /// whereas an unknown *enum value* can sink the whole response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_finish_reason: Option<String>,
     pub output: Vec<OutputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_text: Option<String>,
@@ -210,6 +230,7 @@ impl ResponseObject {
             model: model.into(),
             status: "in_progress",
             incomplete_details: None,
+            x_finish_reason: None,
             output: Vec::new(),
             output_text: None,
             usage: None,
@@ -335,21 +356,28 @@ pub fn responses_from_run(resp: &AgentResponse, id: &str, model: &str) -> Respon
     // in its text alone. Reporting it as `completed` left a caller matching
     // the provider's canned refusal string as the only way to tell, so the
     // status and `incomplete_details` carry it instead.
-    let incomplete = incomplete_reason(resp.finish_reason.as_ref());
-    let status = if incomplete.is_some() {
+    let incomplete = is_incomplete(resp.finish_reason.as_ref());
+    let status = if incomplete {
         "incomplete"
     } else {
         "completed"
     };
+    // Only the two the schema names reach `incomplete_details`; the raw
+    // reason rides the extension field so nothing is lost either way.
+    let detail = incomplete_reason(resp.finish_reason.as_ref());
+    let raw_reason = incomplete
+        .then(|| resp.finish_reason.as_ref().map(|r| r.as_str().to_string()))
+        .flatten();
     ResponseObject {
         id: id.to_string(),
         object: "response",
         created_at: crate::util::now_ts(),
         model: model.to_string(),
         status,
-        incomplete_details: incomplete.map(|reason| IncompleteDetails {
+        incomplete_details: detail.map(|reason| IncompleteDetails {
             reason: reason.to_string(),
         }),
+        x_finish_reason: raw_reason,
         // The item's status follows the response's: the two disagreeing is
         // worse than either being wrong alone.
         output: vec![OutputMessage::assistant_text(mid, text.clone()).with_status(status)],
@@ -421,6 +449,70 @@ mod tests {
         }
     }
 
+    /// The Responses schema names exactly two reasons. A provider's own
+    /// string must still be reported — as `incomplete` status plus the
+    /// extension field — but must not be smuggled into the enum, where a
+    /// strict generated client could reject the whole response over it.
+    #[test]
+    fn an_unfamiliar_reason_is_incomplete_without_an_invalid_detail() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new("model_context_window_exceeded"))),
+            "resp_1",
+            "claude",
+        );
+        assert_eq!(obj.status, "incomplete");
+        assert!(
+            obj.incomplete_details.is_none(),
+            "the schema has no name for this reason, so the field stays absent"
+        );
+        assert_eq!(
+            obj.x_finish_reason.as_deref(),
+            Some("model_context_window_exceeded"),
+            "but the reason itself is not lost"
+        );
+        // And it must serialize without an invalid enum value anywhere.
+        let json = serde_json::to_value(&obj).unwrap();
+        assert!(json.get("incomplete_details").is_none());
+        assert_eq!(
+            json["x_finish_reason"],
+            serde_json::json!("model_context_window_exceeded")
+        );
+    }
+
+    /// The two the schema does name keep using it.
+    #[test]
+    fn a_schema_named_reason_still_fills_incomplete_details() {
+        for (reason, expected) in [
+            (FinishReason::CONTENT_FILTER, "content_filter"),
+            (FinishReason::LENGTH, "max_output_tokens"),
+        ] {
+            let obj = responses_from_run(
+                &run_finishing_with(Some(FinishReason::new(reason))),
+                "resp_1",
+                "gpt-4o",
+            );
+            assert_eq!(obj.status, "incomplete");
+            assert_eq!(
+                obj.incomplete_details.as_ref().map(|d| d.reason.as_str()),
+                Some(expected)
+            );
+            assert_eq!(obj.x_finish_reason.as_deref(), Some(reason));
+        }
+    }
+
+    /// A completed turn carries neither.
+    #[test]
+    fn a_completed_turn_carries_no_finish_reason_extension() {
+        let obj = responses_from_run(
+            &run_finishing_with(Some(FinishReason::new(FinishReason::STOP))),
+            "resp_1",
+            "gpt-4o",
+        );
+        assert_eq!(obj.status, "completed");
+        assert!(obj.incomplete_details.is_none());
+        assert!(obj.x_finish_reason.is_none());
+    }
+
     /// An item's status has to agree with its response's. A `completed`
     /// message inside an `incomplete` response tells a client that reads item
     /// status the opposite of what the response says.
@@ -441,26 +533,6 @@ mod tests {
         );
         assert_eq!(finished.status, "completed");
         assert_eq!(finished.output[0].status, "completed");
-    }
-
-    /// `FinishReason` is an open string, and providers use it: Anthropic's
-    /// converter deliberately preserves `model_context_window_exceeded`
-    /// rather than flattening it. A wildcard that mapped every unfamiliar
-    /// reason to `None` reported those as `completed` — the same false
-    /// success this field was added to remove. Completion is an allowlist.
-    #[test]
-    fn an_unfamiliar_finish_reason_is_reported_incomplete_not_completed() {
-        let obj = responses_from_run(
-            &run_finishing_with(Some(FinishReason::new("model_context_window_exceeded"))),
-            "resp_1",
-            "claude",
-        );
-        assert_eq!(obj.status, "incomplete");
-        assert_eq!(
-            obj.incomplete_details.as_ref().map(|d| d.reason.as_str()),
-            Some("model_context_window_exceeded"),
-            "an unknown reason passes through rather than being renamed"
-        );
     }
 
     /// The other half of that allowlist: the two reasons that really are

@@ -80,6 +80,11 @@ use tokio::sync::Mutex;
 /// `azure-ai-projects`' own default.
 pub const DEFAULT_API_VERSION: &str = "v1";
 
+/// How many scopes keep a cached profile and cursors at once, before the
+/// least recently used is dropped. Override with
+/// [`FoundryMemoryProvider::with_max_cached_scopes`].
+pub const DEFAULT_MAX_CACHED_SCOPES: usize = 512;
+
 /// The instruction prefixed to retrieved memories, as upstream words it.
 pub const DEFAULT_CONTEXT_PROMPT: &str =
     "## Memories\nConsider the following memories when answering user questions:";
@@ -98,6 +103,8 @@ struct ScopeState {
     static_memories: Vec<String>,
     previous_search_id: Option<String>,
     previous_update_id: Option<String>,
+    /// [`State::tick`] when this scope was last used, for eviction order.
+    last_used: u64,
 }
 
 /// Which session ids have come through `before_run`.
@@ -139,6 +146,37 @@ impl SeenSessions {
 struct State {
     scopes: std::collections::HashMap<String, ScopeState>,
     sessions: SeenSessions,
+    /// Monotonic counter standing in for a clock, so the least recently used
+    /// scope can be identified without one.
+    tick: u64,
+}
+
+impl State {
+    /// Get the entry for `scope`, marking it most recently used and evicting
+    /// the least recently used one if the cache is full.
+    ///
+    /// The cache is per scope, and with the session fallback a scope is a
+    /// session — so a long-lived agent creating sessions continuously would
+    /// otherwise grow this map forever. Eviction costs only a re-fetch of
+    /// that scope's profile and a restarted search cursor, both of which the
+    /// provider already handles as the first-run case.
+    fn touch(&mut self, scope: &str, capacity: usize) -> &mut ScopeState {
+        self.tick += 1;
+        let tick = self.tick;
+        if self.scopes.len() >= capacity && !self.scopes.contains_key(scope) {
+            if let Some(victim) = self
+                .scopes
+                .iter()
+                .min_by_key(|(_, state)| state.last_used)
+                .map(|(name, _)| name.clone())
+            {
+                self.scopes.remove(&victim);
+            }
+        }
+        let entry = self.scopes.entry(scope.to_string()).or_default();
+        entry.last_used = tick;
+        entry
+    }
 }
 
 /// A [`ContextProvider`] backed by a Foundry memory store.
@@ -153,6 +191,7 @@ pub struct FoundryMemoryProvider {
     credential: Arc<dyn TokenCredential>,
     token_scope: String,
     state: Mutex<State>,
+    max_cached_scopes: usize,
     /// Latch so the "no scope" warning is logged once rather than per run.
     warned_no_scope: AtomicBool,
 }
@@ -189,6 +228,7 @@ impl FoundryMemoryProvider {
             credential,
             token_scope: crate::FOUNDRY_SCOPE.to_string(),
             state: Mutex::new(State::default()),
+            max_cached_scopes: DEFAULT_MAX_CACHED_SCOPES,
             warned_no_scope: AtomicBool::new(false),
         }
     }
@@ -212,6 +252,14 @@ impl FoundryMemoryProvider {
     /// immediately. The service defaults to 300 when this is unset.
     pub fn with_update_delay(mut self, seconds: u64) -> Self {
         self.update_delay = Some(seconds);
+        self
+    }
+
+    /// Cap how many scopes keep cached state (default
+    /// [`DEFAULT_MAX_CACHED_SCOPES`]). Eviction costs a scope only a
+    /// re-fetched profile and a restarted search cursor.
+    pub fn with_max_cached_scopes(mut self, max: usize) -> Self {
+        self.max_cached_scopes = max.max(1);
         self
     }
 
@@ -386,7 +434,7 @@ impl ContextProvider for FoundryMemoryProvider {
                 self.warn_no_scope();
                 return Ok(());
             };
-            let entry = state.scopes.entry(scope.clone()).or_default();
+            let entry = state.touch(&scope, self.max_cached_scopes);
             (
                 scope,
                 !entry.initialized,
@@ -400,18 +448,28 @@ impl ContextProvider for FoundryMemoryProvider {
         // one unreachable store does not mean one failed request per run
         // forever.
         if needs_static {
-            let fetched = match self.search(&scope, None, None).await {
-                Ok(result) => result.contents,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Foundry memory: static memory retrieval failed");
-                    Vec::new()
-                }
-            };
+            let fetched = self.search(&scope, None, None).await;
             let mut state = self.state.lock().await;
-            let entry = state.scopes.entry(scope.clone()).or_default();
-            entry.static_memories.clone_from(&fetched);
+            let entry = state.touch(&scope, self.max_cached_scopes);
+            match fetched {
+                Ok(result) => entry.static_memories = result.contents,
+                Err(e) => {
+                    // Deliberately *not* clearing. Releasing the lock for the
+                    // request means two first runs for one scope can overlap,
+                    // and if the failing one commits last, overwriting here
+                    // would discard the profile the successful one fetched —
+                    // and `initialized` would then stop anyone re-fetching
+                    // it, losing that scope's profile for good. A failure
+                    // leaves whatever is already known untouched.
+                    tracing::warn!(error = %e, "Foundry memory: static memory retrieval failed");
+                }
+            }
+            // Set either way, as upstream does, so an unreachable store costs
+            // one request rather than one per run.
             entry.initialized = true;
-            statics = fetched;
+            // Read back rather than reusing this run's own result: a
+            // concurrent run may have populated it while this one failed.
+            statics.clone_from(&entry.static_memories);
         }
 
         // The contextual search needs something to search *with*. An
@@ -437,9 +495,7 @@ impl ContextProvider for FoundryMemoryProvider {
                         if let Some(id) = result.search_id {
                             let mut state = self.state.lock().await;
                             state
-                                .scopes
-                                .entry(scope.clone())
-                                .or_default()
+                                .touch(&scope, self.max_cached_scopes)
                                 .previous_search_id = Some(id);
                         }
                     }
@@ -516,8 +572,9 @@ impl ContextProvider for FoundryMemoryProvider {
             Ok(value) => {
                 if let Some(id) = value.get("update_id").and_then(Value::as_str) {
                     let mut state = self.state.lock().await;
-                    state.scopes.entry(scope).or_default().previous_update_id =
-                        Some(id.to_string());
+                    state
+                        .touch(&scope, self.max_cached_scopes)
+                        .previous_update_id = Some(id.to_string());
                 }
             }
             // Storing is an enhancement too, and `after_run` also runs on the

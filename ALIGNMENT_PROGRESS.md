@@ -52,7 +52,17 @@ endpoint does not, and which `agent-framework-openai` and
 noticed that the two routes differ, the fix had only looked in one
 direction. The lists now differ both ways, and the test asserts both.
 
-Sixteen tests added across the eleven findings. Three of the fixes were probed by
+A fifth round raised three more, **two of them created by the fixes two
+rounds earlier** — which is the honest shape of this exchange and worth
+recording rather than smoothing over:
+
+| Finding | Verdict | Fix |
+|---|---|---|
+| A failed concurrent fetch erases the profile | **Real, and caused by my own fix.** Releasing the lock for the request made two first runs for one scope possible; I called that "an idempotent read" in the code comment. It is not idempotent *on failure*: the failing run committed an empty profile over the successful one's and set `initialized`, so nothing re-fetched it and the scope lost its memories for good. | A failure no longer writes `static_memories` at all, and the run reads the entry back rather than trusting its own result. **The first version of this test was vacuous** — with equal delays the harmful ordering is a coin toss, and the test passed against the reintroduced bug. It now forces the failing fetch to commit last. |
+| The scope cache grows without bound | **Real.** Partitioning state by scope — the round-two fix — turned a fixed-size struct into a map with one entry per session and no eviction. | An LRU bounded at 512, overridable. Eviction costs only a re-fetch and a restarted cursor, both already the first-run path. |
+| `incomplete_details.reason` can hold a schema-invalid value | **Real, and in tension with round three.** Round three said: do not swallow abnormal reasons. I satisfied that by passing the provider's string through `incomplete_details.reason` — a field the Responses schema defines as a two-value enum, which a strict generated client can reject outright. Both constraints hold together: the *status* carries the abnormality, the *enum* stays legal. | `is_incomplete` (the status question) is now separate from `incomplete_reason` (the two schema names). An unfamiliar reason yields `incomplete` with no `incomplete_details`, and travels in a new `x_finish_reason` extension. The round-three test asserting the old location was retired, its successor asserting strictly more. |
+
+Twenty-two tests added across the fourteen findings. Three of the fixes were probed by
 mutation — disabling the integer comparison, the ambiguity detection, or the
 latch each reproduces the reported symptom exactly. Full workspace:
 **2100 passing, 0 failing**, clippy `-D warnings`, rustfmt and `cargo doc`
