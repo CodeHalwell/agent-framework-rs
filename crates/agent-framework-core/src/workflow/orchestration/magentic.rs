@@ -484,20 +484,6 @@ pub trait MagenticManager: Send + Sync {
     fn max_round_count(&self) -> Option<usize> {
         None
     }
-
-    /// The manager's current decomposed task ledger (facts + plan), if it
-    /// tracks one separately from the combined message [`Self::plan`] /
-    /// [`Self::replan`] return.
-    ///
-    /// Used only by plan review, to surface separate `facts`/`plan` text in
-    /// [`MagenticPlanReviewRequest`] and to re-render the combined ledger
-    /// after a direct human edit without an LLM call. Default `None`;
-    /// [`StandardMagenticManager`] overrides it. Rust analogue of Python's
-    /// `getattr(manager, "task_ledger", None)` escape hatch in
-    /// `_send_plan_review_request` / `_handle_plan_review_response`.
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        None
-    }
 }
 
 /// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
@@ -977,12 +963,9 @@ impl MagenticOrchestrator {
     /// decomposed ledger. Rust analogue of Python's
     /// `getattr(manager, "task_ledger", None)` access pattern.
     ///
-    /// The run's own [`MagenticContext::task_ledger`] is consulted first,
-    /// because that is what a reviewer must be shown: a ledger read off a
-    /// manager shared by two runs could be the other run's. A manager that
-    /// keeps its own decomposed ledger — the Python escape hatch, which
-    /// third-party managers may still use — is the fallback, and carries that
-    /// caveat with it.
+    /// Read from the run's own [`MagenticContext::task_ledger`], because that
+    /// is what a reviewer must be shown: a ledger read off a manager shared by
+    /// two runs could be the other run's.
     fn decompose_ledger(&self, mctx: &MagenticContext, combined: &Message) -> (String, String) {
         match self.run_ledger(mctx) {
             Some(ledger) => (ledger.facts.text(), ledger.plan.text()),
@@ -990,12 +973,18 @@ impl MagenticOrchestrator {
         }
     }
 
-    /// The decomposed ledger to render for this run: the run's own, else a
-    /// custom manager's.
+    /// The decomposed ledger to render for this run.
+    ///
+    /// The run's own and nothing else. There used to be a fallback to a
+    /// manager-held ledger, for parity with Python's
+    /// `getattr(manager, "task_ledger", None)` escape hatch — but a manager
+    /// field has no run to belong to, so a shared custom manager could still
+    /// show plan review and stall intervention the *other* run's facts and
+    /// plan. That is the exact fault this ledger was moved onto the context
+    /// to remove, so the hatch is gone: a manager that decomposes a plan
+    /// records it in [`MagenticContext::task_ledger`].
     fn run_ledger(&self, mctx: &MagenticContext) -> Option<MagenticTaskLedger> {
-        mctx.task_ledger
-            .clone()
-            .or_else(|| self.manager.current_task_ledger())
+        mctx.task_ledger.clone()
     }
 
     /// Re-render the combined ledger message from `state`'s current

@@ -64,8 +64,12 @@ now satisfy the same bound.
 - **Token log-probabilities are surfaced** (upstream #8997). The OpenAI
   clients read `choices[].logprobs` on both paths and pass it through
   unchanged under `ChatResponse::additional_properties["logprobs"]`
-  (`agent_framework_openai::convert::LOGPROBS_PROPERTY`). Previously the field
-  was dropped outright: a caller could ask for logprobs — the request half
+  (`agent_framework_openai::convert::LOGPROBS_PROPERTY`). Across a stream the
+  per-token entries accumulate, so the aggregated response carries every
+  token's rather than the final chunk's — a deliberate divergence from
+  upstream, which narrows to the last chunk and would have left this client's
+  streaming and non-streaming paths answering the same question differently.
+  Previously the field was dropped outright: a caller could ask for logprobs — the request half
   already worked, since `additional_properties` carries request-wide fields
   verbatim — and never see them. Requesting them still needs no typed option.
   The payload is passed through rather than modelled, because it is a scoring
@@ -92,9 +96,12 @@ now satisfy the same bound.
   `agent_framework_azure::responses::CLIENT_HEADERS_PROPERTY`, a reserved
   `additional_properties` key lifted out of the request body rather than
   merged into it, and validated again where the request is built — the carrier
-  is a public map here, unlike .NET's `internal` key, so a header naming
-  `authorization` or `api-key` is refused outright rather than allowed to
-  redirect a request's authentication.
+  is a public map here, unlike .NET's `internal` key, so the transport
+  enforces the `x-client-` namespace itself. That covers the credentials and
+  also the headers the request builder owns — `content-type` from
+  `.json(body)`, `host` and `content-length` from the transport — any of
+  which `reqwest` would have *appended* rather than replaced, putting two
+  conflicting values on one request.
 - **`AzureAISearchProvider::with_filter`** — an OData `$filter` applied by the
   service before ranking, so retrieval can be scoped to a tenant id, a
   document class or a security-trimming field. On a shared index this is an
@@ -141,6 +148,13 @@ now satisfy the same bound.
   predicate is taken, so existing `|m| m["x"] == 1` call sites compile as they
   were. The `wrap_*` helpers that adapt a closure are now public — the
   `Condition` docs had recommended them while they were crate-private.
+- **A streamed response lost its continuation token.** `ChatResponse` and
+  `AgentResponse` carry the handle for resuming a long-running operation, but
+  the *update* types did not, so `response_to_updates` dropped it and no
+  streamed run could be resumed. It now rides the final update and is taken
+  back by aggregation, like `finish_reason`. Surfaced by review of the
+  Purview fix below, which sets that token precisely so a caller can pick a
+  blocked run back up.
 - **A shared Magentic manager could replan one run from another run's facts**
   (upstream #8581). `StandardMagenticManager` cached the decomposed task
   ledger on itself, and two runs can share one manager — the same `Arc` handed

@@ -94,6 +94,43 @@ pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<Message>> {
 const FENCE_MARKER: &str = "```";
 
 /// The index just past the run of backticks beginning at `start`.
+/// The next backtick run at or after `from` that may *open* a fence.
+///
+/// CommonMark requires an opening fence to begin its line, with up to three
+/// spaces of indentation, and that rule is load-bearing rather than
+/// pedantic: without it any triple-backtick run counts, so prose like
+/// ``Use ```inline``` for code.`` ahead of a real fenced block makes the
+/// inline run the opening marker. The scan then closes it at the *real*
+/// block's opening fence, yielding one body of prose and leaving the genuine
+/// JSON unparsed — which is how a manager's valid fenced decision could still
+/// fail to read.
+///
+/// Only the opening side is restricted. A closing fence is matched by the
+/// existing "nothing but trailing whitespace after the run" rule, which is
+/// what keeps backticks inside a JSON string value from ending a block.
+fn next_fence_open(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut search = from;
+    while let Some(offset) = text[search..].find(FENCE_MARKER) {
+        let candidate = search + offset;
+        // Walk back over this line's leading whitespace; a fence may be
+        // indented by up to three spaces.
+        let line_start = text[..candidate].rfind('\n').map_or(0, |nl| nl + 1);
+        let indent = &text[line_start..candidate];
+        if indent.len() <= 3 && indent.bytes().all(|b| b == b' ') {
+            return Some(candidate);
+        }
+        // Not at a line start: step past this run and keep looking, so the
+        // scan stays linear.
+        search = backtick_run_end(text, candidate);
+        debug_assert!(search > candidate, "a backtick run always advances");
+        if search >= bytes.len() {
+            return None;
+        }
+    }
+    None
+}
+
 fn backtick_run_end(text: &str, start: usize) -> usize {
     let bytes = text.as_bytes();
     let mut end = start;
@@ -150,7 +187,7 @@ fn fence_info_string_end(text: &str, start: usize) -> usize {
 pub(crate) fn markdown_fence_bodies(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut bodies = Vec::new();
-    let mut open_start = text.find(FENCE_MARKER);
+    let mut open_start = next_fence_open(text, 0);
     while let Some(open) = open_start {
         let open_end = backtick_run_end(text, open);
         let closing_marker = &text[open..open_end];
@@ -180,9 +217,7 @@ pub(crate) fn markdown_fence_bodies(text: &str) -> Vec<&str> {
         if !body.is_empty() {
             bodies.push(body);
         }
-        open_start = text[close_end..]
-            .find(FENCE_MARKER)
-            .map(|offset| close_end + offset);
+        open_start = next_fence_open(text, close_end);
     }
     bodies
 }

@@ -38,21 +38,28 @@ fn ledger(satisfied: bool, progress: bool) -> MagenticProgressLedger {
 /// success. `max_stall_count() = 0` makes the very first stall trip the pause.
 struct ScriptedManager {
     ledgers: Mutex<VecDeque<MagenticProgressLedger>>,
-    task_ledger: Mutex<Option<MagenticTaskLedger>>,
 }
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message> {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: Message::assistant("Fact: the dataset lives in data/."),
             plan: Message::assistant("1. Load data. 2. Compute stats."),
         });
         Ok(Message::assistant("combined ledger"))
     }
 
-    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
         println!("  manager replanning after human intervention");
+        // A replan updates the run's ledger, which is what the next stall
+        // intervention shows the human. Keeping it on the context rather than
+        // on the manager is what makes a manager safe to share between
+        // concurrent runs.
+        context.task_ledger = Some(MagenticTaskLedger {
+            facts: Message::assistant("Fact: the dataset lives in data/ (confirmed)."),
+            plan: Message::assistant("1. Load data. 2. Compute stats. 3. Report."),
+        });
         Ok(Message::assistant("revised combined ledger"))
     }
 
@@ -83,10 +90,6 @@ impl MagenticManager for ScriptedManager {
     fn max_stall_count(&self) -> usize {
         0 // pause on the very first stalled round
     }
-
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.task_ledger.lock().unwrap().clone()
-    }
 }
 
 /// Never invoked (the demo stalls before any speaker turn, then finishes),
@@ -114,7 +117,6 @@ async fn main() -> Result<()> {
     let manager = ScriptedManager {
         // Stalled first round; satisfied after the human weighs in.
         ledgers: Mutex::new(VecDeque::from([ledger(false, false), ledger(true, true)])),
-        task_ledger: Mutex::new(None),
     };
 
     let workflow = MagenticBuilder::new()

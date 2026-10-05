@@ -476,6 +476,35 @@ project with no counterpart at all (`GitTag`, `ValkeyChatHistoryProvider`,
 `04_MultiModelService`, the harness's cancellation plumbing, and so on).
 Said plainly so the coverage of this audit is not overstated.
 
+### Review round: seven findings from Copilot, all real
+
+Copilot reviewed the branch and raised seven findings (3 high, 4 medium).
+**All seven held up against the code**, which is worth recording plainly:
+three of them were defects in this pass's own new work, and two of those
+existed *because* two changes in this pass interact.
+
+| Finding | Verdict |
+|---|---|
+| Blocked Purview responses leak content through metadata | **Real, and the sharpest of the set.** The blocked response carried `additional_properties` wholesale "so the caller can identify and resume the operation" — and this same pass put `logprobs` in that map, whose `content` entries hold the generated token *strings*. A caller handed that map could reconstruct the text the policy check had just withheld. Neither change is wrong alone; together they defeat the block. Now an explicit allowlist of control fields, so a field added to `AgentResponse` later is withheld until someone decides it is safe. The in-code comment had even claimed "the raw provider payload is deliberately *not* carried" while the code carried it. |
+| The transport reserves only the two credential headers | **Real.** The carrier is a public key in a public map, and the reserved list named `authorization` and `api-key` only — leaving `content-type` (set by `.json(body)`), `host` and `content-length` (set by the transport). `RequestBuilder::header` appends, so any of those would have gone on the wire twice with conflicting values. The transport now enforces the `x-client-` namespace, which subsumes the credential case and the builder-owned ones at once. |
+| The Magentic ledger fallback reintroduces the cross-run race | **Real.** `run_ledger` fell back to `manager.current_task_ledger()` for Python parity, and a manager field has no run to belong to — so a shared custom manager could still show plan review the other run's plan, the exact fault the move onto the context removes. Worse, the examples and HITL tests all used that fallback, so the port's own demonstrations modelled the unsafe pattern. The fallback and the trait method are gone, and every scripted manager now writes `MagenticContext::task_ledger`. |
+| The fence scanner opens on any backtick run, even mid-line | **Real.** CommonMark requires an opening fence to begin its line. Prose like ``Use ```inline``` for code.`` ahead of a real block made the inline run the opening marker, which then closed at the *genuine* block's fence — yielding one body of prose and leaving valid fenced JSON unparsed. Opening fences are now recognised only at a line start, with CommonMark's three-space indent allowance; the closing rule is untouched. |
+| `wav` is still a substring test | **Real, and the note defending it was simply wrong.** It claimed `wav` "has no sibling subtype that is not WAV audio"; `audio/x-wavpack` is WavPack, a different codec, and the substring test sent it to OpenAI labelled as WAV — the same fault as `audio/mpegurl`, which this very pass fixed one directory along. Now an allowlist, like MP3. |
+| Streamed logprobs collapse to the last chunk | **Real.** Each chunk reports its own tokens and aggregation keeps the last value for a key, so a streamed-then-aggregated response carried the final chunk's entries while the same request made non-streaming returned one per token — two paths of one client answering differently, invisibly. Entries now accumulate across the stream and the total rides the finish chunk; per-update values are unchanged, so a caller reading the stream still sees deltas. A documented divergence from upstream, which narrows to the last chunk. |
+| The continuation token never reaches a streamed caller | **Real.** `response_to_updates` dropped it: the response types carry the field and the update types did not, so *every* streamed response lost its resume handle — including the blocked response the Purview fix sets it on for exactly that purpose. The token now rides the final update and is taken back by aggregation, like `finish_reason`. Additive: new optional fields on `ChatResponseUpdate` and `AgentResponseUpdate`. |
+
+Each fix is mutation-probed where behaviour changed: carrying
+`additional_properties` again fails the new leak assertion (which checks the
+serialized response for a token string, not just the field); dropping the
+line-start rule fails the inline-backtick test; restoring the shared ledger
+fails the cross-run and resume tests.
+
+The honest lesson for the log: the two highest-severity findings were
+*interaction* defects between separate changes in this same pass, each sound
+in isolation. Per-change mutation probing does not catch those, because
+neither change is wrong on its own. That is an argument for reading a pass's
+changes against each other at the end, not only against the code they touch.
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client

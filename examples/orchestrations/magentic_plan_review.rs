@@ -13,7 +13,7 @@
 //! cargo run -p agent-framework-examples --example magentic_plan_review
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agent_framework::prelude::*;
 use agent_framework::workflow::{
@@ -24,27 +24,25 @@ use serde_json::json;
 
 /// A fully scripted manager: fixed plan, fixed "task is done" progress
 /// ledger, fixed final answer. Stands in for `StandardMagenticManager`.
-struct ScriptedManager {
-    ledger: Mutex<Option<MagenticTaskLedger>>,
-}
+struct ScriptedManager {}
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
             facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
             plan: Message::assistant("1. Draft the notes. 2. Have the editor review."),
         };
-        *self.ledger.lock().unwrap() = Some(ledger);
+        context.task_ledger = Some(ledger);
         Ok(Message::assistant("initial combined ledger"))
     }
 
-    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
             facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
             plan: Message::assistant("1. Draft. 2. Review. 3. Add upgrade warnings."),
         };
-        *self.ledger.lock().unwrap() = Some(ledger);
+        context.task_ledger = Some(ledger);
         Ok(Message::assistant("revised combined ledger"))
     }
 
@@ -65,11 +63,6 @@ impl MagenticManager for ScriptedManager {
 
     async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
         Ok(Message::assistant("Release notes drafted and reviewed."))
-    }
-
-    /// Feeds facts/plan text into the plan-review request.
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.ledger.lock().unwrap().clone()
     }
 }
 
@@ -97,9 +90,7 @@ fn placeholder_participant() -> Arc<dyn SupportsAgentRun> {
 async fn main() -> Result<()> {
     let workflow = MagenticBuilder::new()
         .participant("writer", placeholder_participant())
-        .manager(Arc::new(ScriptedManager {
-            ledger: Mutex::new(None),
-        }))
+        .manager(Arc::new(ScriptedManager {}))
         .with_plan_review() // <- opt in to the HITL pause
         .build()?;
 

@@ -40,6 +40,20 @@ const MP3_MEDIA_TYPES: [&str; 5] = [
     "audio/x-mpeg-3",
 ];
 
+/// The media types OpenAI's `wav` format covers.
+///
+/// An allowlist for the same reason as [`MP3_MEDIA_TYPES`], and the note this
+/// replaces was simply wrong: it claimed `wav` "has no sibling subtype that is
+/// not WAV audio", but `audio/x-wavpack` is WavPack — a different codec that a
+/// `contains("wav")` test sent to the API labelled as WAV.
+const WAV_MEDIA_TYPES: [&str; 5] = [
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/x-pn-wav",
+    "audio/vnd.wave",
+];
+
 /// The OpenAI audio `format` string for a media type, or `None` if unsupported.
 pub(crate) fn audio_format(media_type: &str) -> Option<&'static str> {
     // Parameters (`audio/mpeg; rate=44100`) are not part of the type, and the
@@ -50,9 +64,7 @@ pub(crate) fn audio_format(media_type: &str) -> Option<&'static str> {
         .unwrap_or(media_type)
         .trim()
         .to_ascii_lowercase();
-    if normalized.contains("wav") {
-        // Left as a substring test: `wav` has no sibling subtype that is not
-        // WAV audio, so narrowing it would only risk refusing a real alias.
+    if WAV_MEDIA_TYPES.contains(&normalized.as_str()) {
         Some("wav")
     } else if MP3_MEDIA_TYPES.contains(&normalized.as_str()) {
         Some("mp3")
@@ -1140,6 +1152,30 @@ mod tests {
         // Not MP3, though both contain "mpeg": a playlist and an MPEG-4 RTP
         // payload. A substring test sent each to the API as MP3 audio.
         for media_type in ["audio/mpegurl", "audio/mpeg4-generic"] {
+            assert_eq!(audio_format(media_type), None, "{media_type}");
+        }
+
+        // WAV is an allowlist for the same reason, and the aliases are
+        // normalized the same way.
+        for media_type in [
+            "audio/wav",
+            "audio/x-wav",
+            "AUDIO/WAV",
+            "audio/wav; rate=16000",
+            "audio/wave",
+            "audio/x-pn-wav",
+            "audio/vnd.wave",
+        ] {
+            assert_eq!(audio_format(media_type), Some("wav"), "{media_type}");
+        }
+        // The sibling that broke the old substring test: WavPack is a
+        // different codec, and labelling it `wav` sent it to the API as WAV
+        // audio — the same fault as `audio/mpegurl`, one directory along.
+        for media_type in [
+            "audio/x-wavpack",
+            "audio/wavpack",
+            "audio/x-wavpack-correction",
+        ] {
             assert_eq!(audio_format(media_type), None, "{media_type}");
         }
     }

@@ -125,18 +125,19 @@ const DEFAULT_API_VERSION: &str = "preview";
 /// body field, present or future.
 pub const CLIENT_HEADERS_PROPERTY: &str = "agent_framework.client_headers";
 
-/// The headers this client sets itself, which a per-call header may not
-/// replace or duplicate. Lowercase, since HTTP header names compare
-/// case-insensitively and `HeaderName` normalizes to lowercase.
+/// The namespace a per-call header must sit in.
 ///
-/// Authentication is the reason this list exists rather than a general
-/// principle about reserved names: `post` chooses between `api-key` and
-/// `Authorization` from the client's configured credential, and a per-call
-/// header able to set either could redirect a request's authentication — or,
-/// because `reqwest` *appends* rather than replaces, send two conflicting
-/// credentials and leave the outcome to the service. A per-call option should
-/// not be able to do either, so both names are refused up front.
-const RESERVED_HEADERS: [&str; 2] = ["authorization", "api-key"];
+/// The carrier exists to forward `x-client-*` headers, so requiring the
+/// prefix at the transport is both its documented purpose and the check that
+/// makes "a per-call header cannot displace one this client owns" true. It
+/// subsumes the narrower rule it replaces, which named only `authorization`
+/// and `api-key`: every header the client or the request builder sets is
+/// outside this namespace, including `content-type` (set by `.json(body)`),
+/// and `host` and `content-length` (set by the transport). Because
+/// `reqwest::RequestBuilder::header` *appends* rather than replaces, any of
+/// those would have gone on the wire twice with conflicting values and left
+/// the outcome to the service.
+const CLIENT_HEADER_PREFIX: &str = "x-client-";
 
 /// Extract the per-call request headers from [`CLIENT_HEADERS_PROPERTY`],
 /// validating each one before it reaches the transport.
@@ -154,8 +155,8 @@ const RESERVED_HEADERS: [&str; 2] = ["authorization", "api-key"];
 ///
 /// # Errors
 /// [`Error::Configuration`] when the carrier is not an object of string
-/// values, when a name or value is not valid in an HTTP header, or when an
-/// entry names one of [`RESERVED_HEADERS`].
+/// values, when a name or value is not valid in an HTTP header, or when a
+/// name is outside the [`CLIENT_HEADER_PREFIX`] namespace.
 fn client_headers(options: &ChatOptions) -> Result<Vec<(HeaderName, HeaderValue)>> {
     let Some(raw) = options.additional_properties.get(CLIENT_HEADERS_PROPERTY) else {
         return Ok(Vec::new());
@@ -180,10 +181,14 @@ fn client_headers(options: &ChatOptions) -> Result<Vec<(HeaderName, HeaderValue)
         let parsed = HeaderName::try_from(name.as_str()).map_err(|_| {
             Error::Configuration(format!("'{name}' is not a valid HTTP header name"))
         })?;
-        if RESERVED_HEADERS.contains(&parsed.as_str()) {
+        // `HeaderName` lowercases, so this comparison is already
+        // case-insensitive.
+        if !parsed.as_str().starts_with(CLIENT_HEADER_PREFIX) {
             return Err(Error::Configuration(format!(
-                "client header '{name}' is set by the client itself and cannot be overridden \
-                 per call; authentication is configured on the client",
+                "client header '{name}' is outside the '{CLIENT_HEADER_PREFIX}' namespace this \
+                 carrier forwards; headers the client and the transport set themselves — \
+                 authentication, content-type, host, content-length — cannot be overridden per \
+                 call, and `reqwest` would append rather than replace them"
             )));
         }
         let parsed_value = HeaderValue::try_from(value).map_err(|_| {
@@ -1195,15 +1200,28 @@ mod tests {
     }
 
     #[test]
-    fn a_header_the_client_sets_itself_is_refused() {
-        // Both names, because which one the client sends depends on its
-        // configured credential — an api-key client and a token client would
-        // otherwise each have a different bypass.
-        for name in ["authorization", "Authorization", "api-key", "API-Key"] {
+    fn a_header_the_client_or_transport_owns_is_refused() {
+        // Not just the credentials: `content-type` is set by `.json(body)`,
+        // and `host`/`content-length` by the transport. `RequestBuilder::header`
+        // appends, so any of these would have gone on the wire twice with
+        // conflicting values. The `x-client-` namespace excludes all of them
+        // at once.
+        for name in [
+            "authorization",
+            "Authorization",
+            "api-key",
+            "API-Key",
+            "content-type",
+            "Content-Type",
+            "host",
+            "content-length",
+            "x-forwarded-for",
+        ] {
             let err = client_headers(&with_carrier(json!({ name: "v" })))
-                .expect_err("a reserved header name must be refused");
+                .expect_err("a header outside the forwarded namespace must be refused");
             assert!(
-                err.to_string().contains("set by the client itself"),
+                err.to_string()
+                    .contains("outside the 'x-client-' namespace"),
                 "{name}: {err}"
             );
         }

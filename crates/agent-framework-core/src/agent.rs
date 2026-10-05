@@ -98,6 +98,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         conversation_id,
         usage_details,
         finish_reason,
+        continuation_token,
         ..
     } = response;
     let last = messages.len().saturating_sub(1);
@@ -144,6 +145,13 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
                 // takes the last reason it sees, and tagging every update
                 // would claim each message ended the turn.
                 finish_reason: (i == last).then(|| finish_reason.clone()).flatten(),
+                // Same rule, same reason: the resume handle belongs to the
+                // operation, not to each message, so it rides the final
+                // update and aggregation picks it up there. Without this a
+                // streamed response lost it entirely — including the blocked
+                // response a policy check produces, which is the one a caller
+                // most needs to be able to resume.
+                continuation_token: (i == last).then(|| continuation_token.clone()).flatten(),
                 ..Default::default()
             })
         })
@@ -151,7 +159,10 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
     // A reason with no messages is still worth emitting — a turn the content
     // filter stopped before any text is exactly that shape.
     if updates.is_empty()
-        && (usage_details.is_some() || response_id.is_some() || finish_reason.is_some())
+        && (usage_details.is_some()
+            || response_id.is_some()
+            || finish_reason.is_some()
+            || continuation_token.is_some())
     {
         let contents = usage_details
             .map(|u| {
@@ -166,6 +177,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
             response_id,
             conversation_id,
             finish_reason,
+            continuation_token,
             ..Default::default()
         }));
     }
@@ -1510,6 +1522,43 @@ mod tests {
 
     /// A turn the filter stopped before any text is a reason with no
     /// messages; it must still reach the stream rather than vanishing.
+    /// The resume handle has to survive the streaming replay, not just exist
+    /// on the buffered response.
+    ///
+    /// `response_to_updates` dropped it: `ChatResponse`/`AgentResponse` had
+    /// the field and the update types did not, so every streamed response
+    /// lost its continuation token and a background run could not be picked
+    /// back up. The case that made it matter is a policy-blocked streamed run
+    /// — the middleware sets the token precisely so the caller can resume,
+    /// and the replay was throwing it away.
+    #[test]
+    fn response_to_updates_carries_the_continuation_token_through_aggregation() {
+        let token = crate::types::ContinuationToken::new("resume-abc");
+        let response = super::AgentResponse {
+            messages: vec![
+                crate::types::Message::assistant("first"),
+                crate::types::Message::assistant("second"),
+            ],
+            continuation_token: Some(token.clone()),
+            ..Default::default()
+        };
+        let updates: Vec<AgentResponseUpdate> = super::response_to_updates(response)
+            .into_iter()
+            .map(|u| u.unwrap())
+            .collect();
+
+        // Carried on the final update only: the handle belongs to the
+        // operation, not to each message.
+        assert_eq!(updates.len(), 2);
+        assert!(updates[0].continuation_token.is_none());
+        assert_eq!(updates[1].continuation_token.as_ref(), Some(&token));
+
+        // And it survives back through aggregation, which is what a caller
+        // streaming the run actually ends up holding.
+        let aggregated = super::AgentResponse::from_updates(updates);
+        assert_eq!(aggregated.continuation_token.as_ref(), Some(&token));
+    }
+
     #[test]
     fn a_finish_reason_with_no_messages_still_produces_an_update() {
         let response = super::AgentResponse {

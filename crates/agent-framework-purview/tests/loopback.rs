@@ -399,6 +399,18 @@ fn terminal_returning_identified(
                 response_id: Some("resp-7".into()),
                 conversation_id: Some("conv-7".into()),
                 value: Some(serde_json::json!({ "secret": text })),
+                // What a provider actually puts here, including the shape
+                // this port now stores token log-probabilities in — whose
+                // `content` entries hold the generated token *strings*.
+                additional_properties: std::collections::HashMap::from([(
+                    "logprobs".to_string(),
+                    serde_json::json!({
+                        "content": [
+                            { "token": "confidential", "logprob": -0.1 },
+                            { "token": " roadmap", "logprob": -0.2 },
+                        ]
+                    }),
+                )]),
                 ..Default::default()
             });
             Ok(ctx)
@@ -454,6 +466,20 @@ async fn a_streamed_run_is_policy_checked_like_a_buffered_one() {
     assert_eq!(result.conversation_id.as_deref(), Some("conv-7"));
     // ... but the structured value is not: it still holds the blocked content.
     assert!(result.value.is_none(), "{:?}", result.value);
+    // Nor is the provider payload. `additional_properties` is a content
+    // channel as much as `value` is: `logprobs` carries the generated token
+    // strings, so handing that map back would let a caller reconstruct the
+    // text the block just withheld.
+    assert!(
+        result.additional_properties.is_empty(),
+        "the blocked response leaked provider metadata: {:?}",
+        result.additional_properties
+    );
+    let rendered = serde_json::to_string(&result).unwrap();
+    assert!(
+        !rendered.contains("confidential"),
+        "a token string from the blocked content survived into the response: {rendered}"
+    );
 
     let requests = handle.join().expect("server thread panicked");
     assert_eq!(requests.len(), 2, "both phases were evaluated");

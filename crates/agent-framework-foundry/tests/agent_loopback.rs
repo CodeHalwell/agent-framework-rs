@@ -203,35 +203,39 @@ async fn stamped_client_headers_reach_the_wire_and_stay_out_of_the_body() {
     );
 }
 
-/// A header this client sets itself cannot be overridden per call. Because
-/// `reqwest` *appends* a header rather than replacing one, a permitted
-/// `authorization` entry would put two credentials on one request and leave
-/// the choice to the service — so this is refused before the request is
-/// built, and refused at the transport rather than only at the typed surface
-/// that normally stamps these (which would not have accepted the name
-/// anyway).
+/// A header the client or the transport owns cannot be set per call.
+///
+/// The carrier is a public key in a public map, so it is reachable without
+/// the typed `x-client-*` surface that would have refused these names. The
+/// transport therefore enforces the namespace itself — which covers the
+/// credentials *and* the headers the request builder owns (`content-type`
+/// from `.json(body)`, `host` and `content-length` from the transport).
+/// `reqwest::RequestBuilder::header` appends rather than replaces, so any of
+/// them would otherwise have gone on the wire twice with conflicting values.
 #[tokio::test]
-async fn a_client_header_cannot_override_the_clients_own_authentication() {
-    let server = FakeServer::start(false, OK_BODY);
+async fn a_header_the_client_or_transport_owns_cannot_be_set_per_call() {
+    for name in ["Authorization", "api-key", "content-type", "host"] {
+        let server = FakeServer::start(false, OK_BODY);
 
-    let mut options = ChatOptions::new();
-    options.additional_properties.insert(
-        "agent_framework.client_headers".into(),
-        serde_json::json!({ "Authorization": "Bearer attacker-token" }),
-    );
-    let err = client(&server.addr)
-        .get_response(vec![Message::user("hi")], options)
-        .await
-        .expect_err("an authorization override must be refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("set by the client itself"),
-        "the error should name the reason, got: {msg}"
-    );
-    assert!(
-        server.requests().is_empty(),
-        "nothing should have been sent"
-    );
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "agent_framework.client_headers".into(),
+            serde_json::json!({ name: "attacker-value" }),
+        );
+        let err = client(&server.addr)
+            .get_response(vec![Message::user("hi")], options)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside the 'x-client-' namespace"),
+            "{name}: {msg}"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "{name}: nothing should have been sent"
+        );
+    }
 }
 
 /// The use case the capability exists for: a multi-tenant caller attesting

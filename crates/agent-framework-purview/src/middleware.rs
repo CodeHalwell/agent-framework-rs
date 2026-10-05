@@ -174,11 +174,20 @@ impl Middleware<AgentContext> for PurviewAgentMiddleware {
                 .check(&messages, resolved_user_id.as_deref(), "response")
                 .await?;
             if should_block {
-                // Replaced, not emptied: the control fields identify the
-                // operation the caller is holding and let it resume or
-                // correlate the run. `value` and the raw provider payload are
-                // deliberately *not* carried, because both still hold the
-                // content that was just blocked.
+                // Replaced, not emptied: the named control fields identify
+                // the operation the caller is holding and let it correlate or
+                // resume the run.
+                //
+                // Everything else is dropped, and the list is deliberately an
+                // allowlist rather than "all but `value`". `value` holds the
+                // blocked content outright, but so can
+                // `additional_properties`: it is the raw provider-payload
+                // channel, and `logprobs` alone carries the generated token
+                // *strings*, so a caller handed that map could reconstruct
+                // the text this check just blocked. Any future field added to
+                // `AgentResponse` is withheld until someone decides it is
+                // safe, which is the right default for the response a policy
+                // block produces.
                 let evaluated = ctx.result.take().unwrap_or_default();
                 ctx.result = Some(AgentResponse {
                     messages: vec![self.0.blocked_response_message()],
@@ -188,8 +197,7 @@ impl Middleware<AgentContext> for PurviewAgentMiddleware {
                     finish_reason: evaluated.finish_reason,
                     usage_details: evaluated.usage_details,
                     continuation_token: evaluated.continuation_token,
-                    additional_properties: evaluated.additional_properties,
-                    value: None,
+                    ..Default::default()
                 });
             }
         }
@@ -255,8 +263,7 @@ impl Middleware<ChatContext> for PurviewChatMiddleware {
                     finish_reason: evaluated.finish_reason,
                     usage_details: evaluated.usage_details,
                     continuation_token: evaluated.continuation_token,
-                    additional_properties: evaluated.additional_properties,
-                    value: None,
+                    ..Default::default()
                 });
             }
         }
