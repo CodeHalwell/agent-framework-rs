@@ -326,6 +326,58 @@ resume test both fail, and the other two still pass. Clearing the ledger in
 `reset` fails the reset test; marking the field `serde(skip)` fails the
 resume test.
 
+### Also closed: a workflow predicate can report failure (#8490)
+
+Declined twice before, with the blast radius measured both times: closing it
+means widening `Condition` to carry a `Result`, and `Selection` with it.
+Worth doing deliberately, which is what this is.
+
+**The fault.** `Condition` returned a bare `bool`. A realistic predicate
+inspects the payload — deserializes it, reads a field, parses a date — and
+any of that can fail, leaving `false` as the only thing it can return. In a
+switch/case group `false` means "try the next case", and the last `false`
+means the default branch. So a *broken* predicate was indistinguishable from
+one that correctly declined, and the message was delivered somewhere nobody
+chose, with no error anywhere. Upstream reached the same place from the other
+side: it had been swallowing predicate exceptions and routing to the default,
+and #8490 stopped it.
+
+**The design, and why it is not the breaking change the previous passes
+feared.** The aliases widen:
+
+```rust
+pub type Condition = Arc<dyn Fn(&Value) -> BoxFuture<Result<bool>> + Send + Sync>;
+pub type Selection = Arc<dyn Fn(&Value, &[String]) -> BoxFuture<Result<Vec<String>>> + …>;
+```
+
+but every API that takes a *closure* became generic over what the closure
+returns, through two one-method traits — `IntoConditionResult`, implemented
+for `bool` and `Result<bool>`, and `IntoSelectionResult` for the selection
+equivalent. So `Case::new(|m| m == "hot", "hot")` compiles exactly as it did,
+and only a predicate that needs an error channel mentions one. A test pins
+both forms side by side in one switch, because "not breaking" is the claim
+that carries the change.
+
+What does break is constructing a `Condition` or `Selection` by hand, which
+the previous passes assumed was the whole cost. It is now also unnecessary:
+`wrap_sync_condition`, `wrap_async_condition`, `wrap_selection` and
+`wrap_async_selection` are public. The first two existed but were
+`pub(crate)` — while the `Condition` docs told callers to prefer them, which
+no external caller could do. That was its own small gap, closed in passing.
+
+**Propagation.** `resolve_targets` already returned `Result`, so the single
+edge and the fan-out selection became `?`. The interesting one is the switch's
+generated selection, which is where the default-branch fall-through lived:
+its loop now propagates a failing case predicate instead of treating it as a
+decline.
+
+Mutation-probed at all three sites, each by restoring the swallow
+(`unwrap_or(false)`, `unwrap_or_default()`): the case-predicate mutation fails
+the default-branch test, the edge-condition one fails both the sync and async
+tests, and the selection one fails the selection test and the switch test
+that routes through it. The coexistence test passes throughout, which is what
+shows the mutations are catching the fix rather than the API change.
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client
@@ -392,9 +444,6 @@ entirely surfaces this port does not have. Grouped by *why*, so a future pass do
   `Vec<String>`, so upstream's image and media embedding (`Content`/`Part`
   values) cannot be expressed. Widening the trait affects every embedding
   client, which is why the Gemini client ports the text half only.
-- **A switch/case predicate cannot report failure** (#8490). Reconfirmed,
-  unchanged: closing it means widening `Condition` to `Result<bool>` across
-  every builder that takes one.
 
 ## Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
 
@@ -753,7 +802,7 @@ clean.
 | Azure AI Content Understanding | ❌, unblocked | `azure-ai-contentunderstanding` reads the same way: `/analyzers`, `/analyzers/{analyzer}`, api-versions `2025-11-01` (GA) and `2026-06-01-preview`. What makes it the larger job is size, not mystery — ~1400 lines upstream across a context provider, a file-search backend pair, and content detection. Now the top item with nothing in its way. |
 | Foundry — evaluations | ❌ | Same SDK, so also readable now; still large, and upstream is still moving it. The "blocked" half of the old reason is gone; the "moving target" half stands. |
 | Anthropic hosted MCP — `mcp-client-2025-11-20` | ❌, deliberate | Not a defect: upstream sends the same deprecated `mcp-client-2025-04-04`, and this port matches it. The mapping when upstream moves: no `tool_configuration` → an `mcp_toolset` with neither `default_config` nor `configs`; `enabled: false` → `default_config.enabled: false`; `allowed_tools: [...]` → `default_config.enabled: false` plus those tools enabled in `configs`. Note the new beta also *requires* the `mcp_toolset` entry — `mcp_servers` alone is rejected — so this is a two-part change, not a rename. |
-| Switch/case predicate cannot report failure (#8490) | ❌ | Re-examined and still declined, now with the blast radius measured: `Condition` returns `bool`, and the `Selection` it feeds returns `Vec<String>`, so neither has an error channel. Making a predicate fallible means widening both public type aliases and every builder that takes one. Worth doing deliberately, not as a side effect of a verification pass. |
+| Switch/case predicate cannot report failure (#8490) | ✅ (closed in the post-`dc8e226` pass) | Re-examined and declined here, with the blast radius measured: `Condition` returns `bool`, and the `Selection` it feeds returns `Vec<String>`, so neither has an error channel. Making a predicate fallible means widening both public type aliases and every builder that takes one. Worth doing deliberately, not as a side effect of a verification pass. **Done in the `301a43c` pass**, and the measurement above turned out to overstate it: only hand-constructed `Condition`/`Selection` values broke, because the closure-taking APIs became generic over `bool`-or-`Result<bool>`. |
 
 ## Post-`6606bef` drift + Azure-ecosystem review (checked against `dc8e226`, 2026-09-28)
 

@@ -36,7 +36,10 @@ pub use checkpoint::{
     WorkflowCheckpoint, WorkflowCheckpointSummary,
 };
 pub use context::{WorkflowContext, WorkflowMessage};
-pub use edge::{Case, Condition, Default, EdgeGroup, Selection};
+pub use edge::{
+    wrap_async_condition, wrap_async_selection, wrap_selection, wrap_sync_condition, Case,
+    Condition, Default, EdgeGroup, IntoConditionResult, IntoSelectionResult, Selection,
+};
 pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
 pub use orchestration::{

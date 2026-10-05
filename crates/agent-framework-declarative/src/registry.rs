@@ -216,16 +216,14 @@ impl PredicateRegistry {
     }
 
     /// Register a synchronous predicate under `name`.
-    pub fn register<F>(&mut self, name: impl Into<String>, predicate: F)
+    pub fn register<F, R>(&mut self, name: impl Into<String>, predicate: F)
     where
-        F: Fn(&Value) -> bool + Send + Sync + 'static,
+        F: Fn(&Value) -> R + Send + Sync + 'static,
+        R: agent_framework_core::workflow::IntoConditionResult,
     {
         self.predicates.insert(
             name.into(),
-            Arc::new(move |v: &Value| {
-                let result = predicate(v);
-                Box::pin(async move { result }) as agent_framework_core::tools::BoxFuture<bool>
-            }),
+            agent_framework_core::workflow::wrap_sync_condition(predicate),
         );
     }
 

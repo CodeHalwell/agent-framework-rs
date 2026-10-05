@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_framework_core::error::Result;
+use agent_framework_core::error::{Error, Result};
 use agent_framework_core::prelude::{AgentResponse, ChatResponse, Message, SupportsAgentRun};
 use agent_framework_core::session::AgentSession;
 use agent_framework_core::workflow::{
@@ -1273,10 +1273,9 @@ fn multi_selection_workflow(
 #[tokio::test]
 async fn a_multi_selection_delivers_to_every_picked_target() {
     let counts = Arc::new(Mutex::new(HashMap::new()));
-    let selection: agent_framework_core::workflow::Selection =
-        Arc::new(|_msg: &Value, candidates: &[String]| {
-            let all = candidates.to_vec();
-            Box::pin(async move { all })
+    let selection =
+        agent_framework_core::workflow::wrap_selection(|_msg: &Value, candidates: &[String]| {
+            candidates.to_vec()
         });
     let workflow = multi_selection_workflow(selection, counts.clone());
     workflow.run(json!("task")).await.unwrap();
@@ -1291,9 +1290,9 @@ async fn a_repeated_pick_in_one_selection_delivers_once() {
     // Two tags on a message routing to the same reviewer. Without the
     // deduplication the executor runs twice on one message.
     let counts = Arc::new(Mutex::new(HashMap::new()));
-    let selection: agent_framework_core::workflow::Selection =
-        Arc::new(|_msg: &Value, _c: &[String]| {
-            Box::pin(async move { vec!["reviewer_a".to_string(), "reviewer_a".to_string()] })
+    let selection =
+        agent_framework_core::workflow::wrap_selection(|_msg: &Value, _c: &[String]| {
+            vec!["reviewer_a".to_string(), "reviewer_a".to_string()]
         });
     let workflow = multi_selection_workflow(selection, counts.clone());
     workflow.run(json!("task")).await.unwrap();
@@ -1308,9 +1307,9 @@ async fn a_selection_naming_a_target_outside_its_group_is_a_routing_error() {
     // Silently dropping it would leave the run reporting `Idle` with the
     // message delivered nowhere.
     let counts = Arc::new(Mutex::new(HashMap::new()));
-    let selection: agent_framework_core::workflow::Selection =
-        Arc::new(|_msg: &Value, _c: &[String]| {
-            Box::pin(async move { vec!["reviewer_c".to_string()] })
+    let selection =
+        agent_framework_core::workflow::wrap_selection(|_msg: &Value, _c: &[String]| {
+            vec!["reviewer_c".to_string()]
         });
     let workflow = multi_selection_workflow(selection, counts);
     let text = match workflow.run(json!("task")).await {
@@ -1325,8 +1324,178 @@ async fn a_selection_naming_a_target_outside_its_group_is_a_routing_error() {
 async fn a_selection_that_picks_nothing_delivers_nothing() {
     let counts = Arc::new(Mutex::new(HashMap::new()));
     let selection: agent_framework_core::workflow::Selection =
-        Arc::new(|_msg: &Value, _c: &[String]| Box::pin(async move { Vec::new() }));
+        agent_framework_core::workflow::wrap_selection(|_msg: &Value, _c: &[String]| Vec::new());
     let workflow = multi_selection_workflow(selection, counts.clone());
     workflow.run(json!("task")).await.unwrap();
     assert!(counts.lock().unwrap().is_empty());
+}
+
+// ----------------------------------------------------------------------------
+// A predicate that cannot reach a verdict says so (upstream #8490)
+// ----------------------------------------------------------------------------
+//
+// `Condition` returned a bare `bool`, so a predicate that failed — one that
+// deserializes the payload, reads a field, parses a date — had nowhere to put
+// the error and had to return `false`. In a switch/case group that means
+// falling through to the **default branch**: a broken predicate is
+// indistinguishable from one that correctly declined, and the message is
+// quietly delivered somewhere nobody chose. Upstream fixed the same fault from
+// the other side, by no longer swallowing predicate exceptions.
+//
+// These pin both halves: a failure now stops the run, and an infallible
+// predicate is still written exactly as before.
+
+/// Count every message each named executor receives.
+fn counting_workflow(
+    build: impl FnOnce(WorkflowBuilder) -> WorkflowBuilder,
+    ids: &[&'static str],
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+) -> Workflow {
+    let source = FunctionExecutor::new("source", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let mut builder = WorkflowBuilder::new()
+        .add_executor(Arc::new(source))
+        .set_start("source");
+    for id in ids {
+        let id = *id;
+        let counts = counts.clone();
+        builder = builder.add_executor(Arc::new(FunctionExecutor::new(id, move |_msg, _ctx| {
+            let counts = counts.clone();
+            async move {
+                *counts.lock().unwrap().entry(id.to_string()).or_insert(0) += 1;
+                Ok(())
+            }
+        })));
+    }
+    build(builder).build().unwrap()
+}
+
+#[tokio::test]
+async fn a_failing_case_predicate_fails_the_run_instead_of_taking_the_default_branch() {
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let workflow = counting_workflow(
+        |b| {
+            b.add_switch(
+                "source",
+                vec![Case::new(
+                    |_m: &Value| -> Result<bool> {
+                        Err(Error::Workflow("payload is not an Order".into()))
+                    },
+                    "hot",
+                )],
+                SwitchDefault::new("cold"),
+            )
+        },
+        &["hot", "cold"],
+        counts.clone(),
+    );
+
+    let text = match workflow.run(json!("task")).await {
+        Ok(_) => panic!("a failing predicate must not be read as a declined one"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("payload is not an Order"), "{text}");
+    // The point of the fix: the default branch is where this used to land.
+    let counts = counts.lock().unwrap();
+    assert_eq!(
+        counts.get("cold"),
+        None,
+        "the message took the default branch"
+    );
+    assert_eq!(counts.get("hot"), None);
+}
+
+#[tokio::test]
+async fn a_failing_edge_condition_fails_the_run_instead_of_declining_the_edge() {
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let workflow = counting_workflow(
+        |b| {
+            b.add_conditional_edge("source", "sink", |_m: &Value| -> Result<bool> {
+                Err(Error::Workflow("cannot tell".into()))
+            })
+        },
+        &["sink"],
+        counts.clone(),
+    );
+
+    let text = match workflow.run(json!("task")).await {
+        Ok(_) => panic!("a failing condition must not be read as a `false`"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("cannot tell"), "{text}");
+    assert!(counts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_selection_fails_the_run() {
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let selection = agent_framework_core::workflow::wrap_selection(
+        |_msg: &Value, _c: &[String]| -> Result<Vec<String>> {
+            Err(Error::Workflow("no routing table".into()))
+        },
+    );
+    let workflow = multi_selection_workflow(selection, counts.clone());
+    let text = match workflow.run(json!("task")).await {
+        Ok(_) => panic!("a failing selection must not be read as picking nothing"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("no routing table"), "{text}");
+    assert!(counts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_async_failing_predicate_also_propagates() {
+    // The async builder has its own wrapper, so it needs its own proof.
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let workflow = counting_workflow(
+        |b| {
+            b.add_conditional_edge_async("source", "sink", |_m: &Value| async move {
+                Err::<bool, Error>(Error::Workflow("io check failed".into()))
+            })
+        },
+        &["sink"],
+        counts.clone(),
+    );
+    let text = match workflow.run(json!("task")).await {
+        Ok(_) => panic!("a failing async condition must propagate"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("io check failed"), "{text}");
+    assert!(counts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn infallible_and_fallible_predicates_coexist_in_one_switch() {
+    // The reason widening `Condition` is not a breaking change: a plain
+    // `bool` closure and a `Result<bool>` one satisfy the same bound, so
+    // existing code is untouched and only the predicate that needs an error
+    // channel mentions one.
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let workflow = counting_workflow(
+        |b| {
+            b.add_switch(
+                "source",
+                vec![
+                    // Written exactly as before the change.
+                    Case::new(|m: &Value| m == "hot", "hot"),
+                    // And one that could have failed, but didn't.
+                    Case::labeled(
+                        |m: &Value| -> Result<bool> { Ok(m == "warm") },
+                        "warm",
+                        "warm case",
+                    ),
+                ],
+                SwitchDefault::new("cold"),
+            )
+        },
+        &["hot", "warm", "cold"],
+        counts.clone(),
+    );
+    workflow.run(json!("warm")).await.unwrap();
+    let counts = counts.lock().unwrap();
+    assert_eq!(counts.get("warm"), Some(&1));
+    assert_eq!(counts.get("hot"), None);
+    assert_eq!(counts.get("cold"), None);
 }

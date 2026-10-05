@@ -17,7 +17,7 @@ return, a fan-out that could run one executor twice on one message, a replay
 alignment that duplicated history, and an orchestrator decision that was
 unreadable whenever the provider ignored `response_format`.
 
-**Breaking, in two places.** `agent_framework_bedrock::convert::build_request`
+**Breaking, in three places.** `agent_framework_bedrock::convert::build_request`
 takes the model id as a third argument — the request cannot be built correctly
 without it, since which fields Converse accepts depends on the model (see
 below). And `MagenticManager::plan`/`replan` take `&mut MagenticContext`,
@@ -25,7 +25,13 @@ because the task ledger they produce is the run's state rather than the
 manager's; a custom manager updates its signatures and, if it decomposes a
 plan, writes `context.task_ledger` instead of its own field.
 `StandardMagenticManager::task_ledger()` is gone with the cache it read —
-the ledger is on the context.
+the ledger is on the context. And `workflow::Condition` and
+`workflow::Selection` now carry a `Result`, so code that builds one by
+constructing the `Arc` directly returns `Ok(..)` or uses the new
+`wrap_sync_condition` / `wrap_async_condition` / `wrap_selection` /
+`wrap_async_selection` helpers; every builder and `Case` constructor that
+takes a *closure* is unchanged, since both `bool` and `Result<bool>` closures
+now satisfy the same bound.
 
 ### Added
 
@@ -103,6 +109,21 @@ the ledger is on the context.
 
 ### Fixed
 
+- **A failing workflow predicate was indistinguishable from one that said no**
+  (upstream #8490). `Condition` returned a bare `bool`, so a predicate that
+  could not reach a verdict — one that deserializes the payload, reads a
+  field, parses a date — had nowhere to put the error and had to return
+  `false`. In a switch/case group that means falling through to the **default
+  branch**: a broken predicate looks like a working one and the message is
+  delivered somewhere nobody chose. Upstream fixed the same fault from the
+  other side, by no longer swallowing predicate exceptions. `Condition` and
+  `Selection` now carry a `Result`, which the runner propagates — so an `Err`
+  aborts the run instead of quietly routing. Writing an infallible predicate
+  is unchanged: the new `IntoConditionResult` / `IntoSelectionResult` traits
+  mean a `bool` closure and a `Result<bool>` one are both accepted wherever a
+  predicate is taken, so existing `|m| m["x"] == 1` call sites compile as they
+  were. The `wrap_*` helpers that adapt a closure are now public — the
+  `Condition` docs had recommended them while they were crate-private.
 - **A shared Magentic manager could replan one run from another run's facts**
   (upstream #8581). `StandardMagenticManager` cached the decomposed task
   ledger on itself, and two runs can share one manager — the same `Arc` handed
