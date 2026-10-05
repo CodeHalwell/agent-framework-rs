@@ -443,12 +443,51 @@ pub fn parse_response(value: &Value) -> ChatResponse {
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             response.finish_reason = Some(FinishReason::new(fr));
         }
+        if let Some(logprobs) = token_logprobs(choice) {
+            response
+                .additional_properties
+                .insert(LOGPROBS_PROPERTY.to_string(), logprobs);
+        }
     }
 
     if let Some(usage) = value.get("usage") {
         response.usage_details = Some(parse_usage(usage));
     }
     response
+}
+
+/// The [`ChatResponse::additional_properties`] key carrying a response's token
+/// log-probabilities, when the request asked for them.
+///
+/// It is the same name the provider uses, and the same one upstream surfaces
+/// it under, so a caller that reads the raw OpenAI shape elsewhere does not
+/// have to learn a second name for it. The payload is passed through
+/// unchanged rather than modelled: it is a scoring artifact to read or log,
+/// not something this client acts on, and OpenAI has extended its shape
+/// before (`top_logprobs`, `bytes`) — a typed mirror would have to be revised
+/// each time, and would quietly drop whatever it did not yet know about.
+///
+/// Requesting them needs no typed option: `logprobs` and `top_logprobs` are
+/// carried into the request body by the `additional_properties` pass in
+/// [`apply_options`], which is also how upstream's callers ask for them.
+pub const LOGPROBS_PROPERTY: &str = "logprobs";
+
+/// Read a choice's token log-probabilities, or `None` when it carries none.
+///
+/// `None` for an explicit JSON `null` as well as an absent field, which is
+/// what the streaming path depends on: OpenAI sends `"logprobs": null` on
+/// every chunk of a stream that did not ask for them *and* on some chunks of
+/// one that did. Treating that null as a value would overwrite the real
+/// metadata gathered so far with nothing — the bug upstream fixed in #8997,
+/// where the guard had to be written into the merge because the SDK object
+/// was already in hand. Here the distinction lives at the read instead, so
+/// the update simply carries no key and there is nothing for aggregation to
+/// clear: `absorb_update` only inserts the keys an update actually has.
+pub(crate) fn token_logprobs(choice: &Value) -> Option<Value> {
+    match choice.get("logprobs") {
+        Some(Value::Null) | None => None,
+        Some(other) => Some(other.clone()),
+    }
 }
 
 /// The provider reasoning payload to replay for a reasoning content, or
@@ -887,6 +926,71 @@ mod tests {
             );
         }
     }
+
+    // region: token log-probabilities (upstream #8997)
+
+    #[test]
+    fn logprobs_are_surfaced_on_the_response_when_the_choice_carries_them() {
+        let logprobs = json!({
+            "content": [
+                { "token": "hel", "bytes": [104, 101, 108], "logprob": -0.1, "top_logprobs": [] }
+            ]
+        });
+        let value = json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": { "role": "assistant", "content": "hello" },
+                "finish_reason": "stop",
+                "logprobs": logprobs,
+            }]
+        });
+        let resp = parse_response(&value);
+        // Passed through unchanged: the shape is the provider's, and OpenAI
+        // has extended it before.
+        assert_eq!(
+            resp.additional_properties.get(LOGPROBS_PROPERTY),
+            Some(&logprobs)
+        );
+        assert_eq!(resp.text(), "hello");
+    }
+
+    #[test]
+    fn an_absent_or_null_logprobs_adds_no_key() {
+        // Two shapes, one meaning. OpenAI sends an explicit `null` on a
+        // response that did not ask for logprobs, and the distinction between
+        // that and "absent" is exactly what the streaming merge rests on.
+        for choice in [
+            json!({ "message": { "role": "assistant", "content": "hi" } }),
+            json!({ "message": { "role": "assistant", "content": "hi" }, "logprobs": null }),
+        ] {
+            let resp = parse_response(&json!({ "id": "c", "choices": [choice] }));
+            assert!(
+                !resp.additional_properties.contains_key(LOGPROBS_PROPERTY),
+                "a null logprobs must not land as a key with a null value"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_logprobs_needs_no_typed_option() {
+        // The capability's request half: `additional_properties` already
+        // carries request-wide fields verbatim, which is how upstream's
+        // callers ask for these too. Pinned so the round trip is visible in
+        // one place rather than implied by the generic pass-through test.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("logprobs".into(), json!(true));
+        options
+            .additional_properties
+            .insert("top_logprobs".into(), json!(5));
+        let mut body = Map::new();
+        apply_options(&mut body, &options);
+        assert_eq!(body["logprobs"], json!(true));
+        assert_eq!(body["top_logprobs"], json!(5));
+    }
+
+    // endregion
 
     // region: author-name sanitization (upstream #7127)
 

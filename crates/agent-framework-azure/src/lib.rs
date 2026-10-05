@@ -512,6 +512,32 @@ mod tests {
         assert_eq!(resp.usage_details.unwrap().total_token_count, Some(15));
     }
 
+    #[test]
+    fn logprobs_reach_an_azure_response_through_the_shared_parser() {
+        // Azure OpenAI gained token log-probabilities with no Azure-side
+        // change, because this client delegates response parsing wholesale
+        // (and `get_streaming_response` delegates the SSE stream the same
+        // way). Pinned here so the inheritance is a stated property rather
+        // than a coincidence of today's wiring: an Azure-specific parser
+        // added later would have to carry this too.
+        let logprobs = json!({
+            "content": [{ "token": "Hi", "logprob": -0.25, "top_logprobs": [] }]
+        });
+        let value = json!({
+            "id": "chatcmpl-123",
+            "choices": [{
+                "message": { "role": "assistant", "content": "Hi" },
+                "logprobs": logprobs,
+            }],
+        });
+        let resp = agent_framework_openai::convert::parse_response(&value);
+        assert_eq!(
+            resp.additional_properties
+                .get(agent_framework_openai::convert::LOGPROBS_PROPERTY),
+            Some(&logprobs)
+        );
+    }
+
     // endregion
 
     // Streaming: `get_streaming_response` calls

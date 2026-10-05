@@ -547,6 +547,16 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             update.finish_reason = Some(FinishReason::new(fr));
         }
+        // Only when the chunk actually carries them. A chunk with
+        // `"logprobs": null` — which OpenAI sends freely mid-stream — must not
+        // overwrite the metadata gathered so far, and omitting the key is how
+        // that holds here: `ChatResponse::absorb_update` inserts only the keys
+        // an update has. See `convert::token_logprobs` (upstream #8997).
+        if let Some(logprobs) = convert::token_logprobs(choice) {
+            update
+                .additional_properties
+                .insert(convert::LOGPROBS_PROPERTY.to_string(), logprobs);
+        }
     }
 
     // The final chunk (with `stream_options.include_usage`) carries top-level
@@ -595,6 +605,66 @@ mod tests {
             wire[0]["reasoning_details"],
             serde_json::json!([{"type": "reasoning.text", "text": "think"}])
         );
+    }
+
+    #[test]
+    fn streamed_logprobs_survive_a_later_chunk_that_omits_them() {
+        // Upstream #8997. OpenAI sends `"logprobs": null` freely mid-stream,
+        // including on the finish chunk, so a stream that asked for logprobs
+        // ends with chunks that carry none. If such a chunk contributed a key,
+        // the aggregated response would report `null` — the token metadata
+        // gathered over the whole stream replaced by nothing, in the chunk
+        // that completes it.
+        let first = serde_json::json!({
+            "content": [{ "token": "hel", "logprob": -0.1, "top_logprobs": [] }]
+        });
+        let latest = serde_json::json!({
+            "content": [{ "token": "lo", "logprob": -0.2, "top_logprobs": [] }]
+        });
+        let mut ids = HashMap::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"role": "assistant", "content": "hel"},
+                "logprobs": first}]}),
+            serde_json::json!({"choices": [{"delta": {"content": "lo"}, "logprobs": latest}]}),
+            // The finish chunk: text is done and logprobs are explicitly null.
+            serde_json::json!({"choices": [{"delta": {}, "logprobs": null,
+                "finish_reason": "stop"}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .collect();
+        assert_eq!(updates.len(), 3);
+        // The last chunk that *had* logprobs wins, and the one that did not
+        // leaves them alone.
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        assert_eq!(
+            resp.additional_properties
+                .get(crate::convert::LOGPROBS_PROPERTY),
+            Some(&latest),
+            "the latest real logprobs should survive the null finish chunk"
+        );
+        assert_eq!(resp.text(), "hello");
+        assert_eq!(resp.finish_reason.map(|f| f.0).as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn a_stream_that_never_carries_logprobs_surfaces_no_key() {
+        // Negative control: the common case must not gain a `logprobs: null`
+        // entry it never had, which a guard written at the merge instead of
+        // the read would have produced.
+        let mut ids = HashMap::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"role": "assistant", "content": "hi"},
+                "logprobs": null}]}),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .collect();
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        assert!(!resp
+            .additional_properties
+            .contains_key(crate::convert::LOGPROBS_PROPERTY));
     }
 
     #[test]

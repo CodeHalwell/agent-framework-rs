@@ -12,10 +12,10 @@ first; each records the upstream revision it was checked against.
 ## Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05)
 
 Upstream moved **119 non-merge commits** in this window (2026-09-28 → 10-05),
-the largest weekly window this log has recorded. **Nine land on this port**:
-seven ported directly, and two more closed by building the Foundry header
-capability they validate. A tenth Azure capability was added on the back of a
-commit that does not port at all.
+the largest weekly window this log has recorded. **Ten land on this port**:
+seven ported directly, and three more closed by building the capability each
+presupposed. An eleventh Azure capability was added on the back of a commit
+that does not port at all.
 
 The window reads as a provider-and-cloud week. Two of the seven are a field
 the code happily sent that the cloud API *rejects outright*, so the request
@@ -177,14 +177,52 @@ wire tests; dropping the body-lift fails the body tests at both levels;
 disabling the reserved-name refusal fails both auth tests; dropping the
 prefix check fails three validation tests.
 
+### Also closed: token log-probabilities (#8997)
+
+Same shape as the header gap: upstream's commit is a merge rule for a
+capability this port did not have. The OpenAI clients never read
+`choices[].logprobs`, so a caller could *ask* for logprobs — the request half
+already worked, since `additional_properties` carries request-wide fields
+into the body verbatim, which is how upstream's callers ask too — and then
+never see them. The response half is now there, under
+`additional_properties["logprobs"]`, the name the provider and upstream both
+use.
+
+The payload is passed through unchanged rather than modelled. It is a scoring
+artifact to read or log, not something the client acts on, and OpenAI has
+extended its shape before (`top_logprobs`, `bytes`): a typed mirror would
+need revising each time and would quietly drop whatever it did not yet know.
+
+Upstream's actual fix is worth recording for how it lands differently here.
+Its bug was that a streamed chunk whose `logprobs` is `null` — which OpenAI
+sends freely mid-stream, including on the finish chunk — overwrote the
+metadata gathered so far with nothing, so a stream that *did* ask for
+logprobs ended by discarding them in the chunk that completed it. Upstream
+guards the merge (`if choice.logprobs is not None`), because by then the SDK
+object is already in hand. Here the distinction lives at the **read**: an
+explicit `null` is read as no value, so such a chunk carries no key at all
+and `ChatResponse::absorb_update` — which inserts only the keys an update
+has — has nothing to clear. The structural version also gets the negative
+case right for free: a stream that never asked for logprobs gains no
+`logprobs: null` entry, which a merge-side guard alone would still have
+produced on the non-streaming path.
+
+Both mutations are caught: reading `null` as a value (upstream's original
+bug) fails the two streaming tests and the null/absent unit test; dropping
+the surfacing entirely fails the non-streaming test and the Azure one.
+
+**Azure OpenAI, Ollama, GitHub Copilot and Foundry Local inherit this** with
+no change of their own, since each delegates `convert::parse_response` and
+`parse_sse_stream` wholesale. That inheritance is pinned by a test in the
+Azure crate rather than left as a coincidence of today's wiring.
+
 ### The other 107 commits
 
-Seven ported above, and two more (#8715 with #8847) closed by building the
-Foundry header capability they validate. Three are recorded rather than
-closed: #8798 (a Gemini embedding client this port lacks), #8997 (logprobs it
-does not surface), and #8673, whose agentic mode is out of scope but which is
-what surfaced the missing AI Search filter. The rest is almost entirely
-surfaces this port does not have. Grouped by *why*, so a future pass does not re-derive it:
+Seven ported above, and three more (#8715 with #8847, and #8997) closed by
+building the capability each one presupposed. Two are recorded rather than
+closed: #8798 (a Gemini embedding client this port lacks) and #8673, whose
+agentic mode is out of scope but which is what surfaced the missing AI Search
+filter. The rest is almost entirely surfaces this port does not have. Grouped by *why*, so a future pass does not re-derive it:
 
 - **`foundry_hosting`** — #8894, #8794, #8947, #8966, #8899, #8593, #8741,
   #8722, #8717, #8713. The crate does not exist here; ten commits in one
@@ -237,10 +275,6 @@ surfaces this port does not have. Grouped by *why*, so a future pass does not re
   only, so there is no embedding surface to add them to. Smaller than it
   looks — the `EmbeddingClient` trait and three sibling implementations
   already exist — and unblocked.
-- **Logprobs are not surfaced at all** (#8997). Upstream's fix is that an
-  empty streamed chunk must not clear the token metadata gathered so far;
-  here there is nothing to clear, because the OpenAI client does not read
-  `logprobs` on either path. The gap is the capability, not the merge rule.
 - **A switch/case predicate cannot report failure** (#8490). Reconfirmed,
   unchanged: closing it means widening `Condition` to `Result<bool>` across
   every builder that takes one.

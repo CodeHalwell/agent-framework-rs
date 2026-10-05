@@ -23,6 +23,20 @@ without it: which fields Converse accepts depends on the model (see below).
 
 ### Added
 
+- **Token log-probabilities are surfaced** (upstream #8997). The OpenAI
+  clients read `choices[].logprobs` on both paths and pass it through
+  unchanged under `ChatResponse::additional_properties["logprobs"]`
+  (`agent_framework_openai::convert::LOGPROBS_PROPERTY`). Previously the field
+  was dropped outright: a caller could ask for logprobs — the request half
+  already worked, since `additional_properties` carries request-wide fields
+  verbatim — and never see them. Requesting them still needs no typed option.
+  The payload is passed through rather than modelled, because it is a scoring
+  artifact to read or log and OpenAI has extended its shape before.
+  Upstream's fix in this window was the streaming merge rule (a chunk with
+  `"logprobs": null` must not clear the metadata gathered so far); here an
+  explicit null is read as *no value*, so such a chunk contributes no key and
+  `absorb_update` has nothing to clear. Azure OpenAI, Ollama, GitHub Copilot
+  and Foundry Local inherit this, delegating both parsers wholesale.
 - **Per-call `x-client-*` headers on the Foundry path** (upstream #8715,
   #8847). The Foundry Agent Endpoint forwards `x-client-`-prefixed headers
   transparently into the agent container, which makes them the channel for
