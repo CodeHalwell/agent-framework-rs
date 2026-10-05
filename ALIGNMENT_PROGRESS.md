@@ -100,7 +100,7 @@ worth preserving.
 | Azure SQL / SQL Server native vector store | ✅ | ❌ | Unchanged from last pass: still blocked on a TDS driver decision (`tiberius` would unblock it). |
 | Azure DocumentDB | ✅ | ❌ | Unchanged: blocked on the MongoDB wire protocol. |
 | Foundry hosting | ✅ | ❌ | Unchanged, and this window was heavy with it (#8894, #8794, #8947, #8966, #8899, #8593, #8741, #8722, #8717, #8713 all land on `foundry_hosting`). The standing gap is the crate itself; it is now the largest single Azure-shaped hole, ahead of Content Understanding by volume of upstream activity though not by tractability. |
-| Azure AI Content Understanding | ✅ | ❌ | Unchanged: still the largest **unblocked** Azure item, a REST surface with nothing in its way but size. |
+| Azure AI Content Understanding | ✅ | ❌ | **Reassessed this pass, and it is not unblocked.** Earlier passes recorded it as "a REST surface with nothing in its way but size". Reading the package shows the part that matters is not a REST surface at all: the text the LLM actually sees is produced by `azure.ai.contentunderstanding.to_llm_input`, and upstream's own tests deliberately decline to pin its output ("covered by the SDK's own `to_llm_input` tests"). What is visible from here is the front-matter delimiter, a `source` key, the `include_markdown`/`include_fields` flags and that segments carry a `timeRange`; the key set, field and confidence rendering, table-as-HTML form, page markers and RAI-warning surfacing are all inside the SDK, which is not vendored in this repo. Porting now would mean **inventing** the format the model reads — a client that looks right and feeds subtly wrong context, which is the failure mode this port keeps closing. Blocked on reading that SDK's renderer (or on a deliberate decision to define a different rendering and say so), not on effort. |
 
 ### Closed after the review: per-call `x-client-*` headers (#8715, #8847)
 
@@ -448,6 +448,34 @@ tests that pin filter-before-`top` and `top`/`skip`/`include_vectors`, plus
 a new one for the page edges (a `skip` past the last match, and a `top`
 smaller than the match count).
 
+### Re-audit of the ".NET-only" bucket
+
+With every standing gap closed, the remaining risk in this pass was not the
+work done but the work *classified away*. The ".NET-only surfaces with no
+Rust analogue" bucket is 20 commits and the coarsest judgement here, so seven
+of them — every one whose subject describes a fault this port could plausibly
+have, prioritising the security- and correctness-shaped ones — were
+re-examined against the actual Rust code rather than against their package
+path.
+
+**All seven stand, but three of the reasons were wrong or weaker than what is
+actually true**, and two turn out to be places this port was already ahead.
+Recording the real reasons so a future pass does not re-derive them:
+
+| Upstream | Reason it does not apply |
+|---|---|
+| #8656 — workflow topology edge multiplicity | Upstream compared saved and current edges with a *membership* test, so a graph differing only in edge multiplicity passed resume validation and a checkpoint restored into a structurally different workflow. Two things stop it here, and the stronger is upstream of the signature: **the builder refuses a duplicate edge outright** (`EDGE_DUPLICATION`), so the two graphs cannot both be built — now pinned by a test on the builder path with *conditional* edges, the case where a predicate is an opaque closure and so invisible to both the duplicate check and the signature. Second line: `compute_graph_signature` hashes a sorted **vector** of edge descriptors, not a set, so multiplicity would survive into the canonical form if one could ever be produced. |
+| #8837, #8839, #8832 — reject protected values in agent-provider inputs, function invocations and declarative MCP invocations | These guard a `SensitivityLevel.Sensitive` marking on *runtime* workflow state, which belongs to the Power Fx / Copilot Studio DSL this port deliberately does not implement. Worth separating from a superficially similar thing the port *does* have: `${VAR}` environment interpolation across every string in a declarative spec. That is not the same exposure — a spec is the developer's own config file and its author already holds the environment, so no privilege boundary is crossed. The note to carry forward: if declarative workflows with runtime state ever land here, this control lands with them. |
+| #8877 — preserve A2A run errors when session save fails | Upstream's `finally` saved the session after a failed run, and the save's own exception *replaced* the run's, so the caller heard about persistence instead of the actual failure. **Already satisfied here, in all four places**: `agent.rs` calls `after_run` with `let _ = …` on every failure path, so a provider's error cannot displace the run's, and propagates it only on the success path where there is nothing to mask. The A2A *host* upstream fixed also does not exist here — this port's `a2a` crate is client-side. |
+| #8834 — bind MCP approval headers to the approved invocation | Two properties: an approval must execute with the headers it was granted against, and transport credentials must not be persisted into checkpointed workflow state. Both presuppose headers *evaluated per invocation from workflow state*. Here MCP headers are **client-level configuration** set once on the transport, never state-derived, never attached to an approval request and never serialized — so there is nothing to bind and nothing to leak. Live requirements the moment declarative MCP invocations with state-evaluated headers appear. |
+| #8721 — origin pinning on the Foundry toolbox MCP client | **This port is ahead.** `transport/http.rs` already sets `redirect::Policy::none()`, follows redirects itself while tracking the origin, and withholds *both* the caller's custom headers and the MCP session id once a redirect leaves the configured origin — broader than `reqwest`'s own behaviour, which drops only `Authorization`, `Cookie` and `Proxy-Authorization` on a cross-host redirect and would have handed a custom API-key header and the session id to whatever host it redirected to. |
+| #8754 — tool changes between runs | Upstream's framework *auto-approved* a call that needed no approval, **stored** the decision, and could re-inject it on a later turn when the tool had since become approval-required — an approval bypass across turns. This port never makes or stores an approval decision on the application's behalf: an approval response is always something the caller supplies for that run, so there is no stored decision to go stale. The half that *can* arise here is the tool having left the per-run tool set between the request and the replay (`AgentRunOptions::additional_tools` is per-run), and it **fails closed**: the lookup misses, `execute_tool_call` returns `executed: false` with a "tool not found" exception, and nothing runs. |
+
+The thirteen not re-examined are the ones whose subjects name a .NET type or
+project with no counterpart at all (`GitTag`, `ValkeyChatHistoryProvider`,
+`04_MultiModelService`, the harness's cancellation plumbing, and so on).
+Said plainly so the coverage of this audit is not overstated.
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client
@@ -466,7 +494,10 @@ entirely surfaces this port does not have. Grouped by *why*, so a future pass do
   several are deliberate scope boundaries recorded in earlier passes.
 - **.NET-only surfaces with no Rust analogue** — #8872, #8491, #8879,
   #8873, #8877, #8885, #8845, #8813, #8834, #8837, #8839, #8832, #8805,
-  #8827, #8812, #8809, #8656, #8606, #8754, #8721.
+  #8827, #8812, #8809, #8656, #8606, #8754, #8721. Seven of these were
+  re-audited against the Rust code rather than their package path — see
+  *Re-audit of the ".NET-only" bucket* above. All stand; three reasons were
+  corrected and two are places this port is already ahead.
 - **Python-runtime specifics** — asyncio task lifetimes (#8755: the
   lifecycle-owner task leak has no analogue, since this crate's MCP
   transports own their connections directly rather than through a queue-fed

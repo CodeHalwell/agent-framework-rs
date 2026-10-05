@@ -260,3 +260,50 @@ async fn an_older_signature_scheme_is_reported_as_such() {
     };
     assert_eq!(run.state(), WorkflowRunState::Idle);
 }
+
+/// Two edges between the same pair cannot both exist, which is the first of
+/// two reasons a checkpoint here cannot resume into a graph that differs only
+/// in edge multiplicity.
+///
+/// Upstream got that wrong in .NET (#8656): it compared the saved and current
+/// edge lists with a membership test, so a graph with a *different number* of
+/// otherwise-identical edges passed resume validation and a checkpoint was
+/// restored into a structurally different workflow. Two things stop it here,
+/// and the stronger one is upstream of the signature entirely — the builder
+/// refuses the duplicate, so the two graphs cannot both be built. (The
+/// second: `compute_graph_signature` hashes a sorted *vector* of edge
+/// descriptors rather than a set, so a repeated descriptor would survive into
+/// the canonical form if one could ever be produced.)
+///
+/// Conditional edges are the case worth pinning, because a condition is an
+/// opaque closure and cannot be part of a descriptor: two conditional edges
+/// `a -> b` with different predicates are indistinguishable to both the
+/// duplicate check and the signature, so if anything were going to slip
+/// through as "the same edge twice", it is this.
+#[test]
+fn a_second_edge_between_the_same_pair_is_refused_at_build() {
+    fn graph(conditional_edges: usize) -> agent_framework_core::error::Result<Workflow> {
+        let mut builder = WorkflowBuilder::new()
+            .add_executor(Arc::new(FunctionExecutor::new("a", |_m, _c| async move {
+                Ok(())
+            })))
+            .add_executor(Arc::new(FunctionExecutor::new("b", |_m, _c| async move {
+                Ok(())
+            })))
+            .set_start("a");
+        for i in 0..conditional_edges {
+            builder = builder.add_conditional_edge("a", "b", move |v: &serde_json::Value| {
+                v.as_i64() == Some(i as i64)
+            });
+        }
+        builder.build()
+    }
+
+    assert!(graph(1).is_ok());
+    let err = match graph(2) {
+        Ok(_) => panic!("a second a -> b edge must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("EDGE_DUPLICATION"), "{err}");
+    assert!(err.contains("'a' -> 'b'"), "{err}");
+}
