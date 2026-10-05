@@ -57,6 +57,7 @@ use crate::client::EmbeddingClient;
 use crate::error::{Error, Result};
 use crate::memory::{ContextProvider, SessionContext};
 use crate::tools::{ApprovalMode, FunctionTool, ToolDefinition};
+use crate::types::EmbeddingGenerationOptions;
 
 /// The default cap on how many records or keys one tool call may carry.
 ///
@@ -115,6 +116,8 @@ pub struct VectorCollectionContextProviderBuilder {
     approvals: Vec<(VectorToolKind, ApprovalMode)>,
     max_tool_batch_size: usize,
     search_top: usize,
+    search_embedding_options: Option<EmbeddingGenerationOptions>,
+    upsert_embedding_options: Option<EmbeddingGenerationOptions>,
     additional_tools: Vec<ToolDefinition>,
 }
 
@@ -213,6 +216,40 @@ impl VectorCollectionContextProviderBuilder {
     /// How many hits the search tool returns. See [`DEFAULT_SEARCH_TOP`].
     pub fn search_top(mut self, top: usize) -> Self {
         self.search_top = top;
+        self
+    }
+
+    /// Provider options for the embedding call the **search** tool makes.
+    ///
+    /// Searching and indexing are different operations, and for some
+    /// providers the same text must be embedded differently for each. Gemini
+    /// Embedding 2 is the clearest case: it conditions the vector on what the
+    /// text is for and *requires* that to be stated, so a Gemini embedding
+    /// client could not serve a vector store at all until these options
+    /// existed — a retrieval-query task belongs here and a retrieval-document
+    /// task on [`upsert_embedding_options`](Self::upsert_embedding_options).
+    /// For providers that draw no such distinction, leaving both unset is
+    /// right, and is exactly what happened before.
+    ///
+    /// Rust analogue of upstream's per-operation `embeddings_options`
+    /// (#8798). Split by operation rather than by field, because one provider
+    /// has one vector field and it is the operation that differs.
+    ///
+    /// `dimensions` is taken from the vector field's declaration; passing a
+    /// conflicting value here is an error at [`build`](Self::build) rather
+    /// than a store rejection — or worse, a silently mis-shaped vector — at
+    /// the first call.
+    pub fn search_embedding_options(mut self, options: EmbeddingGenerationOptions) -> Self {
+        self.search_embedding_options = Some(options);
+        self
+    }
+
+    /// Provider options for the embedding call the **upsert** tool makes.
+    ///
+    /// See [`search_embedding_options`](Self::search_embedding_options); this
+    /// is the indexing side, where a retrieval-document task belongs.
+    pub fn upsert_embedding_options(mut self, options: EmbeddingGenerationOptions) -> Self {
+        self.upsert_embedding_options = Some(options);
         self
     }
 
@@ -358,11 +395,33 @@ impl VectorCollectionContextProviderBuilder {
             None => kind.tool_name().to_string(),
         };
 
+        // The field's declared width is authoritative: embedding at another
+        // width yields vectors the store either rejects or, worse, stores and
+        // scores against differently shaped neighbours. A caller who asked
+        // for a conflicting width is told now rather than at the first call.
+        let declared_dimensions = vector_field
+            .as_ref()
+            .and_then(|f| f.dimensions)
+            .map(|d| d as u32);
+        let search_embedding_options = resolve_embedding_options(
+            self.search_embedding_options.clone(),
+            declared_dimensions,
+            "search_embedding_options",
+        )?;
+        let upsert_embedding_options = resolve_embedding_options(
+            self.upsert_embedding_options.clone(),
+            declared_dimensions,
+            "upsert_embedding_options",
+        )?;
+
         let mut tools: Vec<ToolDefinition> = Vec::new();
         if self.include_search {
             tools.push(build_search_tool(
                 Arc::clone(&self.collection),
-                Arc::clone(&self.embedder),
+                OperationEmbedder {
+                    client: Arc::clone(&self.embedder),
+                    options: search_embedding_options,
+                },
                 self.scope_filter.clone(),
                 self.search_top,
                 vector_field
@@ -387,7 +446,10 @@ impl VectorCollectionContextProviderBuilder {
         if let Some(text_field) = embed_source {
             tools.push(build_upsert_tool(
                 Arc::clone(&self.collection),
-                Arc::clone(&self.embedder),
+                OperationEmbedder {
+                    client: Arc::clone(&self.embedder),
+                    options: upsert_embedding_options,
+                },
                 self.scope_filter.clone(),
                 self.max_tool_batch_size,
                 text_field,
@@ -484,6 +546,8 @@ impl VectorCollectionContextProvider {
             approvals: Vec::new(),
             max_tool_batch_size: DEFAULT_MAX_TOOL_BATCH_SIZE,
             search_top: DEFAULT_SEARCH_TOP,
+            search_embedding_options: None,
+            upsert_embedding_options: None,
             additional_tools: Vec::new(),
         }
     }
@@ -684,9 +748,52 @@ fn keys_argument(args: &Value, max_batch_size: usize) -> Result<Vec<Value>> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// An embedding client together with the options for one operation's calls.
+///
+/// They always travel as a pair — the options are meaningless without the
+/// client and wrong if paired with the other operation's — so the tool
+/// builders take them as one thing.
+#[derive(Clone)]
+struct OperationEmbedder {
+    client: Arc<dyn EmbeddingClient>,
+    options: Option<EmbeddingGenerationOptions>,
+}
+
+/// Pin `dimensions` to the vector field's declaration, refusing a caller's
+/// conflicting value.
+///
+/// Mirrors upstream's check in `_prepare_embedding_options` (#8798): the field
+/// is the source of truth for width, and a mismatch is a configuration
+/// mistake rather than something to reconcile. An options set that says
+/// nothing about dimensions simply gains the declared one.
+fn resolve_embedding_options(
+    options: Option<EmbeddingGenerationOptions>,
+    declared: Option<u32>,
+    field_name: &str,
+) -> Result<Option<EmbeddingGenerationOptions>> {
+    let Some(mut options) = options else {
+        // Nothing to pin onto, and the embedder's native width is what the
+        // field was declared from in the first place.
+        return Ok(None);
+    };
+    if let Some(declared) = declared {
+        match options.dimensions {
+            Some(requested) if requested != declared => {
+                return Err(Error::Configuration(format!(
+                    "{field_name} requests {requested} dimensions but the vector field \
+                     declares {declared}; a vector of the wrong width cannot be stored or \
+                     compared"
+                )))
+            }
+            _ => options.dimensions = Some(declared),
+        }
+    }
+    Ok(Some(options))
+}
+
 fn build_search_tool(
     collection: Arc<dyn VectorCollection>,
-    embedder: Arc<dyn EmbeddingClient>,
+    embedder: OperationEmbedder,
     scope_filter: Option<FilterExpression>,
     top: usize,
     vector_field: String,
@@ -709,9 +816,12 @@ fn build_search_tool(
         schema,
         move |args: Value| {
             let collection = Arc::clone(&collection);
-            let embedder = Arc::clone(&embedder);
             let scope_filter = scope_filter.clone();
             let vector_field = vector_field.clone();
+            let OperationEmbedder {
+                client: embedder,
+                options: embedding_options,
+            } = embedder.clone();
             async move {
                 let query = args
                     .get("query")
@@ -719,7 +829,7 @@ fn build_search_tool(
                     .filter(|q| !q.trim().is_empty())
                     .ok_or_else(|| Error::Tool("`query` must be a non-empty string".into()))?;
                 let embeddings = embedder
-                    .get_embeddings(vec![query.to_string()], None)
+                    .get_embeddings(vec![query.to_string()], embedding_options)
                     .await?;
                 let vector = embeddings
                     .embeddings
@@ -792,7 +902,7 @@ fn build_get_tool(
 #[allow(clippy::too_many_arguments)]
 fn build_upsert_tool(
     collection: Arc<dyn VectorCollection>,
-    embedder: Arc<dyn EmbeddingClient>,
+    embedder: OperationEmbedder,
     scope_filter: Option<FilterExpression>,
     max_batch_size: usize,
     text_field: String,
@@ -843,11 +953,14 @@ fn build_upsert_tool(
         schema,
         move |args: Value| {
             let collection = Arc::clone(&collection);
-            let embedder = Arc::clone(&embedder);
             let scope_filter = scope_filter.clone();
             let text_field = text_field.clone();
             let vector_field = vector_field.clone();
             let key_field = key_field.clone();
+            let OperationEmbedder {
+                client: embedder,
+                options: embedding_options,
+            } = embedder.clone();
             async move {
                 let records = args
                     .get("records")
@@ -915,7 +1028,7 @@ fn build_upsert_tool(
                     }
                 }
 
-                let embeddings = embedder.get_embeddings(texts, None).await?;
+                let embeddings = embedder.get_embeddings(texts, embedding_options).await?;
                 if embeddings.embeddings.len() != records.len() {
                     return Err(Error::Tool(format!(
                         "the embedding service returned {} vectors for {} records",
@@ -1069,6 +1182,126 @@ mod tests {
             .unwrap_or_else(|| panic!("no tool named {name}"));
         let executor = tool.executor.as_ref().expect("a generated tool executes");
         executor.invoke(args).await.expect("the tool call succeeds")
+    }
+
+    /// An embedder that records the options each call was given, so a test
+    /// can assert that searching and indexing were asked for different
+    /// things.
+    #[derive(Default)]
+    struct OptionRecordingEmbedder {
+        seen: std::sync::Mutex<Vec<Option<EmbeddingGenerationOptions>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for OptionRecordingEmbedder {
+        async fn get_embeddings(
+            &self,
+            values: Vec<String>,
+            options: Option<EmbeddingGenerationOptions>,
+        ) -> Result<GeneratedEmbeddings> {
+            self.seen.lock().unwrap().push(options);
+            Ok(GeneratedEmbeddings {
+                embeddings: values
+                    .iter()
+                    .map(|_| Embedding {
+                        vector: vec![1.0, 1.0, 0.0],
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn task(name: &str) -> EmbeddingGenerationOptions {
+        let mut options = EmbeddingGenerationOptions::new();
+        options
+            .additional_properties
+            .insert("task_type".into(), json!(name));
+        options
+    }
+
+    /// Searching and indexing reach the embedder with their own options.
+    ///
+    /// This is what makes a provider like Gemini Embedding 2 usable here at
+    /// all: it conditions a vector on what the text is for and *requires* the
+    /// caller to say, so until these options existed a Gemini embedding
+    /// client could not serve a vector store (upstream #8798).
+    #[tokio::test]
+    async fn search_and_upsert_embed_with_their_own_options() {
+        let embedder = Arc::new(OptionRecordingEmbedder::default());
+        let provider = VectorCollectionContextProvider::builder(collection(), embedder.clone())
+            .embed_from_field("text")
+            .search_embedding_options(task("RETRIEVAL_QUERY"))
+            .upsert_embedding_options(task("RETRIEVAL_DOCUMENT"))
+            .build()
+            .unwrap();
+
+        call(
+            &provider,
+            "upsert",
+            json!({ "records": [{ "id": "1", "text": "a note" }] }),
+        )
+        .await;
+        call(&provider, "search", json!({ "query": "a note" })).await;
+
+        let seen = embedder.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let upsert = seen[0].as_ref().expect("upsert options");
+        let search = seen[1].as_ref().expect("search options");
+        assert_eq!(
+            upsert.additional_properties.get("task_type"),
+            Some(&json!("RETRIEVAL_DOCUMENT"))
+        );
+        assert_eq!(
+            search.additional_properties.get("task_type"),
+            Some(&json!("RETRIEVAL_QUERY"))
+        );
+        // Both gain the field's declared width without being asked.
+        assert_eq!(upsert.dimensions, Some(3));
+        assert_eq!(search.dimensions, Some(3));
+    }
+
+    #[tokio::test]
+    async fn without_options_the_embedder_is_still_called_with_none() {
+        // The common case is unchanged: a provider that draws no
+        // query/document distinction sees exactly what it saw before.
+        let embedder = Arc::new(OptionRecordingEmbedder::default());
+        let provider = VectorCollectionContextProvider::builder(collection(), embedder.clone())
+            .embed_from_field("text")
+            .build()
+            .unwrap();
+        call(&provider, "search", json!({ "query": "x" })).await;
+        assert_eq!(embedder.seen.lock().unwrap()[0], None);
+    }
+
+    #[test]
+    fn embedding_options_conflicting_with_the_field_width_are_refused() {
+        // A vector of the wrong width cannot be stored or compared, so this
+        // is a configuration mistake to report at build time rather than a
+        // store rejection — or a silently mis-shaped vector — later.
+        let mut options = task("RETRIEVAL_QUERY");
+        options.dimensions = Some(768);
+        let err = builder(collection())
+            .embed_from_field("text")
+            .search_embedding_options(options)
+            .build()
+            .expect_err("a width conflict must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("768"), "{msg}");
+        assert!(msg.contains("declares 3"), "{msg}");
+        assert!(msg.contains("search_embedding_options"), "{msg}");
+    }
+
+    #[test]
+    fn embedding_options_matching_the_field_width_are_accepted() {
+        let mut options = task("RETRIEVAL_DOCUMENT");
+        options.dimensions = Some(3);
+        assert!(builder(collection())
+            .embed_from_field("text")
+            .upsert_embedding_options(options)
+            .build()
+            .is_ok());
     }
 
     #[test]

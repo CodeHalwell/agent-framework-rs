@@ -35,6 +35,15 @@ now satisfy the same bound.
 
 ### Added
 
+- **Per-operation embedding options on the vector-collection provider**
+  (`search_embedding_options`, `upsert_embedding_options`; upstream #8798).
+  Searching and indexing are different operations, and for some providers the
+  same text must be embedded differently for each — which is why the Gemini
+  client above could not serve a vector store at all: its task is required
+  and the two operations need different ones. `dimensions` is pinned from the
+  vector field's declaration, and a conflicting value is refused at `build`
+  rather than becoming a mis-shaped vector later. Leaving both unset is
+  exactly the previous behaviour.
 - **A Gemini embeddings client** (`GeminiEmbeddingClient`, `gemini` crate),
   speaking `batchEmbedContents` directly like this crate's chat client
   (upstream #8798). Gemini Embedding 2 conditions a vector on what the text is

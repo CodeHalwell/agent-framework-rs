@@ -378,6 +378,47 @@ tests, and the selection one fails the selection test and the switch test
 that routes through it. The coexistence test passes throughout, which is what
 shows the mutations are catching the fix rather than the API change.
 
+### Also closed: per-operation embedding options (#8798, the other half)
+
+Recorded as a gap in this same pass, on the assumption that it was a
+`VectorStore` trait change touching every store. It is not. The `VectorStore`
+implementations never call `get_embeddings` — the **vector-collection
+context provider's tools** do, in exactly two places: the search tool
+embedding a query, and the upsert tool embedding the records. So the whole
+change is two builder methods and the wiring to those two call sites, which
+had been passing `None`.
+
+That matters more than a convenience, because the Gemini client added above
+was **unusable with a vector store** without it: Embedding 2 requires a task,
+and the two operations need different ones
+(`RETRIEVAL_QUERY` for the search, `RETRIEVAL_DOCUMENT` for the upsert). The
+gap was recorded as ergonomics; it was really a hole between two pieces of
+this pass's own work.
+
+Split by **operation**, where upstream splits by field as well. Upstream
+needs the per-field form because one record can carry several generated
+vector fields; one provider here has one vector field, so the operation is
+the only axis that differs. The per-field form is not a gap — it is a
+difference in what the two surfaces model.
+
+One check ported from upstream's `_prepare_embedding_options`: `dimensions`
+comes from the vector field's declaration, and a caller requesting a
+different width is refused at `build`. The field is the source of truth, and
+a vector of the wrong width is either rejected by the store or — worse —
+stored and scored against differently shaped neighbours. Options that say
+nothing about dimensions simply gain the declared one, so the pinning is
+invisible unless it conflicts.
+
+Mutation-probed: dropping the forwarding (back to `None`) fails the
+per-operation test; allowing a width conflict fails the refusal test. A
+negative control pins that a provider configured with no options still calls
+the embedder with `None`, which is what every existing caller does.
+
+An incidental refactor came with it: `build_search_tool` crossed clippy's
+argument limit, so the client and its options — which always travel together
+and are wrong if crossed between operations — became one `OperationEmbedder`
+rather than the lint being silenced.
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client
@@ -432,14 +473,6 @@ entirely surfaces this port does not have. Grouped by *why*, so a future pass do
 
 ### Standing gaps this pass surfaced (not closed)
 
-- **Per-operation embedding options on vector stores** (the other half of
-  #8798). Upstream's `upsert(..., embeddings_options=…)` /
-  `embeddings_options_by_field=…` is how a vector store asks for
-  `RETRIEVAL_DOCUMENT` when indexing and `RETRIEVAL_QUERY` when searching —
-  the ergonomic path to the Gemini client's required task. It is a core
-  `VectorStore` API change touching every store implementation, so it is
-  recorded rather than bolted onto one provider. Until it exists, a caller
-  embedding for a vector store passes the task itself.
 - **Multimodal embedding inputs.** `EmbeddingClient::get_embeddings` takes
   `Vec<String>`, so upstream's image and media embedding (`Content`/`Part`
   values) cannot be expressed. Widening the trait affects every embedding
