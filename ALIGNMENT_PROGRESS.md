@@ -419,6 +419,35 @@ argument limit, so the client and its options — which always travel together
 and are wrong if crossed between operations — became one `OperationEmbedder`
 rather than the lint being silenced.
 
+### Also closed: the in-memory search no longer copies the collection (#8544)
+
+The last of the standing gaps, and the only one here that is purely about
+cost. `InMemoryCollection::search` opened with
+
+```rust
+let records: Vec<Value> = self.with_data(|d| d.records.values().cloned().collect());
+```
+
+so a `top: 5` query over 50k records cloned all 50k before looking at any of
+them, then kept a second copy of every match in `scored`. Upstream narrowed
+its own `deepcopy` to the requested page; here the saving is the whole scan
+rather than its tail.
+
+Scoring now runs in place over the stored records and only the page that is
+returned is cloned. The trade is that the lock is held for the scoring pass
+rather than released early — for a store meant for tests and development that
+is clearly the better side of it, since the scan happened regardless and no
+longer has a full copy of the collection in front of it.
+
+**Stated plainly: there is no mutation probe for this one.** It is a
+performance change with no observable behaviour difference, so nothing can
+fail when it is reverted, and claiming otherwise would be dressing up a
+refactor. What the change could plausibly have broken is paging, since
+`skip`/`take` moved to before the clone — that is covered by the two existing
+tests that pin filter-before-`top` and `top`/`skip`/`include_vectors`, plus
+a new one for the page edges (a `skip` past the last match, and a `top`
+smaller than the match count).
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client
@@ -922,11 +951,6 @@ portable, and still the biggest one not waiting on something else.
   every builder method that takes one.
 - **Magentic's task-ledger cache is per-manager, not per-run** (#8581, above).
   Documented this pass; the fix is to move the cache onto the run.
-- **The in-memory vector search clones every record before paging** (#8544).
-  Upstream narrowed its `deepcopy` to the requested page. Here the whole
-  collection is cloned out under the lock before scoring, so the equivalent
-  saving is larger — but it is a performance property of a store meant for
-  tests and development, not a correctness one.
 
 ## Post-`061dc28` drift + Azure-ecosystem review (checked against `6606bef`, 2026-09-21)
 

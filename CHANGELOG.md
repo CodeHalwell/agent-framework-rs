@@ -118,6 +118,14 @@ now satisfy the same bound.
 
 ### Fixed
 
+- **The in-memory vector search cloned the whole collection per query**
+  (upstream #8544). Every record was cloned out of the lock before any was
+  looked at, so a `top: 5` search over 50k records copied all 50k and kept a
+  second copy of each match while scoring. Scoring now happens in place and
+  only the returned page is cloned. The lock is held for the scoring pass
+  instead, which for a store meant for tests and development is the better
+  trade. No behaviour change — this is the one entry here that is purely a
+  performance one.
 - **A failing workflow predicate was indistinguishable from one that said no**
   (upstream #8490). `Condition` returned a bare `bool`, so a predicate that
   could not reach a verdict — one that deserializes the payload, reads a

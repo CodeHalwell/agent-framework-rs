@@ -1064,69 +1064,89 @@ impl VectorCollection for InMemoryCollection {
         // performed at the narrower width.
         let query: Vec<f64> = vector.iter().map(|v| f64::from(*v)).collect();
 
-        let records: Vec<Value> = self.with_data(|d| d.records.values().cloned().collect());
-        let mut scored: Vec<(f64, Value)> = Vec::new();
-        for record in records {
-            // Filtering comes before scoring: a record the filter excludes
-            // must not occupy one of the `top` slots, which is what applying
-            // the filter to an already-truncated result would do.
-            if let Some(filter) = options.filter.as_ref() {
-                // Records are held in storage form, so the filter's logical
-                // names are resolved through the definition — the same
-                // mapping `from_storage` performs on the way out.
-                if !filter.matches(&record, &|name| self.definition.storage_name_for(name))? {
+        // Score in place, under the lock, and clone only the page that is
+        // actually returned.
+        //
+        // This used to clone every record in the collection out of the lock
+        // before looking at any of them, so a `top: 5` search over 50k
+        // records copied all 50k — then kept a second copy of each match in
+        // `scored`. Upstream narrowed its own `deepcopy` to the requested
+        // page (#8544); here the saving is the whole scan rather than just
+        // the tail of it. The lock is held for the scoring pass instead,
+        // which for a store meant for tests and development is the better
+        // trade: the scan happened anyway, and it no longer has a full copy
+        // of the collection in front of it.
+        let page: Vec<(f64, Value)> = self.with_data(|d| -> Result<Vec<(f64, Value)>> {
+            let mut scored: Vec<(f64, &Value)> = Vec::new();
+            for record in d.records.values() {
+                // Filtering comes before scoring: a record the filter excludes
+                // must not occupy one of the `top` slots, which is what applying
+                // the filter to an already-truncated result would do.
+                if let Some(filter) = options.filter.as_ref() {
+                    // Records are held in storage form, so the filter's logical
+                    // names are resolved through the definition — the same
+                    // mapping `from_storage` performs on the way out.
+                    if !filter.matches(record, &|name| self.definition.storage_name_for(name))? {
+                        continue;
+                    }
+                }
+                let Some(stored_vector) = record.get(&field_name).and_then(Value::as_array) else {
+                    continue;
+                };
+                // Every element must be a number. `filter_map`ing the bad ones
+                // away silently reshapes the vector — `[1, "bad", 0, 0]` becomes
+                // `[1, 0, 0]`, which then matches a three-dimensional query
+                // perfectly — so schema-invalid data ranked as a top result.
+                // Each coordinate keeps its integer identity as well as its
+                // `f64` value. This used to narrow to `f32`, which collapsed
+                // distinct large integers onto one value before any metric saw
+                // them; reading at `f64` alone still collapses them above 2^53.
+                // See [`Coord`] for why only Hamming notices.
+                let Some(stored) = stored_vector
+                    .iter()
+                    .map(Coord::from_json)
+                    .collect::<Option<Vec<Coord>>>()
+                else {
+                    continue;
+                };
+                // And it must be the declared width. Two vectors of the same
+                // *wrong* length compare fine to `score_vectors`, so without this
+                // a collection whose records disagree with its own definition
+                // still returns confident hits.
+                if stored.len() != dimensions {
                     continue;
                 }
+                // A stored non-finite element poisons the score the same way a
+                // query one does; skip the record rather than rank it.
+                if stored.iter().any(|c| !c.value.is_finite()) {
+                    continue;
+                }
+                match score_vectors(&distance, &query, &stored) {
+                    // Belt and braces: overflow on very large finite inputs can
+                    // still produce a non-finite score, which must not be ranked
+                    // or handed back as JSON.
+                    Some(score) if score.is_finite() => scored.push((score, record)),
+                    _ => continue,
+                }
             }
-            let Some(stored_vector) = record.get(&field_name).and_then(Value::as_array) else {
-                continue;
-            };
-            // Every element must be a number. `filter_map`ing the bad ones
-            // away silently reshapes the vector — `[1, "bad", 0, 0]` becomes
-            // `[1, 0, 0]`, which then matches a three-dimensional query
-            // perfectly — so schema-invalid data ranked as a top result.
-            // Each coordinate keeps its integer identity as well as its
-            // `f64` value. This used to narrow to `f32`, which collapsed
-            // distinct large integers onto one value before any metric saw
-            // them; reading at `f64` alone still collapses them above 2^53.
-            // See [`Coord`] for why only Hamming notices.
-            let Some(stored) = stored_vector
-                .iter()
-                .map(Coord::from_json)
-                .collect::<Option<Vec<Coord>>>()
-            else {
-                continue;
-            };
-            // And it must be the declared width. Two vectors of the same
-            // *wrong* length compare fine to `score_vectors`, so without this
-            // a collection whose records disagree with its own definition
-            // still returns confident hits.
-            if stored.len() != dimensions {
-                continue;
+            if higher_is_closer {
+                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            } else {
+                scored.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
-            // A stored non-finite element poisons the score the same way a
-            // query one does; skip the record rather than rank it.
-            if stored.iter().any(|c| !c.value.is_finite()) {
-                continue;
-            }
-            match score_vectors(&distance, &query, &stored) {
-                // Belt and braces: overflow on very large finite inputs can
-                // still produce a non-finite score, which must not be ranked
-                // or handed back as JSON.
-                Some(score) if score.is_finite() => scored.push((score, record)),
-                _ => continue,
-            }
-        }
-        if higher_is_closer {
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        } else {
-            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-        }
 
-        scored
-            .into_iter()
-            .skip(options.skip)
-            .take(options.top)
+            // Paging stays here, before the clone: `skip`/`top` select which
+            // records are worth copying, and filtering has already happened
+            // above, so a record the filter excluded never occupied a slot.
+            Ok(scored
+                .into_iter()
+                .skip(options.skip)
+                .take(options.top)
+                .map(|(score, record)| (score, record.clone()))
+                .collect())
+        })?;
+
+        page.into_iter()
             .map(|(score, record)| {
                 Ok(VectorSearchResult {
                     record: self
@@ -2023,6 +2043,39 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record["id"], json!("c"));
         assert!(hits[0].record.get("embedding").is_some());
+    }
+
+    /// Paging now happens before the records are cloned, so the edges of the
+    /// page are worth pinning: a `skip` past the last match yields nothing
+    /// rather than panicking on the slice, and `top` still bounds the result
+    /// independently of how many records were scored.
+    #[tokio::test]
+    async fn a_page_past_the_last_match_is_empty() {
+        let store = InMemoryVectorStore::new();
+        let c = store.get_collection("docs", definition()).unwrap();
+        c.upsert(vec![
+            record("a", "alpha", [1.0, 0.0, 0.0]),
+            record("c", "gamma", [0.9, 0.1, 0.0]),
+        ])
+        .await
+        .unwrap();
+
+        let hits = c
+            .search(
+                vec![1.0, 0.0, 0.0],
+                &VectorSearchOptions::new(5).with_skip(2),
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+
+        // And one fewer than the matches still returns exactly that many.
+        let hits = c
+            .search(vec![1.0, 0.0, 0.0], &VectorSearchOptions::new(1))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record["id"], json!("a"));
     }
 
     #[tokio::test]
