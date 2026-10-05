@@ -43,7 +43,7 @@ struct ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
             facts: Message::assistant("Fact: the dataset lives in data/."),
             plan: Message::assistant("1. Load data. 2. Compute stats."),
@@ -51,7 +51,7 @@ impl MagenticManager for ScriptedManager {
         Ok(Message::assistant("combined ledger"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
         println!("  manager replanning after human intervention");
         Ok(Message::assistant("revised combined ledger"))
     }

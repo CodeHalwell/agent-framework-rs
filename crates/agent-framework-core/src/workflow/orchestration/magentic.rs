@@ -70,7 +70,7 @@
 //! ([`MagenticContext`]) is persisted through [`WorkflowContext::shared_state`]
 //! so the orchestrator executor stays stateless across the pause.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -395,6 +395,23 @@ pub struct MagenticContext {
     pub stall_count: usize,
     /// The number of replans performed.
     pub reset_count: usize,
+    /// The decomposed task ledger (facts + plan) this run last planned, set
+    /// by [`MagenticManager::plan`] and updated by
+    /// [`MagenticManager::replan`].
+    ///
+    /// It lives on the run rather than on the manager, which is what makes a
+    /// shared manager safe. `replan` builds its "update these facts" prompt
+    /// from the previous ledger, and the plan-review and stall-intervention
+    /// requests render it for a human to read and approve — so a ledger held
+    /// on a manager that two runs share lets one run replan from the other's
+    /// facts, and shows a reviewer the other run's plan to sign off. Being
+    /// part of the context also means it is checkpointed with the rest of the
+    /// run, so a resumed run can still replan (upstream #8581).
+    ///
+    /// `None` before the first `plan`, and for a manager that tracks no
+    /// decomposed ledger of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ledger: Option<MagenticTaskLedger>,
 }
 
 impl MagenticContext {
@@ -407,6 +424,7 @@ impl MagenticContext {
             round_count: 0,
             stall_count: 0,
             reset_count: 0,
+            task_ledger: None,
         }
     }
 
@@ -417,6 +435,10 @@ impl MagenticContext {
         self.chat_history.clear();
         self.stall_count = 0;
         self.reset_count += 1;
+        // `task_ledger` is deliberately kept: a reset is followed by a
+        // replan, whose whole job is to *update* the previous facts and plan.
+        // Clearing it here would make the replan that follows a fresh plan
+        // with no memory of what the run had established.
     }
 }
 
@@ -424,11 +446,20 @@ impl MagenticContext {
 /// and final-answer synthesis. Rust analogue of `MagenticManagerBase`.
 #[async_trait]
 pub trait MagenticManager: Send + Sync {
-    /// Gather facts and produce the initial plan (returns the combined ledger).
-    async fn plan(&self, context: &MagenticContext) -> Result<Message>;
+    /// Gather facts and produce the initial plan (returns the combined
+    /// ledger).
+    ///
+    /// Takes `&mut` so an implementation that decomposes its plan can record
+    /// it in [`MagenticContext::task_ledger`] — the run's own state — rather
+    /// than in its own, which two concurrent runs would share. See that
+    /// field for what goes wrong otherwise.
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message>;
 
     /// Update facts and plan after a stall (returns the combined ledger).
-    async fn replan(&self, context: &MagenticContext) -> Result<Message>;
+    ///
+    /// Reads the previous [`MagenticContext::task_ledger`] as the facts to
+    /// update, and records the new one in its place.
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message>;
 
     /// Produce the structured progress ledger for the current round.
     async fn create_progress_ledger(
@@ -471,28 +502,29 @@ pub trait MagenticManager: Send + Sync {
 
 /// The standard LLM-driven manager. Rust analogue of `StandardMagenticManager`.
 ///
-/// # One manager per concurrent run
+/// # Safe to share between runs
 ///
-/// This manager is **stateful**: it caches the decomposed task ledger it last
-/// planned, and [`MagenticBuilder`] holds it behind an `Arc`. Building a
-/// workflow consumes the builder, so two workflows cannot accidentally share
-/// one — but two things still can, and both surface the same way.
+/// This manager holds no run state. The decomposed task ledger it plans lives
+/// on [`MagenticContext::task_ledger`] — the run's own state — so a manager
+/// shared by two concurrent runs, whether through one `Arc` handed to two
+/// builders or through [`Workflow::run`](crate::workflow::Workflow::run)
+/// taking `&self`, serves each from its own facts and plan.
 ///
-/// A caller can hand the same `Arc` to two builders, and
-/// [`Workflow::run`](crate::workflow::Workflow::run) takes `&self`, so one
-/// Magentic workflow can have two runs in flight at once. Either way the
-/// second run's `plan`/`replan` overwrites the cached ledger, and the ledger
-/// is read back by exactly the two surfaces where being wrong is expensive:
-/// the plan-review request and the stall-intervention request. A human
-/// reviewer can therefore be shown — and asked to approve — the *other* run's
-/// facts and plan. The runs' own execution state is unaffected; it lives on
-/// the orchestrator, per run.
+/// That is a change in this port (upstream #8581, which made the same
+/// guarantee by creating a manager per build). The ledger used to be cached
+/// on the manager, where a second run's planning overwrote the first's, and
+/// the cache was read at three places: `replan`, which builds its "update
+/// these facts" prompt from it — so a run could be told to update the *other*
+/// run's facts, corrupting its reasoning rather than only a display — and the
+/// plan-review and stall-intervention requests, where a human could be shown,
+/// and asked to approve, the other run's plan. None of it raised an error.
 ///
-/// Give each concurrent run its own manager (and its own workflow). Upstream
-/// (#8581) made the same guarantee by creating a manager per build.
+/// Moving the ledger onto the context also put it inside the run's
+/// checkpointed state, so a resumed run can replan; previously the ledger
+/// died with the process and the first stall after a resume failed with
+/// `replan() called before plan()`.
 pub struct StandardMagenticManager {
     agent: Arc<dyn SupportsAgentRun>,
-    task_ledger: Mutex<Option<MagenticTaskLedger>>,
     max_stall_count: usize,
     max_reset_count: Option<usize>,
     max_round_count: Option<usize>,
@@ -504,7 +536,6 @@ impl StandardMagenticManager {
     pub fn new(agent: Arc<dyn SupportsAgentRun>) -> Self {
         Self {
             agent,
-            task_ledger: Mutex::new(None),
             max_stall_count: 3,
             max_reset_count: None,
             max_round_count: None,
@@ -536,11 +567,6 @@ impl StandardMagenticManager {
         self
     }
 
-    /// The current task ledger, if planning has run.
-    pub fn task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.task_ledger.lock().unwrap().clone()
-    }
-
     /// Run the underlying agent and return the last message, tagged as the
     /// manager. Rust analogue of `_complete`.
     async fn complete(&self, messages: Vec<Message>) -> Result<Message> {
@@ -567,7 +593,7 @@ impl StandardMagenticManager {
 
 #[async_trait]
 impl MagenticManager for StandardMagenticManager {
-    async fn plan(&self, context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message> {
         let task_text = context.task.text();
         let team_text = team_block(&context.participant_descriptions);
 
@@ -583,7 +609,7 @@ impl MagenticManager for StandardMagenticManager {
         plan_msgs.extend([facts_user, facts_msg.clone(), plan_user]);
         let plan_msg = self.complete(plan_msgs).await?;
 
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: facts_msg.clone(),
             plan: plan_msg.clone(),
         });
@@ -599,11 +625,9 @@ impl MagenticManager for StandardMagenticManager {
         ))
     }
 
-    async fn replan(&self, context: &MagenticContext) -> Result<Message> {
-        let ledger = self
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
+        let ledger = context
             .task_ledger
-            .lock()
-            .unwrap()
             .clone()
             .ok_or_else(|| Error::Workflow("replan() called before plan()".into()))?;
         let task_text = context.task.text();
@@ -625,7 +649,7 @@ impl MagenticManager for StandardMagenticManager {
         plan_msgs.extend([facts_update_user, updated_facts.clone(), plan_update_user]);
         let updated_plan = self.complete(plan_msgs).await?;
 
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: updated_facts.clone(),
             plan: updated_plan.clone(),
         });
@@ -704,9 +728,6 @@ impl MagenticManager for StandardMagenticManager {
     }
     fn max_round_count(&self) -> Option<usize> {
         self.max_round_count
-    }
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.task_ledger()
     }
 }
 
@@ -950,16 +971,31 @@ impl MagenticOrchestrator {
         ctx.yield_output(payload).await
     }
 
-    /// Split a manager's current ledger into separate facts/plan text for a
+    /// Split the run's current ledger into separate facts/plan text for a
     /// [`MagenticPlanReviewRequest`], falling back to the combined message's
     /// text as `plan` (facts left empty) for managers that don't track a
     /// decomposed ledger. Rust analogue of Python's
     /// `getattr(manager, "task_ledger", None)` access pattern.
-    fn decompose_ledger(&self, combined: &Message) -> (String, String) {
-        match self.manager.current_task_ledger() {
+    ///
+    /// The run's own [`MagenticContext::task_ledger`] is consulted first,
+    /// because that is what a reviewer must be shown: a ledger read off a
+    /// manager shared by two runs could be the other run's. A manager that
+    /// keeps its own decomposed ledger — the Python escape hatch, which
+    /// third-party managers may still use — is the fallback, and carries that
+    /// caveat with it.
+    fn decompose_ledger(&self, mctx: &MagenticContext, combined: &Message) -> (String, String) {
+        match self.run_ledger(mctx) {
             Some(ledger) => (ledger.facts.text(), ledger.plan.text()),
             None => (String::new(), combined.text()),
         }
+    }
+
+    /// The decomposed ledger to render for this run: the run's own, else a
+    /// custom manager's.
+    fn run_ledger(&self, mctx: &MagenticContext) -> Option<MagenticTaskLedger> {
+        mctx.task_ledger
+            .clone()
+            .or_else(|| self.manager.current_task_ledger())
     }
 
     /// Re-render the combined ledger message from `state`'s current
@@ -1033,8 +1069,9 @@ impl MagenticOrchestrator {
                         .mctx
                         .chat_history
                         .push(Message::user(format!("Human plan feedback: {comments}")));
-                    state.combined_ledger = self.manager.replan(&state.mctx).await?;
-                    let (facts_text, plan_text) = self.decompose_ledger(&state.combined_ledger);
+                    state.combined_ledger = self.manager.replan(&mut state.mctx).await?;
+                    let (facts_text, plan_text) =
+                        self.decompose_ledger(&state.mctx, &state.combined_ledger);
                     state.facts_text = facts_text;
                     state.plan_text = plan_text;
                 }
@@ -1077,8 +1114,9 @@ impl MagenticOrchestrator {
                             .chat_history
                             .push(Message::user(format!("Human plan feedback: {comments}")));
                     }
-                    state.combined_ledger = self.manager.replan(&state.mctx).await?;
-                    let (facts_text, plan_text) = self.decompose_ledger(&state.combined_ledger);
+                    state.combined_ledger = self.manager.replan(&mut state.mctx).await?;
+                    let (facts_text, plan_text) =
+                        self.decompose_ledger(&state.mctx, &state.combined_ledger);
                     state.facts_text = facts_text;
                     state.plan_text = plan_text;
                 }
@@ -1125,7 +1163,7 @@ impl MagenticOrchestrator {
         // Python reads facts/plan straight off the manager's task ledger,
         // leaving them empty when the manager tracks none (unlike plan review,
         // which falls back to the combined ledger text).
-        let (facts, plan) = match self.manager.current_task_ledger() {
+        let (facts, plan) = match self.run_ledger(&mctx) {
             Some(ledger) => (ledger.facts.text(), ledger.plan.text()),
             None => (String::new(), String::new()),
         };
@@ -1290,13 +1328,13 @@ impl Executor for MagenticOrchestrator {
         self.emit_orchestrator_message(&ctx, &task);
 
         // Initial planning.
-        let task_ledger = self.manager.plan(&mctx).await?;
+        let task_ledger = self.manager.plan(&mut mctx).await?;
 
         if self.require_plan_signoff {
             // Withhold the ledger from chat_history until approved, mirroring
             // Python's `handle_start_message` (which only appends it after
             // `_send_plan_review_request` is skipped or resolved).
-            let (facts_text, plan_text) = self.decompose_ledger(&task_ledger);
+            let (facts_text, plan_text) = self.decompose_ledger(&mctx, &task_ledger);
             let state = MagenticPlanReviewState {
                 mctx,
                 combined_ledger: task_ledger,

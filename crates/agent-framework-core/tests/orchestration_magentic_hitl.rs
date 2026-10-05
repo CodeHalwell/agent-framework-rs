@@ -118,7 +118,7 @@ impl ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         let facts = Message::assistant("FACTS v1");
         let plan = Message::assistant("PLAN v1");
@@ -129,7 +129,7 @@ impl MagenticManager for ScriptedManager {
         Ok(Message::assistant("combined ledger v1"))
     }
 
-    async fn replan(&self, context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
         let saw_feedback = context
             .chat_history

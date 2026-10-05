@@ -30,7 +30,7 @@ struct ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
             facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
             plan: Message::assistant("1. Draft the notes. 2. Have the editor review."),
@@ -39,7 +39,7 @@ impl MagenticManager for ScriptedManager {
         Ok(Message::assistant("initial combined ledger"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
         let ledger = MagenticTaskLedger {
             facts: Message::assistant("Fact: the release notes live in CHANGELOG.md."),
             plan: Message::assistant("1. Draft. 2. Review. 3. Add upgrade warnings."),

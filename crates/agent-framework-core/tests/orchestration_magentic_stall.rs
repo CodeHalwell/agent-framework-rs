@@ -129,7 +129,7 @@ impl ScriptedStallManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedStallManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
             facts: Message::assistant("FACTS v1"),
@@ -138,7 +138,7 @@ impl MagenticManager for ScriptedStallManager {
         Ok(Message::assistant("combined ledger v1"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
         *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
             facts: Message::assistant("FACTS v2"),

@@ -17,9 +17,15 @@ return, a fan-out that could run one executor twice on one message, a replay
 alignment that duplicated history, and an orchestrator decision that was
 unreadable whenever the provider ignored `response_format`.
 
-**Breaking, in one place.** `agent_framework_bedrock::convert::build_request`
-takes the model id as a third argument. The request cannot be built correctly
-without it: which fields Converse accepts depends on the model (see below).
+**Breaking, in two places.** `agent_framework_bedrock::convert::build_request`
+takes the model id as a third argument — the request cannot be built correctly
+without it, since which fields Converse accepts depends on the model (see
+below). And `MagenticManager::plan`/`replan` take `&mut MagenticContext`,
+because the task ledger they produce is the run's state rather than the
+manager's; a custom manager updates its signatures and, if it decomposes a
+plan, writes `context.task_ledger` instead of its own field.
+`StandardMagenticManager::task_ledger()` is gone with the cache it read —
+the ledger is on the context.
 
 ### Added
 
@@ -97,6 +103,21 @@ without it: which fields Converse accepts depends on the model (see below).
 
 ### Fixed
 
+- **A shared Magentic manager could replan one run from another run's facts**
+  (upstream #8581). `StandardMagenticManager` cached the decomposed task
+  ledger on itself, and two runs can share one manager — the same `Arc` handed
+  to two builders, or `Workflow::run` taking `&self`. The cache was read at
+  three places: `replan`, which builds its "update these facts" prompt from
+  the previous ledger, and the plan-review and stall-intervention requests,
+  where a human is shown facts and a plan to approve. So a run could be told
+  to update the other run's facts — corrupting its own reasoning, not just a
+  display, which the previous note on this recorded incorrectly — and a
+  reviewer could be asked to sign off the other run's plan. Nothing raised an
+  error. The ledger now lives on `MagenticContext::task_ledger`, the run's own
+  state, which also puts it inside the run's checkpoint: previously the ledger
+  died with the process, so the first stall after a resume failed with
+  `replan() called before plan()`. `MagenticContext::reset` deliberately keeps
+  it, since the replan that follows a reset exists to update it.
 - **A Purview-guarded streamed run was not policy-checked** (upstream #8702).
   `PurviewAgentMiddleware` skipped its response-phase check whenever
   `ctx.is_streaming`, carried over from Python's "streaming responses are not

@@ -279,6 +279,53 @@ values, which `EmbeddingClient::get_embeddings` cannot express — it takes
 options (the other half of #8798), are recorded under *Remaining* rather than
 forced through a provider-shaped side door.
 
+### Also closed: Magentic's task ledger moves onto the run (#8581)
+
+Recorded as a standing gap two passes ago and left documented rather than
+fixed. Closing it turned up that the note written then **understated it**:
+"the runs' own execution state is unaffected" is wrong. `replan` builds its
+`{old_facts}` prompt from the cached ledger, so a shared manager does not
+merely mis-render a review surface — it hands one run the other run's facts
+as the facts to update, and the plan it produces from them becomes that run's
+plan. The note has been corrected in place.
+
+Three consequences, all silent, now closed by moving the ledger to
+`MagenticContext::task_ledger`:
+
+1. **`replan` reasoning.** A run replans from its own facts. This is the one
+   that corrupted output rather than a display.
+2. **The human surfaces.** Plan review and stall intervention render the
+   run's ledger, so a reviewer cannot be asked to approve another run's plan.
+   A custom manager's own `current_task_ledger()` remains the fallback — it is
+   the Python escape hatch and two examples implement it — and carries that
+   caveat in its docs.
+3. **Resume.** The ledger is part of the run's serialized state, so a
+   checkpointed run can still replan. Previously it lived on the manager,
+   died with the process, and the first stall after a resume failed outright
+   with `replan() called before plan()`. That one was a hard error nobody had
+   hit yet, not a silent fault.
+
+The fix also brings the manager in line with a rule this file's own
+orchestration code already states: `MagenticPlanReviewState`'s comment
+requires the executor instance to stay stateless between `execute()` calls.
+The manager is held by that executor, and its cache was exactly the kind of
+cross-call state the rule forbids.
+
+**Breaking:** `MagenticManager::plan`/`replan` take `&mut MagenticContext`.
+That is the shape the fix wants rather than a return-value change, because
+`MagenticContext` is already documented as "mutable state threaded through the
+manager and orchestrator" and is already what gets checkpointed — so the
+ledger lands in the right place without the orchestrator having to put it
+there. `StandardMagenticManager::task_ledger()` is removed with the cache it
+read. `current_task_ledger()` stays on the trait, defaulting to `None`, so
+custom managers are otherwise untouched.
+
+Mutation-probed with the old design restored verbatim (a `Mutex` on the
+manager, written by `plan` and read by `replan`): the cross-run test and the
+resume test both fail, and the other two still pass. Clearing the ledger in
+`reset` fails the reset test; marking the field `serde(skip)` fails the
+resume test.
+
 ### The other 107 commits
 
 Seven ported above, and four more (#8715 with #8847, #8997, and the client
@@ -348,8 +395,6 @@ entirely surfaces this port does not have. Grouped by *why*, so a future pass do
 - **A switch/case predicate cannot report failure** (#8490). Reconfirmed,
   unchanged: closing it means widening `Condition` to `Result<bool>` across
   every builder that takes one.
-- **Magentic's task-ledger cache is per-manager, not per-run** (#8581).
-  Unchanged; documented two passes ago.
 
 ## Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
 
@@ -735,7 +780,7 @@ table gains one new upstream connector.
 | #8637 | **Hamming distance could not tell two large integers apart.** Stored vectors were read as `f64` and then narrowed to `f32` before scoring. `f32` carries 24 bits of mantissa, so any two distinct integers above 2^24 — ids, timestamps, hashes, which is exactly what a Hamming collection holds — compared **equal**, and the record that did not match came back scored as an exact match. Hamming is where this surfaces because it is the one metric asking whether coordinates are the *same* rather than how far apart they are. Coordinates are now read at `f64` and the query widened once, which also stops every other metric losing precision it was never meant to lose. Two details ride along. The score is now **normalized** by the vector width, as upstream has it: ranking was unaffected (dividing by a constant is monotonic) but a raw count made `score_threshold` mean a different thing on every collection. And the sibling test that pinned the *old* narrowing — it fed `1e39`, finite in `f64` and infinite in `f32`, to prove a non-finite stored vector is dropped — was rewritten rather than deleted: the property it protects (a score that cannot be serialized is never ranked) is real, but its route is now arithmetic overflow, so it squares `1e200` instead, and a second test pins that `1e39` is ranked normally now. Worth noting the port was *already* ahead of this class elsewhere: `vectors/filters.rs` documents refusing `f64` for integer comparison for the same reason. | `core/vectors.rs` (`score_vectors`, `InMemoryCollection::search`) |
 | #8454 | **A Foundry project could not be used for embeddings.** `FoundryEmbeddingClient` spoke only the Foundry **Models** inference endpoint, a separately-provisioned surface. The endpoint a Foundry user actually has is the *project* endpoint — the one `FoundryChatClient` already takes — so a project holding an embedding deployment still could not be embedded against from here. Upstream's route is now derived: `https://<res>.services.ai.azure.com/api/projects/<proj>` becomes `https://<res>.openai.azure.com/openai/v1`, scoped to the **resource** rather than the project, which is why the project path is dropped. Three details are right rather than plausible. The project route is **path-versioned**, so it must not carry the Models endpoint's `?api-version=` — the same split `FoundryChatClient` handles with `without_api_version`, and the reason `url()` now branches instead of formatting one string. The token audience stays `cognitiveservices.azure.com` (the derived host is Azure OpenAI data plane), *not* `FOUNDRY_SCOPE`. And the project route is **Entra-only**, which is why there is no api-key counterpart. `from_env` prefers the Models endpoint when both are set, so an environment that already worked is untouched, and accepts `FOUNDRY_ENDPOINT` beside `FOUNDRY_PROJECT_ENDPOINT` so one Foundry environment configures both clients — an alias upstream does not need and this crate does, because its chat client reads the other name first. | `foundry/embeddings.rs` (`openai_model_base_url`, `Route`, `with_project_endpoint`, `from_env`) |
 | #8524 | **A whitespace-only instruction became a contentless system turn.** `prepare_messages` skipped `""` but not `" "` or `"\n"`, so a blank instruction — the shape an unset options default or an instruction merge produces — was prepended to the conversation as a system message some providers bill for and others reject. A real instruction still prepends **verbatim**, whitespace included; the trim decides only whether to prepend. | `core/types/message.rs` (`prepare_messages`) |
-| #8581 | **A shared Magentic manager interleaves two runs' plans.** Upstream created a manager per build. Rust's `build(self)` consumes the builder, so the case upstream was fixing cannot arise here — but two others can, and they surface identically: a caller can hand one `Arc` to two builders, and `Workflow::run` takes `&self`, so one Magentic workflow can have two runs in flight. `StandardMagenticManager` caches the decomposed task ledger, and that cache is read back by exactly the two surfaces where being wrong is expensive — the plan-review request and the stall-intervention request — so a human reviewer can be shown, and asked to approve, the *other* run's facts and plan. The runs' own execution state is unaffected; it lives per-run on the orchestrator. **Documented rather than fixed**, which is the honest scope: the fix is to move the cache per-run, and `standard_manager` (which takes the manager by value, so each builder owns one) is already the shape that avoids it. Recorded below as a standing gap. | `core/workflow/orchestration/magentic.rs` (docs on `StandardMagenticManager`, `manager`, `standard_manager`) |
+| #8581 | **A shared Magentic manager interleaves two runs' plans.** Upstream created a manager per build. Rust's `build(self)` consumes the builder, so the case upstream was fixing cannot arise here — but two others can, and they surface identically: a caller can hand one `Arc` to two builders, and `Workflow::run` takes `&self`, so one Magentic workflow can have two runs in flight. `StandardMagenticManager` caches the decomposed task ledger, and that cache is read back by exactly the two surfaces where being wrong is expensive — the plan-review request and the stall-intervention request — so a human reviewer can be shown, and asked to approve, the *other* run's facts and plan. **Documented rather than fixed**, which is the honest scope: the fix is to move the cache per-run, and `standard_manager` (which takes the manager by value, so each builder owns one) is already the shape that avoids it. Recorded below as a standing gap. **Correction (post-`301a43c` pass, where this was fixed):** the sentence originally here — "the runs' own execution state is unaffected; it lives per-run on the orchestrator" — was wrong. `replan` builds its `{old_facts}` prompt from the cached ledger, so a shared manager hands one run the other's facts as the facts to update, and the resulting plan becomes that run's plan. The fault reached the run's reasoning, not only the review surfaces. | `core/workflow/orchestration/magentic.rs` (docs on `StandardMagenticManager`, `manager`, `standard_manager`) |
 
 Verified across all six: full workspace build, `cargo test --workspace
 --all-features` (**2082 passing, 0 failing**), `cargo clippy --all-targets
