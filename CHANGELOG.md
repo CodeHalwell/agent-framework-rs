@@ -5,7 +5,7 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.10.0] — 2026-10-05
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).
 **Nine land on this port**, plus one Azure capability added on the back of a
@@ -24,8 +24,10 @@ below). And `MagenticManager::plan`/`replan` take `&mut MagenticContext`,
 because the task ledger they produce is the run's state rather than the
 manager's; a custom manager updates its signatures and, if it decomposes a
 plan, writes `context.task_ledger` instead of its own field.
-`StandardMagenticManager::task_ledger()` is gone with the cache it read —
-the ledger is on the context. And `workflow::Condition` and
+`StandardMagenticManager::task_ledger()` is gone with the cache it read, and
+so is `MagenticManager::current_task_ledger()` — the ledger is on the
+context, and a trait method reading it off the manager could only ever
+return a ledger belonging to no particular run. And `workflow::Condition` and
 `workflow::Selection` now carry a `Result`, so code that builds one by
 constructing the `Arc` directly returns `Ok(..)` or uses the new
 `wrap_sync_condition` / `wrap_async_condition` / `wrap_selection` /
@@ -117,7 +119,10 @@ now satisfy the same bound.
   the multi-target form was unreachable from the public API.
 - **A Markdown-fence JSON scanner shared by group chat and Magentic.** A
   provider that ignores `response_format` wraps the orchestrator's decision in
-  a code fence; the body of the fence is now a parse candidate. A closing
+  a code fence; the body of the fence is now a parse candidate. An opening fence must
+  begin its line (CommonMark's rule, with up to three spaces of indent), so
+  an inline backtick run in the surrounding prose cannot be mistaken for the
+  start of the block and swallow the real one. A closing
   fence must be at least as long as its opening one and end its line, so
   backticks inside a JSON string value do not end the block and an outer
   fence may use four or more. Ports upstream's
@@ -178,12 +183,17 @@ now satisfy the same bound.
   replays the *result* as updates, so the hook is handed the complete response
   and a replacement reaches the caller — the buffering upstream had to add to
   `ResponseStream` is already how this port streams such a run. The check now
-  runs whenever a response exists. A blocked response also carries the
-  evaluated response's control fields (`response_id`, `conversation_id`,
-  `created_at`, `finish_reason`, `usage_details`, `continuation_token`,
-  `additional_properties`) so the caller can still identify and resume the
-  operation, while `value` is dropped because it still holds the blocked
-  content. `PurviewChatMiddleware` is gated on a response being present
+  runs whenever a response exists. A blocked response carries an explicit
+  allowlist of the evaluated response's control fields (`response_id`,
+  `conversation_id`, `created_at`, `finish_reason`, `usage_details`,
+  `continuation_token`) so the caller can still identify and resume the
+  operation. Everything else is withheld, `value` and
+  `additional_properties` alike: both are content channels, and `logprobs`
+  (new in this release) puts the generated token *strings* in the latter, so
+  returning that map would let a caller reconstruct the text the check just
+  blocked. The list is an allowlist rather than "all but `value`" so that a
+  field added to `AgentResponse` later is withheld until someone decides it
+  is safe. `PurviewChatMiddleware` is gated on a response being present
   rather than on `is_streaming`, which is what is actually true of it: the
   streaming chat path honours only pre-call mutation, so a token stream never
   reaches that hook — attach the agent middleware to enforce one.
@@ -207,7 +217,10 @@ now satisfy the same bound.
   `audio_format` matched `"mpeg"` as a substring, but one of those is an M3U
   playlist and the other an MPEG-4 RTP payload. The media type is now
   normalized (parameters stripped, case-folded) and compared against the
-  registered MP3 aliases, so a non-MP3 sibling takes the unsupported-content
+  registered MP3 aliases — and WAV is matched against its own allowlist for
+  the same reason, since `audio/x-wavpack` is a different codec that a
+  substring test labelled as WAV. A non-matching sibling takes the
+  unsupported-content
   path instead of failing at the provider after the upload (upstream #8787).
 - **A fan-out selection could run one executor twice on one message.** A
   selection naming the same target more than once — two tags routing to the
@@ -226,6 +239,22 @@ now satisfy the same bound.
   *injection* follows the same alignment and now prepends exactly the part a
   trimmed replay is missing, instead of all of it (duplicating the window) or
   none of it (losing the turns before it).
+
+### Changed
+
+- **`async-trait` moved to 0.1.92** (lockfile only; the requirement stays
+  `"0.1"`). Through 0.1.89 the macro pushed `#[must_use]` onto every
+  generated method, which Rust 1.99's clippy reports as `double_must_use`
+  on a method already returning a `#[must_use]` boxed future — 33 instances
+  across `agent-framework-core`, all in trait definitions, none of them
+  written by hand. 0.1.92 stops emitting the attribute. This bumps
+  `async-trait` onto `syn 3`, so `syn` 2 and 3 now coexist in the lockfile;
+  both declare `rust-version` 1.71, well under this workspace's 1.88 floor.
+- **The one `Atomic::fetch_update` call site allows its deprecation.** Rust
+  1.99 renamed the method to `try_update`, which does not exist on the
+  declared `rust-version = "1.88"` — so the rename cannot be taken until the
+  floor rises, and the attribute carries that note. Behaviour is unchanged;
+  the method itself was only renamed.
 
 ## [0.9.0] — 2026-09-30
 
