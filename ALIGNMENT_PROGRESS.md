@@ -30,6 +30,15 @@ existed to return, a fan-out that could run one executor twice on one
 message, and a replay alignment that duplicated history for any caller
 keeping its own window.
 
+**On the baseline, and the mirror.** The window was diffed against
+`microsoft/agent-framework` directly (`218700d..301a43c`) rather than against
+the local mirror, which is one upstream day behind at `e9857bd`. That is not
+a sync failure: the mirror's daily job has merged every day it had something
+to merge (09-28 through 10-03), and upstream was simply quiet from 10-02
+14:12 until 10-05 09:09 — after this morning's 06:06 run. Reading upstream
+directly is what brought the eight commits from 10-05 09:09–09:32 into
+scope, two of which (#8997, #9026) are in the triage above.
+
 ### Ported this pass (7 upstream changes, all with regression tests)
 
 Eight rows below, seven upstream commits: #8739 appears twice because the
