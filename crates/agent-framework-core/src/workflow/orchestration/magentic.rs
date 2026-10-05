@@ -266,30 +266,24 @@ fn first_assistant(messages: &[Message]) -> Option<Message> {
         .cloned()
 }
 
-/// Extract the first balanced JSON object from model output. Rust analogue of
-/// `_extract_json` (fenced blocks are handled implicitly by scanning for the
-/// first `{...}`).
+/// Extract the JSON object a Magentic ledger prompt asked for. Rust analogue
+/// of `_extract_json`.
+///
+/// A fenced object wins when there is one, because the fence is the model
+/// saying where its answer is: scanning for the first `{` instead picks up a
+/// brace in the prose around the fence — a worked example, a schema reminder,
+/// an emoticon — and parses that as the ledger. Only a body that is itself an
+/// object is taken, so a fenced code sample in the answer is skipped rather
+/// than mistaken for one (#8850). Without a fenced object, the first balanced
+/// `{...}` is still the candidate, which is what unfenced output needs.
 fn extract_json(text: &str) -> Result<Value> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| Error::Workflow("no JSON object found in model output".into()))?;
-    let mut depth = 0usize;
-    let mut end = None;
-    for (i, ch) in text[start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(start + i + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| Error::Workflow("unbalanced JSON braces".into()))?;
-    let candidate = &text[start..end];
+    let fenced = super::markdown_fence_bodies(text)
+        .into_iter()
+        .find(|body| body.starts_with('{') && body.ends_with('}'));
+    let candidate = match fenced {
+        Some(body) => body,
+        None => first_balanced_object(text)?,
+    };
     if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(candidate) {
         return Ok(v);
     }
@@ -304,6 +298,28 @@ fn extract_json(text: &str) -> Result<Value> {
             "unable to parse JSON from model output".into(),
         )),
     }
+}
+
+/// The first balanced `{...}` span in `text`, for output that carries no
+/// fenced object.
+fn first_balanced_object(text: &str) -> Result<&str> {
+    let start = text
+        .find('{')
+        .ok_or_else(|| Error::Workflow("no JSON object found in model output".into()))?;
+    let mut depth = 0usize;
+    for (i, ch) in text[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(&text[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(Error::Workflow("unbalanced JSON braces".into()))
 }
 
 /// A single progress-ledger field: a reason plus a boolean or string answer.

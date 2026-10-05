@@ -384,3 +384,116 @@ async fn non_success_status_surfaces_as_service_error_and_stops_the_pipeline() {
     assert_eq!(err.status(), Some(403));
     assert!(!called.load(Ordering::SeqCst));
 }
+
+/// A terminal returning a response that carries the control fields a real
+/// provider would set, so the blocked replacement can be checked for them.
+fn terminal_returning_identified(
+    called: Arc<AtomicBool>,
+    text: &'static str,
+) -> Terminal<AgentContext> {
+    Box::new(move |mut ctx: AgentContext| {
+        called.store(true, Ordering::SeqCst);
+        Box::pin(async move {
+            ctx.result = Some(AgentResponse {
+                messages: vec![Message::assistant(text)],
+                response_id: Some("resp-7".into()),
+                conversation_id: Some("conv-7".into()),
+                value: Some(serde_json::json!({ "secret": text })),
+                ..Default::default()
+            });
+            Ok(ctx)
+        }) as BoxFuture<agent_framework_core::error::Result<AgentContext>>
+    })
+}
+
+#[tokio::test]
+async fn a_streamed_run_is_policy_checked_like_a_buffered_one() {
+    // `Agent::run_stream` routes a middleware-guarded run through `run_core`
+    // and replays its *result* as updates, so this hook sees the whole
+    // response and its replacement is what the caller receives. Skipping the
+    // check on `is_streaming` left a streamed run unenforced — the one
+    // direction a policy check must not fail in.
+    let (base_url, handle) = serve_sequence(vec![
+        // Prompt check: allow.
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "1"}))),
+        // Response check: block.
+        Box::new(|stream| {
+            write_json_response(
+                stream,
+                &serde_json::json!({
+                    "id": "2",
+                    "policyActions": [{"action": "blockAccess", "restrictionAction": "block"}]
+                }),
+            );
+        }),
+    ]);
+
+    let middleware = PurviewAgentMiddleware::new(
+        StaticTokenProvider::new("test-token"),
+        settings_pointed_at(&base_url).with_blocked_response_message("Response blocked by policy"),
+    );
+    let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
+    let called = Arc::new(AtomicBool::new(false));
+    // The streaming context — the case that used to be skipped.
+    let ctx = AgentContext::new(vec![user_message()], true);
+
+    let result_ctx = pipeline
+        .execute(
+            ctx,
+            terminal_returning_identified(called.clone(), "Here is the confidential roadmap."),
+        )
+        .await
+        .unwrap();
+
+    assert!(called.load(Ordering::SeqCst));
+    let result = result_ctx.result.expect("a result is produced");
+    assert_eq!(result.text(), "Response blocked by policy");
+    // The control fields identify the operation the caller is holding, so they
+    // are carried over ...
+    assert_eq!(result.response_id.as_deref(), Some("resp-7"));
+    assert_eq!(result.conversation_id.as_deref(), Some("conv-7"));
+    // ... but the structured value is not: it still holds the blocked content.
+    assert!(result.value.is_none(), "{:?}", result.value);
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests.len(), 2, "both phases were evaluated");
+    assert_eq!(
+        requests[1].body_json()["contentToProcess"]["contentEntries"][0]["content"]["data"],
+        serde_json::json!("Here is the confidential roadmap."),
+        "the response phase evaluated the streamed reply"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_run_the_service_allows_is_delivered_unchanged() {
+    // Negative control for the test above: the new check must not swap in a
+    // blocked message when nothing is blocked.
+    let (base_url, handle) = serve_sequence(vec![
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "1"}))),
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "2"}))),
+    ]);
+
+    let middleware = PurviewAgentMiddleware::new(
+        StaticTokenProvider::new("test-token"),
+        settings_pointed_at(&base_url),
+    );
+    let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
+    let called = Arc::new(AtomicBool::new(false));
+    let ctx = AgentContext::new(vec![user_message()], true);
+
+    let result_ctx = pipeline
+        .execute(
+            ctx,
+            terminal_returning_identified(called.clone(), "Here's the roadmap."),
+        )
+        .await
+        .unwrap();
+
+    let result = result_ctx.result.expect("a result is produced");
+    assert_eq!(result.text(), "Here's the roadmap.");
+    assert!(
+        result.value.is_some(),
+        "an allowed response keeps its value"
+    );
+    assert_eq!(handle.join().expect("server thread").len(), 2);
+}

@@ -95,6 +95,7 @@ pub struct AzureAISearchProvider {
     semantic_configuration_name: Option<String>,
     vector_field_name: Option<String>,
     embedding_function: Option<EmbeddingFn>,
+    filter: Option<String>,
     context_prompt: String,
 }
 
@@ -110,6 +111,7 @@ impl std::fmt::Debug for AzureAISearchProvider {
                 &self.semantic_configuration_name,
             )
             .field("vector_field_name", &self.vector_field_name)
+            .field("filter", &self.filter)
             .field(
                 "auth",
                 &match &self.auth {
@@ -135,6 +137,7 @@ impl AzureAISearchProvider {
             semantic_configuration_name: None,
             vector_field_name: None,
             embedding_function: None,
+            filter: None,
             context_prompt: DEFAULT_CONTEXT_PROMPT.to_string(),
         }
     }
@@ -221,6 +224,39 @@ impl AzureAISearchProvider {
         self
     }
 
+    /// Restrict retrieval to the documents matching an OData `$filter`
+    /// expression, applied by the service before ranking.
+    ///
+    /// This is what scopes a shared index: a tenant id, a document class, a
+    /// security-trimming field. Without it every run retrieves over the whole
+    /// index, so one tenant's documents can land in another tenant's context —
+    /// which makes this an isolation control, not only a relevance knob. The
+    /// filter is applied server-side and so also bounds `top`: it selects the
+    /// candidate set the ranking is drawn from rather than trimming the
+    /// results after the fact.
+    ///
+    /// The expression is sent verbatim, so it must be valid OData for the
+    /// index's fields and any literal interpolated into it must be escaped
+    /// (single quotes are doubled in OData string literals). Upstream exposes
+    /// the same capability on its agentic knowledge sources as
+    /// `SearchIndexKnowledgeSourceParams(filter_add_on=…)` (#8673); the
+    /// semantic-mode equivalent is this `filter`.
+    ///
+    /// ```no_run
+    /// # use agent_framework_azure_ai_search::AzureAISearchProvider;
+    /// let provider = AzureAISearchProvider::with_api_key(
+    ///     "https://my-search.search.windows.net",
+    ///     "my-index",
+    ///     "<admin-or-query-key>",
+    /// )
+    /// .with_filter("tenant_id eq 'acme' and status ne 'archived'");
+    /// # let _ = provider;
+    /// ```
+    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
+        self.filter = Some(filter.into());
+        self
+    }
+
     /// Override the prompt prepended to retrieved context
     /// (default [`DEFAULT_CONTEXT_PROMPT`]).
     pub fn with_context_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -255,6 +291,9 @@ impl AzureAISearchProvider {
         body.insert("top".into(), json!(self.top_k));
         if let Some(fields) = &self.select_fields {
             body.insert("select".into(), json!(fields.join(",")));
+        }
+        if let Some(filter) = &self.filter {
+            body.insert("filter".into(), json!(filter));
         }
         if let Some(sem) = &self.semantic_configuration_name {
             body.insert("queryType".into(), json!("semantic"));
@@ -424,6 +463,24 @@ mod tests {
         assert_eq!(body["queryType"], json!("semantic"));
         assert_eq!(body["semanticConfiguration"], json!("sem-cfg"));
         assert_eq!(body["captions"], json!("extractive"));
+    }
+
+    #[tokio::test]
+    async fn an_odata_filter_is_sent_verbatim_and_is_absent_when_unset() {
+        // A shared index needs this to keep one tenant's documents out of
+        // another's retrieved context, so the clause has to reach the service
+        // exactly as written.
+        let filter = "tenant_id eq 'acme' and status ne 'archived'";
+        let body = provider()
+            .with_filter(filter)
+            .build_search_body("hello")
+            .await
+            .unwrap();
+        assert_eq!(body["filter"], json!(filter));
+        // Negative control: no filter configured adds no key, so an unscoped
+        // provider still searches the whole index as it always did.
+        let body = provider().build_search_body("hello").await.unwrap();
+        assert!(body.get("filter").is_none(), "{body}");
     }
 
     #[tokio::test]

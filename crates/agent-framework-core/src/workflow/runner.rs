@@ -286,6 +286,61 @@ impl WorkflowBuilder {
         self
     }
 
+    /// Fan out from `source` to the subset of `targets` a selection function
+    /// picks per message. Rust analogue of upstream's
+    /// `WorkflowBuilder.add_multi_selection_edge_group`.
+    ///
+    /// The selection is handed the message and the group's target ids, and
+    /// returns the ids that should receive it — zero, one, or several. Unlike
+    /// [`add_switch`](Self::add_switch), which picks exactly one branch, this
+    /// is the multi-target form: a message tagged for two reviewers goes to
+    /// both in the same superstep.
+    ///
+    /// Two rules are enforced when the selection runs, not when it is
+    /// registered, because its result is only known per message:
+    ///
+    /// * An id that is not one of `targets` is a routing error. A selection
+    ///   naming an executor outside its own group would otherwise be dropped
+    ///   silently and the run would still report `Idle`.
+    /// * A repeated id is delivered **once**. A selection may name the same
+    ///   target twice — two tags on a message routing to the same executor —
+    ///   and running that executor twice on one message is never what was
+    ///   meant, besides double-counting toward a fan-in barrier downstream.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use agent_framework_core::workflow::{Selection, WorkflowBuilder};
+    /// # use serde_json::Value;
+    /// let urgent: Selection = Arc::new(|msg: &Value, candidates: &[String]| {
+    ///     let picked: Vec<String> = if msg["urgent"].as_bool().unwrap_or(false) {
+    ///         candidates.to_vec()
+    ///     } else {
+    ///         candidates.first().cloned().into_iter().collect()
+    ///     };
+    ///     Box::pin(async move { picked })
+    /// });
+    /// let builder = WorkflowBuilder::new().add_multi_selection(
+    ///     "triage",
+    ///     vec!["reviewer_a".to_string(), "reviewer_b".to_string()],
+    ///     urgent,
+    /// );
+    /// # let _ = builder;
+    /// ```
+    pub fn add_multi_selection(
+        mut self,
+        source: impl Into<String>,
+        targets: impl IntoIterator<Item = String>,
+        selection: Selection,
+    ) -> Self {
+        self.edge_groups.push(EdgeGroup::FanOut {
+            source: source.into(),
+            targets: targets.into_iter().collect(),
+            selection: Some(selection),
+            case_labels: None,
+        });
+        self
+    }
+
     /// Fan in from `sources` to `target` (barrier).
     pub fn add_fan_in(
         mut self,
@@ -1172,7 +1227,37 @@ impl WorkflowRun {
                     selection,
                     ..
                 } if *source == msg.source_id => match selection {
-                    Some(sel) => targets.extend(sel(&msg.data, outs).await),
+                    Some(sel) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for id in sel(&msg.data, outs).await {
+                            // A selection that names something outside its own
+                            // group is a routing error, not a silent drop —
+                            // the same contract an explicit `target_id`
+                            // already gets above. Without the check the id
+                            // falls through the planning loop's
+                            // `executors.get(...)` miss and the run still
+                            // reports `Idle`, so a typo in a custom
+                            // `Selection` looks like a message nobody wanted.
+                            if !outs.contains(&id) {
+                                return Err(Error::Workflow(format!(
+                                    "executor '{}' selected target '{}', which is not one of \
+                                     its fan-out group's targets: {}",
+                                    msg.source_id,
+                                    id,
+                                    outs.join(", ")
+                                )));
+                            }
+                            // A selection may name one target more than once —
+                            // two tags on a message routing to the same
+                            // executor, say. Deliver to each selected target
+                            // once: a second delivery runs the executor twice
+                            // on one message, and for a fan-in sink it also
+                            // double-counts toward the barrier.
+                            if seen.insert(id.clone()) {
+                                targets.push(id);
+                            }
+                        }
+                    }
                     None => targets.extend(outs.clone()),
                 },
                 EdgeGroup::FanIn { sources, target } if sources.contains(&msg.source_id) => {

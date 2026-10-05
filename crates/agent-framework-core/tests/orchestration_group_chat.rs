@@ -313,3 +313,80 @@ async fn output_from_and_intermediate_output_from_conflict() {
     };
     assert!(err.to_string().contains("group_chat_orchestrator"));
 }
+
+#[tokio::test]
+async fn llm_manager_parses_a_fenced_json_selection() {
+    // A provider that ignores `response_format` wraps the decision in a
+    // Markdown fence. The strict parse used to fail and take the run down,
+    // so a `finish: true` the manager did issue was never applied.
+    let manager = manager_agent(vec![
+        "Thinking about who should go next.\n\n```json\n{\"selected_participant\": \"A\", \"instruction\": \"please answer\", \"finish\": false}\n```",
+        "```\n{\"finish\": true, \"final_message\": \"resolved\"}\n```",
+    ]);
+    let a = agent("A", vec!["a-answer"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .max_rounds(10)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("please solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("please answer")),
+        "instruction injected: {texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("a-answer")), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.contains("resolved")),
+        "final message: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn llm_manager_takes_the_last_fenced_block() {
+    // A model that shows a worked example first and closes with its actual
+    // decision: the final block is the one that counts.
+    let manager = manager_agent(vec![
+        "For example:\n\n```json\n{\"finish\": true, \"final_message\": \"example\"}\n```\n\nMy decision:\n\n```json\n{\"finish\": true, \"final_message\": \"real\"}\n```",
+    ]);
+    let a = agent("A", vec!["unused"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(texts.iter().any(|t| t.contains("real")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("example")), "{texts:?}");
+}
+
+#[tokio::test]
+async fn llm_manager_keeps_backticks_inside_a_final_message() {
+    // A closing fence has to end its line, so the backticks around `cargo`
+    // inside the JSON string do not end the block early.
+    let manager = manager_agent(vec![
+        "```json\n{\"finish\": true, \"final_message\": \"run ```cargo test``` first\"}\n```",
+    ]);
+    let a = agent("A", vec!["unused"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("run ```cargo test``` first")),
+        "{texts:?}"
+    );
+}

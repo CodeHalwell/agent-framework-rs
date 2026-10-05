@@ -6,8 +6,163 @@ the `68136ee` heading refer to that document. Every item recorded as landed was
 independently verified (full workspace build + `cargo test` + clippy
 `--all-targets` + rustfmt, all green) before commit.
 
-**Current upstream baseline: `dc8e226` (2026-09-28).** Sections are newest
+**Current upstream baseline: `301a43c` (2026-10-05).** Sections are newest
 first; each records the upstream revision it was checked against.
+
+## Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05)
+
+Upstream moved **119 non-merge commits** in this window (2026-09-28 → 10-05),
+the largest weekly window this log has recorded. **Seven land on this port**,
+and an eighth Azure capability was added on the back of a commit that does
+not.
+
+The window reads as a provider-and-cloud week. Two of the seven are a field
+the code happily sent that the cloud API *rejects outright*, so the request
+failed rather than degraded — the opposite of the permissive-failure pattern
+the last few windows were made of. Three are Azure-surface work, and one of
+those is an enforcement hole rather than a defect: a Purview-guarded
+**streamed** run was never policy-checked, because the port had copied
+Python's "streaming responses are not supported for post-checks" along with
+the guard, and that reason does not hold in this architecture.
+
+The remaining three are a filter clause that dropped exactly the rows it
+existed to return, a fan-out that could run one executor twice on one
+message, and a replay alignment that duplicated history for any caller
+keeping its own window.
+
+### Ported this pass (7 upstream changes, all with regression tests)
+
+Eight rows below, seven upstream commits: #8739 appears twice because the
+fault it fixes was unreachable from this port's public API, so closing it
+properly meant adding the builder method that reaches it.
+
+| Upstream | Change | Rust site |
+|---|---|---|
+| #8702 | **A Purview-guarded streamed run was not policy-checked.** `PurviewAgentMiddleware` ran its response-phase check only when `!ctx.is_streaming`, carried over verbatim from upstream's "streaming responses are not supported for post-checks". That premise is false here: `Agent::run_stream` routes a run with agent middleware through `run_core` with `is_streaming = true`, the terminal buffers the whole response into `ctx.result`, and `run_stream_impl` replays **the result** as updates (`agent.rs:493`) — so the hook already receives the complete response and a replacement already reaches the caller. The buffering upstream had to build into `ResponseStream` (`stream_buffer_updates` / `stream_result_transforms`, #8829) is simply how this port streams a guarded run. So the guard's effect was not "streaming is unsupported" but "a streamed run is unenforced", which is the one direction a policy check must not fail in. The check now runs whenever a response exists. Two details beyond the guard. A blocked response **carries the evaluated response's control fields** — `response_id`, `conversation_id`, `created_at`, `finish_reason`, `usage_details`, `continuation_token`, `additional_properties` — so the caller can still identify and resume the operation, while `value` is deliberately not carried because it still holds the content that was just blocked (upstream's `_blocked_response`, same reasoning). And `PurviewChatMiddleware` is now gated on a response being *present* rather than on `is_streaming`: for chat middleware the two are not interchangeable, since `apply_chat_middleware_pre_call` honours only pre-call mutation and leaves `ctx.result` as `None`, so a token stream never reaches that hook at all. Asking the question that way states what is true instead of asserting something about streaming. One place this port ends up **ahead** of upstream: upstream documents that the run has already written the blocked content to conversation history by the time the post-check runs; here the replacement happens inside `run_core`, before `run_stream_impl` calls the context providers' `after_run`, so history gets the blocked message rather than the content. | `purview/middleware.rs` (`PurviewAgentMiddleware`, `PurviewChatMiddleware`) |
+| #8771 | **A negated `eq` dropped exactly the Cosmos documents it should return.** `eq` compiled to `(IS_DEFINED(x) AND x = @p)`. Cosmos SQL evaluates `x = @p` on a *stored null* to UNDEFINED rather than false, `IS_DEFINED(x) AND UNDEFINED` is UNDEFINED, and `NOT UNDEFINED` stays UNDEFINED — so `NOT (field eq value)` excluded the null-valued documents that are its clearest matches. The guard is the one `in`/`not_in` (`vector_store.rs:1148`) and the ordered operators (`:1051`) already carried, which is also what makes this a consistency fix rather than a new rule: the same portable filter answered differently depending on which operator it reached. | `cosmos/vector_store.rs` (`eq` arm of the `Eq`/`Ne` branch) |
+| #8680 | **Two Bedrock fields Converse rejects outright, sent on every request that set them.** The port was already *ahead* of the half of this upstream fix that forwards `guardrailConfig` / `performanceConfig` / `requestMetadata` / `promptVariables` / `additionalModelRequestFields` — `build_request` merges `additional_properties` as top-level Converse fields, so all five already went. What it did not do is drop the two things Converse will not accept. **`guardrailConfig.streamProcessingMode`** is modelled only on `ConverseStream`'s `GuardrailStreamConfiguration`; `Converse` models `GuardrailConfiguration`, which has no such field. Upstream drops it on its non-streaming path only, because its streaming path really does call `ConverseStream`; here it is dropped unconditionally, and that is the *faithful* reading rather than a stricter one — this client's streaming path aggregates a single `Converse` call (the documented event-stream-framing divergence), so `ConverseStream` is never reached and the field is never valid. **A Prompt Management ARN** (`:prompt/` in the model id) takes its instructions, tools and inference settings from the prompt, and Converse rejects a request that also sets `inferenceConfig`, `system`, `toolConfig` or `additionalModelRequestFields`; they are now dropped with one warning naming them. Upstream additionally has to drop its own default `maxTokens` quietly — this converter never adds one, so everything present here was asked for by the caller and is worth telling them about. Prompt-*router* ARNs are ordinary inference targets and are untouched, pinned as a negative control. Forced a **breaking signature change**: `build_request` now takes the model id, because which fields the request may carry is a property of the model. | `bedrock/convert.rs` (`build_request`, new `apply_converse_compatibility`), `bedrock/lib.rs` |
+| #8787 | **`audio/mpegurl` and `audio/mpeg4-generic` were uploaded to OpenAI as MP3.** `audio_format` tested `media_type.contains("mpeg")`, but one of those types is an M3U *playlist* (text, not audio frames) and the other an MPEG-4 RTP payload. Both were labelled `mp3` and sent as audio, which can only fail at the provider — after the upload. The media type is now normalized (parameters stripped, case-folded) and compared against the registered MP3 aliases, so a non-MP3 sibling takes the unsupported-content path. `wav` is deliberately left as a substring test, as upstream leaves it: it has no sibling subtype that is not WAV audio, so narrowing it would only risk refusing a real alias. | `openai/convert.rs` (`audio_format`, new `MP3_MEDIA_TYPES`) |
+| #8739 | **A fan-out selection could run one executor twice on one message.** `resolve_targets` extended its target list with the selection's result as-is, so a selection naming the same target more than once — two tags on a message routing to the same executor — delivered once per mention. Beyond running the executor twice, that double-counts toward a downstream fan-in barrier, which is the part that corrupts a run rather than merely repeating work. Each selected target is now delivered to once, per selection (upstream dedups the same way, in the same place). A second, pre-existing gap closed alongside it: upstream validates that a selection's result is a subset of the group's targets, and the port had no equivalent, so a custom `Selection` naming an unregistered executor fell through the planning loop's `executors.get(...)` miss and the run still reported `Idle` — a silent drop where an explicit `target_id` already got an error. | `core/workflow/runner.rs` (`resolve_targets`) |
+| #8739 (reachability) | **The multi-selection fan-out had no builder method**, which is why neither of the two faults above was reachable from the public API: `EdgeGroup::FanOut` has carried a `Selection` since the engine was built, but only `add_switch` installed one and it picks exactly one branch. `add_multi_selection` is the Rust analogue of upstream's `add_multi_selection_edge_group` — the capability the upstream fix is *about*. | `core/workflow/runner.rs` (`WorkflowBuilder::add_multi_selection`) |
+| #8800 | **A replay of a trimmed transcript duplicated stored history on every run.** `filter_new_messages_from` looked for *all* of stored history inside a run's input, so a caller keeping its own window — a UI holding the last N turns, a client replaying what is still on screen — matched nothing and had every replayed turn appended again, each run. Upstream added a tail alignment in the same window; here it is `trailing_overlap`, the longest suffix of stored history that is also a prefix of the input. The port keeps its own, stronger refusals rather than upstream's: `could_be_a_replay` still gates the whole thing, an overlap consuming all of the input is still read as a turn that repeated itself, and a single id-less user message is still no evidence of a replay (upstream declines that case too, and for the same reason). The part upstream has no analogue for: `inject_stored_history_from` decided what to prepend by *comparing lengths*, which a partial alignment makes wrong — it would have read "shorter result" as "the input has it all" and prepended nothing, dropping the turns before the caller's window out of the request. Alignment is now one computation with one answer (`Alignment::{None, WholeBlock, Tail}`) shared by both, and injection prepends exactly the part a trimmed replay is missing. | `core/history.rs` (`align`, `Alignment`, `trailing_overlap`, `filter_new_messages_from`, `inject_stored_history_from`) |
+| #8850 | **An orchestrator decision was unreadable whenever the provider ignored `response_format`.** A manager or Magentic agent asked for JSON commonly answers with the JSON inside a Markdown fence. The group chat manager's parse was a strict `serde_json::from_str` on the trimmed text, so a fenced answer failed and took the whole run down — a `finish: true` the manager did issue was never applied. (Upstream's symptom was milder: its parse failure let the chat run to `max_rounds` instead.) Magentic's `extract_json` scanned for the first balanced `{…}`, which is fence-tolerant by accident but picks up a brace in the prose *around* the fence — a worked example, a schema reminder echoed back — and parses that as the ledger. Both now share a linear fence scanner ported from upstream's `extract_markdown_fence_bodies`. Three properties of it are load-bearing rather than incidental: a closing fence must be at least as long as its opening one **and end its line**, so backticks inside a JSON string value (which always have at least a closing quote after them) never end the block and an outer fence can survive three-backtick fences nested inside it; the whole info string is consumed, so `application/json` parses; and the scan never backtracks, so an unterminated fence followed by whitespace cannot stall. Group chat takes the **last** fence body, as upstream does — a model that reasons in prose and closes with its decision puts it in the final block. Magentic takes the first body that is itself an object, so a fenced code sample in the answer is skipped rather than mistaken for the ledger. | `core/workflow/orchestration/mod.rs` (new `markdown_fence_bodies`), `orchestration/group_chat.rs` (`LlmGroupChatManager::parse`), `orchestration/magentic.rs` (`extract_json`, new `first_balanced_object`) |
+
+Verified across all of them: full workspace build, `cargo test --workspace
+--all-features` (**2169 passing, 0 failing**), `cargo clippy --all-targets
+--all-features` under `-D warnings` (CI's own flag) clean, `cargo fmt --check`
+clean, `cargo doc --workspace` clean.
+
+Every behavioural change was probed by mutation against the code it pins,
+not merely tested beside it. Removing the fan-out deduplication fails
+`a_repeated_pick_in_one_selection_delivers_once` with the executor run twice.
+Returning `Alignment::None` instead of a tail overlap fails all four new
+history tests while both negative controls still pass. Disabling the fence
+preference fails the Magentic test with the prose brace parsed as the ledger,
+and dropping the fence candidate fails all three group chat tests. Restoring
+the `is_streaming` guard fails both new Purview loopback tests. Negative
+controls throughout: an absent AI Search filter still adds no `filter` key, a
+prompt-router ARN still carries its `inferenceConfig` and `system`, an
+unfenced Magentic ledger still parses, a manager answering neither bare nor
+fenced JSON still fails the run, a selection picking nothing still delivers
+nothing, and an allowed streamed Purview run still keeps its `value`.
+
+Two of the Purview tests are loopback tests against a fake Graph
+`processContent` on a real socket, because the response phase can only be
+isolated where the prompt phase has a server to succeed against. The unit
+test that pinned the old behaviour — `agent_middleware_skips_post_check_when_streaming`
+— was removed rather than rewritten in place, with a comment at its old site
+naming its two replacements: it passed only because `ignore_exceptions`
+suppressed the very check it claimed was skipped, so there was nothing in it
+worth preserving.
+
+### Also closed this pass: the Azure review
+
+| Azure surface | Upstream | Here | Change this pass |
+|---|---|---|---|
+| Azure AI Search — scoped retrieval | ✅ (agentic `filter_add_on`, #8673) | ✅ (was ❌, untracked) | **Closed, by the semantic-mode route.** Upstream's new `knowledge_source_params` configures its *agentic* Knowledge-Base mode, which this port documents as out of scope — so the commit itself is not portable. But reading it surfaced that the Rust provider had **no filter at all**: every run retrieved over the whole index. On a shared index that is an isolation gap, not a relevance one — one tenant's documents can land in another tenant's context — so `with_filter` sends an OData `$filter` the service applies before ranking, which is the semantic-mode equivalent of `filter_add_on`. Sent verbatim, with the escaping requirement documented, and absent entirely when unset so an existing provider is untouched. |
+| Purview — streamed runs | ✅ | ✅ (was ❌) | **Closed** (above). The gap was an enforcement hole, and the fix needed no core change because this port already buffers a middleware-guarded streamed run. |
+| Azure Cosmos DB — negated `eq` filters | ✅ | ✅ (was ❌) | **Closed** (above). |
+| Foundry — empty memory context | ✅ (#8932, .NET) | ✅ already | **No action: already satisfied.** The provider built last pass returns without touching `ctx.messages` when it retrieved nothing (`foundry/memory.rs:533`), which is the guard upstream has just added. Worth recording as a hit rather than a miss: the .NET fix landed one week after the Rust port shipped the same behaviour. |
+| Azure OpenAI — OpenAI metadata headers | ✅ (#8969) | n/a | Not applicable, and worth stating why so it is not re-triaged. Upstream's bug is that the OpenAI Python SDK injects `OpenAI-Organization`, `OpenAI-Project` and `Authorization` defaults from the environment into an `AsyncAzureOpenAI` client, so an Azure route carried OpenAI credentials. `AzureOpenAIClient` here builds its own `reqwest` request and sets exactly one auth header (`api-key` *or* `Authorization: Bearer`), never an organization or project header, and reads no `OPENAI_*` variable. There is no shared client object for a default to leak through. |
+| Azure AI Search — agentic / Knowledge Base mode | ✅ | ❌ | Unchanged, and now the reason #8673 does not port. A documented scope boundary rather than a defect; it is also where upstream is moving fastest on this connector. |
+| Foundry — `x-client-*` request headers | ✅ (#8715, #8847) | ❌ | **New gap, recorded.** Upstream added validation (reject NUL/CR/LF, require the `x-client-` prefix) to a per-call client-header carrier the port does not have at all, so there is nothing here to validate. The underlying capability — forwarding caller-supplied `x-client-*` headers through `ChatOptions` to the Foundry data plane — is the actual gap. Note `reqwest` would refuse a CR/LF header value at build time, so the *injection* half of upstream's fix is structurally unavailable here even once the carrier exists. |
+| Azure Cosmos DB — chat history batch size | ✅ (#8870, .NET) | n/a | Not applicable: `CosmosChatMessageStore` exposes no batch-size knob, so there is no value to validate. Upstream's fault was a settable `MaxBatchSize` of zero spinning a batching loop forever. |
+| Azure SQL / SQL Server native vector store | ✅ | ❌ | Unchanged from last pass: still blocked on a TDS driver decision (`tiberius` would unblock it). |
+| Azure DocumentDB | ✅ | ❌ | Unchanged: blocked on the MongoDB wire protocol. |
+| Foundry hosting | ✅ | ❌ | Unchanged, and this window was heavy with it (#8894, #8794, #8947, #8966, #8899, #8593, #8741, #8722, #8717, #8713 all land on `foundry_hosting`). The standing gap is the crate itself; it is now the largest single Azure-shaped hole, ahead of Content Understanding by volume of upstream activity though not by tractability. |
+| Azure AI Content Understanding | ✅ | ❌ | Unchanged: still the largest **unblocked** Azure item, a REST surface with nothing in its way but size. |
+
+### The other 107 commits
+
+Seven ported above. Five more are recorded rather than ported: #8715 with
+#8847 (the Foundry `x-client-*` carrier this port lacks), #8798 (a Gemini
+embedding client it lacks), #8997 (logprobs it does not surface), and #8673,
+whose agentic mode is out of scope but which is what surfaced the missing AI
+Search filter. The rest is almost entirely surfaces this port does
+not have. Grouped by *why*, so a future pass does not re-derive it:
+
+- **`foundry_hosting`** — #8894, #8794, #8947, #8966, #8899, #8593, #8741,
+  #8722, #8717, #8713. The crate does not exist here; ten commits in one
+  week is why it is now the largest Azure-shaped hole by activity.
+- **AG-UI, ChatKit, Telegram, DevUI frontend, TypeSafe, DuckDB, MongoDB,
+  Hyperlight, LocalCodeAct, shell/skills tooling** — #8672, #8807, #8948,
+  #8734, #8737, #8844, #8843, #8803, #8592, #8792, #8725, #8946, #8934,
+  #8720, #8766, #8937, #8749, #9043, #8769. No Rust counterpart, and
+  several are deliberate scope boundaries recorded in earlier passes.
+- **.NET-only surfaces with no Rust analogue** — #8872, #8491, #8879,
+  #8873, #8877, #8885, #8845, #8813, #8834, #8837, #8839, #8832, #8805,
+  #8827, #8812, #8809, #8656, #8606, #8754, #8721.
+- **Python-runtime specifics** — asyncio task lifetimes (#8755: the
+  lifecycle-owner task leak has no analogue, since this crate's MCP
+  transports own their connections directly rather than through a queue-fed
+  owner task), SDK stream disposal (#8773), `ResponseStream` hot-path
+  latency (#8971) and its gating/buffering rework (#8829, whose capability
+  this port expresses as method pairs — see *Remaining*), postponed-annotation
+  middleware detection (#8648), `py.typed` markers (#8823), pickle
+  allowlists for checkpoint deserialization (#8723 — this port's checkpoints
+  are JSON and there is no unpickler to allow types for), pydantic settings
+  coercion (#8926), functional-workflow replay identity (#8887), and the
+  declarative Power Fx / state-path work (#8893, #8974) against a DSL the
+  port deliberately does not implement.
+- **Already satisfied or ahead** — #9026 (the port already errors on a
+  manager selecting an unknown participant, and does so for *every* manager
+  rather than only the agent-based one, so the check cannot be bypassed by
+  supplying a custom manager), #8932 (above), #8736 (a single stop string
+  cannot arise: `ChatOptions::stop` is `Option<Vec<String>>`, so none of the
+  four providers upstream fixed was ever able to send a bare string).
+- **Native-SDK-shaped provider fixes the OpenAI-compatible path makes
+  moot** — #8917, #8815, #8928, and the Ollama half of #8736. The Ollama
+  client here speaks Ollama's OpenAI-compatible endpoint and reuses
+  `agent_framework_openai::convert`, so `images`, native tool-result shapes
+  and `keep_alive` are not fields it sends at all.
+- **Structurally impossible here** — #8699 (a `None` text delta:
+  `TextContent::text` is a `String`, not an `Option`), #8735 and #8816
+  (Anthropic schema and metadata mutation: ownership means `build_request`
+  cannot mutate a caller's `ChatOptions`, and the response format is
+  embedded in the system prompt rather than written into a shared dict).
+- **Harness / approval / file-store internals with no Rust surface** —
+  #8778, #8457, #8710, #8895, #8761 (with #8780).
+- **Dependency bumps, release version bumps, CI and codeql config, docs and
+  samples** — the remainder, with no behavioural content for this port.
+
+### Standing gaps this pass surfaced (not closed)
+
+- **Foundry `x-client-*` header forwarding** (#8715, #8847). The carrier
+  itself is missing; see the Azure table.
+- **A Gemini embedding client** (#8798). Upstream added Gemini Embedding 2
+  and per-task vector options; the Rust `gemini` crate has a chat client
+  only, so there is no embedding surface to add them to. Smaller than it
+  looks — the `EmbeddingClient` trait and three sibling implementations
+  already exist — and unblocked.
+- **Logprobs are not surfaced at all** (#8997). Upstream's fix is that an
+  empty streamed chunk must not clear the token metadata gathered so far;
+  here there is nothing to clear, because the OpenAI client does not read
+  `logprobs` on either path. The gap is the capability, not the merge rule.
+- **A switch/case predicate cannot report failure** (#8490). Reconfirmed,
+  unchanged: closing it means widening `Condition` to `Result<bool>` across
+  every builder that takes one.
+- **Magentic's task-ledger cache is per-manager, not per-run** (#8581).
+  Unchanged; documented two passes ago.
 
 ## Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
 

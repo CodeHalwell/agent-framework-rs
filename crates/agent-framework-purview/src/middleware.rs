@@ -93,13 +93,18 @@ impl PurviewPolicyCore {
 ///   true` — the wrapped agent/chat-client is never called, matching this
 ///   crate's `ShortCircuitChat`-style test pattern in
 ///   `agent-framework-core`.
-/// - **Response (post) check**: only runs when `!ctx.is_streaming` and a
-///   result was produced (mirrors Python: "Streaming responses are not
-///   supported for post-checks"). If blocked, `ctx.result` is *replaced*
-///   with a single `system`-role message
-///   ([`PurviewSettings::blocked_response_message`]) — unlike the prompt
-///   check, `ctx.terminate` is not set here (there's nothing left to
-///   terminate; the underlying call already happened), matching Python.
+/// - **Response (post) check**: runs whenever the run produced a result,
+///   streamed or not. A streamed run reaches this hook fully buffered (see
+///   the note on `ctx.is_streaming` in the implementation), so it gets the
+///   same evaluation as a buffered one — at the cost of incremental
+///   delivery, which a decision needing the whole response cannot have. If
+///   blocked, `ctx.result` is *replaced* with a single `system`-role message
+///   ([`PurviewSettings::blocked_response_message`]) carrying the evaluated
+///   response's control fields; unlike the prompt check, `ctx.terminate` is
+///   not set here (there's nothing left to terminate; the underlying call
+///   already happened), matching Python. Because the replacement happens
+///   inside the run, the blocked message — not the content — is what the
+///   run's context providers persist to history.
 ///
 /// ```no_run
 /// use agent_framework_core::prelude::*;
@@ -149,19 +154,43 @@ impl Middleware<AgentContext> for PurviewAgentMiddleware {
 
         let mut ctx = next.run(ctx).await?;
 
-        if !ctx.is_streaming {
-            let post_messages = ctx.result.as_ref().map(|r| r.messages.clone());
-            if let Some(messages) = post_messages {
-                let (should_block, _) = self
-                    .0
-                    .check(&messages, resolved_user_id.as_deref(), "response")
-                    .await?;
-                if should_block {
-                    ctx.result = Some(AgentResponse {
-                        messages: vec![self.0.blocked_response_message()],
-                        ..Default::default()
-                    });
-                }
+        // Evaluated whenever a response exists, streaming or not. On the
+        // streaming path `Agent::run_stream` routes a run with agent
+        // middleware through `run_core` and replays the *result* as updates,
+        // so this hook is handed the complete response and the replacement
+        // below is what the caller actually receives — the buffering upstream
+        // had to add to `ResponseStream` (#8702) is already how this port
+        // streams a middleware-guarded run. The consequence of the old
+        // `!ctx.is_streaming` guard was therefore not "streaming is
+        // unsupported" but "a streamed run is unenforced", which is the one
+        // direction a policy check must not fail in.
+        //
+        // Streamed delivery is not incremental while this middleware is
+        // attached: a policy decision needs the whole response, so no update
+        // can be released before it is evaluated.
+        if let Some(messages) = ctx.result.as_ref().map(|r| r.messages.clone()) {
+            let (should_block, _) = self
+                .0
+                .check(&messages, resolved_user_id.as_deref(), "response")
+                .await?;
+            if should_block {
+                // Replaced, not emptied: the control fields identify the
+                // operation the caller is holding and let it resume or
+                // correlate the run. `value` and the raw provider payload are
+                // deliberately *not* carried, because both still hold the
+                // content that was just blocked.
+                let evaluated = ctx.result.take().unwrap_or_default();
+                ctx.result = Some(AgentResponse {
+                    messages: vec![self.0.blocked_response_message()],
+                    response_id: evaluated.response_id,
+                    conversation_id: evaluated.conversation_id,
+                    created_at: evaluated.created_at,
+                    finish_reason: evaluated.finish_reason,
+                    usage_details: evaluated.usage_details,
+                    continuation_token: evaluated.continuation_token,
+                    additional_properties: evaluated.additional_properties,
+                    value: None,
+                });
             }
         }
         Ok(ctx)
@@ -197,19 +226,38 @@ impl Middleware<ChatContext> for PurviewChatMiddleware {
 
         let mut ctx = next.run(ctx).await?;
 
-        if !ctx.is_streaming {
-            let post_messages = ctx.result.as_ref().map(|r| r.messages.clone());
-            if let Some(messages) = post_messages {
-                let (should_block, _) = self
-                    .0
-                    .check(&messages, resolved_user_id.as_deref(), "response")
-                    .await?;
-                if should_block {
-                    ctx.result = Some(ChatResponse {
-                        messages: vec![self.0.blocked_response_message()],
-                        ..Default::default()
-                    });
-                }
+        // Gated on a response existing rather than on `is_streaming`. For chat
+        // middleware the two are not interchangeable the way they are for
+        // agent middleware: `Agent::apply_chat_middleware_pre_call` honors
+        // only *pre-call* mutation on the streaming path, so `ctx.result` is
+        // `None` there and a token stream never reaches this hook. Asking the
+        // question this way says what is actually true — the check runs on
+        // every response it can see — instead of asserting that a streamed
+        // chat call has one.
+        //
+        // A streamed chat call that must be policy-checked is enforced by
+        // attaching [`PurviewAgentMiddleware`] instead, whose streaming path
+        // does buffer.
+        if let Some(messages) = ctx.result.as_ref().map(|r| r.messages.clone()) {
+            let (should_block, _) = self
+                .0
+                .check(&messages, resolved_user_id.as_deref(), "response")
+                .await?;
+            if should_block {
+                // See the agent middleware above on what is carried and why.
+                let evaluated = ctx.result.take().unwrap_or_default();
+                ctx.result = Some(ChatResponse {
+                    messages: vec![self.0.blocked_response_message()],
+                    response_id: evaluated.response_id,
+                    conversation_id: evaluated.conversation_id,
+                    model: evaluated.model,
+                    created_at: evaluated.created_at,
+                    finish_reason: evaluated.finish_reason,
+                    usage_details: evaluated.usage_details,
+                    continuation_token: evaluated.continuation_token,
+                    additional_properties: evaluated.additional_properties,
+                    value: None,
+                });
             }
         }
         Ok(ctx)
@@ -381,24 +429,15 @@ mod tests {
         assert_eq!(result_ctx.result.unwrap().text(), "real response");
     }
 
-    #[tokio::test]
-    async fn agent_middleware_skips_post_check_when_streaming() {
-        // is_streaming = true -> the response-phase check must never run,
-        // so even a config-broken response phase can't surface an error.
-        // `ignore_exceptions` keeps the *prompt* phase from failing closed on
-        // the unidentifiable message, which is what this test is not about.
-        let middleware = agent_middleware(valid_settings().with_ignore_exceptions(true));
-        let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
-        let called = Arc::new(AtomicBool::new(false));
-        let ctx = AgentContext::new(vec![Message::user("hello, nothing identifying here")], true);
-
-        let result_ctx = pipeline
-            .execute(ctx, agent_terminal(called.clone(), "streamed response"))
-            .await
-            .unwrap();
-        assert!(called.load(Ordering::SeqCst));
-        assert_eq!(result_ctx.result.unwrap().text(), "streamed response");
-    }
+    // `agent_middleware_skips_post_check_when_streaming` lived here and
+    // pinned the opposite of what this middleware now does: a streamed run is
+    // evaluated, because `Agent::run_stream` hands agent middleware the whole
+    // buffered response. Its replacements are
+    // `a_streamed_run_is_policy_checked_like_a_buffered_one` and
+    // `a_streamed_run_the_service_allows_is_delivered_unchanged` in
+    // `tests/loopback.rs` — the response phase can only be isolated where the
+    // prompt phase has a server to succeed against, which is there and not
+    // here.
 
     #[tokio::test]
     async fn chat_middleware_fails_closed_when_no_user_id_resolves() {

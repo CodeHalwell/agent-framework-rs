@@ -22,11 +22,39 @@ pub(crate) fn top_level_media_type(media_type: &str) -> String {
     span.trim().to_ascii_lowercase()
 }
 
+/// The media types that name MP3 audio, as IANA and the long tail of encoders
+/// register it. `audio/mpeg` is the registered type; the rest are aliases still
+/// emitted in the wild.
+///
+/// Matched exactly rather than as a substring, because the sibling MPEG
+/// subtypes are *not* MP3: `audio/mpegurl` is an M3U playlist (text, not
+/// audio frames) and `audio/mpeg4-generic` is an MPEG-4 RTP payload. Both
+/// contain `"mpeg"`, so a substring test labelled them `mp3` and sent them to
+/// the API as MP3 audio, which can only fail at the provider — after the
+/// upload. They now take the unsupported-content path instead.
+const MP3_MEDIA_TYPES: [&str; 5] = [
+    "audio/mp3",
+    "audio/mpeg",
+    "audio/x-mpeg",
+    "audio/mpeg3",
+    "audio/x-mpeg-3",
+];
+
 /// The OpenAI audio `format` string for a media type, or `None` if unsupported.
 pub(crate) fn audio_format(media_type: &str) -> Option<&'static str> {
-    if media_type.contains("wav") {
+    // Parameters (`audio/mpeg; rate=44100`) are not part of the type, and the
+    // type itself is case-insensitive.
+    let normalized = media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.contains("wav") {
+        // Left as a substring test: `wav` has no sibling subtype that is not
+        // WAV audio, so narrowing it would only risk refusing a real alias.
         Some("wav")
-    } else if media_type.contains("mp3") || media_type.contains("mpeg") {
+    } else if MP3_MEDIA_TYPES.contains(&normalized.as_str()) {
         Some("mp3")
     } else {
         None
@@ -988,6 +1016,28 @@ mod tests {
         })]);
         let out = messages_to_openai(&[msg]);
         assert_eq!(out[0]["content"][0]["input_audio"]["format"], json!("mp3"));
+    }
+
+    #[test]
+    fn mp3_aliases_and_parameters_are_recognized_but_sibling_mpeg_types_are_not() {
+        // The registered aliases, each with a parameter on one of them to pin
+        // that parameters are stripped before the comparison.
+        for media_type in [
+            "audio/mp3",
+            "audio/mpeg",
+            "AUDIO/MPEG",
+            "audio/mpeg; rate=44100",
+            "audio/x-mpeg",
+            "audio/mpeg3",
+            "audio/x-mpeg-3",
+        ] {
+            assert_eq!(audio_format(media_type), Some("mp3"), "{media_type}");
+        }
+        // Not MP3, though both contain "mpeg": a playlist and an MPEG-4 RTP
+        // payload. A substring test sent each to the API as MP3 audio.
+        for media_type in ["audio/mpegurl", "audio/mpeg4-generic"] {
+            assert_eq!(audio_format(media_type), None, "{media_type}");
+        }
     }
 
     #[test]

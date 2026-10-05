@@ -7,6 +7,102 @@ may break APIs).
 
 ## [Unreleased]
 
+Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).
+**Seven land on this port**, plus one Azure capability added on the back of a
+commit that does not. Three are Azure-surface work and one of those is an
+enforcement hole: a Purview-guarded *streamed* run was never policy-checked.
+Two are fields a cloud API rejects outright, so the request failed rather than
+degraded. The rest are a filter clause that dropped the rows it was meant to
+return, a fan-out that could run one executor twice on one message, a replay
+alignment that duplicated history, and an orchestrator decision that was
+unreadable whenever the provider ignored `response_format`.
+
+**Breaking, in one place.** `agent_framework_bedrock::convert::build_request`
+takes the model id as a third argument. The request cannot be built correctly
+without it: which fields Converse accepts depends on the model (see below).
+
+### Added
+
+- **`AzureAISearchProvider::with_filter`** — an OData `$filter` applied by the
+  service before ranking, so retrieval can be scoped to a tenant id, a
+  document class or a security-trimming field. On a shared index this is an
+  isolation control rather than a relevance knob: without it every run
+  retrieves over the whole index, so one tenant's documents can land in
+  another tenant's context. The semantic-mode equivalent of upstream's
+  agentic `SearchIndexKnowledgeSourceParams(filter_add_on=…)` (#8673).
+- **`WorkflowBuilder::add_multi_selection`** — a fan-out whose selection
+  function picks a *subset* of the group's targets per message, the Rust
+  analogue of upstream's `add_multi_selection_edge_group`. `add_switch`
+  already covered picking exactly one branch, and `EdgeGroup::FanOut` already
+  carried a `Selection` at runtime, but no builder method installed one, so
+  the multi-target form was unreachable from the public API.
+- **A Markdown-fence JSON scanner shared by group chat and Magentic.** A
+  provider that ignores `response_format` wraps the orchestrator's decision in
+  a code fence; the body of the fence is now a parse candidate. A closing
+  fence must be at least as long as its opening one and end its line, so
+  backticks inside a JSON string value do not end the block and an outer
+  fence may use four or more. Ports upstream's
+  `extract_markdown_fence_bodies` (#8850).
+
+### Fixed
+
+- **A Purview-guarded streamed run was not policy-checked** (upstream #8702).
+  `PurviewAgentMiddleware` skipped its response-phase check whenever
+  `ctx.is_streaming`, carried over from Python's "streaming responses are not
+  supported for post-checks". That reason does not hold here:
+  `Agent::run_stream` routes a middleware-guarded run through `run_core` and
+  replays the *result* as updates, so the hook is handed the complete response
+  and a replacement reaches the caller — the buffering upstream had to add to
+  `ResponseStream` is already how this port streams such a run. The check now
+  runs whenever a response exists. A blocked response also carries the
+  evaluated response's control fields (`response_id`, `conversation_id`,
+  `created_at`, `finish_reason`, `usage_details`, `continuation_token`,
+  `additional_properties`) so the caller can still identify and resume the
+  operation, while `value` is dropped because it still holds the blocked
+  content. `PurviewChatMiddleware` is gated on a response being present
+  rather than on `is_streaming`, which is what is actually true of it: the
+  streaming chat path honours only pre-call mutation, so a token stream never
+  reaches that hook — attach the agent middleware to enforce one.
+- **A negated `eq` filter dropped the Cosmos documents it should return**
+  (upstream #8771). `eq` compiled to `(IS_DEFINED(x) AND x = @p)`, and Cosmos
+  SQL evaluates `x = @p` on a stored null to UNDEFINED, which `NOT` leaves
+  UNDEFINED — so `NOT (field eq value)` excluded exactly the null-valued
+  documents that match it. `eq` now carries the `NOT IS_NULL` guard that
+  `in`/`not_in` and the ordered operators already had.
+- **Two Bedrock fields Converse rejects outright.** This client reaches
+  Bedrock through `Converse` only (its streaming path aggregates one
+  `Converse` call), so `guardrailConfig.streamProcessingMode` — valid only on
+  `ConverseStream` — failed every guarded request; it is now dropped and the
+  rest of the guardrail config still sent. And a `modelId` naming a Prompt
+  Management prompt (`:prompt/`) takes its instructions, tools and inference
+  settings from the prompt, so Converse rejects a request that also sets
+  `inferenceConfig`, `system`, `toolConfig` or `additionalModelRequestFields`;
+  those are dropped with one warning naming them. Prompt-*router* ARNs are
+  ordinary inference targets and are untouched (upstream #8680).
+- **`audio/mpegurl` and `audio/mpeg4-generic` were sent to OpenAI as MP3.**
+  `audio_format` matched `"mpeg"` as a substring, but one of those is an M3U
+  playlist and the other an MPEG-4 RTP payload. The media type is now
+  normalized (parameters stripped, case-folded) and compared against the
+  registered MP3 aliases, so a non-MP3 sibling takes the unsupported-content
+  path instead of failing at the provider after the upload (upstream #8787).
+- **A fan-out selection could run one executor twice on one message.** A
+  selection naming the same target more than once — two tags routing to the
+  same executor — delivered once per mention, which also double-counted
+  toward a downstream fan-in barrier. Each selected target is now delivered to
+  once (upstream #8739). A selection naming a target outside its own group is
+  now a routing error rather than a silent drop, matching the contract an
+  explicit `target_id` already had.
+- **A replay of a trimmed transcript duplicated stored history.** Alignment
+  only looked for *all* of stored history inside a run's input, so a caller
+  that keeps its own window — a UI holding the last N turns — matched nothing
+  and had every replayed turn appended again on each run. The stored tail is
+  now matched against the incoming head (upstream #8800); the longest overlap
+  wins, and an overlap of a single id-less user message, or one consuming all
+  of the input, is still read as real input rather than a replay. History
+  *injection* follows the same alignment and now prepends exactly the part a
+  trimmed replay is missing, instead of all of it (duplicating the window) or
+  none of it (losing the turns before it).
+
 ## [0.9.0] — 2026-09-30
 
 Four values the code already had and never read, a Foundry surface it could

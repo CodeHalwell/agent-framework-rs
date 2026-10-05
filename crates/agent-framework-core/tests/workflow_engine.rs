@@ -1229,3 +1229,104 @@ fn workflow_builder_rejects_overlapping_output_designation_at_build() {
     };
     assert!(err.to_string().contains("OUTPUT_VALIDATION"));
 }
+
+// ----------------------------------------------------------------------------
+// Multi-selection fan-out: a selection picks a subset of the group's targets
+// per message (upstream `add_multi_selection_edge_group`), and a repeated pick
+// delivers once.
+// ----------------------------------------------------------------------------
+
+/// A workflow whose `triage` executor fans out through `selection` to two
+/// counting workers, each recording how many messages it received.
+fn multi_selection_workflow(
+    selection: agent_framework_core::workflow::Selection,
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+) -> Workflow {
+    let triage = FunctionExecutor::new("triage", |msg, ctx| async move {
+        ctx.send_message(msg).await?;
+        Ok(())
+    });
+    let worker = |id: &'static str, counts: Arc<Mutex<HashMap<String, usize>>>| {
+        FunctionExecutor::new(id, move |_msg, _ctx| {
+            let counts = counts.clone();
+            async move {
+                *counts.lock().unwrap().entry(id.to_string()).or_insert(0) += 1;
+                Ok(())
+            }
+        })
+    };
+
+    WorkflowBuilder::new()
+        .add_executor(Arc::new(triage))
+        .add_executor(Arc::new(worker("reviewer_a", counts.clone())))
+        .add_executor(Arc::new(worker("reviewer_b", counts)))
+        .set_start("triage")
+        .add_multi_selection(
+            "triage",
+            vec!["reviewer_a".to_string(), "reviewer_b".to_string()],
+            selection,
+        )
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_multi_selection_delivers_to_every_picked_target() {
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let selection: agent_framework_core::workflow::Selection =
+        Arc::new(|_msg: &Value, candidates: &[String]| {
+            let all = candidates.to_vec();
+            Box::pin(async move { all })
+        });
+    let workflow = multi_selection_workflow(selection, counts.clone());
+    workflow.run(json!("task")).await.unwrap();
+
+    let counts = counts.lock().unwrap();
+    assert_eq!(counts.get("reviewer_a"), Some(&1));
+    assert_eq!(counts.get("reviewer_b"), Some(&1));
+}
+
+#[tokio::test]
+async fn a_repeated_pick_in_one_selection_delivers_once() {
+    // Two tags on a message routing to the same reviewer. Without the
+    // deduplication the executor runs twice on one message.
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let selection: agent_framework_core::workflow::Selection =
+        Arc::new(|_msg: &Value, _c: &[String]| {
+            Box::pin(async move { vec!["reviewer_a".to_string(), "reviewer_a".to_string()] })
+        });
+    let workflow = multi_selection_workflow(selection, counts.clone());
+    workflow.run(json!("task")).await.unwrap();
+
+    let counts = counts.lock().unwrap();
+    assert_eq!(counts.get("reviewer_a"), Some(&1));
+    assert_eq!(counts.get("reviewer_b"), None);
+}
+
+#[tokio::test]
+async fn a_selection_naming_a_target_outside_its_group_is_a_routing_error() {
+    // Silently dropping it would leave the run reporting `Idle` with the
+    // message delivered nowhere.
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let selection: agent_framework_core::workflow::Selection =
+        Arc::new(|_msg: &Value, _c: &[String]| {
+            Box::pin(async move { vec!["reviewer_c".to_string()] })
+        });
+    let workflow = multi_selection_workflow(selection, counts);
+    let text = match workflow.run(json!("task")).await {
+        Ok(_) => panic!("an out-of-group selection must not route"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("reviewer_c"), "{text}");
+    assert!(text.contains("fan-out group"), "{text}");
+}
+
+#[tokio::test]
+async fn a_selection_that_picks_nothing_delivers_nothing() {
+    let counts = Arc::new(Mutex::new(HashMap::new()));
+    let selection: agent_framework_core::workflow::Selection =
+        Arc::new(|_msg: &Value, _c: &[String]| Box::pin(async move { Vec::new() }));
+    let workflow = multi_selection_workflow(selection, counts.clone());
+    workflow.run(json!("task")).await.unwrap();
+    assert!(counts.lock().unwrap().is_empty());
+}
