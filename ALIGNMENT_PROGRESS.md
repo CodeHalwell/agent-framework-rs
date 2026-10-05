@@ -12,9 +12,10 @@ first; each records the upstream revision it was checked against.
 ## Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05)
 
 Upstream moved **119 non-merge commits** in this window (2026-09-28 → 10-05),
-the largest weekly window this log has recorded. **Seven land on this port**,
-and an eighth Azure capability was added on the back of a commit that does
-not.
+the largest weekly window this log has recorded. **Nine land on this port**:
+seven ported directly, and two more closed by building the Foundry header
+capability they validate. A tenth Azure capability was added on the back of a
+commit that does not port at all.
 
 The window reads as a provider-and-cloud week. Two of the seven are a field
 the code happily sent that the cloud API *rejects outright*, so the request
@@ -94,21 +95,96 @@ worth preserving.
 | Foundry — empty memory context | ✅ (#8932, .NET) | ✅ already | **No action: already satisfied.** The provider built last pass returns without touching `ctx.messages` when it retrieved nothing (`foundry/memory.rs:533`), which is the guard upstream has just added. Worth recording as a hit rather than a miss: the .NET fix landed one week after the Rust port shipped the same behaviour. |
 | Azure OpenAI — OpenAI metadata headers | ✅ (#8969) | n/a | Not applicable, and worth stating why so it is not re-triaged. Upstream's bug is that the OpenAI Python SDK injects `OpenAI-Organization`, `OpenAI-Project` and `Authorization` defaults from the environment into an `AsyncAzureOpenAI` client, so an Azure route carried OpenAI credentials. `AzureOpenAIClient` here builds its own `reqwest` request and sets exactly one auth header (`api-key` *or* `Authorization: Bearer`), never an organization or project header, and reads no `OPENAI_*` variable. There is no shared client object for a default to leak through. |
 | Azure AI Search — agentic / Knowledge Base mode | ✅ | ❌ | Unchanged, and now the reason #8673 does not port. A documented scope boundary rather than a defect; it is also where upstream is moving fastest on this connector. |
-| Foundry — `x-client-*` request headers | ✅ (#8715, #8847) | ❌ | **New gap, recorded.** Upstream added validation (reject NUL/CR/LF, require the `x-client-` prefix) to a per-call client-header carrier the port does not have at all, so there is nothing here to validate. The underlying capability — forwarding caller-supplied `x-client-*` headers through `ChatOptions` to the Foundry data plane — is the actual gap. Note `reqwest` would refuse a CR/LF header value at build time, so the *injection* half of upstream's fix is structurally unavailable here even once the carrier exists. |
+| Foundry — `x-client-*` request headers | ✅ (#8715, #8847) | ✅ (was ❌) | **Closed, carrier and all** — see below. Upstream's commits validate a per-call carrier the port did not have, so the capability had to be built before the validation meant anything. |
 | Azure Cosmos DB — chat history batch size | ✅ (#8870, .NET) | n/a | Not applicable: `CosmosChatMessageStore` exposes no batch-size knob, so there is no value to validate. Upstream's fault was a settable `MaxBatchSize` of zero spinning a batching loop forever. |
 | Azure SQL / SQL Server native vector store | ✅ | ❌ | Unchanged from last pass: still blocked on a TDS driver decision (`tiberius` would unblock it). |
 | Azure DocumentDB | ✅ | ❌ | Unchanged: blocked on the MongoDB wire protocol. |
 | Foundry hosting | ✅ | ❌ | Unchanged, and this window was heavy with it (#8894, #8794, #8947, #8966, #8899, #8593, #8741, #8722, #8717, #8713 all land on `foundry_hosting`). The standing gap is the crate itself; it is now the largest single Azure-shaped hole, ahead of Content Understanding by volume of upstream activity though not by tractability. |
 | Azure AI Content Understanding | ✅ | ❌ | Unchanged: still the largest **unblocked** Azure item, a REST surface with nothing in its way but size. |
 
+### Closed after the review: per-call `x-client-*` headers (#8715, #8847)
+
+Upstream's two commits add validation — reject NUL/CR/LF, require the
+`x-client-` prefix — to a per-call client-header carrier. The port had no
+carrier, so there was nothing to validate and nothing to port; the Azure
+table above recorded that as the real gap. It is now built, which is what
+makes the validation meaningful.
+
+**Why the capability matters.** The Foundry Agent Endpoint forwards
+`x-client-`-prefixed headers transparently into the agent container. That
+makes them the only channel for something the *platform in front of the
+model* must read, and the headline case is the identity of the end user a run
+is made on behalf of (`x-client-end-user-id`). It has to be per **run**: one
+`FoundryChatClient` serves every tenant of a multi-tenant SaaS, so an
+identity pinned at construction would be the wrong one for all but the first
+caller. So the carrier rides on `ChatOptions`, as upstream's does.
+
+**Where it went.** Two pieces, mirroring upstream's own split between a
+transport policy and a validated stamping API:
+
+| Piece | Site | What it does |
+|---|---|---|
+| Transport | `azure/responses.rs` (`CLIENT_HEADERS_PROPERTY`, `client_headers`, `RESERVED_HEADERS`, `post`) | A reserved `additional_properties` key, **lifted out of the request body** rather than merged into it, and applied to the outbound request. The lift is the load-bearing part: every other entry in that map is copied verbatim into the body, so without it a caller's end-user identity would be sent to the service as request JSON — the specific way this would have failed silently. |
+| Validated surface | `foundry/client_headers.rs` (`FoundryClientHeaders`, `CLIENT_HEADER_PREFIX`) | `with_client_header` / `with_client_headers` / `client_headers` on `ChatOptions`, enforcing upstream's rules: the `x-client-` prefix (case-insensitive), non-empty name and value, no NUL/CR/LF. Batches are all-or-nothing, and re-stamping a name replaces it case-insensitively rather than leaving the transport to pick between two spellings of one HTTP header. |
+
+**Three deliberate divergences**, each because an upstream constraint does
+not hold here:
+
+1. **No silent no-op.** Upstream needs `AIAgentBuilder.UseClientHeaders()`
+   plus an `OpenAIRequestPolicies` registration, and documents the call as a
+   silent no-op when either is missing or the client is not OpenAI-backed.
+   `ChatOptions` already reaches `FoundryChatClient`'s transport here, so a
+   stamped header is delivered by construction and a malformed one is an
+   error. Porting the no-op would have reproduced the one property of
+   upstream's design its own documentation warns about.
+2. **The transport validates too.** Upstream's carrier key is `internal`, so
+   its dictionary is unreachable except through the validated API. Here it is
+   a public key in a public map on a public struct, so a check only on the
+   stamping surface is one that can be stepped around. The transport's own
+   validation is the faithful equivalent of .NET's `internal` visibility, not
+   an extra rule.
+3. **`authorization` and `api-key` are refused outright.** This follows from
+   (2): once the carrier is reachable, a per-call header could name the
+   header the client sets from its own credential. Because `reqwest`
+   *appends* rather than replaces, that would put two credentials on one
+   request and leave the choice to the service. Both names are refused before
+   the request is built. Upstream needs no such rule because its dictionary
+   cannot be reached.
+
+The NUL/CR/LF checks — the substance of #8847 — are kept even though they are
+not load-bearing against injection here: `HeaderName`/`HeaderValue` parsing
+cannot be talked into accepting any of the three, so a request would fail
+rather than split. What they buy is an error naming the offending header at
+the point the caller wrote it, instead of an opaque `reqwest` builder failure
+at `send()`. Neither error echoes the header *value*, which is the field most
+likely to hold an end-user identifier.
+
+One upstream property is inherited rather than fixed, and documented on the
+module because it is silent: `ChatOptions::merge` combines
+`additional_properties` with a map `extend`, so a per-run carrier **replaces**
+a client-level one whole rather than merging the individual headers. Upstream
+behaves the same way, its dictionary living on one `ChatOptions` instance.
+Changing it would mean special-casing one key inside core's merge.
+
+Tested at four levels, each probed by mutation: the validation rules as unit
+tests (10); the transport's body-lift, extraction, reserved-name refusal and
+malformed-carrier errors as unit tests (5); the header arriving on the wire
+and staying out of the body, on both the non-streaming and streaming paths,
+as loopback tests against a real socket; and the whole
+`Agent::run_with_options` → merge → transport path, which is the multi-tenant
+case the capability exists for. Dropping the header application fails both
+wire tests; dropping the body-lift fails the body tests at both levels;
+disabling the reserved-name refusal fails both auth tests; dropping the
+prefix check fails three validation tests.
+
 ### The other 107 commits
 
-Seven ported above. Five more are recorded rather than ported: #8715 with
-#8847 (the Foundry `x-client-*` carrier this port lacks), #8798 (a Gemini
-embedding client it lacks), #8997 (logprobs it does not surface), and #8673,
-whose agentic mode is out of scope but which is what surfaced the missing AI
-Search filter. The rest is almost entirely surfaces this port does
-not have. Grouped by *why*, so a future pass does not re-derive it:
+Seven ported above, and two more (#8715 with #8847) closed by building the
+Foundry header capability they validate. Three are recorded rather than
+closed: #8798 (a Gemini embedding client this port lacks), #8997 (logprobs it
+does not surface), and #8673, whose agentic mode is out of scope but which is
+what surfaced the missing AI Search filter. The rest is almost entirely
+surfaces this port does not have. Grouped by *why*, so a future pass does not re-derive it:
 
 - **`foundry_hosting`** — #8894, #8794, #8947, #8966, #8899, #8593, #8741,
   #8722, #8717, #8713. The crate does not exist here; ten commits in one
@@ -156,8 +232,6 @@ not have. Grouped by *why*, so a future pass does not re-derive it:
 
 ### Standing gaps this pass surfaced (not closed)
 
-- **Foundry `x-client-*` header forwarding** (#8715, #8847). The carrier
-  itself is missing; see the Azure table.
 - **A Gemini embedding client** (#8798). Upstream added Gemini Embedding 2
   and per-task vector options; the Rust `gemini` crate has a chat client
   only, so there is no embedding surface to add them to. Smaller than it

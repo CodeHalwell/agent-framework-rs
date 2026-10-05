@@ -88,6 +88,7 @@ use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
 use futures::StreamExt;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
 
 use crate::{Auth, TokenCredential};
@@ -101,6 +102,116 @@ use crate::{Auth, TokenCredential};
 /// via [`with_api_version`](AzureOpenAIResponsesClient::with_api_version) or
 /// `AZURE_OPENAI_API_VERSION`.
 const DEFAULT_API_VERSION: &str = "preview";
+
+/// The reserved [`ChatOptions::additional_properties`] key carrying **per-call
+/// request headers** rather than a request-body field.
+///
+/// Every other `additional_properties` entry is merged verbatim into the
+/// request body; this one is lifted out of it and applied to the outbound HTTP
+/// request instead. It exists because a header is the only way to carry
+/// something the *platform in front of the model* must read — the Foundry
+/// Agent Endpoint forwards `x-client-*` headers into the agent container, so
+/// a per-run caller identity has to travel beside the body, not in it.
+///
+/// Callers do not normally write this key by hand. The validated surface for
+/// it is `agent_framework_foundry::FoundryClientHeaders`, which enforces the
+/// `x-client-` prefix the Foundry platform requires. Writing it directly is
+/// supported but subject to the same transport rules
+/// (documented on this module's private `client_headers`): the value must
+/// be a JSON object of string values, each name a valid HTTP header name, and
+/// no entry may name a header this client sets itself.
+///
+/// The key is namespaced with a dot so it cannot collide with a Responses API
+/// body field, present or future.
+pub const CLIENT_HEADERS_PROPERTY: &str = "agent_framework.client_headers";
+
+/// The headers this client sets itself, which a per-call header may not
+/// replace or duplicate. Lowercase, since HTTP header names compare
+/// case-insensitively and `HeaderName` normalizes to lowercase.
+///
+/// Authentication is the reason this list exists rather than a general
+/// principle about reserved names: `post` chooses between `api-key` and
+/// `Authorization` from the client's configured credential, and a per-call
+/// header able to set either could redirect a request's authentication — or,
+/// because `reqwest` *appends* rather than replaces, send two conflicting
+/// credentials and leave the outcome to the service. A per-call option should
+/// not be able to do either, so both names are refused up front.
+const RESERVED_HEADERS: [&str; 2] = ["authorization", "api-key"];
+
+/// Extract the per-call request headers from [`CLIENT_HEADERS_PROPERTY`],
+/// validating each one before it reaches the transport.
+///
+/// Returns an empty vector when the key is absent, which is the common case.
+///
+/// The validation is here, at the one place the headers become an HTTP
+/// request, rather than only on the typed surface that stamps them: a
+/// `ChatOptions` is a public struct with a public map, so the carrier is
+/// reachable without going through that surface, and a check that can be
+/// stepped around is not one this client can rely on. `reqwest` would also
+/// reject a malformed name or value on its own, but only at `send()` and only
+/// as an opaque builder error that names neither the header nor the caller
+/// mistake.
+///
+/// # Errors
+/// [`Error::Configuration`] when the carrier is not an object of string
+/// values, when a name or value is not valid in an HTTP header, or when an
+/// entry names one of [`RESERVED_HEADERS`].
+fn client_headers(options: &ChatOptions) -> Result<Vec<(HeaderName, HeaderValue)>> {
+    let Some(raw) = options.additional_properties.get(CLIENT_HEADERS_PROPERTY) else {
+        return Ok(Vec::new());
+    };
+    let map = raw.as_object().ok_or_else(|| {
+        Error::Configuration(format!(
+            "additional_properties[\"{CLIENT_HEADERS_PROPERTY}\"] must be an object of header \
+             name/value strings, found {}",
+            kind_of(raw)
+        ))
+    })?;
+    let mut headers = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        let value = value.as_str().ok_or_else(|| {
+            Error::Configuration(format!(
+                "client header '{name}' must have a string value, found {}",
+                kind_of(value)
+            ))
+        })?;
+        // Parsing the name is also what rejects a NUL, CR or LF in it, since
+        // none is a valid header-name character.
+        let parsed = HeaderName::try_from(name.as_str()).map_err(|_| {
+            Error::Configuration(format!("'{name}' is not a valid HTTP header name"))
+        })?;
+        if RESERVED_HEADERS.contains(&parsed.as_str()) {
+            return Err(Error::Configuration(format!(
+                "client header '{name}' is set by the client itself and cannot be overridden \
+                 per call; authentication is configured on the client",
+            )));
+        }
+        let parsed_value = HeaderValue::try_from(value).map_err(|_| {
+            // Deliberately does not echo the value: a header carrying an
+            // end-user identity or token does not belong in an error message
+            // or whatever log it lands in.
+            Error::Configuration(format!(
+                "the value of client header '{name}' is not valid in an HTTP header (a NUL, \
+                 carriage return or line feed cannot be sent)"
+            ))
+        })?;
+        headers.push((parsed, parsed_value));
+    }
+    Ok(headers)
+}
+
+/// Name a JSON value's type for an error message, so a caller is told what
+/// they actually passed rather than only what was expected.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 
 /// An Azure OpenAI Responses API chat client
 /// (`POST {endpoint}/openai/v1/responses`).
@@ -411,6 +522,14 @@ impl AzureOpenAIResponsesClient {
             if k == "include" {
                 continue;
             }
+            // The header carrier is not a body field. Letting it through
+            // would send a caller's `x-client-*` map to the model as request
+            // JSON — which the service would reject as an unknown field, and
+            // which would put a per-run end-user identity somewhere it was
+            // never meant to go.
+            if k == CLIENT_HEADERS_PROPERTY {
+                continue;
+            }
             body.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
@@ -433,14 +552,22 @@ impl AzureOpenAIResponsesClient {
         }
     }
 
-    async fn post(&self, body: &Value) -> Result<reqwest::Response> {
+    async fn post(&self, body: &Value, options: &ChatOptions) -> Result<reqwest::Response> {
+        // Validated before the credential is fetched: a malformed header is
+        // the caller's mistake and should be reported without first spending a
+        // token request on it.
+        let client_headers = client_headers(options)?;
         let (header_name, header_value) = self.auth_header().await?;
-        let resp = self
+        let mut req = self
             .inner
             .http
             .post(self.url())
             .header(header_name, header_value)
-            .json(body)
+            .json(body);
+        for (name, value) in client_headers {
+            req = req.header(name, value);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| Error::service(format!("request failed: {e}")))?;
@@ -469,7 +596,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let body = self.build_body(&messages, &options, false);
-        let resp = self.post(&body).await?;
+        let resp = self.post(&body, &options).await?;
         let value: Value = resp
             .json()
             .await
@@ -493,7 +620,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         options: ChatOptions,
     ) -> Result<ChatStream> {
         let body = self.build_body(&messages, &options, true);
-        let resp = self.post(&body).await?;
+        let resp = self.post(&body, &options).await?;
         Ok(
             agent_framework_openai::responses::parse_responses_sse_stream(resp, options.store)
                 .boxed(),
@@ -1004,6 +1131,113 @@ mod tests {
     // test` runs both modules' tests concurrently in one binary. Testing
     // through the injectable `from_env_vars` seam instead gives the same
     // coverage with no risk of racing those tests.
+
+    // endregion
+
+    // region: per-call client headers
+
+    fn with_carrier(value: Value) -> ChatOptions {
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert(CLIENT_HEADERS_PROPERTY.to_string(), value);
+        options
+    }
+
+    #[test]
+    fn the_header_carrier_is_lifted_out_of_the_request_body() {
+        // Every *other* `additional_properties` entry is merged into the body
+        // verbatim, so without this the carrier would be sent to the service
+        // as an unknown request field — taking a per-run end-user identity
+        // somewhere it was never meant to go.
+        let body = client().build_body(
+            &[user("hi")],
+            &with_carrier(json!({ "x-client-end-user-id": "user-42" })),
+            false,
+        );
+        assert!(body.get(CLIENT_HEADERS_PROPERTY).is_none(), "body: {body}");
+        assert!(
+            !body.to_string().contains("user-42"),
+            "no part of a client header belongs in the body: {body}"
+        );
+        // Negative control: an ordinary extra still passes through, so the
+        // skip is specific to the carrier rather than a new general filter.
+        let mut options = with_carrier(json!({ "x-client-id": "v" }));
+        options
+            .additional_properties
+            .insert("truncation".into(), json!("auto"));
+        let body = client().build_body(&[user("hi")], &options, false);
+        assert_eq!(body["truncation"], json!("auto"));
+    }
+
+    #[test]
+    fn valid_client_headers_are_extracted_in_order_of_the_carrier() {
+        let headers = client_headers(&with_carrier(
+            json!({ "x-client-a": "1", "x-client-b": "2" }),
+        ))
+        .unwrap();
+        let pairs: Vec<(String, String)> = headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("x-client-a".to_string(), "1".to_string()),
+                ("x-client-b".to_string(), "2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn no_carrier_yields_no_headers_and_no_error() {
+        assert!(client_headers(&ChatOptions::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_header_the_client_sets_itself_is_refused() {
+        // Both names, because which one the client sends depends on its
+        // configured credential — an api-key client and a token client would
+        // otherwise each have a different bypass.
+        for name in ["authorization", "Authorization", "api-key", "API-Key"] {
+            let err = client_headers(&with_carrier(json!({ name: "v" })))
+                .expect_err("a reserved header name must be refused");
+            assert!(
+                err.to_string().contains("set by the client itself"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_carrier_is_a_configuration_error_naming_what_was_found() {
+        // Reported here rather than left to `reqwest`, which would surface a
+        // malformed header only at `send()` and as an opaque builder error
+        // naming neither the header nor the mistake.
+        let err = client_headers(&with_carrier(json!("not an object"))).expect_err("not an object");
+        assert!(err.to_string().contains("found a string"), "{err}");
+
+        let err = client_headers(&with_carrier(json!({ "x-client-id": 7 })))
+            .expect_err("value is not a string");
+        assert!(err.to_string().contains("found a number"), "{err}");
+
+        let err = client_headers(&with_carrier(json!({ "x client id": "v" })))
+            .expect_err("a space is not valid in a header name");
+        assert!(
+            err.to_string().contains("not a valid HTTP header name"),
+            "{err}"
+        );
+
+        // A CR in a value cannot be smuggled onto the wire: `HeaderValue`
+        // refuses it, so a request is never built rather than being split.
+        let err = client_headers(&with_carrier(
+            json!({ "x-client-id": "v\r\nx-injected: 1" }),
+        ))
+        .expect_err("a line break is not valid in a header value");
+        let msg = err.to_string();
+        assert!(msg.contains("not valid in an HTTP header"), "{msg}");
+        assert!(!msg.contains("x-injected"), "the value leaked: {msg}");
+    }
 
     // endregion
 }

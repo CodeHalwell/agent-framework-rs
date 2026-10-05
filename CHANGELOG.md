@@ -8,8 +8,8 @@ may break APIs).
 ## [Unreleased]
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).
-**Seven land on this port**, plus one Azure capability added on the back of a
-commit that does not. Three are Azure-surface work and one of those is an
+**Nine land on this port**, plus one Azure capability added on the back of a
+commit that does not. Five are Azure-surface work and one of those is an
 enforcement hole: a Purview-guarded *streamed* run was never policy-checked.
 Two are fields a cloud API rejects outright, so the request failed rather than
 degraded. The rest are a filter clause that dropped the rows it was meant to
@@ -23,6 +23,26 @@ without it: which fields Converse accepts depends on the model (see below).
 
 ### Added
 
+- **Per-call `x-client-*` headers on the Foundry path** (upstream #8715,
+  #8847). The Foundry Agent Endpoint forwards `x-client-`-prefixed headers
+  transparently into the agent container, which makes them the channel for
+  attesting *this run's* end user (`x-client-end-user-id`) — the one thing a
+  multi-tenant caller cannot pin on the client, since one client serves every
+  tenant. The port had no carrier for them at all, so upstream's validation
+  fix landed on a capability that did not exist here.
+  `agent_framework_foundry::FoundryClientHeaders` adds
+  `with_client_header`/`with_client_headers` on `ChatOptions`, validating the
+  `x-client-` prefix (case-insensitive), non-empty names and values, and the
+  NUL/CR/LF refusals upstream added. Delivery is by construction rather than
+  conditional: `ChatOptions` already reaches the transport, so none of
+  upstream's agent decorator, policy registration or documented silent no-op
+  is needed. The transport side is
+  `agent_framework_azure::responses::CLIENT_HEADERS_PROPERTY`, a reserved
+  `additional_properties` key lifted out of the request body rather than
+  merged into it, and validated again where the request is built — the carrier
+  is a public map here, unlike .NET's `internal` key, so a header naming
+  `authorization` or `api-key` is refused outright rather than allowed to
+  redirect a request's authentication.
 - **`AzureAISearchProvider::with_filter`** — an OData `$filter` applied by the
   service before ranking, so retrieval can be scoped to a tenant id, a
   document class or a security-trimming field. On a shared index this is an

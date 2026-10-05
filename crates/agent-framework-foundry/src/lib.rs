@@ -72,10 +72,12 @@
 //! # }
 //! ```
 
+pub mod client_headers;
 pub mod embeddings;
 pub mod memory;
 mod tool_definition_wire;
 
+pub use client_headers::{FoundryClientHeaders, CLIENT_HEADER_PREFIX};
 pub use embeddings::FoundryEmbeddingClient;
 pub use memory::FoundryMemoryProvider;
 
