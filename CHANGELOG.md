@@ -23,6 +23,23 @@ without it: which fields Converse accepts depends on the model (see below).
 
 ### Added
 
+- **A Gemini embeddings client** (`GeminiEmbeddingClient`, `gemini` crate),
+  speaking `batchEmbedContents` directly like this crate's chat client
+  (upstream #8798). Gemini Embedding 2 conditions a vector on what the text is
+  *for*, and takes that from a prefix on the text itself rather than a request
+  field — `title: … | text: …` when indexing, `task: … | query: …` when
+  searching — so the client applies it and sends no `taskType`, as upstream
+  does. A task is therefore **required** per call
+  (`EmbeddingGenerationOptions::with_task`, via the `GeminiEmbeddingOptions`
+  trait): there is no safe default, since `RetrievalDocument` on a search
+  query indexes the query as a document and no prefix at all silently opts
+  out of the conditioning, and both failures are invisible in the response.
+  `with_title` applies only when indexing, and is refused otherwise rather
+  than dropped. The model is an allowlist (`gemini-embedding-2`,
+  `gemini-embedding-2-preview`) because the prefix convention is Embedding
+  2's: applying it to `gemini-embedding-001` would embed the prefix as
+  literal text. Text only — upstream's multimodal inputs need a wider
+  `EmbeddingClient` trait than this port has (recorded as a gap).
 - **Token log-probabilities are surfaced** (upstream #8997). The OpenAI
   clients read `choices[].logprobs` on both paths and pass it through
   unchanged under `ChatResponse::additional_properties["logprobs"]`

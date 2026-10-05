@@ -12,10 +12,10 @@ first; each records the upstream revision it was checked against.
 ## Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05)
 
 Upstream moved **119 non-merge commits** in this window (2026-09-28 → 10-05),
-the largest weekly window this log has recorded. **Ten land on this port**:
-seven ported directly, and three more closed by building the capability each
-presupposed. An eleventh Azure capability was added on the back of a commit
-that does not port at all.
+the largest weekly window this log has recorded. **Eleven land on this
+port**: seven ported directly, and four more closed by building the
+capability each presupposed. A twelfth Azure capability was added on the back
+of a commit that does not port at all.
 
 The window reads as a provider-and-cloud week. Two of the seven are a field
 the code happily sent that the cloud API *rejects outright*, so the request
@@ -216,13 +216,76 @@ no change of their own, since each delegates `convert::parse_response` and
 `parse_sse_stream` wholesale. That inheritance is pinned by a test in the
 Azure crate rather than left as a coincidence of today's wiring.
 
+### Also closed: a Gemini embeddings client (#8798, client half)
+
+The third gap of the same shape, and the clearest: upstream added Gemini
+Embedding 2 with per-task options, and the Rust `gemini` crate had a chat
+client only — no embedding surface for the options to land on.
+`GeminiEmbeddingClient` speaks `batchEmbedContents` directly, as this crate's
+chat client speaks `generateContent`, rather than taking on the
+`google-genai` SDK.
+
+**The detail that matters, and that reading the diff rather than the REST
+docs settled.** Embedding 2 conditions a vector on what the text is *for*,
+and it takes that from a prefix on the text itself — `title: … | text: …`
+when indexing, `task: <phrase> | query: …` when searching — not from a
+request field. Upstream passes `output_dimensionality` as its only config and
+rewrites each string; a `taskType` field does exist on the older
+`text-embedding-004` and `gemini-embedding-001` routes, and sending it here
+would do nothing. Guessing from the REST reference would have produced a
+client that looks right, sends `taskType`, skips the prefix, and returns
+vectors conditioned on nothing in particular. So this client sends no
+`taskType`, and a test pins its absence.
+
+That is also why a task is **required** per call, as upstream requires it.
+There is no safe default: `RetrievalDocument` on a search query indexes the
+query as a document, and no prefix at all silently opts out of the
+conditioning. Both failures produce a perfectly well-formed response and show
+up only as worse retrieval, which is the category of failure this port
+refuses rather than defaults. A missing task is an error naming
+`with_task`, and it is raised before any request is sent — a round trip that
+can only return a mis-conditioned vector is not worth spending, which a
+loopback test asserts by checking the server recorded nothing.
+
+Three smaller judgements, each the stricter of two options for the same
+reason:
+
+* **The model is an allowlist** (`gemini-embedding-2`,
+  `gemini-embedding-2-preview`), as upstream's is, enforced at construction,
+  on the `GOOGLE_EMBEDDING_MODEL` override and on a per-call `model`. The
+  prefix convention *is* Embedding 2's, so applying it to
+  `gemini-embedding-001` would embed the prefix as literal text — again a
+  silent accuracy loss rather than an error.
+* **A title outside document indexing is refused**, not dropped: a caller who
+  set one believed it was part of the embedding.
+* **A response whose vector count does not match the request is an error.**
+  Callers pair vectors with inputs by position, so a short list would attach
+  every later vector to the wrong input.
+
+Typed where upstream is stringly: `GeminiEmbeddingTask` is an enum with the
+eight task names, and each task's prefix phrase is pinned by test, since a
+wrong phrase conditions the vector on the wrong job and nothing in the
+response would say so. A raw `task_type` string is still accepted
+case-insensitively, for a deserialized config or a generic caller.
+
+Mutation-probed: removing the prefix fails five tests across the unit and
+loopback levels; defaulting a missing task fails the refusal test and the
+loopback test that asserts no request is sent; dropping the count check fails
+the response test.
+
+Scope: text only. Upstream also embeds images and media as `Content`/`Part`
+values, which `EmbeddingClient::get_embeddings` cannot express — it takes
+`Vec<String>`. That, and upstream's per-operation vector-store embedding
+options (the other half of #8798), are recorded under *Remaining* rather than
+forced through a provider-shaped side door.
+
 ### The other 107 commits
 
-Seven ported above, and three more (#8715 with #8847, and #8997) closed by
-building the capability each one presupposed. Two are recorded rather than
-closed: #8798 (a Gemini embedding client this port lacks) and #8673, whose
-agentic mode is out of scope but which is what surfaced the missing AI Search
-filter. The rest is almost entirely surfaces this port does not have. Grouped by *why*, so a future pass does not re-derive it:
+Seven ported above, and four more (#8715 with #8847, #8997, and the client
+half of #8798) closed by building the capability each one presupposed. One is
+recorded rather than closed: #8673, whose agentic mode is out of scope but
+which is what surfaced the missing AI Search filter. The rest is almost
+entirely surfaces this port does not have. Grouped by *why*, so a future pass does not re-derive it:
 
 - **`foundry_hosting`** — #8894, #8794, #8947, #8966, #8899, #8593, #8741,
   #8722, #8717, #8713. The crate does not exist here; ten commits in one
@@ -270,11 +333,18 @@ filter. The rest is almost entirely surfaces this port does not have. Grouped by
 
 ### Standing gaps this pass surfaced (not closed)
 
-- **A Gemini embedding client** (#8798). Upstream added Gemini Embedding 2
-  and per-task vector options; the Rust `gemini` crate has a chat client
-  only, so there is no embedding surface to add them to. Smaller than it
-  looks — the `EmbeddingClient` trait and three sibling implementations
-  already exist — and unblocked.
+- **Per-operation embedding options on vector stores** (the other half of
+  #8798). Upstream's `upsert(..., embeddings_options=…)` /
+  `embeddings_options_by_field=…` is how a vector store asks for
+  `RETRIEVAL_DOCUMENT` when indexing and `RETRIEVAL_QUERY` when searching —
+  the ergonomic path to the Gemini client's required task. It is a core
+  `VectorStore` API change touching every store implementation, so it is
+  recorded rather than bolted onto one provider. Until it exists, a caller
+  embedding for a vector store passes the task itself.
+- **Multimodal embedding inputs.** `EmbeddingClient::get_embeddings` takes
+  `Vec<String>`, so upstream's image and media embedding (`Content`/`Part`
+  values) cannot be expressed. Widening the trait affects every embedding
+  client, which is why the Gemini client ports the text half only.
 - **A switch/case predicate cannot report failure** (#8490). Reconfirmed,
   unchanged: closing it means widening `Condition` to `Result<bool>` across
   every builder that takes one.
