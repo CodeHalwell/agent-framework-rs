@@ -121,7 +121,7 @@ jobs:
             # after <date>" from the error and sleep until then; retry until
             # published. (Version bumps of existing crates have a much
             # higher limit, so this mostly matters for the first release.)
-            local attempt out when ts wait plain_failures=0
+            local attempt out when ts wait plain_failures=0 index_wait=30
             for attempt in $(seq 1 12); do
               if out=$(cargo publish -p "$1" 2>&1); then
                 echo "$out" | tail -n 3
@@ -137,6 +137,27 @@ jobs:
                 fi
                 echo "$1: rate limited — sleeping ${wait}s (until ${when:-unknown}), attempt $attempt/12"
                 sleep "$wait"
+              elif grep -q "failed to select a version for the requirement .agent-framework" <<<"$out"; then
+                # A sibling is published but not yet readable in the index.
+                #
+                # This is what cost the 0.9.0 release. `cargo publish`
+                # *warns* rather than fails when its own index wait times out
+                # ("timed out waiting for <crate> to be available in registry
+                # ... the registry may have a backlog"), and exits 0 — so the
+                # tier loop moved on, and the umbrella crate, the only one
+                # depending on all 21 siblings, was left to discover the gap.
+                # The old policy then treated a transient registry backlog as
+                # a hard error and gave up 30s later, so 21 of 22 crates
+                # published, `agent-framework` stayed a version behind, and
+                # the tag and GitHub Release were skipped.
+                #
+                # Registry lag is a wait, not a failure: back off and keep
+                # trying within the same attempt budget, so the run either
+                # completes the release or fails having actually waited.
+                echo "$1: a sibling is not in the index yet (registry lag) — sleeping ${index_wait}s, attempt $attempt/12"
+                sleep "$index_wait"
+                index_wait=$(( index_wait * 2 ))
+                (( index_wait > 600 )) && index_wait=600
               else
                 # Real failures (auth, manifest, ...) fail fast: one retry
                 # covers a just-published dependency not being indexed yet.
