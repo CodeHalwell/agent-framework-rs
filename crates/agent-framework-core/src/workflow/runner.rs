@@ -12,7 +12,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use super::checkpoint::{CheckpointStorage, WorkflowCheckpoint};
 use super::context::{DrainedEffects, WorkflowContext, WorkflowMessage};
 use super::edge::{
-    wrap_async_condition, wrap_sync_condition, Case, Default as SwitchDefault, EdgeGroup, Selection,
+    wrap_async_condition, wrap_sync_condition, Case, Default as SwitchDefault, EdgeGroup,
+    IntoConditionResult, Selection,
 };
 use super::events::{WorkflowEvent, WorkflowRunState};
 use super::executor::Executor;
@@ -233,11 +234,11 @@ impl WorkflowBuilder {
     }
 
     /// Add a single directed edge guarded by a synchronous condition.
-    pub fn add_conditional_edge(
+    pub fn add_conditional_edge<R: IntoConditionResult>(
         mut self,
         source: impl Into<String>,
         target: impl Into<String>,
-        condition: impl Fn(&Value) -> bool + Send + Sync + 'static,
+        condition: impl Fn(&Value) -> R + Send + Sync + 'static,
     ) -> Self {
         self.edge_groups.push(EdgeGroup::Single {
             source: source.into(),
@@ -253,7 +254,7 @@ impl WorkflowBuilder {
     /// predicate that itself needs to `.await` (e.g. an I/O check); the
     /// condition is awaited at routing time (see `UPSTREAM_DRIFT.md` §10,
     /// `Edge.should_route` becoming async upstream).
-    pub fn add_conditional_edge_async<F, Fut>(
+    pub fn add_conditional_edge_async<F, Fut, R>(
         mut self,
         source: impl Into<String>,
         target: impl Into<String>,
@@ -261,7 +262,8 @@ impl WorkflowBuilder {
     ) -> Self
     where
         F: Fn(&Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoConditionResult,
     {
         self.edge_groups.push(EdgeGroup::Single {
             source: source.into(),
@@ -281,6 +283,64 @@ impl WorkflowBuilder {
             source: source.into(),
             targets: targets.into_iter().collect(),
             selection: None,
+            case_labels: None,
+        });
+        self
+    }
+
+    /// Fan out from `source` to the subset of `targets` a selection function
+    /// picks per message. Rust analogue of upstream's
+    /// `WorkflowBuilder.add_multi_selection_edge_group`.
+    ///
+    /// The selection is handed the message and the group's target ids, and
+    /// returns the ids that should receive it — zero, one, or several. Unlike
+    /// [`add_switch`](Self::add_switch), which picks exactly one branch, this
+    /// is the multi-target form: a message tagged for two reviewers goes to
+    /// both in the same superstep.
+    ///
+    /// Two rules are enforced when the selection runs, not when it is
+    /// registered, because its result is only known per message:
+    ///
+    /// * An id that is not one of `targets` is a routing error. A selection
+    ///   naming an executor outside its own group would otherwise be dropped
+    ///   silently and the run would still report `Idle`.
+    /// * A repeated id is delivered **once**. A selection may name the same
+    ///   target twice — two tags on a message routing to the same executor —
+    ///   and running that executor twice on one message is never what was
+    ///   meant, besides double-counting toward a fan-in barrier downstream.
+    ///
+    /// Build the selection with [`wrap_selection`](super::wrap_selection) (or
+    /// [`wrap_async_selection`](super::wrap_async_selection)). The closure may
+    /// return the ids directly, or a `Result` when choosing them can fail —
+    /// an `Err` aborts the run rather than being read as "picked nothing".
+    ///
+    /// ```no_run
+    /// # use agent_framework_core::workflow::{wrap_selection, WorkflowBuilder};
+    /// # use serde_json::Value;
+    /// let urgent = wrap_selection(|msg: &Value, candidates: &[String]| {
+    ///     if msg["urgent"].as_bool().unwrap_or(false) {
+    ///         candidates.to_vec()
+    ///     } else {
+    ///         candidates.first().cloned().into_iter().collect()
+    ///     }
+    /// });
+    /// let builder = WorkflowBuilder::new().add_multi_selection(
+    ///     "triage",
+    ///     vec!["reviewer_a".to_string(), "reviewer_b".to_string()],
+    ///     urgent,
+    /// );
+    /// # let _ = builder;
+    /// ```
+    pub fn add_multi_selection(
+        mut self,
+        source: impl Into<String>,
+        targets: impl IntoIterator<Item = String>,
+        selection: Selection,
+    ) -> Self {
+        self.edge_groups.push(EdgeGroup::FanOut {
+            source: source.into(),
+            targets: targets.into_iter().collect(),
+            selection: Some(selection),
             case_labels: None,
         });
         self
@@ -331,12 +391,17 @@ impl WorkflowBuilder {
             let msg = msg.clone();
             Box::pin(async move {
                 for (condition, target) in &case_targets {
-                    if condition(&msg).await {
-                        return vec![target.clone()];
+                    // `?`, not a swallowed `false`: a case predicate that
+                    // could not reach a verdict must not look like one that
+                    // declined, or the message lands on the default branch
+                    // and a broken switch looks like a working one
+                    // (upstream #8490).
+                    if condition(&msg).await? {
+                        return Ok(vec![target.clone()]);
                     }
                 }
-                vec![default_target.clone()]
-            }) as BoxFuture<Vec<String>>
+                Ok(vec![default_target.clone()])
+            }) as BoxFuture<Result<Vec<String>>>
         });
         self.edge_groups.push(EdgeGroup::FanOut {
             source,
@@ -1158,8 +1223,10 @@ impl WorkflowRun {
                     target,
                     condition,
                 } if *source == msg.source_id => {
+                    // A predicate that failed is not a predicate that said
+                    // no: propagate rather than silently declining the edge.
                     let route = match condition {
-                        Some(c) => c(&msg.data).await,
+                        Some(c) => c(&msg.data).await?,
                         None => true,
                     };
                     if route {
@@ -1172,7 +1239,37 @@ impl WorkflowRun {
                     selection,
                     ..
                 } if *source == msg.source_id => match selection {
-                    Some(sel) => targets.extend(sel(&msg.data, outs).await),
+                    Some(sel) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for id in sel(&msg.data, outs).await? {
+                            // A selection that names something outside its own
+                            // group is a routing error, not a silent drop —
+                            // the same contract an explicit `target_id`
+                            // already gets above. Without the check the id
+                            // falls through the planning loop's
+                            // `executors.get(...)` miss and the run still
+                            // reports `Idle`, so a typo in a custom
+                            // `Selection` looks like a message nobody wanted.
+                            if !outs.contains(&id) {
+                                return Err(Error::Workflow(format!(
+                                    "executor '{}' selected target '{}', which is not one of \
+                                     its fan-out group's targets: {}",
+                                    msg.source_id,
+                                    id,
+                                    outs.join(", ")
+                                )));
+                            }
+                            // A selection may name one target more than once —
+                            // two tags on a message routing to the same
+                            // executor, say. Deliver to each selected target
+                            // once: a second delivery runs the executor twice
+                            // on one message, and for a fan-in sink it also
+                            // double-counts toward the barrier.
+                            if seen.insert(id.clone()) {
+                                targets.push(id);
+                            }
+                        }
+                    }
                     None => targets.extend(outs.clone()),
                 },
                 EdgeGroup::FanIn { sources, target } if sources.contains(&msg.source_id) => {

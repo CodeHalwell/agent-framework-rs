@@ -313,3 +313,139 @@ async fn output_from_and_intermediate_output_from_conflict() {
     };
     assert!(err.to_string().contains("group_chat_orchestrator"));
 }
+
+#[tokio::test]
+async fn llm_manager_parses_a_fenced_json_selection() {
+    // A provider that ignores `response_format` wraps the decision in a
+    // Markdown fence. The strict parse used to fail and take the run down,
+    // so a `finish: true` the manager did issue was never applied.
+    let manager = manager_agent(vec![
+        "Thinking about who should go next.\n\n```json\n{\"selected_participant\": \"A\", \"instruction\": \"please answer\", \"finish\": false}\n```",
+        "```\n{\"finish\": true, \"final_message\": \"resolved\"}\n```",
+    ]);
+    let a = agent("A", vec!["a-answer"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .max_rounds(10)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("please solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("please answer")),
+        "instruction injected: {texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("a-answer")), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.contains("resolved")),
+        "final message: {texts:?}"
+    );
+}
+
+/// An inline backtick run ahead of the real block must not be taken as the
+/// opening fence.
+///
+/// CommonMark requires an opening fence to begin its line. Without that rule
+/// the inline run in the prose becomes the opening marker and closes at the
+/// *real* block's opening fence, so the scanner yields one body of prose and
+/// the genuine JSON is never parsed — a valid fenced decision that still
+/// fails to read.
+#[tokio::test]
+async fn an_inline_backtick_run_does_not_open_a_fence() {
+    let manager = manager_agent(vec![
+        "Use ```json``` fences for structured output.\n\n```json\n{\"selected_participant\": \"A\", \"instruction\": \"please answer\", \"finish\": false}\n```",
+        "Wrap it in ```these``` please.\n\n```json\n{\"finish\": true, \"final_message\": \"resolved\"}\n```",
+    ]);
+    let a = agent("A", vec!["a-answer"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .max_rounds(10)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("please solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("please answer")),
+        "the real fenced block should have been parsed: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("resolved")),
+        "final message: {texts:?}"
+    );
+}
+
+/// An indented fence still opens (CommonMark allows up to three spaces),
+/// which is the other half of the line-start rule.
+#[tokio::test]
+async fn an_indented_fence_still_opens() {
+    let manager = manager_agent(vec![
+        "Here it is:\n\n   ```json\n{\"finish\": true, \"final_message\": \"resolved\"}\n   ```",
+    ]);
+    let a = agent("A", vec!["a-answer"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .max_rounds(10)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("please solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("resolved")),
+        "an indented fence should still parse: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn llm_manager_takes_the_last_fenced_block() {
+    // A model that shows a worked example first and closes with its actual
+    // decision: the final block is the one that counts.
+    let manager = manager_agent(vec![
+        "For example:\n\n```json\n{\"finish\": true, \"final_message\": \"example\"}\n```\n\nMy decision:\n\n```json\n{\"finish\": true, \"final_message\": \"real\"}\n```",
+    ]);
+    let a = agent("A", vec!["unused"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(texts.iter().any(|t| t.contains("real")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("example")), "{texts:?}");
+}
+
+#[tokio::test]
+async fn llm_manager_keeps_backticks_inside_a_final_message() {
+    // A closing fence has to end its line, so the backticks around `cargo`
+    // inside the JSON string do not end the block early.
+    let manager = manager_agent(vec![
+        "```json\n{\"finish\": true, \"final_message\": \"run ```cargo test``` first\"}\n```",
+    ]);
+    let a = agent("A", vec!["unused"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .manager_agent(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("solve").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("run ```cargo test``` first")),
+        "{texts:?}"
+    );
+}

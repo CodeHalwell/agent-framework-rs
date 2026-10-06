@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_framework_azure::StaticTokenCredential;
+use agent_framework_core::agent::{Agent, AgentRunOptions, SupportsAgentRun};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{ChatOptions, Content, Message};
-use agent_framework_foundry::FoundryChatClient;
+use agent_framework_foundry::{FoundryChatClient, FoundryClientHeaders};
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -141,12 +142,166 @@ impl Drop for FakeServer {
     }
 }
 
+/// A minimal completed Responses body, for tests whose subject is the
+/// outbound request rather than the parse.
+const OK_BODY: &str = r#"{"id":"resp_h","model":"gpt-4o","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}"#;
+
 fn client(endpoint: &str) -> FoundryChatClient {
     FoundryChatClient::with_token_credential(
         endpoint,
         "gpt-4o",
         Arc::new(StaticTokenCredential::new("test-token")),
     )
+}
+
+/// The point of the whole `x-client-*` capability: a header stamped on the
+/// per-call `ChatOptions` has to arrive on the outbound HTTP request, and must
+/// *not* arrive in the request body. Nothing else in this port proves the
+/// first half — the carrier lives in `additional_properties`, every other
+/// entry of which is merged into the JSON body, so "it ended up in the body"
+/// is the specific way this would silently fail.
+#[tokio::test]
+async fn stamped_client_headers_reach_the_wire_and_stay_out_of_the_body() {
+    let server = FakeServer::start(false, OK_BODY);
+
+    let options = ChatOptions::new()
+        .with_client_header("x-client-end-user-id", "user-42")
+        .unwrap()
+        .with_client_header("X-Client-Request-Id", "req-7")
+        .unwrap();
+    let c = client(&server.addr);
+    c.get_response(vec![Message::user("hi")], options)
+        .await
+        .unwrap();
+
+    let (_line, headers, body) = server.requests().remove(0);
+    let headers = headers.to_ascii_lowercase();
+    assert!(
+        headers.contains("x-client-end-user-id: user-42"),
+        "headers: {headers}"
+    );
+    assert!(
+        headers.contains("x-client-request-id: req-7"),
+        "a header name's case is the caller's; only the prefix check is \
+         case-insensitive. headers: {headers}"
+    );
+    // The client's own credential still goes, beside them rather than
+    // replaced by them.
+    assert!(
+        headers.contains("authorization: bearer test-token"),
+        "headers: {headers}"
+    );
+
+    let body_json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        body_json.get("agent_framework.client_headers").is_none(),
+        "the carrier must be lifted out of the body, not merged into it: {body_json}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("user-42"),
+        "no part of a client header belongs in the request body"
+    );
+}
+
+/// A header the client or the transport owns cannot be set per call.
+///
+/// The carrier is a public key in a public map, so it is reachable without
+/// the typed `x-client-*` surface that would have refused these names. The
+/// transport therefore enforces the namespace itself — which covers the
+/// credentials *and* the headers the request builder owns (`content-type`
+/// from `.json(body)`, `host` and `content-length` from the transport).
+/// `reqwest::RequestBuilder::header` appends rather than replaces, so any of
+/// them would otherwise have gone on the wire twice with conflicting values.
+#[tokio::test]
+async fn a_header_the_client_or_transport_owns_cannot_be_set_per_call() {
+    for name in ["Authorization", "api-key", "content-type", "host"] {
+        let server = FakeServer::start(false, OK_BODY);
+
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "agent_framework.client_headers".into(),
+            serde_json::json!({ name: "attacker-value" }),
+        );
+        let err = client(&server.addr)
+            .get_response(vec![Message::user("hi")], options)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside the 'x-client-' namespace"),
+            "{name}: {msg}"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "{name}: nothing should have been sent"
+        );
+    }
+}
+
+/// The use case the capability exists for: a multi-tenant caller attesting
+/// *this run's* end user. One agent serves every tenant, so the identity can
+/// only ride on the per-run options — which is why it is worth proving the
+/// whole `Agent::run_with_options` → `ChatOptions` merge → transport path,
+/// not just the chat client in isolation.
+#[tokio::test]
+async fn a_client_header_set_per_run_reaches_the_wire_through_an_agent() {
+    let server = FakeServer::start(false, OK_BODY);
+
+    let agent = Agent::builder(client(&server.addr))
+        .instructions("be brief")
+        .build();
+    let options = AgentRunOptions {
+        chat_options: Some(
+            ChatOptions::new()
+                .with_client_header("x-client-end-user-id", "tenant-a-user-9")
+                .unwrap(),
+        ),
+        ..Default::default()
+    };
+    agent
+        .run_with_options(vec![Message::user("hi")], None, options)
+        .await
+        .unwrap();
+
+    let (_line, headers, body) = server.requests().remove(0);
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("x-client-end-user-id: tenant-a-user-9"),
+        "headers: {headers}"
+    );
+    // The agent's own options still took effect, so the carrier rode along
+    // with them rather than displacing them in the merge.
+    let body_json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body_json["instructions"], serde_json::json!("be brief"));
+}
+
+/// Non-streaming is not the only path: the streaming one builds its own
+/// request, so it needs its own proof that the headers are applied there too.
+#[tokio::test]
+async fn stamped_client_headers_reach_the_wire_on_the_streaming_path() {
+    let server = FakeServer::start(
+        true,
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+         event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    );
+
+    let options = ChatOptions::new()
+        .with_client_header("x-client-end-user-id", "user-42")
+        .unwrap();
+    let mut stream = client(&server.addr)
+        .get_streaming_response(vec![Message::user("hi")], options)
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let (_line, headers, _body) = server.requests().remove(0);
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("x-client-end-user-id: user-42"),
+        "headers: {headers}"
+    );
 }
 
 /// Non-streaming round trip: a Responses JSON body with plain assistant text

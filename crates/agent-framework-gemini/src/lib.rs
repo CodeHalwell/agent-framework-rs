@@ -32,6 +32,12 @@
 //! ```
 
 mod convert;
+pub mod embeddings;
+
+pub use embeddings::{
+    GeminiEmbeddingClient, GeminiEmbeddingOptions, GeminiEmbeddingTask, DEFAULT_EMBEDDING_MODEL,
+    SUPPORTED_EMBEDDING_MODELS,
+};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -53,7 +59,7 @@ const API_VERSION: &str = "v1beta";
 /// one via a proxy or future API revision, so this is checked defensively —
 /// mirroring `agent-framework-anthropic`'s `parse_retry_after` — rather than
 /// assumed absent.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
     headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
@@ -82,7 +88,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
 /// `candidates`, mapped to `FinishReason::CONTENT_FILTER` by
 /// [`convert::parse_response`] rather than raised as an error, so
 /// [`Error::ServiceContentFilter`] is never constructed on this path.
-fn classify_gemini_error(
+pub(crate) fn classify_gemini_error(
     status: u16,
     body: &str,
     message: impl Into<String>,

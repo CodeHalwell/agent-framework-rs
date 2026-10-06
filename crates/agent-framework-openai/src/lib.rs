@@ -399,6 +399,7 @@ pub fn parse_sse_stream(
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             tool_ids: HashMap::new(),
+            logprobs_content: Vec::new(),
             done: false,
         },
         |mut state| async move {
@@ -434,7 +435,13 @@ pub fn parse_sse_stream(
                                         state.done = true;
                                         return Some((Err(Error::service(msg)), state));
                                     }
-                                    if let Some(update) = parse_delta(&value, &mut state.tool_ids) {
+                                    if let Some(mut update) =
+                                        parse_delta(&value, &mut state.tool_ids)
+                                    {
+                                        accumulate_logprobs(
+                                            &mut update,
+                                            &mut state.logprobs_content,
+                                        );
                                         state.queued.push_back(update);
                                     }
                                 }
@@ -459,6 +466,16 @@ struct SseState {
     utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
     tool_ids: HashMap<i64, String>,
+    /// Every token entry seen under `logprobs.content` so far.
+    ///
+    /// Each chunk reports only its own tokens, and aggregation keeps the last
+    /// value it sees for a given `additional_properties` key — so without
+    /// this a streamed-then-aggregated response would carry the final chunk's
+    /// logprobs alone, where the same request made non-streaming returns
+    /// every token's. Two paths of one client answering the same question
+    /// differently, and silently. The running total is attached to the final
+    /// update (see `finish_logprobs`), which is the one aggregation keeps.
+    logprobs_content: Vec<Value>,
     done: bool,
 }
 
@@ -469,6 +486,47 @@ fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseS
             Some((Ok(update), state))
         }
         None => None,
+    }
+}
+
+/// Fold this chunk's token log-probabilities into the running total, and put
+/// the whole total on the final update.
+///
+/// A chunk's `logprobs` describes only that chunk's tokens. Updates are
+/// aggregated by `ChatResponse::absorb_update`, which inserts whatever an
+/// update has under a given `additional_properties` key — so the last chunk
+/// to carry logprobs would be the only one left in the aggregate, while the
+/// same request made non-streaming returns an entry per token. That gap is
+/// invisible to a caller: the key is present either way, just far emptier.
+///
+/// So each update keeps its own chunk's logprobs (a caller reading the stream
+/// sees the deltas as they arrive, unchanged), and the update carrying
+/// `finish_reason` — the one aggregation ends on — carries the accumulated
+/// `content` array instead. Accumulating on *every* update would cost a full
+/// copy per chunk for no gain.
+///
+/// A deliberate divergence from upstream, which keeps only the most recent
+/// chunk's value in its aggregate (#8997 fixed a null chunk *clearing* that
+/// value, not the narrowing). Matching upstream here would mean shipping the
+/// inconsistency between this client's own two paths.
+fn accumulate_logprobs(update: &mut ChatResponseUpdate, running: &mut Vec<Value>) {
+    let key = convert::LOGPROBS_PROPERTY;
+    if let Some(entries) = update
+        .additional_properties
+        .get(key)
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_array)
+    {
+        running.extend(entries.iter().cloned());
+    }
+    // `finish_reason` marks the end of the choice, so this is the update whose
+    // value survives aggregation. A stream cut off before it leaves the
+    // per-chunk values in place, which is all that can be known.
+    if update.finish_reason.is_some() && !running.is_empty() {
+        update.additional_properties.insert(
+            key.to_string(),
+            serde_json::json!({ "content": std::mem::take(running) }),
+        );
     }
 }
 
@@ -547,6 +605,16 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             update.finish_reason = Some(FinishReason::new(fr));
         }
+        // Only when the chunk actually carries them. A chunk with
+        // `"logprobs": null` — which OpenAI sends freely mid-stream — must not
+        // overwrite the metadata gathered so far, and omitting the key is how
+        // that holds here: `ChatResponse::absorb_update` inserts only the keys
+        // an update has. See `convert::token_logprobs` (upstream #8997).
+        if let Some(logprobs) = convert::token_logprobs(choice) {
+            update
+                .additional_properties
+                .insert(convert::LOGPROBS_PROPERTY.to_string(), logprobs);
+        }
     }
 
     // The final chunk (with `stream_options.include_usage`) carries top-level
@@ -595,6 +663,91 @@ mod tests {
             wire[0]["reasoning_details"],
             serde_json::json!([{"type": "reasoning.text", "text": "think"}])
         );
+    }
+
+    #[test]
+    fn streamed_logprobs_accumulate_across_chunks_and_survive_a_null_chunk() {
+        // Two things at once. Upstream #8997: a chunk with `"logprobs": null`
+        // — which OpenAI sends freely mid-stream, including on the finish
+        // chunk — must not clear what was gathered. And the aggregate must
+        // end up with *every* token's entry, not just the last chunk's:
+        // the same request made non-streaming returns one entry per token,
+        // and a caller cannot see which it got.
+        let first = serde_json::json!({
+            "content": [{ "token": "hel", "logprob": -0.1 }]
+        });
+        let latest = serde_json::json!({
+            "content": [{ "token": "lo", "logprob": -0.2 }]
+        });
+        let mut ids = HashMap::new();
+        let mut running = Vec::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"role": "assistant", "content": "hel"},
+                "logprobs": first}]}),
+            serde_json::json!({"choices": [{"delta": {"content": "lo"}, "logprobs": latest}]}),
+            // The finish chunk: text is done and logprobs are explicitly null.
+            serde_json::json!({"choices": [{"delta": {}, "logprobs": null,
+                "finish_reason": "stop"}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .map(|mut u| {
+            accumulate_logprobs(&mut u, &mut running);
+            u
+        })
+        .collect();
+        assert_eq!(updates.len(), 3);
+
+        // Each non-final update still carries its own chunk, so a caller
+        // reading the stream sees the deltas as they arrive.
+        assert_eq!(
+            updates[0].additional_properties[crate::convert::LOGPROBS_PROPERTY],
+            first
+        );
+        assert_eq!(
+            updates[1].additional_properties[crate::convert::LOGPROBS_PROPERTY],
+            latest
+        );
+
+        // The aggregate has both tokens — the null finish chunk neither
+        // cleared them nor narrowed them to the last.
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        let content = resp.additional_properties[crate::convert::LOGPROBS_PROPERTY]["content"]
+            .as_array()
+            .expect("an accumulated content array")
+            .clone();
+        let tokens: Vec<&str> = content
+            .iter()
+            .map(|e| e["token"].as_str().unwrap())
+            .collect();
+        assert_eq!(tokens, vec!["hel", "lo"]);
+        assert_eq!(resp.text(), "hello");
+        assert_eq!(resp.finish_reason.map(|f| f.0).as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn a_stream_that_never_carries_logprobs_surfaces_no_key() {
+        // Negative control: the common case must not gain a `logprobs: null`
+        // entry it never had, which a guard written at the merge instead of
+        // the read would have produced.
+        let mut ids = HashMap::new();
+        let mut running = Vec::new();
+        let updates: Vec<_> = [
+            serde_json::json!({"choices": [{"delta": {"role": "assistant", "content": "hi"},
+                "logprobs": null}]}),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ]
+        .iter()
+        .filter_map(|v| parse_delta(v, &mut ids))
+        .map(|mut u| {
+            accumulate_logprobs(&mut u, &mut running);
+            u
+        })
+        .collect();
+        let resp = agent_framework_core::types::ChatResponse::from_updates(updates);
+        assert!(!resp
+            .additional_properties
+            .contains_key(crate::convert::LOGPROBS_PROPERTY));
     }
 
     #[test]

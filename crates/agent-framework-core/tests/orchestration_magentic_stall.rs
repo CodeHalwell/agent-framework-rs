@@ -105,7 +105,6 @@ fn satisfied() -> MagenticProgressLedger {
 /// whether the history it was handed carried the human's stall guidance.
 struct ScriptedStallManager {
     ledgers: Arc<Mutex<VecDeque<MagenticProgressLedger>>>,
-    task_ledger: Mutex<Option<MagenticTaskLedger>>,
     plan_calls: Arc<AtomicUsize>,
     replan_calls: Arc<AtomicUsize>,
     final_calls: Arc<AtomicUsize>,
@@ -117,7 +116,6 @@ impl ScriptedStallManager {
     fn new(ledgers: Vec<MagenticProgressLedger>, max_stall: usize) -> Self {
         Self {
             ledgers: Arc::new(Mutex::new(ledgers.into())),
-            task_ledger: Mutex::new(None),
             plan_calls: Arc::new(AtomicUsize::new(0)),
             replan_calls: Arc::new(AtomicUsize::new(0)),
             final_calls: Arc::new(AtomicUsize::new(0)),
@@ -129,18 +127,18 @@ impl ScriptedStallManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedStallManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: Message::assistant("FACTS v1"),
             plan: Message::assistant("PLAN v1"),
         });
         Ok(Message::assistant("combined ledger v1"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: Message::assistant("FACTS v2"),
             plan: Message::assistant("PLAN v2"),
         });
@@ -173,10 +171,6 @@ impl MagenticManager for ScriptedStallManager {
 
     fn max_stall_count(&self) -> usize {
         self.max_stall
-    }
-
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.task_ledger.lock().unwrap().clone()
     }
 }
 

@@ -143,12 +143,12 @@ fn ledger(satisfied: bool, progress: bool, in_loop: bool, next: &str) -> Magenti
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, _context: &mut MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Message::assistant("PLAN"))
     }
 
-    async fn replan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, _context: &mut MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Message::assistant("REPLAN"))
     }
@@ -331,4 +331,75 @@ async fn output_from_rejects_unknown_participant() {
         Err(e) => e,
     };
     assert!(err.to_string().contains("nobody"));
+}
+
+#[tokio::test]
+async fn a_fenced_ledger_wins_over_a_brace_in_the_prose_around_it() {
+    // The ledger prompt's own schema reminder, echoed back before the answer,
+    // puts a `{` ahead of the real object. Scanning for the first balanced
+    // brace parsed that instead and the ledger was unreadable; the fence is
+    // the model saying where its answer is.
+    let preamble = "Recall the shape: {\"is_request_satisfied\": {...}}\n\n";
+    let manager_client = MockClient::new(vec![
+        ChatResponse::from_text("GIVEN OR VERIFIED FACTS: none"),
+        ChatResponse::from_text("PLAN: ask the coder"),
+        ChatResponse::from_text(format!(
+            "{preamble}```json\n{}\n```",
+            ledger_json(false, true, false, "coder", "write the code")
+        )),
+        ChatResponse::from_text(format!(
+            "{preamble}```json\n{}\n```",
+            ledger_json(true, true, false, "coder", "")
+        )),
+        ChatResponse::from_text("FINAL ANSWER: 42"),
+    ]);
+    let manager_agent =
+        Arc::new(Agent::builder(manager_client).name("mgr").build()) as Arc<dyn SupportsAgentRun>;
+    let manager = StandardMagenticManager::new(manager_agent).max_round_count(10);
+    let coder = agent("coder", vec!["def solve(): return 42"]);
+
+    let workflow = MagenticBuilder::new()
+        .participant("coder", coder)
+        .standard_manager(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("compute the answer").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("FINAL ANSWER: 42")),
+        "the fenced ledger drove the run: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unfenced_ledger_still_parses() {
+    // Negative control for the test above: output with no fence still takes
+    // the first balanced `{...}`.
+    let manager_client = MockClient::new(vec![
+        ChatResponse::from_text("GIVEN OR VERIFIED FACTS: none"),
+        ChatResponse::from_text("PLAN: ask the coder"),
+        ChatResponse::from_text(format!(
+            "Here it is: {}",
+            ledger_json(true, true, false, "coder", "")
+        )),
+        ChatResponse::from_text("FINAL ANSWER: 7"),
+    ]);
+    let manager_agent =
+        Arc::new(Agent::builder(manager_client).name("mgr").build()) as Arc<dyn SupportsAgentRun>;
+    let manager = StandardMagenticManager::new(manager_agent).max_round_count(10);
+    let coder = agent("coder", vec!["unused"]);
+
+    let workflow = MagenticBuilder::new()
+        .participant("coder", coder)
+        .standard_manager(manager)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("compute").await.unwrap();
+    let texts: Vec<String> = conversation(&run).iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("FINAL ANSWER: 7")),
+        "{texts:?}"
+    );
 }

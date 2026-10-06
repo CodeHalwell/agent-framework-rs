@@ -343,6 +343,9 @@ impl ChatResponse {
         if update.finish_reason.is_some() {
             self.finish_reason = update.finish_reason.clone();
         }
+        if update.continuation_token.is_some() {
+            self.continuation_token = update.continuation_token.clone();
+        }
 
         let role = update.role.clone().unwrap_or_else(Role::assistant);
         // Find or create the target message by message_id.
@@ -576,6 +579,19 @@ pub struct ChatResponseUpdate {
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub finish_reason: Option<FinishReason>,
+    /// The handle for resuming a long-running operation, when the service
+    /// issues one.
+    ///
+    /// On a streamed response this used to be lost: [`ChatResponse`] has the
+    /// field but the update type did not, so the token never survived
+    /// aggregation and a streamed background run could not be resumed — the
+    /// blocked response a policy check produces most of all, since that is
+    /// the one a caller needs to pick back up. Carried on the update that
+    /// knows it (in practice the last) and taken by
+    /// [`absorb_update`](ChatResponse::absorb_update) the way `finish_reason`
+    /// is.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     /// Provider-specific metadata for this update. Merged onto
     /// [`ChatResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -777,6 +793,10 @@ pub struct AgentResponseUpdate {
     /// [`AgentResponse::finish_reason`] a non-streaming `run()` returns.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub finish_reason: Option<FinishReason>,
+    /// The handle for resuming a long-running operation. See
+    /// [`ChatResponseUpdate::continuation_token`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub continuation_token: Option<ContinuationToken>,
     /// Provider-specific metadata for this update. Merged onto
     /// [`AgentResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -832,6 +852,7 @@ impl AgentResponseUpdate {
             conversation_id: u.conversation_id.clone(),
             created_at: u.created_at.clone(),
             finish_reason: u.finish_reason.clone(),
+            continuation_token: u.continuation_token.clone(),
             additional_properties: u.additional_properties.clone(),
             raw_representation: u.raw_representation.clone(),
         }
@@ -850,6 +871,7 @@ impl AgentResponseUpdate {
             // is how `from_updates` aggregates — dropped the reason on the
             // floor, so a streamed run always reported none.
             finish_reason: self.finish_reason,
+            continuation_token: self.continuation_token,
             additional_properties: self.additional_properties,
             raw_representation: self.raw_representation,
             ..Default::default()

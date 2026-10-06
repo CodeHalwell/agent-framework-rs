@@ -692,13 +692,22 @@ impl Tool for FunctionTool {
             Some(max) => {
                 // Reserve or bail: a concurrent call may have consumed the
                 // last slot since the fast-path check above.
-                if self
-                    .invocation_count
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                        (c < max).then(|| c + 1)
-                    })
-                    .is_err()
-                {
+                //
+                // Rust 1.99 renamed `fetch_update` to `try_update` and
+                // deprecated the old name, which `-D warnings` makes fatal.
+                // The rename cannot be taken yet: `try_update` does not exist
+                // on this workspace's declared `rust-version = "1.88"`, so
+                // using it would trade this failure for a red MSRV job. The
+                // method itself is unchanged, so allowing the deprecation is
+                // the whole fix — drop the attribute and rename once the
+                // floor reaches a compiler that has `try_update`.
+                #[allow(deprecated)]
+                let reserved =
+                    self.invocation_count
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                            (c < max).then(|| c + 1)
+                        });
+                if reserved.is_err() {
                     return Err(invocation_limit_error());
                 }
             }

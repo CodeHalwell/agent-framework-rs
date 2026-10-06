@@ -1023,7 +1023,16 @@ impl CosmosVectorCollection {
                 }
                 let p = bind(parameters, v.clone());
                 Ok(if is_eq {
-                    format!("(IS_DEFINED({access}) AND {access} = {p})")
+                    // `NOT IS_NULL` is load-bearing under a `not` group, not
+                    // redundant with the presence guard. Cosmos SQL evaluates
+                    // `x = @p` on a stored null to UNDEFINED rather than
+                    // false, and `NOT UNDEFINED` stays UNDEFINED — so a
+                    // document whose field is null was dropped from
+                    // `NOT (field eq value)`, which it should match. Deciding
+                    // the null case here keeps the clause three-valued-logic
+                    // free, the way `in`/`not_in` and the ordered operators
+                    // below already do.
+                    format!("(IS_DEFINED({access}) AND NOT IS_NULL({access}) AND {access} = {p})")
                 } else {
                     // A stored null is "present and not equal", which `!=`
                     // alone does not say in Cosmos SQL.
@@ -1801,9 +1810,26 @@ mod tests {
         let (clause, parameters) = translate(Filter::eq("text", "hello").unwrap().into()).unwrap();
         assert_eq!(
             clause,
-            r#"(IS_DEFINED(c["text"]) AND c["text"] = @filter_0)"#
+            r#"(IS_DEFINED(c["text"]) AND NOT IS_NULL(c["text"]) AND c["text"] = @filter_0)"#
         );
         assert_eq!(parameters, vec![("@filter_0".to_string(), json!("hello"))]);
+    }
+
+    #[test]
+    fn a_negated_eq_still_matches_a_stored_null() {
+        // Without the `NOT IS_NULL` guard inside `eq`, `x = @p` on a stored
+        // null is UNDEFINED in Cosmos SQL, `IS_DEFINED(x) AND UNDEFINED` is
+        // UNDEFINED, and `NOT UNDEFINED` is UNDEFINED — so the one document
+        // the filter is meant to return was the one it dropped.
+        let negated = agent_framework_core::vectors::FilterGroup::not(
+            Filter::eq("text", "hello").unwrap().into(),
+        )
+        .unwrap();
+        let (clause, _) = translate(negated).unwrap();
+        assert_eq!(
+            clause,
+            r#"(NOT (IS_DEFINED(c["text"]) AND NOT IS_NULL(c["text"]) AND c["text"] = @filter_0))"#
+        );
     }
 
     #[test]

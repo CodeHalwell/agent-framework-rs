@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ensure_author, parse_conversation, run_agent_and_emit};
+use super::{ensure_author, markdown_fence_bodies, parse_conversation, run_agent_and_emit};
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::Message;
@@ -288,12 +288,29 @@ IMPORTANT: Choose only from these exact participant names (case-sensitive).\n\n{
             }
         }
         let text = response.text();
-        serde_json::from_str::<ManagerSelectionResponse>(text.trim()).map_err(|e| {
-            Error::Workflow(format!(
-                "manager response did not contain valid selection data ({e}). \
-                 Ensure the manager agent returns JSON matching ManagerSelectionResponse."
-            ))
-        })
+        let trimmed = text.trim();
+        // The raw text first, so a manager that answers with bare JSON — every
+        // one that honours `response_format` — behaves exactly as before. A
+        // provider that ignores it commonly wraps the decision in a Markdown
+        // fence instead, and the strict parse then failed and took the whole
+        // run down with it: a `finish: true` the manager did issue was never
+        // applied. The *last* fence body is the candidate, as upstream has it
+        // (#8850) — a model that reasons in prose and closes with the JSON
+        // puts the decision in the final block.
+        let mut last_error = None;
+        for candidate in
+            std::iter::once(trimmed).chain(markdown_fence_bodies(trimmed).into_iter().last())
+        {
+            match serde_json::from_str::<ManagerSelectionResponse>(candidate) {
+                Ok(sel) => return Ok(sel),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(Error::Workflow(format!(
+            "manager response did not contain valid selection data ({}). \
+             Ensure the manager agent returns JSON matching ManagerSelectionResponse.",
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        )))
     }
 }
 

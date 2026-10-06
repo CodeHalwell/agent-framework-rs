@@ -17,7 +17,6 @@
 //! `predicate:` instead of `condition:`.
 
 use serde_json::Value;
-use std::sync::Arc;
 
 use agent_framework_core::workflow::Condition;
 
@@ -66,13 +65,15 @@ pub fn parse(expr: &str) -> Result<Condition> {
     }
     let expected = parse_literal(literal_str);
 
-    Ok(Arc::new(move |msg: &Value| {
-        let result = match lookup(msg, &path) {
+    // A path that is absent reads as `false` — that is this DSL's semantics,
+    // not a swallowed failure: the expression is fully parsed up front, so
+    // nothing here can fail at routing time.
+    Ok(agent_framework_core::workflow::wrap_sync_condition(
+        move |msg: &Value| match lookup(msg, &path) {
             Some(actual) => compare(actual, op, &expected),
             None => false,
-        };
-        Box::pin(async move { result }) as agent_framework_core::tools::BoxFuture<bool>
-    }))
+        },
+    ))
 }
 
 /// Split `expr` into `(path, op, literal)` around the first operator found.

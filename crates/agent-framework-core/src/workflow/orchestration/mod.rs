@@ -90,6 +90,138 @@ pub(crate) fn parse_conversation(value: &Value) -> Result<Vec<Message>> {
     }
 }
 
+/// The shortest run of backticks that opens a Markdown code fence.
+const FENCE_MARKER: &str = "```";
+
+/// The index just past the run of backticks beginning at `start`.
+/// The next backtick run at or after `from` that may *open* a fence.
+///
+/// CommonMark requires an opening fence to begin its line, with up to three
+/// spaces of indentation, and that rule is load-bearing rather than
+/// pedantic: without it any triple-backtick run counts, so prose like
+/// ``Use ```inline``` for code.`` ahead of a real fenced block makes the
+/// inline run the opening marker. The scan then closes it at the *real*
+/// block's opening fence, yielding one body of prose and leaving the genuine
+/// JSON unparsed — which is how a manager's valid fenced decision could still
+/// fail to read.
+///
+/// Only the opening side is restricted. A closing fence is matched by the
+/// existing "nothing but trailing whitespace after the run" rule, which is
+/// what keeps backticks inside a JSON string value from ending a block.
+fn next_fence_open(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut search = from;
+    while let Some(offset) = text[search..].find(FENCE_MARKER) {
+        let candidate = search + offset;
+        // Walk back over this line's leading whitespace; a fence may be
+        // indented by up to three spaces.
+        let line_start = text[..candidate].rfind('\n').map_or(0, |nl| nl + 1);
+        let indent = &text[line_start..candidate];
+        if indent.len() <= 3 && indent.bytes().all(|b| b == b' ') {
+            return Some(candidate);
+        }
+        // Not at a line start: step past this run and keep looking, so the
+        // scan stays linear.
+        search = backtick_run_end(text, candidate);
+        debug_assert!(search > candidate, "a backtick run always advances");
+        if search >= bytes.len() {
+            return None;
+        }
+    }
+    None
+}
+
+fn backtick_run_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = start;
+    while end < bytes.len() && bytes[end] == b'`' {
+        end += 1;
+    }
+    end
+}
+
+/// The index just past an opening fence's info string (`json`,
+/// `application/json`), or `start` when there is none.
+///
+/// An info string has to start with a letter, so a same-line body such as
+/// `{"a": 1}` written directly after the fence is left in place.
+fn fence_info_string_end(text: &str, start: usize) -> usize {
+    let rest = &text[start..];
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    let skipped = rest.len() - trimmed.len();
+    match trimmed.chars().next() {
+        Some(first) if first.is_alphabetic() => {
+            let len = trimmed
+                .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '+' | '.' | '/')))
+                .unwrap_or(trimmed.len());
+            start + skipped + len
+        }
+        _ => start,
+    }
+}
+
+/// The trimmed bodies of the Markdown code fences in `text`, in source order.
+///
+/// A manager or orchestrator agent is asked for JSON, and a provider that
+/// ignores `response_format` commonly answers with the JSON wrapped in a code
+/// fence instead. Without this the whole decision was unreadable: the group
+/// chat manager's strict parse failed and took the run down with it, and
+/// Magentic's brace scan could pick up a stray `{` in the prose around the
+/// fence rather than the object inside it.
+///
+/// An opening fence is a run of three or more backticks plus an optional info
+/// string. The closing fence is the next run that is **at least as long** and
+/// **ends its line**, which is what makes the scan safe on real model output:
+///
+/// * Backticks inside a JSON string value always have something after them on
+///   the same line (at minimum the closing quote), so they never close the
+///   block — a `final_message` quoting a fenced code sample stays intact.
+/// * An outer fence may use four or more backticks and so survive the
+///   three-backtick fences nested inside it.
+/// * A fence that is never closed yields nothing, rather than swallowing the
+///   remainder of the output.
+///
+/// The scan never backtracks, so it stays linear in the input even for
+/// malformed output. Mirrors upstream's `extract_markdown_fence_bodies`
+/// (#8850), which group chat and Magentic likewise share.
+pub(crate) fn markdown_fence_bodies(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut bodies = Vec::new();
+    let mut open_start = next_fence_open(text, 0);
+    while let Some(open) = open_start {
+        let open_end = backtick_run_end(text, open);
+        let closing_marker = &text[open..open_end];
+        let body_start = fence_info_string_end(text, open_end);
+
+        let mut search_from = body_start;
+        let mut closed = None;
+        while let Some(offset) = text[search_from..].find(closing_marker) {
+            let run_start = search_from + offset;
+            let run_end = backtick_run_end(text, run_start);
+            let mut line_end = run_end;
+            while line_end < bytes.len() && matches!(bytes[line_end], b' ' | b'\t' | b'\r') {
+                line_end += 1;
+            }
+            if line_end == bytes.len() || bytes[line_end] == b'\n' {
+                closed = Some((run_start, run_end));
+                break;
+            }
+            // `line_end` is strictly past `search_from` (the run is at least
+            // three backticks long), so the scan always advances.
+            search_from = line_end;
+        }
+        let Some((close_start, close_end)) = closed else {
+            break;
+        };
+        let body = text[body_start..close_start].trim();
+        if !body.is_empty() {
+            bodies.push(body);
+        }
+        open_start = next_fence_open(text, close_end);
+    }
+    bodies
+}
+
 /// Ensure a message carries an author name, defaulting to `name` when unset.
 ///
 /// Mirrors Python's `ensure_author`: participants and orchestrators tag their

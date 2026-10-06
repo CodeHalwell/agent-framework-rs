@@ -22,10 +22,13 @@ use agent_framework_core::types::{
 };
 use serde_json::{json, Map, Value};
 
-/// Build a full Bedrock `Converse` / `ConverseStream` request body (minus
-/// the `modelId`, which the caller embeds in the URL path rather than the
-/// body).
-pub fn build_request(messages: &[Message], options: &ChatOptions) -> Value {
+/// Build a full Bedrock `Converse` request body (minus the `modelId`, which
+/// the caller embeds in the URL path rather than the body).
+///
+/// `model` is the model id the request will be sent to. It is not written
+/// into the body, but it decides which fields Converse will *accept* — see
+/// [`apply_converse_compatibility`].
+pub fn build_request(messages: &[Message], options: &ChatOptions, model: &str) -> Value {
     let (system_from_messages, turns) = messages_to_bedrock(messages);
     let system =
         merge_instructions_into_system(system_from_messages, options.instructions.as_deref());
@@ -44,7 +47,63 @@ pub fn build_request(messages: &[Message], options: &ChatOptions) -> Value {
     for (k, v) in &options.additional_properties {
         body.entry(k.clone()).or_insert_with(|| v.clone());
     }
+    apply_converse_compatibility(&mut body, model);
     Value::Object(body)
+}
+
+/// Remove the fields `Converse` rejects, so a request carrying them fails
+/// validation at the caller's option rather than at the API.
+///
+/// This client reaches Bedrock through `Converse` only — its streaming path
+/// aggregates a single `Converse` call rather than speaking `ConverseStream`'s
+/// binary event-stream framing (see
+/// [`BedrockChatClient::get_streaming_response`](crate::BedrockChatClient)) —
+/// so a field that is valid only on `ConverseStream` is never valid here.
+/// Two cases, both of which otherwise reject the *whole* request:
+///
+/// * **`guardrailConfig.streamProcessingMode`.** Converse models
+///   `guardrailConfig` as `GuardrailConfiguration`, which has no such field;
+///   only `ConverseStream`'s `GuardrailStreamConfiguration` does. Setting it
+///   made every guarded call fail, so the key is dropped and the rest of the
+///   guardrail config is still sent. Upstream drops it on its non-streaming
+///   path for the same reason (#8680).
+/// * **A Prompt Management ARN.** A `modelId` naming a managed prompt
+///   (`:prompt/`) takes its instructions, tools and inference settings *from
+///   the prompt*, and Converse rejects a request that also sets
+///   `inferenceConfig`, `system`, `toolConfig` or
+///   `additionalModelRequestFields`. They are dropped with one warning naming
+///   them, the same way a provider's unsupported tools are stripped rather
+///   than failing the call. Nothing is dropped silently: unlike upstream,
+///   this converter never adds a default `maxTokens`, so anything present
+///   here is something the caller asked for and is worth telling them about.
+///
+/// Other model ids — including prompt-*router* ARNs, which are ordinary
+/// inference targets — are left alone.
+pub fn apply_converse_compatibility(body: &mut Map<String, Value>, model: &str) {
+    if let Some(Value::Object(guardrail)) = body.get_mut("guardrailConfig") {
+        guardrail.remove("streamProcessingMode");
+    }
+    if !model.contains(":prompt/") {
+        return;
+    }
+    let dropped: Vec<&str> = [
+        "inferenceConfig",
+        "system",
+        "toolConfig",
+        "additionalModelRequestFields",
+    ]
+    .into_iter()
+    .filter(|key| body.remove(*key).is_some())
+    .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            model = model,
+            fields = dropped.join(", "),
+            "Converse does not accept these fields with a Prompt Management prompt; \
+             they were omitted from the request. Define them on the prompt in \
+             Prompt Management instead."
+        );
+    }
 }
 
 /// Split messages into Bedrock's top-level `system` blocks and its
@@ -892,7 +951,7 @@ mod tests {
             .with_temperature(0.2)
             .with_tool(tool);
         let messages = vec![Message::user("hi")];
-        let body = build_request(&messages, &options);
+        let body = build_request(&messages, &options, "amazon.nova-lite-v1:0");
         assert_eq!(body["system"], json!([{ "text": "Be terse." }]));
         assert_eq!(body["messages"][0]["role"], "user");
         // `with_temperature` takes `f32`; compare against the same `f32`
@@ -909,7 +968,7 @@ mod tests {
             Message::user("hi"),
         ];
         let options = ChatOptions::new().with_instructions("From options.");
-        let body = build_request(&messages, &options);
+        let body = build_request(&messages, &options, "amazon.nova-lite-v1:0");
         assert_eq!(
             body["system"],
             json!([{ "text": "From options." }, { "text": "From the conversation." }])
@@ -919,16 +978,85 @@ mod tests {
     #[test]
     fn build_request_instructions_alone_populate_system() {
         let options = ChatOptions::new().with_instructions("Be terse.");
-        let body = build_request(&[Message::user("hi")], &options);
+        let body = build_request(&[Message::user("hi")], &options, "amazon.nova-lite-v1:0");
         assert_eq!(body["system"], json!([{ "text": "Be terse." }]));
     }
 
     #[test]
     fn build_request_omits_absent_sections() {
-        let body = build_request(&[Message::user("hi")], &ChatOptions::new());
+        let body = build_request(
+            &[Message::user("hi")],
+            &ChatOptions::new(),
+            "amazon.nova-lite-v1:0",
+        );
         assert!(body.get("system").is_none());
         assert!(body.get("inferenceConfig").is_none());
         assert!(body.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn a_guardrail_stream_processing_mode_is_dropped_because_converse_rejects_it() {
+        // Converse models `guardrailConfig` as `GuardrailConfiguration`, which
+        // has no `streamProcessingMode` — only ConverseStream's
+        // `GuardrailStreamConfiguration` does, and this client never calls it.
+        // Sending the key failed the whole guarded request.
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "guardrailConfig".to_string(),
+            json!({
+                "guardrailIdentifier": "g1",
+                "guardrailVersion": "1",
+                "streamProcessingMode": "async",
+            }),
+        );
+        let body = build_request(&[Message::user("hi")], &options, "amazon.nova-lite-v1:0");
+        assert_eq!(
+            body["guardrailConfig"],
+            json!({ "guardrailIdentifier": "g1", "guardrailVersion": "1" }),
+            "the rest of the guardrail config still goes"
+        );
+    }
+
+    #[test]
+    fn a_prompt_management_arn_omits_the_fields_converse_rejects() {
+        let mut options = ChatOptions::new();
+        options.instructions = Some("be brief".into());
+        options.max_tokens = Some(256);
+        options.additional_properties.insert(
+            "additionalModelRequestFields".to_string(),
+            json!({ "reasoning": { "effort": "low" } }),
+        );
+        let body = build_request(
+            &[Message::user("hi")],
+            &options,
+            "arn:aws:bedrock:us-east-1:111122223333:prompt/PROMPT123",
+        );
+        for key in [
+            "inferenceConfig",
+            "system",
+            "toolConfig",
+            "additionalModelRequestFields",
+        ] {
+            assert!(body.get(key).is_none(), "{key} must be omitted: {body}");
+        }
+        // The conversation itself is still what the prompt is invoked with.
+        assert_eq!(body["messages"][0]["content"][0]["text"], json!("hi"));
+    }
+
+    #[test]
+    fn a_prompt_router_arn_is_an_ordinary_inference_target() {
+        // Negative control: `prompt-router` is not `:prompt/`, so nothing is
+        // stripped from it.
+        let mut options = ChatOptions::new();
+        options.instructions = Some("be brief".into());
+        options.max_tokens = Some(256);
+        let body = build_request(
+            &[Message::user("hi")],
+            &options,
+            "arn:aws:bedrock:us-east-1:111122223333:default-prompt-router/anthropic.claude:1",
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], json!(256));
+        assert_eq!(body["system"][0]["text"], json!("be brief"));
     }
 
     #[test]
@@ -940,7 +1068,7 @@ mod tests {
             json!({ "guardrailIdentifier": "g1" }),
         );
         options.additional_properties = extra;
-        let body = build_request(&[Message::user("hi")], &options);
+        let body = build_request(&[Message::user("hi")], &options, "amazon.nova-lite-v1:0");
         assert_eq!(
             body["guardrailConfig"],
             json!({ "guardrailIdentifier": "g1" })

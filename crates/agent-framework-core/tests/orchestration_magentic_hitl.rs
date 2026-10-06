@@ -97,7 +97,6 @@ fn satisfied_ledger() -> MagenticProgressLedger {
 /// actually reached the manager (mirrors Python appending
 /// `"Human plan feedback: ..."` to `chat_history` before calling `replan`).
 struct ScriptedManager {
-    task_ledger: Mutex<Option<MagenticTaskLedger>>,
     plan_calls: Arc<AtomicUsize>,
     replan_calls: Arc<AtomicUsize>,
     final_calls: Arc<AtomicUsize>,
@@ -107,7 +106,6 @@ struct ScriptedManager {
 impl ScriptedManager {
     fn new() -> Self {
         Self {
-            task_ledger: Mutex::new(None),
             plan_calls: Arc::new(AtomicUsize::new(0)),
             replan_calls: Arc::new(AtomicUsize::new(0)),
             final_calls: Arc::new(AtomicUsize::new(0)),
@@ -118,18 +116,18 @@ impl ScriptedManager {
 
 #[async_trait]
 impl MagenticManager for ScriptedManager {
-    async fn plan(&self, _context: &MagenticContext) -> Result<Message> {
+    async fn plan(&self, context: &mut MagenticContext) -> Result<Message> {
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         let facts = Message::assistant("FACTS v1");
         let plan = Message::assistant("PLAN v1");
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: facts.clone(),
             plan: plan.clone(),
         });
         Ok(Message::assistant("combined ledger v1"))
     }
 
-    async fn replan(&self, context: &MagenticContext) -> Result<Message> {
+    async fn replan(&self, context: &mut MagenticContext) -> Result<Message> {
         self.replan_calls.fetch_add(1, Ordering::SeqCst);
         let saw_feedback = context
             .chat_history
@@ -139,7 +137,7 @@ impl MagenticManager for ScriptedManager {
 
         let facts = Message::assistant("FACTS v1");
         let plan = Message::assistant("REVISED PLAN");
-        *self.task_ledger.lock().unwrap() = Some(MagenticTaskLedger {
+        context.task_ledger = Some(MagenticTaskLedger {
             facts: facts.clone(),
             plan: plan.clone(),
         });
@@ -156,10 +154,6 @@ impl MagenticManager for ScriptedManager {
     async fn prepare_final_answer(&self, _context: &MagenticContext) -> Result<Message> {
         self.final_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Message::assistant("FINAL ANSWER"))
-    }
-
-    fn current_task_ledger(&self) -> Option<MagenticTaskLedger> {
-        self.task_ledger.lock().unwrap().clone()
     }
 }
 

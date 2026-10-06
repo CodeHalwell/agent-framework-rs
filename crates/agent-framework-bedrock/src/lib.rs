@@ -341,7 +341,7 @@ impl ChatClient for BedrockChatClient {
         options: ChatOptions,
     ) -> Result<ChatResponse> {
         let model = self.effective_model(&options);
-        let body = convert::build_request(&messages, &options);
+        let body = convert::build_request(&messages, &options, &model);
         let payload = serde_json::to_vec(&body).map_err(|e| {
             Error::Serialization(format!("failed to serialize Bedrock Converse request: {e}"))
         })?;

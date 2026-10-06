@@ -22,11 +22,51 @@ pub(crate) fn top_level_media_type(media_type: &str) -> String {
     span.trim().to_ascii_lowercase()
 }
 
+/// The media types that name MP3 audio, as IANA and the long tail of encoders
+/// register it. `audio/mpeg` is the registered type; the rest are aliases still
+/// emitted in the wild.
+///
+/// Matched exactly rather than as a substring, because the sibling MPEG
+/// subtypes are *not* MP3: `audio/mpegurl` is an M3U playlist (text, not
+/// audio frames) and `audio/mpeg4-generic` is an MPEG-4 RTP payload. Both
+/// contain `"mpeg"`, so a substring test labelled them `mp3` and sent them to
+/// the API as MP3 audio, which can only fail at the provider — after the
+/// upload. They now take the unsupported-content path instead.
+const MP3_MEDIA_TYPES: [&str; 5] = [
+    "audio/mp3",
+    "audio/mpeg",
+    "audio/x-mpeg",
+    "audio/mpeg3",
+    "audio/x-mpeg-3",
+];
+
+/// The media types OpenAI's `wav` format covers.
+///
+/// An allowlist for the same reason as [`MP3_MEDIA_TYPES`], and the note this
+/// replaces was simply wrong: it claimed `wav` "has no sibling subtype that is
+/// not WAV audio", but `audio/x-wavpack` is WavPack — a different codec that a
+/// `contains("wav")` test sent to the API labelled as WAV.
+const WAV_MEDIA_TYPES: [&str; 5] = [
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/x-pn-wav",
+    "audio/vnd.wave",
+];
+
 /// The OpenAI audio `format` string for a media type, or `None` if unsupported.
 pub(crate) fn audio_format(media_type: &str) -> Option<&'static str> {
-    if media_type.contains("wav") {
+    // Parameters (`audio/mpeg; rate=44100`) are not part of the type, and the
+    // type itself is case-insensitive.
+    let normalized = media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase();
+    if WAV_MEDIA_TYPES.contains(&normalized.as_str()) {
         Some("wav")
-    } else if media_type.contains("mp3") || media_type.contains("mpeg") {
+    } else if MP3_MEDIA_TYPES.contains(&normalized.as_str()) {
         Some("mp3")
     } else {
         None
@@ -415,12 +455,51 @@ pub fn parse_response(value: &Value) -> ChatResponse {
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
             response.finish_reason = Some(FinishReason::new(fr));
         }
+        if let Some(logprobs) = token_logprobs(choice) {
+            response
+                .additional_properties
+                .insert(LOGPROBS_PROPERTY.to_string(), logprobs);
+        }
     }
 
     if let Some(usage) = value.get("usage") {
         response.usage_details = Some(parse_usage(usage));
     }
     response
+}
+
+/// The [`ChatResponse::additional_properties`] key carrying a response's token
+/// log-probabilities, when the request asked for them.
+///
+/// It is the same name the provider uses, and the same one upstream surfaces
+/// it under, so a caller that reads the raw OpenAI shape elsewhere does not
+/// have to learn a second name for it. The payload is passed through
+/// unchanged rather than modelled: it is a scoring artifact to read or log,
+/// not something this client acts on, and OpenAI has extended its shape
+/// before (`top_logprobs`, `bytes`) — a typed mirror would have to be revised
+/// each time, and would quietly drop whatever it did not yet know about.
+///
+/// Requesting them needs no typed option: `logprobs` and `top_logprobs` are
+/// carried into the request body by the `additional_properties` pass in
+/// [`apply_options`], which is also how upstream's callers ask for them.
+pub const LOGPROBS_PROPERTY: &str = "logprobs";
+
+/// Read a choice's token log-probabilities, or `None` when it carries none.
+///
+/// `None` for an explicit JSON `null` as well as an absent field, which is
+/// what the streaming path depends on: OpenAI sends `"logprobs": null` on
+/// every chunk of a stream that did not ask for them *and* on some chunks of
+/// one that did. Treating that null as a value would overwrite the real
+/// metadata gathered so far with nothing — the bug upstream fixed in #8997,
+/// where the guard had to be written into the merge because the SDK object
+/// was already in hand. Here the distinction lives at the read instead, so
+/// the update simply carries no key and there is nothing for aggregation to
+/// clear: `absorb_update` only inserts the keys an update actually has.
+pub(crate) fn token_logprobs(choice: &Value) -> Option<Value> {
+    match choice.get("logprobs") {
+        Some(Value::Null) | None => None,
+        Some(other) => Some(other.clone()),
+    }
 }
 
 /// The provider reasoning payload to replay for a reasoning content, or
@@ -860,6 +939,71 @@ mod tests {
         }
     }
 
+    // region: token log-probabilities (upstream #8997)
+
+    #[test]
+    fn logprobs_are_surfaced_on_the_response_when_the_choice_carries_them() {
+        let logprobs = json!({
+            "content": [
+                { "token": "hel", "bytes": [104, 101, 108], "logprob": -0.1, "top_logprobs": [] }
+            ]
+        });
+        let value = json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": { "role": "assistant", "content": "hello" },
+                "finish_reason": "stop",
+                "logprobs": logprobs,
+            }]
+        });
+        let resp = parse_response(&value);
+        // Passed through unchanged: the shape is the provider's, and OpenAI
+        // has extended it before.
+        assert_eq!(
+            resp.additional_properties.get(LOGPROBS_PROPERTY),
+            Some(&logprobs)
+        );
+        assert_eq!(resp.text(), "hello");
+    }
+
+    #[test]
+    fn an_absent_or_null_logprobs_adds_no_key() {
+        // Two shapes, one meaning. OpenAI sends an explicit `null` on a
+        // response that did not ask for logprobs, and the distinction between
+        // that and "absent" is exactly what the streaming merge rests on.
+        for choice in [
+            json!({ "message": { "role": "assistant", "content": "hi" } }),
+            json!({ "message": { "role": "assistant", "content": "hi" }, "logprobs": null }),
+        ] {
+            let resp = parse_response(&json!({ "id": "c", "choices": [choice] }));
+            assert!(
+                !resp.additional_properties.contains_key(LOGPROBS_PROPERTY),
+                "a null logprobs must not land as a key with a null value"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_logprobs_needs_no_typed_option() {
+        // The capability's request half: `additional_properties` already
+        // carries request-wide fields verbatim, which is how upstream's
+        // callers ask for these too. Pinned so the round trip is visible in
+        // one place rather than implied by the generic pass-through test.
+        let mut options = ChatOptions::new();
+        options
+            .additional_properties
+            .insert("logprobs".into(), json!(true));
+        options
+            .additional_properties
+            .insert("top_logprobs".into(), json!(5));
+        let mut body = Map::new();
+        apply_options(&mut body, &options);
+        assert_eq!(body["logprobs"], json!(true));
+        assert_eq!(body["top_logprobs"], json!(5));
+    }
+
+    // endregion
+
     // region: author-name sanitization (upstream #7127)
 
     #[test]
@@ -988,6 +1132,52 @@ mod tests {
         })]);
         let out = messages_to_openai(&[msg]);
         assert_eq!(out[0]["content"][0]["input_audio"]["format"], json!("mp3"));
+    }
+
+    #[test]
+    fn mp3_aliases_and_parameters_are_recognized_but_sibling_mpeg_types_are_not() {
+        // The registered aliases, each with a parameter on one of them to pin
+        // that parameters are stripped before the comparison.
+        for media_type in [
+            "audio/mp3",
+            "audio/mpeg",
+            "AUDIO/MPEG",
+            "audio/mpeg; rate=44100",
+            "audio/x-mpeg",
+            "audio/mpeg3",
+            "audio/x-mpeg-3",
+        ] {
+            assert_eq!(audio_format(media_type), Some("mp3"), "{media_type}");
+        }
+        // Not MP3, though both contain "mpeg": a playlist and an MPEG-4 RTP
+        // payload. A substring test sent each to the API as MP3 audio.
+        for media_type in ["audio/mpegurl", "audio/mpeg4-generic"] {
+            assert_eq!(audio_format(media_type), None, "{media_type}");
+        }
+
+        // WAV is an allowlist for the same reason, and the aliases are
+        // normalized the same way.
+        for media_type in [
+            "audio/wav",
+            "audio/x-wav",
+            "AUDIO/WAV",
+            "audio/wav; rate=16000",
+            "audio/wave",
+            "audio/x-pn-wav",
+            "audio/vnd.wave",
+        ] {
+            assert_eq!(audio_format(media_type), Some("wav"), "{media_type}");
+        }
+        // The sibling that broke the old substring test: WavPack is a
+        // different codec, and labelling it `wav` sent it to the API as WAV
+        // audio — the same fault as `audio/mpegurl`, one directory along.
+        for media_type in [
+            "audio/x-wavpack",
+            "audio/wavpack",
+            "audio/x-wavpack-correction",
+        ] {
+            assert_eq!(audio_format(media_type), None, "{media_type}");
+        }
     }
 
     #[test]

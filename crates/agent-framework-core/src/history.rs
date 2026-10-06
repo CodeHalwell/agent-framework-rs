@@ -152,35 +152,116 @@ pub fn filter_new_messages_from<'a>(
     incoming: &'a [Message],
     shape: StoredHistory,
 ) -> &'a [Message] {
-    if existing.is_empty() || incoming.len() <= existing.len() || !could_be_a_replay(existing) {
-        return incoming;
+    match align(existing, incoming, shape) {
+        Alignment::None => incoming,
+        Alignment::WholeBlock { start } => &incoming[start + existing.len()..],
+        Alignment::Tail { overlap } => &incoming[overlap..],
     }
-    let matches = |start: usize| {
-        incoming[start..start + existing.len()]
+}
+
+/// Where stored history was found inside a run's input, which is both what
+/// makes the new messages identifiable ([`filter_new_messages_from`]) and what
+/// says how much of stored history still has to be injected into the request
+/// ([`inject_stored_history_from`]). The two answers differ, which is why this
+/// is one computation with one result rather than two length comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Alignment {
+    /// The input does not carry stored history at all.
+    None,
+    /// The input carries **all** of stored history, as a contiguous block
+    /// starting at `start`.
+    WholeBlock { start: usize },
+    /// The input opens with the **last `overlap`** messages of stored history
+    /// and nothing before them — a caller replaying a trimmed transcript.
+    Tail { overlap: usize },
+}
+
+/// Locate stored history inside a run's input. See [`Alignment`].
+fn align(existing: &[Message], incoming: &[Message], shape: StoredHistory) -> Alignment {
+    if existing.is_empty() || incoming.is_empty() || !could_be_a_replay(existing) {
+        return Alignment::None;
+    }
+    if incoming.len() > existing.len() {
+        let matches = |start: usize| {
+            incoming[start..start + existing.len()]
+                .iter()
+                .zip(existing)
+                .all(|(a, b)| message_identity(a) == message_identity(b))
+        };
+        let found = match shape {
+            // A complete history starts at the conversation's first message, so
+            // a replay of it can only *begin* with it. Matching at a later
+            // offset would mean the input carried turns from before the
+            // conversation started — impossible — and a coincidental match
+            // there would silently drop every genuinely new message in front
+            // of it.
+            StoredHistory::Complete => matches(0).then_some(0),
+            // A window may sit in the middle of the transcript, so it has to be
+            // searched for — but an anchored match still wins, since an at-cap
+            // list that has never actually been trimmed is still a complete
+            // history.
+            StoredHistory::Window => matches(0).then_some(0).or_else(|| {
+                (1..(incoming.len() - existing.len()))
+                    .rev()
+                    .find(|s| matches(*s))
+            }),
+        };
+        if let Some(start) = found {
+            return Alignment::WholeBlock { start };
+        }
+    }
+    match trailing_overlap(existing, incoming) {
+        Some(overlap) => Alignment::Tail { overlap },
+        None => Alignment::None,
+    }
+}
+
+/// Align a replay that begins *inside* stored history: the longest suffix of
+/// `existing` that is also a prefix of `incoming`.
+///
+/// The whole-block search above only finds a replay that carries all of stored
+/// history. A caller that trims its own transcript — a UI keeping the last N
+/// turns, a client replaying only what it still has on screen — sends a window
+/// that starts in the middle of what the provider holds, so no whole-block
+/// match exists and every replayed turn used to be appended again on each run.
+/// Matching the stored *tail* against the incoming *head* locates that cut
+/// point, and the messages after it are the new ones. Upstream added the same
+/// alignment in `filter_new_messages` (#8800).
+///
+/// The longest overlap wins: a shorter one would treat turns that *are* in
+/// stored history as new, which is the duplication this exists to stop.
+///
+/// Two overlaps are refused, both for the reason stated on
+/// [`filter_new_messages`] — an alignment this cannot tell from real input is
+/// read as real input, because a redundant write is trimmed away and a dropped
+/// turn is not recoverable:
+///
+/// * One that consumes **all** of `incoming`, leaving nothing new. That is the
+///   ambiguous "input exactly repeats the stored tail" case, read here as a
+///   turn that genuinely repeated itself.
+/// * A **single** id-less user message. With stored history ending in
+///   `user("yes")`, an input of `[user("yes"), …]` is equally well a replay or
+///   a caller saying "yes" again; one message of content carries no evidence
+///   either way. Upstream declines this case for the same reason. A longer
+///   overlap, or one bearing an id, does carry evidence and is accepted.
+fn trailing_overlap(existing: &[Message], incoming: &[Message]) -> Option<usize> {
+    let max = existing.len().min(incoming.len());
+    (1..=max).rev().find(|&overlap| {
+        if overlap == incoming.len() {
+            return false;
+        }
+        let tail = &existing[existing.len() - overlap..];
+        if !tail
             .iter()
-            .zip(existing)
+            .zip(&incoming[..overlap])
             .all(|(a, b)| message_identity(a) == message_identity(b))
-    };
-    let found = match shape {
-        // A complete history starts at the conversation's first message, so a
-        // replay of it can only *begin* with it. Matching at a later offset
-        // would mean the input carried turns from before the conversation
-        // started — impossible — and a coincidental match there would silently
-        // drop every genuinely new message in front of it.
-        StoredHistory::Complete => matches(0).then_some(0),
-        // A window may sit in the middle of the transcript, so it has to be
-        // searched for — but an anchored match still wins, since an at-cap list
-        // that has never actually been trimmed is still a complete history.
-        StoredHistory::Window => matches(0).then_some(0).or_else(|| {
-            (1..(incoming.len() - existing.len()))
-                .rev()
-                .find(|s| matches(*s))
-        }),
-    };
-    match found {
-        Some(start) => &incoming[start + existing.len()..],
-        None => incoming,
-    }
+        {
+            return false;
+        }
+        !(overlap == 1
+            && real_message_id(&tail[0]).is_none()
+            && tail[0].role == crate::types::Role::user())
+    })
 }
 
 /// Whether stored history could be a *replay* at all when it turns up inside a
@@ -279,13 +360,27 @@ pub fn inject_stored_history_from(
     if stored.is_empty() {
         return;
     }
-    // A shorter result means the input aligned against — and therefore already
-    // contains — the stored run.
-    if filter_new_messages_from(&stored, &ctx.input_messages, shape).len()
-        < ctx.input_messages.len()
-    {
-        return;
-    }
+    // How much of stored history the input already carries decides how much of
+    // it still belongs in the request.
+    let stored = match align(&stored, &ctx.input_messages, shape) {
+        // Nothing of it is in the input: inject all of it, as before.
+        Alignment::None => stored,
+        // The input carries the whole stored run, so injecting any of it would
+        // send those turns to the model twice.
+        Alignment::WholeBlock { .. } => return,
+        // The input carries only the stored *tail* — a caller replaying a
+        // trimmed transcript. Injecting nothing would drop the turns from
+        // before its window out of the request entirely, and injecting
+        // everything would duplicate the ones it did send, so inject exactly
+        // the part it does not have.
+        Alignment::Tail { overlap } => {
+            let keep = stored.len() - overlap;
+            if keep == 0 {
+                return;
+            }
+            stored.into_iter().take(keep).collect()
+        }
+    };
     let existing = std::mem::take(&mut ctx.messages);
     ctx.messages = stored.into_iter().chain(existing).collect();
 }
@@ -749,6 +844,114 @@ mod tests {
         // A *complete* history can only be a replay when it comes first, so the
         // same input is entirely new to a store that keeps everything.
         assert_eq!(filter_new_messages(&existing, &incoming).len(), 5);
+    }
+
+    /// A caller that trims its own transcript sends a window that begins in
+    /// the middle of stored history, so there is no whole-block match: the
+    /// stored *tail* has to be matched against the incoming *head* (#8800).
+    /// Before this alignment existed, every replayed turn was appended again
+    /// on each run.
+    #[test]
+    fn filter_new_messages_aligns_a_replay_that_starts_mid_history() {
+        let existing = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        // The caller kept only the last exchange and added a new turn.
+        let incoming = vec![
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["q3".to_string()]
+        );
+    }
+
+    /// The longest overlap wins: a shorter one would treat turns that *are*
+    /// stored as new, which is the duplication the alignment exists to stop.
+    #[test]
+    fn a_trailing_overlap_takes_the_longest_match() {
+        let existing = vec![
+            Message::assistant("a"),
+            Message::user("b"),
+            Message::assistant("a"),
+            Message::user("b"),
+        ];
+        let incoming = vec![
+            Message::assistant("a"),
+            Message::user("b"),
+            Message::user("new"),
+        ];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["new".to_string()]
+        );
+    }
+
+    /// One id-less user message of overlap is no evidence of a replay: with
+    /// stored history ending in `user("yes")`, an input opening with
+    /// `user("yes")` is equally well a caller saying "yes" again. Upstream
+    /// declines the same case.
+    #[test]
+    fn a_single_id_less_user_message_is_not_a_trailing_overlap() {
+        let existing = vec![Message::assistant("ok?"), Message::user("yes")];
+        let incoming = vec![Message::user("yes"), Message::user("and now this")];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["yes".to_string(), "and now this".to_string()]
+        );
+    }
+
+    /// The same overlap *with an id* is evidence: ids are assigned, not
+    /// guessed.
+    #[test]
+    fn a_single_user_message_with_an_id_is_a_trailing_overlap() {
+        let mut stored_turn = Message::user("yes");
+        stored_turn.message_id = Some("m-7".into());
+        let existing = vec![Message::assistant("ok?"), stored_turn.clone()];
+        let incoming = vec![stored_turn, Message::user("and now this")];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["and now this".to_string()]
+        );
+    }
+
+    /// An overlap consuming all of `incoming` leaves nothing new, which is the
+    /// ambiguous case the port reads as a turn that repeated itself.
+    #[test]
+    fn a_trailing_overlap_that_consumes_everything_is_not_an_alignment() {
+        let existing = vec![Message::user("q"), Message::assistant("a")];
+        let incoming = vec![Message::assistant("a")];
+        assert_eq!(
+            texts(filter_new_messages(&existing, &incoming)),
+            vec!["a".to_string()]
+        );
+    }
+
+    /// Injection has to follow the same alignment: a replay of a *trimmed*
+    /// transcript needs the turns from before its window, and only those.
+    #[test]
+    fn injection_prepends_only_the_part_a_trimmed_replay_is_missing() {
+        let stored = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        let mut ctx = SessionContext::new(vec![
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ]);
+        inject_stored_history(&mut ctx, stored);
+        assert_eq!(
+            texts(&ctx.messages),
+            vec!["q1".to_string(), "a1".to_string()]
+        );
     }
 
     /// A retention-limited list whose length merely reaches the cap has not
