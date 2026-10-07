@@ -363,6 +363,31 @@ async fn return_final_only_returns_last_response() {
     assert_eq!(response.text(), "second answer");
 }
 
+#[tokio::test]
+async fn return_final_only_still_sums_usage_across_passes() {
+    let client = Mock::new();
+    for (text, input) in [("first answer", 10), ("second answer", 20)] {
+        client.push(ChatResponse {
+            usage_details: Some(UsageDetails {
+                input_token_count: Some(input),
+                output_token_count: Some(1),
+                ..Default::default()
+            }),
+            ..ChatResponse::from_text(text)
+        });
+    }
+    let looping = LoopAgent::builder(agent(&client), always)
+        .max_iterations(Some(2))
+        .return_final_only(true)
+        .build()
+        .unwrap();
+    let response = looping.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(response.text(), "second answer");
+    let usage = response.usage_details.unwrap();
+    assert_eq!(usage.input_token_count, Some(30));
+    assert_eq!(usage.output_token_count, Some(2));
+}
+
 // region: feedback and progress
 
 #[tokio::test]
@@ -1103,6 +1128,95 @@ async fn tool_approval_presents_multiple_requests_one_at_a_time() {
     let last = f.run(approve(&requests[0])).await;
     assert_eq!(last.text(), "done");
     assert_eq!(f.executed(), ["first_tool", "second_tool"]);
+}
+
+#[tokio::test]
+async fn input_sent_with_a_queued_answer_reaches_the_model() {
+    let mut f = approval_fixture(&["first_tool", "second_tool"], |a| a);
+    f.client.push(call_response(&[
+        ("call_first", "first_tool", "{}"),
+        ("call_second", "second_tool", "{}"),
+    ]));
+    let first = f.run(Message::user("call both")).await;
+    // Answer the first request and add a note in the same turn.
+    let second = f
+        .agent
+        .run(
+            vec![
+                approve(&approval_requests(&first)[0]),
+                Message::user("also use metric units"),
+            ],
+            Some(&mut f.session),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.client.calls(), 1);
+    assert_eq!(
+        f.agent.state(&f.session).unwrap().held_messages.len(),
+        1,
+        "the note is held in session state"
+    );
+
+    f.client.push(ChatResponse::from_text("done"));
+    let last = f.run(approve(&approval_requests(&second)[0])).await;
+    assert_eq!(last.text(), "done");
+    assert!(any_contains(&f.client.received(1), "also use metric units"));
+    assert!(f.agent.state(&f.session).unwrap().held_messages.is_empty());
+    assert_eq!(f.executed(), ["first_tool", "second_tool"]);
+}
+
+#[tokio::test]
+async fn streaming_input_sent_with_a_queued_answer_reaches_the_model() {
+    let f = approval_fixture(&["first_tool", "second_tool"], |a| a);
+    f.client.push(call_response(&[
+        ("call_first", "first_tool", "{}"),
+        ("call_second", "second_tool", "{}"),
+    ]));
+    let stream_requests = |updates: Vec<AgentResponseUpdate>| {
+        approval_requests(&AgentResponse::from_updates(updates))
+    };
+    let first = stream_requests(
+        collect(
+            f.agent
+                .run_stream(
+                    vec![Message::user("call both")],
+                    Some(f.session.clone()),
+                    None,
+                )
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    let second = stream_requests(
+        collect(
+            f.agent
+                .run_stream(
+                    vec![approve(&first[0]), Message::user("also use metric units")],
+                    Some(f.session.clone()),
+                    None,
+                )
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    assert_eq!(f.client.calls(), 1);
+    assert_eq!(second.len(), 1);
+
+    f.client.push(ChatResponse::from_text("done"));
+    collect(
+        f.agent
+            .run_stream(vec![approve(&second[0])], Some(f.session.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(any_contains(&f.client.received(1), "also use metric units"));
+    assert!(f.agent.state(&f.session).unwrap().held_messages.is_empty());
+    let mut executed = f.executed();
+    executed.sort();
+    assert_eq!(executed, ["first_tool", "second_tool"]);
 }
 
 #[tokio::test]

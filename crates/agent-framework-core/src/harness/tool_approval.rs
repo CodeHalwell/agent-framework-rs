@@ -187,6 +187,10 @@ pub struct ToolApprovalState {
     /// Approvals held back until every queued request is answered.
     #[serde(default)]
     pub collected_approval_responses: Vec<FunctionApprovalResponseContent>,
+    /// Other input the caller sent while queued requests were still being
+    /// answered, held back to go to the model with the collected approvals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_messages: Vec<Message>,
     /// "Always approve" choices keyed by approval-request id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_standing_approvals: BTreeMap<String, PendingStandingApproval>,
@@ -329,10 +333,20 @@ impl ToolApprovalAgent {
             Value::Object(map) => map,
             _ => unreachable!("ToolApprovalState serializes to an object"),
         };
-        // Keep any keys someone else stored alongside ours.
+        // Keep any keys someone else stored alongside ours. Our own keys
+        // are skipped when empty, so an old value must not resurrect them.
+        const OWN_KEYS: [&str; 5] = [
+            "rules",
+            "queued_approval_requests",
+            "collected_approval_responses",
+            "held_messages",
+            "pending_standing_approvals",
+        ];
         if let Some(Value::Object(existing)) = session.state.get(&self.source_id) {
             for (key, value) in existing {
-                serialized.entry(key).or_insert(value);
+                if !OWN_KEYS.contains(&key.as_str()) {
+                    serialized.entry(key).or_insert(value);
+                }
             }
         }
         session
@@ -482,18 +496,22 @@ impl ToolApprovalAgent {
         }
     }
 
-    /// Prepend the collected approvals to `messages` as one `user` message.
+    /// Prepend the collected approvals to `messages` as one `user` message,
+    /// followed by any input held back while the queue was being answered.
     fn inject_collected(messages: Vec<Message>, state: &mut ToolApprovalState) -> Vec<Message> {
-        if state.collected_approval_responses.is_empty() {
+        if state.collected_approval_responses.is_empty() && state.held_messages.is_empty() {
             return messages;
         }
-        let approvals: Vec<Content> = state
-            .collected_approval_responses
-            .drain(..)
-            .map(Content::FunctionApprovalResponse)
-            .collect();
-        let mut out = Vec::with_capacity(messages.len() + 1);
-        out.push(Message::with_contents(Role::user(), approvals));
+        let mut out = Vec::with_capacity(messages.len() + state.held_messages.len() + 1);
+        if !state.collected_approval_responses.is_empty() {
+            let approvals: Vec<Content> = state
+                .collected_approval_responses
+                .drain(..)
+                .map(Content::FunctionApprovalResponse)
+                .collect();
+            out.push(Message::with_contents(Role::user(), approvals));
+        }
+        out.append(&mut state.held_messages);
         out.extend(messages);
         out
     }
@@ -555,6 +573,7 @@ impl ToolApprovalAgent {
         self.drain_queue(&mut state).await;
         if !state.queued_approval_requests.is_empty() {
             let next = state.queued_approval_requests.remove(0);
+            state.held_messages.extend(messages);
             self.save_state(session, &state)?;
             return Ok(Self::queued_response(next));
         }
@@ -564,6 +583,7 @@ impl ToolApprovalAgent {
         let mut usage: Option<UsageDetails> = None;
         loop {
             let collected = state.collected_approval_responses.clone();
+            let held = state.held_messages.clone();
             messages = Self::inject_collected(messages, &mut state);
             self.save_state(session, &state)?;
 
@@ -576,6 +596,7 @@ impl ToolApprovalAgent {
                 Err(error) => {
                     // Keep the batch so a retry can still send it.
                     state.collected_approval_responses = collected;
+                    state.held_messages = held;
                     self.save_state(session, &state)?;
                     return Err(error);
                 }
@@ -627,6 +648,7 @@ impl ToolApprovalAgent {
         self.drain_queue(&mut state).await;
         if !state.queued_approval_requests.is_empty() {
             let next = state.queued_approval_requests.remove(0);
+            state.held_messages.extend(messages);
             self.save_state(&session, &state)?;
             sink.send(AgentResponseUpdate {
                 contents: vec![Content::FunctionApprovalRequest(next)],
@@ -639,6 +661,7 @@ impl ToolApprovalAgent {
         let mut iteration = 0usize;
         loop {
             let collected = state.collected_approval_responses.clone();
+            let held = state.held_messages.clone();
             messages = Self::inject_collected(messages, &mut state);
             self.save_state(&session, &state)?;
             // On reaching the cap this pass streams through as-is.
@@ -648,6 +671,7 @@ impl ToolApprovalAgent {
             // Keep the batch so a retry can still send it.
             let restore = |state: &mut ToolApprovalState, session: &AgentSession| {
                 state.collected_approval_responses = collected.clone();
+                state.held_messages = held.clone();
                 self.save_state(session, state)
             };
             let mut inner = match self

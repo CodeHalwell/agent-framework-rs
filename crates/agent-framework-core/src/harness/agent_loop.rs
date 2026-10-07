@@ -494,7 +494,11 @@ impl LoopAgent {
         };
         run.finish(session, &messages, &last).await?;
         if self.config.return_final_only {
-            return Ok(last);
+            // The final pass's messages, but every pass's token usage.
+            return Ok(AgentResponse {
+                usage_details: usage,
+                ..last
+            });
         }
         Ok(AgentResponse {
             messages: transcript,
