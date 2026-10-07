@@ -71,8 +71,8 @@
         "methods": {
           "AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
             "rust": [],
-            "status": "intentional",
-            "note": "SCOPE.md 'Expressed differently: Foundry server-hosted agents' makes binding to a hosted agent endpoint an extension point; FoundryAgent is client-side only."
+            "status": "unmapped",
+            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
           },
           "AsAIAgent(AIProjectClient, string, string, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
@@ -3732,8 +3732,8 @@
         "constructors": {
           "FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
             "rust": [],
-            "status": "intentional",
-            "note": "SCOPE.md 'Expressed differently: Foundry server-hosted agents' makes binding to a hosted agent endpoint an extension point; FoundryAgent is client-side only."
+            "status": "unmapped",
+            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
           },
           "FoundryAgent(Uri, AuthenticationTokenProvider, string, string, AIProjectClientOptions?, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
