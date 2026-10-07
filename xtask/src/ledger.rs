@@ -105,7 +105,7 @@ fn load(root: &Path, errors: &mut Vec<String>) -> Result<Inputs, String> {
     let go_tree = read_json(root, GO_MAPPING)?;
     let inventory = read_json(root, INVENTORY)?;
     let rust = flatten(&ledger, "rust", errors);
-    let go = flatten(&go_tree, "go_symbols", &mut Vec::new());
+    let go = flatten(&go_tree, "go_symbols", errors);
     Ok(Inputs {
         ledger,
         rust,
@@ -373,9 +373,9 @@ fn gap_rows(inputs: &Inputs) -> Vec<(Key, String, String, String)> {
             Some(l) => (l.status.as_str(), l.note.as_str()),
             None => ("unreviewed", ""),
         };
-        let rust_lacks = matches!(rust, "unmapped" | "partial");
-        let go_has = matches!(go, "mapped" | "adapted");
-        if rust_lacks || (rust == "unreviewed" && go_has) {
+        // Every unreviewed declaration is listed, whatever Go's status: a
+        // refresh that adds one must surface it for assessment.
+        if matches!(rust, "unmapped" | "partial" | "unreviewed") {
             rows.push((
                 key.clone(),
                 rust.to_string(),
@@ -475,7 +475,7 @@ fn render_report(inputs: &Inputs) -> String {
     let _ = writeln!(out, "\n## Not yet reviewed\n");
     let _ = writeln!(
         out,
-        "{} declarations Go maps that the Rust ledger has not assessed yet ({} unreviewed in all), by type:\n",
+        "{} declarations in Go's catalog that the Rust ledger has not assessed yet ({} unreviewed in all), by type:\n",
         unreviewed.len(),
         total_unreviewed
     );

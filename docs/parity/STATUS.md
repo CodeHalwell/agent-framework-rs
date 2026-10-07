@@ -618,5 +618,5 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 ## Not yet reviewed
 
-0 declarations Go maps that the Rust ledger has not assessed yet (0 unreviewed in all), by type:
+0 declarations in Go's catalog that the Rust ledger has not assessed yet (0 unreviewed in all), by type:
 
