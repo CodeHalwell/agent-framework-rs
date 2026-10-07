@@ -10,11 +10,11 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 |---|---|---|---|---|
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
-| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 1 | 0 | 0 |
+| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 52 / 86 / 30 / 272 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 8 / 1 | 0 | 0 |
+| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.GitHub.Copilot` | 1 / 5 / 0 / 0 / 0 | 0 / 1 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
@@ -34,6 +34,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 | Declaration | Rust | Go | Note |
 |---|---|---|---|
+| `Azure.AI.Projects::AIProjectClientExtensions methods::AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService<TService>(object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent properties::CurrentRunContext` | partial | adapted | Middleware gets AgentContext and tools get the session, but there is no ambient run context carrying agent, session and options. |
@@ -406,6 +407,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Compaction::ToolResultCompactionStrategy properties::ToolCallFormatter` | partial | mapped | The replacement text is the fixed OMITTED_TOOL_RESULT constant; a custom formatter cannot be supplied. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy constructors::TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | Truncation::new takes a max message count; there are no trigger/target triggers. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy properties::MinimumPreservedGroups` | partial | adapted | max_messages caps retained messages rather than guaranteeing a minimum number of preserved groups. |
+| `Microsoft.Agents.AI.Foundry::FoundryAgent constructors::FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)` | unmapped | mapped | FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)` | unmapped | mapped | No operation to delete stored memories for a scope. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::EnableSensitiveTelemetryData` | unmapped | unmapped | FoundryMemoryProvider emits no sensitive-data telemetry toggle. |

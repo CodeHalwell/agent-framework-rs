@@ -37,8 +37,6 @@ on one of them still needs checking against the Rust form.
 | `run(stream=...)` / `get_response(stream=...)` | Method pairs: `run` / `run_stream`, `get_response` / `get_streaming_response`. One function returning either a value or a stream on a runtime flag is not idiomatic Rust. |
 | Ollama's native API | `agent-framework-ollama` speaks Ollama's OpenAI-compatible endpoint and reuses `agent_framework_openai::convert`, so fixes to native fields (`images`, `keep_alive`, native tool-result shapes) do not apply. |
 | Anthropic `response_format` handling | Folded into the system prompt (the Messages API has no native field), so upstream's schema-mutation fixes cannot arise. |
-| Foundry server-hosted agents | `FoundryAgent` realises a Prompt Agent client-side. Binding to an agent hosted on the Foundry control plane is a documented extension point. |
-| Cloud-transport streaming for Anthropic on Bedrock and Vertex | A single-update adaptation. The AWS event-stream and `:streamRawPredict` framings are marked extension points. |
 
 ## Not yet ported
 
@@ -54,6 +52,12 @@ from the roadmap, not from this file.
 - **Multimodal embedding inputs** (`EmbeddingClient::get_embeddings` takes
   `Vec<String>`).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
+- **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
+  client-side and cannot yet bind to an agent hosted on the Foundry control
+  plane (`AIProjectClient.AsAIAgent`, `FoundryAgent(Uri, ...)`).
+- **Cloud-transport streaming for Anthropic on Bedrock and Vertex**: the
+  streaming methods buffer one non-streaming request into a single update.
+  The AWS event-stream and `:streamRawPredict` framings are not implemented.
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
