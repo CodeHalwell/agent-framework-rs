@@ -1,13 +1,13 @@
 # Verification pass + the Foundry memory provider (same upstream baseline, `dc8e226`)
 
-A follow-up over the pass above: re-check its six changes against primary
+A follow-up over the [post-`6606bef` pass](2026-09-28-dc8e226.md): re-check its six changes against primary
 sources, then spend the rest on the standing-gap list. The re-check held —
 and it turned up that the list's own top entry had been closed off for the
 wrong reason.
 
 ### What the re-check confirmed
 
-The riskiest call in the pass above was encoding an empty hosted-MCP
+The riskiest call in that pass was encoding an empty hosted-MCP
 allowlist as `tool_configuration: {"enabled": false}` rather than upstream's
 literal `allowed_tools: []`. Anthropic's MCP connector documentation settles
 both halves of it. Its migration table off the deprecated beta reads

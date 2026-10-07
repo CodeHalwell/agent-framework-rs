@@ -1,6 +1,6 @@
 # Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`)
 
-The round below recorded "neither hosting surface serializes tool calls" as
+The [PR #28 review round](2026-09-30-dc8e226-pr28-review.md) recorded "neither hosting surface serializes tool calls" as
 a capability gap and declined to close it inside a review cycle. The
 repository owner overruled that: close it. This is that work.
 
