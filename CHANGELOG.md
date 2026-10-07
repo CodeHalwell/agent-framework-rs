@@ -7,6 +7,39 @@ may break APIs).
 
 ## [Unreleased]
 
+### Experimental agent harness
+
+A new `experimental-harness` feature on `agent-framework-core` (forwarded by
+the umbrella crate and included in `experimental`) adds the `harness`
+module, a port of upstream's experimental harness:
+
+- **Agent loop**: `LoopAgent` wraps an agent and re-invokes it until a
+  condition says stop, with `max_iterations`, `next_message`,
+  `record_feedback`, `inject_progress`, `fresh_context` and
+  `return_final_only`. Conditions are closures or `LoopCallback`s. `Judge`
+  asks a chat client whether the criteria are met, and `todos_remaining`
+  (optionally limited to some agent modes) keeps going while todos are open.
+  Upstream's `AgentLoopMiddleware` becomes a wrapper agent here, as in .NET,
+  because Rust agent middleware cannot re-run its terminal.
+- **Todo**: `TodoProvider` (context provider plus the `todos_*` tools) with a
+  pluggable `TodoStore`; `TodoSessionStore` keeps the list in session state.
+- **Tool approval**: `ToolApprovalAgent` adds standing "always approve"
+  rules (per tool, or per tool and arguments), auto-approval rules, and
+  presents several pending approvals one at a time. Auto-approval re-runs
+  are capped per run (`with_max_auto_approval_iterations`, default 40, as
+  .NET's `DefaultMaxAutoApprovalIterations`).
+- **Agent mode**: `AgentModeProvider` with `mode_set` / `mode_get` tools,
+  per-mode instructions and a one-time mode-change notification.
+
+Not ported: file access, file memory, memory, background agents (so the
+loop has no `background_tasks_running` condition), `TodoFileStore` and
+`create_harness_agent`.
+
+`SessionContext` gains a public `session: Option<AgentSession>` field, set by
+`Agent` runs, so context providers can read and write per-session state, as
+upstream's `before_run(session=...)` allows. Code that builds a
+`SessionContext` with a struct literal must set it.
+
 ### Local shell tool (new crate `agent-framework-tools`)
 
 Ports upstream's `agent_framework_tools.shell` (.NET
@@ -89,6 +122,7 @@ CI. To keep using a gated API, enable its feature:
 | `experimental-file-history` | `FileHistoryProvider` | core |
 | `experimental-progressive-tools` | `LiveToolList`, and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}` | core |
 | `experimental-declarative-agents` | the whole `agent-framework-declarative` crate | declarative |
+| `experimental-harness` | `agent_framework_core::harness` (`LoopAgent`, `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`) | core |
 
 The umbrella crate re-exposes each feature under the same name and adds
 `experimental` to turn them all on. **Its `declarative` feature is now

@@ -24,6 +24,12 @@ pub struct SessionContext {
     pub session_id: Option<String>,
     /// Service-managed session/conversation id, when applicable.
     pub service_session_id: Option<String>,
+    /// The session the run belongs to, when the caller of `before_run` has
+    /// one (an [`Agent`](crate::agent::Agent) run always does). Clones share
+    /// the session's state bag, so a provider can read and persist
+    /// per-session state through it. Mirrors the `session` argument of
+    /// upstream's `before_run`.
+    pub session: Option<crate::session::AgentSession>,
     /// The run's input messages (read-only for providers).
     pub input_messages: Vec<Message>,
     /// Extra system instructions to inject (providers append via add_instructions).
@@ -114,6 +120,7 @@ mod tests {
         assert_eq!(ctx.input_messages[0].text(), "hi");
         assert!(ctx.session_id.is_none());
         assert!(ctx.service_session_id.is_none());
+        assert!(ctx.session.is_none());
         assert!(ctx.instructions.is_none());
         assert!(ctx.messages.is_empty());
         assert!(ctx.tools.is_empty());

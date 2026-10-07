@@ -487,95 +487,123 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
       "AIJudgeLoopEvaluator": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::Judge"
+          ],
+          "status": "adapted",
+          "note": "Judge is a LoopCallback condition used through LoopAgent::with_judge, which also relays its reasoning as the next message."
         },
         "constructors": {
           "AIJudgeLoopEvaluator(IChatClient, AIJudgeLoopEvaluatorOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AIJudgeLoopEvaluator: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::Judge::new"
+            ],
+            "status": "adapted",
+            "note": "Judge::new(client) with options as builder methods."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::Judge::call",
+              "agent_framework_core::harness::agent_loop::Judge::verdict"
+            ],
+            "status": "adapted",
+            "note": "The LoopCallback impl returns a LoopDecision; verdict returns the parsed JudgeVerdict."
           }
         },
         "constants": {
           "CriteriaPlaceholder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "CriteriaPlaceholder: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::CRITERIA_PLACEHOLDER"
+            ],
+            "status": "adapted",
+            "note": "The placeholder is spelled {{criteria}} rather than {criteria}."
           },
           "DefaultFeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultFeedbackMessageTemplate: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::judge_feedback_message"
+            ],
+            "status": "adapted",
+            "note": "judge_feedback_message builds the default feedback message with fixed text rather than from a template."
           },
           "DefaultInstructions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultInstructions: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::DEFAULT_JUDGE_INSTRUCTIONS"
+            ],
+            "status": "mapped",
+            "note": "The default judge instructions."
           },
           "DoneVerdictMarker": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DoneVerdictMarker: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::JUDGE_VERDICT_DONE"
+            ],
+            "status": "mapped",
+            "note": "The done verdict marker."
           },
           "GapAnalysisPlaceholder": {
             "rust": [],
             "status": "unmapped",
-            "note": "GapAnalysisPlaceholder: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Judge feedback is not templated; judge_feedback_message inserts the judge's reasoning directly."
           },
           "MoreVerdictMarker": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "MoreVerdictMarker: no LLM-judge loop evaluator; the harness loop (LoopAgent/LoopEvaluator) is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::JUDGE_VERDICT_MORE"
+            ],
+            "status": "mapped",
+            "note": "The more-work verdict marker."
           }
         }
       },
       "AIJudgeLoopEvaluatorOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No LLM-judge evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::Judge"
+          ],
+          "status": "adapted",
+          "note": "Options become builder methods on Judge."
         },
         "constructors": {
           "AIJudgeLoopEvaluatorOptions()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AIJudgeLoopEvaluatorOptions: no LLM-judge evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::Judge::new"
+            ],
+            "status": "adapted",
+            "note": "Judge::new starts from the defaults."
           }
         },
         "properties": {
           "Criteria": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Criteria: no LLM-judge evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::Judge::criteria"
+            ],
+            "status": "mapped",
+            "note": "Adds criteria rendered into the instructions."
           },
           "FeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no LLM-judge evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::next_message"
+            ],
+            "status": "adapted",
+            "note": "A custom next-message callback replaces judge_feedback_message instead of a template string."
           },
           "Instructions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Instructions: no LLM-judge evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::Judge::instructions"
+            ],
+            "status": "mapped",
+            "note": "Replaces the judge instructions."
           }
         }
       },
@@ -704,53 +732,53 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "CreateDirectoryAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "CreateDirectoryAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "DeleteAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "DeleteAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "DeleteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "FileExistsAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileExistsAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileExistsAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ListChildrenAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ListChildrenAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "ListChildrenAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ReadAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ReadAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "ReadAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ScanContent(string, string, Regex)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ScanContent: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "ScanContent: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "SearchAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "SearchAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "SplitLines(string)": {
             "rust": [],
             "status": "unmapped",
-            "note": "SplitLines: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "SplitLines: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "WriteAsync(string, string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "WriteAsync: no agent file-store abstraction (harness file memory); SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "WriteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -844,85 +872,117 @@
       },
       "AgentModeProvider": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No agent-mode context provider (mode get/set tools per session); SCOPE.md lists the harness under 'Not yet ported'."
+          "rust": [
+            "agent_framework_core::harness::mode::AgentModeProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider tracking the session's operating mode."
         },
         "constructors": {
           "AgentModeProvider(AgentModeProviderOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AgentModeProvider: no agent-mode context provider (mode get/set tools per session); SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProvider::new",
+              "agent_framework_core::harness::mode::AgentModeProvider::builder"
+            ],
+            "status": "adapted",
+            "note": "new() for the plan/execute defaults, builder() for custom configuration."
           }
         },
         "methods": {
           "GetModeAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "GetModeAsync: no agent-mode context provider (mode get/set tools per session); SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProvider::mode",
+              "agent_framework_core::harness::mode::get_agent_mode"
+            ],
+            "status": "mapped",
+            "note": "mode(session) is synchronous; get_agent_mode uses the built-in configuration."
           },
           "SetModeAsync(AgentSession, string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SetModeAsync: no agent-mode context provider (mode get/set tools per session); SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProvider::set_mode",
+              "agent_framework_core::harness::mode::set_agent_mode"
+            ],
+            "status": "mapped",
+            "note": "set_mode(session, mode) is synchronous and notifies the agent on its next run."
           },
           "SetModeAsync(AgentSession, string, bool, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SetModeAsync: no agent-mode context provider (mode get/set tools per session); SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProvider::set_mode",
+              "agent_framework_core::harness::mode::AgentModeProvider::set_mode_without_notification"
+            ],
+            "status": "adapted",
+            "note": "The notify flag becomes a choice between set_mode and set_mode_without_notification."
           }
         }
       },
       "AgentModeProviderOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::mode::AgentModeProviderBuilder"
+          ],
+          "status": "adapted",
+          "note": "Options become methods on AgentModeProviderBuilder."
         },
         "properties": {
           "DefaultMode": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultMode: no agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::default_mode"
+            ],
+            "status": "mapped",
+            "note": "The initial mode."
           },
           "DisableModeGetTool": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DisableModeGetTool: no agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::expose_mode_get"
+            ],
+            "status": "adapted",
+            "note": "expose_mode_get(false) is the inverted flag."
           },
           "DisableModeSetTool": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DisableModeSetTool: no agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::expose_mode_set"
+            ],
+            "status": "adapted",
+            "note": "expose_mode_set(false) is the inverted flag."
           },
           "Instructions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Instructions: no agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::instructions"
+            ],
+            "status": "mapped",
+            "note": "Replaces the mode instructions template."
           },
           "Modes": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Modes: no agent-mode provider options; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::mode_instructions"
+            ],
+            "status": "adapted",
+            "note": "Modes are given as (name, instructions) pairs rather than AgentMode objects."
           }
         }
       },
       "AgentModeProviderOptions.AgentMode": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No agent-mode definition type; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::mode::AgentModeProviderBuilder::mode_instructions"
+          ],
+          "status": "adapted",
+          "note": "No mode type; a mode is a (name, instructions) pair passed to mode_instructions."
         },
         "properties": {
           "Instructions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Instructions: no agent-mode definition type; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::mode_instructions"
+            ],
+            "status": "adapted",
+            "note": "The second element of a mode_instructions pair."
           },
           "Name": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Name: no agent-mode definition type; agent mode is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::mode::AgentModeProviderBuilder::mode_instructions"
+            ],
+            "status": "adapted",
+            "note": "The first element of a mode_instructions pair."
           }
         }
       },
@@ -1696,25 +1756,32 @@
       },
       "AlwaysApproveToolApprovalResponseContent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No always-approve wrapper around FunctionApprovalResponseContent; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::tool_approval::ToolApprovalAgent::always_approve_tool_response",
+            "agent_framework_core::harness::tool_approval::ToolApprovalAgent::always_approve_tool_with_arguments_response"
+          ],
+          "status": "adapted",
+          "note": "No wrapper content; the always-approve intent is recorded in the session and an ordinary approval is returned."
         },
         "properties": {
           "AlwaysApproveTool": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AlwaysApproveTool: no always-approve wrapper around FunctionApprovalResponseContent; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalScope::Tool"
+            ],
+            "status": "adapted",
+            "note": "Recorded as a pending rule with scope Tool rather than a flag on the response."
           },
           "AlwaysApproveToolWithArguments": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AlwaysApproveToolWithArguments: no always-approve wrapper around FunctionApprovalResponseContent; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalScope::ToolWithArguments"
+            ],
+            "status": "adapted",
+            "note": "Recorded as a pending rule with scope ToolWithArguments rather than a flag on the response."
           },
           "InnerResponse": {
             "rust": [],
             "status": "unmapped",
-            "note": "InnerResponse: no always-approve wrapper around FunctionApprovalResponseContent; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "There is no wrapper, so the returned FunctionApprovalResponseContent is the response itself."
           }
         }
       },
@@ -1722,37 +1789,37 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "note": "No background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluator(BackgroundTaskCompletionLoopEvaluatorOptions)": {
             "rust": [],
             "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluator: no background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "BackgroundTaskCompletionLoopEvaluator: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "EvaluateAsync: no background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "EvaluateAsync: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "constants": {
           "DefaultFeedbackMessageTemplate": {
             "rust": [],
             "status": "unmapped",
-            "note": "DefaultFeedbackMessageTemplate: no background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "DefaultFeedbackMessageTemplate: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "IncompleteTaskCountPlaceholder": {
             "rust": [],
             "status": "unmapped",
-            "note": "IncompleteTaskCountPlaceholder: no background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "IncompleteTaskCountPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "IncompleteTasksPlaceholder": {
             "rust": [],
             "status": "unmapped",
-            "note": "IncompleteTasksPlaceholder: no background-task completion loop evaluator; harness loop and background agents are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "IncompleteTasksPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -1760,20 +1827,20 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No options type for the background-task loop evaluator; SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluatorOptions()": {
             "rust": [],
             "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluatorOptions: no options type for the background-task loop evaluator; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "BackgroundTaskCompletionLoopEvaluatorOptions: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "properties": {
           "FeedbackMessageTemplate": {
             "rust": [],
             "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no options type for the background-task loop evaluator; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FeedbackMessageTemplate: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2118,11 +2185,12 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
@@ -2149,20 +2217,20 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No completion-marker loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "note": "No built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same."
         },
         "constructors": {
           "CompletionMarkerLoopEvaluator(string, CompletionMarkerLoopEvaluatorOptions)": {
             "rust": [],
             "status": "unmapped",
-            "note": "CompletionMarkerLoopEvaluator: no completion-marker loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "CompletionMarkerLoopEvaluator: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "EvaluateAsync: no completion-marker loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "EvaluateAsync: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same."
           }
         }
       },
@@ -2170,13 +2238,13 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No completion-marker evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "note": "No completion-marker condition options; a LoopAgent::builder closure covers the pattern."
         },
         "properties": {
           "FeedbackMessageTemplate": {
             "rust": [],
             "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no completion-marker evaluator options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "FeedbackMessageTemplate: no completion-marker condition options; a LoopAgent::builder closure covers the pattern."
           }
         }
       },
@@ -2200,22 +2268,29 @@
       },
       "DelegateLoopEvaluator": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No closure-based loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopCallback",
+            "agent_framework_core::harness::agent_loop::AsyncLoopCallback"
+          ],
+          "status": "adapted",
+          "note": "Closures implement LoopCallback directly; async_loop_callback adapts an async closure."
         },
         "constructors": {
           "DelegateLoopEvaluator(Func<LoopContext, CancellationToken, ValueTask<LoopEvaluation>>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DelegateLoopEvaluator: no closure-based loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::async_loop_callback"
+            ],
+            "status": "adapted",
+            "note": "async_loop_callback wraps an async closure; a sync closure needs no wrapper."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no closure-based loop evaluator; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::AsyncLoopCallback::call"
+            ],
+            "status": "adapted",
+            "note": "Through the LoopCallback trait."
           }
         }
       },
@@ -2247,30 +2322,30 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No line-edit type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "FileLineEdit()": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileLineEdit: no line-edit type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileLineEdit: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "properties": {
           "ExpectedLine": {
             "rust": [],
             "status": "unmapped",
-            "note": "ExpectedLine: no line-edit type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "ExpectedLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "LineNumber": {
             "rust": [],
             "status": "unmapped",
-            "note": "LineNumber: no line-edit type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "LineNumber: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "NewLine": {
             "rust": [],
             "status": "unmapped",
-            "note": "NewLine: no line-edit type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "NewLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2278,25 +2353,25 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No file-search match type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "FileSearchMatch()": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileSearchMatch: no file-search match type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileSearchMatch: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "properties": {
           "Line": {
             "rust": [],
             "status": "unmapped",
-            "note": "Line: no file-search match type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "Line: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "LineNumber": {
             "rust": [],
             "status": "unmapped",
-            "note": "LineNumber: no file-search match type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "LineNumber: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2304,30 +2379,30 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No file-search result type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "FileSearchResult()": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileSearchResult: no file-search result type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileSearchResult: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "properties": {
           "FileName": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileName: no file-search result type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileName: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "MatchingLines": {
             "rust": [],
             "status": "unmapped",
-            "note": "MatchingLines: no file-search result type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "MatchingLines: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "Snippet": {
             "rust": [],
             "status": "unmapped",
-            "note": "Snippet: no file-search result type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "Snippet: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2335,42 +2410,42 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+          "note": "No file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "FileStoreEntry()": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileStoreEntry: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "FileStoreEntry(string, string)": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileStoreEntry: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "properties": {
           "Name": {
             "rust": [],
             "status": "unmapped",
-            "note": "Name: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "Name: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "Type": {
             "rust": [],
             "status": "unmapped",
-            "note": "Type: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "Type: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "constants": {
           "Directory": {
             "rust": [],
             "status": "unmapped",
-            "note": "Directory: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "Directory: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "File": {
             "rust": [],
             "status": "unmapped",
-            "note": "File: no file-store entry type for harness file memory; SCOPE.md lists the harness under 'Not yet ported'."
+            "note": "File: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2378,50 +2453,50 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "note": "No filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "FileSystemAgentFileStore(string)": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileSystemAgentFileStore: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "FileSystemAgentFileStore: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "CreateDirectoryAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "CreateDirectoryAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "DeleteAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "DeleteAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "DeleteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "FileExistsAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileExistsAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "FileExistsAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ListChildrenAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ListChildrenAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "ListChildrenAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ReadAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ReadAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "ReadAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "SearchAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "SearchAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "WriteAsync(string, string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "WriteAsync: no filesystem-backed agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "WriteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2448,50 +2523,50 @@
         "mapping": {
           "rust": [],
           "status": "unmapped",
-          "note": "No in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "note": "No in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
         },
         "constructors": {
           "InMemoryAgentFileStore()": {
             "rust": [],
             "status": "unmapped",
-            "note": "InMemoryAgentFileStore: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "InMemoryAgentFileStore: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "CreateDirectoryAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "CreateDirectoryAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "DeleteAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "DeleteAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "DeleteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "FileExistsAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "FileExistsAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "FileExistsAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ListChildrenAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ListChildrenAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "ListChildrenAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "ReadAsync(string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ReadAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "ReadAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "SearchAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "SearchAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           },
           "WriteAsync(string, string, CancellationToken)": {
             "rust": [],
             "status": "unmapped",
-            "note": "WriteAsync: no in-memory agent file store; harness file memory is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "WriteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
           }
         }
       },
@@ -2635,158 +2710,202 @@
       },
       "LoopAgent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No LoopAgent re-invoking an inner agent until evaluators stop; FunctionInvocationConfig::max_iterations only bounds tool-call rounds (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopAgent"
+          ],
+          "status": "mapped",
+          "note": "A wrapper agent re-running the inner agent; its stop condition is a LoopCallback rather than LoopEvaluator objects."
         },
         "constructors": {
           "LoopAgent(AIAgent, IEnumerable<LoopEvaluator>, LoopAgentOptions, ILoggerFactory)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "LoopAgent: no LoopAgent re-invoking an inner agent until evaluators stop; FunctionInvocationConfig::max_iterations only bounds tool-call rounds (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgent::builder"
+            ],
+            "status": "adapted",
+            "note": "builder takes a single condition callback; several evaluators are combined inside one closure."
           },
           "LoopAgent(AIAgent, LoopEvaluator, LoopAgentOptions, ILoggerFactory)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "LoopAgent: no LoopAgent re-invoking an inner agent until evaluators stop; FunctionInvocationConfig::max_iterations only bounds tool-call rounds (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgent::builder",
+              "agent_framework_core::harness::agent_loop::LoopAgent::with_judge"
+            ],
+            "status": "adapted",
+            "note": "builder takes the inner agent and one condition callback (with_judge for a judge), and options are builder methods."
           }
         }
       },
       "LoopAgentOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopAgentBuilder"
+          ],
+          "status": "adapted",
+          "note": "Options become methods on LoopAgentBuilder."
         },
         "properties": {
           "ExcludeOnBehalfOfMessages": {
             "rust": [],
             "status": "unmapped",
-            "note": "ExcludeOnBehalfOfMessages: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Injected loop messages are always surfaced in the aggregated response and stream; there is no option to omit them."
           },
           "FreshContextPerIteration": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FreshContextPerIteration: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::fresh_context"
+            ],
+            "status": "mapped",
+            "note": "fresh_context(bool) restores the session snapshot before each further pass."
           },
           "MaxIterations": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "MaxIterations: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::max_iterations"
+            ],
+            "status": "mapped",
+            "note": "max_iterations(Option<usize>); None removes the cap."
           },
           "NonStreamingReturnsLastResponseOnly": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "NonStreamingReturnsLastResponseOnly: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::return_final_only"
+            ],
+            "status": "mapped",
+            "note": "return_final_only(bool) returns only the last pass of a non-streaming run."
           },
           "OnBehalfOfAuthorName": {
             "rust": [],
             "status": "unmapped",
-            "note": "OnBehalfOfAuthorName: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Messages the loop injects carry no configurable author name."
           },
           "SessionCreatedCallback": {
             "rust": [],
             "status": "unmapped",
-            "note": "SessionCreatedCallback: no loop-agent options; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "No callback when the loop creates a session; fresh-context passes restore a snapshot into the same session instead of creating new ones."
           }
         }
       },
       "LoopContext": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopContext"
+          ],
+          "status": "mapped",
+          "note": "A plain struct the loop passes to every callback."
         },
         "properties": {
           "AdditionalProperties": {
             "rust": [],
             "status": "unmapped",
-            "note": "AdditionalProperties: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "No property bag on the loop context; callbacks can keep state in the session or their own captures."
           },
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "Agent: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "The context carries no agent; helpers that need a provider take it explicitly."
           },
           "Feedback": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Feedback: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopContext::progress"
+            ],
+            "status": "adapted",
+            "note": "progress holds the progress log of earlier passes; this pass's condition feedback is the separate feedback field."
           },
           "InitialMessages": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "InitialMessages: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopContext::original_messages"
+            ],
+            "status": "mapped",
+            "note": "The input of the first pass."
           },
           "Iteration": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Iteration: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopContext::iteration"
+            ],
+            "status": "mapped",
+            "note": "The number of completed passes."
           },
           "LastResponse": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "LastResponse: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopContext::last_result"
+            ],
+            "status": "mapped",
+            "note": "The response of the pass that just completed."
           },
           "RunOptions": {
             "rust": [],
             "status": "unmapped",
-            "note": "RunOptions: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "The run options are not exposed to loop callbacks."
           },
           "Session": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Session: no loop context passed to evaluators; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopContext::session"
+            ],
+            "status": "mapped",
+            "note": "The session the loop runs against."
           }
         }
       },
       "LoopEvaluation": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopDecision"
+          ],
+          "status": "adapted",
+          "note": "LoopDecision carries continue/stop and optional feedback; replacement messages come from the next-message callback."
         },
         "properties": {
           "Feedback": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Feedback: no loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopDecision::feedback"
+            ],
+            "status": "mapped",
+            "note": "Feedback surfaced to later callbacks as LoopContext::feedback."
           },
           "ShouldReinvoke": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ShouldReinvoke: no loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopDecision::should_continue"
+            ],
+            "status": "mapped",
+            "note": "Whether to run the agent again."
           }
         },
         "methods": {
           "Continue(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Continue: no loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopDecision::run_again",
+              "agent_framework_core::harness::agent_loop::LoopDecision::with_feedback"
+            ],
+            "status": "adapted",
+            "note": "run_again() plus with_feedback(..) when there is feedback."
           },
           "ContinueWithMessages(IEnumerable<ChatMessage>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ContinueWithMessages: no loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::next_message"
+            ],
+            "status": "adapted",
+            "note": "The next pass's messages come from a separate next-message callback rather than the decision."
           },
           "Stop()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Stop: no loop evaluation result (continue/stop/feedback); the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopDecision::stop"
+            ],
+            "status": "mapped",
+            "note": "Stop looping."
           }
         }
       },
       "LoopEvaluator": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No loop evaluator trait; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::LoopCallback"
+          ],
+          "status": "adapted",
+          "note": "The abstract evaluator becomes the LoopCallback<LoopDecision> trait, also implemented by closures."
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no loop evaluator trait; the harness loop is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopCallback::call"
+            ],
+            "status": "adapted",
+            "note": "call(&LoopContext) returns Result<LoopDecision>; cancellation is by dropping the future."
           }
         }
       },
@@ -2825,11 +2944,12 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
@@ -2889,7 +3009,7 @@
             "agent_framework_core::session::SessionState"
           ],
           "status": "partial",
-          "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+          "note": "before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session)."
         },
         "methods": {
           "GetOrInitializeState(AgentSession)": {
@@ -2897,205 +3017,256 @@
               "agent_framework_core::session::SessionState::get",
               "agent_framework_core::session::SessionState::insert"
             ],
-            "status": "partial",
-            "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+            "status": "adapted",
+            "note": "A provider reads and writes its JSON state through SessionContext::session in before_run; there is no typed wrapper."
           },
           "SaveState(AgentSession, TState)": {
             "rust": [
               "agent_framework_core::session::SessionState::insert"
             ],
-            "status": "partial",
-            "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+            "status": "adapted",
+            "note": "A provider reads and writes its JSON state through SessionContext::session in before_run; there is no typed wrapper."
           }
         }
       },
       "TodoCompletionLoopEvaluator": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No todo-completion loop evaluator; harness loop and todo are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::TodosRemaining",
+            "agent_framework_core::harness::agent_loop::todos_remaining"
+          ],
+          "status": "adapted",
+          "note": "todos_remaining(&provider) is a loop condition, paired with todos_remaining_message for the feedback."
         },
         "constructors": {
           "TodoCompletionLoopEvaluator(TodoCompletionLoopEvaluatorOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "TodoCompletionLoopEvaluator: no todo-completion loop evaluator; harness loop and todo are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::todos_remaining"
+            ],
+            "status": "adapted",
+            "note": "todos_remaining takes the TodoProvider explicitly because Rust agents do not expose their providers."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no todo-completion loop evaluator; harness loop and todo are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::TodosRemaining::call"
+            ],
+            "status": "adapted",
+            "note": "Through the LoopCallback trait."
           }
         },
         "constants": {
           "DefaultFeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultFeedbackMessageTemplate: no todo-completion loop evaluator; harness loop and todo are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::todos_remaining_message"
+            ],
+            "status": "adapted",
+            "note": "todos_remaining_message builds the open-todo reminder with fixed text rather than from a template."
           },
           "RemainingTodosPlaceholder": {
             "rust": [],
             "status": "unmapped",
-            "note": "RemainingTodosPlaceholder: no todo-completion loop evaluator; harness loop and todo are not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "The todo reminder is not templated; todos_remaining_message lists the open items directly."
           }
         }
       },
       "TodoCompletionLoopEvaluatorOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No todo-completion evaluator options; SCOPE.md lists the harness under 'Not yet ported'."
+          "rust": [
+            "agent_framework_core::harness::agent_loop::TodosRemaining"
+          ],
+          "status": "adapted",
+          "note": "Options become methods on TodosRemaining and the loop builder."
         },
         "constructors": {
           "TodoCompletionLoopEvaluatorOptions()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "TodoCompletionLoopEvaluatorOptions: no todo-completion evaluator options; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::todos_remaining"
+            ],
+            "status": "adapted",
+            "note": "todos_remaining starts from the defaults."
           }
         },
         "properties": {
           "FeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no todo-completion evaluator options; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::LoopAgentBuilder::next_message"
+            ],
+            "status": "adapted",
+            "note": "A custom next-message callback replaces todos_remaining_message instead of a template string."
           },
           "Modes": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Modes: no todo-completion evaluator options; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::agent_loop::TodosRemaining::looping_modes"
+            ],
+            "status": "adapted",
+            "note": "looping_modes takes the AgentModeProvider explicitly along with the modes."
           }
         }
       },
       "TodoItem": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No todo item type; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::todo::TodoItem"
+          ],
+          "status": "mapped",
+          "note": "A serde struct stored in the session state bag."
         },
         "properties": {
           "Description": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Description: no todo item type; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoItem::description"
+            ],
+            "status": "mapped",
+            "note": "An optional description."
           },
           "Id": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Id: no todo item type; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoItem::id"
+            ],
+            "status": "mapped",
+            "note": "A u64 unique within the session's list."
           },
           "IsComplete": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "IsComplete: no todo item type; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoItem::is_complete"
+            ],
+            "status": "mapped",
+            "note": "Whether the item is done."
           },
           "Title": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Title: no todo item type; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoItem::title"
+            ],
+            "status": "mapped",
+            "note": "The item title."
           }
         }
       },
       "TodoProvider": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No todo context provider exposing todo tools per session; SCOPE.md lists the harness under 'Not yet ported'."
+          "rust": [
+            "agent_framework_core::harness::todo::TodoProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider contributing the todo tools, instructions and current list."
         },
         "constructors": {
           "TodoProvider(TodoProviderOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "TodoProvider: no todo context provider exposing todo tools per session; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::new"
+            ],
+            "status": "adapted",
+            "note": "new() with with_instructions, with_source_id and with_store builders."
           }
         },
         "methods": {
           "GetAllTodosAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "GetAllTodosAsync: no todo context provider exposing todo tools per session; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::items"
+            ],
+            "status": "mapped",
+            "note": "All items for the session."
           },
           "GetRemainingTodosAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "GetRemainingTodosAsync: no todo context provider exposing todo tools per session; SCOPE.md lists the harness under 'Not yet ported'."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::remaining"
+            ],
+            "status": "mapped",
+            "note": "Open items for the session."
           }
         }
       },
       "TodoProviderOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No todo provider options; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::todo::TodoProvider"
+          ],
+          "status": "adapted",
+          "note": "Options become builder methods on TodoProvider."
         },
         "properties": {
           "Instructions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Instructions: no todo provider options; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::with_instructions"
+            ],
+            "status": "mapped",
+            "note": "Replaces the todo instructions."
           },
           "SuppressTodoListMessage": {
             "rust": [],
             "status": "unmapped",
-            "note": "SuppressTodoListMessage: no todo provider options; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "The current-list message is always injected; there is no option to suppress it."
           },
           "TodoListMessageBuilder": {
             "rust": [],
             "status": "unmapped",
-            "note": "TodoListMessageBuilder: no todo provider options; the harness todo provider is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "The current-list message has a fixed format; there is no custom builder."
           }
         }
       },
       "ToolApprovalAgent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No auto-approval agent wrapper; Rust only surfaces FunctionApprovalRequestContent to the caller with no rule-based auto-approval (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::tool_approval::ToolApprovalAgent"
+          ],
+          "status": "mapped",
+          "note": "A wrapper agent with standing approvals, auto-approval rules and one-at-a-time prompts."
         },
         "constructors": {
           "ToolApprovalAgent(AIAgent, ToolApprovalAgentOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ToolApprovalAgent: no auto-approval agent wrapper; Rust only surfaces FunctionApprovalRequestContent to the caller with no rule-based auto-approval (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::new"
+            ],
+            "status": "adapted",
+            "note": "new(inner) with with_auto_approval_rule, with_source_id and with_max_auto_approval_iterations builders."
           }
         },
         "properties": {
           "AllToolsAutoApprovalRule": {
             "rust": [],
             "status": "unmapped",
-            "note": "AllToolsAutoApprovalRule: no auto-approval agent wrapper; Rust only surfaces FunctionApprovalRequestContent to the caller with no rule-based auto-approval (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "No predefined approve-everything rule; the closure |_: &FunctionCallContent| true serves."
           }
         },
         "constants": {
           "DefaultMaxAutoApprovalIterations": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultMaxAutoApprovalIterations: no auto-approval agent wrapper; Rust only surfaces FunctionApprovalRequestContent to the caller with no rule-based auto-approval (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS"
+            ],
+            "status": "mapped",
+            "note": "40, as in .NET; a module constant."
           }
         }
       },
       "ToolApprovalAgentOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No auto-approval rule options; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::tool_approval::ToolApprovalAgent"
+          ],
+          "status": "adapted",
+          "note": "Options become builder methods on ToolApprovalAgent."
         },
         "properties": {
           "AutoApprovalRules": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AutoApprovalRules: no auto-approval rule options; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::with_auto_approval_rule"
+            ],
+            "status": "adapted",
+            "note": "Rules are added one at a time."
           },
           "JsonSerializerOptions": {
             "rust": [],
             "status": "unmapped",
-            "note": "JsonSerializerOptions: no auto-approval rule options; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Rule arguments and state are serialized with serde; there are no serializer options."
           },
           "MaxAutoApprovalIterations": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "MaxAutoApprovalIterations: no auto-approval rule options; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::with_max_auto_approval_iterations"
+            ],
+            "status": "adapted",
+            "note": "A builder taking a usize (zero is a configuration error); unset means the default of 40. On reaching the cap the final inner turn is returned as-is, as in .NET."
           }
         }
       },
@@ -3103,58 +3274,62 @@
         "methods": {
           "CreateAlwaysApproveToolResponse(ToolApprovalRequestContent, string)": {
             "rust": [
-              "agent_framework_core::types::content::FunctionApprovalRequestContent::create_response"
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::always_approve_tool_response"
             ],
-            "status": "partial",
-            "note": "create_response(approved) builds a one-off approval; there is no always-approve (tool) response variant because harness tool approval is not ported."
+            "status": "adapted",
+            "note": "A method on ToolApprovalAgent that also takes the session, where the standing rule is recorded."
           },
           "CreateAlwaysApproveToolWithArgumentsResponse(ToolApprovalRequestContent, string)": {
             "rust": [
-              "agent_framework_core::types::content::FunctionApprovalRequestContent::create_response"
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::always_approve_tool_with_arguments_response"
             ],
-            "status": "partial",
-            "note": "create_response(approved) builds a one-off approval; there is no always-approve (tool-with-arguments) response variant because harness tool approval is not ported."
+            "status": "adapted",
+            "note": "A method on ToolApprovalAgent that also takes the session, where the standing rule is recorded."
           }
         }
       },
       "ToolAutoApprovalRuleContext": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::tool_approval::ToolAutoApprovalRule::approves"
+          ],
+          "status": "partial",
+          "note": "Rules receive only the FunctionCallContent, not the agent, session, request messages or run options."
         },
         "constructors": {
           "ToolAutoApprovalRuleContext(FunctionCallContent, AIAgent, AgentSession, IReadOnlyCollection<ChatMessage>, AgentRunOptions)": {
             "rust": [],
             "status": "unmapped",
-            "note": "ToolAutoApprovalRuleContext: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "No rule context type; rules receive the function call directly."
           }
         },
         "properties": {
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "Agent: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Auto-approval rules do not receive the agent."
           },
           "FunctionCallContent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FunctionCallContent: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolAutoApprovalRule::approves"
+            ],
+            "status": "adapted",
+            "note": "The function call is the rule's only argument."
           },
           "RequestMessages": {
             "rust": [],
             "status": "unmapped",
-            "note": "RequestMessages: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Auto-approval rules do not receive the request messages."
           },
           "RunOptions": {
             "rust": [],
             "status": "unmapped",
-            "note": "RunOptions: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Auto-approval rules do not receive the run options."
           },
           "Session": {
             "rust": [],
             "status": "unmapped",
-            "note": "Session: no auto-approval rule context; harness tool approval is not ported (SCOPE.md lists the harness under 'Not yet ported')."
+            "note": "Auto-approval rules do not receive the session."
           }
         }
       }

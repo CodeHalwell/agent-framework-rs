@@ -46,6 +46,7 @@ can upstream.
 | `experimental-vector-stores` | `VECTOR_STORES` | `agent-framework-core`, `agent-framework-cosmos`, `agent-framework-azure-ai-search` | `agent_framework_core::vectors` (stores, collections, portable filters, the vector-collection tools provider), `CosmosVectorStore`, `AzureAISearchStore` |
 | `experimental-file-history` | `FILE_HISTORY` | `agent-framework-core` | `history::FileHistoryProvider` |
 | `experimental-progressive-tools` | `PROGRESSIVE_TOOLS` | `agent-framework-core` | `middleware::LiveToolList` and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}`. The function-calling loop still uses the live list internally, so behaviour is unchanged; only the public handle is gated. |
+| `experimental-harness` | `HARNESS` | `agent-framework-core` | `agent_framework_core::harness`: `LoopAgent` (with `Judge` and `todos_remaining`), `TodoProvider`, `ToolApprovalAgent` and `AgentModeProvider`. File access, file memory, memory, background agents and `create_harness_agent` are not ported. |
 | `experimental-declarative-agents` | `DECLARATIVE_AGENTS` | `agent-framework-declarative` | The whole crate, which is empty without it |
 <!-- /feature-table -->
 
@@ -54,4 +55,4 @@ can upstream.
 | Upstream id | Why there is no feature |
 |---|---|
 | `TO_PROMPT_AGENT` | `FoundryAgent::to_prompt_agent` returns the definition the agent was built from. That is a getter, not upstream's conversion of an arbitrary agent. |
-| `AGENT_HOOKS`, `EVALS`, `FIDES`, `HARNESS`, `COMPUTER_USE`, `FUNCTIONAL_WORKFLOWS`, `MCP_LONG_RUNNING_TASKS`, `MCP_SKILLS`, `SESSION_STORE`, `FOUNDRY_TOOLS`, `FOUNDRY_PREVIEW_TOOLS` | Not ported yet. Whichever lands first adds its `experimental-*` feature here. |
+| `AGENT_HOOKS`, `EVALS`, `FIDES`, `COMPUTER_USE`, `FUNCTIONAL_WORKFLOWS`, `MCP_LONG_RUNNING_TASKS`, `MCP_SKILLS`, `SESSION_STORE`, `FOUNDRY_TOOLS`, `FOUNDRY_PREVIEW_TOOLS` | Not ported yet. Whichever lands first adds its `experimental-*` feature here. |
