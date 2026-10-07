@@ -47,9 +47,10 @@ from the roadmap, not from this file.
   agents (and the loop's `background_tasks_running` condition),
   `TodoFileStore` and the `create_harness_agent` assembly. The agent loop,
   todo, tool approval and agent mode are ported behind
-  `experimental-harness`. **Agent hooks**, **evaluation** and **security
-  (FIDES)**: all marked experimental upstream. They wait on a
-  feature-stage mechanism so they can ship without semver commitments.
+  `experimental-harness`.
+- **Evaluation** and **security (FIDES)**: both marked experimental
+  upstream; when ported they go behind `experimental-*` features (see
+  `docs/feature-stages.md`).
 - **AG-UI client** (the hosting crate has the server side only).
 - **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
