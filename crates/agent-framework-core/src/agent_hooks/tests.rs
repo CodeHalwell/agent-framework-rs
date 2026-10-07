@@ -965,6 +965,49 @@ async fn post_tool_call_judges_the_error_text_the_model_sees() {
 }
 
 #[tokio::test]
+async fn pre_model_call_sees_the_tool_error_text_the_model_receives() {
+    // A rejection's text reaches the model verbatim (provider converters
+    // read `exception` directly). The pre_model_call projection must show
+    // that same text, not the persistence redaction marker.
+    let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
+        Err::<Value, _>(Error::tool_rejected("secret 1234"))
+    })
+    .into_definition();
+    let (client, requests) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|_| Verdict::allow());
+    let agent = hooks(interceptor).build_agent(Agent::builder(client).tool(failing));
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    let projected: Vec<Value> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.point() == InterceptionPoint::PreModelCall)
+        .nth(1)
+        .unwrap()
+        .target()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|c| c["type"] == "function_result")
+        .map(|c| c["exception"].clone())
+        .collect();
+    assert_eq!(projected, vec![json!("secret 1234")]);
+    // The untouched projection writes back to the original result.
+    let sent = requests.lock().unwrap()[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(Content::as_function_result)
+        .and_then(|r| r.exception.clone())
+        .unwrap();
+    assert_eq!(sent, "secret 1234");
+}
+
+#[tokio::test]
 async fn post_tool_call_deny_discards_an_errored_result() {
     let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
         Err::<Value, _>(Error::tool_rejected("secret 1234"))

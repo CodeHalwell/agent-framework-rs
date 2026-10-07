@@ -37,6 +37,23 @@ fn input_role(role: &Role) -> &'static str {
     }
 }
 
+/// Project one content item as the model will see it.
+///
+/// `FunctionResultContent::exception` serializes as a redaction marker for
+/// persistence, but provider converters read the raw field and send that
+/// text to the model. The projection carries the raw text instead, so an
+/// interceptor judges what the model actually receives (and an untouched
+/// entry still matches its original on write-back).
+fn content_to_wire(content: &Content) -> Result<Value> {
+    let mut value = serde_json::to_value(content)?;
+    if let (Content::FunctionResult(result), Value::Object(map)) = (content, &mut value) {
+        if let Some(exception) = &result.exception {
+            map.insert("exception".into(), Value::String(exception.clone()));
+        }
+    }
+    Ok(value)
+}
+
 /// Plain text as a string; anything else as a list of content objects.
 pub(super) fn contents_to_wire(contents: &[Content]) -> Result<Value> {
     if let [Content::Text(text)] = contents {
@@ -44,7 +61,7 @@ pub(super) fn contents_to_wire(contents: &[Content]) -> Result<Value> {
     }
     contents
         .iter()
-        .map(|c| serde_json::to_value(c).map_err(Error::from))
+        .map(content_to_wire)
         .collect::<Result<Vec<_>>>()
         .map(Value::Array)
 }
