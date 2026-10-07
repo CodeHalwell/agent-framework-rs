@@ -29,6 +29,7 @@
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
+//! | `tools` | [`agent_framework_tools`] — built-in tools: local and Docker shell (re-exported as `builtin_tools`) | no |
 //!
 //! `full` enables every stable integration above. APIs upstream still marks
 //! experimental sit behind `experimental-*` features with no semver promise:
@@ -139,6 +140,12 @@ pub use agent_framework_copilotstudio as copilotstudio;
 #[cfg(feature = "purview")]
 pub use agent_framework_purview as purview;
 
+/// Built-in tools: the local and Docker shell tools (enable the `tools`
+/// feature). Re-exported as `builtin_tools` because `tools` is already the
+/// core's tool module.
+#[cfg(feature = "tools")]
+pub use agent_framework_tools as builtin_tools;
+
 /// Commonly used imports for building agents and workflows.
 pub mod prelude {
     pub use agent_framework_core::prelude::*;
@@ -212,4 +219,7 @@ pub mod prelude {
 
     #[cfg(feature = "purview")]
     pub use agent_framework_purview::{PurviewAgentMiddleware, PurviewChatMiddleware};
+
+    #[cfg(feature = "tools")]
+    pub use agent_framework_tools::{DockerShellTool, LocalShellTool};
 }

@@ -7,6 +7,33 @@ may break APIs).
 
 ## [Unreleased]
 
+### Local shell tool (new crate `agent-framework-tools`)
+
+Ports upstream's `agent_framework_tools.shell` (.NET
+`Microsoft.Agents.AI.Tools.Shell`). Enable it through the umbrella crate's
+`tools` feature, which re-exports it as `agent_framework::builtin_tools`.
+
+- `LocalShellTool` runs model-written commands on the host, in a persistent
+  shell (the default; `cd` and exports carry over) or one process per
+  command. Timeouts kill the command's whole process group, output is held
+  to a head/tail byte limit, and the working directory is re-anchored before
+  each persistent command. `as_function()` returns the `run_shell` function
+  for an agent.
+- **Approval is required by default.** Building with
+  `ApprovalMode::NeverRequire` fails unless `acknowledge_unsafe(true)` is
+  also set.
+- `ShellPolicy` is an allow/deny/custom pre-filter with no default
+  patterns. It is documented as a UX filter, not a security boundary.
+- `DockerShellTool` runs commands in a container through the `docker` (or
+  `podman`) CLI, with no network, a read-only root, dropped capabilities, an
+  unprivileged user and memory/process caps by default. `extra_run_args` that
+  would undo those are rejected.
+- `ShellEnvironmentProvider` is a context provider that tells the model which
+  shell, OS, working directory and CLIs it has.
+- `ShellResult` converts to the hosted-shell content types, which
+  `agent_framework_core::types` now re-exports (`ShellToolCallContent`,
+  `ShellToolResultContent`, `ShellCommandOutputContent`).
+
 ### AG-UI client
 
 `agent_framework_hosting::agui::AgUiChatClient`, behind the new

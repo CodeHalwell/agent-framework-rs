@@ -3980,349 +3980,469 @@
     "Microsoft.Agents.AI.Tools.Shell": {
       "DockerShellExecutor": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No Docker shell executor; Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::docker::DockerShellTool"
+          ],
+          "status": "mapped",
+          "note": "Runs commands in a container through the docker CLI with the same isolation defaults and extra-run-arg validation."
         }
       },
       "DockerShellExecutorOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No Docker shell executor; Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::docker::DockerShellToolBuilder"
+          ],
+          "status": "adapted",
+          "note": "The options become builder methods on DockerShellToolBuilder, validated by build()."
         }
       },
       "LocalShellExecutor": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::tool::LocalShellTool"
+          ],
+          "status": "mapped",
+          "note": "Runs commands on the host in a persistent or stateless shell behind approval gating."
         },
         "constructors": {
           "LocalShellExecutor(LocalShellExecutorOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::build"
+            ],
+            "status": "adapted",
+            "note": "Built from LocalShellToolBuilder, which fails when approval is disabled without acknowledge_unsafe."
           }
         },
         "methods": {
           "AsAIFunction(string, string?, bool)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellTool::as_function",
+              "agent_framework_tools::shell::tool::LocalShellTool::as_function_with"
+            ],
+            "status": "adapted",
+            "note": "The approval flag is the builder approval_mode, so turning approval off is refused at build time rather than here."
           },
           "DisposeAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellTool::close"
+            ],
+            "status": "adapted",
+            "note": "ShellExecutor::close stops the persistent shell; dropping the last clone also kills it."
           },
           "InitializeAsync(CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellTool::start"
+            ],
+            "status": "mapped",
+            "note": "ShellExecutor::start spawns the persistent shell and is a no-op in stateless mode."
           },
           "RunAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellTool::run"
+            ],
+            "status": "adapted",
+            "note": "ShellExecutor::run takes an optional per-call timeout and cancels by dropping the future."
           }
         }
       },
       "LocalShellExecutorOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::tool::LocalShellToolBuilder"
+          ],
+          "status": "adapted",
+          "note": "The options become builder methods on LocalShellToolBuilder."
         },
         "properties": {
           "AcknowledgeUnsafe": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::acknowledge_unsafe"
+            ],
+            "status": "mapped",
+            "note": "Required to build with approval disabled."
           },
           "CleanEnvironment": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::clean_env"
+            ],
+            "status": "adapted",
+            "note": "Follows Python: only the configured variables are passed, with no preserved PATH or HOME."
           },
           "ConfineWorkingDirectory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::confine_workdir"
+            ],
+            "status": "mapped",
+            "note": "Re-anchors each persistent command with a quoted cd; it does not confine file access."
           },
           "Environment": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::env"
+            ],
+            "status": "adapted",
+            "note": "Variables are added one at a time with env or together with envs."
           },
           "MaxOutputBytes": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::max_output_bytes"
+            ],
+            "status": "mapped",
+            "note": "Byte limit per stream with head and tail kept."
           },
           "Mode": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::mode"
+            ],
+            "status": "mapped",
+            "note": "Takes ShellMode, persistent by default."
           },
           "Policy": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::policy"
+            ],
+            "status": "mapped",
+            "note": "Takes a ShellPolicy, empty by default."
           },
           "Shell": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::shell"
+            ],
+            "status": "adapted",
+            "note": "Takes a ShellSpec, a command line split with POSIX shell-word rules."
           },
           "ShellArgv": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::shell"
+            ],
+            "status": "adapted",
+            "note": "The same builder method takes ShellSpec::Argv for a verbatim argv."
           },
           "Timeout": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::timeout"
+            ],
+            "status": "mapped",
+            "note": "An optional Duration, 30 seconds by default."
           },
           "WorkingDirectory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::tool::LocalShellToolBuilder::workdir"
+            ],
+            "status": "mapped",
+            "note": "The directory commands start in."
           }
         }
       },
       "ShellEnvironmentProvider": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::environment::ShellEnvironmentProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider that probes the shell once and adds an instructions block to every run."
         },
         "constructors": {
           "ShellEnvironmentProvider(ShellExecutor, ShellEnvironmentProviderOptions?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProvider::new"
+            ],
+            "status": "mapped",
+            "note": "Takes an Arc<dyn ShellExecutor> and optional options."
           }
         },
         "properties": {
           "CurrentSnapshot": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProvider::current_snapshot"
+            ],
+            "status": "mapped",
+            "note": "Returns a clone of the cached snapshot."
           }
         },
         "methods": {
           "RefreshAsync(CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProvider::refresh"
+            ],
+            "status": "mapped",
+            "note": "Probes again and replaces the cached snapshot."
           }
         }
       },
       "ShellEnvironmentProviderOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::environment::ShellEnvironmentProviderOptions"
+          ],
+          "status": "mapped",
+          "note": "A struct with public fields and the same defaults."
         },
         "properties": {
           "InstructionsFormatter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProviderOptions::instructions_formatter"
+            ],
+            "status": "mapped",
+            "note": "A public field with the upstream default."
           },
           "OverrideFamily": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProviderOptions::override_family"
+            ],
+            "status": "mapped",
+            "note": "A public field with the upstream default."
           },
           "ProbeTimeout": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProviderOptions::probe_timeout"
+            ],
+            "status": "mapped",
+            "note": "A public field with the upstream default."
           },
           "ProbeTools": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentProviderOptions::probe_tools"
+            ],
+            "status": "mapped",
+            "note": "A public field with the upstream default."
           }
         }
       },
       "ShellEnvironmentSnapshot": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot"
+          ],
+          "status": "mapped",
+          "note": "A plain struct of the probe results."
         },
         "properties": {
           "Family": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot::family"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "OSDescription": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot::os_description"
+            ],
+            "status": "mapped",
+            "note": "The OS description is the target OS and architecture."
           },
           "ShellVersion": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot::shell_version"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "ToolVersions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot::tool_versions"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "WorkingDirectory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellEnvironmentSnapshot::working_directory"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           }
         }
       },
       "ShellFamily": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::environment::ShellFamily"
+          ],
+          "status": "mapped",
+          "note": "An enum of the shell families."
         },
         "constants": {
           "Posix": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellFamily::Posix"
+            ],
+            "status": "mapped",
+            "note": "An enum variant."
           },
           "PowerShell": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::environment::ShellFamily::PowerShell"
+            ],
+            "status": "mapped",
+            "note": "An enum variant."
           }
         }
       },
       "ShellMode": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::types::ShellMode"
+          ],
+          "status": "mapped",
+          "note": "An enum defaulting to Persistent."
         },
         "constants": {
           "Persistent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellMode::Persistent"
+            ],
+            "status": "mapped",
+            "note": "An enum variant."
           },
           "Stateless": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellMode::Stateless"
+            ],
+            "status": "mapped",
+            "note": "An enum variant."
           }
         }
       },
       "ShellPolicy": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::policy::ShellPolicy"
+          ],
+          "status": "mapped",
+          "note": "Deny-list, allow-list and custom rule, with no default patterns."
         },
         "constructors": {
           "ShellPolicy(IEnumerable<string>?, IEnumerable<string>?, Func<ShellRequest, ShellPolicyOutcome?>?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellPolicy::new",
+              "agent_framework_tools::shell::policy::ShellPolicy::with_denylist",
+              "agent_framework_tools::shell::policy::ShellPolicy::with_allowlist",
+              "agent_framework_tools::shell::policy::ShellPolicy::with_custom"
+            ],
+            "status": "adapted",
+            "note": "An empty policy plus builder methods; patterns use the linear-time regex crate, so there is no match timeout."
           }
         },
         "methods": {
           "Evaluate(ShellRequest)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellPolicy::evaluate"
+            ],
+            "status": "mapped",
+            "note": "Returns a ShellDecision."
           }
         }
       },
       "ShellPolicyOutcome": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::policy::ShellDecision"
+          ],
+          "status": "adapted",
+          "note": "An Allow or Deny(reason) enum, named after the Python ShellDecision."
         },
         "properties": {
           "Allowed": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellDecision::is_allowed"
+            ],
+            "status": "adapted",
+            "note": "A method on the enum."
           },
           "Reason": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellDecision::reason"
+            ],
+            "status": "adapted",
+            "note": "A method returning the denial reason, empty for Allow."
           }
         }
       },
       "ShellRequest": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::policy::ShellRequest"
+          ],
+          "status": "mapped",
+          "note": "The command and configured working directory."
         },
         "properties": {
           "Command": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellRequest::command"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "WorkingDirectory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::policy::ShellRequest::workdir"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           }
         }
       },
       "ShellResult": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+          "rust": [
+            "agent_framework_tools::shell::types::ShellResult"
+          ],
+          "status": "mapped",
+          "note": "The outcome of one command."
         },
         "properties": {
           "Duration": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::duration"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "ExitCode": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::exit_code"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "Stderr": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::stderr"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "Stdout": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::stdout"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "TimedOut": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::timed_out"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           },
           "Truncated": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::truncated"
+            ],
+            "status": "mapped",
+            "note": "A public field."
           }
         },
         "methods": {
           "FormatForModel()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types."
+            "rust": [
+              "agent_framework_tools::shell::types::ShellResult::format_for_model"
+            ],
+            "status": "mapped",
+            "note": "The same text layout as upstream."
           }
         }
       }

@@ -19,7 +19,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 0 / 0 / 0 / 58 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 44 / 14 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 97 / 43 / 69 / 0 | 41 | 0 |
 | `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
 | `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
@@ -429,64 +429,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Hosting.A2A::AgentRunMode methods::AllowBackgroundWhen(Func<A2ARunDecisionContext, CancellationToken, ValueTask<bool>>)` | unmapped | adapted | No per-request background decision callback; A2ARouter runs synchronously. |
 | `Microsoft.Agents.AI.Hosting.A2A::AgentRunMode properties::AllowBackgroundIfSupported` | unmapped | adapted | A2ARouter cannot return working tasks for background responses. |
 | `Microsoft.Agents.AI.Hosting.A2A::AgentRunMode` | unmapped | adapted | No run-mode type; A2ARouter always runs synchronously with no background tasks. |
-| `Microsoft.Agents.AI.Tools.Shell::DockerShellExecutor` | unmapped | unmapped | No Docker shell executor; Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::DockerShellExecutorOptions` | unmapped | unmapped | No Docker shell executor; Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor constructors::LocalShellExecutor(LocalShellExecutorOptions)` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor methods::AsAIFunction(string, string?, bool)` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor methods::DisposeAsync()` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor methods::InitializeAsync(CancellationToken)` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor methods::RunAsync(string, CancellationToken)` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutor` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::AcknowledgeUnsafe` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::CleanEnvironment` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::ConfineWorkingDirectory` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::Environment` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::MaxOutputBytes` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::Mode` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::Policy` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::Shell` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::ShellArgv` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::Timeout` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions properties::WorkingDirectory` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::LocalShellExecutorOptions` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProvider constructors::ShellEnvironmentProvider(ShellExecutor, ShellEnvironmentProviderOptions?)` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProvider methods::RefreshAsync(CancellationToken)` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProvider properties::CurrentSnapshot` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProvider` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProviderOptions properties::InstructionsFormatter` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProviderOptions properties::OverrideFamily` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProviderOptions properties::ProbeTimeout` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProviderOptions properties::ProbeTools` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentProviderOptions` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot properties::Family` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot properties::OSDescription` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot properties::ShellVersion` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot properties::ToolVersions` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot properties::WorkingDirectory` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellEnvironmentSnapshot` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellFamily constants::Posix` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellFamily constants::PowerShell` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellFamily` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellMode constants::Persistent` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellMode constants::Stateless` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellMode` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicy constructors::ShellPolicy(IEnumerable<string>?, IEnumerable<string>?, Func<ShellRequest, ShellPolicyOutcome?>?)` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicy methods::Evaluate(ShellRequest)` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicy` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicyOutcome properties::Allowed` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicyOutcome properties::Reason` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellPolicyOutcome` | unmapped | adapted | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellRequest properties::Command` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellRequest properties::WorkingDirectory` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellRequest` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult methods::FormatForModel()` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::Duration` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::ExitCode` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::Stderr` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::Stdout` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::TimedOut` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult properties::Truncated` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
-| `Microsoft.Agents.AI.Tools.Shell::ShellResult` | unmapped | mapped | Local shell tool is listed under SCOPE.md 'Not yet ported'; Rust only has hosted shell content types. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::EmitAgentResponseEvents` | partial | mapped | AgentExecutor always emits WorkflowEvent::AgentRun after each agent run; emission cannot be turned off. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::EmitAgentUpdateEvents` | partial | mapped | AgentExecutor always streams and emits WorkflowEvent::AgentRunUpdate per update; there is no switch to suppress update events. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::ForwardIncomingMessages` | partial | mapped | AgentExecutor always sends the incoming conversation plus the reply downstream; forwarding only the reply is not configurable. |
