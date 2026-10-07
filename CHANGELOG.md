@@ -79,6 +79,17 @@ The umbrella crate re-exposes each feature under the same name and adds
 `agent_framework_cosmos::DEFAULT_VECTOR_API_VERSION` moves behind
 `experimental-vector-stores` with the store it configures.
 
+### Fixed
+
+- **An approved tool re-ran on every later turn of a session.** The approval
+  response stayed in session history and the function-invocation loop
+  collected it again on each run, executing the tool every turn. As upstream's
+  `_collect_approval_responses` does, a response is now settled once a later
+  function result answers its `call_id` (or a later request reuses its id), and
+  settled responses neither execute nor reach the model. The results resolving
+  an approval are also returned ahead of the model's answer, so history records
+  the approval as settled. Streaming and non-streaming runs share the fix.
+
 ## [0.10.0] — 2026-10-05
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).

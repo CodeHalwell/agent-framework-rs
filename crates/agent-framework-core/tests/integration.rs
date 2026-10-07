@@ -1108,6 +1108,145 @@ async fn agent_surfaces_and_resolves_approval_round_trip() {
     assert!(recorded.iter().any(|m| !m.user_input_requests().is_empty()));
 }
 
+#[tokio::test]
+async fn a_settled_approval_in_history_does_not_rerun_the_tool() {
+    // Regression: an approval response that stays in session history was
+    // collected again on every later run, re-executing the approved tool each
+    // turn. A response whose call already has a result is settled history.
+    let counter = Arc::new(Mutex::new(0));
+    let client = MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+        ChatResponse::from_text("You're welcome."),
+    ]);
+    let seen = client.seen.clone();
+    let agent = Agent::builder(client)
+        .tool(approval_tool(counter.clone()))
+        .build();
+    let mut thread = AgentSession::new();
+    thread
+        .context_providers
+        .push(Arc::new(InMemoryHistoryProvider::new()));
+
+    let resp1 = agent
+        .run(vec![Message::user("get the secret")], Some(&mut thread))
+        .await
+        .unwrap();
+    let approval = resp1.user_input_requests()[0].create_response(true);
+    agent
+        .run(
+            vec![Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionApprovalResponse(approval)],
+            )],
+            Some(&mut thread),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*counter.lock().unwrap(), 1);
+
+    let resp3 = agent
+        .run(vec![Message::user("thanks")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert!(resp3.text().contains("welcome"), "got: {}", resp3.text());
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "settled approval re-ran the tool"
+    );
+
+    // The third model call sees the settled approval as a plain call and its
+    // result: neither the request nor the response is resent.
+    let third = seen.lock().unwrap().last().cloned().unwrap();
+    let contents: Vec<&Content> = third.iter().flat_map(|m| m.contents.iter()).collect();
+    assert!(
+        !contents.iter().any(|c| matches!(
+            c,
+            Content::FunctionApprovalRequest(_) | Content::FunctionApprovalResponse(_)
+        )),
+        "settled approval resent: {third:?}"
+    );
+    let calls = contents
+        .iter()
+        .filter(|c| matches!(c, Content::FunctionCall(_)))
+        .count();
+    let results = contents
+        .iter()
+        .filter(|c| matches!(c, Content::FunctionResult(_)))
+        .count();
+    assert_eq!((calls, results), (1, 1), "{third:?}");
+}
+
+#[tokio::test]
+async fn a_settled_approval_in_history_does_not_rerun_the_tool_when_streaming() {
+    let counter = Arc::new(Mutex::new(0));
+    let agent = Agent::builder(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+        ChatResponse::from_text("You're welcome."),
+    ]))
+    .tool(approval_tool(counter.clone()))
+    .build();
+    let mut thread = AgentSession::new();
+    thread
+        .context_providers
+        .push(Arc::new(InMemoryHistoryProvider::new()));
+
+    async fn drain(stream: AgentRunStream) -> Vec<AgentResponseUpdate> {
+        stream.map(|u| u.unwrap()).collect().await
+    }
+
+    let updates1 = drain(
+        agent
+            .run_stream("get the secret", Some(thread.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let request = updates1
+        .iter()
+        .flat_map(|u| u.contents.iter())
+        .find_map(|c| match c {
+            Content::FunctionApprovalRequest(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("approval request");
+    drain(
+        agent
+            .run_stream(
+                vec![Message::with_contents(
+                    Role::user(),
+                    vec![Content::FunctionApprovalResponse(
+                        request.create_response(true),
+                    )],
+                )],
+                Some(thread.clone()),
+                None,
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(*counter.lock().unwrap(), 1);
+
+    let updates3 = drain(
+        agent
+            .run_stream("thanks", Some(thread.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let text: String = updates3.iter().map(|u| u.text()).collect();
+    assert!(text.contains("welcome"), "got: {text}");
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "settled approval re-ran the tool"
+    );
+    let _ = &mut thread;
+}
+
 // ---------------------------------------------------------------------------
 // SupportsAgentRun-as-tool
 // ---------------------------------------------------------------------------
