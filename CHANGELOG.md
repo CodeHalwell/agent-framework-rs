@@ -20,6 +20,14 @@ may break APIs).
   Settlement is decided before history compaction (a window could keep the
   response but drop the result that settled it) and before the no-tools fast
   path, so a settled approval never reaches the model on either route.
+- **OpenAI Responses dropped completed hosted MCP calls.** An `mcp_call`
+  output item (and its streamed `output_item.added`/`.done` events) is now
+  parsed into `McpServerToolCall`/`McpServerToolResult` contents and replayed
+  as one `mcp_call` input item carrying its output, as upstream does. A hosted
+  approval replayed from local history is therefore followed by the call it
+  approved, rather than standing alone as an approval still to act on.
+  `McpServerToolCallContent` and `McpServerToolResultContent` are now exported
+  from `agent_framework_core::types`.
 
 ## [0.10.0] — 2026-10-05
 

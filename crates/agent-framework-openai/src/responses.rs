@@ -31,8 +31,9 @@ use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
-    Message, ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode,
-    UriContent, UsageContent, UsageDetails,
+    McpServerToolCallContent, McpServerToolResultContent, Message, ResponseFormat, Role,
+    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
+    UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -352,8 +353,10 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         let role = msg.role.as_str();
         if role == Role::TOOL {
             for content in &msg.contents {
-                if let Content::FunctionResult(fr) = content {
-                    out.push(function_result_to_item(fr));
+                match content {
+                    Content::FunctionResult(fr) => out.push(function_result_to_item(fr)),
+                    Content::McpServerToolResult(r) => attach_mcp_output(&mut out, r),
+                    _ => {}
                 }
             }
             continue;
@@ -428,6 +431,28 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                         "arguments": function_arguments_to_string(&r.function_call.arguments),
                     }));
                 }
+                // A hosted MCP call and its result are one `mcp_call` input
+                // item carrying both `arguments` and `output`
+                // (`_prepare_content_for_openai` + `_coalesce_pending_mcp_results`).
+                // Replayed after its approval pair, it tells the service the
+                // approved call already ran, so local history does not ask
+                // for it again.
+                Content::McpServerToolCall(call) => {
+                    if !call.call_id.is_empty() {
+                        flush_text(&mut out, &mut buffered, role);
+                        out.push(json!({
+                            "type": "mcp_call",
+                            "id": call.call_id,
+                            "server_label": call.server_name.clone().unwrap_or_default(),
+                            "name": call.tool_name,
+                            "arguments": function_arguments_to_string(&call.arguments),
+                        }));
+                    }
+                }
+                Content::McpServerToolResult(result) => {
+                    flush_text(&mut out, &mut buffered, role);
+                    attach_mcp_output(&mut out, result);
+                }
                 Content::TextReasoning(tr) => {
                     // Re-emit the original reasoning item verbatim (store:false
                     // replay). A summary-only reasoning content with no
@@ -444,6 +469,87 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
         flush_text(&mut out, &mut buffered, role);
     }
     out
+}
+
+/// Set a hosted MCP result's output on the latest `mcp_call` input item with
+/// its id that has none yet. A result with no such call is dropped: the
+/// Responses API has no standalone MCP output item
+/// (`_coalesce_pending_mcp_results`).
+fn attach_mcp_output(out: &mut [Value], result: &McpServerToolResultContent) {
+    if result.call_id.is_empty() {
+        return;
+    }
+    let target = out.iter_mut().rev().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("mcp_call")
+            && item.get("id").and_then(Value::as_str) == Some(result.call_id.as_str())
+    });
+    if let Some(Value::Object(item)) = target {
+        if item.get("output").is_none_or(Value::is_null) {
+            item.insert(
+                "output".into(),
+                Value::String(stringify_mcp_output(result.output.as_ref())),
+            );
+        }
+    }
+}
+
+/// Render a hosted MCP result as the string `mcp_call.output` field
+/// (`_stringify_mcp_output`): a string as is, text entries joined, anything
+/// else as JSON.
+fn stringify_mcp_output(output: Option<&Value>) -> String {
+    match output {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| match entry {
+                Value::String(s) => s.clone(),
+                other => match other.get("text").and_then(Value::as_str) {
+                    Some(text) => text.to_string(),
+                    None => other.to_string(),
+                },
+            })
+            .collect(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Parse a hosted `mcp_call` output item into its call and, once it has run,
+/// its result (`_create_response_content`'s `mcp_call` arm). The item's `id`
+/// is the call id, falling back to `call_id`.
+fn mcp_call_item_contents(item: &Value, include_result: bool) -> Vec<Content> {
+    let call_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| item.get("call_id").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let mut contents = vec![Content::McpServerToolCall(McpServerToolCallContent {
+        call_id: call_id.clone(),
+        tool_name: item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        server_name: item
+            .get("server_label")
+            .and_then(Value::as_str)
+            .map(String::from),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(|a| FunctionArguments::Raw(a.to_string())),
+    })];
+    if include_result {
+        if let Some(output) = item.get("output").filter(|o| !o.is_null()) {
+            contents.push(Content::McpServerToolResult(McpServerToolResultContent {
+                call_id,
+                output: Some(output.clone()),
+            }));
+        }
+    }
+    contents
 }
 
 /// Map a URI/data content item to a Responses API input content part, or `None`
@@ -884,6 +990,7 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
         // An MCP approval request round-trips its `id` as the call id so a
         // later `FunctionApprovalResponse` refers back to it
         // (`_create_response_content:775-787`).
+        Some("mcp_call") => contents.extend(mcp_call_item_contents(item, true)),
         Some("mcp_approval_request") => {
             let id = item
                 .get("id")
@@ -1220,7 +1327,17 @@ fn parse_responses_event(
         }
         "response.output_item.added" => {
             let item = value.get("item");
-            if item.and_then(|i| i.get("type")).and_then(Value::as_str) != Some("function_call") {
+            let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+            // A hosted MCP call surfaces on `added`; its result waits for
+            // the completed item on `done` (upstream's streaming parse).
+            if let (Some("mcp_call"), Some(item)) = (item_type, item) {
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents: mcp_call_item_contents(item, false),
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
+            if item_type != Some("function_call") {
                 return EventOutcome::None;
             }
             let output_index = value
@@ -1323,11 +1440,33 @@ fn parse_responses_event(
                 _ => Error::service(msg),
             })
         }
+        "response.output_item.done" => {
+            let Some(item) = value
+                .get("item")
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("mcp_call"))
+            else {
+                return EventOutcome::None;
+            };
+            let call_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| item.get("call_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            EventOutcome::Update(ChatResponseUpdate {
+                contents: vec![Content::McpServerToolResult(McpServerToolResultContent {
+                    call_id,
+                    output: item.get("output").filter(|o| !o.is_null()).cloned(),
+                })],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            })
+        }
         // Recognized but carry no additional content: the arguments are
         // already fully accumulated via `.delta` events, and item/part
         // lifecycle markers don't themselves map to a `Content`.
         "response.function_call_arguments.done"
-        | "response.output_item.done"
         | "response.content_part.added"
         | "response.content_part.done"
         | "response.in_progress" => EventOutcome::None,
@@ -2353,6 +2492,112 @@ mod tests {
         assert_eq!(input[0]["type"], json!("mcp_approval_response"));
         assert_eq!(input[0]["approval_request_id"], json!("appr_9"));
         assert_eq!(input[0]["approve"], json!(true));
+    }
+
+    #[test]
+    fn mcp_call_output_item_parses_into_call_and_result() {
+        let contents = parse_item(json!({
+            "type": "mcp_call", "id": "mcp_1", "name": "search",
+            "server_label": "docs", "arguments": r#"{"q":"rust"}"#,
+            "output": "found it",
+        }));
+        let [Content::McpServerToolCall(call), Content::McpServerToolResult(result)] =
+            contents.as_slice()
+        else {
+            panic!("expected hosted call and result, got {contents:?}");
+        };
+        assert_eq!(call.call_id, "mcp_1");
+        assert_eq!(call.tool_name, "search");
+        assert_eq!(call.server_name.as_deref(), Some("docs"));
+        assert_eq!(result.call_id, "mcp_1");
+        assert_eq!(result.output, Some(json!("found it")));
+    }
+
+    /// A hosted approval replayed from local history carries the completed
+    /// `mcp_call` after its request/response pair, so the service sees the
+    /// approved call as already run instead of an approval still to act on.
+    #[test]
+    fn replayed_hosted_approval_carries_its_completed_mcp_call() {
+        let request = parse_item(json!({
+            "type": "mcp_approval_request",
+            "id": "appr_9", "name": "search", "arguments": r#"{"q":"rust"}"#,
+            "server_label": "docs",
+        }));
+        let Content::FunctionApprovalRequest(req) = &request[0] else {
+            panic!("expected approval request");
+        };
+        let response = req.create_response(true);
+        let completed = parse_item(json!({
+            "type": "mcp_call", "id": "mcp_1", "approval_request_id": "appr_9",
+            "name": "search", "server_label": "docs",
+            "arguments": r#"{"q":"rust"}"#, "output": "found it",
+        }));
+        let history = vec![
+            Message::with_contents(Role::assistant(), request),
+            user_with(vec![Content::FunctionApprovalResponse(response)]),
+            Message::with_contents(Role::assistant(), completed),
+            user("and now?"),
+        ];
+        let input = messages_to_input(&history);
+        let types: Vec<_> = input.iter().map(|i| i["type"].clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                json!("mcp_approval_request"),
+                json!("mcp_approval_response"),
+                json!("mcp_call"),
+                json!("message"),
+            ]
+        );
+        assert_eq!(input[2]["id"], json!("mcp_1"));
+        assert_eq!(input[2]["server_label"], json!("docs"));
+        assert_eq!(input[2]["name"], json!("search"));
+        assert_eq!(input[2]["arguments"], json!(r#"{"q":"rust"}"#));
+        assert_eq!(input[2]["output"], json!("found it"));
+    }
+
+    #[test]
+    fn orphan_mcp_result_is_dropped_from_input() {
+        let input = messages_to_input(&[Message::with_contents(
+            Role::assistant(),
+            vec![Content::McpServerToolResult(McpServerToolResultContent {
+                call_id: "mcp_missing".into(),
+                output: Some(json!("x")),
+            })],
+        )]);
+        assert!(input.is_empty(), "{input:?}");
+    }
+
+    #[test]
+    fn streamed_mcp_call_emits_call_on_added_and_result_on_done() {
+        let mut ids = HashMap::new();
+        let item = json!({
+            "type": "mcp_call", "id": "mcp_2", "name": "search",
+            "server_label": "docs", "arguments": "{}", "output": "ok",
+        });
+        let EventOutcome::Update(added) = parse_responses_event(
+            &json!({"type": "response.output_item.added", "output_index": 0, "item": item}),
+            &mut ids,
+            None,
+        ) else {
+            panic!("expected an update on added");
+        };
+        assert!(matches!(
+            added.contents.as_slice(),
+            [Content::McpServerToolCall(c)] if c.call_id == "mcp_2"
+        ));
+        let EventOutcome::Update(done) = parse_responses_event(
+            &json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+            &mut ids,
+            None,
+        ) else {
+            panic!("expected an update on done");
+        };
+        assert!(matches!(
+            done.contents.as_slice(),
+            [Content::McpServerToolResult(r)]
+                if r.call_id == "mcp_2" && r.output == Some(json!("ok"))
+        ));
     }
 
     // endregion
