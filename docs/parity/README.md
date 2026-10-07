@@ -106,6 +106,11 @@ percentage.
 - **Porting a gap:** flip its leaf from `unmapped` to `mapped` or `adapted`,
   then run `cargo xtask parity report`.
 - **Refreshing upstream:** follow [`upstream/SOURCE.md`](upstream/SOURCE.md).
-  New .NET declarations appear under "Not yet reviewed" in `STATUS.md`.
+  New .NET declarations appear under "Not yet reviewed" in `STATUS.md`:
+  each new declaration in Go's catalog, and each .NET inventory type that
+  neither Go's catalog nor the ledger lists (counted once per type, since
+  the inventory also carries compiler-generated members no catalog reviews).
+  A new member on a type either catalog already lists surfaces only once Go
+  catalogs it.
 - **The weekly drift pass** ([`docs/drift/`](../drift/README.md)) should
   touch the ledger whenever a ported change adds or renames a public symbol.

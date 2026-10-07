@@ -462,10 +462,12 @@ impl AzureOpenAIResponsesClient {
         if let Some(instructions) = instructions {
             body.insert("instructions".into(), json!(instructions));
         }
-        body.insert(
-            "input".into(),
-            json!(agent_framework_openai::responses::messages_to_input(rest)),
-        );
+        let input = if agent_framework_openai::responses::uses_service_side_storage(options) {
+            agent_framework_openai::responses::messages_to_continuation_input(rest)
+        } else {
+            agent_framework_openai::responses::messages_to_input(rest)
+        };
+        body.insert("input".into(), json!(input));
 
         if let Some(conversation_id) = &options.conversation_id {
             body.insert("previous_response_id".into(), json!(conversation_id));

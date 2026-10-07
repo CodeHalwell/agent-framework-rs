@@ -32,6 +32,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 | [`2026-09-21-6606bef`](2026-09-21-6606bef.md) | Post-`061dc28` drift + Azure-ecosystem review (checked against `6606bef`, 2026-09-21) |
 | [`2026-09-14-061dc28`](2026-09-14-061dc28.md) | Post-`010a43a` drift + Azure-ecosystem review (checked against `061dc28`, 2026-09-14) |
 | [`2026-09-07-010a43a`](2026-09-07-010a43a.md) | Post-`b5d9f4b` drift + Azure-ecosystem review (checked against `010a43a`, 2026-09-07) |
+| [`2026-08-31-b5d9f4b`](2026-08-31-b5d9f4b.md) | Post-`d8d07eb` drift (checked against `b5d9f4b`, 2026-08-31) |
 | [`2026-08-29-d8d07eb`](2026-08-29-d8d07eb.md) | Post-`e6d8d99` drift (checked against `d8d07eb`, 2026-08-29) |
 | [`2026-08-26-e6d8d99`](2026-08-26-e6d8d99.md) | Post-`a63d462` drift (checked against `e6d8d99`, 2026-08-26) |
 | [`2026-08-24-a63d462`](2026-08-24-a63d462.md) | Post-`e1326eb` drift (checked against `a63d462`, 2026-08-24) |
