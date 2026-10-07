@@ -65,7 +65,7 @@ use crate::error::{Error, Result};
 use crate::session::AgentSession;
 use crate::types::{
     AgentResponse, AgentResponseUpdate, Content, FunctionApprovalRequestContent,
-    FunctionApprovalResponseContent, FunctionCallContent, Message, Role,
+    FunctionApprovalResponseContent, FunctionCallContent, Message, Role, UsageDetails,
 };
 
 use super::{channel_stream, json_type_name};
@@ -559,6 +559,9 @@ impl ToolApprovalAgent {
             return Ok(Self::queued_response(next));
         }
         let mut iteration = 0usize;
+        // Usage of every inner run this call made: an auto-approved pass is
+        // discarded, but its tokens were still spent.
+        let mut usage: Option<UsageDetails> = None;
         loop {
             let collected = state.collected_approval_responses.clone();
             messages = Self::inject_collected(messages, &mut state);
@@ -577,6 +580,13 @@ impl ToolApprovalAgent {
                     return Err(error);
                 }
             };
+            if let Some(run_usage) = response.usage_details.take() {
+                usage = Some(match usage {
+                    Some(total) => total + run_usage,
+                    None => run_usage,
+                });
+            }
+            response.usage_details = usage.clone();
             if iteration >= self.max_auto_approval_iterations {
                 // Cap reached: return this turn as-is, without auto-approving
                 // again, so the caller decides on any request in it.

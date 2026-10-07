@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_framework_core::harness::*;
 use agent_framework_core::prelude::*;
-use agent_framework_core::types::FunctionArguments;
+use agent_framework_core::types::{FunctionArguments, UsageContent};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -108,13 +108,20 @@ impl ChatClient for Mock {
     ) -> Result<ChatStream> {
         let response = self.get_response(messages, options).await?;
         let conversation_id = response.conversation_id.clone();
+        let last = response.messages.len().saturating_sub(1);
+        let usage = response.usage_details.clone();
         let updates: Vec<Result<ChatResponseUpdate>> = response
             .messages
             .into_iter()
             .enumerate()
             .map(|(i, m)| {
+                let mut contents = m.contents;
+                // Usage rides the final update, as real providers stream it.
+                if let (true, Some(details)) = (i == last, usage.clone()) {
+                    contents.push(Content::Usage(UsageContent { details }));
+                }
                 Ok(ChatResponseUpdate {
-                    contents: m.contents,
+                    contents,
                     role: Some(m.role),
                     message_id: Some(format!("m{i}")),
                     conversation_id: conversation_id.clone(),
@@ -1208,6 +1215,78 @@ async fn streaming_auto_approval_reruns_stop_at_the_cap() {
         })
         .collect();
     assert_eq!(requests, ["c2"]);
+}
+
+fn with_usage(response: ChatResponse, input: u64, output: u64) -> ChatResponse {
+    ChatResponse {
+        usage_details: Some(UsageDetails {
+            input_token_count: Some(input),
+            output_token_count: Some(output),
+            ..Default::default()
+        }),
+        ..response
+    }
+}
+
+/// Two auto-approved passes (10/1 and 20/2 tokens), then a final turn
+/// (40/4) that is returned or capped.
+fn auto_approval_usage_script(f: &ApprovalFixture) {
+    f.client
+        .push(with_usage(call_response(&[("c0", "safe", "{}")]), 10, 1));
+    f.client
+        .push(with_usage(call_response(&[("c1", "safe", "{}")]), 20, 2));
+    f.client
+        .push(with_usage(ChatResponse::from_text("finished"), 40, 4));
+}
+
+#[tokio::test]
+async fn auto_approval_reruns_sum_usage() {
+    let mut f = approval_fixture(&["safe"], |a| {
+        a.with_auto_approval_rule(|call: &FunctionCallContent| call.name == "safe")
+    });
+    auto_approval_usage_script(&f);
+    let response = f.run(Message::user("go")).await;
+    assert_eq!(response.text(), "finished");
+    assert_eq!(f.client.calls(), 3);
+    let usage = response.usage_details.unwrap();
+    assert_eq!(usage.input_token_count, Some(70));
+    assert_eq!(usage.output_token_count, Some(7));
+
+    // Hitting the cap returns the last pass as-is, still with the full sum.
+    let mut f = approval_fixture(&["safe"], |a| {
+        a.with_auto_approval_rule(|call: &FunctionCallContent| call.name == "safe")
+            .with_max_auto_approval_iterations(1)
+            .unwrap()
+    });
+    auto_approval_usage_script(&f);
+    let response = f.run(Message::user("go")).await;
+    assert_eq!(f.client.calls(), 2);
+    assert_eq!(approval_requests(&response).len(), 1);
+    let usage = response.usage_details.unwrap();
+    assert_eq!(usage.input_token_count, Some(30));
+    assert_eq!(usage.output_token_count, Some(3));
+}
+
+#[tokio::test]
+async fn streaming_auto_approval_reruns_sum_usage() {
+    let f = approval_fixture(&["safe"], |a| {
+        a.with_auto_approval_rule(|call: &FunctionCallContent| call.name == "safe")
+    });
+    auto_approval_usage_script(&f);
+    let updates = collect(
+        f.agent
+            .run_stream(vec![Message::user("go")], Some(f.session.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(f.client.calls(), 3);
+    let response = AgentResponse::from_updates(updates);
+    assert_eq!(response.text(), "finished");
+    assert!(approval_requests(&response).is_empty());
+    let usage = response.usage_details.unwrap();
+    assert_eq!(usage.input_token_count, Some(70));
+    assert_eq!(usage.output_token_count, Some(7));
 }
 
 #[tokio::test]
