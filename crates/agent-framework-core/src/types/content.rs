@@ -637,6 +637,11 @@ pub struct McpServerToolResultContent {
     pub call_id: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub output: Option<Value>,
+    /// The error the hosted call failed with, when it did. A failed call
+    /// can finish with an error and no output; keeping it lets a replay
+    /// mark the call as finished rather than still running.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<Value>,
 }
 
 /// A provider-hosted search tool call (e.g. web/file search).
@@ -1065,6 +1070,7 @@ mod tests {
                 Content::McpServerToolResult(McpServerToolResultContent {
                     call_id: "c".into(),
                     output: None,
+                    error: None,
                 }),
                 "mcp_server_tool_result",
             ),
