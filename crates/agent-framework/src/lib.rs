@@ -197,9 +197,11 @@ pub mod prelude {
     pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient, FoundryEmbeddingClient};
 
     #[cfg(feature = "azure-ai-search")]
-    pub use agent_framework_azure_ai_search::{
-        AzureAISearchCollection, AzureAISearchProvider, AzureAISearchStore,
-    };
+    pub use agent_framework_azure_ai_search::AzureAISearchProvider;
+
+    // The vector store is experimental in the crate itself.
+    #[cfg(all(feature = "azure-ai-search", feature = "experimental-vector-stores"))]
+    pub use agent_framework_azure_ai_search::{AzureAISearchCollection, AzureAISearchStore};
 
     #[cfg(feature = "cosmos")]
     pub use agent_framework_cosmos::CosmosChatMessageStore;

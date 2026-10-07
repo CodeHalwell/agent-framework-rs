@@ -13,11 +13,12 @@
 >
 > As a result, some findings below are **stale or inverted** — a few "gaps" no
 > longer exist, and some work the port shipped now targets removed surfaces.
-> Each such claim carries an inline **`Re-baseline (68136ee):`** note. The
-> complete, current re-derivation lives in **[`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md)**;
-> treat that document as the authority on what upstream looks like today and
-> this one as the historical `638fbb5f` audit plus the implementation waves that
-> answered it.
+> Each such claim carries an inline **`Re-baseline (68136ee):`** note. This
+> document is the historical `638fbb5f` audit plus the implementation waves
+> that answered it, and [`UPSTREAM_DRIFT.md`](./UPSTREAM_DRIFT.md) is the July
+> 2026 re-derivation. **Neither is current:** see [`SCOPE.md`](SCOPE.md) for
+> what is out of scope or not yet ported, and
+> [`docs/drift/`](docs/drift/README.md) for the weekly passes since.
 
 A full-repo audit of this port against the upstream
 [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) at

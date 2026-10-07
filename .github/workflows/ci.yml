@@ -57,6 +57,8 @@ jobs:
         run: |
           cargo check --all-targets -p agent-framework-core -p agent-framework-cosmos -p agent-framework-azure-ai-search -p agent-framework-declarative
           cargo test --doc -p agent-framework-core -p agent-framework-cosmos -p agent-framework-azure-ai-search -p agent-framework-declarative
+          # The umbrella with every stable integration but no experimental one.
+          cargo check --all-targets -p agent-framework --features full
 
   msrv:
     name: MSRV (Rust 1.88)
