@@ -55,7 +55,6 @@ from the roadmap, not from this file.
   result-label flow (labels reach the combined verdict and the record but
   are not persisted with the produced data or resurfaced as
   `source_labels`; upstream's framework layer does not do this either).
-- **AG-UI client** (the hosting crate has the server side only).
 - **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
