@@ -504,6 +504,33 @@ async fn empty_stream_gives_an_empty_response() {
 }
 
 #[tokio::test]
+async fn snapshot_only_run_yields_its_new_messages() {
+    // The server answers with nothing but a MESSAGES_SNAPSHOT that echoes the
+    // request's history: only the new assistant message is added.
+    let body = concat!(
+        "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+        "data: {\"type\":\"MESSAGES_SNAPSHOT\",\"messages\":[",
+        "{\"id\":\"u1\",\"role\":\"user\",\"content\":\"hi\"},",
+        "{\"id\":\"a0\",\"role\":\"assistant\",\"content\":\"earlier answer\"},",
+        "{\"id\":\"a1\",\"role\":\"assistant\",\"content\":\"from the snapshot\"}]}\n\n",
+        "data: {\"type\":\"RUN_FINISHED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+    );
+    let (url, _) = scripted(StatusCode::OK, body).await;
+    let client = AgUiChatClient::new(url);
+    let mut user = Message::user("hi");
+    user.message_id = Some("u1".into());
+    let mut earlier = Message::assistant("earlier answer");
+    earlier.message_id = Some("a0".into());
+    let response = client
+        .get_response(vec![earlier, user], ChatOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "from the snapshot");
+    assert_eq!(response.messages.len(), 1);
+    assert_eq!(response.messages[0].message_id.as_deref(), Some("a1"));
+}
+
+#[tokio::test]
 async fn server_tool_call_surfaces_as_a_function_call() {
     // A call to a tool the client did not declare, with no result: surfaced
     // as a FunctionCallContent (upstream unwraps its server_function_call to

@@ -41,14 +41,14 @@
 //! | `TEXT_MESSAGE_START` | assistant update carrying the `messageId` |
 //! | `TEXT_MESSAGE_CONTENT`, `TEXT_MESSAGE_CHUNK` | text delta |
 //! | `TEXT_MESSAGE_END`, `TOOL_CALL_END` | nothing |
-//! | `TOOL_CALL_START` | a [`FunctionCallContent`] with empty arguments |
+//! | `TOOL_CALL_START` | a [`FunctionCallContent`] with empty arguments, on the `parentMessageId` message when given (as are the call's later fragments) |
 //! | `TOOL_CALL_ARGS` | an argument fragment of the call its `toolCallId` names (the latest open call when it has none) |
 //! | `TOOL_CALL_CHUNK` | a call fragment: opens the call on its first chunk, later chunks without an id continue it |
 //! | `TOOL_CALL_RESULT` | a tool-role [`FunctionResultContent`] carrying the event's `messageId` |
 //! | `REASONING_MESSAGE_CONTENT`, `REASONING_MESSAGE_CHUNK` | reasoning delta |
 //! | `REASONING_ENCRYPTED_VALUE` | `protected_data` on the named message's reasoning (`message`) or on the named call (`tool-call`); sent back as `encryptedValue` |
 //! | `STATE_SNAPSHOT`, `STATE_DELTA` | JSON [`DataContent`] (`application/json`, `application/json-patch+json`) |
-//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]` |
+//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]`, plus an update per `assistant` / `tool` message neither sent nor streamed (matched by message id and `toolCallId`) |
 //! | `RUN_FINISHED` | finish reason `stop`; `interrupt`, `outcome`, `interrupts`, `result` metadata; `usage` entries summed into one [`UsageContent`] |
 //! | `RUN_ERROR` | an [`ErrorContent`] with code `RUN_ERROR`, plus any reported `usage` |
 //! | `CUSTOM` | `additional_properties["ag_ui_custom_event"]`; an `annotations` event restores text annotations |
@@ -743,6 +743,18 @@ pub struct AgUiEventConverter {
     /// Every call this run has opened, by `toolCallId`, with its name, so a
     /// `REASONING_ENCRYPTED_VALUE` for a call that already ended still finds it.
     seen_tool_calls: HashMap<String, String>,
+    /// The `parentMessageId` each tool call was opened with, by `toolCallId`,
+    /// so every fragment of the call lands on that message.
+    tool_call_parents: HashMap<String, String>,
+    /// Message ids already accounted for: sent in the request or streamed
+    /// in this run. A `MESSAGES_SNAPSHOT` entry with one of these is skipped.
+    known_message_ids: HashSet<String>,
+    /// Tool call ids sent in the request (calls and results); with
+    /// `seen_tool_calls` and `seen_result_call_ids` they keep a snapshot from
+    /// repeating a call or result the response already has.
+    known_call_ids: HashSet<String>,
+    /// Calls whose `TOOL_CALL_RESULT` this run streamed.
+    seen_result_call_ids: HashSet<String>,
     thread_id: Option<String>,
     run_id: Option<String>,
 }
@@ -863,10 +875,71 @@ impl AgUiEventConverter {
         ])
     }
 
-    /// Convert one AG-UI event. Returns `None` for events that carry nothing
-    /// a chat update can hold (`TEXT_MESSAGE_END`, `TOOL_CALL_END`, unknown
-    /// types). The `type` match is case-insensitive.
+    /// Mark the messages of the request this converter's run answers (AG-UI
+    /// wire messages, as [`messages_to_agui`] builds them) as already known,
+    /// so a `MESSAGES_SNAPSHOT` echoing them back adds nothing.
+    pub fn with_request_messages(mut self, messages: &[Value]) -> Self {
+        for message in messages {
+            if let Some(id) = str_field(message, &["id"]) {
+                self.known_message_ids.insert(id);
+            }
+            if let Some(id) = str_field(message, &["toolCallId", "tool_call_id"]) {
+                self.known_call_ids.insert(id);
+            }
+            let calls = message
+                .get("toolCalls")
+                .or_else(|| message.get("tool_calls"))
+                .and_then(Value::as_array);
+            for call in calls.into_iter().flatten() {
+                if let Some(id) = str_field(call, &["id"]) {
+                    self.known_call_ids.insert(id);
+                }
+            }
+        }
+        self
+    }
+
+    /// Convert one AG-UI event to its primary update. Returns `None` for
+    /// events that carry nothing a chat update can hold (`TEXT_MESSAGE_END`,
+    /// `TOOL_CALL_END`, unknown types). The `type` match is case-insensitive.
+    ///
+    /// A `MESSAGES_SNAPSHOT` also yields one update per snapshot message the
+    /// run has not already produced; only [`Self::convert_event_all`] returns
+    /// those, so prefer it when the stream may carry snapshots.
     pub fn convert_event(&mut self, event: &Value) -> Option<ChatResponseUpdate> {
+        self.convert_event_all(event).into_iter().next()
+    }
+
+    /// Convert one AG-UI event to every update it produces: the update
+    /// [`Self::convert_event`] returns, followed, for a `MESSAGES_SNAPSHOT`,
+    /// by an update for each snapshot message the response does not already
+    /// hold: each `assistant` message (its text and `toolCalls`) and each
+    /// `tool` message (a [`FunctionResultContent`]) whose `id` was neither
+    /// sent in the request (see [`Self::with_request_messages`]) nor streamed
+    /// in this run. Within such a message, a call or result whose
+    /// `toolCallId` the run already has is left out too. Other roles (`user`,
+    /// `system`, `developer`, `reasoning`, `activity`) are input or
+    /// client-side display and are not added. A snapshot does not edit or
+    /// remove messages already produced; the raw list stays available as
+    /// `ag_ui_messages_snapshot`.
+    pub fn convert_event_all(&mut self, event: &Value) -> Vec<ChatResponseUpdate> {
+        let mut out: Vec<ChatResponseUpdate> = self.convert_one(event).into_iter().collect();
+        let is_snapshot = event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case(event_type::MESSAGES_SNAPSHOT));
+        if is_snapshot {
+            out.extend(self.snapshot_messages(event));
+        }
+        for update in &out {
+            if let Some(id) = &update.message_id {
+                self.known_message_ids.insert(id.clone());
+            }
+        }
+        out
+    }
+
+    fn convert_one(&mut self, event: &Value) -> Option<ChatResponseUpdate> {
         let raw_type = event
             .get("type")
             .and_then(Value::as_str)
@@ -929,11 +1002,8 @@ impl AgUiEventConverter {
                 let id = str_field(event, &["toolCallId", "tool_call_id"]).unwrap_or_default();
                 let name = tool_name_of(event).unwrap_or_default();
                 self.open_call(id.clone(), name.clone());
-                Some(assistant_update(vec![call_fragment(
-                    id,
-                    name,
-                    String::new(),
-                )]))
+                self.record_parent(&id, event);
+                Some(self.call_update(id, name, String::new()))
             }
             event_type::TOOL_CALL_ARGS => {
                 // Fragments are keyed by `toolCallId`; aggregation merges each
@@ -944,11 +1014,7 @@ impl AgUiEventConverter {
                     .or_else(|| self.open_tool_calls.last().map(|(id, _)| id.clone()))
                     .unwrap_or_default();
                 let name = self.open_call_name(&id);
-                Some(assistant_update(vec![call_fragment(
-                    id,
-                    name,
-                    delta_of(event),
-                )]))
+                Some(self.call_update(id, name, delta_of(event)))
             }
             event_type::TOOL_CALL_CHUNK => {
                 // Shorthand for start/args/end: the first chunk of a call
@@ -965,13 +1031,10 @@ impl AgUiEventConverter {
                 if !self.open_tool_calls.iter().any(|(open, _)| *open == id) {
                     self.open_call(id.clone(), name.clone().unwrap_or_default());
                 }
+                self.record_parent(&id, event);
                 self.last_chunk_tool_call_id = Some(id.clone());
                 let name = self.open_call_name(&id);
-                Some(assistant_update(vec![call_fragment(
-                    id,
-                    name,
-                    delta_of(event),
-                )]))
+                Some(self.call_update(id, name, delta_of(event)))
             }
             event_type::TOOL_CALL_END => {
                 match str_field(event, &["toolCallId", "tool_call_id"]) {
@@ -984,6 +1047,7 @@ impl AgUiEventConverter {
             }
             event_type::TOOL_CALL_RESULT => {
                 let call_id = str_field(event, &["toolCallId", "tool_call_id"]).unwrap_or_default();
+                self.seen_result_call_ids.insert(call_id.clone());
                 let result = event
                     .get("result")
                     .filter(|v| !v.is_null())
@@ -1113,9 +1177,12 @@ impl AgUiEventConverter {
                     );
                     return None;
                 };
+                let parent = self.tool_call_parents.get(&entity_id).cloned();
                 let mut call = FunctionCallContent::new(entity_id, name.clone(), None);
                 call.protected_data = Some(value);
-                Some(assistant_update(vec![Content::FunctionCall(call)]))
+                let mut update = assistant_update(vec![Content::FunctionCall(call)]);
+                update.message_id = parent;
+                Some(update)
             }
             other => {
                 tracing::warn!(
@@ -1125,6 +1192,107 @@ impl AgUiEventConverter {
                 None
             }
         }
+    }
+
+    /// Remember the `parentMessageId` an opening event gives call `id`. A
+    /// later event without one keeps the call's existing parent.
+    fn record_parent(&mut self, id: &str, event: &Value) {
+        if let Some(parent) =
+            str_field(event, &["parentMessageId", "parent_message_id"]).filter(|p| !p.is_empty())
+        {
+            self.tool_call_parents.insert(id.to_string(), parent);
+        }
+    }
+
+    /// A fragment of call `id`, on the message its `parentMessageId` named so
+    /// aggregation attaches it there rather than to the latest assistant
+    /// message. A call with no parent carries no message id, as before.
+    fn call_update(&self, id: String, name: String, arguments: String) -> ChatResponseUpdate {
+        let parent = self.tool_call_parents.get(&id).cloned();
+        let mut update = assistant_update(vec![call_fragment(id, name, arguments)]);
+        update.message_id = parent;
+        update
+    }
+
+    /// The `MESSAGES_SNAPSHOT` messages the response does not already hold
+    /// (see [`Self::convert_event_all`]), one update each.
+    fn snapshot_messages(&mut self, event: &Value) -> Vec<ChatResponseUpdate> {
+        let Some(messages) = event.get("messages").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for message in messages {
+            let Some(id) = str_field(message, &["id"]).filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if self.known_message_ids.contains(&id) {
+                continue;
+            }
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            let update = match role {
+                "assistant" => self.snapshot_assistant(message),
+                "tool" => self.snapshot_tool(message),
+                _ => None,
+            };
+            if let Some(mut update) = update {
+                update.message_id = Some(id);
+                out.push(update);
+            }
+        }
+        out
+    }
+
+    fn call_known(&self, id: &str) -> bool {
+        self.seen_tool_calls.contains_key(id) || self.known_call_ids.contains(id)
+    }
+
+    fn snapshot_assistant(&mut self, message: &Value) -> Option<ChatResponseUpdate> {
+        let mut contents = Vec::new();
+        if let Some(text) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        {
+            contents.push(Content::text(text));
+        }
+        let calls = message
+            .get("toolCalls")
+            .or_else(|| message.get("tool_calls"))
+            .and_then(Value::as_array);
+        for call in calls.into_iter().flatten() {
+            let Some(call_id) = str_field(call, &["id"]).filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if self.call_known(&call_id) {
+                continue;
+            }
+            let function = call.get("function").unwrap_or(&Value::Null);
+            let name = str_field(function, &["name"]).unwrap_or_default();
+            let arguments = match function.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(other) => other.to_string(),
+            };
+            self.seen_tool_calls.insert(call_id.clone(), name.clone());
+            contents.push(call_fragment(call_id, name, arguments));
+        }
+        (!contents.is_empty()).then(|| assistant_update(contents))
+    }
+
+    fn snapshot_tool(&mut self, message: &Value) -> Option<ChatResponseUpdate> {
+        let call_id = str_field(message, &["toolCallId", "tool_call_id"])?;
+        if self.seen_result_call_ids.contains(&call_id) || self.known_call_ids.contains(&call_id) {
+            return None;
+        }
+        self.seen_result_call_ids.insert(call_id.clone());
+        let result = message.get("content").cloned().filter(|v| !v.is_null());
+        Some(ChatResponseUpdate {
+            contents: vec![Content::FunctionResult(FunctionResultContent::new(
+                call_id, result,
+            ))],
+            role: Some(Role::tool()),
+            ..Default::default()
+        })
     }
 
     /// The name the open call `id` started with, or empty when it is not open.
@@ -1416,7 +1584,7 @@ impl RunStream {
             .and_then(Value::as_str)
             .unwrap_or("UNKNOWN");
         tracing::debug!(kind, "AG-UI event");
-        if let Some(update) = self.converter.convert_event(&event) {
+        for update in self.converter.convert_event_all(&event) {
             if let Some(update) = self.fold.push(update) {
                 self.ready.push_back(update);
             }
@@ -1620,7 +1788,7 @@ impl AgUiChatClient {
         Ok(RunStream {
             bytes: response.bytes_stream().boxed(),
             sse: SseDecoder::default(),
-            converter: AgUiEventConverter::new(),
+            converter: AgUiEventConverter::new().with_request_messages(&run.input.messages),
             fold: MetadataFold::default(),
             ready: VecDeque::new(),
             done: false,
@@ -1668,7 +1836,7 @@ mod tests {
         let mut converter = AgUiEventConverter::new();
         events
             .iter()
-            .filter_map(|e| converter.convert_event(e))
+            .flat_map(|e| converter.convert_event_all(e))
             .collect()
     }
 
@@ -2777,5 +2945,129 @@ mod tests {
             let run = client.prepare(vec![Message::user("hi")], &options).unwrap();
             assert_eq!(run.input.tools.len(), declared);
         }
+    }
+
+    #[test]
+    fn tool_call_attaches_to_its_parent_message() {
+        // m1 opens, then m2; a call whose parent is m1 must land on m1 even
+        // though m2 is the latest assistant message.
+        let updates = convert_all(&[
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "first"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m1"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m2", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "second"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m2"}),
+            json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "a", "parentMessageId": "m1"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": "{\"x\":"}),
+            json!({"type": "TOOL_CALL_ARGS", "delta": "1}"}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "c1"}),
+            json!({"type": "TOOL_CALL_CHUNK", "toolCallId": "c2", "toolCallName": "b", "parentMessageId": "m1", "delta": "{}"}),
+            json!({"type": "TOOL_CALL_CHUNK", "delta": " "}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "tool-call", "entityId": "c1", "encryptedValue": "enc"}),
+        ]);
+        for update in updates.iter().filter(|u| !calls(u).is_empty()) {
+            assert_eq!(update.message_id.as_deref(), Some("m1"));
+        }
+        let response = finalize_response(updates);
+        assert_eq!(response.messages.len(), 2);
+        let m1 = &response.messages[0];
+        assert_eq!(m1.message_id.as_deref(), Some("m1"));
+        let on_m1: Vec<_> = m1
+            .contents
+            .iter()
+            .filter_map(Content::as_function_call)
+            .collect();
+        assert_eq!(on_m1.len(), 2);
+        assert_eq!(raw_args(on_m1[0]), "{\"x\":1}");
+        assert_eq!(on_m1[0].protected_data.as_deref(), Some("enc"));
+        assert_eq!(on_m1[1].name, "b");
+        assert!(response.messages[1]
+            .contents
+            .iter()
+            .all(|c| c.as_function_call().is_none()));
+    }
+
+    #[test]
+    fn tool_call_without_parent_keeps_latest_message() {
+        let updates = convert_all(&[
+            json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "a"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": "{}"}),
+        ]);
+        assert!(updates.iter().all(|u| u.message_id.is_none()));
+    }
+
+    #[test]
+    fn snapshot_only_response_has_its_messages() {
+        let snapshot = json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+            {"id": "u1", "role": "user", "content": "weather?"},
+            {"id": "a1", "role": "assistant", "content": "Checking.", "toolCalls": [
+                {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}}
+            ]},
+            {"id": "t1", "role": "tool", "toolCallId": "c1", "content": "sunny"},
+            {"id": "a2", "role": "assistant", "content": "It is sunny."},
+        ]});
+        let mut c = AgUiEventConverter::new()
+            .with_request_messages(&[json!({"id": "u1", "role": "user", "content": "weather?"})]);
+        let updates: Vec<_> = [
+            json!({"type": "RUN_STARTED", "threadId": "t", "runId": "r"}),
+            snapshot.clone(),
+            // A repeated snapshot adds nothing new.
+            snapshot,
+            json!({"type": "RUN_FINISHED", "threadId": "t", "runId": "r"}),
+        ]
+        .iter()
+        .flat_map(|e| c.convert_event_all(e))
+        .collect();
+        let response = finalize_response(updates);
+        let roles: Vec<_> = response.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(roles, [Role::assistant(), Role::tool(), Role::assistant()]);
+        assert_eq!(response.messages[0].text(), "Checking.");
+        assert_eq!(response.messages[2].text(), "It is sunny.");
+        let calls = response.function_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].parse_arguments().unwrap()["city"], "Oslo");
+        let Content::FunctionResult(result) = &response.messages[1].contents[0] else {
+            panic!("expected a function result")
+        };
+        assert_eq!(result.call_id, "c1");
+        assert!(response.additional_properties["ag_ui_messages_snapshot"].is_array());
+    }
+
+    #[test]
+    fn snapshot_skips_what_was_streamed_or_sent() {
+        let mut c = AgUiEventConverter::new().with_request_messages(&[
+            json!({"id": "old", "role": "assistant", "content": "earlier", "toolCalls": [
+                {"id": "c0", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]}),
+            json!({"id": "old_t", "role": "tool", "toolCallId": "c0", "content": "r0"}),
+        ]);
+        let events = [
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "streamed"}),
+            // Streamed with no parent: the snapshot's copy is under another id.
+            json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "g"}),
+            json!({"type": "TOOL_CALL_RESULT", "toolCallId": "c1", "content": "r1"}),
+            json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+                {"id": "old", "role": "assistant", "content": "earlier"},
+                {"id": "old_t", "role": "tool", "toolCallId": "c0", "content": "r0"},
+                {"id": "m1", "role": "assistant", "content": "streamed"},
+                {"id": "x", "role": "assistant", "toolCalls": [
+                    {"id": "c1", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+                ]},
+                {"id": "y", "role": "tool", "toolCallId": "c1", "content": "r1"},
+                {"id": "new", "role": "assistant", "content": "fresh"},
+            ]}),
+        ];
+        let mut snapshot_updates = Vec::new();
+        for event in &events {
+            snapshot_updates = c.convert_event_all(event);
+        }
+        // The metadata update, then only the fresh message.
+        assert_eq!(snapshot_updates.len(), 2);
+        assert_eq!(snapshot_updates[1].message_id.as_deref(), Some("new"));
+        assert!(matches!(
+            &snapshot_updates[1].contents[..],
+            [Content::Text(t)] if t.text == "fresh"
+        ));
     }
 }
