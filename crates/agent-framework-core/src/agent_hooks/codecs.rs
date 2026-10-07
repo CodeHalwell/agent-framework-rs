@@ -11,7 +11,7 @@
 //! `_ModelResponseCodec`, `_ToolArgumentsCodec`, `_ToolResultCodec` and
 //! `_OutputCodec`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::{Map, Value};
 
@@ -407,68 +407,81 @@ fn write_back_tool_calls(response: &mut ChatResponse, after_calls: &Value) -> Re
         }
         wire_calls.push((id.to_string(), map));
     }
-    let by_id: HashMap<&str, &Map<String, Value>> =
-        wire_calls.iter().map(|(id, m)| (id.as_str(), *m)).collect();
+    // Reconcile occurrence-aware: providers may reuse a call id within one
+    // response, so the k-th wire entry with an id pairs with the k-th native
+    // call carrying it. The rebuilt calls follow the transformed order.
     let resolved = provider_resolved_ids(&response.messages);
-    let mut consumed = HashSet::new();
-    let mut changed = false;
-    for message in &mut response.messages {
+    let mut originals: Vec<Option<FunctionCallContent>> = response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(|c| is_host_call(c, &resolved).cloned())
+        .map(Some)
+        .collect();
+    let before: Vec<FunctionCallContent> = originals.iter().flatten().cloned().collect();
+    let mut rebuilt = Vec::with_capacity(wire_calls.len());
+    for (id, wire) in &wire_calls {
+        let name = wire["name"].as_str().unwrap_or_default();
+        let args = wire["args"].as_object().cloned().unwrap_or_default();
+        let matched = originals
+            .iter_mut()
+            .find(|c| c.as_ref().is_some_and(|c| &c.call_id == id))
+            .and_then(Option::take);
+        let call = match matched {
+            Some(mut call) => {
+                if name != call.name {
+                    call.name = name.to_string();
+                }
+                if call_args_to_wire(&call) != args {
+                    call.arguments = Some(FunctionArguments::Object(args.into_iter().collect()));
+                }
+                call
+            }
+            None => FunctionCallContent::new(
+                id.clone(),
+                name,
+                Some(FunctionArguments::Object(args.into_iter().collect())),
+            ),
+        };
+        rebuilt.push(call);
+    }
+    if rebuilt == before {
+        return Ok(false);
+    }
+    // Put the rebuilt calls where the first native host call was (or at the
+    // end of the last assistant message when there was none).
+    let mut anchor: Option<(usize, usize)> = None;
+    for (mi, message) in response.messages.iter_mut().enumerate() {
         let mut kept = Vec::with_capacity(message.contents.len());
         for content in std::mem::take(&mut message.contents) {
-            let Content::FunctionCall(mut call) = content else {
+            if is_host_call(&content, &resolved).is_some() {
+                anchor.get_or_insert((mi, kept.len()));
+            } else {
                 kept.push(content);
-                continue;
-            };
-            if resolved.contains(&call.call_id) {
-                kept.push(Content::FunctionCall(call));
-                continue;
             }
-            let Some(wire) = by_id.get(call.call_id.as_str()) else {
-                changed = true; // the transform dropped this call
-                continue;
-            };
-            consumed.insert(call.call_id.clone());
-            let name = wire["name"].as_str().unwrap_or_default();
-            if name != call.name {
-                call.name = name.to_string();
-                changed = true;
-            }
-            let args = wire["args"].as_object().cloned().unwrap_or_default();
-            if call_args_to_wire(&call) != args {
-                call.arguments = Some(FunctionArguments::Object(args.into_iter().collect()));
-                changed = true;
-            }
-            kept.push(Content::FunctionCall(call));
         }
         message.contents = kept;
     }
-    let added: Vec<Content> = wire_calls
-        .iter()
-        .filter(|(id, _)| !consumed.contains(id))
-        .map(|(id, wire)| {
-            let args = wire["args"].as_object().cloned().unwrap_or_default();
-            Content::FunctionCall(FunctionCallContent::new(
-                id.clone(),
-                wire["name"].as_str().unwrap_or_default(),
-                Some(FunctionArguments::Object(args.into_iter().collect())),
-            ))
-        })
-        .collect();
-    if !added.is_empty() {
-        match response
+    let rebuilt: Vec<Content> = rebuilt.into_iter().map(Content::FunctionCall).collect();
+    match anchor {
+        Some((mi, at)) => {
+            let contents = &mut response.messages[mi].contents;
+            contents.splice(at..at, rebuilt);
+        }
+        None if rebuilt.is_empty() => {}
+        None => match response
             .messages
             .iter_mut()
             .rev()
             .find(|m| m.role.0 == Role::ASSISTANT)
         {
-            Some(target) => target.contents.extend(added),
+            Some(target) => target.contents.extend(rebuilt),
             None => response
                 .messages
-                .push(Message::with_contents(Role::assistant(), added)),
-        }
-        changed = true;
+                .push(Message::with_contents(Role::assistant(), rebuilt)),
+        },
     }
-    Ok(changed)
+    Ok(true)
 }
 
 /// Rebuild the response's visible content, keeping its host-executed tool

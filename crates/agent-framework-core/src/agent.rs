@@ -1293,11 +1293,13 @@ impl AgentBuilder {
     pub(crate) fn install_agent_hooks(
         mut self,
         agent_mw: Arc<crate::middleware::AgentMiddleware>,
-        function_mw: Arc<crate::middleware::FunctionMiddleware>,
+        function_outer_mw: Arc<crate::middleware::FunctionMiddleware>,
+        function_inner_mw: Arc<crate::middleware::FunctionMiddleware>,
         wrap_client: impl FnOnce(Arc<dyn ChatClient>) -> Arc<dyn ChatClient>,
     ) -> (Agent, Vec<String>) {
         self.agent_middleware.insert(0, agent_mw);
-        self.function_middleware.insert(0, function_mw);
+        self.function_middleware.insert(0, function_outer_mw);
+        self.function_middleware.push(function_inner_mw);
         // Resolve the default model from the raw client before wrapping.
         if self.chat_options.model.is_none() {
             self.chat_options.model = self.client.model().map(str::to_string);

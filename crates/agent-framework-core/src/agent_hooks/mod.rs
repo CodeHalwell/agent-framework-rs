@@ -16,7 +16,7 @@
 //! | `agent_startup`, `input`, `agent_shutdown` | [`AgentHooksAgent`], a decorator around the [`Agent`](crate::agent::Agent) (like .NET's `AgentHooksAgent`) |
 //! | `output` | agent middleware, first in the agent's list |
 //! | `pre_model_call`, `post_model_call` | a chat-client decorator below the function-invocation loop (like .NET's `AgentHooksChatClient`), so each model service call is bracketed |
-//! | `pre_tool_call`, `post_tool_call` | function middleware, first in the agent's list |
+//! | `pre_tool_call`, `post_tool_call` | function middleware: `post_tool_call` first in the agent's list, `pre_tool_call` last (directly around the tool), so each sees what the tool and the loop actually get |
 //!
 //! The split follows the Rust agent's run order. Its agent middleware runs
 //! *after* context providers have loaded history and *before* they persist
@@ -90,9 +90,13 @@
 //! # Protocol layer
 //!
 //! Upstream depends on the external agent-hooks SDK for the emitter and
-//! types. No Rust crate exists, so [`InterceptionEmitter`],
+//! types. The agent-hooks project also ships a canonical Rust core
+//! ([`agent-hooks-sdk`](https://crates.io/crates/agent-hooks-sdk), lib name
+//! `agent_hooks`), but only as a `0.1.0-beta` pre-release, and this module's
+//! public types would have to become (or wrap) its types to adopt it. Until
+//! it reaches a stable release, [`InterceptionEmitter`],
 //! [`InterceptionContextBuilder`], [`Verdict`], [`Interceptor`] and
-//! [`InterceptionRecord`] implement the subset the bundle needs: contexts
+//! [`InterceptionRecord`] reimplement the subset the bundle needs: contexts
 //! validated against the §4 envelope and the §12.3 size and depth bounds,
 //! §5 verdict validation, `$target` transform paths (§5.2), the
 //! `sequential/first_deny` profile with `on_approval: "stop"` (§7.4),
@@ -106,6 +110,10 @@
 //!   allows.
 //! - **Composition profiles** other than `sequential/first_deny`
 //!   (`sequential/run_all`, `parallel/strictest`, `parallel/unanimous`).
+//! - **Result-label flow (§5.4).** Labels are unioned onto the combined
+//!   verdict and its record, but not persisted with the data the action
+//!   produced nor resurfaced as `extensions.*.source_labels` on later
+//!   points.
 //! - **Identity providers (§10).** No `jcs-sha256` (RFC 8785 + SHA-256) or
 //!   custom provider: records carry `null` identities and
 //!   `identity_provider: null`, i.e. they are identity-unbound.

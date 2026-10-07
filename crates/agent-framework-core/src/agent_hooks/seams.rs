@@ -3,12 +3,13 @@
 //! sharing one per-run state through a task-local (the counterpart of
 //! upstream's `ContextVar` / .NET's `AsyncLocal`).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::codecs;
 use super::protocol::{
@@ -121,6 +122,20 @@ struct RunState {
     session_scoped: bool,
     config: Arc<Config>,
     halted: Mutex<Option<Halt>>,
+    /// Tool invocations in flight, keyed by the token the outer tool seam
+    /// puts in the invocation's metadata; the inner seam records there
+    /// whether (and with which arguments) the call was dispatched.
+    tool_calls: Mutex<HashMap<String, ToolTrack>>,
+}
+
+/// What the inner tool seam observed for one invocation.
+enum ToolTrack {
+    /// The inner seam has not run (yet): no `pre_tool_call` was emitted.
+    Pending,
+    /// `pre_tool_call` blocked the call; no `post_tool_call` follows (§6.2).
+    Blocked,
+    /// The call was dispatched with these (post-transform) arguments.
+    Dispatched(Map<String, Value>),
 }
 
 impl RunState {
@@ -240,9 +255,12 @@ impl AgentHooks {
 
     /// Install every seam on `builder` and build the guarded agent.
     ///
-    /// The bundle's agent and function middleware go first in their lists,
-    /// whatever was added before: middleware outside the bundle would run
-    /// outside the enforcement boundary. Its model-call seam wraps the
+    /// The bundle's agent middleware and the `post_tool_call` half of its
+    /// function seam go first in their lists, whatever was added before:
+    /// middleware outside the bundle would run outside the enforcement
+    /// boundary. The `pre_tool_call` half goes last, directly around the
+    /// tool, so it judges the arguments the tool actually receives. Its
+    /// model-call seam wraps the
     /// supplied chat client directly, below the function-invocation loop,
     /// so every model service call is bracketed individually.
     pub fn build_agent(self, builder: AgentBuilder) -> AgentHooksAgent {
@@ -252,7 +270,10 @@ impl AgentHooks {
             Arc::new(OutputMiddleware {
                 config: config.clone(),
             }),
-            Arc::new(ToolMiddleware {
+            Arc::new(ToolPostMiddleware {
+                config: config.clone(),
+            }),
+            Arc::new(ToolPreMiddleware {
                 config: config.clone(),
             }),
             move |client| {
@@ -332,6 +353,7 @@ impl AgentHooksAgent {
             session_scoped,
             config: config.clone(),
             halted: Mutex::new(None),
+            tool_calls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -611,8 +633,10 @@ impl ChatClient for GuardedChatClient {
 }
 
 /// Re-derive stream updates from a (transformed) response: one per message,
-/// with the response-level metadata on each and the finish reason, usage and
-/// continuation token on the last.
+/// with the response-level metadata (ids, model, `created_at`) on each and
+/// the finish reason, usage, continuation token and `additional_properties`
+/// on the last, so [`ChatResponse::from_updates`] reassembles the same
+/// metadata the buffered stream carried.
 fn chat_response_to_updates(response: ChatResponse) -> Vec<ChatResponseUpdate> {
     let last = response.messages.len().saturating_sub(1);
     let mut updates: Vec<ChatResponseUpdate> = response
@@ -627,6 +651,7 @@ fn chat_response_to_updates(response: ChatResponse) -> Vec<ChatResponseUpdate> {
             response_id: response.response_id.clone(),
             conversation_id: response.conversation_id.clone(),
             model: response.model.clone(),
+            created_at: response.created_at.clone(),
             ..Default::default()
         })
         .collect();
@@ -636,6 +661,7 @@ fn chat_response_to_updates(response: ChatResponse) -> Vec<ChatResponseUpdate> {
             response_id: response.response_id.clone(),
             conversation_id: response.conversation_id.clone(),
             model: response.model.clone(),
+            created_at: response.created_at.clone(),
             ..Default::default()
         });
     }
@@ -643,14 +669,25 @@ fn chat_response_to_updates(response: ChatResponse) -> Vec<ChatResponseUpdate> {
     let tail = &mut updates[tail_index];
     tail.finish_reason = response.finish_reason;
     tail.continuation_token = response.continuation_token;
+    tail.additional_properties = response.additional_properties;
     if let Some(details) = response.usage_details {
         tail.contents.push(Content::Usage(UsageContent { details }));
     }
     updates
 }
 
-/// Function seam: `pre_tool_call` / `post_tool_call` around each
-/// host-executed tool call.
+/// The metadata key carrying the outer tool seam's per-invocation token.
+const TOOL_TOKEN_KEY: &str = "agent_hooks.invocation";
+
+/// Function seam, outer half: `post_tool_call`.
+///
+/// The function seam is two function middleware. [`ToolPreMiddleware`] is
+/// **last** in the agent's list, directly around the tool, so
+/// `pre_tool_call` judges (and its transform rewrites) the arguments the
+/// tool actually receives, after every other middleware has rewritten them.
+/// This one is **first**, so `post_tool_call` judges the result the function
+/// loop actually uses, after every other middleware has rewritten it, and
+/// reports the arguments the inner half saw dispatched (§4.2).
 ///
 /// A policy deny blocks the call (the tool is not run, or its result is
 /// discarded) and hands the model a tool-error payload so the loop can
@@ -659,82 +696,117 @@ fn chat_response_to_updates(response: ChatResponse) -> Vec<ChatResponseUpdate> {
 /// (fail open for an enforcement failure), so the seam returns
 /// [`Error::MiddlewareFailure`], the loop's one fail-closed escape, and the
 /// agent decorator surfaces the recorded block at the run boundary.
-struct ToolMiddleware {
+///
+/// A middleware between the halves that answers without calling on reaches
+/// no tool: nothing is emitted for it here, and its result reaches the model
+/// through the next `pre_model_call`.
+struct ToolPostMiddleware {
     config: Arc<Config>,
 }
 
-impl ToolMiddleware {
-    fn block(
-        state: &RunState,
-        mut ctx: FunctionInvocationContext,
-        b: Box<InterceptionBlocked>,
-    ) -> Result<FunctionInvocationContext> {
-        if b.is_host_error() {
-            return Err(state.halt(Halt::Blocked(b)));
-        }
-        let mut payload = serde_json::json!({
-            "error": format!("Tool call blocked by agent-hooks at {}.", b.point()),
-            "reason": b.reason().unwrap_or("deny"),
-        });
-        if let Some(message) = &b.verdict.message {
-            payload["message"] = Value::String(message.clone());
-        }
-        ctx.result = Some(payload);
-        Ok(ctx)
+/// Function seam, inner half: `pre_tool_call`; see [`ToolPostMiddleware`].
+struct ToolPreMiddleware {
+    config: Arc<Config>,
+}
+
+/// The model's call id for an invocation (a fresh one when it has none).
+fn invocation_call_id(ctx: &FunctionInvocationContext) -> String {
+    ctx.metadata
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// The tool-error payload a policy deny hands the model.
+fn blocked_payload(b: &InterceptionBlocked) -> Value {
+    let mut payload = serde_json::json!({
+        "error": format!("Tool call blocked by agent-hooks at {}.", b.point()),
+        "reason": b.reason().unwrap_or("deny"),
+    });
+    if let Some(message) = &b.verdict.message {
+        payload["message"] = Value::String(message.clone());
     }
+    payload
+}
+
+fn block_tool(
+    state: &RunState,
+    mut ctx: FunctionInvocationContext,
+    b: Box<InterceptionBlocked>,
+) -> Result<FunctionInvocationContext> {
+    if b.is_host_error() {
+        return Err(state.halt(Halt::Blocked(b)));
+    }
+    ctx.result = Some(blocked_payload(&b));
+    Ok(ctx)
 }
 
 #[async_trait]
-impl Middleware<FunctionInvocationContext> for ToolMiddleware {
+impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
     async fn process(
         &self,
         mut ctx: FunctionInvocationContext,
         next: Next<FunctionInvocationContext>,
     ) -> Result<FunctionInvocationContext> {
         let state = current_state(&self.config, "function")?;
-        let call_id = ctx
-            .metadata
-            .get("call_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        let call_id = invocation_call_id(&ctx);
+        // The inner half reports the same id even when the model gave none.
+        ctx.metadata
+            .insert("call_id".into(), Value::String(call_id.clone()));
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        state
+            .tool_calls
+            .lock()
+            .unwrap()
+            .insert(token.clone(), ToolTrack::Pending);
+        ctx.metadata
+            .insert(TOOL_TOKEN_KEY.into(), Value::String(token.clone()));
         let name = ctx.function_name.clone();
-        let mut args = codecs::tool_args_to_wire(&ctx.arguments);
-        let pre = state.builder.pre_tool_call(&call_id, &name, args.clone());
-        match state.emitter.emit(pre).await {
-            Ok(outcome) => match codecs::tool_args_write_back(&args, &outcome.target) {
-                Ok(Some(rewritten)) => {
-                    ctx.arguments = Value::Object(rewritten.clone());
-                    args = rewritten;
-                }
-                Ok(None) => {}
-                Err(e) => return Err(state.halt(Halt::Failure(e.to_string()))),
-            },
-            // §6.2: not dispatched, and no post_tool_call.
-            Err(b) => return Self::block(&state, ctx, b),
-        }
 
-        match next.run(ctx).await {
+        let result = next.run(ctx).await;
+        let track = state.tool_calls.lock().unwrap().remove(&token);
+        let args = match track {
+            Some(ToolTrack::Dispatched(args)) => args,
+            // Blocked at pre_tool_call (§6.2: no post_tool_call), or no tool
+            // was reached at all.
+            Some(ToolTrack::Blocked | ToolTrack::Pending) | None => {
+                return result.map(|mut ctx| {
+                    ctx.metadata.remove(TOOL_TOKEN_KEY);
+                    ctx
+                });
+            }
+        };
+
+        match result {
+            // A halt (the inner half's, or another fail-closed middleware's)
+            // stays a halt.
+            Err(error) if error.is_middleware_failure() => Err(error),
             Err(error) => {
                 // The invocation errored; the contract still brackets it.
-                let post = state.builder.post_tool_call(
-                    &call_id,
-                    &name,
-                    args,
-                    Value::String(crate::observability::error_type(&error)),
-                    true,
-                );
-                if let Err(b) = state.emitter.emit(post).await {
-                    // A policy deny over an errored call changes nothing; a
-                    // host error still halts the run.
-                    if b.is_host_error() {
-                        return Err(state.halt(Halt::Blocked(b)));
+                let value = Value::String(crate::observability::error_type(&error));
+                let post = state
+                    .builder
+                    .post_tool_call(&call_id, &name, args, value.clone(), true);
+                match state.emitter.emit(post).await {
+                    // A transform rewrites the error the loop hands the model.
+                    Ok(outcome) if outcome.target != value => {
+                        let text = match outcome.target {
+                            Value::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        Err(Error::Tool(text))
                     }
+                    Ok(_) => Err(error),
+                    // A host error halts the run; a policy deny over an
+                    // errored call changes nothing.
+                    Err(b) if b.is_host_error() => Err(state.halt(Halt::Blocked(b))),
+                    Err(_) => Err(error),
                 }
-                Err(error)
             }
             Ok(mut ctx) => {
+                ctx.metadata.remove(TOOL_TOKEN_KEY);
                 let value = ctx.result.clone().unwrap_or(Value::Null);
                 let post =
                     state
@@ -748,10 +820,63 @@ impl Middleware<FunctionInvocationContext> for ToolMiddleware {
                         Ok(ctx)
                     }
                     // §6.1: the result is discarded as if the call errored.
-                    Err(b) => Self::block(&state, ctx, b),
+                    Err(b) => block_tool(&state, ctx, b),
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        let state = current_state(&self.config, "function")?;
+        // The outer half's token. A middleware that dropped it, or an
+        // invocation that bypassed the outer half, leaves the call
+        // unbracketed: fail closed.
+        let token = match ctx.metadata.remove(TOOL_TOKEN_KEY) {
+            Some(Value::String(token)) if state.tool_calls.lock().unwrap().contains_key(&token) => {
+                token
+            }
+            _ => {
+                return Err(state.halt(Halt::Failure(
+                    "agent-hooks: tool invocation not bracketed by the tool seam".into(),
+                )));
+            }
+        };
+        let call_id = invocation_call_id(&ctx);
+        let name = ctx.function_name.clone();
+        let mut args = codecs::tool_args_to_wire(&ctx.arguments);
+        let pre = state.builder.pre_tool_call(&call_id, &name, args.clone());
+        match state.emitter.emit(pre).await {
+            Ok(outcome) => match codecs::tool_args_write_back(&args, &outcome.target) {
+                Ok(Some(rewritten)) => {
+                    ctx.arguments = Value::Object(rewritten.clone());
+                    args = rewritten;
+                }
+                Ok(None) => {}
+                Err(e) => return Err(state.halt(Halt::Failure(e.to_string()))),
+            },
+            // §6.2: not dispatched, and no post_tool_call.
+            Err(b) => {
+                state
+                    .tool_calls
+                    .lock()
+                    .unwrap()
+                    .insert(token, ToolTrack::Blocked);
+                return block_tool(&state, ctx, b);
+            }
+        }
+        state
+            .tool_calls
+            .lock()
+            .unwrap()
+            .insert(token, ToolTrack::Dispatched(args));
+        next.run(ctx).await
     }
 }
 
@@ -767,6 +892,18 @@ impl AgentBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rederived_updates_keep_response_metadata() {
+        let mut response = ChatResponse::from_text("transformed");
+        response.created_at = Some("2026-10-07T00:00:00Z".into());
+        response
+            .additional_properties
+            .insert("provider".into(), Value::String("p".into()));
+        let back = ChatResponse::from_updates(chat_response_to_updates(response.clone()));
+        assert_eq!(back.created_at, response.created_at);
+        assert_eq!(back.additional_properties, response.additional_properties);
+    }
 
     struct Unreachable;
 
@@ -798,6 +935,7 @@ mod tests {
             session_scoped: false,
             config,
             halted: Mutex::new(None),
+            tool_calls: Mutex::new(HashMap::new()),
         })
     }
 

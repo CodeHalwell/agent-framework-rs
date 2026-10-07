@@ -51,7 +51,10 @@ from the roadmap, not from this file.
   enforcement bundle): the approval seam (liftable denies are enforced as
   plain denies), the `sequential/run_all` and parallel composition profiles,
   the `jcs-sha256` and custom identity providers (records are
-  identity-unbound), and an `agent_shutdown` on cancellation.
+  identity-unbound), an `agent_shutdown` on cancellation, and §5.4
+  result-label flow (labels reach the combined verdict and the record but
+  are not persisted with the produced data or resurfaced as
+  `source_labels`; upstream's framework layer does not do this either).
 - **AG-UI client** (the hosting crate has the server side only).
 - **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).

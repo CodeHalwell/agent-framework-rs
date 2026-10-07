@@ -11,7 +11,7 @@ use super::*;
 use crate::agent::{Agent, AgentRunOptions, SupportsAgentRun};
 use crate::client::{ChatClient, ChatStream};
 use crate::error::{Error, Result};
-use crate::middleware::{AgentContext, Middleware, Next};
+use crate::middleware::{AgentContext, FunctionInvocationContext, Middleware, Next};
 use crate::tools::FunctionTool;
 use crate::types::{
     AgentResponse, ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason,
@@ -736,4 +736,186 @@ async fn nested_guarded_agents_keep_their_own_runs() {
     assert_eq!(post.target(), &json!("sub answer"));
     let session = seen[0].session_id();
     assert!(seen.iter().all(|c| c.session_id() == session));
+}
+
+/// A user function middleware that rewrites the tool arguments.
+struct RewriteArgs(Value);
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for RewriteArgs {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        ctx.arguments = self.0.clone();
+        next.run(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_call_judges_the_arguments_after_user_middleware() {
+    // A deny keyed on the rewritten arguments must stop the call.
+    let count = Arc::new(AtomicUsize::new(0));
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({"q": "public"})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, _) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PreToolCall if ctx.target()["q"] == "sensitive" => {
+            Verdict::deny("sensitive_path")
+        }
+        _ => Verdict::allow(),
+    });
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_middleware(Arc::new(RewriteArgs(json!({"q": "sensitive"})))),
+    );
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+
+    // An allowed call reports the arguments the tool actually received.
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({"q": "original"})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|_| Verdict::allow());
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_middleware(Arc::new(RewriteArgs(json!({"q": "rewritten"})))),
+    );
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let seen = seen.lock().unwrap();
+    let pre = seen
+        .iter()
+        .find(|c| c.point() == InterceptionPoint::PreToolCall)
+        .unwrap();
+    assert_eq!(pre.target(), &json!({"q": "rewritten"}));
+    assert_eq!(pre.as_json()["tool_call"]["id"], "c1");
+    let post = seen
+        .iter()
+        .find(|c| c.point() == InterceptionPoint::PostToolCall)
+        .unwrap();
+    assert_eq!(
+        post.as_json()["tool_call"]["args"],
+        json!({"q": "rewritten"})
+    );
+    assert_eq!(post.as_json()["tool_call"]["id"], "c1");
+    assert_eq!(post.target(), &json!({"found": "rewritten"}));
+}
+
+#[tokio::test]
+async fn post_tool_call_transform_rewrites_an_errored_result() {
+    let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
+        Err::<Value, _>(Error::Tool("raw internal detail".into()))
+    })
+    .into_definition();
+    let (client, requests) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PostToolCall => Verdict::transform("$target", json!("sanitized")),
+        _ => Verdict::allow(),
+    });
+    let config = crate::tools::FunctionInvocationConfig {
+        include_detailed_errors: true,
+        ..Default::default()
+    };
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(failing)
+            .function_invocation_config(config),
+    );
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.point() == InterceptionPoint::PostToolCall)
+            .unwrap()
+            .as_json()["tool_result"]["is_error"],
+        true
+    );
+    let requests = requests.lock().unwrap();
+    let exception = requests[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(Content::as_function_result)
+        .and_then(|r| r.exception.clone())
+        .unwrap();
+    assert!(exception.contains("sanitized"), "{exception}");
+    assert!(!exception.contains("raw internal detail"), "{exception}");
+}
+
+fn host_calls(response: &ChatResponse) -> Vec<(String, Value)> {
+    response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(|c| match c {
+            Content::FunctionCall(call) => Some((
+                call.call_id.clone(),
+                Value::Object(call.parse_arguments().unwrap().into_iter().collect()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn two_calls(first: &str, second: &str) -> ChatResponse {
+    let call = |id: &str, q: i64| {
+        Content::FunctionCall(FunctionCallContent::new(
+            id,
+            "lookup",
+            Some(FunctionArguments::Object(
+                [("q".to_string(), json!(q))].into_iter().collect(),
+            )),
+        ))
+    };
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            "assistant",
+            vec![Content::text("calling"), call(first, 1), call(second, 2)],
+        )],
+        finish_reason: Some(FinishReason::tool_calls()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn post_model_call_transform_reorders_tool_calls() {
+    let mut response = two_calls("a", "b");
+    let before = codecs::response_to_wire(&response).unwrap();
+    let mut after = before.clone();
+    after["tool_calls"].as_array_mut().unwrap().swap(0, 1);
+    assert!(codecs::response_write_back(&mut response, &before, &after).unwrap());
+    assert_eq!(
+        host_calls(&response),
+        vec![("b".into(), json!({"q": 2})), ("a".into(), json!({"q": 1}))]
+    );
+    // The visible text keeps its place ahead of the calls.
+    assert!(matches!(
+        &response.messages[0].contents[0],
+        Content::Text(_)
+    ));
+}
+
+#[test]
+fn post_model_call_transform_keeps_duplicate_call_ids_apart() {
+    let mut response = two_calls("dup", "dup");
+    let before = codecs::response_to_wire(&response).unwrap();
+    let mut after = before.clone();
+    after["tool_calls"][1]["args"] = json!({"q": 3});
+    assert!(codecs::response_write_back(&mut response, &before, &after).unwrap());
+    assert_eq!(
+        host_calls(&response),
+        vec![
+            ("dup".into(), json!({"q": 1})),
+            ("dup".into(), json!({"q": 3}))
+        ]
+    );
 }

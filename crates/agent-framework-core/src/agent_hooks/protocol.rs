@@ -2,9 +2,11 @@
 //! verdicts, the interceptor trait, the emitter and the interception record.
 //!
 //! Upstream depends on the external `agent-hooks` SDK for this layer (Python
-//! `agent_hooks`, .NET `ResponsibleAI.AgentHooks`). No Rust crate exists, so
-//! the subset the enforcement bundle needs is implemented here, following the
-//! SDK's emitter: one `sequential/first_deny` composition profile with
+//! `agent_hooks`, .NET `ResponsibleAI.AgentHooks`). Its Rust core,
+//! `agent-hooks-sdk`, is published only as a `0.1.0-beta` pre-release, so
+//! rather than depend on it the subset the enforcement bundle needs is
+//! reimplemented here (see [`crate::agent_hooks`]), following the SDK's
+//! emitter: one `sequential/first_deny` composition profile with
 //! `on_approval: "stop"`, no approval resolver, and no identity provider (see
 //! the module docs of [`crate::agent_hooks`] for what is left out).
 
@@ -432,6 +434,7 @@ pub enum Decision {
 
 /// A recorded concern that does not change control flow (§5.1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Warning {
     /// Machine-readable reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +446,7 @@ pub struct Warning {
 
 /// The rewrite a `transform` verdict carries (§5.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transform {
     /// A path rooted at `$target` (`$policy_target` is accepted as a
     /// deprecated alias): dot members, `[index]` and `["member"]` only.
@@ -460,6 +464,7 @@ pub struct Transform {
 /// non-transform decision, oversized evidence, ...) is replaced by a
 /// `deny host_error:verdict_invalid`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verdict {
     /// The decision.
     pub decision: Decision,
@@ -480,8 +485,9 @@ pub struct Verdict {
     /// The rewrite; present iff the decision is `transform`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<Transform>,
-    /// An opaque pointer to offline evidence (an object, at most 10 KiB
-    /// serialized).
+    /// An opaque pointer to offline evidence: an object with only an
+    /// `artefact` string and a `verification_pointers` map of strings, at
+    /// most 10 KiB serialized (§5.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
     /// Labels for label-flow tracking (§5.4).
@@ -564,8 +570,15 @@ impl Verdict {
 
     /// Parse a wire verdict (for interceptors that delegate to a remote
     /// service). Validation happens at emission time.
+    ///
+    /// The verdict schema admits no unknown members, so a typo such as
+    /// `"transformm"` is rejected rather than read as a bare `allow`. An
+    /// interceptor that returns this error (e.g. with `?`) fails its
+    /// emission closed as `deny host_error:verdict_invalid`.
     pub fn from_json(value: Value) -> crate::Result<Self> {
-        serde_json::from_value(value).map_err(Into::into)
+        serde_json::from_value(value).map_err(|e| {
+            crate::Error::Serialization(format!("{}: {e}", host_error::VERDICT_INVALID))
+        })
     }
 
     /// Whether this verdict lets the action proceed (`allow`/`transform`).
@@ -585,6 +598,13 @@ impl Verdict {
         if self.is_host_error() {
             return Err("reason must not start with host_error:".into());
         }
+        if self.warnings.iter().any(|w| {
+            w.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(host_error::PREFIX))
+        }) {
+            return Err("a warning reason must not start with host_error:".into());
+        }
         if (self.decision == Decision::Transform) != self.transform.is_some() {
             return Err("transform must be present iff decision is transform".into());
         }
@@ -592,8 +612,23 @@ impl Verdict {
             return Err("approval is only valid on a deny".into());
         }
         if let Some(evidence) = &self.evidence {
-            if !evidence.is_object() {
+            let Some(map) = evidence.as_object() else {
                 return Err("evidence must be an object".into());
+            };
+            for (key, value) in map {
+                let ok = match key.as_str() {
+                    "artefact" => value.is_string() || value.is_null(),
+                    "verification_pointers" => value
+                        .as_object()
+                        .is_some_and(|p| p.values().all(Value::is_string)),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(
+                        "evidence admits only an artefact string and string verification_pointers"
+                            .into(),
+                    );
+                }
             }
             let size = serde_json::to_vec(evidence).map(|v| v.len()).unwrap_or(0);
             if size > MAX_EVIDENCE_BYTES {
@@ -1100,6 +1135,14 @@ impl InterceptionEmitter {
             }
             // Only a type-level description crosses into the record (§14): an
             // error's text may carry target content.
+            Ok(Err(crate::Error::Serialization(m)))
+                if m.starts_with(host_error::VERDICT_INVALID) =>
+            {
+                Verdict::host_error(
+                    host_error::VERDICT_INVALID,
+                    Some("unparseable verdict".into()),
+                )
+            }
             Ok(Err(_)) => Verdict::host_error(host_error::INTERCEPTOR_FAILED, Some("error".into())),
             Ok(Ok(verdict)) => match verdict.validate() {
                 Ok(()) => verdict,
@@ -1350,6 +1393,62 @@ fn format_rfc3339(secs: i64, millis: u32) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn reason_for(verdict: Value) -> Option<String> {
+        let emitter = InterceptionEmitter::new().register(
+            Arc::new(interceptor_fn(move |_| {
+                let verdict = verdict.clone();
+                async move { Verdict::from_json(verdict) }
+            })),
+            None,
+        );
+        let b = InterceptionContextBuilder::new("agent-1", "agent-framework", "s1");
+        match emitter.emit(b.output(json!("x"))).await {
+            Ok(_) => None,
+            Err(blocked) => blocked.reason().map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_verdicts_fail_closed_on_schema_violations() {
+        let invalid = Some(host_error::VERDICT_INVALID.to_string());
+        // Unknown members (a typo) are not an allow.
+        assert_eq!(
+            reason_for(json!({"decision": "allow", "transformm": {}})).await,
+            invalid
+        );
+        assert_eq!(
+            reason_for(json!({"decision": "allow", "warnings": [{"reasn": "x"}]})).await,
+            invalid
+        );
+        // The reserved prefix is rejected in warnings too.
+        assert_eq!(
+            reason_for(json!({"decision": "allow", "warnings": [{"reason": "host_error:spoof"}]}))
+                .await,
+            invalid
+        );
+        // Evidence admits only artefact and string verification_pointers.
+        assert_eq!(
+            reason_for(json!({"decision": "allow", "evidence": {"payload": "secret"}})).await,
+            invalid
+        );
+        assert_eq!(
+            reason_for(
+                json!({"decision": "allow", "evidence": {"verification_pointers": {"a": 1}}})
+            )
+            .await,
+            invalid
+        );
+        assert_eq!(
+            reason_for(json!({
+                "decision": "allow",
+                "warnings": [{"reason": "note"}],
+                "evidence": {"artefact": "sha256:00", "verification_pointers": {"log": "https://x"}}
+            }))
+            .await,
+            None
+        );
+    }
 
     #[test]
     fn rfc3339_formats_known_instants() {
