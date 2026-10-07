@@ -75,3 +75,29 @@ jobs:
       # need 1.85+, the icu/idna chain needs 1.86, and redis 1.3.0 needs 1.88.
       - name: Check on MSRV (all features)
         run: cargo check --workspace --all-targets --all-features --verbose
+
+  parity:
+    name: Parity ledger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-parity-${{ hashFiles('**/Cargo.lock') }}
+
+      # Rebuilds the Rust public-API index from rustdoc JSON and checks every
+      # ledger entry against it, the .NET inventory and the Go catalog
+      # (docs/parity/README.md). Fails when a ledger entry names a Rust symbol
+      # that no longer exists, so renames and removals cannot silently
+      # orphan it, and when docs/parity/STATUS.md is stale.
+      - name: Check the parity ledger
+        run: cargo xtask parity check
