@@ -21,9 +21,13 @@ may break APIs).
   response but drop the result that settled it) and before the no-tools fast
   path, so a settled approval never reaches the model on either route.
 - **OpenAI Responses dropped completed hosted MCP calls.** An `mcp_call`
-  output item (and its streamed `output_item.added`/`.done` events) is now
-  parsed into `McpServerToolCall`/`McpServerToolResult` contents and replayed
-  as one `mcp_call` input item carrying its output, as upstream does. A hosted
+  output item (streamed: its completed `output_item.done` item, which carries
+  the final arguments) is now parsed into
+  `McpServerToolCall`/`McpServerToolResult` contents and replayed as one
+  `mcp_call` input item carrying its output, as upstream does. A call that
+  failed keeps its `error` (new `McpServerToolResultContent::error`) and
+  replays it, so it does not look unfinished; upstream drops both the error
+  and, when streamed, the arguments. A hosted
   approval replayed from local history is therefore followed by the call it
   approved, rather than standing alone as an approval still to act on.
   `McpServerToolCallContent` and `McpServerToolResultContent` are now exported
