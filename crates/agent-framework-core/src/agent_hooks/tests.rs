@@ -908,6 +908,93 @@ async fn post_tool_call_transform_rewrites_an_errored_result() {
 }
 
 #[tokio::test]
+async fn post_tool_call_judges_the_error_text_the_model_sees() {
+    // A rejection is shown verbatim; another error only with detailed
+    // errors on. post_tool_call must judge exactly that text.
+    async fn judged(error: fn() -> Error, detailed: bool) -> (Value, String) {
+        let failing = FunctionTool::new(
+            "lookup",
+            "",
+            json!({"type": "object"}),
+            move |_| async move { Err::<Value, _>(error()) },
+        )
+        .into_definition();
+        let (client, requests) = Scripted::new(vec![
+            tool_call_reply("c1", "lookup", json!({})),
+            text_reply("handled"),
+        ]);
+        let (interceptor, seen) = recorder(|_| Verdict::allow());
+        let config = crate::tools::FunctionInvocationConfig {
+            include_detailed_errors: detailed,
+            ..Default::default()
+        };
+        let agent = hooks(interceptor).build_agent(
+            Agent::builder(client)
+                .tool(failing)
+                .function_invocation_config(config),
+        );
+        agent.run(vec![Message::user("go")], None).await.unwrap();
+        let target = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.point() == InterceptionPoint::PostToolCall)
+            .unwrap()
+            .target()
+            .clone();
+        let exception = requests.lock().unwrap()[1]
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .find_map(Content::as_function_result)
+            .and_then(|r| r.exception.clone())
+            .unwrap();
+        (target, exception)
+    }
+
+    let (target, seen) = judged(|| Error::tool_rejected("secret 1234"), false).await;
+    assert_eq!(seen, "secret 1234");
+    assert_eq!(target, json!(seen));
+
+    let (target, seen) = judged(|| Error::Tool("secret 1234".into()), true).await;
+    assert!(seen.contains("secret 1234"), "{seen}");
+    assert_eq!(target, json!(seen));
+
+    let (target, seen) = judged(|| Error::Tool("secret 1234".into()), false).await;
+    assert!(!seen.contains("secret"), "{seen}");
+    assert_eq!(target, json!(seen));
+}
+
+#[tokio::test]
+async fn post_tool_call_deny_discards_an_errored_result() {
+    let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
+        Err::<Value, _>(Error::tool_rejected("secret 1234"))
+    })
+    .into_definition();
+    let (client, requests) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, _) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PostToolCall => Verdict::deny("leaky_result"),
+        _ => Verdict::allow(),
+    });
+    let agent = hooks(interceptor).build_agent(Agent::builder(client).tool(failing));
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    let requests = requests.lock().unwrap();
+    let result = requests[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(Content::as_function_result)
+        .unwrap();
+    // §6.1: the denied error payload never reaches the model; the
+    // blocked-call payload replaces it.
+    assert_eq!(result.result, None);
+    let exception = result.exception.as_deref().unwrap();
+    assert!(exception.contains("leaky_result"), "{exception}");
+    assert!(!exception.contains("secret"), "{exception}");
+}
+
+#[tokio::test]
 async fn post_tool_call_brackets_a_dispatched_call_that_fails_closed() {
     let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
         Err::<Value, _>(Error::middleware_failure("executor halted"))

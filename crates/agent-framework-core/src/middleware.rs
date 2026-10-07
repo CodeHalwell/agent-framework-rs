@@ -238,6 +238,11 @@ pub struct FunctionInvocationContext {
     /// middleware may rewrite, it cannot be changed outside the crate, so
     /// enforcement judges the tool that actually runs.
     pub(crate) tool_name: Option<String>,
+    /// Whether the function loop that dispatched this invocation shows the
+    /// model a failed call's full error text (its
+    /// `include_detailed_errors`), so middleware can judge the error result
+    /// the model will actually see.
+    pub(crate) include_detailed_errors: bool,
 }
 
 impl FunctionInvocationContext {
@@ -251,12 +256,19 @@ impl FunctionInvocationContext {
             result: None,
             terminate: false,
             tool_name: None,
+            include_detailed_errors: false,
         }
     }
 
     /// Builder: record the selected tool definition's name.
     pub(crate) fn with_tool_name(mut self, name: impl Into<String>) -> Self {
         self.tool_name = Some(name.into());
+        self
+    }
+
+    /// Builder: record the dispatching loop's `include_detailed_errors`.
+    pub(crate) fn with_detailed_errors(mut self, detailed: bool) -> Self {
+        self.include_detailed_errors = detailed;
         self
     }
 

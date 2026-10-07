@@ -441,6 +441,17 @@ struct ToolCallOutcome {
     content: FunctionResultContent,
 }
 
+/// The error text the model sees for a dispatched tool call that failed.
+pub(crate) fn tool_error_message(e: &Error, include_detailed_errors: bool) -> String {
+    match e {
+        // Addressed to the model by the middleware itself: shown verbatim
+        // whatever the detail setting.
+        Error::ToolRejected(msg) => msg.clone(),
+        e if include_detailed_errors => format!("{e}"),
+        _ => "tool execution failed".to_string(),
+    }
+}
+
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
@@ -538,6 +549,7 @@ async fn execute_tool_call(
 
             let mut ctx = FunctionInvocationContext::new(call.name.clone(), args)
                 .with_tool_name(def.name.clone())
+                .with_detailed_errors(include_detailed_errors)
                 .with_session(session.cloned())
                 .with_tools(live_tools.cloned());
             // Middleware can correlate the invocation with the model's call
@@ -561,13 +573,7 @@ async fn execute_tool_call(
                 // other error keeps the absorb-and-continue contract below.
                 Err(e) if e.is_middleware_failure() => Err(e),
                 Err(e) => {
-                    let msg = match e {
-                        // Addressed to the model by the middleware itself:
-                        // shown verbatim whatever the detail setting.
-                        Error::ToolRejected(msg) => msg,
-                        e if include_detailed_errors => format!("{e}"),
-                        _ => "tool execution failed".to_string(),
-                    };
+                    let msg = tool_error_message(&e, include_detailed_errors);
                     // The pipeline ran and the tool failed, which is an
                     // execution: charged like any other.
                     Ok(ToolCallOutcome {

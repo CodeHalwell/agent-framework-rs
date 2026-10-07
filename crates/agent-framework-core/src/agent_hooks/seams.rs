@@ -784,6 +784,7 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
         ctx.metadata
             .insert(TOOL_TOKEN_KEY.into(), Value::String(token.clone()));
 
+        let detailed_errors = ctx.include_detailed_errors;
         let result = next.run(ctx).await;
         let track = state.tool_calls.lock().unwrap().remove(&token);
         // The inner half reports the selected tool's name, which middleware
@@ -804,7 +805,9 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
             Err(error) => {
                 // The invocation was dispatched and errored; the contract
                 // still brackets it (§3), whatever kind of error it was.
-                let value = Value::String(crate::observability::error_type(&error));
+                // Judge the error result the model will actually see.
+                let value =
+                    Value::String(crate::client::tool_error_message(&error, detailed_errors));
                 let post = state
                     .builder
                     .post_tool_call(&call_id, &name, args, value.clone(), true);
@@ -827,10 +830,10 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
                         Err(Error::ToolRejected(text))
                     }
                     Ok(_) => Err(error),
-                    // A host error halts the run; a policy deny over an
-                    // errored call changes nothing.
-                    Err(b) if b.is_host_error() => Err(state.halt(Halt::Blocked(b))),
-                    Err(_) => Err(error),
+                    // §6.1: a deny discards the error result too, so the
+                    // denied payload never reaches the model; a host error
+                    // halts the run.
+                    Err(b) => Err(block_tool(&state, b)),
                 }
             }
             Ok(mut ctx) => {
