@@ -1194,3 +1194,97 @@ async fn swallowed_model_call_denies_still_halt_the_run() {
         assert!(!points(&seen).contains(&"output"), "{point:?}");
     }
 }
+
+/// Transforms the model-call `point` into a JSON-valid target the host
+/// cannot decode (a non-string message role).
+fn undecodable_model_transform(point: InterceptionPoint) -> Arc<dyn Interceptor> {
+    recorder(move |ctx| {
+        if ctx.point() != point {
+            return Verdict::allow();
+        }
+        match point {
+            InterceptionPoint::PreModelCall => {
+                let last = ctx.target().as_array().unwrap().len() - 1;
+                Verdict::transform(format!("$target[{last}].role"), json!(7))
+            }
+            _ => Verdict::transform("$target.content", json!([{"content": "x"}])),
+        }
+    })
+    .0
+}
+
+#[tokio::test]
+async fn swallowed_model_write_back_failures_still_halt_the_run() {
+    // The write-back fails the model call closed; an agent middleware that
+    // swallows the failure must not let its substitute response egress.
+    for point in [
+        InterceptionPoint::PreModelCall,
+        InterceptionPoint::PostModelCall,
+    ] {
+        let (client, _) = Scripted::new(vec![text_reply("model")]);
+        let (observer, seen) = recorder(|_| Verdict::allow());
+        let bundle = AgentHooks::new(
+            AgentHooksOptions::new()
+                .interceptor(undecodable_model_transform(point))
+                .interceptor(observer),
+        )
+        .unwrap();
+        let agent = bundle.build_agent(Agent::builder(client).middleware(Arc::new(SwallowErrors)));
+        let err = agent.run(vec![Message::user("x")], None).await.unwrap_err();
+        assert!(err.is_middleware_failure(), "{point:?}: {err}");
+        assert!(
+            err.to_string().contains("could not be written back"),
+            "{point:?}: {err}"
+        );
+        assert!(!points(&seen).contains(&"output"), "{point:?}");
+
+        // A streamed run fails the same way.
+        let (client, _) = Scripted::new(vec![text_reply("model")]);
+        let agent = hooks(undecodable_model_transform(point))
+            .build_agent(Agent::builder(client).middleware(Arc::new(SwallowErrors)));
+        let Err(err) = agent.run_stream(vec![Message::user("x")], None, None).await else {
+            panic!("{point:?}: the streamed run must fail");
+        };
+        assert!(err.is_middleware_failure(), "{point:?}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn post_tool_call_host_error_on_a_halting_call_still_halts_the_run() {
+    // The executor fails closed, then post_tool_call itself fails (a host
+    // error). Even when an agent middleware swallows the executor's error,
+    // the post hook's host error must halt the run.
+    let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
+        Err::<Value, _>(Error::middleware_failure("executor halted"))
+    })
+    .into_definition();
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({})),
+        text_reply("unreachable"),
+    ]);
+    let interceptor: Arc<dyn Interceptor> = Arc::new(interceptor_fn(|ctx| async move {
+        if ctx.point() == InterceptionPoint::PostToolCall {
+            Err(Error::other("policy engine down"))
+        } else {
+            Ok(Verdict::allow())
+        }
+    }));
+    let (observer, seen) = recorder(|_| Verdict::allow());
+    let hooks = AgentHooks::new(
+        AgentHooksOptions::new()
+            .interceptor(interceptor)
+            .interceptor(observer),
+    )
+    .unwrap();
+    let agent = hooks.build_agent(
+        Agent::builder(client)
+            .tool(failing)
+            .middleware(Arc::new(SwallowErrors)),
+    );
+    let err = agent
+        .run(vec![Message::user("go")], None)
+        .await
+        .unwrap_err();
+    assert_eq!(blocked_reason(&err), Some(host_error::INTERCEPTOR_FAILED));
+    assert!(!points(&seen).contains(&"output"));
+}

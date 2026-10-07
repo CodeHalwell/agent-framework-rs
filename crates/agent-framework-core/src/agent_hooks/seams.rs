@@ -151,15 +151,27 @@ impl RunState {
         Error::middleware_failure(message)
     }
 
-    /// Record a model-seam deny as the run's halt (the first one wins) and
-    /// return it unchanged, so a middleware that catches the error and
-    /// substitutes a response still cannot egress or persist it.
-    fn block_model(&self, b: Box<InterceptionBlocked>) -> Error {
+    /// Record a deny as the run's halt (the first one wins) and return it
+    /// unchanged, so a middleware that catches the error and substitutes a
+    /// response still cannot egress or persist it.
+    ///
+    /// Every fail-closed outcome at every seam goes through this, [`halt`]
+    /// or [`fail_closed`] before its error propagates.
+    ///
+    /// [`halt`]: RunState::halt
+    /// [`fail_closed`]: RunState::fail_closed
+    fn block(&self, b: Box<InterceptionBlocked>) -> Error {
         self.halted
             .lock()
             .unwrap()
             .get_or_insert_with(|| Halt::Blocked(b.clone()));
         Error::InterceptionBlocked(b)
+    }
+
+    /// Record a seam failure (a transform that cannot be written back, a
+    /// projection fault) as the run's halt and return the fail-closed error.
+    fn fail_closed(&self, error: Error) -> Error {
+        self.halt(Halt::Failure(error.to_string()))
     }
 
     /// The error a halted run surfaces at the run boundary.
@@ -170,8 +182,8 @@ impl RunState {
         })
     }
 
-    /// Record a host projection failure (§10.3) and return the error that
-    /// fails the guarded action closed.
+    /// Record a host projection failure (§10.3) and the run's halt, and
+    /// return the error that fails the guarded action closed.
     fn projection_failure(&self, point: InterceptionPoint, error: Error) -> Error {
         self.emitter.record_host_failure(
             point,
@@ -179,12 +191,10 @@ impl RunState {
             self.builder.session_id(),
             Some(self.builder.next_sequence()),
         );
-        error
+        self.fail_closed(Error::middleware_failure(format!(
+            "agent-hooks {point} projection failed: {error}"
+        )))
     }
-}
-
-fn blocked(b: Box<InterceptionBlocked>) -> Error {
-    Error::InterceptionBlocked(b)
 }
 
 /// The run state for `config`, failing closed when there is none (a seam
@@ -400,14 +410,19 @@ impl AgentHooksAgent {
                 .emitter
                 .emit(state.builder.agent_startup(self.tools_registered(options)))
                 .await
-                .map_err(blocked)?;
+                .map_err(|b| state.block(b))?;
         }
         let (content, role) = codecs::input_to_wire(messages)
             .map_err(|e| state.projection_failure(InterceptionPoint::Input, e))?;
         let context = state.builder.input(content, role);
         let before = context.target().clone();
-        let outcome = state.emitter.emit(context).await.map_err(blocked)?;
+        let outcome = state
+            .emitter
+            .emit(context)
+            .await
+            .map_err(|b| state.block(b))?;
         codecs::input_write_back(messages, &before, &outcome.target)
+            .map_err(|e| state.fail_closed(e))
     }
 
     /// Surface any halt, then emit `agent_shutdown` (per-run sessions).
@@ -533,8 +548,9 @@ impl Middleware<AgentContext> for OutputMiddleware {
                 .emitter
                 .emit(state.builder.output(before.clone()))
                 .await
-                .map_err(blocked)?;
-            codecs::output_write_back(response, &before, &outcome.target)?;
+                .map_err(|b| state.block(b))?;
+            codecs::output_write_back(response, &before, &outcome.target)
+                .map_err(|e| state.fail_closed(e))?;
         }
         Ok(ctx)
     }
@@ -575,8 +591,9 @@ impl GuardedChatClient {
             .emitter
             .emit(context)
             .await
-            .map_err(|b| state.block_model(b))?;
+            .map_err(|b| state.block(b))?;
         codecs::request_write_back(messages, &before, &outcome.target)
+            .map_err(|e| state.fail_closed(e))
     }
 
     async fn post(
@@ -599,8 +616,9 @@ impl GuardedChatClient {
             .emitter
             .emit(context)
             .await
-            .map_err(|b| state.block_model(b))?;
+            .map_err(|b| state.block(b))?;
         codecs::response_write_back(response, &before, &outcome.target)
+            .map_err(|e| state.fail_closed(e))
     }
 }
 
@@ -814,9 +832,15 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
                 let emitted = state.emitter.emit(post).await;
                 // A halt (the executor's, or another fail-closed
                 // middleware's) stays a halt: the post hook observes it but
-                // cannot turn it back into a model-facing result.
+                // cannot turn it back into a model-facing result. A host
+                // error from the post hook itself is still enforced: it is
+                // recorded as the run's halt, so a middleware that swallows
+                // the original error cannot complete the run.
                 if error.is_middleware_failure() {
-                    return Err(error);
+                    return match emitted {
+                        Err(b) if b.is_host_error() => Err(block_tool(&state, b)),
+                        _ => Err(error),
+                    };
                 }
                 match emitted {
                     // A transform rewrites the error the loop hands the
