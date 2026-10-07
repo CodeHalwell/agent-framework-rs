@@ -548,15 +548,19 @@ fn write_back_content(response: &mut ChatResponse, after_content: &Value) -> Res
 // ---- pre_tool_call / post_tool_call --------------------------------------
 
 /// Project tool arguments as the spec's `args` object.
-pub(super) fn tool_args_to_wire(arguments: &Value) -> Map<String, Value> {
+///
+/// The loop always dispatches an object, so any other value was put there by
+/// function middleware. It is refused rather than wrapped or normalized: the
+/// executor would still receive the non-object value, so `pre_tool_call`
+/// would judge a different shape from the one that runs. (Upstream wraps it
+/// as `{"raw_arguments": ...}`; this port fails closed instead.)
+pub(super) fn tool_args_to_wire(arguments: &Value) -> Result<Map<String, Value>> {
     match arguments {
-        Value::Object(map) => map.clone(),
-        Value::Null => Map::new(),
-        other => {
-            let mut map = Map::new();
-            map.insert("raw_arguments".into(), other.clone());
-            map
-        }
+        Value::Object(map) => Ok(map.clone()),
+        _ => Err(Error::middleware_failure(
+            "agent-hooks: tool arguments must be a JSON object; \
+             function middleware replaced them with another value",
+        )),
     }
 }
 
@@ -834,7 +838,7 @@ mod tests {
     #[test]
     fn tool_args_round_trip() {
         let args = json!({"path": "/etc/passwd"});
-        let wire = tool_args_to_wire(&args);
+        let wire = tool_args_to_wire(&args).unwrap();
         assert_eq!(
             tool_args_write_back(&wire, &Value::Object(wire.clone())).unwrap(),
             None
@@ -842,5 +846,8 @@ mod tests {
         let changed = tool_args_write_back(&wire, &json!({"path": "/tmp/x"})).unwrap();
         assert_eq!(changed.unwrap()["path"], "/tmp/x");
         assert!(tool_args_write_back(&wire, &json!([1])).is_err());
+        for other in [json!(null), json!([1]), json!("x"), json!(1)] {
+            assert!(tool_args_to_wire(&other).is_err(), "{other}");
+        }
     }
 }

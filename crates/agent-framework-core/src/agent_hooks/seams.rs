@@ -912,7 +912,14 @@ impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
                 "agent-hooks: tool invocation lost the selected tool's identity".into(),
             )));
         };
-        let mut args = codecs::tool_args_to_wire(&ctx.arguments);
+        // Fail closed on non-object arguments (a function middleware's
+        // rewrite): no pre_tool_call is emitted, the tool does not run, and
+        // the call stays undispatched, so no post_tool_call reports a shape
+        // that never executed.
+        let mut args = match codecs::tool_args_to_wire(&ctx.arguments) {
+            Ok(args) => args,
+            Err(e) => return Err(state.halt(Halt::Failure(e.to_string()))),
+        };
         let pre = state.builder.pre_tool_call(&call_id, &name, args.clone());
         match state.emitter.emit(pre).await {
             Ok(outcome) => match codecs::tool_args_write_back(&args, &outcome.target) {

@@ -871,6 +871,49 @@ async fn pre_tool_call_judges_the_arguments_after_user_middleware() {
 }
 
 #[tokio::test]
+async fn non_object_tool_arguments_from_middleware_fail_closed() {
+    // The executor would receive the array or scalar itself, so no projection
+    // of it can be what pre_tool_call approves: the call is refused before
+    // the policy sees it, the tool never runs, and no post_tool_call
+    // reports a shape that never executed.
+    for rewritten in [json!(["q", "x"]), json!("q=x"), json!(7), json!(null)] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (client, requests) = Scripted::new(vec![
+            tool_call_reply("c1", "lookup", json!({"q": "x"})),
+            text_reply("unreachable"),
+        ]);
+        let (interceptor, seen) = recorder(|_| Verdict::allow());
+        let agent = hooks(interceptor).build_agent(
+            Agent::builder(client)
+                .tool(echo_tool(count.clone()))
+                .function_middleware(Arc::new(RewriteArgs(rewritten.clone())))
+                .middleware(Arc::new(SwallowErrors)),
+        );
+        let err = agent
+            .run(vec![Message::user("go")], None)
+            .await
+            .unwrap_err();
+        assert!(err.is_middleware_failure(), "{rewritten}: {err}");
+        assert!(
+            err.to_string().contains("must be a JSON object"),
+            "{rewritten}: {err}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0, "{rewritten}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{rewritten}");
+        let points = points(&seen);
+        assert!(
+            !points.contains(&"pre_tool_call"),
+            "{rewritten}: {points:?}"
+        );
+        assert!(
+            !points.contains(&"post_tool_call"),
+            "{rewritten}: {points:?}"
+        );
+        assert!(!points.contains(&"output"), "{rewritten}: {points:?}");
+    }
+}
+
+#[tokio::test]
 async fn post_tool_call_transform_rewrites_an_errored_result() {
     let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
         Err::<Value, _>(Error::Tool("raw internal detail".into()))
