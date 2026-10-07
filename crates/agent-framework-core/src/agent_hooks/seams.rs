@@ -156,8 +156,8 @@ impl RunState {
     }
 }
 
-fn blocked(b: InterceptionBlocked) -> Error {
-    Error::InterceptionBlocked(Box::new(b))
+fn blocked(b: Box<InterceptionBlocked>) -> Error {
+    Error::InterceptionBlocked(b)
 }
 
 /// The run state for `config`, failing closed when there is none (a seam
@@ -667,10 +667,10 @@ impl ToolMiddleware {
     fn block(
         state: &RunState,
         mut ctx: FunctionInvocationContext,
-        b: InterceptionBlocked,
+        b: Box<InterceptionBlocked>,
     ) -> Result<FunctionInvocationContext> {
         if b.is_host_error() {
-            return Err(state.halt(Halt::Blocked(Box::new(b))));
+            return Err(state.halt(Halt::Blocked(b)));
         }
         let mut payload = serde_json::json!({
             "error": format!("Tool call blocked by agent-hooks at {}.", b.point()),
@@ -729,7 +729,7 @@ impl Middleware<FunctionInvocationContext> for ToolMiddleware {
                     // A policy deny over an errored call changes nothing; a
                     // host error still halts the run.
                     if b.is_host_error() {
-                        return Err(state.halt(Halt::Blocked(Box::new(b))));
+                        return Err(state.halt(Halt::Blocked(b)));
                     }
                 }
                 Err(error)

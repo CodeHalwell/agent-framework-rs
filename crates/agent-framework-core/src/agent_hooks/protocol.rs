@@ -896,18 +896,20 @@ impl InterceptionEmitter {
     }
 
     /// Run one emission; `Err` when the guarded action must not proceed.
+    ///
+    /// The block is boxed because it carries the full record.
     pub async fn emit(
         &self,
         context: InterceptionContext,
-    ) -> std::result::Result<EmitOutcome, InterceptionBlocked> {
+    ) -> std::result::Result<EmitOutcome, Box<InterceptionBlocked>> {
         let outcome = self.emit_unchecked(context).await;
         if outcome.record.proceeds() {
             Ok(outcome)
         } else {
-            Err(InterceptionBlocked {
+            Err(Box::new(InterceptionBlocked {
                 verdict: outcome.verdict,
                 record: outcome.record,
-            })
+            }))
         }
     }
 
