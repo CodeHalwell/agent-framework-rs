@@ -96,14 +96,12 @@ fn flatten(
                     group.to_string(),
                     member.to_string(),
                 );
-                let rust = leaf[symbols]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|s| s.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let rust = symbol_list(
+                    leaf.get(symbols),
+                    &format!("{source}: {at}"),
+                    symbols,
+                    errors,
+                );
                 let parsed = Leaf {
                     status: leaf["status"].as_str().unwrap_or_default().to_string(),
                     note: leaf["note"].as_str().unwrap_or_default().to_string(),
@@ -137,6 +135,53 @@ fn flatten(
     out
 }
 
+/// The counterpart symbols in a leaf's `field`: absent means none, but a
+/// value that is not an array, or an element that is not a string, is an
+/// error, so a typo cannot hide behind a valid sibling symbol.
+fn symbol_list(
+    value: Option<&Value>,
+    at: &str,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        errors.push(format!(
+            "{at}: `{field}` must be an array of strings, found {}",
+            describe(value)
+        ));
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let symbol = item.as_str();
+            if symbol.is_none() {
+                errors.push(format!(
+                    "{at}: `{field}[{i}]` must be a string, found {}",
+                    describe(item)
+                ));
+            }
+            symbol.map(str::to_string)
+        })
+        .collect()
+}
+
+/// How a JSON value reads in an "expected …, found …" diagnostic.
+fn describe(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "nothing",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// `value` as a JSON object, or an error naming `at`.
 fn object<'a>(
     value: &'a Value,
@@ -145,15 +190,10 @@ fn object<'a>(
 ) -> Option<&'a Map<String, Value>> {
     let map = value.as_object();
     if map.is_none() {
-        let found = match value {
-            Value::Null => "nothing",
-            Value::Bool(_) => "a boolean",
-            Value::Number(_) => "a number",
-            Value::String(_) => "a string",
-            Value::Array(_) => "an array",
-            Value::Object(_) => unreachable!(),
-        };
-        errors.push(format!("{at}: expected an object, found {found}"));
+        errors.push(format!(
+            "{at}: expected an object, found {}",
+            describe(value)
+        ));
     }
     map
 }
@@ -277,40 +317,155 @@ fn clr_type_key(ns: &str, ty: &str) -> String {
     let segments: Vec<String> = segments
         .into_iter()
         .map(|s| match s.split_once('<') {
-            Some((name, args)) => format!("{name}`{}", top_level_count(args.trim_end_matches('>'))),
+            Some((name, args)) => format!(
+                "{name}`{}",
+                split_top_level(args.trim_end_matches('>')).len()
+            ),
             None => s,
         })
         .collect();
     format!("{ns}.{}", segments.join("+"))
 }
 
-/// Number of comma-separated entries at nesting depth zero.
-fn top_level_count(list: &str) -> usize {
+/// Comma-separated entries at nesting depth zero.
+fn split_top_level(list: &str) -> Vec<&str> {
     if list.trim().is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut depth = 0i32;
-    let mut count = 1;
-    for c in list.chars() {
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (i, c) in list.char_indices() {
         match c {
             '<' | '(' | '[' => depth += 1,
             '>' | ')' | ']' => depth -= 1,
-            ',' if depth == 0 => count += 1,
+            ',' if depth == 0 => {
+                out.push(&list[start..i]);
+                start = i + 1;
+            }
             _ => {}
         }
     }
-    count
+    out.push(&list[start..]);
+    out
 }
 
-/// `(base name, parameter count or None for a property-like key)`.
-fn member_shape(key: &str) -> (String, Option<usize>) {
+/// A parameter's type in one spelling, as tokens: the ledger's C# source
+/// (`Func<JsonElement?, string>`, `ref int`) and the inventory's CLR
+/// signature (``System.Func`2<System.Nullable`1<System.Text.Json.JsonElement>,System.String>``,
+/// `System.Int32&`) both become `Func < JsonElement , String >` / `Int32`.
+/// Names lose their namespace, enclosing type and generic arity; C# keyword
+/// aliases take their CLR names; nullability (`?`, `Nullable<T>`), by-ref
+/// (`&`) and parameter modifiers drop out; and a generic placeholder (`!0`,
+/// `!!0`) becomes `*`, which matches any one name.
+fn parameter_type(spelling: &str) -> Vec<String> {
+    let mut rest = spelling.trim();
+    while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
+        if !matches!(word, "this" | "ref" | "out" | "in" | "params" | "scoped") {
+            break;
+        }
+        rest = tail.trim_start();
+    }
+    let mut tokens = Vec::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            let mut name = c.to_string();
+            while let Some(&n) = chars.peek() {
+                if !(n.is_alphanumeric() || matches!(n, '_' | '.' | '+' | '`')) {
+                    break;
+                }
+                name.push(n);
+                chars.next();
+            }
+            let name = name.rsplit(['.', '+']).next().unwrap_or_default();
+            let name = name.split('`').next().unwrap_or_default();
+            tokens.push(clr_alias(name).to_string());
+        } else if c == '!' {
+            while chars
+                .peek()
+                .is_some_and(|n| *n == '!' || n.is_ascii_digit())
+            {
+                chars.next();
+            }
+            tokens.push("*".to_string());
+        } else if !(c.is_whitespace() || matches!(c, '?' | '&')) {
+            tokens.push(c.to_string());
+        }
+    }
+    // `Nullable<T>` → `T`: drop the name and its brackets, keep the argument.
+    let mut out = Vec::new();
+    let mut open = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "Nullable" && tokens.get(i + 1).is_some_and(|t| t == "<") {
+            open.push(false);
+            i += 2;
+            continue;
+        }
+        if tokens[i] == "<" {
+            open.push(true);
+        } else if tokens[i] == ">" && open.pop() == Some(false) {
+            i += 1;
+            continue;
+        }
+        out.push(std::mem::take(&mut tokens[i]));
+        i += 1;
+    }
+    out
+}
+
+/// The CLR name of a C# keyword type, or `name` unchanged.
+fn clr_alias(name: &str) -> &str {
+    match name {
+        "string" => "String",
+        "bool" => "Boolean",
+        "int" => "Int32",
+        "long" => "Int64",
+        "short" => "Int16",
+        "byte" => "Byte",
+        "sbyte" => "SByte",
+        "uint" => "UInt32",
+        "ulong" => "UInt64",
+        "ushort" => "UInt16",
+        "float" => "Single",
+        "double" => "Double",
+        "decimal" => "Decimal",
+        "char" => "Char",
+        "object" => "Object",
+        "void" => "Void",
+        "nint" => "IntPtr",
+        "nuint" => "UIntPtr",
+        other => other,
+    }
+}
+
+/// `(base name, parameter types or None for a property-like key)`, the
+/// types normalised by [`parameter_type`].
+fn member_shape(key: &str) -> (String, Option<Vec<Vec<String>>>) {
     let head = key.split(" -> ").next().unwrap_or(key);
     let (name, params) = match head.split_once('(') {
-        Some((name, rest)) => (name, Some(top_level_count(rest.trim_end_matches(')')))),
+        Some((name, rest)) => {
+            let list = rest.strip_suffix(')').unwrap_or(rest);
+            let params = split_top_level(list)
+                .into_iter()
+                .map(parameter_type)
+                .collect();
+            (name, Some(params))
+        }
         None => (head, None),
     };
     let name = name.split(['<', '`']).next().unwrap_or(name).trim();
     (name.to_string(), params)
+}
+
+/// Whether two normalised parameter lists name the same overload: same
+/// length, and each type equal token for token, `*` matching any one token.
+fn same_parameters(a: &[Vec<String>], b: &[Vec<String>]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.len() == y.len() && x.iter().zip(y).all(|(s, t)| s == t || s == "*" || t == "*")
+        })
 }
 
 fn resolves_in_inventory(inventory: &Value, key: &Key) -> bool {
@@ -321,14 +476,18 @@ fn resolves_in_inventory(inventory: &Value, key: &Key) -> bool {
     if group == "type" {
         return true;
     }
-    let (mut name, arity) = member_shape(member);
+    let (mut name, params) = member_shape(member);
     if group == "constructors" {
         name = ".ctor".to_string();
     }
     entry[group.as_str()].as_object().is_some_and(|members| {
         members.keys().any(|k| {
-            let (n, a) = member_shape(k);
-            n == name && (arity.is_none() || a.is_none() || a == arity)
+            let (n, p) = member_shape(k);
+            n == name
+                && match (&params, &p) {
+                    (Some(a), Some(b)) => same_parameters(a, b),
+                    _ => true,
+                }
         })
     })
 }
@@ -880,20 +1039,159 @@ mod tests {
     }
 
     #[test]
+    fn flatten_rejects_non_string_symbols() {
+        use serde_json::json;
+        let leaf = |rust: Value| {
+            json!({"namespaces": {"N": {"T": {"methods": {"M()": {
+                "status": "mapped", "note": "n", "rust": rust
+            }}}}}})
+        };
+        let at = "ledger.json: N::T methods::M()";
+        let cases = [
+            (
+                json!(["k::m", null, 3]),
+                vec![
+                    format!("{at}: `rust[1]` must be a string, found nothing"),
+                    format!("{at}: `rust[2]` must be a string, found a number"),
+                ],
+            ),
+            (
+                json!("k::m"),
+                vec![format!(
+                    "{at}: `rust` must be an array of strings, found a string"
+                )],
+            ),
+            (
+                Value::Null,
+                vec![format!(
+                    "{at}: `rust` must be an array of strings, found nothing"
+                )],
+            ),
+        ];
+        for (rust, expected) in cases {
+            let mut errors = Vec::new();
+            flatten(&leaf(rust), "ledger.json", "rust", &mut errors);
+            assert_eq!(errors, expected);
+        }
+    }
+
+    fn shape(key: &str) -> (String, Option<Vec<String>>) {
+        let (name, params) = member_shape(key);
+        let params = params.map(|ps| ps.into_iter().map(|p| p.join(" ")).collect());
+        (name, params)
+    }
+
+    #[test]
     fn member_shapes_ignore_generics_and_return_types() {
         assert_eq!(
-            member_shape("RunAsync<T>(string, AgentSession, JsonSerializerOptions, AgentRunOptions, CancellationToken)"),
-            ("RunAsync".into(), Some(5))
+            shape("RunAsync<T>(string, AgentSession, CancellationToken)"),
+            (
+                "RunAsync".into(),
+                Some(vec![
+                    "String".into(),
+                    "AgentSession".into(),
+                    "CancellationToken".into()
+                ])
+            )
         );
         assert_eq!(
-            member_shape("GetService``1(System.Object) -> !!0"),
-            ("GetService".into(), Some(1))
+            shape("GetService``1(System.Object) -> !!0"),
+            ("GetService".into(), Some(vec!["Object".into()]))
         );
         assert_eq!(
-            member_shape("AddEdge(Microsoft.Agents.AI.Workflows.ExecutorBinding,System.Func`2<System.Object,System.Boolean>) -> X"),
-            ("AddEdge".into(), Some(2))
+            shape("AddEdge(Microsoft.Agents.AI.Workflows.ExecutorBinding,System.Func`2<System.Object,System.Boolean>) -> X"),
+            (
+                "AddEdge".into(),
+                Some(vec![
+                    "ExecutorBinding".into(),
+                    "Func < Object , Boolean >".into()
+                ])
+            )
         );
-        assert_eq!(member_shape("Name -> System.String"), ("Name".into(), None));
-        assert_eq!(member_shape("Build()"), ("Build".into(), Some(0)));
+        assert_eq!(shape("Name -> System.String"), ("Name".into(), None));
+        assert_eq!(shape("Build()"), ("Build".into(), Some(vec![])));
+    }
+
+    #[test]
+    fn parameter_types_agree_across_spellings() {
+        let pairs = [
+            ("string?", "System.String"),
+            ("int?", "System.Nullable`1<System.Int32>"),
+            (
+                "Func<JsonElement?, AIFunctionArguments>",
+                "System.Func`2<System.Nullable`1<System.Text.Json.JsonElement>,Microsoft.Extensions.AI.AIFunctionArguments>",
+            ),
+            (
+                "AIContextProvider.InvokedContext",
+                "Microsoft.Agents.AI.AIContextProvider+InvokedContext",
+            ),
+            ("ref int", "System.Int32&"),
+            ("params ChatMessage[]", "Microsoft.Extensions.AI.ChatMessage[]"),
+        ];
+        for (ledger, inventory) in pairs {
+            assert_eq!(
+                parameter_type(ledger),
+                parameter_type(inventory),
+                "{ledger}"
+            );
+        }
+        assert_eq!(parameter_type("!!0"), ["*"]);
+    }
+
+    #[test]
+    fn inventory_lookup_compares_parameter_types() {
+        let inventory = serde_json::json!({"types": {"N.T": {
+            "methods": {
+                "Foo(System.Int32) -> System.Void": {},
+                "Bar``1(!!0,System.String) -> System.Void": {}
+            },
+            "constructors": {".ctor(System.Nullable`1<System.Int32>)": {}},
+            "properties": {"Name -> System.String": {}}
+        }}});
+        let key = |group: &str, member: &str| {
+            (
+                "N".to_string(),
+                "T".to_string(),
+                group.to_string(),
+                member.to_string(),
+            )
+        };
+        for (group, member, found) in [
+            ("methods", "Foo(int)", true),
+            ("methods", "Foo(string)", false),
+            ("methods", "Foo(int, int)", false),
+            ("methods", "Bar<TItem>(TItem, string)", true),
+            ("methods", "Bar<TItem>(TItem, int)", false),
+            ("constructors", "T(int?)", true),
+            ("constructors", "T(long?)", false),
+            ("properties", "Name", true),
+        ] {
+            assert_eq!(
+                resolves_in_inventory(&inventory, &key(group, member)),
+                found,
+                "{group}::{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_go_catalog_member_resolves_by_parameter_types() {
+        // Go's catalog spells keys the way the ledger does, so each of its
+        // members on an inventory type must find its overload by type.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut errors = Vec::new();
+        let tree = read_json(&root, GO_MAPPING).unwrap();
+        let go = flatten(&tree, GO_MAPPING, "go_symbols", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        let inventory = read_json(&root, INVENTORY).unwrap();
+        let unresolved: Vec<String> = go
+            .keys()
+            .filter(|(ns, ty, group, _)| {
+                group != "type" && inventory["types"].get(clr_type_key(ns, ty)).is_some()
+            })
+            .filter(|key| !resolves_in_inventory(&inventory, key))
+            .map(label)
+            .collect();
+        assert!(unresolved.is_empty(), "{unresolved:#?}");
     }
 }
