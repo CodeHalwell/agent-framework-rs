@@ -353,20 +353,31 @@ fn split_top_level(list: &str) -> Vec<&str> {
 /// A parameter's type in one spelling, as tokens: the ledger's C# source
 /// (`Func<JsonElement?, string>`, `ref int`) and the inventory's CLR
 /// signature (``System.Func`2<System.Nullable`1<System.Text.Json.JsonElement>,System.String>``,
-/// `System.Int32&`) both become `Func < JsonElement , String >` / `Int32`.
+/// `System.Int32&`) both become `Func < JsonElement , String >` / `& Int32`.
 /// Names lose their namespace, enclosing type and generic arity; C# keyword
-/// aliases take their CLR names; nullability (`?`, `Nullable<T>`), by-ref
-/// (`&`) and parameter modifiers drop out; and a generic placeholder (`!0`,
-/// `!!0`) stays one token for [`bind_placeholders`] to name.
+/// aliases take their CLR names; nullability (`?`, `Nullable<T>`) and the
+/// `this`, `params` and `scoped` modifiers drop out; passing by reference
+/// (`ref`, `out`, `in`, `ref readonly`, or the CLR's trailing `&`) becomes one
+/// leading [`BY_REF`] token, so a by-value overload never matches a
+/// by-reference one; and a generic placeholder (`!0`, `!!0`) stays one token
+/// for [`bind_placeholders`] to name.
 fn parameter_type(spelling: &str) -> Vec<String> {
     let mut rest = spelling.trim();
+    let mut by_ref = false;
     while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
-        if !matches!(word, "this" | "ref" | "out" | "in" | "params" | "scoped") {
-            break;
+        match word {
+            "ref" | "out" | "in" => by_ref = true,
+            // `readonly` appears here only after `ref`.
+            "this" | "params" | "scoped" | "readonly" => {}
+            _ => break,
         }
         rest = tail.trim_start();
     }
     let mut tokens = Vec::new();
+    // The CLR spells by-reference as a suffix on the whole type.
+    if by_ref || rest.contains('&') {
+        tokens.push(BY_REF.to_string());
+    }
     let mut chars = rest.chars().peekable();
     while let Some(c) = chars.next() {
         if c.is_alphanumeric() || c == '_' {
@@ -416,6 +427,10 @@ fn parameter_type(spelling: &str) -> Vec<String> {
     }
     out
 }
+
+/// The token that marks a parameter passed by reference, whichever modifier
+/// spells it.
+const BY_REF: &str = "&";
 
 /// The CLR name of a C# keyword type, or `name` unchanged.
 fn clr_alias(name: &str) -> &str {
@@ -606,8 +621,7 @@ pub fn check(root: &Path, build: bool) -> Result<(), String> {
         index::load(root)?
     };
     let mut errors = Vec::new();
-    let inputs = load(root, &mut errors)?;
-    validate(&inputs, &rust_index, &mut errors);
+    let inputs = load_checked(root, &rust_index, &mut errors)?;
 
     let expected = render_report(&inputs);
     let current = fs::read_to_string(root.join(REPORT)).unwrap_or_default();
@@ -752,11 +766,27 @@ fn counts(map: &BTreeMap<String, usize>) -> String {
         .join(" / ")
 }
 
-/// Loads the inputs for a read-only command, failing on any parse problem so
-/// a malformed ledger or catalog is never reported, or written, as partial.
+/// Loads the inputs and runs every check `parity check` makes on them,
+/// structural and semantic, collecting the problems in `errors`.
+fn load_checked(
+    root: &Path,
+    rust_index: &RustIndex,
+    errors: &mut Vec<String>,
+) -> Result<Inputs, String> {
+    let inputs = load(root, errors)?;
+    validate(&inputs, rust_index, errors);
+    Ok(inputs)
+}
+
+/// Loads the inputs for `report`, `summary` or `gaps`, failing on anything
+/// `parity check` would reject (bar a stale report) so an invalid ledger,
+/// such as one with a misspelled status the counts would silently skip, is
+/// never reported, or written. Uses the Rust index from the last build,
+/// building it when there is none.
 fn load_strict(root: &Path) -> Result<Inputs, String> {
+    let rust_index = index::load(root).or_else(|_| index::build(root))?;
     let mut errors = Vec::new();
-    let inputs = load(root, &mut errors)?;
+    let inputs = load_checked(root, &rust_index, &mut errors)?;
     if errors.is_empty() {
         return Ok(inputs);
     }
@@ -764,7 +794,7 @@ fn load_strict(root: &Path) -> Result<Inputs, String> {
         eprintln!("  {e}");
     }
     Err(format!(
-        "{} problem(s) reading the parity ledger; run `cargo xtask parity check`",
+        "{} problem(s) in the parity ledger; run `cargo xtask parity check`",
         errors.len()
     ))
 }
@@ -953,26 +983,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn report_refuses_to_write_from_a_malformed_ledger() {
+    /// Runs `report`, `summary` and `gaps` over a scratch root holding the
+    /// vendored catalogs, an empty Rust index and `ledger`, returning each
+    /// command's result and whether the report was written.
+    fn read_only_commands(name: &str, ledger: Value) -> (Vec<Result<(), String>>, bool) {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let root = std::env::temp_dir().join(format!("parity-report-{}", std::process::id()));
-        let upstream = root.join("docs/parity/upstream");
-        fs::create_dir_all(&upstream).unwrap();
+        let root = std::env::temp_dir().join(format!("parity-{name}-{}", std::process::id()));
+        fs::create_dir_all(root.join("docs/parity/upstream")).unwrap();
         for file in [INVENTORY, GO_MAPPING] {
             fs::copy(repo.join(file), root.join(file)).unwrap();
         }
+        let index = index::index_path(&root);
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "[]").unwrap();
+        fs::write(root.join(LEDGER), ledger.to_string()).unwrap();
+
+        let results = vec![write_report(&root), summary(&root), gaps(&root, None)];
+        let written = root.join(REPORT).exists();
+        fs::remove_dir_all(&root).unwrap();
+        (results, written)
+    }
+
+    #[test]
+    fn report_refuses_to_write_from_a_malformed_ledger() {
         let ledger = serde_json::json!({
             "schema_version": 1,
             "namespaces": { "Microsoft.Agents.AI": { "AIAgent": { "bogus_group": {} } } }
         });
-        fs::write(root.join(LEDGER), ledger.to_string()).unwrap();
-
-        let result = write_report(&root);
-        let written = root.join(REPORT).exists();
-        fs::remove_dir_all(&root).unwrap();
-        assert!(result.is_err(), "report accepted a malformed ledger");
+        let (results, written) = read_only_commands("malformed", ledger);
+        assert!(
+            results.iter().all(Result::is_err),
+            "a command accepted a malformed ledger: {results:?}"
+        );
         assert!(!written, "report was written from a malformed ledger");
+    }
+
+    #[test]
+    fn read_only_commands_run_the_semantic_checks() {
+        // Well formed, but `mapd` is no status, so the report's counts would
+        // silently leave the declaration out.
+        let ledger = serde_json::json!({
+            "schema_version": 1,
+            "namespaces": { "Microsoft.Agents.AI": { "AIAgent": {
+                "mapping": { "status": "mapd", "note": "misspelled" }
+            } } }
+        });
+        let mut errors = Vec::new();
+        flatten(&ledger, LEDGER, "rust", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "the ledger should be well formed: {errors:?}"
+        );
+
+        let (results, written) = read_only_commands("semantic", ledger);
+        assert!(
+            results.iter().all(Result::is_err),
+            "a command accepted an unknown status: {results:?}"
+        );
+        assert!(!written, "report was written from an invalid ledger");
     }
 
     fn flatten_errors(tree: Value) -> Vec<String> {
@@ -1250,6 +1318,61 @@ mod tests {
         }
         assert_eq!(parameter_type("!!0"), ["!!0"]);
         assert_eq!(parameter_type("!1[]"), ["!1", "[", "]"]);
+    }
+
+    #[test]
+    fn by_reference_is_one_marker_and_distinct_from_by_value() {
+        for spelling in [
+            "ref int",
+            "out int",
+            "in int",
+            "ref readonly int",
+            "scoped ref int",
+            "this ref int",
+            "System.Int32&",
+        ] {
+            assert_eq!(parameter_type(spelling), [BY_REF, "Int32"], "{spelling}");
+        }
+        assert_eq!(
+            parameter_type("out List<ChatMessage>?"),
+            parameter_type(
+                "System.Collections.Generic.List`1<Microsoft.Extensions.AI.ChatMessage>&"
+            )
+        );
+        assert_eq!(
+            parameter_type("out bool?"),
+            parameter_type("System.Nullable`1<System.Boolean>&")
+        );
+        for (by_value, by_ref) in [("int", "System.Int32&"), ("int", "ref int"), ("T", "out T")] {
+            assert_ne!(parameter_type(by_value), parameter_type(by_ref), "{by_ref}");
+        }
+        for dropped in ["this int", "params int", "scoped int", "int?"] {
+            assert_eq!(parameter_type(dropped), ["Int32"], "{dropped}");
+        }
+    }
+
+    #[test]
+    fn inventory_lookup_tells_by_value_from_by_reference() {
+        let inventory = serde_json::json!({"types": {"N.Bag": {"methods": {
+            "TryGetValue``1(System.String,!!0&) -> System.Boolean": {},
+            "Read(System.Int32) -> System.Void": {}
+        }}}});
+        for (member, found) in [
+            ("TryGetValue<T>(string, out T)", true),
+            ("TryGetValue<T>(string, ref T)", true),
+            ("TryGetValue<T>(string, T)", false),
+            ("Read(int)", true),
+            ("Read(ref int)", false),
+            ("Read(out int)", false),
+        ] {
+            let key = (
+                "N".to_string(),
+                "Bag".to_string(),
+                "methods".to_string(),
+                member.to_string(),
+            );
+            assert_eq!(resolves_in_inventory(&inventory, &key), found, "{member}");
+        }
     }
 
     #[test]
