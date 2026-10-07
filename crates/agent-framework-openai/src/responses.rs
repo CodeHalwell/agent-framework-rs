@@ -488,6 +488,13 @@ fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> 
                             "name": call.tool_name,
                             "arguments": function_arguments_to_string(&call.arguments),
                         }));
+                        // Links the completed call to its replayed approval
+                        // request/response pair.
+                        if let (Some(id), Some(Value::Object(item))) =
+                            (&call.approval_request_id, out.last_mut())
+                        {
+                            item.insert("approval_request_id".into(), Value::String(id.clone()));
+                        }
                     }
                 }
                 Content::McpServerToolResult(result) => {
@@ -595,6 +602,11 @@ fn mcp_call_item_contents(item: &Value) -> Vec<Content> {
             .get("arguments")
             .and_then(Value::as_str)
             .map(|a| FunctionArguments::Raw(a.to_string())),
+        approval_request_id: item
+            .get("approval_request_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from),
     })];
     let output = item.get("output").filter(|o| !o.is_null()).cloned();
     let error = item.get("error").filter(|e| !e.is_null()).cloned();
@@ -2599,6 +2611,7 @@ mod tests {
         assert_eq!(input[2]["name"], json!("search"));
         assert_eq!(input[2]["arguments"], json!(r#"{"q":"rust"}"#));
         assert_eq!(input[2]["output"], json!("found it"));
+        assert_eq!(input[2]["approval_request_id"], json!("appr_9"));
     }
 
     #[test]
@@ -2644,6 +2657,7 @@ mod tests {
             &json!({"type": "response.output_item.done", "output_index": 0, "item": {
                 "type": "mcp_call", "id": "mcp_2", "name": "search",
                 "server_label": "docs", "arguments": "{\"q\":\"rust\"}", "output": "ok",
+                "approval_request_id": "appr_2",
             }}),
             &mut ids,
             None,
@@ -2657,6 +2671,7 @@ mod tests {
             vec![json!({
                 "type": "mcp_call", "id": "mcp_2", "server_label": "docs",
                 "name": "search", "arguments": "{\"q\":\"rust\"}", "output": "ok",
+                "approval_request_id": "appr_2",
             })]
         );
     }

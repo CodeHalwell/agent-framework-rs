@@ -629,6 +629,11 @@ pub struct McpServerToolCallContent {
     pub server_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub arguments: Option<FunctionArguments>,
+    /// The id of the hosted approval request this call ran under, when it
+    /// needed one. A stateless replay sends it back on the `mcp_call` so the
+    /// service links the completed call to its approval request/response.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_request_id: Option<String>,
 }
 
 /// The result of a provider-hosted MCP server tool call.
@@ -1063,6 +1068,7 @@ mod tests {
                     tool_name: "t".into(),
                     server_name: None,
                     arguments: None,
+                    approval_request_id: None,
                 }),
                 "mcp_server_tool_call",
             ),
