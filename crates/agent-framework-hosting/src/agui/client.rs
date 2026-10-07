@@ -42,8 +42,9 @@
 //! | `TEXT_MESSAGE_CONTENT`, `TEXT_MESSAGE_CHUNK` | text delta |
 //! | `TEXT_MESSAGE_END`, `TOOL_CALL_END` | nothing |
 //! | `TOOL_CALL_START` | a [`FunctionCallContent`] with empty arguments |
-//! | `TOOL_CALL_ARGS` | an argument fragment of the open call |
-//! | `TOOL_CALL_RESULT` | a tool-role [`FunctionResultContent`] |
+//! | `TOOL_CALL_ARGS` | an argument fragment of the call its `toolCallId` names (the latest open call when it has none) |
+//! | `TOOL_CALL_CHUNK` | a call fragment: opens the call on its first chunk, later chunks without an id continue it |
+//! | `TOOL_CALL_RESULT` | a tool-role [`FunctionResultContent`] carrying the event's `messageId` |
 //! | `REASONING_MESSAGE_CONTENT`, `REASONING_MESSAGE_CHUNK` | reasoning delta |
 //! | `STATE_SNAPSHOT`, `STATE_DELTA` | JSON [`DataContent`] (`application/json`, `application/json-patch+json`) |
 //! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]` |
@@ -92,7 +93,7 @@ use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, ErrorContent,
     FinishReason, FunctionCallContent, FunctionResultContent, Message, Role, TextContent,
-    TextReasoningContent,
+    TextReasoningContent, ToolMode,
 };
 
 use super::{arguments_delta, event_type, result_content, RunAgentInput};
@@ -667,15 +668,18 @@ fn first_property<'a>(options: &'a ChatOptions, keys: &[&str]) -> Option<&'a Val
 ///
 /// Port of upstream's `AGUIEventConverter`, plus the text-chunk, reasoning,
 /// state and messages-snapshot events the Go provider handles. Stateful: it
-/// tracks the open text message, the open tool call (so a `TOOL_CALL_ARGS`
-/// for a different call is dropped rather than attached to the wrong one) and
-/// the run's ids. Use one converter per run.
+/// tracks the open text message, every open tool call by `toolCallId` (so
+/// argument deltas for parallel calls each land on their own call) and the
+/// run's ids. Use one converter per run.
 #[derive(Debug, Default, Clone)]
 pub struct AgUiEventConverter {
     current_message_id: Option<String>,
-    current_tool_call_id: Option<String>,
-    current_tool_name: Option<String>,
-    accumulated_tool_args: String,
+    /// Open tool calls as `(toolCallId, name)`, oldest first. Several can be
+    /// open at once when a server streams parallel calls.
+    open_tool_calls: Vec<(String, String)>,
+    /// The call the last `TOOL_CALL_CHUNK` named, so a later chunk that omits
+    /// `toolCallId` continues it.
+    last_chunk_tool_call_id: Option<String>,
     last_chunk_message_id: Option<String>,
     last_reasoning_message_id: Option<String>,
     thread_id: Option<String>,
@@ -713,6 +717,21 @@ fn assistant_update(contents: Vec<Content>) -> ChatResponseUpdate {
 }
 
 /// JSON as a base64 data item, the way the Go provider surfaces state events.
+fn tool_name_of(event: &Value) -> Option<String> {
+    str_field(event, &["toolName", "toolCallName", "tool_call_name"])
+}
+
+/// One streamed fragment of call `id`; aggregation merges fragments by id.
+fn call_fragment(id: String, name: String, arguments: String) -> Content {
+    Content::FunctionCall(FunctionCallContent::new(
+        id,
+        name,
+        Some(agent_framework_core::types::FunctionArguments::Raw(
+            arguments,
+        )),
+    ))
+}
+
 fn json_data(value: &Value, media_type: &str) -> Content {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"null".to_vec());
     Content::Data(DataContent::from_bytes(&bytes, media_type))
@@ -803,40 +822,59 @@ impl AgUiEventConverter {
             }
             event_type::TEXT_MESSAGE_END => None,
             event_type::TOOL_CALL_START => {
-                self.current_tool_call_id = str_field(event, &["toolCallId", "tool_call_id"]);
-                self.current_tool_name =
-                    str_field(event, &["toolName", "toolCallName", "tool_call_name"]);
-                self.accumulated_tool_args.clear();
-                Some(assistant_update(vec![self.call_fragment(String::new())]))
+                let id = str_field(event, &["toolCallId", "tool_call_id"]).unwrap_or_default();
+                let name = tool_name_of(event).unwrap_or_default();
+                self.open_call(id.clone(), name.clone());
+                Some(assistant_update(vec![call_fragment(
+                    id,
+                    name,
+                    String::new(),
+                )]))
             }
             event_type::TOOL_CALL_ARGS => {
-                if let Some(id) = str_field(event, &["toolCallId", "tool_call_id"]) {
-                    match &self.current_tool_call_id {
-                        Some(current) if *current != id => {
-                            tracing::warn!(
-                                tool_call_id = %id,
-                                current = %current,
-                                "ignoring TOOL_CALL_ARGS for a tool call that is not the open one"
-                            );
-                            return None;
-                        }
-                        Some(_) => {}
-                        None => self.current_tool_call_id = Some(id),
-                    }
+                // Fragments are keyed by `toolCallId`; aggregation merges each
+                // into the call with that id, so interleaved deltas for
+                // parallel calls stay with their own call. A delta with no id
+                // continues the most recently opened call.
+                let id = str_field(event, &["toolCallId", "tool_call_id"])
+                    .or_else(|| self.open_tool_calls.last().map(|(id, _)| id.clone()))
+                    .unwrap_or_default();
+                let name = self.open_call_name(&id);
+                Some(assistant_update(vec![call_fragment(
+                    id,
+                    name,
+                    delta_of(event),
+                )]))
+            }
+            event_type::TOOL_CALL_CHUNK => {
+                // Shorthand for start/args/end: the first chunk of a call
+                // names it (`toolCallId`, `toolCallName`), later chunks may
+                // omit the id and continue the last chunked call. There is no
+                // explicit end; the call simply stops receiving deltas.
+                let id = str_field(event, &["toolCallId", "tool_call_id"])
+                    .or_else(|| self.last_chunk_tool_call_id.clone());
+                let Some(id) = id else {
+                    tracing::warn!("ignoring TOOL_CALL_CHUNK with no toolCallId and no open call");
+                    return None;
+                };
+                let name = tool_name_of(event);
+                if !self.open_tool_calls.iter().any(|(open, _)| *open == id) {
+                    self.open_call(id.clone(), name.clone().unwrap_or_default());
                 }
-                let delta = delta_of(event);
-                self.accumulated_tool_args.push_str(&delta);
-                Some(assistant_update(vec![self.call_fragment(delta)]))
+                self.last_chunk_tool_call_id = Some(id.clone());
+                let name = self.open_call_name(&id);
+                Some(assistant_update(vec![call_fragment(
+                    id,
+                    name,
+                    delta_of(event),
+                )]))
             }
             event_type::TOOL_CALL_END => {
-                let id = str_field(event, &["toolCallId", "tool_call_id"]);
-                if self.current_tool_call_id.is_none()
-                    || id.is_none()
-                    || id == self.current_tool_call_id
-                {
-                    self.current_tool_call_id = None;
-                    self.current_tool_name = None;
-                    self.accumulated_tool_args.clear();
+                match str_field(event, &["toolCallId", "tool_call_id"]) {
+                    Some(id) => self.open_tool_calls.retain(|(open, _)| *open != id),
+                    None => {
+                        self.open_tool_calls.pop();
+                    }
                 }
                 None
             }
@@ -853,6 +891,7 @@ impl AgUiEventConverter {
                         call_id, result,
                     ))],
                     role: Some(Role::tool()),
+                    message_id: str_field(event, &["messageId", "message_id"]),
                     ..Default::default()
                 })
             }
@@ -926,14 +965,20 @@ impl AgUiEventConverter {
         }
     }
 
-    fn call_fragment(&self, arguments: String) -> Content {
-        Content::FunctionCall(FunctionCallContent::new(
-            self.current_tool_call_id.clone().unwrap_or_default(),
-            self.current_tool_name.clone().unwrap_or_default(),
-            Some(agent_framework_core::types::FunctionArguments::Raw(
-                arguments,
-            )),
-        ))
+    /// Record `id` as open, replacing an earlier call with the same id.
+    fn open_call(&mut self, id: String, name: String) {
+        self.open_tool_calls.retain(|(open, _)| *open != id);
+        self.open_tool_calls.push((id, name));
+    }
+
+    /// The name the open call `id` started with, or empty when it is not open.
+    fn open_call_name(&self, id: &str) -> String {
+        self.open_tool_calls
+            .iter()
+            .rev()
+            .find(|(open, _)| open == id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_default()
     }
 
     /// A `CUSTOM` event stays inspectable as metadata; an `annotations` event
@@ -1074,6 +1119,9 @@ struct SseDecoder {
     utf8: Utf8StreamDecoder,
     line: String,
     data: Option<String>,
+    /// The last line ended in a CR at the end of a chunk; an LF opening the
+    /// next chunk completes that CRLF rather than ending an empty line.
+    skip_lf: bool,
 }
 
 impl SseDecoder {
@@ -1081,11 +1129,20 @@ impl SseDecoder {
         let text = self.utf8.push(bytes);
         let mut out = Vec::new();
         self.line.push_str(&text);
-        while let Some(pos) = self.line.find('\n') {
+        loop {
+            if self.skip_lf && !self.line.is_empty() {
+                if self.line.starts_with('\n') {
+                    self.line.remove(0);
+                }
+                self.skip_lf = false;
+            }
+            // SSE lines end in CRLF, LF or a bare CR.
+            let Some(pos) = self.line.find(['\r', '\n']) else {
+                break;
+            };
             let mut line: String = self.line.drain(..=pos).collect();
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+            if line.pop() == Some('\r') {
+                self.skip_lf = true;
             }
             self.process_line(&line, &mut out);
         }
@@ -1098,7 +1155,7 @@ impl SseDecoder {
         let mut out = self.push(tail.as_bytes());
         let rest = std::mem::take(&mut self.line);
         if !rest.is_empty() {
-            self.process_line(rest.trim_end_matches('\r'), &mut out);
+            self.process_line(&rest, &mut out);
         }
         if let Some(data) = self.data.take() {
             out.push(data);
@@ -1132,10 +1189,12 @@ impl SseDecoder {
     }
 }
 
-/// Folds metadata-only updates (no content, no message id, no finish reason
-/// — `RUN_STARTED`, most `CUSTOM` events) into the next update. Aggregation
-/// would otherwise open an empty assistant message for each, ahead of the
-/// message the text then goes to.
+/// Folds the run-id-only update of `RUN_STARTED` (no content, no message id,
+/// no finish reason, nothing but `thread_id` / `run_id`) into the next
+/// update, so aggregation does not open an empty assistant message for it.
+/// Any other metadata-only update (`CUSTOM`, `MESSAGES_SNAPSHOT`) is passed
+/// on at once: folding those would let consecutive ones overwrite each other
+/// under the same key and hold them back until the next content arrives.
 #[derive(Debug, Default)]
 struct MetadataFold {
     pending: Option<HashMap<String, Value>>,
@@ -1143,10 +1202,14 @@ struct MetadataFold {
 
 impl MetadataFold {
     fn push(&mut self, mut update: ChatResponseUpdate) -> Option<ChatResponseUpdate> {
-        let metadata_only = update.contents.is_empty()
+        let run_ids_only = update.contents.is_empty()
             && update.message_id.is_none()
-            && update.finish_reason.is_none();
-        if metadata_only {
+            && update.finish_reason.is_none()
+            && update
+                .additional_properties
+                .keys()
+                .all(|k| k == "thread_id" || k == "run_id");
+        if run_ids_only {
             self.pending
                 .get_or_insert_with(HashMap::new)
                 .extend(update.additional_properties);
@@ -1354,7 +1417,14 @@ impl AgUiChatClient {
             thread_id: Some(thread_id),
             run_id: Some(run_id),
             messages: messages_to_agui(&to_send),
-            tools: tools_to_agui(&options.tools),
+            // The function-invocation loop's final request disables tools
+            // with `ToolMode::None` but leaves `options.tools` in place;
+            // declaring them anyway would let the server call them again.
+            tools: if matches!(options.tool_choice, Some(ToolMode::None)) {
+                Vec::new()
+            } else {
+                tools_to_agui(&options.tools)
+            },
             state: state.map(Value::Object),
             context,
             forwarded_props,
@@ -1539,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_args_for_another_call_are_ignored() {
+    fn parallel_tool_call_args_land_on_their_own_call() {
         let mut c = AgUiEventConverter::new();
         c.convert_event(
             &json!({"type": "TOOL_CALL_START", "toolCallId": "safe", "toolName": "safe_tool"}),
@@ -1547,19 +1617,118 @@ mod tests {
         c.convert_event(
             &json!({"type": "TOOL_CALL_START", "toolCallId": "danger", "toolName": "danger_tool"}),
         );
-        assert!(c
+        // Args for the earlier, still-open call go to that call, not the
+        // most recent one.
+        let u = c
             .convert_event(&json!({"type": "TOOL_CALL_ARGS", "toolCallId": "safe", "delta": "{\"amount\": 100}"}))
-            .is_none());
-        // Ending a different call leaves the open one open.
+            .unwrap();
+        assert_eq!(calls(&u)[0].call_id, "safe");
+        assert_eq!(calls(&u)[0].name, "safe_tool");
         c.convert_event(&json!({"type": "TOOL_CALL_END", "toolCallId": "safe"}));
+        // Ending one call leaves the other open.
         let u = c
             .convert_event(
                 &json!({"type": "TOOL_CALL_ARGS", "toolCallId": "danger", "delta": "{}"}),
             )
             .unwrap();
+        assert_eq!(calls(&u)[0].call_id, "danger");
         assert_eq!(calls(&u)[0].name, "danger_tool");
         c.convert_event(&json!({"type": "TOOL_CALL_END", "toolCallId": "danger"}));
-        assert!(c.current_tool_call_id.is_none());
+        assert!(c.open_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn interleaved_parallel_args_aggregate_per_call() {
+        let updates = convert_all(&[
+            json!({"type": "TOOL_CALL_START", "toolCallId": "a", "toolCallName": "first"}),
+            json!({"type": "TOOL_CALL_START", "toolCallId": "b", "toolCallName": "second"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "a", "delta": "{\"x\":"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "b", "delta": "{\"y\":"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "a", "delta": "1}"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "b", "delta": "2}"}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "a"}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "b"}),
+        ]);
+        let response = ChatResponse::from_updates(updates);
+        let calls = response.function_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].call_id.as_str(), calls[0].name.as_str()),
+            ("a", "first")
+        );
+        assert_eq!(calls[0].parse_arguments().unwrap()["x"], 1);
+        assert_eq!(
+            (calls[1].call_id.as_str(), calls[1].name.as_str()),
+            ("b", "second")
+        );
+        assert_eq!(calls[1].parse_arguments().unwrap()["y"], 2);
+    }
+
+    #[test]
+    fn tool_call_args_without_an_id_continue_the_latest_open_call() {
+        let mut c = AgUiEventConverter::new();
+        c.convert_event(
+            &json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "f"}),
+        );
+        let u = c
+            .convert_event(&json!({"type": "TOOL_CALL_ARGS", "delta": "{}"}))
+            .unwrap();
+        assert_eq!(calls(&u)[0].call_id, "c1");
+        assert_eq!(calls(&u)[0].name, "f");
+    }
+
+    #[test]
+    fn tool_call_chunks_decode_into_calls() {
+        let updates = convert_all(&[
+            json!({"type": "TOOL_CALL_CHUNK", "toolCallId": "c1", "toolCallName": "search", "parentMessageId": "m1", "delta": "{\"q\":"}),
+            // A follow-up chunk may omit the id and name.
+            json!({"type": "TOOL_CALL_CHUNK", "delta": "\"rust\"}"}),
+            json!({"type": "TOOL_CALL_CHUNK", "toolCallId": "c2", "toolCallName": "lookup"}),
+            json!({"type": "TOOL_CALL_CHUNK", "toolCallId": "c2", "delta": "{}"}),
+        ]);
+        assert_eq!(updates.len(), 4);
+        assert_eq!(calls(&updates[1])[0].call_id, "c1");
+        assert_eq!(calls(&updates[1])[0].name, "search");
+        assert_eq!(calls(&updates[3])[0].name, "lookup");
+        let response = ChatResponse::from_updates(updates);
+        let calls = response.function_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].call_id.as_str(), calls[0].name.as_str()),
+            ("c1", "search")
+        );
+        assert_eq!(calls[0].parse_arguments().unwrap()["q"], "rust");
+        assert_eq!(
+            (calls[1].call_id.as_str(), calls[1].name.as_str()),
+            ("c2", "lookup")
+        );
+        assert_eq!(raw_args(calls[1]), "{}");
+    }
+
+    #[test]
+    fn tool_call_chunk_without_any_call_is_ignored() {
+        let mut c = AgUiEventConverter::new();
+        assert!(c
+            .convert_event(&json!({"type": "TOOL_CALL_CHUNK", "delta": "{}"}))
+            .is_none());
+    }
+
+    #[test]
+    fn tool_call_result_carries_its_message_id() {
+        for key in ["messageId", "message_id"] {
+            let mut c = AgUiEventConverter::new();
+            let u = c
+                .convert_event(&json!({"type": "TOOL_CALL_RESULT", "toolCallId": "c1", "content": "42", key: "tool-msg-1"}))
+                .unwrap();
+            assert_eq!(u.message_id.as_deref(), Some("tool-msg-1"));
+        }
+        let mut c = AgUiEventConverter::new();
+        let u = c
+            .convert_event(
+                &json!({"type": "TOOL_CALL_RESULT", "toolCallId": "c1", "content": "42"}),
+            )
+            .unwrap();
+        assert!(u.message_id.is_none());
     }
 
     #[test]
@@ -1725,6 +1894,40 @@ mod tests {
         assert_eq!(
             response.additional_properties[CUSTOM_EVENT_KEY]["name"],
             "annotations"
+        );
+    }
+
+    #[test]
+    fn streamed_annotations_survive_plain_aggregation() {
+        // What a caller of `get_streaming_response` sees when it aggregates
+        // the updates itself, without the client's `finalize_response`.
+        let mut c = AgUiEventConverter::new();
+        let mut fold = MetadataFold::default();
+        let updates: Vec<_> = [
+            json!({"type": "RUN_STARTED", "threadId": "t", "runId": "r"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m1"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Cited"}),
+            json!({"type": "CUSTOM", "name": "annotations",
+                   "value": {"messageId": "m1", "annotations": [{"type": "citation", "url": "https://example.com"}]}}),
+            json!({"type": "RUN_FINISHED", "threadId": "t", "runId": "r"}),
+        ]
+        .iter()
+        .filter_map(|e| c.convert_event(e))
+        .filter_map(|u| fold.push(u))
+        .collect();
+        let response = ChatResponse::from_updates(updates);
+        let message = response
+            .messages
+            .iter()
+            .find(|m| m.message_id.as_deref() == Some("m1"))
+            .unwrap();
+        let Content::Text(t) = &message.contents[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(t.text, "Cited");
+        assert_eq!(
+            t.annotations.as_ref().unwrap()[0].url.as_deref(),
+            Some("https://example.com")
         );
     }
 
@@ -2143,6 +2346,35 @@ mod tests {
     }
 
     #[test]
+    fn sse_decoder_accepts_bare_cr_line_ends() {
+        let mut d = SseDecoder::default();
+        let out = d.push(b"data: 1\r\rdata: 2\r\r");
+        assert_eq!(out, ["1", "2"]);
+        assert!(d.finish().is_empty());
+    }
+
+    #[test]
+    fn sse_decoder_joins_crlf_split_across_chunks() {
+        let mut d = SseDecoder::default();
+        // The CR ends one chunk and its LF opens the next: one line end, not
+        // two, so the event is not dispatched before its second data line.
+        let mut out = d.push(b"data: a\r");
+        out.extend(d.push(b"\ndata: b\r"));
+        assert!(out.is_empty());
+        // The leading LF completes the split CRLF; the CR after it is the
+        // blank line that dispatches the event.
+        out.extend(d.push(b"\n\r"));
+        assert_eq!(out, ["a\nb"]);
+        // And the LF completing that CRLF is not a second blank line that
+        // would swallow the next event's first field.
+        out = d.push(b"\ndata: z\n\n");
+        assert_eq!(out, ["z"]);
+        // Mixed line ends in one stream.
+        out = d.push(b"data: c\n\ndata: d\r\n\r\ndata: e\r\r");
+        assert_eq!(out, ["c", "d", "e"]);
+    }
+
+    #[test]
     fn metadata_only_updates_fold_into_the_next() {
         let mut fold = MetadataFold::default();
         let mut started = assistant_update(Vec::new());
@@ -2155,5 +2387,62 @@ mod tests {
             .unwrap();
         assert_eq!(text.additional_properties["thread_id"], "t");
         assert!(fold.finish().is_none());
+    }
+
+    #[test]
+    fn consecutive_custom_and_snapshot_events_are_each_delivered() {
+        let mut c = AgUiEventConverter::new();
+        let mut fold = MetadataFold::default();
+        let events = [
+            json!({"type": "RUN_STARTED", "threadId": "t", "runId": "r"}),
+            json!({"type": "CUSTOM", "name": "progress", "value": 1}),
+            json!({"type": "CUSTOM", "name": "progress", "value": 2}),
+            json!({"type": "MESSAGES_SNAPSHOT", "messages": [{"id": "a"}]}),
+            json!({"type": "MESSAGES_SNAPSHOT", "messages": [{"id": "b"}]}),
+        ];
+        let out: Vec<_> = events
+            .iter()
+            .filter_map(|e| c.convert_event(e))
+            .filter_map(|u| fold.push(u))
+            .collect();
+        assert_eq!(out.len(), 4, "each event is delivered at once");
+        assert_eq!(out[0].additional_properties[CUSTOM_EVENT_KEY]["value"], 1);
+        assert_eq!(out[1].additional_properties[CUSTOM_EVENT_KEY]["value"], 2);
+        assert_eq!(
+            out[2].additional_properties["ag_ui_messages_snapshot"][0]["id"],
+            "a"
+        );
+        assert_eq!(
+            out[3].additional_properties["ag_ui_messages_snapshot"][0]["id"],
+            "b"
+        );
+        assert!(out.iter().all(|u| u.additional_properties["run_id"] == "r"));
+        assert!(fold.finish().is_none());
+    }
+
+    #[test]
+    fn tool_mode_none_declares_no_tools() {
+        let client = AgUiChatClient::new("http://localhost:8888/");
+        let tool = ToolDefinition {
+            name: "lookup".into(),
+            description: "d".into(),
+            parameters: json!({"type": "object"}),
+            kind: ToolKind::Function,
+            approval_mode: Default::default(),
+            executor: None,
+        };
+        let mut options = ChatOptions {
+            tools: vec![tool],
+            ..Default::default()
+        };
+        for (choice, declared) in [
+            (None, 1),
+            (Some(ToolMode::Auto), 1),
+            (Some(ToolMode::None), 0),
+        ] {
+            options.tool_choice = choice;
+            let run = client.prepare(vec![Message::user("hi")], &options).unwrap();
+            assert_eq!(run.input.tools.len(), declared);
+        }
     }
 }

@@ -133,6 +133,9 @@ pub mod event_type {
     pub const TOOL_CALL_ARGS: &str = "TOOL_CALL_ARGS";
     /// A tool call closes: `{toolCallId}`.
     pub const TOOL_CALL_END: &str = "TOOL_CALL_END";
+    /// A self-contained tool-call fragment, shorthand for start/args/end:
+    /// `{toolCallId?, toolCallName?, parentMessageId?, delta?}`.
+    pub const TOOL_CALL_CHUNK: &str = "TOOL_CALL_CHUNK";
     /// A server-side tool result: `{messageId, toolCallId, content, role}`.
     pub const TOOL_CALL_RESULT: &str = "TOOL_CALL_RESULT";
     /// A reasoning delta: `{messageId, delta}`.
