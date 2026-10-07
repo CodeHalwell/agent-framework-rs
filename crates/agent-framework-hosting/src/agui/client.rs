@@ -48,7 +48,7 @@
 //! | `REASONING_MESSAGE_CONTENT`, `REASONING_MESSAGE_CHUNK` | reasoning delta |
 //! | `REASONING_ENCRYPTED_VALUE` | `protected_data` on the named message's reasoning (`message`) or on the named call (`tool-call`); sent back as `encryptedValue` |
 //! | `STATE_SNAPSHOT`, `STATE_DELTA` | JSON [`DataContent`] (`application/json`, `application/json-patch+json`) |
-//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]`, plus an update per `assistant` / `tool` message neither sent nor streamed (matched by message id and `toolCallId`) |
+//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]`, plus an update per `assistant` / `tool` / `reasoning` message neither sent nor streamed (matched by message id and `toolCallId`) |
 //! | `RUN_FINISHED` | finish reason `stop`; `interrupt`, `outcome`, `interrupts`, `result` metadata; `usage` entries summed into one [`UsageContent`] |
 //! | `RUN_ERROR` | an [`ErrorContent`] with code `RUN_ERROR`, plus any reported `usage` |
 //! | `CUSTOM` | `additional_properties["ag_ui_custom_event"]`; an `annotations` event restores text annotations |
@@ -204,12 +204,15 @@ fn new_message_id() -> String {
 }
 
 /// The AG-UI role for a framework role. `tool` is not here: a tool message is
-/// emitted per function result. Anything else becomes `user`, as upstream's
-/// `FRAMEWORK_TO_AGUI_ROLE.get(role, "user")` does.
+/// emitted per function result. `developer` (an open [`Role`]) keeps its own
+/// AG-UI role, so instructions stay at developer priority. Anything else
+/// becomes `user`, as upstream's `FRAMEWORK_TO_AGUI_ROLE.get(role, "user")`
+/// does.
 fn agui_role(role: &Role) -> &'static str {
     match role.as_str() {
         Role::ASSISTANT => "assistant",
         Role::SYSTEM => "system",
+        "developer" => "developer",
         _ => "user",
     }
 }
@@ -749,10 +752,13 @@ pub struct AgUiEventConverter {
     /// Message ids already accounted for: sent in the request or streamed
     /// in this run. A `MESSAGES_SNAPSHOT` entry with one of these is skipped.
     known_message_ids: HashSet<String>,
-    /// Tool call ids sent in the request (calls and results); with
-    /// `seen_tool_calls` and `seen_result_call_ids` they keep a snapshot from
-    /// repeating a call or result the response already has.
+    /// Tool call ids the request's assistant messages sent as `toolCalls`;
+    /// with `seen_tool_calls` they keep a snapshot from repeating a call the
+    /// response already has. A call here may still be unanswered.
     known_call_ids: HashSet<String>,
+    /// `toolCallId`s the request's `tool` messages already answered; with
+    /// `seen_result_call_ids` they keep a snapshot from repeating a result.
+    known_result_call_ids: HashSet<String>,
     /// Calls whose `TOOL_CALL_RESULT` this run streamed.
     seen_result_call_ids: HashSet<String>,
     thread_id: Option<String>,
@@ -884,7 +890,7 @@ impl AgUiEventConverter {
                 self.known_message_ids.insert(id);
             }
             if let Some(id) = str_field(message, &["toolCallId", "tool_call_id"]) {
-                self.known_call_ids.insert(id);
+                self.known_result_call_ids.insert(id);
             }
             let calls = message
                 .get("toolCalls")
@@ -917,8 +923,11 @@ impl AgUiEventConverter {
     /// `tool` message (a [`FunctionResultContent`]) whose `id` was neither
     /// sent in the request (see [`Self::with_request_messages`]) nor streamed
     /// in this run. Within such a message, a call or result whose
-    /// `toolCallId` the run already has is left out too. Other roles (`user`,
-    /// `system`, `developer`, `reasoning`, `activity`) are input or
+    /// `toolCallId` the run already has is left out too (a result counts as
+    /// known only when its call was already answered, not merely sent). Each
+    /// new `reasoning` message becomes reasoning content, its `encryptedValue`
+    /// as `protected_data`, as the reasoning events would have built it. Other
+    /// roles (`user`, `system`, `developer`, `activity`) are input or
     /// client-side display and are not added. A snapshot does not edit or
     /// remove messages already produced; the raw list stays available as
     /// `ag_ui_messages_snapshot`.
@@ -1232,6 +1241,7 @@ impl AgUiEventConverter {
             let update = match role {
                 "assistant" => self.snapshot_assistant(message),
                 "tool" => self.snapshot_tool(message),
+                "reasoning" => snapshot_reasoning(message),
                 _ => None,
             };
             if let Some(mut update) = update {
@@ -1243,7 +1253,9 @@ impl AgUiEventConverter {
     }
 
     fn call_known(&self, id: &str) -> bool {
-        self.seen_tool_calls.contains_key(id) || self.known_call_ids.contains(id)
+        self.seen_tool_calls.contains_key(id)
+            || self.known_call_ids.contains(id)
+            || self.known_result_call_ids.contains(id)
     }
 
     fn snapshot_assistant(&mut self, message: &Value) -> Option<ChatResponseUpdate> {
@@ -1281,7 +1293,11 @@ impl AgUiEventConverter {
 
     fn snapshot_tool(&mut self, message: &Value) -> Option<ChatResponseUpdate> {
         let call_id = str_field(message, &["toolCallId", "tool_call_id"])?;
-        if self.seen_result_call_ids.contains(&call_id) || self.known_call_ids.contains(&call_id) {
+        // Only a result already received counts: a call the request sent may
+        // be answered for the first time by this snapshot.
+        if self.seen_result_call_ids.contains(&call_id)
+            || self.known_result_call_ids.contains(&call_id)
+        {
             return None;
         }
         self.seen_result_call_ids.insert(call_id.clone());
@@ -1350,6 +1366,30 @@ impl AgUiEventConverter {
         }
         update
     }
+}
+
+/// A snapshot `reasoning` message (`{content, encryptedValue?}`) as the
+/// reasoning the event path builds from `REASONING_MESSAGE_CONTENT` and a
+/// `REASONING_ENCRYPTED_VALUE` (`message`): its text, with the opaque value as
+/// `protected_data` so it goes back to the server on the next request.
+fn snapshot_reasoning(message: &Value) -> Option<ChatResponseUpdate> {
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let protected_data = str_field(message, &["encryptedValue", "encrypted_value"])
+        .filter(|value| !value.is_empty());
+    if text.is_empty() && protected_data.is_none() {
+        return None;
+    }
+    Some(assistant_update(vec![Content::TextReasoning(
+        TextReasoningContent {
+            text,
+            protected_data,
+            ..Default::default()
+        },
+    )]))
 }
 
 /// Whether `update` is an annotation batch from [`AgUiEventConverter`].
@@ -3068,6 +3108,93 @@ mod tests {
         assert!(matches!(
             &snapshot_updates[1].contents[..],
             [Content::Text(t)] if t.text == "fresh"
+        ));
+    }
+
+    #[test]
+    fn developer_role_keeps_its_agui_role() {
+        let out = messages_to_agui(&[
+            Message::with_contents(Role::new("developer"), vec![Content::text("Be terse.")]),
+            Message::with_contents(Role::new("critic"), vec![Content::text("Hm.")]),
+        ]);
+        assert_eq!(out[0]["role"], "developer");
+        assert_eq!(out[0]["content"], "Be terse.");
+        // Other unknown roles still fall back to `user`.
+        assert_eq!(out[1]["role"], "user");
+    }
+
+    #[test]
+    fn snapshot_reasoning_keeps_its_encrypted_value_and_round_trips() {
+        let mut c = AgUiEventConverter::new().with_request_messages(&[json!({
+            "id": "old_r", "role": "reasoning", "content": "earlier", "encryptedValue": "old"
+        })]);
+        let events = [
+            json!({"type": "RUN_STARTED", "threadId": "t", "runId": "r"}),
+            // Streamed reasoning: its snapshot copy adds nothing.
+            json!({"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "streamed"}),
+            json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+                {"id": "old_r", "role": "reasoning", "content": "earlier", "encryptedValue": "old"},
+                {"id": "r1", "role": "reasoning", "content": "streamed"},
+                {"id": "r2", "role": "reasoning", "content": "Thinking.", "encryptedValue": "enc-2"},
+                {"id": "r3", "role": "reasoning", "content": ""},
+                {"id": "a1", "role": "assistant", "content": "Done."},
+            ]}),
+            json!({"type": "RUN_FINISHED", "threadId": "t", "runId": "r"}),
+        ];
+        let updates: Vec<_> = events.iter().flat_map(|e| c.convert_event_all(e)).collect();
+        let response = finalize_response(updates);
+        let ids: Vec<_> = response
+            .messages
+            .iter()
+            .map(|m| m.message_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, ["r1", "r2", "a1"]);
+        let Content::TextReasoning(reasoning) = &response.messages[1].contents[0] else {
+            panic!("expected reasoning")
+        };
+        assert_eq!(reasoning.text, "Thinking.");
+        assert_eq!(reasoning.protected_data.as_deref(), Some("enc-2"));
+
+        // The value goes back to the server as a `reasoning` message.
+        let out = messages_to_agui(&response.messages[1..2]);
+        assert_eq!(
+            out,
+            [
+                json!({"id": "r2", "role": "reasoning", "content": "Thinking.", "encryptedValue": "enc-2"})
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_answers_a_call_the_request_sent() {
+        let mut c = AgUiEventConverter::new().with_request_messages(&[
+            json!({"id": "a0", "role": "assistant", "content": "", "toolCalls": [
+                {"id": "c0", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "c1", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+            ]}),
+            json!({"id": "t0", "role": "tool", "toolCallId": "c0", "content": "r0"}),
+        ]);
+        let updates = c.convert_event_all(&json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+            {"id": "a0", "role": "assistant", "content": "", "toolCalls": [
+                {"id": "c0", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "c1", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+            ]},
+            {"id": "t0", "role": "tool", "toolCallId": "c0", "content": "r0"},
+            // Answered already, under a new id: still a repeat.
+            {"id": "t0b", "role": "tool", "toolCallId": "c0", "content": "r0"},
+            // The first answer to c1, which the request sent unanswered.
+            {"id": "t1", "role": "tool", "toolCallId": "c1", "content": "r1"},
+            // A call the request already sent is not repeated.
+            {"id": "a1", "role": "assistant", "toolCalls": [
+                {"id": "c1", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+            ]},
+        ]}));
+        // The metadata update, then only c1's result.
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].message_id.as_deref(), Some("t1"));
+        assert!(matches!(
+            &updates[1].contents[..],
+            [Content::FunctionResult(r)] if r.call_id == "c1"
         ));
     }
 }
