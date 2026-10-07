@@ -291,7 +291,8 @@ December 2025 matrix and audit, kept for history. The remaining gaps:
 - [ ] AG-UI: the client (`AGUIChatClient`) and predictive-state events
       (`STATE_SNAPSHOT`/`STATE_DELTA`, `confirm_changes`)
 - [ ] DevUI parity: conversations API, run cancellation, `/meta`,
-      directory-based entity discovery, auth; the React frontend
+      directory-based entity discovery, auth (the frontend itself is out of
+      scope; see [`SCOPE.md`](SCOPE.md))
 - [ ] A2A serving: streaming, non-terminal task lifecycle, file/data parts,
       push-notification config, `tasks/resubscribe`, extended card
 - [ ] `as_mcp_server`
@@ -326,7 +327,7 @@ Done — everything else, including:
       orchestrations, streaming A2A
 - [x] `AiFunction::typed` — parameter schemas derived from Rust types
       (schemars), plus invocation limits and hosted-tool config setters
-- [x] Providers: OpenAI (chat + Responses + **Assistants**), Azure OpenAI
+- [x] Providers: OpenAI (chat + Responses), Azure OpenAI
       (chat + **Responses**), Azure AI Foundry (incl. Bing grounding /
       file-search configs), Anthropic (betas + hosted tools + citations),
       Copilot Studio; Entra ID credential chain incl.
