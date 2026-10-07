@@ -110,9 +110,11 @@ fn write_back_message_list(
     let Value::Array(after_items) = after else {
         return Err(write_back_error(point, "expected a list of messages"));
     };
+    // Every entry needs a string role and a content member: a missing or
+    // non-string role is an unappliable transform, not an implicit `user`.
     if after_items
         .iter()
-        .any(|i| !i.is_object() || i.get("content").is_none())
+        .any(|i| !i.get("role").is_some_and(Value::is_string) || i.get("content").is_none())
     {
         return Err(write_back_error(point, "a message lacks role/content"));
     }
@@ -124,7 +126,7 @@ fn write_back_message_list(
             cursor = found + 1;
             continue;
         }
-        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+        let role = item["role"].as_str().unwrap_or_default();
         let content = wire_to_contents(&item["content"], point)?;
         if cursor < originals.len() {
             let candidate = &before[cursor];
@@ -690,6 +692,20 @@ mod tests {
             request_write_back(originals.clone(), &before, &Value::Array(before.clone())).unwrap();
         assert_eq!(same.len(), 3);
         assert!(request_write_back(originals, &before, &json!("nope")).is_err());
+    }
+
+    #[test]
+    fn message_list_write_back_rejects_missing_or_non_string_roles() {
+        let originals = vec![Message::user("a"), Message::user("b")];
+        let before = request_to_wire(&originals).unwrap();
+        for after in [
+            json!([{"role": "user", "content": "a"}, {"content": "sanitized"}]),
+            json!([{"role": "user", "content": "a"}, {"role": 7, "content": "b"}]),
+            json!([{"role": "user", "content": "a"}, {"role": null, "content": "b"}]),
+        ] {
+            let err = request_write_back(originals.clone(), &before, &after).unwrap_err();
+            assert!(err.is_middleware_failure(), "{after}");
+        }
     }
 
     fn tool_call_response() -> ChatResponse {

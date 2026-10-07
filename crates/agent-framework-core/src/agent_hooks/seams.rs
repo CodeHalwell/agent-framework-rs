@@ -780,16 +780,21 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
         };
 
         match result {
-            // A halt (the inner half's, or another fail-closed middleware's)
-            // stays a halt.
-            Err(error) if error.is_middleware_failure() => Err(error),
             Err(error) => {
-                // The invocation errored; the contract still brackets it.
+                // The invocation was dispatched and errored; the contract
+                // still brackets it (§3), whatever kind of error it was.
                 let value = Value::String(crate::observability::error_type(&error));
                 let post = state
                     .builder
                     .post_tool_call(&call_id, &name, args, value.clone(), true);
-                match state.emitter.emit(post).await {
+                let emitted = state.emitter.emit(post).await;
+                // A halt (the executor's, or another fail-closed
+                // middleware's) stays a halt: the post hook observes it but
+                // cannot turn it back into a model-facing result.
+                if error.is_middleware_failure() {
+                    return Err(error);
+                }
+                match emitted {
                     // A transform rewrites the error the loop hands the
                     // model; it is the interceptor's model-facing text, so
                     // it reaches the model even without detailed errors.

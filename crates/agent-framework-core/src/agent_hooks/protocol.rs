@@ -742,7 +742,10 @@ pub struct InterceptionRecord {
     pub interception_point: InterceptionPoint,
     /// The enforcement mode in effect.
     pub mode: EnforcementMode,
-    /// The payload-free projection of the combined verdict.
+    /// The payload-free projection of the combined verdict. Its
+    /// `transform.value` is always `null` here and is omitted when the
+    /// record is serialized (§10.3).
+    #[serde(serialize_with = "serialize_record_verdict")]
     pub verdict: Verdict,
     /// Always `None` (no identity provider).
     pub input_identity: Option<String>,
@@ -767,6 +770,19 @@ pub struct InterceptionRecord {
     pub fold_truncated: bool,
     /// Number of interceptors registered.
     pub interceptors_registered: usize,
+}
+
+/// Serialize a record's verdict without the `transform.value` member: the
+/// §10.3 record carries the transform's path, never its payload.
+fn serialize_record_verdict<S: serde::Serializer>(
+    verdict: &Verdict,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(verdict).map_err(serde::ser::Error::custom)?;
+    if let Some(Value::Object(transform)) = value.get_mut("transform") {
+        transform.remove("value");
+    }
+    value.serialize(serializer)
 }
 
 impl InterceptionRecord {
@@ -1575,6 +1591,25 @@ mod tests {
             .unwrap()
             .insert("ticket".into(), json!("t"));
         assert_eq!(e.project().approval, Some(Map::new()));
+    }
+
+    #[test]
+    fn serialized_records_omit_the_transform_value() {
+        let mut record = InterceptionEmitter::new().record_host_failure(
+            InterceptionPoint::PostToolCall,
+            "detail",
+            "s",
+            Some(1),
+        );
+        record.verdict = Verdict::transform("$target.secret", json!("redacted value")).project();
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            json["verdict"]["transform"],
+            json!({"path": "$target.secret"})
+        );
+        // A verdict on its own still carries the member.
+        let verdict = serde_json::to_value(&record.verdict).unwrap();
+        assert_eq!(verdict["transform"]["value"], Value::Null);
     }
 
     #[test]

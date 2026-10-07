@@ -907,6 +907,33 @@ async fn post_tool_call_transform_rewrites_an_errored_result() {
     assert_eq!(exception, "sanitized");
 }
 
+#[tokio::test]
+async fn post_tool_call_brackets_a_dispatched_call_that_fails_closed() {
+    let failing = FunctionTool::new("lookup", "", json!({"type": "object"}), |_| async {
+        Err::<Value, _>(Error::middleware_failure("executor halted"))
+    })
+    .into_definition();
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({})),
+        text_reply("unreachable"),
+    ]);
+    let (interceptor, seen) = recorder(|_| Verdict::allow());
+    let agent = hooks(interceptor).build_agent(Agent::builder(client).tool(failing));
+    let err = agent
+        .run(vec![Message::user("go")], None)
+        .await
+        .unwrap_err();
+    // The halt still surfaces...
+    assert!(err.is_middleware_failure(), "{err}");
+    // ...but the dispatched call is still bracketed by post_tool_call.
+    let seen = seen.lock().unwrap();
+    let post = seen
+        .iter()
+        .find(|c| c.point() == InterceptionPoint::PostToolCall)
+        .expect("post_tool_call for the dispatched call");
+    assert_eq!(post.as_json()["tool_result"]["is_error"], true);
+}
+
 fn host_calls(response: &ChatResponse) -> Vec<(String, Value)> {
     response
         .messages
