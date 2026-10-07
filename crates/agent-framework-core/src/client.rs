@@ -537,6 +537,7 @@ async fn execute_tool_call(
             });
 
             let mut ctx = FunctionInvocationContext::new(call.name.clone(), args)
+                .with_tool_name(def.name.clone())
                 .with_session(session.cloned())
                 .with_tools(live_tools.cloned());
             // Middleware can correlate the invocation with the model's call

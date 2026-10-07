@@ -233,6 +233,11 @@ pub struct FunctionInvocationContext {
     pub metadata: HashMap<String, serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub terminate: bool,
+    /// The name of the tool definition the function loop selected (and
+    /// whose executor the terminal runs). Unlike `function_name`, which
+    /// middleware may rewrite, it cannot be changed outside the crate, so
+    /// enforcement judges the tool that actually runs.
+    pub(crate) tool_name: Option<String>,
 }
 
 impl FunctionInvocationContext {
@@ -245,7 +250,14 @@ impl FunctionInvocationContext {
             metadata: HashMap::new(),
             result: None,
             terminate: false,
+            tool_name: None,
         }
+    }
+
+    /// Builder: record the selected tool definition's name.
+    pub(crate) fn with_tool_name(mut self, name: impl Into<String>) -> Self {
+        self.tool_name = Some(name.into());
+        self
     }
 
     /// Builder: attach the agent session this invocation belongs to.

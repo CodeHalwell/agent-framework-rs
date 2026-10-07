@@ -504,13 +504,12 @@ fn write_back_content(response: &mut ChatResponse, after_content: &Value) -> Res
         Value::Array(items) => items
             .iter()
             .map(|item| {
-                if !item.is_object() || item.get("content").is_none() {
-                    return Err(write_back_error(POINT, "content lacks role/content"));
-                }
-                let role = item
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or(Role::ASSISTANT);
+                // A missing or non-string role is an unappliable transform,
+                // not an implicit `assistant`.
+                let role = match item.get("role").and_then(Value::as_str) {
+                    Some(role) if item.get("content").is_some() => role,
+                    _ => return Err(write_back_error(POINT, "content lacks role/content")),
+                };
                 Ok(Message::with_contents(
                     role,
                     wire_to_contents(&item["content"], POINT)?,
@@ -769,6 +768,32 @@ mod tests {
         let mut after = before.clone();
         after["tool_calls"] = json!([{"id": "c1"}]);
         assert!(response_write_back(&mut response, &before, &after).is_err());
+    }
+
+    #[test]
+    fn response_content_write_back_rejects_missing_or_non_string_roles() {
+        let original = ChatResponse {
+            messages: vec![Message::assistant("a"), Message::assistant("b")],
+            ..Default::default()
+        };
+        let before = response_to_wire(&original).unwrap();
+        for content in [
+            json!([{"role": "assistant", "content": "a"}, {"content": "sanitized"}]),
+            json!([{"role": "assistant", "content": "a"}, {"role": 7, "content": "b"}]),
+            json!([{"role": "assistant", "content": "a"}, {"role": null, "content": "b"}]),
+        ] {
+            let mut response = original.clone();
+            let mut after = before.clone();
+            after["content"] = content.clone();
+            let err = response_write_back(&mut response, &before, &after).unwrap_err();
+            assert!(err.is_middleware_failure(), "{content}");
+        }
+        // A well-formed list still applies.
+        let mut response = original.clone();
+        let mut after = before.clone();
+        after["content"] = json!([{"role": "assistant", "content": "only"}]);
+        assert!(response_write_back(&mut response, &before, &after).unwrap());
+        assert_eq!(response.text(), "only");
     }
 
     #[test]

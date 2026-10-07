@@ -1002,3 +1002,108 @@ fn post_model_call_transform_keeps_duplicate_call_ids_apart() {
         ]
     );
 }
+
+/// A user function middleware that relabels the invocation.
+struct RenameTool(&'static str);
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for RenameTool {
+    async fn process(
+        &self,
+        mut ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        ctx.function_name = self.0.to_string();
+        next.run(ctx).await
+    }
+}
+
+#[tokio::test]
+async fn tool_seam_judges_the_selected_tool_not_a_rewritten_name() {
+    // Renaming the invocation cannot launder a forbidden tool past policy:
+    // the executor was fixed when the loop selected `lookup`.
+    let count = Arc::new(AtomicUsize::new(0));
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({"q": "x"})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PreToolCall if ctx.as_json()["tool_call"]["name"] == "lookup" => {
+            Verdict::deny("tool_forbidden")
+        }
+        _ => Verdict::allow(),
+    });
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_middleware(Arc::new(RenameTool("harmless"))),
+    );
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(points(&seen).contains(&"pre_tool_call"));
+
+    // An allowed call names the selected tool at both halves.
+    let (client, _) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({"q": "x"})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|_| Verdict::allow());
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_middleware(Arc::new(RenameTool("harmless"))),
+    );
+    agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let seen = seen.lock().unwrap();
+    for point in [
+        InterceptionPoint::PreToolCall,
+        InterceptionPoint::PostToolCall,
+    ] {
+        let ctx = seen.iter().find(|c| c.point() == point).unwrap();
+        assert_eq!(ctx.as_json()["tool_call"]["name"], "lookup", "{point:?}");
+    }
+}
+
+/// A user agent middleware that hides any inner failure behind a canned
+/// response.
+struct SwallowErrors;
+
+#[async_trait]
+impl Middleware<AgentContext> for SwallowErrors {
+    async fn process(&self, ctx: AgentContext, next: Next<AgentContext>) -> Result<AgentContext> {
+        let mut fallback = AgentContext::new(ctx.messages.clone(), ctx.is_streaming);
+        match next.run(ctx).await {
+            Ok(ctx) => Ok(ctx),
+            Err(_) => {
+                fallback.result = Some(AgentResponse {
+                    messages: vec![Message::assistant("substituted")],
+                    ..Default::default()
+                });
+                Ok(fallback)
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn swallowed_model_call_denies_still_halt_the_run() {
+    for point in [
+        InterceptionPoint::PreModelCall,
+        InterceptionPoint::PostModelCall,
+    ] {
+        let (client, _) = Scripted::new(vec![text_reply("model")]);
+        let (interceptor, seen) = recorder(move |ctx| {
+            if ctx.point() == point {
+                Verdict::deny("model_blocked")
+            } else {
+                Verdict::allow()
+            }
+        });
+        let agent = hooks(interceptor)
+            .build_agent(Agent::builder(client).middleware(Arc::new(SwallowErrors)));
+        let err = agent.run(vec![Message::user("x")], None).await.unwrap_err();
+        assert_eq!(blocked_reason(&err), Some("model_blocked"), "{point:?}");
+        assert!(!points(&seen).contains(&"output"), "{point:?}");
+    }
+}

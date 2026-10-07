@@ -1087,9 +1087,16 @@ impl InterceptionEmitter {
                 }
                 Decision::Transform => {
                     if let Err(reason) = self.fold(context, &verdict) {
+                        // An unappliable transform is the interceptor's
+                        // failure: the synthesized deny takes its slot
+                        // (§6.3, §7.4) and decides the fold.
+                        let deny = Verdict::host_error(reason, None);
+                        let slot = &mut summaries[i];
+                        slot.decision = deny.decision;
+                        slot.reason = deny.reason.clone();
                         return Dispatch {
-                            combined: with_unions(Verdict::host_error(reason, None), &pool),
-                            decided_by: None,
+                            combined: with_unions(deny, &pool),
+                            decided_by: Some(i),
                             verdicts: summaries,
                             fold_truncated: truncated,
                         };
@@ -1786,6 +1793,46 @@ mod tests {
             assert!(!wire.contains("secret text"), "{wire}");
             assert!(wire.contains("\"identity_provider\":null"));
         }
+    }
+
+    #[tokio::test]
+    async fn an_unappliable_transform_denies_in_its_own_slot() {
+        let called = Arc::new(AtomicU64::new(0));
+        let called2 = called.clone();
+        let emitter = InterceptionEmitter::new()
+            .register(
+                Arc::new(interceptor_fn(|_| async { Ok(Verdict::allow()) })),
+                None,
+            )
+            .register(
+                Arc::new(interceptor_fn(|_| async {
+                    Ok(Verdict::transform("$target.nope", json!(1)))
+                })),
+                Some("broken".into()),
+            )
+            .register(
+                Arc::new(interceptor_fn(move |_| {
+                    called2.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(Verdict::allow()) }
+                })),
+                None,
+            );
+        let blocked = emitter
+            .emit(builder().output(json!("x")))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.reason(), Some(host_error::TRANSFORM_INVALID));
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+        let record = &blocked.record;
+        assert_eq!(record.decided_by, Some(1));
+        assert!(record.fold_truncated);
+        assert_eq!(record.verdicts.len(), 2);
+        let slot = &record.verdicts[1];
+        assert_eq!(slot.index, 1);
+        assert_eq!(slot.name.as_deref(), Some("broken"));
+        assert_eq!(slot.decision, Decision::Deny);
+        assert_eq!(slot.reason.as_deref(), Some(host_error::TRANSFORM_INVALID));
+        assert_eq!(record.verdicts[0].decision, Decision::Allow);
     }
 
     #[tokio::test(start_paused = true)]

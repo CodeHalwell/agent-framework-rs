@@ -134,8 +134,9 @@ enum ToolTrack {
     Pending,
     /// `pre_tool_call` blocked the call; no `post_tool_call` follows (§6.2).
     Blocked,
-    /// The call was dispatched with these (post-transform) arguments.
-    Dispatched(Map<String, Value>),
+    /// The call was dispatched to the named tool with these
+    /// (post-transform) arguments.
+    Dispatched(String, Map<String, Value>),
 }
 
 impl RunState {
@@ -148,6 +149,17 @@ impl RunState {
         };
         self.halted.lock().unwrap().get_or_insert(halt);
         Error::middleware_failure(message)
+    }
+
+    /// Record a model-seam deny as the run's halt (the first one wins) and
+    /// return it unchanged, so a middleware that catches the error and
+    /// substitutes a response still cannot egress or persist it.
+    fn block_model(&self, b: Box<InterceptionBlocked>) -> Error {
+        self.halted
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Halt::Blocked(b.clone()));
+        Error::InterceptionBlocked(b)
     }
 
     /// The error a halted run surfaces at the run boundary.
@@ -559,7 +571,11 @@ impl GuardedChatClient {
             before.clone(),
             codecs::tools_to_wire(&options.tools),
         );
-        let outcome = state.emitter.emit(context).await.map_err(blocked)?;
+        let outcome = state
+            .emitter
+            .emit(context)
+            .await
+            .map_err(|b| state.block_model(b))?;
         codecs::request_write_back(messages, &before, &outcome.target)
     }
 
@@ -579,7 +595,11 @@ impl GuardedChatClient {
             before["finish_reason"].as_str().unwrap_or("stop"),
             codecs::usage_to_wire(response.usage_details.as_ref()),
         );
-        let outcome = state.emitter.emit(context).await.map_err(blocked)?;
+        let outcome = state
+            .emitter
+            .emit(context)
+            .await
+            .map_err(|b| state.block_model(b))?;
         codecs::response_write_back(response, &before, &outcome.target)
     }
 }
@@ -763,12 +783,13 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
             .insert(token.clone(), ToolTrack::Pending);
         ctx.metadata
             .insert(TOOL_TOKEN_KEY.into(), Value::String(token.clone()));
-        let name = ctx.function_name.clone();
 
         let result = next.run(ctx).await;
         let track = state.tool_calls.lock().unwrap().remove(&token);
-        let args = match track {
-            Some(ToolTrack::Dispatched(args)) => args,
+        // The inner half reports the selected tool's name, which middleware
+        // cannot rewrite; post_tool_call names the same tool.
+        let (name, args) = match track {
+            Some(ToolTrack::Dispatched(name, args)) => (name, args),
             // Blocked at pre_tool_call (§6.2: no post_tool_call), or no tool
             // was reached at all.
             Some(ToolTrack::Blocked | ToolTrack::Pending) | None => {
@@ -856,7 +877,14 @@ impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
             }
         };
         let call_id = invocation_call_id(&ctx);
-        let name = ctx.function_name.clone();
+        // Judge the tool whose executor actually runs: the loop fixed it
+        // when it selected the definition, and `function_name` is only a
+        // mutable label middleware may have rewritten.
+        let Some(name) = ctx.tool_name.clone() else {
+            return Err(state.halt(Halt::Failure(
+                "agent-hooks: tool invocation lost the selected tool's identity".into(),
+            )));
+        };
         let mut args = codecs::tool_args_to_wire(&ctx.arguments);
         let pre = state.builder.pre_tool_call(&call_id, &name, args.clone());
         match state.emitter.emit(pre).await {
@@ -882,7 +910,7 @@ impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
             .tool_calls
             .lock()
             .unwrap()
-            .insert(token, ToolTrack::Dispatched(args));
+            .insert(token, ToolTrack::Dispatched(name, args));
         next.run(ctx).await
     }
 }
