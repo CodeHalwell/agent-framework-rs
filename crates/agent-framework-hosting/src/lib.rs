@@ -16,7 +16,13 @@
 //! - **AG-UI protocol** ([`agui::AgUiRouter`]) — CopilotKit's SupportsAgentRun-User
 //!   Interaction protocol: `POST {path}` streaming camelCase SSE events
 //!   (`RUN_STARTED` → `TEXT_MESSAGE_*` / `TOOL_CALL_*` → `RUN_FINISHED`),
-//!   mirroring the Python `agent_framework_ag_ui` package.
+//!   mirroring the Python `agent_framework_ag_ui` package. With the
+//!   `agui-client` feature, `agui::AgUiChatClient` is the matching client: a
+//!   `ChatClient` for any AG-UI server.
+//!
+//! # Cargo features
+//! - `agui-client` (off by default): `agui::AgUiChatClient`, which adds a
+//!   `reqwest` dependency that a server alone does not need.
 //!
 //! The OpenAI-Responses request/response types and the
 //! [`responses::responses_to_run`]/[`responses::responses_from_run`]
@@ -65,6 +71,8 @@
 //! each module. The most consequential: **runs are stateless** — there is no
 //! conversation store or workflow-resume endpoint, matching the work package's
 //! decision that DevUI exposes no HTTP run-resume path of its own.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod a2a;
 pub mod agui;

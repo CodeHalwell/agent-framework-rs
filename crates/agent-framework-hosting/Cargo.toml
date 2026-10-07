@@ -24,8 +24,29 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
+# Only for the `agui-client` feature: server users do not pull an HTTP client.
+reqwest = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[features]
+# `agui::AgUiChatClient`: a `ChatClient` that talks to a remote AG-UI server
+# over HTTP + SSE (upstream `AGUIChatClient`). Off by default so hosting a
+# server does not pull in reqwest.
+agui-client = ["dep:reqwest", "dep:base64", "dep:bytes"]
 
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[[test]]
+name = "agui_client"
+required-features = ["agui-client"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
