@@ -643,6 +643,99 @@ async fn non_fresh_loop_accumulates_history() {
     );
 }
 
+/// A session with one earlier turn, its providers, and a fresh-context loop
+/// whose condition never resolves, so the run can only end by cancellation.
+async fn session_and_stuck_fresh_loop(
+    client: &Mock,
+) -> (AgentSession, Vec<Arc<dyn ContextProvider>>, LoopAgent) {
+    let inner = agent(client);
+    let mut session = inner.create_session();
+    inner
+        .run(vec![Message::user("earlier turn")], Some(&mut session))
+        .await
+        .unwrap();
+    let providers = session.context_providers.clone();
+    assert!(providers.iter().any(|p| p.is_history_provider()));
+    let looping = LoopAgent::builder(
+        inner,
+        async_loop_callback(|_ctx: LoopContext| async move {
+            std::future::pending::<Result<LoopDecision>>().await
+        }),
+    )
+    .fresh_context(true)
+    .build()
+    .unwrap();
+    (session, providers, looping)
+}
+
+/// After a cancelled loop the session is back on its own providers, and the
+/// next turn sees the pre-loop transcript.
+async fn assert_providers_restored(
+    client: &Mock,
+    mut session: AgentSession,
+    providers: &[Arc<dyn ContextProvider>],
+) {
+    assert_eq!(session.context_providers.len(), providers.len());
+    for (now, before) in session.context_providers.iter().zip(providers) {
+        assert!(Arc::ptr_eq(now, before), "provider was not restored");
+    }
+    let call = client.calls();
+    agent(client)
+        .run(vec![Message::user("after")], Some(&mut session))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.received(call),
+        ["earlier turn", "response to: earlier turn", "after"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_context_restores_providers_when_run_times_out() {
+    let client = Mock::new();
+    let (mut session, providers, looping) = session_and_stuck_fresh_loop(&client).await;
+    let run = looping.run(vec![Message::user("loop task")], Some(&mut session));
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(1), run)
+        .await
+        .is_err());
+    // The first pass ran on the scratch history before the timeout.
+    assert_eq!(client.calls(), 2);
+    assert_providers_restored(&client, session, &providers).await;
+}
+
+#[tokio::test]
+async fn fresh_context_restores_providers_when_run_future_is_dropped() {
+    use futures::FutureExt;
+    let client = Mock::new();
+    let (mut session, providers, looping) = session_and_stuck_fresh_loop(&client).await;
+    // Poll once (the first pass completes, the condition pends), then drop.
+    assert!(looping
+        .run(vec![Message::user("loop task")], Some(&mut session))
+        .now_or_never()
+        .is_none());
+    assert_eq!(client.calls(), 2);
+    assert_providers_restored(&client, session, &providers).await;
+}
+
+#[tokio::test]
+async fn fresh_context_stream_dropped_mid_run_leaves_caller_session_intact() {
+    let client = Mock::new();
+    let (session, providers, looping) = session_and_stuck_fresh_loop(&client).await;
+    // The stream owns its own copy of the session; dropping it mid-run must
+    // not touch the caller's providers or history.
+    let mut stream = looping
+        .run_stream(
+            vec![Message::user("loop task")],
+            Some(session.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+    drop(stream);
+    assert_providers_restored(&client, session, &providers).await;
+}
+
 // region: judge
 
 fn verdict(answered: bool, reasoning: &str) -> ChatResponse {

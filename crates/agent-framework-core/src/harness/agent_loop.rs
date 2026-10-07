@@ -472,7 +472,10 @@ impl LoopAgent {
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
         ensure_history_provider(session);
-        let mut run = LoopRun::start(self.config.clone(), input, session).await?;
+        // Fresh-context mode swaps the session's history providers for a
+        // scratch one; put them back even if this future is dropped.
+        let mut session = ProviderRestore::new(session, self.config.fresh_context);
+        let mut run = LoopRun::start(self.config.clone(), input, &mut session).await?;
         let mut messages = run.original.clone();
         let mut transcript = Vec::new();
         let mut usage: Option<UsageDetails> = None;
@@ -484,7 +487,7 @@ impl LoopAgent {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    run.abort(session);
+                    run.abort(&mut session);
                     return Err(e);
                 }
             };
@@ -495,9 +498,12 @@ impl LoopAgent {
                 });
             }
             transcript.extend(response.messages.iter().cloned());
-            match run.after_iteration(session, &messages, &response).await {
+            match run
+                .after_iteration(&mut session, &messages, &response)
+                .await
+            {
                 Err(e) => {
-                    run.abort(session);
+                    run.abort(&mut session);
                     return Err(e);
                 }
                 Ok(Step::Stop) => break response,
@@ -510,7 +516,8 @@ impl LoopAgent {
                 }
             }
         };
-        run.finish(session, &messages, &last).await?;
+        run.finish(&mut session, &messages, &last).await?;
+        session.disarm();
         if self.config.return_final_only {
             // The final pass's messages, but every pass's token usage.
             return Ok(AgentResponse {
@@ -822,6 +829,48 @@ impl LoopRun {
     fn abort(&mut self, session: &mut AgentSession) {
         if let Some(fresh) = self.fresh.take() {
             session.context_providers = fresh.providers;
+        }
+    }
+}
+
+/// Restores a borrowed session's context providers on drop unless
+/// disarmed, so a fresh-context run cancelled by dropping its future (a
+/// timeout, `select!`) does not leave the caller's session on the scratch
+/// history. The streaming loop owns its session, so it needs no guard.
+struct ProviderRestore<'a> {
+    session: &'a mut AgentSession,
+    original: Option<Vec<Arc<dyn ContextProvider>>>,
+}
+
+impl<'a> ProviderRestore<'a> {
+    fn new(session: &'a mut AgentSession, armed: bool) -> Self {
+        let original = armed.then(|| session.context_providers.clone());
+        Self { session, original }
+    }
+
+    /// The run completed and restored the providers itself.
+    fn disarm(&mut self) {
+        self.original = None;
+    }
+}
+
+impl std::ops::Deref for ProviderRestore<'_> {
+    type Target = AgentSession;
+    fn deref(&self) -> &AgentSession {
+        self.session
+    }
+}
+
+impl std::ops::DerefMut for ProviderRestore<'_> {
+    fn deref_mut(&mut self) -> &mut AgentSession {
+        self.session
+    }
+}
+
+impl Drop for ProviderRestore<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            self.session.context_providers = original;
         }
     }
 }
