@@ -292,6 +292,11 @@ impl DockerShellToolBuilder {
     }
 
     /// An explicit container name; by default a unique one is generated.
+    ///
+    /// With an explicit name, a start that is cancelled before `docker run`
+    /// returns does not remove anything by that name (it may belong to a
+    /// container this tool does not own), so a container created by that
+    /// start is left for the caller to remove.
     pub fn container_name(mut self, name: impl Into<String>) -> Self {
         self.container_name = Some(name.into());
         self
@@ -475,6 +480,7 @@ impl DockerShellToolBuilder {
                 "max_output_bytes must be positive".into(),
             ));
         }
+        let generated_name = self.container_name.is_none();
         let container_name = self
             .container_name
             .clone()
@@ -482,8 +488,10 @@ impl DockerShellToolBuilder {
         Ok(DockerShellTool {
             inner: Arc::new(DockerInner {
                 container_name,
+                generated_name,
                 config: self,
                 state: Mutex::new(PersistentState::default()),
+                run_lock: Mutex::new(()),
             }),
         })
     }
@@ -577,8 +585,16 @@ struct PersistentState {
 
 struct DockerInner {
     container_name: String,
+    /// Whether `container_name` is a random name this tool generated, as
+    /// opposed to one the caller chose (which may name a container this
+    /// tool does not own).
+    generated_name: bool,
     config: DockerShellToolBuilder,
     state: Mutex<PersistentState>,
+    /// Serialises persistent calls end to end: execution *and* the recovery
+    /// after a timeout or cancellation, so a queued call never starts on a
+    /// shell that recovery is about to kill.
+    run_lock: Mutex<()>,
 }
 
 /// A shell tool that runs commands inside a Docker (or compatible)
@@ -771,17 +787,24 @@ impl DockerShellTool {
     async fn start_container(&self) -> Result<(), ShellError> {
         let argv = self.run_argv();
         // If this future is dropped mid-start the daemon may still create the
-        // container, and nothing has recorded it yet: remove it by name.
+        // container, and nothing has recorded it yet: remove it by name. Only
+        // for a name this tool generated: a caller-chosen `container_name`
+        // may already belong to another container, and a cancellation before
+        // `docker run` reports the name conflict must not remove that one.
+        // A cancelled start with an explicit name may leave the container
+        // behind for its owner to remove.
         let mut cleanup =
             ContainerCleanup::new(&self.inner.config.docker_binary, &self.inner.container_name);
+        if !self.inner.generated_name {
+            cleanup.disarm();
+        }
         let out = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output()
             .await;
-        // A refused start is not cleaned up by name: with an explicit
-        // `container_name` the name may belong to someone else's container.
+        // Not armed past here: a refused start created nothing of ours.
         cleanup.disarm();
         let out = out.map_err(|e| ShellError::io("failed to run the container CLI", e))?;
         if !out.status.success() {
@@ -973,6 +996,11 @@ impl ShellExecutor for DockerShellTool {
         if c.mode == ShellMode::Stateless {
             return self.run_stateless(command, timeout).await;
         }
+        // Held from the poison check through recovery. The session's own
+        // lock is released when `session.run` returns, before the reap below;
+        // without this, a queued call could start on the shell (or in the
+        // container) the reap is about to kill.
+        let _serial = self.inner.run_lock.lock().await;
         {
             // A previous call was cancelled mid-command: its command may still
             // be running in the container. Reap it before the session is

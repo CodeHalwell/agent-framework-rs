@@ -237,6 +237,28 @@ async fn cancelled_stateless_run_kills_the_process_group() {
     );
 }
 
+/// A background job left behind by a shell that exited normally must not
+/// hold the pipes open (losing the output) or outlive the command.
+#[tokio::test]
+async fn stateless_background_job_is_killed_and_output_kept() {
+    let tool = stateless().timeout(None).build().unwrap();
+    let result = tool.run("sleep 30 & echo $!; echo ok", None).await.unwrap();
+    assert!(!result.timed_out);
+    assert_eq!(result.exit_code, 0);
+    let mut lines = result.stdout.lines();
+    let pid: u32 = lines.next().expect("pid").trim().parse().unwrap();
+    assert_eq!(lines.next(), Some("ok"), "{:?}", result.stdout);
+    assert!(
+        result.duration < Duration::from_secs(1),
+        "waited on the background job: {:?}",
+        result.duration
+    );
+    assert!(
+        eventually(|| !process_alive(pid)).await,
+        "background job {pid} outlived the command"
+    );
+}
+
 #[tokio::test]
 async fn stateless_output_is_truncated_head_and_tail() {
     let tool = stateless().max_output_bytes(64).build().unwrap();
@@ -525,6 +547,34 @@ async fn cancelled_persistent_run_replaces_the_shell() {
     assert_ne!(next.stdout.lines().next().unwrap(), shell_pid.trim());
     let pid: u32 = shell_pid.trim().parse().unwrap();
     assert!(eventually(|| !process_alive(pid)).await);
+    tool.close().await.unwrap();
+}
+
+/// Cancelling a persistent run stops the command at once, not only at the
+/// next call or when the tool is dropped.
+#[tokio::test]
+async fn cancelled_persistent_run_kills_the_command_immediately() {
+    let dir = TempDir::new("cancel-persistent");
+    let pidfile = dir.path().join("pid");
+    let tool = persistent()
+        .confine_workdir(false)
+        .timeout(None)
+        .build()
+        .unwrap();
+    let command = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+    let outcome = tokio::time::timeout(Duration::from_millis(500), tool.run(&command, None)).await;
+    assert!(outcome.is_err(), "the run should still have been going");
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // No further call, no close, and the tool is still alive.
+    assert!(
+        eventually(|| !process_alive(pid)).await,
+        "cancelled command {pid} kept running"
+    );
+    assert_eq!(tool.run("echo next", None).await.unwrap().stdout, "next");
     tool.close().await.unwrap();
 }
 

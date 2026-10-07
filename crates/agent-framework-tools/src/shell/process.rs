@@ -278,6 +278,17 @@ pub(crate) async fn run_to_completion(
             (child.try_wait().ok().flatten(), true)
         }
     };
+    // The shell has exited, but a background job it left behind (`sleep
+    // 3600 & echo ok`) still holds the pipes open and would outlive the
+    // command. The group outlives its leader while any member is alive, so
+    // its id cannot be reused yet: kill it now, before disarming, so the
+    // readers see EOF and keep what was already written. (Windows cannot
+    // walk the tree from an exited shell; there the readers' bounded wait
+    // below still returns.)
+    #[cfg(unix)]
+    if let Some(pid) = guard.pid {
+        signal_group(pid, libc::SIGKILL);
+    }
     guard.disarm();
 
     // After a normal exit the pipes close promptly; after a kill, give the

@@ -148,16 +148,35 @@ pub struct ShellSession {
     poisoned: AtomicBool,
 }
 
-/// Marks the session poisoned unless the command it guards completed.
+/// Guards a command in flight. If the `run` future is dropped before the
+/// command completed, the session is marked poisoned and its shell is torn
+/// down on the spot: otherwise the cancelled command (say `sleep 3600`)
+/// would keep running until the next call or until the tool is dropped.
 struct InFlight<'a> {
     poisoned: &'a AtomicBool,
+    live: &'a Mutex<Option<Live>>,
+    /// The shell's pid, for when `live` is briefly held elsewhere.
+    pid: Option<u32>,
     done: bool,
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if !self.done {
-            self.poisoned.store(true, Ordering::SeqCst);
+        if self.done {
+            return;
+        }
+        // Stays set after the shell is gone, so a wrapper (Docker) knows to
+        // reap what the command left behind outside this process tree.
+        self.poisoned.store(true, Ordering::SeqCst);
+        match self.live.try_lock() {
+            // Dropping `Live` kills the shell's process tree and aborts the
+            // readers.
+            Ok(mut live) => drop(live.take()),
+            Err(_) => {
+                if let Some(pid) = self.pid {
+                    kill_tree_now(pid);
+                }
+            }
         }
     }
 }
@@ -311,8 +330,16 @@ impl ShellSession {
     ) -> Result<ShellResult, ShellError> {
         let _serial = self.run_lock.lock().await;
         self.start().await?;
+        let pid = self
+            .live
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|live| live.child.id());
         let mut in_flight = InFlight {
             poisoned: &self.poisoned,
+            live: &self.live,
+            pid,
             done: false,
         };
         let result = self.run_started(command, timeout).await;

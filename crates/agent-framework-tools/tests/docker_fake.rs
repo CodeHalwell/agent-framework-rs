@@ -359,8 +359,9 @@ async fn cancelled_persistent_command_is_reaped_before_the_next_call() {
     tool.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn cancelled_container_start_removes_the_container() {
+/// A fake CLI whose `docker run` hangs, so a start can be cancelled before
+/// it reports anything (such as a name conflict).
+fn slow_docker() -> (TempDir, PathBuf, PathBuf) {
     let dir = TempDir::new("slow-docker");
     let log = dir.path().join("calls.log");
     let binary = dir.path().join("docker");
@@ -381,29 +382,94 @@ async fn cancelled_container_start_removes_the_container() {
             _ => break,
         }
     }
+    let _ = std::fs::remove_file(&log);
+    (dir, binary, log)
+}
+
+fn read_log(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn cancelled_container_start_removes_the_generated_container() {
+    let (_dir, binary, log) = slow_docker();
     let tool = DockerShellTool::builder()
         .docker_binary(binary.to_string_lossy())
-        .container_name("af-slow-box")
         .build()
         .unwrap();
+    let rm = format!("rm -f {}", tool.container_name());
     let dropped = tokio::time::timeout(Duration::from_millis(300), tool.start()).await;
     assert!(dropped.is_err());
     let mut calls = Vec::new();
     for _ in 0..100 {
-        calls = std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        if calls.iter().any(|c| c == "rm -f af-slow-box") {
+        calls = read_log(&log);
+        if calls.contains(&rm) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(
-        calls.contains(&"rm -f af-slow-box".to_string()),
-        "{calls:?}"
+    assert!(calls.contains(&rm), "{calls:?}");
+}
+
+/// A caller-chosen name may already belong to another container; a start
+/// cancelled before `docker run` reports the conflict must not remove it.
+#[tokio::test]
+async fn cancelled_container_start_never_removes_an_explicit_name() {
+    let (_dir, binary, log) = slow_docker();
+    let tool = DockerShellTool::builder()
+        .docker_binary(binary.to_string_lossy())
+        .container_name("someone-elses-box")
+        .build()
+        .unwrap();
+    let dropped = tokio::time::timeout(Duration::from_millis(300), tool.start()).await;
+    assert!(dropped.is_err());
+    // Give a (wrongly) spawned cleanup thread time to show up in the log.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let calls = read_log(&log);
+    assert!(calls.iter().any(|c| c.starts_with("run -d")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("rm")), "{calls:?}");
+}
+
+/// A call queued behind one that is then cancelled must not slip past the
+/// container reap: the poison check and recovery sit inside the same
+/// serialisation as execution.
+#[tokio::test]
+async fn queued_call_behind_a_cancelled_one_reaps_first() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake)
+        .container_name("af-queue-box")
+        .timeout(None)
+        .build()
+        .unwrap();
+    tool.start().await.unwrap();
+    let (first, second) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)),
+        async {
+            // Queue up while the first call is still running.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tool.run("echo second", None).await
+        }
     );
+    assert!(first.is_err(), "the first call should have been cancelled");
+    assert_eq!(second.unwrap().stdout, "second");
+    let calls = fake.calls();
+    let reap = calls
+        .iter()
+        .position(|c| c.starts_with("exec af-queue-box sh -c kill -KILL -1"))
+        .unwrap_or_else(|| panic!("the queued call ran without a reap: {calls:?}"));
+    let second_shell = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| *c == "exec -i af-queue-box sh")
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("no second shell: {calls:?}"));
+    assert!(reap < second_shell, "{calls:?}");
+    tool.close().await.unwrap();
 }
 
 #[tokio::test]
