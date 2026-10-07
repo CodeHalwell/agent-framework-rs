@@ -32,9 +32,9 @@
 //! APIs that upstream still marks experimental sit behind `experimental-*`
 //! cargo features and carry no semver promise: `experimental-vector-stores`
 //! (the `vectors` module), `experimental-file-history`
-//! (`history::FileHistoryProvider`) and `experimental-progressive-tools`
-//! (`middleware::LiveToolList`). See `docs/feature-stages.md` in the
-//! repository.
+//! (`history::FileHistoryProvider`), `experimental-progressive-tools`
+//! (`middleware::LiveToolList`) and `experimental-agent-hooks` (the
+//! `agent_hooks` module). See `docs/feature-stages.md` in the repository.
 //!
 //! ## Example
 //!
@@ -72,6 +72,9 @@ macro_rules! experimental {
 }
 
 pub mod agent;
+#[cfg(feature = "experimental-agent-hooks")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+pub mod agent_hooks;
 pub mod client;
 pub mod compaction;
 pub mod error;

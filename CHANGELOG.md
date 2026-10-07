@@ -7,6 +7,29 @@ may break APIs).
 
 ## [Unreleased]
 
+### Agent hooks (experimental)
+
+New `experimental-agent-hooks` feature (upstream `AGENT_HOOKS`): the
+`agent_framework_core::agent_hooks` module implements the AGENT-HOOKS-0.1
+control contract. `AgentHooks::build_agent` (or
+`AgentBuilder::build_with_agent_hooks`) installs all eight interception points
+as one unit — `agent_startup`, `input` and `agent_shutdown` in an agent
+decorator, `output` as the first agent middleware, `pre_model_call` /
+`post_model_call` around each model service call, and `pre_tool_call` /
+`post_tool_call` as the first function middleware — and enforces the combined
+verdicts fail closed. A run-level deny fails the run with the new
+`Error::InterceptionBlocked`; a tool-level deny blocks that call and tells the
+model why; a `host_error:*` deny anywhere halts the run. Transforms are
+written back into messages, arguments and results, streaming is buffered
+behind the verdicts, and denied output is never persisted to history. The
+protocol layer (contexts, verdicts, `Interceptor`, `InterceptionEmitter`,
+payload-free records) is implemented in Rust since no agent-hooks crate
+exists; it supports the `sequential/first_deny` profile without an approval
+resolver or identity provider.
+
+The function-invocation loop now puts the model's `call_id` in
+`FunctionInvocationContext::metadata["call_id"]`, as upstream does.
+
 ### Multimodal embedding inputs (breaking)
 
 `EmbeddingClient::get_embeddings` takes `Vec<EmbeddingInput>` instead of

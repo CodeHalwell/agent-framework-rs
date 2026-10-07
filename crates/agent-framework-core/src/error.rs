@@ -140,6 +140,18 @@ pub enum Error {
     #[error("middleware failure: {0}")]
     MiddlewareFailure(String),
 
+    /// An agent-hooks interceptor verdict blocked the run (AGENT-HOOKS-0.1).
+    ///
+    /// Returned by an agent guarded with
+    /// [`AgentHooks`](crate::agent_hooks::AgentHooks) when an emission's
+    /// combined verdict is a deny: a policy deny at a run-level point, or a
+    /// `host_error:*` deny (the enforcement layer itself failed) anywhere.
+    /// Carries the verdict and its payload-free interception record.
+    #[cfg(feature = "experimental-agent-hooks")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+    #[error("{0}")]
+    InterceptionBlocked(Box<crate::agent_hooks::InterceptionBlocked>),
+
     /// A workflow validation or execution error.
     #[error("workflow error: {0}")]
     Workflow(String),
@@ -253,6 +265,17 @@ impl Error {
     /// instead of having its error absorbed into a tool-error result.
     pub fn middleware_failure(msg: impl fmt::Display) -> Self {
         Error::MiddlewareFailure(msg.to_string())
+    }
+
+    /// The agent-hooks block this error carries, when it is an
+    /// [`Error::InterceptionBlocked`].
+    #[cfg(feature = "experimental-agent-hooks")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+    pub fn interception_blocked(&self) -> Option<&crate::agent_hooks::InterceptionBlocked> {
+        match self {
+            Error::InterceptionBlocked(blocked) => Some(blocked),
+            _ => None,
+        }
     }
 
     /// Whether this error is the [`Error::MiddlewareFailure`] fail-closed

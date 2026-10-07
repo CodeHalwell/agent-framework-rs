@@ -44,9 +44,14 @@ Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
 - **Harness** (agent loop, todo, tool approval, agent mode, file memory,
-  background agents), **agent hooks**, **evaluation** and **security
-  (FIDES)**: all marked experimental upstream. They wait on a
-  feature-stage mechanism so they can ship without semver commitments.
+  background agents), **evaluation** and **security (FIDES)**: all marked
+  experimental upstream. They wait on a feature-stage mechanism so they can
+  ship without semver commitments.
+- **Agent hooks, remainder** (`experimental-agent-hooks` ships the
+  enforcement bundle): the approval seam (liftable denies are enforced as
+  plain denies), the `sequential/run_all` and parallel composition profiles,
+  the `jcs-sha256` and custom identity providers (records are
+  identity-unbound), and an `agent_shutdown` on cancellation.
 - **AG-UI client** (the hosting crate has the server side only).
 - **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).

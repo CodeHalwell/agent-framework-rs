@@ -536,9 +536,13 @@ async fn execute_tool_call(
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
 
-            let ctx = FunctionInvocationContext::new(call.name.clone(), args)
+            let mut ctx = FunctionInvocationContext::new(call.name.clone(), args)
                 .with_session(session.cloned())
                 .with_tools(live_tools.cloned());
+            // Middleware can correlate the invocation with the model's call
+            // (upstream sets the same key in `_tools.py`).
+            ctx.metadata
+                .insert("call_id".into(), Value::String(call.call_id.clone()));
             match function_middleware.execute(ctx, terminal).await {
                 Ok(ctx) => Ok(ToolCallOutcome {
                     executed: true,

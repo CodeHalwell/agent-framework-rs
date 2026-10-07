@@ -32,7 +32,9 @@
 //! `full` enables every stable integration above. APIs upstream still marks
 //! experimental sit behind `experimental-*` features with no semver promise:
 //! `experimental-vector-stores`, `experimental-file-history`,
-//! `experimental-progressive-tools` and `experimental-declarative-agents`.
+//! `experimental-progressive-tools`, `experimental-agent-hooks` (the
+//! `agent_hooks` module of [`agent_framework_core`]) and
+//! `experimental-declarative-agents`.
 //! `experimental` turns them all on.
 //!
 //! ```no_run

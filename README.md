@@ -218,8 +218,9 @@ features and carry no semver promise. `full` leaves them out, and
 | `experimental-vector-stores` | `agent_framework_core::vectors`, plus the Cosmos DB and Azure AI Search vector stores |
 | `experimental-file-history` | `FileHistoryProvider` |
 | `experimental-progressive-tools` | `LiveToolList`, and adding or removing tools mid-run from `FunctionInvocationContext` |
+| `experimental-agent-hooks` | `agent_framework_core::agent_hooks`: AGENT-HOOKS-0.1 interception (allow / deny / transform verdicts at the agent, model-call and tool-call seams), enforced fail-closed |
 | `experimental-declarative-agents` | [`agent-framework-declarative`](crates/agent-framework-declarative): YAML/JSON agents and workflows |
-| `experimental` | all four |
+| `experimental` | all five |
 
 ```toml
 # Everything:

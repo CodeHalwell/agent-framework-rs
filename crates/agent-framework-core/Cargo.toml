@@ -54,6 +54,9 @@ experimental-file-history = []
 # PROGRESSIVE_TOOLS: `middleware::LiveToolList` and adding or removing tools
 # from inside a run via `FunctionInvocationContext`.
 experimental-progressive-tools = []
+# AGENT_HOOKS: the `agent_hooks` module (AGENT-HOOKS-0.1 interception
+# contract and the enforcement bundle over the agent, chat and function seams).
+experimental-agent-hooks = []
 # Enables the three GenAI histograms on `ObservableChatClient` and the
 # function-invocation loop via the `opentelemetry` API crate. Purely additive:
 # default behavior/build is unaffected when this is off, and the instruments
