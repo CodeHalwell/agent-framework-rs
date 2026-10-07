@@ -142,6 +142,9 @@ pub mod event_type {
     pub const REASONING_MESSAGE_CONTENT: &str = "REASONING_MESSAGE_CONTENT";
     /// A self-contained reasoning delta: `{messageId?, delta?}`.
     pub const REASONING_MESSAGE_CHUNK: &str = "REASONING_MESSAGE_CHUNK";
+    /// An opaque encrypted reasoning value for a message or tool call:
+    /// `{subtype: "message" | "tool-call", entityId, encryptedValue}`.
+    pub const REASONING_ENCRYPTED_VALUE: &str = "REASONING_ENCRYPTED_VALUE";
     /// The whole shared state: `{snapshot}`.
     pub const STATE_SNAPSHOT: &str = "STATE_SNAPSHOT";
     /// A JSON Patch (RFC 6902) against the shared state: `{delta}`.

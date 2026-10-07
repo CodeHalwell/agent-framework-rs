@@ -46,10 +46,11 @@
 //! | `TOOL_CALL_CHUNK` | a call fragment: opens the call on its first chunk, later chunks without an id continue it |
 //! | `TOOL_CALL_RESULT` | a tool-role [`FunctionResultContent`] carrying the event's `messageId` |
 //! | `REASONING_MESSAGE_CONTENT`, `REASONING_MESSAGE_CHUNK` | reasoning delta |
+//! | `REASONING_ENCRYPTED_VALUE` | `protected_data` on the named message's reasoning (`message`) or on the named call (`tool-call`); sent back as `encryptedValue` |
 //! | `STATE_SNAPSHOT`, `STATE_DELTA` | JSON [`DataContent`] (`application/json`, `application/json-patch+json`) |
 //! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]` |
-//! | `RUN_FINISHED` | finish reason `stop`; `interrupt`, `outcome`, `interrupts`, `result` metadata |
-//! | `RUN_ERROR` | an [`ErrorContent`] with code `RUN_ERROR` |
+//! | `RUN_FINISHED` | finish reason `stop`; `interrupt`, `outcome`, `interrupts`, `result` metadata; `usage` entries summed into one [`UsageContent`] |
+//! | `RUN_ERROR` | an [`ErrorContent`] with code `RUN_ERROR`, plus any reported `usage` |
 //! | `CUSTOM` | `additional_properties["ag_ui_custom_event"]`; an `annotations` event restores text annotations |
 //!
 //! A `RUN_ERROR` is in-band, as upstream has it: the request succeeds and the
@@ -93,7 +94,7 @@ use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, ErrorContent,
     FinishReason, FunctionCallContent, FunctionResultContent, Message, Role, TextContent,
-    TextReasoningContent, ToolMode,
+    TextReasoningContent, ToolMode, UsageContent, UsageDetails,
 };
 
 use super::{arguments_delta, event_type, result_content, RunAgentInput};
@@ -292,11 +293,34 @@ fn tool_call_json(fc: &FunctionCallContent) -> Value {
     let arguments = arguments_delta(fc)
         .filter(|a| !a.trim().is_empty())
         .unwrap_or_else(|| "{}".to_string());
-    json!({
+    let mut call = json!({
         "id": fc.call_id,
         "type": "function",
         "function": { "name": fc.name, "arguments": arguments },
-    })
+    });
+    // The opaque value a `REASONING_ENCRYPTED_VALUE` (`tool-call`) attached;
+    // the server needs it back to restore its reasoning context.
+    if let Some(encrypted) = fc.protected_data.as_ref().filter(|v| !v.is_empty()) {
+        call["encryptedValue"] = Value::String(encrypted.clone());
+    }
+    call
+}
+
+/// The encrypted values on a message's reasoning items, in order: what a
+/// `REASONING_ENCRYPTED_VALUE` (`message`) attached, to be sent back as
+/// `encryptedValue`.
+fn encrypted_reasoning(msg: &Message) -> Vec<(&str, &str)> {
+    msg.contents
+        .iter()
+        .filter_map(|c| match c {
+            Content::TextReasoning(r) => r
+                .protected_data
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| (r.text.as_str(), v)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_segment_content(content: &Content, role: &str) -> bool {
@@ -431,7 +455,13 @@ fn split_mixed_message(
 ///   (`{type: "text", text}` and `{type: image|audio|video|document,
 ///   source: {type: "data"|"url", value, mimeType}}`);
 /// - function calls become `toolCalls` (`{id, type: "function", function:
-///   {name, arguments}}`, arguments as a JSON string);
+///   {name, arguments}}`, arguments as a JSON string), with the call's
+///   `protected_data` as `encryptedValue`;
+/// - reasoning is display-only and not sent, except an encrypted value a
+///   server attached (`REASONING_ENCRYPTED_VALUE`): a message of reasoning
+///   alone becomes a `reasoning` message (`{content, encryptedValue}`), and
+///   on any other message the value is the message's `encryptedValue`
+///   (an extension: upstream sends no reasoning back);
 /// - each function result becomes its own `tool` message (`{toolCallId,
 ///   content}`), ordered so that no result precedes its call and no assistant
 ///   message separates an open call from its result;
@@ -454,6 +484,29 @@ pub fn messages_to_agui(messages: &[Message]) -> Vec<Value> {
             continue;
         }
 
+        let encrypted = encrypted_reasoning(msg);
+        if !encrypted.is_empty()
+            && msg
+                .contents
+                .iter()
+                .all(|c| matches!(c, Content::TextReasoning(_)))
+        {
+            // A reasoning message the server streamed: send it back as one
+            // (`{id, role: "reasoning", content, encryptedValue}`) so the
+            // server can restore its reasoning. Reasoning with no encrypted
+            // value is display-only and stays out of the request.
+            let mut own_id = msg.message_id.clone().filter(|id| !id.is_empty());
+            for (text, value) in encrypted {
+                out.push(json!({
+                    "id": own_id.take().unwrap_or_else(new_message_id),
+                    "role": "reasoning",
+                    "content": text,
+                    "encryptedValue": value,
+                }));
+            }
+            continue;
+        }
+
         let segment: Vec<&Content> = msg.contents.iter().collect();
         let (content, tool_calls) = encode_segment(&segment, role);
         let id = msg
@@ -462,6 +515,11 @@ pub fn messages_to_agui(messages: &[Message]) -> Vec<Value> {
             .filter(|id| !id.is_empty())
             .unwrap_or_else(new_message_id);
         let mut message = json!({ "id": id, "role": role, "content": content });
+        // An encrypted value the server attached to this (assistant) message
+        // itself goes back on it, as the protocol's `encryptedValue`.
+        if let Some((_, value)) = encrypted.last() {
+            message["encryptedValue"] = Value::String((*value).to_string());
+        }
         // A non-tool message resets the open set to the calls it introduces.
         unresolved.clear();
         if !tool_calls.is_empty() {
@@ -682,6 +740,9 @@ pub struct AgUiEventConverter {
     last_chunk_tool_call_id: Option<String>,
     last_chunk_message_id: Option<String>,
     last_reasoning_message_id: Option<String>,
+    /// Every call this run has opened, by `toolCallId`, with its name, so a
+    /// `REASONING_ENCRYPTED_VALUE` for a call that already ended still finds it.
+    seen_tool_calls: HashMap<String, String>,
     thread_id: Option<String>,
     run_id: Option<String>,
 }
@@ -730,6 +791,48 @@ fn call_fragment(id: String, name: String, arguments: String) -> Content {
             arguments,
         )),
     ))
+}
+
+/// The `usage` of a `RUN_FINISHED` / `RUN_ERROR` event (`TokenUsage[]`, one
+/// entry per model call or provider/model pair) as a single [`UsageContent`],
+/// the entries summed. Empty when the event reports no usable count, so
+/// "not reported" stays distinct from zero.
+fn usage_contents(event: &Value) -> Vec<Content> {
+    let Some(entries) = event.get("usage").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let count = |entry: &Value, keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|k| entry.get(*k))
+            .and_then(Value::as_u64)
+    };
+    let mut total: Option<UsageDetails> = None;
+    for entry in entries {
+        let details = UsageDetails {
+            input_token_count: count(entry, ["inputTokens", "input_tokens"]),
+            output_token_count: count(entry, ["outputTokens", "output_tokens"]),
+            total_token_count: count(entry, ["totalTokens", "total_tokens"]),
+            reasoning_output_token_count: count(entry, ["reasoningTokens", "reasoning_tokens"]),
+            cache_read_input_token_count: count(
+                entry,
+                ["cachedInputTokens", "cached_input_tokens"],
+            ),
+            cache_creation_input_token_count: count(
+                entry,
+                ["cacheWriteInputTokens", "cache_write_input_tokens"],
+            ),
+            ..Default::default()
+        };
+        if details == UsageDetails::default() {
+            continue;
+        }
+        total
+            .get_or_insert_with(UsageDetails::new)
+            .add_assign(&details);
+    }
+    total
+        .map(|details| vec![Content::Usage(UsageContent { details })])
+        .unwrap_or_default()
 }
 
 fn json_data(value: &Value, media_type: &str) -> Content {
@@ -820,6 +923,7 @@ impl AgUiEventConverter {
                 update.message_id = self.last_reasoning_message_id.clone();
                 Some(update)
             }
+            event_type::REASONING_ENCRYPTED_VALUE => self.encrypted_value(event),
             event_type::TEXT_MESSAGE_END => None,
             event_type::TOOL_CALL_START => {
                 let id = str_field(event, &["toolCallId", "tool_call_id"]).unwrap_or_default();
@@ -941,7 +1045,7 @@ impl AgUiEventConverter {
                 if let Some(result) = event.get("result") {
                     props.insert("result".into(), result.clone());
                 }
-                let mut update = assistant_update(Vec::new());
+                let mut update = assistant_update(usage_contents(event));
                 update.finish_reason = Some(FinishReason::new(FinishReason::STOP));
                 update.additional_properties = props;
                 Some(update)
@@ -952,11 +1056,14 @@ impl AgUiEventConverter {
                     .and_then(Value::as_str)
                     .unwrap_or("Unknown error")
                     .to_string();
-                let mut update = assistant_update(vec![Content::Error(ErrorContent {
+                let mut contents = vec![Content::Error(ErrorContent {
                     message: Some(message),
                     error_code: Some("RUN_ERROR".to_string()),
                     details: str_field(event, &["code"]),
-                })]);
+                })];
+                // A failed run may still report the usage it accrued.
+                contents.extend(usage_contents(event));
+                let mut update = assistant_update(contents);
                 update.additional_properties = self.run_ids();
                 Some(update)
             }
@@ -968,7 +1075,56 @@ impl AgUiEventConverter {
     /// Record `id` as open, replacing an earlier call with the same id.
     fn open_call(&mut self, id: String, name: String) {
         self.open_tool_calls.retain(|(open, _)| *open != id);
+        self.seen_tool_calls.insert(id.clone(), name.clone());
         self.open_tool_calls.push((id, name));
+    }
+
+    /// `REASONING_ENCRYPTED_VALUE`: attach the opaque value to the entity it
+    /// names, as `protected_data`, so it survives aggregation and is sent back
+    /// as `encryptedValue` on the next turn. A `message` value becomes a
+    /// textless reasoning fragment on that message (aggregation merges it
+    /// into the message's reasoning); a `tool-call` value becomes a fragment
+    /// of that call. A value for a call this run never opened is dropped, as
+    /// a fragment would otherwise start a new, empty call.
+    fn encrypted_value(&self, event: &Value) -> Option<ChatResponseUpdate> {
+        let subtype = str_field(event, &["subtype"]).unwrap_or_default();
+        let entity_id = str_field(event, &["entityId", "entity_id"]).filter(|id| !id.is_empty());
+        let value = str_field(event, &["encryptedValue", "encrypted_value"])
+            .filter(|value| !value.is_empty());
+        let (Some(entity_id), Some(value)) = (entity_id, value) else {
+            tracing::warn!("ignoring REASONING_ENCRYPTED_VALUE with no entityId or value");
+            return None;
+        };
+        match subtype.as_str() {
+            "message" => {
+                let mut update =
+                    assistant_update(vec![Content::TextReasoning(TextReasoningContent {
+                        protected_data: Some(value),
+                        ..Default::default()
+                    })]);
+                update.message_id = Some(entity_id);
+                Some(update)
+            }
+            "tool-call" => {
+                let Some(name) = self.seen_tool_calls.get(&entity_id) else {
+                    tracing::warn!(
+                        tool_call_id = %entity_id,
+                        "ignoring REASONING_ENCRYPTED_VALUE for a tool call this run did not open"
+                    );
+                    return None;
+                };
+                let mut call = FunctionCallContent::new(entity_id, name.clone(), None);
+                call.protected_data = Some(value);
+                Some(assistant_update(vec![Content::FunctionCall(call)]))
+            }
+            other => {
+                tracing::warn!(
+                    subtype = other,
+                    "ignoring REASONING_ENCRYPTED_VALUE with an unknown subtype"
+                );
+                None
+            }
+        }
     }
 
     /// The name the open call `id` started with, or empty when it is not open.
@@ -1779,6 +1935,183 @@ mod tests {
             .convert_event(&json!({"type": "RUN_FINISHED", "outcome": "done"}))
             .unwrap();
         assert_eq!(odd.additional_properties["outcome"], "done");
+    }
+
+    #[test]
+    fn run_finished_usage_reaches_usage_details() {
+        // `usage` is `TokenUsage[]`; several entries (one per model call) sum.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "threadId": "t", "runId": "r"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m", "delta": "hi"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m"}),
+            json!({"type": "RUN_FINISHED", "threadId": "t", "runId": "r", "usage": [
+                {"provider": "openai", "model": "gpt-5", "inputTokens": 10, "outputTokens": 4,
+                 "totalTokens": 14, "reasoningTokens": 2, "cachedInputTokens": 3},
+                {"provider": "openai", "model": "gpt-5", "inputTokens": 5, "outputTokens": 1,
+                 "totalTokens": 6, "cacheWriteInputTokens": 7},
+            ]}),
+        ];
+        let response = finalize_response(convert_all(&events));
+        let usage = response.usage_details.clone().expect("usage reported");
+        assert_eq!(usage.input_token_count, Some(15));
+        assert_eq!(usage.output_token_count, Some(5));
+        assert_eq!(usage.total_token_count, Some(20));
+        assert_eq!(usage.reasoning_output_token_count, Some(2));
+        assert_eq!(usage.cache_read_input_token_count, Some(3));
+        assert_eq!(usage.cache_creation_input_token_count, Some(7));
+        // Usage is response metadata, not message content.
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.text(), "hi");
+    }
+
+    #[test]
+    fn run_finished_without_usage_reports_none() {
+        for event in [
+            json!({"type": "RUN_FINISHED", "threadId": "t", "runId": "r"}),
+            json!({"type": "RUN_FINISHED", "usage": []}),
+            json!({"type": "RUN_FINISHED", "usage": [{"provider": "openai"}]}),
+        ] {
+            let response = finalize_response(convert_all(&[event]));
+            assert_eq!(response.usage_details, None);
+        }
+    }
+
+    #[test]
+    fn run_error_keeps_partial_usage() {
+        let mut c = AgUiEventConverter::new();
+        let u = c
+            .convert_event(&json!({"type": "RUN_ERROR", "message": "boom",
+                "usage": [{"inputTokens": 12}]}))
+            .unwrap();
+        let response = ChatResponse::from_updates(vec![u]);
+        assert_eq!(
+            response.usage_details.and_then(|u| u.input_token_count),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn encrypted_reasoning_value_attaches_to_its_message_and_round_trips() {
+        let events = vec![
+            json!({"type": "REASONING_START", "messageId": "rs"}),
+            json!({"type": "REASONING_MESSAGE_START", "messageId": "r1", "role": "reasoning"}),
+            json!({"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "Analy"}),
+            json!({"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "sing"}),
+            json!({"type": "REASONING_MESSAGE_END", "messageId": "r1"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Done"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m1"}),
+            // Arrives after other output; still lands on the message it names.
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message",
+                   "entityId": "r1", "encryptedValue": "c2VjcmV0"}),
+            json!({"type": "REASONING_END", "messageId": "rs"}),
+        ];
+        let response = finalize_response(convert_all(&events));
+        let reasoning = response
+            .messages
+            .iter()
+            .find(|m| m.message_id.as_deref() == Some("r1"))
+            .expect("reasoning message");
+        assert_eq!(reasoning.contents.len(), 1);
+        let Content::TextReasoning(r) = &reasoning.contents[0] else {
+            panic!("expected reasoning content")
+        };
+        assert_eq!(r.text, "Analysing");
+        assert_eq!(r.protected_data.as_deref(), Some("c2VjcmV0"));
+
+        // Sent back on the next turn as a reasoning message with the value.
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(
+            out[0],
+            json!({"id": "r1", "role": "reasoning", "content": "Analysing",
+                   "encryptedValue": "c2VjcmV0"})
+        );
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"], "Done");
+        assert!(out[1].get("encryptedValue").is_none());
+    }
+
+    #[test]
+    fn encrypted_value_on_an_assistant_message_goes_back_on_it() {
+        let events = vec![
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Hi"}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message",
+                   "entityId": "m1", "encryptedValue": "ZW5j"}),
+        ];
+        let response = finalize_response(convert_all(&events));
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], "m1");
+        assert_eq!(out[0]["content"], "Hi");
+        assert_eq!(out[0]["encryptedValue"], "ZW5j");
+    }
+
+    #[test]
+    fn encrypted_value_attaches_to_its_tool_call_and_round_trips() {
+        let events = vec![
+            json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "lookup"}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": "{\"q\":1}"}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "c1"}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "tool-call",
+                   "entityId": "c1", "encryptedValue": "dG9vbA=="}),
+            // A call this run never opened is not invented.
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "tool-call",
+                   "entityId": "ghost", "encryptedValue": "eA=="}),
+        ];
+        let response = finalize_response(convert_all(&events));
+        let calls: Vec<&FunctionCallContent> = response
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::FunctionCall(fc) => Some(fc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lookup");
+        assert_eq!(raw_args(calls[0]), "{\"q\":1}");
+        assert_eq!(calls[0].protected_data.as_deref(), Some("dG9vbA=="));
+
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(
+            out[0]["toolCalls"],
+            json!([{"id": "c1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":1}"},
+                    "encryptedValue": "dG9vbA=="}])
+        );
+    }
+
+    #[test]
+    fn malformed_encrypted_values_are_ignored() {
+        let mut c = AgUiEventConverter::new();
+        for event in [
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message", "encryptedValue": "x"}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message", "entityId": "m"}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "other", "entityId": "m",
+                   "encryptedValue": "x"}),
+        ] {
+            assert!(c.convert_event(&event).is_none());
+        }
+    }
+
+    #[test]
+    fn reasoning_without_an_encrypted_value_is_not_sent() {
+        let mut thinking = Message::with_contents(
+            Role::assistant(),
+            vec![Content::TextReasoning(TextReasoningContent {
+                text: "hmm".into(),
+                ..Default::default()
+            })],
+        );
+        thinking.message_id = Some("r1".into());
+        let out = messages_to_agui(&[thinking]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "");
+        assert!(out[0].get("encryptedValue").is_none());
     }
 
     #[test]
