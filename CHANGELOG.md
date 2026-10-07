@@ -5,6 +5,19 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Fixed
+
+- **An approved tool re-ran on every later turn of a session.** The approval
+  response stayed in session history and the function-invocation loop
+  collected it again on each run, executing the tool every turn. As upstream's
+  `_collect_approval_responses` does, a response is now settled once a later
+  function result answers its `call_id` (or a later request reuses its id), and
+  settled responses neither execute nor reach the model. The results resolving
+  an approval are also returned ahead of the model's answer, so history records
+  the approval as settled. Streaming and non-streaming runs share the fix.
+
 ## [0.10.0] — 2026-10-05
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).

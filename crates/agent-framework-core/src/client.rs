@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -577,17 +577,98 @@ async fn execute_tool_call(
     }
 }
 
-/// Collect all function-approval responses present in a conversation.
+/// Positions (`(message, content)` indices) of the approval responses in a
+/// conversation that are already *settled* history rather than pending
+/// decisions, mirroring the correlation in Python's
+/// `_collect_approval_responses`:
+///
+/// * a response is settled by a later function result for the same `call_id`
+///   (responses for one `call_id` are consumed first-in, first-out), and
+/// * a response is superseded by a later approval request reusing its id.
+///
+/// A settled response must never execute its call again: it stays in session
+/// history after the run that acted on it, and every later run sees it.
+fn settled_approval_responses(messages: &[Message]) -> HashSet<(usize, usize)> {
+    let mut settled = HashSet::new();
+    let mut pending_by_call_id: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
+    let mut pending_by_id: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (m, msg) in messages.iter().enumerate() {
+        for (c, content) in msg.contents.iter().enumerate() {
+            match content {
+                Content::FunctionApprovalRequest(req) => {
+                    if let Some(position) = pending_by_id.remove(req.id.as_str()) {
+                        settled.insert(position);
+                    }
+                }
+                Content::FunctionApprovalResponse(resp) => {
+                    if resp.function_call.call_id.is_empty() {
+                        continue;
+                    }
+                    if !resp.id.is_empty() {
+                        pending_by_id.insert(resp.id.as_str(), (m, c));
+                    }
+                    pending_by_call_id
+                        .entry(resp.function_call.call_id.as_str())
+                        .or_default()
+                        .push_back((m, c));
+                }
+                Content::FunctionResult(fr) => {
+                    let Some(queue) = pending_by_call_id.get_mut(fr.call_id.as_str()) else {
+                        continue;
+                    };
+                    while queue.front().is_some_and(|p| settled.contains(p)) {
+                        queue.pop_front();
+                    }
+                    if let Some(position) = queue.pop_front() {
+                        settled.insert(position);
+                        pending_by_id.retain(|_, p| *p != position);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    settled
+}
+
+/// Collect the function-approval responses in a conversation that are still
+/// pending, i.e. not [settled](settled_approval_responses) by a later result
+/// or superseded by a later request.
 fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalResponseContent> {
+    let settled = settled_approval_responses(messages);
     let mut out = Vec::new();
-    for msg in messages {
-        for content in &msg.contents {
+    for (m, msg) in messages.iter().enumerate() {
+        for (c, content) in msg.contents.iter().enumerate() {
             if let Content::FunctionApprovalResponse(resp) = content {
-                out.push(resp.clone());
+                if !settled.contains(&(m, c)) {
+                    out.push(resp.clone());
+                }
             }
         }
     }
     out
+}
+
+/// Remove settled approval responses from the model input: their calls were
+/// already answered by the results that follow them in history. A message
+/// left empty by the removal is dropped.
+fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
+    let settled = settled_approval_responses(messages);
+    if settled.is_empty() {
+        return;
+    }
+    let mut m = 0usize;
+    messages.retain_mut(|msg| {
+        let before = msg.contents.len();
+        let mut c = 0usize;
+        msg.contents.retain(|_| {
+            let keep = !settled.contains(&(m, c));
+            c += 1;
+            keep
+        });
+        m += 1;
+        before == 0 || !msg.contents.is_empty()
+    });
 }
 
 /// Rewrite approval request/response contents in place, mirroring Python's
@@ -812,14 +893,29 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 // execute the approved calls and splice their results into the
                 // conversation (mirrors Python's `_collect_approval_responses` +
                 // `_replace_approval_contents_with_results`).
+                //
+                // Responses already settled by a result later in history (an
+                // approval acted on in an earlier run) are dropped from the
+                // model input and never execute again.
+                drop_settled_approval_responses(&mut conversation);
                 let approval_responses = collect_approval_responses(&conversation);
                 if !approval_responses.is_empty() {
+                    // The results resolving these approvals are returned to
+                    // the caller ahead of the model's answer (Python prepends
+                    // them as `function_call_messages`), so session history
+                    // records each approval as settled.
+                    let mut terminal: Vec<Content> = Vec::new();
                     let mut approved_results: HashMap<String, FunctionResultContent> =
                         HashMap::new();
                     let mut had_error = false;
                     let mut executed = 0usize;
                     for resp in &approval_responses {
                         if !resp.approved {
+                            terminal.push(Content::FunctionResult(FunctionResultContent {
+                                call_id: resp.function_call.call_id.clone(),
+                                result: Some(Value::String(REJECTION_MESSAGE.to_string())),
+                                exception: None,
+                            }));
                             continue;
                         }
                         let call = &resp.function_call;
@@ -830,13 +926,12 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         // did not run, the same shape a rejection gets.
                         if budget_spent.is_some() {
                             let key = call.id.clone().unwrap_or_else(|| call.call_id.clone());
-                            approved_results.insert(
-                                key,
-                                FunctionResultContent::new(
-                                    call.call_id.clone(),
-                                    Some(Value::String(BUDGET_EXHAUSTED_MESSAGE.to_string())),
-                                ),
+                            let result = FunctionResultContent::new(
+                                call.call_id.clone(),
+                                Some(Value::String(BUDGET_EXHAUSTED_MESSAGE.to_string())),
                             );
+                            terminal.push(Content::FunctionResult(result.clone()));
+                            approved_results.insert(key, result);
                             continue;
                         }
                         let tool = tools.iter().find(|t| t.name == call.name).cloned();
@@ -866,6 +961,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                         // overwriting the other. Falls back to `call_id` for a
                         // call that predates occurrence ids.
                         let key = call.id.clone().unwrap_or_else(|| content.call_id.clone());
+                        terminal.push(Content::FunctionResult(content.clone()));
                         approved_results.insert(key, content);
                         if ran {
                             executed += 1;
@@ -873,6 +969,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                     }
                     budget.record(executed);
                     replace_approval_contents_with_results(&mut conversation, &approved_results);
+                    if !terminal.is_empty() {
+                        carried.push(Message::with_contents(Role::tool(), terminal));
+                    }
                     if had_error {
                         consecutive_errors += 1;
                         if consecutive_errors > self.config.max_consecutive_errors_per_request {
