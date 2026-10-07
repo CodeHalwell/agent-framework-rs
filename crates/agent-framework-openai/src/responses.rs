@@ -124,7 +124,12 @@ impl OpenAIChatClient {
         if let Some(instructions) = instructions {
             body.insert("instructions".into(), json!(instructions));
         }
-        body.insert("input".into(), json!(messages_to_input(rest)));
+        let input = if uses_service_side_storage(options) {
+            messages_to_continuation_input(rest)
+        } else {
+            messages_to_input(rest)
+        };
+        body.insert("input".into(), json!(input));
 
         if let Some(conversation_id) = &options.conversation_id {
             body.insert("previous_response_id".into(), json!(conversation_id));
@@ -292,10 +297,7 @@ pub fn responses_include(options: &ChatOptions, implicit: bool) -> Option<Value>
 
     // Upstream keys this off the service-side-storage indicators, not `store`:
     // a request continuing a stored conversation needs nothing echoed back.
-    let uses_service_side_storage = options
-        .conversation_id
-        .as_deref()
-        .is_some_and(|id| !id.is_empty());
+    let uses_service_side_storage = uses_service_side_storage(options);
 
     let already_present = include
         .iter()
@@ -305,6 +307,20 @@ pub fn responses_include(options: &ChatOptions, implicit: bool) -> Option<Value>
     }
 
     (!include.is_empty()).then(|| json!(include))
+}
+
+/// Whether a request continues a service-stored response chain: it carries a
+/// non-empty `conversation_id`, sent as `previous_response_id`
+/// (upstream's `request_uses_service_side_storage`).
+///
+/// `pub` so `agent-framework-azure`'s Responses client makes the same call
+/// when choosing between [`messages_to_input`] and
+/// [`messages_to_continuation_input`].
+pub fn uses_service_side_storage(options: &ChatOptions) -> bool {
+    options
+        .conversation_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty())
 }
 
 /// Split a leading system message (and/or `ChatOptions::instructions`) out
@@ -348,6 +364,26 @@ pub fn extract_instructions<'a>(
 /// conversion verbatim rather than reimplementing it (Azure OpenAI's
 /// Responses API shares the exact same `input` item wire shape).
 pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
+    convert_messages(messages, false)
+}
+
+/// Convert framework messages into `input` items for a request that continues
+/// a stored response chain (`previous_response_id`, see
+/// [`uses_service_side_storage`]).
+///
+/// The service already holds every item the earlier responses produced, and
+/// rejects an inline copy of one with a server-issued `id` as a duplicate
+/// ("Duplicate item found with id ..."). So hosted `mcp_call` items (and the
+/// results folded into them), `mcp_approval_request` items and reasoning items
+/// are left out here, as upstream's `_prepare_message_for_openai` does under
+/// `request_uses_service_side_storage` (microsoft/agent-framework#3295).
+/// Approval responses and function results still go out: they are new input
+/// the service pairs to its stored items by id.
+pub fn messages_to_continuation_input(messages: &[Message]) -> Vec<Value> {
+    convert_messages(messages, true)
+}
+
+fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         let role = msg.role.as_str();
@@ -422,6 +458,9 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                         "approve": r.approved,
                     }));
                 }
+                // Already stored service-side under continuation; re-sending
+                // its `id` would duplicate it.
+                Content::FunctionApprovalRequest(_) if continues_stored => {}
                 Content::FunctionApprovalRequest(r) => {
                     flush_text(&mut out, &mut buffered, role);
                     out.push(json!({
@@ -436,9 +475,11 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                 // (`_prepare_content_for_openai` + `_coalesce_pending_mcp_results`).
                 // Replayed after its approval pair, it tells the service the
                 // approved call already ran, so local history does not ask
-                // for it again.
+                // for it again. Under continuation the service already has
+                // the item by its `id`, so it is not re-sent (and its result,
+                // finding no call to attach to, is dropped with it).
                 Content::McpServerToolCall(call) => {
-                    if !call.call_id.is_empty() {
+                    if !continues_stored && !call.call_id.is_empty() {
                         flush_text(&mut out, &mut buffered, role);
                         out.push(json!({
                             "type": "mcp_call",
@@ -458,7 +499,9 @@ pub fn messages_to_input(messages: &[Message]) -> Vec<Value> {
                     // replay). A summary-only reasoning content with no
                     // preserved item has no valid input form (it lacks the
                     // required id/encrypted_content), so it is dropped.
-                    if let Some(raw) = &tr.raw_representation {
+                    // Under continuation the service already holds the item.
+                    let raw = tr.raw_representation.as_ref().filter(|_| !continues_stored);
+                    if let Some(raw) = raw {
                         flush_text(&mut out, &mut buffered, role);
                         out.push(raw.clone());
                     }
@@ -2615,6 +2658,83 @@ mod tests {
                 "type": "mcp_call", "id": "mcp_2", "server_label": "docs",
                 "name": "search", "arguments": "{\"q\":\"rust\"}", "output": "ok",
             })]
+        );
+    }
+
+    /// A turn continuing a stored response (`previous_response_id`) with the
+    /// local history provider still attached must not re-send items the
+    /// service already holds by their server-issued `id` (hosted `mcp_call`,
+    /// `mcp_approval_request`, reasoning): OpenAI rejects them as duplicates.
+    /// The new approval response and the text still go out; a stateless
+    /// request keeps replaying everything.
+    #[test]
+    fn continuation_request_does_not_resend_stored_hosted_items() {
+        let mut assistant = vec![
+            Content::TextReasoning(TextReasoningContent {
+                text: String::new(),
+                annotations: None,
+                raw_representation: Some(json!({
+                    "type": "reasoning", "id": "rs_1", "summary": [],
+                })),
+                protected_data: None,
+            }),
+            Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                id: "mcpr_1".into(),
+                function_call: FunctionCallContent::new(
+                    "mcpr_1",
+                    "search",
+                    Some(FunctionArguments::Raw("{}".into())),
+                ),
+            }),
+        ];
+        assistant.extend(mcp_call_item_contents(&json!({
+            "type": "mcp_call", "id": "mcp_1", "name": "search",
+            "server_label": "docs", "arguments": "{}", "output": "ok",
+        })));
+        assistant.push(Content::text("done"));
+        let history = vec![
+            user("find it"),
+            Message::with_contents(Role::assistant(), assistant),
+            user_with(vec![Content::FunctionApprovalResponse(
+                FunctionApprovalResponseContent {
+                    approved: true,
+                    id: "mcpr_2".into(),
+                    function_call: FunctionCallContent::new("mcpr_2", "search", None),
+                },
+            )]),
+        ];
+        let types = |body: &Value| -> Vec<String> {
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["type"].as_str().unwrap_or("message").to_string())
+                .collect()
+        };
+
+        let c = client();
+        let mut options = ChatOptions::new();
+        options.conversation_id = Some("resp_1".into());
+        let body = c.build_body(&history, &options, false);
+        assert_eq!(body["previous_response_id"], json!("resp_1"));
+        assert_eq!(
+            types(&body),
+            ["message", "message", "mcp_approval_response"],
+            "{body}"
+        );
+
+        let body = c.build_body(&history, &ChatOptions::new(), false);
+        assert_eq!(
+            types(&body),
+            [
+                "message",
+                "reasoning",
+                "mcp_approval_request",
+                "mcp_call",
+                "message",
+                "mcp_approval_response",
+            ],
+            "{body}"
         );
     }
 
