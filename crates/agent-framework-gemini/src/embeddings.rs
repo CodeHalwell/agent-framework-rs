@@ -78,7 +78,7 @@ use agent_framework_core::types::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::convert::{data_part, uri_part};
+use crate::convert::{base64_data_part, uri_part};
 use crate::{classify_gemini_error, parse_retry_after, API_VERSION, DEFAULT_BASE_URL};
 
 /// The default (and stable) Gemini embedding model.
@@ -525,7 +525,7 @@ fn multimodal_parts(value: &EmbeddingInput, index: usize) -> Result<Vec<Value>> 
             Content::Text(t) => json!({ "text": t.text }),
             Content::Data(d) => {
                 has_media = true;
-                data_part(d).ok_or_else(|| {
+                base64_data_part(d).ok_or_else(|| {
                     Error::Content(format!(
                         "embedding input {index} has a data item that is not a base64 data URI"
                     ))
@@ -778,6 +778,31 @@ mod tests {
         let (body, _) = client().build_body(&inputs, Some(&doc_options())).unwrap();
         assert_eq!(text_of(&body, 0), "title: none | text: q");
         assert!(body["requests"][1]["content"]["parts"][0]["inlineData"].is_object());
+    }
+
+    #[test]
+    fn a_data_uri_without_the_base64_marker_is_refused() {
+        let raw = Content::Data(agent_framework_core::types::DataContent {
+            uri: "data:image/png,raw".into(),
+            media_type: Some("image/png".into()),
+        });
+        let err = client()
+            .build_body(&[EmbeddingInput::from(raw)], None)
+            .expect_err("Gemini needs base64 inline data");
+        assert!(err.to_string().contains("not a base64 data URI"), "{err}");
+
+        // The marker is a parameter, so parameters before it are fine.
+        let with_param = Content::Data(agent_framework_core::types::DataContent {
+            uri: "data:image/png;name=a.png;base64,iVBO".into(),
+            media_type: None,
+        });
+        let (body, _) = client()
+            .build_body(&[EmbeddingInput::from(with_param)], None)
+            .unwrap();
+        assert_eq!(
+            body["requests"][0]["content"]["parts"][0]["inlineData"]["data"],
+            json!("iVBO")
+        );
     }
 
     #[test]
