@@ -123,6 +123,20 @@ pub fn load(root: &Path) -> Result<RustIndex, String> {
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Public positions of a tuple struct's fields. rustdoc lists every position
+/// and writes `null` where a field is private, so a position keeps its
+/// source index (`Wrapper(pub A, B, pub C)` gives `0` and `2`).
+fn tuple_fields(fields: &Value) -> Vec<String> {
+    fields
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, id)| !id.is_null())
+        .map(|(position, _)| position.to_string())
+        .collect()
+}
+
 fn collect(doc: &Value, out: &mut RustIndex) {
     let empty = serde_json::Map::new();
     let index = doc["index"].as_object().unwrap_or(&empty);
@@ -192,6 +206,9 @@ fn collect(doc: &Value, out: &mut RustIndex) {
             if let Some(fields) = s["kind"].get("plain").map(|p| &p["fields"]) {
                 members.extend(names_of(fields));
             }
+            if let Some(fields) = s["kind"].get("tuple") {
+                members.extend(tuple_fields(fields));
+            }
             members.extend(impl_members(&s["impls"]));
         } else if let Some(e) = inner.get("enum") {
             members.extend(names_of(&e["variants"]));
@@ -206,5 +223,35 @@ fn collect(doc: &Value, out: &mut RustIndex) {
             out.insert(format!("{path}::{m}"));
         }
         out.insert(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tuple_fields_keep_their_positions_and_skip_private_ones() {
+        let doc = json!({
+            "index": {
+                "1": {"name": "Wrapper", "inner": {"struct": {
+                    "kind": {"tuple": [10, null, 12]},
+                    "impls": []
+                }}},
+                "10": {"name": "0", "visibility": "public", "inner": {"struct_field": {}}},
+                "12": {"name": "2", "visibility": "public", "inner": {"struct_field": {}}}
+            },
+            "paths": {
+                "1": {"crate_id": 0, "kind": "struct", "path": ["krate", "Wrapper"]}
+            }
+        });
+        let mut index = RustIndex::new();
+        collect(&doc, &mut index);
+        let got: Vec<_> = index.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            ["krate::Wrapper", "krate::Wrapper::0", "krate::Wrapper::2"]
+        );
     }
 }
