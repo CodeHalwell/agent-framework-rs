@@ -59,5 +59,12 @@ from the roadmap, not from this file.
   to build on.
 - **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
   on the Agent Memory Toolkit), the dedicated Application Insights exporter.
+- **Depth gaps the parity ledger surfaced** (see
+  [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
+  skills beyond inline skills (scripts, file-based sources, source
+  pipelines); compaction's message-group model, triggers and summarization;
+  workflow telemetry, run cancellation and graph reflection; message source
+  attribution and message injection; context providers seeing the agent and
+  session.
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
