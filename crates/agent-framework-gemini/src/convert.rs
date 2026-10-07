@@ -294,6 +294,22 @@ pub(crate) fn data_part(dc: &DataContent) -> Option<Value> {
     Some(json!({ "inlineData": { "mimeType": media_type, "data": data } }))
 }
 
+/// [`data_part`] for callers that must refuse anything Gemini would not
+/// accept as `inlineData`: the URI has to carry the `;base64` marker, since
+/// Gemini requires base64 data. The chat path keeps the looser
+/// [`data_part`] so its existing behaviour is unchanged.
+pub(crate) fn base64_data_part(dc: &DataContent) -> Option<Value> {
+    let meta = dc.uri.strip_prefix("data:")?.split_once(',')?.0;
+    if !meta
+        .split(';')
+        .skip(1)
+        .any(|p| p.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    data_part(dc)
+}
+
 pub(crate) fn uri_part(uc: &UriContent) -> Value {
     json!({ "fileData": { "mimeType": uc.media_type, "fileUri": uc.uri } })
 }

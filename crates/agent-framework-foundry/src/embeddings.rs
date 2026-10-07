@@ -604,10 +604,27 @@ fn route_input(value: EmbeddingInput, index: usize) -> Result<Routed> {
         }
     }
     match (image, text) {
+        // Upstream rejects image content with no URI before any request.
+        (Some(image), _) if image.is_empty() => Err(Error::Content(format!(
+            "Foundry embedding input {index} is an image with no URI"
+        ))),
         (Some(image), text) => Ok(Routed::Image(ImageInput { image, text })),
         (None, Some(text)) => Ok(Routed::Text(text)),
         (None, None) => Err(unsupported()),
     }
+}
+
+/// Refuse a response that does not hold exactly one vector per input: a
+/// short or padded batch would silently misalign the caller's data.
+fn check_count(batch: &GeneratedEmbeddings, inputs: usize) -> Result<()> {
+    if batch.embeddings.len() != inputs {
+        return Err(Error::service(format!(
+            "Foundry returned {} embeddings for {} inputs",
+            batch.embeddings.len(),
+            inputs
+        )));
+    }
+    Ok(())
 }
 
 impl FoundryEmbeddingClient {
@@ -707,14 +724,18 @@ impl EmbeddingClient for FoundryEmbeddingClient {
         let (text_body, text_extras) = self.body_for(&text_inputs, options.as_ref());
         let (image_body, image_extras) = self.image_body_for(&image_inputs, options.as_ref());
 
-        // A batch on one route is that route's response, unchanged.
-        if images.is_empty() {
-            return self.embed("embeddings", text_body, text_extras).await;
-        }
-        if texts.is_empty() {
-            return self
-                .embed("images/embeddings", image_body, image_extras)
-                .await;
+        // A batch on one route is that route's response, with its usage and
+        // extras intact, once it accounts for exactly one vector per input
+        // (the `EmbeddingClient` contract).
+        if images.is_empty() || texts.is_empty() {
+            let (path, body, expanded_extras) = if images.is_empty() {
+                ("embeddings", text_body, text_extras)
+            } else {
+                ("images/embeddings", image_body, image_extras)
+            };
+            let batch = self.embed(path, body, expanded_extras).await?;
+            check_count(&batch, count)?;
+            return Ok(batch);
         }
 
         // A mixed batch is reassembled into input order, so each response
@@ -736,13 +757,7 @@ impl EmbeddingClient for FoundryEmbeddingClient {
             ),
         ] {
             let batch = self.embed(path, body, expanded_extras).await?;
-            if batch.embeddings.len() != indices.len() {
-                return Err(Error::service(format!(
-                    "Foundry returned {} embeddings for {} inputs",
-                    batch.embeddings.len(),
-                    indices.len()
-                )));
-            }
+            check_count(&batch, indices.len())?;
             for (index, embedding) in indices.into_iter().zip(batch.embeddings) {
                 slots[index] = Some(embedding);
             }
