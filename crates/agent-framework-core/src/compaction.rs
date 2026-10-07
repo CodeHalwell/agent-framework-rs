@@ -977,7 +977,24 @@ pub fn compact(
     strategy: &dyn CompactionStrategy,
     tokenizer: &dyn Tokenizer,
 ) -> Vec<Message> {
+    let messages = &without_settled_approvals(messages);
     finalize_compaction(messages, strategy.compact(messages, tokenizer), &[])
+}
+
+/// `messages` without approvals already settled by a later result.
+///
+/// Settlement has to be decided before any strategy runs: a cut can keep an
+/// approval response while losing the result that settled it (or the orphan
+/// repair can drop that result once its call falls outside the window), and
+/// the function-invocation layer would then see an old approval as pending
+/// and execute its call again. A settled approval is dead weight for the model
+/// either way, so it leaves before compaction rather than after. Upstream
+/// avoids the same hazard by ordering: its approval collection runs before
+/// in-run compaction, on the full message list.
+fn without_settled_approvals(messages: &[Message]) -> Vec<Message> {
+    let mut messages = messages.to_vec();
+    crate::client::drop_settled_approval_responses(&mut messages);
+    messages
 }
 
 /// A [`ContextProvider`] that compacts the accumulated message list —
@@ -1022,6 +1039,9 @@ impl ContextProvider for CompactionProvider {
     /// Replace `ctx.messages` (the accumulated history + any earlier
     /// provider-injected messages) with the strategy's compacted subset.
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        // Settlement is decided on the uncompacted history (see
+        // `without_settled_approvals`); the run's input is not ours to edit.
+        crate::client::drop_settled_approval_responses(&mut ctx.messages);
         let retained = self.strategy.compact(&ctx.messages, &*self.tokenizer);
         // Pair against the run's input as well as history. `prepare_request`
         // appends `input_messages` *after* every provider has run, so a

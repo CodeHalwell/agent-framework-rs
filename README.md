@@ -223,8 +223,10 @@ features and carry no semver promise. `full` leaves them out, and
 | `experimental` | all five |
 
 ```toml
-# Everything:
+# Every stable integration (no experimental APIs):
 agent-framework = { version = "0.1", features = ["full"] }
+# Everything, experimental APIs included:
+agent-framework = { version = "0.1", features = ["full", "experimental"] }
 # Just OpenAI (the default) plus Anthropic:
 agent-framework = { version = "0.1", features = ["anthropic"] }
 ```
