@@ -48,9 +48,17 @@ from the roadmap, not from this file.
   `TodoFileStore` and the `create_harness_agent` assembly. The agent loop,
   todo, tool approval and agent mode are ported behind
   `experimental-harness`.
-- **Agent hooks**, **evaluation** and **security (FIDES)**: all marked
-  experimental upstream; when ported they go behind `experimental-*`
-  features (see `docs/feature-stages.md`).
+- **Agent hooks, remainder** (`experimental-agent-hooks` ships the
+  enforcement bundle): the approval seam (liftable denies are enforced as
+  plain denies), the `sequential/run_all` and parallel composition profiles,
+  the `jcs-sha256` and custom identity providers (records are
+  identity-unbound), an `agent_shutdown` on cancellation, and §5.4
+  result-label flow (labels reach the combined verdict and the record but
+  are not persisted with the produced data or resurfaced as
+  `source_labels`; upstream's framework layer does not do this either).
+- **Evaluation** and **security (FIDES)**: both marked experimental
+  upstream; when ported they go behind `experimental-*` features (see
+  `docs/feature-stages.md`).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control

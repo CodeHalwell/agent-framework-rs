@@ -32,6 +32,20 @@ pub enum Error {
     #[error("tool error: {0}")]
     Tool(String),
 
+    /// A function middleware rejected a tool call (or rewrote its failure)
+    /// with a message written for the model.
+    ///
+    /// The function-invocation loop absorbs it like any other tool error: the
+    /// call's result is an error result and counts toward
+    /// `max_consecutive_errors_per_request`. Unlike other errors, its message
+    /// always reaches the model verbatim, even with `include_detailed_errors`
+    /// off: that setting hides tool-internal diagnostics, while this message
+    /// is one the middleware deliberately addressed to the model (a policy
+    /// gate's "call blocked" notice, say). Put nothing in it the model must
+    /// not see.
+    #[error("tool call rejected: {0}")]
+    ToolRejected(String),
+
     /// A chat client / service returned an error.
     ///
     /// Used for non-HTTP service failures (transport errors, stream-decode
@@ -139,6 +153,18 @@ pub enum Error {
     /// keep returning any other variant — [`Error::Tool`] is the usual choice.
     #[error("middleware failure: {0}")]
     MiddlewareFailure(String),
+
+    /// An agent-hooks interceptor verdict blocked the run (AGENT-HOOKS-0.1).
+    ///
+    /// Returned by an agent guarded with
+    /// [`AgentHooks`](crate::agent_hooks::AgentHooks) when an emission's
+    /// combined verdict is a deny: a policy deny at a run-level point, or a
+    /// `host_error:*` deny (the enforcement layer itself failed) anywhere.
+    /// Carries the verdict and its payload-free interception record.
+    #[cfg(feature = "experimental-agent-hooks")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+    #[error("{0}")]
+    InterceptionBlocked(Box<crate::agent_hooks::InterceptionBlocked>),
 
     /// A workflow validation or execution error.
     #[error("workflow error: {0}")]
@@ -248,11 +274,28 @@ impl Error {
         Error::Tool(msg.to_string())
     }
 
+    /// Create an [`Error::ToolRejected`] from anything displayable: a tool
+    /// error whose message the model sees verbatim.
+    pub fn tool_rejected(msg: impl fmt::Display) -> Self {
+        Error::ToolRejected(msg.to_string())
+    }
+
     /// Create an [`Error::MiddlewareFailure`] from anything displayable: the
     /// fail-closed signal function middleware returns to stop a run outright
     /// instead of having its error absorbed into a tool-error result.
     pub fn middleware_failure(msg: impl fmt::Display) -> Self {
         Error::MiddlewareFailure(msg.to_string())
+    }
+
+    /// The agent-hooks block this error carries, when it is an
+    /// [`Error::InterceptionBlocked`].
+    #[cfg(feature = "experimental-agent-hooks")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+    pub fn interception_blocked(&self) -> Option<&crate::agent_hooks::InterceptionBlocked> {
+        match self {
+            Error::InterceptionBlocked(blocked) => Some(blocked),
+            _ => None,
+        }
     }
 
     /// Whether this error is the [`Error::MiddlewareFailure`] fail-closed

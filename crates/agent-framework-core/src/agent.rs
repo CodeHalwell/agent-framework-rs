@@ -1284,6 +1284,38 @@ impl AgentBuilder {
     }
 }
 
+#[cfg(feature = "experimental-agent-hooks")]
+impl AgentBuilder {
+    /// Install the agent-hooks seams and build: `agent_mw` and `function_mw`
+    /// go first in their lists (outermost), and `wrap_client` decorates the
+    /// raw client below the function-invocation loop. Also returns the
+    /// agent's own tool names. Only [`crate::agent_hooks::AgentHooks`] calls
+    /// this, so the seams are always installed together.
+    pub(crate) fn install_agent_hooks(
+        mut self,
+        agent_mw: Arc<crate::middleware::AgentMiddleware>,
+        function_outer_mw: Arc<crate::middleware::FunctionMiddleware>,
+        function_inner_mw: Arc<crate::middleware::FunctionMiddleware>,
+        wrap_client: impl FnOnce(Arc<dyn ChatClient>) -> Arc<dyn ChatClient>,
+    ) -> (Agent, Vec<String>) {
+        self.agent_middleware.insert(0, agent_mw);
+        self.function_middleware.insert(0, function_outer_mw);
+        self.function_middleware.push(function_inner_mw);
+        // Resolve the default model from the raw client before wrapping.
+        if self.chat_options.model.is_none() {
+            self.chat_options.model = self.client.model().map(str::to_string);
+        }
+        self.client = wrap_client(self.client);
+        let tools = self
+            .chat_options
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        (self.build(), tools)
+    }
+}
+
 impl Agent {
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {

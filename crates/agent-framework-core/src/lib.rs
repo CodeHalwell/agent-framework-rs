@@ -36,7 +36,8 @@
 //! cargo features and carry no semver promise: `experimental-vector-stores`
 //! (the `vectors` module), `experimental-file-history`
 //! (`history::FileHistoryProvider`), `experimental-progressive-tools`
-//! (`middleware::LiveToolList`) and `experimental-harness` (the `harness`
+//! (`middleware::LiveToolList`), `experimental-agent-hooks` (the
+//! `agent_hooks` module) and `experimental-harness` (the `harness`
 //! module). See `docs/feature-stages.md` in the repository.
 //!
 //! ## Example
@@ -75,6 +76,9 @@ macro_rules! experimental {
 }
 
 pub mod agent;
+#[cfg(feature = "experimental-agent-hooks")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-agent-hooks")))]
+pub mod agent_hooks;
 pub mod client;
 pub mod compaction;
 pub mod error;

@@ -441,6 +441,17 @@ struct ToolCallOutcome {
     content: FunctionResultContent,
 }
 
+/// The error text the model sees for a dispatched tool call that failed.
+pub(crate) fn tool_error_message(e: &Error, include_detailed_errors: bool) -> String {
+    match e {
+        // Addressed to the model by the middleware itself: shown verbatim
+        // whatever the detail setting.
+        Error::ToolRejected(msg) => msg.clone(),
+        e if include_detailed_errors => format!("{e}"),
+        _ => "tool execution failed".to_string(),
+    }
+}
+
 async fn execute_tool_call(
     tool: Option<ToolDefinition>,
     call: &FunctionCallContent,
@@ -536,9 +547,15 @@ async fn execute_tool_call(
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
 
-            let ctx = FunctionInvocationContext::new(call.name.clone(), args)
+            let mut ctx = FunctionInvocationContext::new(call.name.clone(), args)
+                .with_tool_name(def.name.clone())
+                .with_detailed_errors(include_detailed_errors)
                 .with_session(session.cloned())
                 .with_tools(live_tools.cloned());
+            // Middleware can correlate the invocation with the model's call
+            // (upstream sets the same key in `_tools.py`).
+            ctx.metadata
+                .insert("call_id".into(), Value::String(call.call_id.clone()));
             match function_middleware.execute(ctx, terminal).await {
                 Ok(ctx) => Ok(ToolCallOutcome {
                     executed: true,
@@ -556,11 +573,7 @@ async fn execute_tool_call(
                 // other error keeps the absorb-and-continue contract below.
                 Err(e) if e.is_middleware_failure() => Err(e),
                 Err(e) => {
-                    let msg = if include_detailed_errors {
-                        format!("{e}")
-                    } else {
-                        "tool execution failed".to_string()
-                    };
+                    let msg = tool_error_message(&e, include_detailed_errors);
                     // The pipeline ran and the tool failed, which is an
                     // execution: charged like any other.
                     Ok(ToolCallOutcome {

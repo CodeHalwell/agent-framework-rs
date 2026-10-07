@@ -7,6 +7,34 @@ may break APIs).
 
 ## [Unreleased]
 
+### Agent hooks (experimental)
+
+New `experimental-agent-hooks` feature (upstream `AGENT_HOOKS`): the
+`agent_framework_core::agent_hooks` module implements the AGENT-HOOKS-0.1
+control contract. `AgentHooks::build_agent` (or
+`AgentBuilder::build_with_agent_hooks`) installs all eight interception points
+as one unit — `agent_startup`, `input` and `agent_shutdown` in an agent
+decorator, `output` as the first agent middleware, `pre_model_call` /
+`post_model_call` around each model service call, and `pre_tool_call` /
+`post_tool_call` as the first function middleware — and enforces the combined
+verdicts fail closed. A run-level deny fails the run with the new
+`Error::InterceptionBlocked`; a tool-level deny blocks that call and tells the
+model why; a `host_error:*` deny anywhere halts the run. Transforms are
+written back into messages, arguments and results, streaming is buffered
+behind the verdicts, and denied output is never persisted to history. The
+protocol layer (contexts, verdicts, `Interceptor`, `InterceptionEmitter`,
+payload-free records) is implemented in Rust since no agent-hooks crate
+exists; it supports the `sequential/first_deny` profile without an approval
+resolver or identity provider.
+
+The function-invocation loop now puts the model's `call_id` in
+`FunctionInvocationContext::metadata["call_id"]`, as upstream does. A new
+`Error::ToolRejected` lets function middleware fail a call with a message
+written for the model: the loop records it as an error result (counted toward
+`max_consecutive_errors_per_request`) and shows the model that message even
+with `include_detailed_errors` off. The tool seam uses it for blocked calls
+and for a `post_tool_call` transform of a failed call.
+
 ### Experimental agent harness
 
 A new `experimental-harness` feature on `agent-framework-core` (forwarded by
@@ -123,6 +151,7 @@ CI. To keep using a gated API, enable its feature:
 | `experimental-progressive-tools` | `LiveToolList`, and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}` | core |
 | `experimental-declarative-agents` | the whole `agent-framework-declarative` crate | declarative |
 | `experimental-harness` | `agent_framework_core::harness` (`LoopAgent`, `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`) | core |
+| `experimental-agent-hooks` | `agent_framework_core::agent_hooks`, `AgentBuilder::build_with_agent_hooks`, `Error::InterceptionBlocked` | core |
 
 The umbrella crate re-exposes each feature under the same name and adds
 `experimental` to turn them all on. **Its `declarative` feature is now
