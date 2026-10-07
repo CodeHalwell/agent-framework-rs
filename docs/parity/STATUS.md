@@ -11,20 +11,24 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 88 / 137 / 24 / 191 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 88 / 137 / 24 / 191 / 0 | 52 | 0 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.GitHub.Copilot` | 1 / 5 / 0 / 0 / 0 | 0 / 1 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 0 / 0 / 0 / 58 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 97 / 43 / 69 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 97 / 43 / 69 / 0 | 41 | 0 |
+| `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
+| `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
 | `Microsoft.Agents.AI.Workflows.InProc` | 5 / 3 / 0 / 0 / 0 | 1 / 2 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Workflows.Observability` | 7 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 7 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Workflows.Reflection` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 3 | 0 |
+| `Microsoft.Agents.AI.Workflows.Specialized.Magentic` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 4 | 0 |
 | `Microsoft.AspNetCore.Builder` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 1 / 0 / 0 | 0 | 0 |
+| `Microsoft.Extensions.AI` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 3 | 0 |
 | `OpenAI.Chat` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `OpenAI.Responses` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 
@@ -531,5 +535,125 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 ## Not yet reviewed
 
-0 declarations Go maps that the Rust ledger has not assessed yet (0 unreviewed in all), by type:
+110 declarations the Rust ledger has not assessed yet.
 
+### In Go's catalog
+
+0 declarations, by type:
+
+None.
+
+### Only in the .NET inventory
+
+110 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
+
+- `Microsoft.Agents.AI::AdditionalPropertiesExtensions`
+- `Microsoft.Agents.AI::AgentAbstractionsJsonUtilities`
+- `Microsoft.Agents.AI::AgentClassSkill<TSelf>`
+- `Microsoft.Agents.AI::AgentEvaluationExtensions`
+- `Microsoft.Agents.AI::AgentEvaluationResults`
+- `Microsoft.Agents.AI::AgentSessionStateBagJsonConverter`
+- `Microsoft.Agents.AI::AgentSessionStore`
+- `Microsoft.Agents.AI::AgentSessionStoreKey`
+- `Microsoft.Agents.AI::AgentSkillResourceAttribute`
+- `Microsoft.Agents.AI::AgentSkillScriptAttribute`
+- `Microsoft.Agents.AI::BackgroundAgentsProvider`
+- `Microsoft.Agents.AI::BackgroundAgentsProviderOptions`
+- `Microsoft.Agents.AI::BackgroundTaskInfo`
+- `Microsoft.Agents.AI::BackgroundTaskStatus`
+- `Microsoft.Agents.AI::CachingAgentSkillsSourceOptions`
+- `Microsoft.Agents.AI::ChatHistoryMemoryProvider`
+- `Microsoft.Agents.AI::ChatHistoryMemoryProvider.State`
+- `Microsoft.Agents.AI::ChatHistoryMemoryProviderOptions`
+- `Microsoft.Agents.AI::ChatHistoryMemoryProviderOptions.SearchBehavior`
+- `Microsoft.Agents.AI::ChatHistoryMemoryProviderScope`
+- `Microsoft.Agents.AI::ConversationSplitters`
+- `Microsoft.Agents.AI::DelegatingAgentSessionStore`
+- `Microsoft.Agents.AI::EvalCheck`
+- `Microsoft.Agents.AI::EvalCheckResult`
+- `Microsoft.Agents.AI::EvalChecks`
+- `Microsoft.Agents.AI::EvalItem`
+- `Microsoft.Agents.AI::EvalItemResult`
+- `Microsoft.Agents.AI::EvalScoreResult`
+- `Microsoft.Agents.AI::ExpectedToolCall`
+- `Microsoft.Agents.AI::FeatureUsage`
+- `Microsoft.Agents.AI::FileAccessProvider`
+- `Microsoft.Agents.AI::FileAccessProviderOptions`
+- `Microsoft.Agents.AI::FileListEntry`
+- `Microsoft.Agents.AI::FileMemoryProvider`
+- `Microsoft.Agents.AI::FileMemoryProviderOptions`
+- `Microsoft.Agents.AI::FileMemoryState`
+- `Microsoft.Agents.AI::FunctionEvaluator`
+- `Microsoft.Agents.AI::GeneratedEvaluatorRef`
+- `Microsoft.Agents.AI::IAgentEvaluator`
+- `Microsoft.Agents.AI::IConversationSplitter`
+- `Microsoft.Agents.AI::LocalEvaluator`
+- `Microsoft.Agents.AI::PerEvaluatorResult`
+- `Microsoft.Agents.AI::RoutePersistingRoutingChatClient`
+- `Microsoft.Agents.AI::RoutePersistingRoutingChatClientOptions`
+- `Microsoft.Agents.AI::RubricScore`
+- `Microsoft.Agents.AI::TextSearchProvider`
+- `Microsoft.Agents.AI::TextSearchProvider.TextSearchProviderState`
+- `Microsoft.Agents.AI::TextSearchProvider.TextSearchResult`
+- `Microsoft.Agents.AI::TextSearchProviderOptions`
+- `Microsoft.Agents.AI::TextSearchProviderOptions.TextSearchBehavior`
+- `Microsoft.Agents.AI::ToolApprovalAgentBuilderExtensions`
+- `Microsoft.Agents.AI::ToolCalledMode`
+- `Microsoft.Agents.AI.Compaction::ChatReducerCompactionStrategy`
+- `Microsoft.Agents.AI.Compaction::ChatStrategyExtensions`
+- `Microsoft.Agents.AI.Workflows::AIAgentBinding`
+- `Microsoft.Agents.AI.Workflows::AggregatingExecutor<TInput, TAggregate>`
+- `Microsoft.Agents.AI.Workflows::ChatForwardingExecutor`
+- `Microsoft.Agents.AI.Workflows::ChatForwardingExecutorOptions`
+- `Microsoft.Agents.AI.Workflows::ChatProtocolExecutor`
+- `Microsoft.Agents.AI.Workflows::ChatProtocolExecutorOptions`
+- `Microsoft.Agents.AI.Workflows::ChatProtocolExtensions`
+- `Microsoft.Agents.AI.Workflows::Edge`
+- `Microsoft.Agents.AI.Workflows::ExecutorConfig`
+- `Microsoft.Agents.AI.Workflows::ExecutorConfig<TOptions>`
+- `Microsoft.Agents.AI.Workflows::ExecutorPlaceholder`
+- `Microsoft.Agents.AI.Workflows::Futures`
+- `Microsoft.Agents.AI.Workflows::HandoffToolCallFilteringBehavior`
+- `Microsoft.Agents.AI.Workflows::HandoffWorkflowBuilderCore<TBuilder>`
+- `Microsoft.Agents.AI.Workflows::HandoffsWorkflowBuilder`
+- `Microsoft.Agents.AI.Workflows::IExternalRequestEnvelope`
+- `Microsoft.Agents.AI.Workflows::IWorkflowExecutionEnvironment`
+- `Microsoft.Agents.AI.Workflows::MagenticDefaultPrompts`
+- `Microsoft.Agents.AI.Workflows::MagenticPlanReviewRequest`
+- `Microsoft.Agents.AI.Workflows::MagenticPlanReviewResponse`
+- `Microsoft.Agents.AI.Workflows::MagenticProgressLedger`
+- `Microsoft.Agents.AI.Workflows::MagenticPromptOverrides`
+- `Microsoft.Agents.AI.Workflows::MessageHandlerAttribute`
+- `Microsoft.Agents.AI.Workflows::RequestPort<TRequest, TResponse>`
+- `Microsoft.Agents.AI.Workflows::RequestPortBinding`
+- `Microsoft.Agents.AI.Workflows::ResetChatSignal`
+- `Microsoft.Agents.AI.Workflows::SendsMessageAttribute`
+- `Microsoft.Agents.AI.Workflows::StatefulExecutor<TState, TInput, TOutput>`
+- `Microsoft.Agents.AI.Workflows::StatefulExecutor<TState, TInput>`
+- `Microsoft.Agents.AI.Workflows::StatefulExecutor<TState>`
+- `Microsoft.Agents.AI.Workflows::StreamingAggregators`
+- `Microsoft.Agents.AI.Workflows::StreamingRunExtensions`
+- `Microsoft.Agents.AI.Workflows::StreamsMessageAttribute`
+- `Microsoft.Agents.AI.Workflows::SubworkflowBinding`
+- `Microsoft.Agents.AI.Workflows::SwitchBuilder`
+- `Microsoft.Agents.AI.Workflows::WorkflowAgentMetadata`
+- `Microsoft.Agents.AI.Workflows::WorkflowBuilderExtensions`
+- `Microsoft.Agents.AI.Workflows::WorkflowEvaluationExtensions`
+- `Microsoft.Agents.AI.Workflows::WorkflowVisualizer`
+- `Microsoft.Agents.AI.Workflows::YieldsMessageAttribute`
+- `Microsoft.Agents.AI.Workflows::YieldsOutputAttribute`
+- `Microsoft.Agents.AI.Workflows.Checkpointing::FanInEdgeInfo`
+- `Microsoft.Agents.AI.Workflows.Checkpointing::IWireMarshaller<TWireContainer>`
+- `Microsoft.Agents.AI.Workflows.Checkpointing::JsonCheckpointStore`
+- `Microsoft.Agents.AI.Workflows.Checkpointing::TypeId`
+- `Microsoft.Agents.AI.Workflows.Execution::EdgeConnection`
+- `Microsoft.Agents.AI.Workflows.Reflection::IMessageHandler<TMessage, TResult>`
+- `Microsoft.Agents.AI.Workflows.Reflection::IMessageHandler<TMessage>`
+- `Microsoft.Agents.AI.Workflows.Reflection::ReflectingExecutor<TExecutor>`
+- `Microsoft.Agents.AI.Workflows.Specialized.Magentic::MagenticOrchestratorEvent`
+- `Microsoft.Agents.AI.Workflows.Specialized.Magentic::MagenticPlanCreatedEvent`
+- `Microsoft.Agents.AI.Workflows.Specialized.Magentic::MagenticProgressLedgerUpdatedEvent`
+- `Microsoft.Agents.AI.Workflows.Specialized.Magentic::MagenticReplannedEvent`
+- `Microsoft.Extensions.AI::AIContextProviderChatClientBuilderExtensions`
+- `Microsoft.Extensions.AI::ChatClientBuilderExtensions`
+- `Microsoft.Extensions.AI::ChatClientExtensions`
