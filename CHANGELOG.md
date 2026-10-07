@@ -17,6 +17,9 @@ may break APIs).
   settled responses neither execute nor reach the model. The results resolving
   an approval are also returned ahead of the model's answer, so history records
   the approval as settled. Streaming and non-streaming runs share the fix.
+  Settlement is decided before history compaction (a window could keep the
+  response but drop the result that settled it) and before the no-tools fast
+  path, so a settled approval never reaches the model on either route.
 
 ## [0.10.0] — 2026-10-05
 
