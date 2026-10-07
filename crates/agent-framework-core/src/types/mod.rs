@@ -12,7 +12,8 @@ pub use content::{
     prepare_function_call_results, Annotation, AnnotationKind, Content, DataContent, ErrorContent,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
-    TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
+    ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
+    TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
     FUNCTION_INVOCATION_ERROR_MARKER,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};

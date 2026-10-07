@@ -48,7 +48,6 @@ from the roadmap, not from this file.
   (FIDES)**: all marked experimental upstream. They wait on a
   feature-stage mechanism so they can ship without semver commitments.
 - **AG-UI client** (the hosting crate has the server side only).
-- **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control
