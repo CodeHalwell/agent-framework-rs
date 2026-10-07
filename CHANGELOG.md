@@ -7,6 +7,27 @@ may break APIs).
 
 ## [Unreleased]
 
+### Feature stages (breaking)
+
+APIs that upstream still marks experimental now sit behind `experimental-*`
+cargo features and carry no semver promise, mirroring Python's
+`@experimental` and .NET's `[Experimental]`. The rules are in
+`docs/feature-stages.md`, and `cargo xtask features check` enforces them in
+CI. To keep using a gated API, enable its feature:
+
+| Feature | Gates | Crates |
+|---|---|---|
+| `experimental-vector-stores` | `agent_framework_core::vectors`, `CosmosVectorStore`, `AzureAISearchStore` | core, cosmos, azure-ai-search |
+| `experimental-file-history` | `FileHistoryProvider` | core |
+| `experimental-progressive-tools` | `LiveToolList`, and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}` | core |
+| `experimental-declarative-agents` | the whole `agent-framework-declarative` crate | declarative |
+
+The umbrella crate re-exposes each feature under the same name and adds
+`experimental` to turn them all on. **Its `declarative` feature is now
+`experimental-declarative-agents`**, and `full` no longer includes it.
+`agent_framework_cosmos::DEFAULT_VECTOR_API_VERSION` moves behind
+`experimental-vector-stores` with the store it configures.
+
 ### Fixed
 
 - **An approved tool re-ran on every later turn of a session.** The approval

@@ -138,21 +138,25 @@ impl ChatContext {
     }
 }
 
-/// The live, mutable tool list of an in-flight agent run (progressive tool
-/// exposure).
-///
-/// Handed to function middleware and tools via
-/// [`FunctionInvocationContext::tools`]; a clone is a view onto the *same*
-/// list. Mutations take effect on the **next** iteration of the
-/// function-calling loop — they never affect tool calls already requested in
-/// the in-flight batch, because the loop snapshots the list once per model
-/// iteration. Mirrors upstream `FunctionInvocationContext.tools` +
-/// `add_tools`/`remove_tools` (`_middleware.py`).
-#[derive(Clone, Default)]
-pub struct LiveToolList {
-    inner: Arc<std::sync::Mutex<Vec<ToolDefinition>>>,
+experimental! {
+    "experimental-progressive-tools",
+    /// The live, mutable tool list of an in-flight agent run (progressive tool
+    /// exposure).
+    ///
+    /// Handed to function middleware and tools via
+    /// [`FunctionInvocationContext::tools`]; a clone is a view onto the *same*
+    /// list. Mutations take effect on the **next** iteration of the
+    /// function-calling loop — they never affect tool calls already requested in
+    /// the in-flight batch, because the loop snapshots the list once per model
+    /// iteration. Mirrors upstream `FunctionInvocationContext.tools` +
+    /// `add_tools`/`remove_tools` (`_middleware.py`).
+    #[derive(Clone, Default)]
+    pub struct LiveToolList {
+        inner: Arc<std::sync::Mutex<Vec<ToolDefinition>>>,
+    }
 }
 
+#[cfg_attr(not(feature = "experimental-progressive-tools"), allow(dead_code))]
 impl LiveToolList {
     /// A live list seeded with the run's current tools.
     pub fn new(tools: Vec<ToolDefinition>) -> Self {
@@ -221,7 +225,11 @@ pub struct FunctionInvocationContext {
     /// tools may [`add_tools`](FunctionInvocationContext::add_tools) /
     /// [`remove_tools`](FunctionInvocationContext::remove_tools); mutations
     /// take effect on the **next** model iteration, not the in-flight batch.
+    #[cfg(feature = "experimental-progressive-tools")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-progressive-tools")))]
     pub tools: Option<LiveToolList>,
+    #[cfg(not(feature = "experimental-progressive-tools"))]
+    pub(crate) tools: Option<LiveToolList>,
     pub metadata: HashMap<String, serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub terminate: bool,
@@ -246,42 +254,51 @@ impl FunctionInvocationContext {
         self
     }
 
-    /// Builder: attach the run's live tool list.
-    pub fn with_tools(mut self, tools: Option<LiveToolList>) -> Self {
-        self.tools = tools;
-        self
+    experimental! {
+        "experimental-progressive-tools",
+        /// Builder: attach the run's live tool list.
+        pub fn with_tools(mut self, tools: Option<LiveToolList>) -> Self {
+            self.tools = tools;
+            self
+        }
     }
 
-    /// Add tools to the current agent run (progressive tool exposure); see
-    /// [`LiveToolList::add_tools`]. Errors when this invocation is not bound
-    /// to a live agent run (mirrors upstream's `RuntimeError`).
-    pub fn add_tools(&self, tools: impl IntoIterator<Item = ToolDefinition>) -> Result<()> {
-        self.tools
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Configuration(
-                    "cannot add tools: this FunctionInvocationContext is not bound to a \
-                     live agent run"
-                        .into(),
-                )
-            })?
-            .add_tools(tools)
+    experimental! {
+        "experimental-progressive-tools",
+        /// Add tools to the current agent run (progressive tool exposure); see
+        /// [`LiveToolList::add_tools`]. Errors when this invocation is not bound
+        /// to a live agent run (mirrors upstream's `RuntimeError`).
+        pub fn add_tools(&self, tools: impl IntoIterator<Item = ToolDefinition>) -> Result<()> {
+            self.tools
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Configuration(
+                        "cannot add tools: this FunctionInvocationContext is not bound to a \
+                         live agent run"
+                            .into(),
+                    )
+                })?
+                .add_tools(tools)
+        }
     }
 
-    /// Remove tools from the current agent run by name; see
-    /// [`LiveToolList::remove_tools`]. Errors when this invocation is not
-    /// bound to a live agent run.
-    pub fn remove_tools<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
-        self.tools
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Configuration(
-                    "cannot remove tools: this FunctionInvocationContext is not bound to a \
-                     live agent run"
-                        .into(),
-                )
-            })
-            .map(|t| t.remove_tools(names))
+    experimental! {
+        "experimental-progressive-tools",
+        /// Remove tools from the current agent run by name; see
+        /// [`LiveToolList::remove_tools`]. Errors when this invocation is not
+        /// bound to a live agent run.
+        pub fn remove_tools<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+            self.tools
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Configuration(
+                        "cannot remove tools: this FunctionInvocationContext is not bound to a \
+                         live agent run"
+                            .into(),
+                    )
+                })
+                .map(|t| t.remove_tools(names))
+        }
     }
 }
 

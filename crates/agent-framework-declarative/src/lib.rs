@@ -1,5 +1,9 @@
 //! # agent-framework-declarative
 //!
+//! **Experimental:** everything here needs the
+//! `experimental-declarative-agents` feature; without it the crate is empty.
+//! See `docs/feature-stages.md`.
+//!
 //! Load [`Agent`](agent_framework_core::agent::Agent)s and
 //! [`Workflow`](agent_framework_core::workflow::Workflow)s from declarative
 //! YAML/JSON specifications, mirroring the Microsoft Agent Framework
@@ -31,6 +35,8 @@
 //! ## Example
 //!
 //! ```no_run
+//! # #[cfg(feature = "experimental-declarative-agents")]
+//! # mod example {
 //! use std::sync::Arc;
 //! use agent_framework_core::prelude::*;
 //! use agent_framework_declarative::{ChatClientFactory, DeclarativeLoader};
@@ -58,29 +64,48 @@
 //! println!("{}", response.text());
 //! # Ok(())
 //! # }
+//! # }
 //! ```
 
 #![warn(missing_docs)]
+// Upstream marks declarative agents experimental (Python `DECLARATIVE_AGENTS`),
+// so the whole crate is behind a feature and is empty without it. See
+// docs/feature-stages.md.
+#![cfg(feature = "experimental-declarative-agents")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod agent;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod condition;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod env;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod error;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod loader;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod registry;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub mod workflow;
 
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use agent::{
     AgentSpec, ApprovalModeDetail, ApprovalModeSpec, ConnectionSpec, ModelOptions, ModelSpec,
     PropertySchema, PropertySpec, ToolSpec,
 };
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use env::{EnvSource, ProcessEnv};
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use error::{DeclarativeError, Result};
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use loader::DeclarativeLoader;
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use registry::{
     AgentRegistry, ChatClientFactory, ClientFactoryResult, FactoryError, PredicateRegistry,
     ToolRegistry,
 };
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-declarative-agents")))]
 pub use workflow::{
     CaseSpec, EdgeSpec, FanInSpec, FanOutSpec, HandoffEdgeSpec, NodeSpec, OrchestrationType,
     SwitchSpec, WorkflowSpec,

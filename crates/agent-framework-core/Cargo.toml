@@ -42,6 +42,18 @@ tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 
 [features]
+# Experimental surfaces: APIs upstream still marks experimental, gated so the
+# stable surface carries no semver promise for them. Each mirrors a Python
+# `ExperimentalFeature` id; see docs/feature-stages.md. Never on by default.
+#
+# VECTOR_STORES: the `vectors` module (stores, collections, filters, the
+# vector-collection tools provider).
+experimental-vector-stores = []
+# FILE_HISTORY: `history::FileHistoryProvider`.
+experimental-file-history = []
+# PROGRESSIVE_TOOLS: `middleware::LiveToolList` and adding or removing tools
+# from inside a run via `FunctionInvocationContext`.
+experimental-progressive-tools = []
 # Enables the three GenAI histograms on `ObservableChatClient` and the
 # function-invocation loop via the `opentelemetry` API crate. Purely additive:
 # default behavior/build is unaffected when this is off, and the instruments
@@ -58,3 +70,10 @@ otel-export = [
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }

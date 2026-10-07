@@ -61,6 +61,7 @@ pub const DEFAULT_API_VERSION: &str = "2018-12-31";
 /// Public so a caller pinning a validated version can see what they are
 /// moving away from; override with
 /// [`CosmosVectorStore::with_api_version`](crate::CosmosVectorStore::with_api_version).
+#[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
 pub const DEFAULT_VECTOR_API_VERSION: &str = "2020-07-15";
 
 /// Partition key path used for every container this crate creates —
@@ -277,6 +278,7 @@ impl CosmosRestClient {
     /// The default is right for the item/query surface the history and
     /// checkpoint stores use; the vector surface needs a newer one (see
     /// [`DEFAULT_VECTOR_API_VERSION`]).
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) fn with_api_version(mut self, api_version: impl Into<String>) -> Self {
         self.api_version = api_version.into();
         self
@@ -418,6 +420,7 @@ impl CosmosRestClient {
     /// rejects one that changes the vector policy, so the policy has to be
     /// right at creation. Tolerates `409 Conflict` as success, same as the
     /// plain form.
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) async fn create_container_with_body(
         &self,
         database_id: &str,
@@ -461,6 +464,7 @@ impl CosmosRestClient {
     /// (partition key, indexing policy, vector embedding policy). `Ok(None)`
     /// on `404`, so "does it exist" and "what is it" are one round trip
     /// rather than two.
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) async fn read_container(
         &self,
         database_id: &str,
@@ -499,6 +503,7 @@ impl CosmosRestClient {
 
     /// `DELETE /dbs/{db}/colls/{coll}`. `404 Not Found` (already gone) is
     /// treated as success, mirroring [`Self::delete_document`].
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) async fn delete_container(
         &self,
         database_id: &str,
@@ -527,6 +532,7 @@ impl CosmosRestClient {
 
     /// `GET /dbs/{db}/colls` — every container id in the database, following
     /// `x-ms-continuation` until exhausted.
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) async fn list_container_ids(&self, database_id: &str) -> Result<Vec<String>> {
         let resource_link = db_link(database_id);
         let url_path = format!("{resource_link}/colls");

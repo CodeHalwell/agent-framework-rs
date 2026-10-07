@@ -56,16 +56,24 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 mod auth;
 mod chat_message_store;
 mod checkpoint_storage;
 mod client;
 mod dates;
+#[cfg(feature = "experimental-vector-stores")]
 mod vector_store;
 
 pub use chat_message_store::{CosmosChatMessageStore, DEFAULT_PARTITION_KEY_PATH};
 pub use checkpoint_storage::{
     CosmosCheckpointStorage, DEFAULT_PARTITION_KEY_PATH as DEFAULT_CHECKPOINT_PARTITION_KEY_PATH,
 };
-pub use client::{DEFAULT_API_VERSION, DEFAULT_VECTOR_API_VERSION};
+pub use client::DEFAULT_API_VERSION;
+#[cfg(feature = "experimental-vector-stores")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
+pub use client::DEFAULT_VECTOR_API_VERSION;
+#[cfg(feature = "experimental-vector-stores")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
 pub use vector_store::{CosmosVectorCollection, CosmosVectorStore, VECTOR_PARTITION_KEY_PATH};

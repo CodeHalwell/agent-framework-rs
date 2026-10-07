@@ -11,6 +11,11 @@ categories.workspace = true
 readme.workspace = true
 description = "Declarative agents and workflows loaded from YAML/JSON specs"
 
+[features]
+# DECLARATIVE_AGENTS (experimental upstream): the whole crate. Without this
+# feature the crate is empty. See docs/feature-stages.md.
+experimental-declarative-agents = []
+
 [dependencies]
 agent-framework-core = { workspace = true }
 serde = { workspace = true }
@@ -23,3 +28,30 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+
+[[test]]
+name = "agent_specs"
+required-features = ["experimental-declarative-agents"]
+
+[[test]]
+name = "conditions"
+required-features = ["experimental-declarative-agents"]
+
+[[test]]
+name = "env_interpolation"
+required-features = ["experimental-declarative-agents"]
+
+[[test]]
+name = "roundtrip"
+required-features = ["experimental-declarative-agents"]
+
+[[test]]
+name = "workflows"
+required-features = ["experimental-declarative-agents"]

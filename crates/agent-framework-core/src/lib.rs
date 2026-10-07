@@ -27,6 +27,15 @@
 //!   and precedence-based setting resolution.
 //! - [`workflow`] — graph-based multi-agent workflow orchestration.
 //!
+//! ## Experimental features
+//!
+//! APIs that upstream still marks experimental sit behind `experimental-*`
+//! cargo features and carry no semver promise: `experimental-vector-stores`
+//! (the `vectors` module), `experimental-file-history`
+//! (`history::FileHistoryProvider`) and `experimental-progressive-tools`
+//! (`middleware::LiveToolList`). See `docs/feature-stages.md` in the
+//! repository.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -43,6 +52,25 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// Declares an item `pub` when its experimental cargo feature is on and
+/// `pub(crate)` otherwise, for items the crate uses internally either way.
+/// Items nothing else uses are gated with a plain `#[cfg(feature = ...)]`.
+macro_rules! experimental {
+    ($feature:literal, $(#[$meta:meta])* pub $($item:tt)*) => {
+        #[cfg(feature = $feature)]
+        #[cfg_attr(docsrs, doc(cfg(feature = $feature)))]
+        $(#[$meta])*
+        pub $($item)*
+
+        #[cfg(not(feature = $feature))]
+        #[allow(dead_code)]
+        $(#[$meta])*
+        pub(crate) $($item)*
+    };
+}
+
 pub mod agent;
 pub mod client;
 pub mod compaction;
@@ -58,6 +86,8 @@ pub mod storage_keys;
 pub mod streaming;
 pub mod tools;
 pub mod types;
+#[cfg(feature = "experimental-vector-stores")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
 pub mod vectors;
 pub mod workflow;
 
@@ -78,11 +108,14 @@ pub mod prelude {
         SlidingWindow, TokenBudget, Tokenizer, Truncation,
     };
     pub use crate::error::{Error, Result};
-    pub use crate::history::{FileHistoryProvider, HistoryProvider, InMemoryHistoryProvider};
+    #[cfg(feature = "experimental-file-history")]
+    pub use crate::history::FileHistoryProvider;
+    pub use crate::history::{HistoryProvider, InMemoryHistoryProvider};
     pub use crate::memory::{ContextProvider, SessionContext};
+    #[cfg(feature = "experimental-progressive-tools")]
+    pub use crate::middleware::LiveToolList;
     pub use crate::middleware::{
-        AgentContext, ChatContext, FunctionInvocationContext, LiveToolList, Middleware,
-        MiddlewarePipeline, Next,
+        AgentContext, ChatContext, FunctionInvocationContext, Middleware, MiddlewarePipeline, Next,
     };
     pub use crate::observability::{ObservabilityConfig, ObservableChatClient};
     pub use crate::session::{AgentSession, SessionState};

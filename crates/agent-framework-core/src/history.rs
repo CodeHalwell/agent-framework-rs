@@ -14,6 +14,7 @@
 //! provider, so local multi-turn conversations keep accumulating history the
 //! way the old `AgentThread` message store used to.
 
+#[cfg(feature = "experimental-file-history")]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -474,6 +475,8 @@ impl ContextProvider for InMemoryHistoryProvider {
 
 impl HistoryProvider for InMemoryHistoryProvider {}
 
+#[cfg(feature = "experimental-file-history")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-file-history")))]
 /// A [`HistoryProvider`] that persists to a JSON file on disk, loading any
 /// existing history from `path` on construction and rewriting the whole file
 /// after every successful run.
@@ -496,6 +499,7 @@ pub struct FileHistoryProvider {
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+#[cfg(feature = "experimental-file-history")]
 impl FileHistoryProvider {
     /// Open (or create) a file-backed history provider at `path`. A missing
     /// or empty file starts with no history; an existing file is parsed
@@ -593,6 +597,7 @@ impl FileHistoryProvider {
 }
 
 #[async_trait]
+#[cfg(feature = "experimental-file-history")]
 impl ContextProvider for FileHistoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let stored = self.messages.lock().unwrap().clone();
@@ -639,6 +644,7 @@ impl ContextProvider for FileHistoryProvider {
     }
 }
 
+#[cfg(feature = "experimental-file-history")]
 impl HistoryProvider for FileHistoryProvider {}
 
 #[cfg(test)]
@@ -723,6 +729,7 @@ mod tests {
         assert!(service.context_providers.is_empty());
     }
 
+    #[cfg(feature = "experimental-file-history")]
     #[tokio::test]
     async fn file_history_provider_persists_and_reloads() {
         let dir = std::env::temp_dir().join(format!("afr-history-test-{}", uuid::Uuid::new_v4()));
@@ -748,6 +755,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "experimental-file-history")]
     #[tokio::test]
     async fn file_history_provider_concurrent_runs_do_not_lose_messages() {
         // Regression for the snapshot/overwrite race: many concurrent
@@ -1292,6 +1300,7 @@ mod tests {
         assert_eq!(provider.list_messages().len(), 6);
     }
 
+    #[cfg(feature = "experimental-file-history")]
     #[tokio::test]
     async fn file_history_provider_does_not_duplicate_a_replayed_transcript() {
         let dir = std::env::temp_dir().join(format!("afr-history-dedup-{}", uuid::Uuid::new_v4()));

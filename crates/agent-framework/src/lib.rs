@@ -19,7 +19,7 @@
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
-//! | `declarative` | [`agent_framework_declarative`] — YAML/JSON agents & workflows | no |
+//! | `experimental-declarative-agents` | [`agent_framework_declarative`] — YAML/JSON agents & workflows (experimental) | no |
 //! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, OpenAI-compatible) | no |
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
@@ -29,7 +29,11 @@
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
 //!
-//! `full` enables everything.
+//! `full` enables every stable integration above. APIs upstream still marks
+//! experimental sit behind `experimental-*` features with no semver promise:
+//! `experimental-vector-stores`, `experimental-file-history`,
+//! `experimental-progressive-tools` and `experimental-declarative-agents`.
+//! `experimental` turns them all on.
 //!
 //! ```no_run
 //! use agent_framework::prelude::*;
@@ -95,8 +99,8 @@ pub use agent_framework_mcp as mcp;
 #[cfg(feature = "a2a")]
 pub use agent_framework_a2a as a2a;
 
-/// Declarative YAML/JSON agents and workflows (enable the `declarative` feature).
-#[cfg(feature = "declarative")]
+/// Declarative YAML/JSON agents and workflows (enable the `experimental-declarative-agents` feature).
+#[cfg(feature = "experimental-declarative-agents")]
 pub use agent_framework_declarative as declarative;
 
 /// HTTP hosting: DevUI-style, A2A, and OpenAI-compatible serving (enable the `hosting` feature).
@@ -177,7 +181,7 @@ pub mod prelude {
     #[cfg(feature = "a2a")]
     pub use agent_framework_a2a::{A2AAgent, A2AClient};
 
-    #[cfg(feature = "declarative")]
+    #[cfg(feature = "experimental-declarative-agents")]
     pub use agent_framework_declarative::DeclarativeLoader;
 
     #[cfg(feature = "hosting")]
@@ -193,9 +197,11 @@ pub mod prelude {
     pub use agent_framework_foundry::{FoundryAgent, FoundryChatClient, FoundryEmbeddingClient};
 
     #[cfg(feature = "azure-ai-search")]
-    pub use agent_framework_azure_ai_search::{
-        AzureAISearchCollection, AzureAISearchProvider, AzureAISearchStore,
-    };
+    pub use agent_framework_azure_ai_search::AzureAISearchProvider;
+
+    // The vector store is experimental in the crate itself.
+    #[cfg(all(feature = "azure-ai-search", feature = "experimental-vector-stores"))]
+    pub use agent_framework_azure_ai_search::{AzureAISearchCollection, AzureAISearchStore};
 
     #[cfg(feature = "cosmos")]
     pub use agent_framework_cosmos::CosmosChatMessageStore;
