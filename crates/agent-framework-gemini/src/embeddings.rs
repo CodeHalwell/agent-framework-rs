@@ -56,23 +56,29 @@
 //! # }
 //! ```
 //!
-//! # Scope
+//! # Inputs
 //!
-//! Text only. Upstream also accepts `google.genai` `Content`/`Part` values to
-//! embed images and other media, which this port's
-//! [`EmbeddingClient`] trait
-//! cannot express — it takes `Vec<String>`. Widening the trait is a core
-//! change affecting every embedding client, so it is recorded as a gap rather
-//! than forced through a provider-shaped side door.
-
+//! A text input (exactly one text item) is conditioned on the task, as
+//! above, and needs one. Any other [`EmbeddingInput`] is multimodal, as
+//! upstream's `google.genai` `Content`/`Part` inputs are: its items become
+//! the parts of one Gemini `Content` and are embedded together. Images and
+//! other media go in as [`Content::Data`] (sent inline) or [`Content::Uri`]
+//! (sent as `fileData`), and text items in a multimodal input are sent as
+//! they are, without a task prefix. A multimodal input needs at least one
+//! media item, and a batch with no text input takes no task, matching
+//! upstream.
+//!
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
+use agent_framework_core::types::{
+    Content, Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings,
+};
 use serde_json::{json, Map, Value};
 
+use crate::convert::{base64_data_part, uri_part};
 use crate::{classify_gemini_error, parse_retry_after, API_VERSION, DEFAULT_BASE_URL};
 
 /// The default (and stable) Gemini embedding model.
@@ -309,10 +315,10 @@ impl GeminiEmbeddingClient {
     }
 
     /// Build the `batchEmbedContents` request body, applying the task prefix
-    /// to every value.
+    /// to every text input.
     fn build_body(
         &self,
-        values: &[String],
+        values: &[EmbeddingInput],
         options: Option<&EmbeddingGenerationOptions>,
     ) -> Result<(Value, String)> {
         let empty = HashMap::new();
@@ -332,24 +338,39 @@ impl GeminiEmbeddingClient {
         };
 
         let task = match extras.get(TASK_PROPERTY) {
-            Some(Value::String(name)) => GeminiEmbeddingTask::parse(name).ok_or_else(|| {
-                Error::Configuration(format!("unsupported Gemini embedding task '{name}'"))
-            })?,
+            Some(Value::String(name)) => {
+                Some(GeminiEmbeddingTask::parse(name).ok_or_else(|| {
+                    Error::Configuration(format!("unsupported Gemini embedding task '{name}'"))
+                })?)
+            }
             Some(other) => {
                 return Err(Error::Configuration(format!(
                 "the '{TASK_PROPERTY}' embedding option must be a task name string, found {other}"
             )))
             }
+            None => None,
+        };
+        let has_text = values.iter().any(|v| v.as_text().is_some());
+        let task = match (task, has_text) {
+            (Some(task), true) => Some(task),
             // Refused rather than defaulted: see the module docs. The message
             // names the typed setter, since the key is an implementation
             // detail of it.
-            None => {
+            (None, true) => {
                 return Err(Error::Configuration(format!(
                     "Gemini Embedding 2 conditions a vector on what the text is for, so a task is \
                      required: set one with `EmbeddingGenerationOptions::with_task` (one of {})",
                     SUPPORTED_TASK_NAMES.join(", ")
                 )))
             }
+            // Upstream refuses this too: the task only conditions text, so
+            // setting one for media alone suggests an effect it cannot have.
+            (Some(_), false) => {
+                return Err(Error::Configuration(
+                    "a task only applies to text inputs; omit it when embedding only media".into(),
+                ))
+            }
+            (None, false) => None,
         };
 
         let title = match extras.get(TITLE_PROPERTY) {
@@ -361,12 +382,19 @@ impl GeminiEmbeddingClient {
             }
             None => None,
         };
-        if title.is_some() && task != GeminiEmbeddingTask::RetrievalDocument {
+        if let Some(task) =
+            task.filter(|t| title.is_some() && *t != GeminiEmbeddingTask::RetrievalDocument)
+        {
             return Err(Error::Configuration(format!(
                 "a title only applies when indexing a document, but the task is {}; drop the \
                  title or use GeminiEmbeddingTask::RetrievalDocument",
                 task.as_str()
             )));
+        }
+        if title.is_some() && task.is_none() {
+            return Err(Error::Configuration(
+                "a title only applies when indexing a document, but there is no text input".into(),
+            ));
         }
 
         let dimensions = match options.and_then(|o| o.dimensions) {
@@ -380,23 +408,24 @@ impl GeminiEmbeddingClient {
             other => other,
         };
 
-        let requests: Vec<Value> = values
-            .iter()
-            .map(|text| {
-                let mut req = Map::new();
-                // `batchEmbedContents` requires the model on each entry, in
-                // the resource form.
-                req.insert("model".into(), json!(format!("models/{model}")));
-                req.insert(
-                    "content".into(),
-                    json!({ "parts": [{ "text": task.prepare(text, title) }] }),
-                );
-                if let Some(d) = dimensions {
-                    req.insert("outputDimensionality".into(), json!(d));
+        let mut requests = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let content = match (value.as_text(), task) {
+                (Some(text), Some(task)) => {
+                    json!({ "parts": [{ "text": task.prepare(text, title) }] })
                 }
-                Value::Object(req)
-            })
-            .collect();
+                _ => json!({ "parts": multimodal_parts(value, index)? }),
+            };
+            let mut req = Map::new();
+            // `batchEmbedContents` requires the model on each entry, in
+            // the resource form.
+            req.insert("model".into(), json!(format!("models/{model}")));
+            req.insert("content".into(), content);
+            if let Some(d) = dimensions {
+                req.insert("outputDimensionality".into(), json!(d));
+            }
+            requests.push(Value::Object(req));
+        }
 
         Ok((json!({ "requests": requests }), model))
     }
@@ -485,11 +514,49 @@ pub fn parse_embeddings_response(
     Ok(GeneratedEmbeddings::new(out))
 }
 
+/// The Gemini parts for a multimodal input: text items as they are, media
+/// inline or by URI. At least one media item is required, as upstream
+/// requires; a text-only input goes through the task prefix instead.
+fn multimodal_parts(value: &EmbeddingInput, index: usize) -> Result<Vec<Value>> {
+    let mut parts = Vec::with_capacity(value.contents.len());
+    let mut has_media = false;
+    for content in &value.contents {
+        let part = match content {
+            Content::Text(t) => json!({ "text": t.text }),
+            Content::Data(d) => {
+                has_media = true;
+                base64_data_part(d).ok_or_else(|| {
+                    Error::Content(format!(
+                        "embedding input {index} has a data item that is not a base64 data URI"
+                    ))
+                })?
+            }
+            Content::Uri(u) => {
+                has_media = true;
+                uri_part(u)
+            }
+            _ => {
+                return Err(Error::Content(format!(
+                    "embedding input {index}: Gemini embeds text, data and URI items only"
+                )))
+            }
+        };
+        parts.push(part);
+    }
+    if !has_media {
+        return Err(Error::Content(format!(
+            "embedding input {index} has no media item; pass text as a single text input, which \
+             takes a task"
+        )));
+    }
+    Ok(parts)
+}
+
 #[async_trait::async_trait]
 impl EmbeddingClient for GeminiEmbeddingClient {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
         if values.is_empty() {
@@ -530,7 +597,7 @@ mod tests {
     fn a_document_is_prefixed_with_its_title_or_the_literal_none() {
         let (body, _) = client()
             .build_body(
-                &["chapter 4".to_string()],
+                &["chapter 4".into()],
                 Some(&doc_options().with_title("Ownership")),
             )
             .unwrap();
@@ -540,7 +607,7 @@ mod tests {
         // model is conditioned on the shape, so omitting it is a different
         // prompt rather than a cleaner one.
         let (body, _) = client()
-            .build_body(&["chapter 4".to_string()], Some(&doc_options()))
+            .build_body(&["chapter 4".into()], Some(&doc_options()))
             .unwrap();
         assert_eq!(text_of(&body, 0), "title: none | text: chapter 4");
     }
@@ -564,7 +631,7 @@ mod tests {
         ] {
             let options = EmbeddingGenerationOptions::new().with_task(task);
             let (body, _) = client()
-                .build_body(&["who owns it".to_string()], Some(&options))
+                .build_body(&["who owns it".into()], Some(&options))
                 .unwrap();
             assert_eq!(
                 text_of(&body, 0),
@@ -579,11 +646,11 @@ mod tests {
         // The whole reason the task is required: indexing and searching the
         // same string must not produce the same request.
         let (doc, _) = client()
-            .build_body(&["ownership".to_string()], Some(&doc_options()))
+            .build_body(&["ownership".into()], Some(&doc_options()))
             .unwrap();
         let (query, _) = client()
             .build_body(
-                &["ownership".to_string()],
+                &["ownership".into()],
                 Some(
                     &EmbeddingGenerationOptions::new()
                         .with_task(GeminiEmbeddingTask::RetrievalQuery),
@@ -599,10 +666,7 @@ mod tests {
         // document, and no prefix silently opts out of the conditioning.
         // Both look like success in the response.
         let err = client()
-            .build_body(
-                &["hi".to_string()],
-                Some(&EmbeddingGenerationOptions::new()),
-            )
+            .build_body(&["hi".into()], Some(&EmbeddingGenerationOptions::new()))
             .expect_err("a task is required");
         let msg = err.to_string();
         assert!(msg.contains("a task is required"), "{msg}");
@@ -610,7 +674,7 @@ mod tests {
         assert!(msg.contains("with_task"), "{msg}");
         // Options omitted entirely fails the same way, which is the path a
         // generic `EmbeddingClient` caller takes.
-        assert!(client().build_body(&["hi".to_string()], None).is_err());
+        assert!(client().build_body(&["hi".into()], None).is_err());
     }
 
     #[test]
@@ -621,18 +685,14 @@ mod tests {
         options
             .additional_properties
             .insert("task_type".into(), json!("retrieval_query"));
-        let (body, _) = client()
-            .build_body(&["q".to_string()], Some(&options))
-            .unwrap();
+        let (body, _) = client().build_body(&["q".into()], Some(&options)).unwrap();
         assert_eq!(text_of(&body, 0), "task: search result | query: q");
 
         let mut options = EmbeddingGenerationOptions::new();
         options
             .additional_properties
             .insert("task_type".into(), json!("NOT_A_TASK"));
-        assert!(client()
-            .build_body(&["q".to_string()], Some(&options))
-            .is_err());
+        assert!(client().build_body(&["q".into()], Some(&options)).is_err());
         // A non-string task names what was found rather than falling through
         // to "no task".
         let mut options = EmbeddingGenerationOptions::new();
@@ -640,7 +700,7 @@ mod tests {
             .additional_properties
             .insert("task_type".into(), json!(7));
         let err = client()
-            .build_body(&["q".to_string()], Some(&options))
+            .build_body(&["q".into()], Some(&options))
             .expect_err("a number is not a task");
         assert!(err.to_string().contains("task name string"), "{err}");
     }
@@ -653,7 +713,7 @@ mod tests {
             .with_task(GeminiEmbeddingTask::RetrievalQuery)
             .with_title("Ownership");
         let err = client()
-            .build_body(&["q".to_string()], Some(&options))
+            .build_body(&["q".into()], Some(&options))
             .expect_err("a title needs RETRIEVAL_DOCUMENT");
         assert!(
             err.to_string().contains("only applies when indexing"),
@@ -668,7 +728,7 @@ mod tests {
     #[test]
     fn the_body_carries_one_request_per_value_with_the_resource_model() {
         let (body, model) = client()
-            .build_body(&["a".to_string(), "b".to_string()], Some(&doc_options()))
+            .build_body(&["a".into(), "b".into()], Some(&doc_options()))
             .unwrap();
         assert_eq!(model, DEFAULT_EMBEDDING_MODEL);
         let requests = body["requests"].as_array().unwrap();
@@ -682,12 +742,97 @@ mod tests {
         assert!(requests[0].get("taskType").is_none(), "{body}");
     }
 
+    fn png() -> Content {
+        Content::Data(agent_framework_core::types::DataContent::from_bytes(
+            &[0x89, 0x50, 0x4e, 0x47],
+            "image/png",
+        ))
+    }
+
+    #[test]
+    fn media_inputs_become_parts_and_need_no_task() {
+        let uri = Content::Uri(agent_framework_core::types::UriContent {
+            uri: "gs://bucket/cat.png".into(),
+            media_type: "image/png".into(),
+        });
+        let inputs = [
+            EmbeddingInput::from(png()),
+            EmbeddingInput::new(vec![Content::text("a cat"), uri]),
+        ];
+        let (body, _) = client().build_body(&inputs, None).unwrap();
+        let parts = &body["requests"][0]["content"]["parts"];
+        assert_eq!(parts[0]["inlineData"]["mimeType"], json!("image/png"));
+        assert!(parts[0]["inlineData"]["data"].is_string(), "{body}");
+        // Text in a multimodal input goes as it is, with no task prefix.
+        let parts = &body["requests"][1]["content"]["parts"];
+        assert_eq!(parts[0], json!({ "text": "a cat" }));
+        assert_eq!(
+            parts[1]["fileData"]["fileUri"],
+            json!("gs://bucket/cat.png")
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_prefixes_only_its_text_inputs() {
+        let inputs = ["q".into(), EmbeddingInput::from(png())];
+        let (body, _) = client().build_body(&inputs, Some(&doc_options())).unwrap();
+        assert_eq!(text_of(&body, 0), "title: none | text: q");
+        assert!(body["requests"][1]["content"]["parts"][0]["inlineData"].is_object());
+    }
+
+    #[test]
+    fn a_data_uri_without_the_base64_marker_is_refused() {
+        let raw = Content::Data(agent_framework_core::types::DataContent {
+            uri: "data:image/png,raw".into(),
+            media_type: Some("image/png".into()),
+        });
+        let err = client()
+            .build_body(&[EmbeddingInput::from(raw)], None)
+            .expect_err("Gemini needs base64 inline data");
+        assert!(err.to_string().contains("not a base64 data URI"), "{err}");
+
+        // The marker is a parameter, so parameters before it are fine.
+        let with_param = Content::Data(agent_framework_core::types::DataContent {
+            uri: "data:image/png;name=a.png;base64,iVBO".into(),
+            media_type: None,
+        });
+        let (body, _) = client()
+            .build_body(&[EmbeddingInput::from(with_param)], None)
+            .unwrap();
+        assert_eq!(
+            body["requests"][0]["content"]["parts"][0]["inlineData"]["data"],
+            json!("iVBO")
+        );
+    }
+
+    #[test]
+    fn media_only_batches_refuse_a_task_and_media_free_multimodal_inputs_are_refused() {
+        let err = client()
+            .build_body(&[EmbeddingInput::from(png())], Some(&doc_options()))
+            .expect_err("a task needs a text input");
+        assert!(err.to_string().contains("only applies to text"), "{err}");
+
+        let two_texts = EmbeddingInput::new(vec![Content::text("a"), Content::text("b")]);
+        let err = client()
+            .build_body(&[two_texts], None)
+            .expect_err("no media item");
+        assert!(err.to_string().contains("input 0 has no media"), "{err}");
+
+        let call = Content::FunctionCall(agent_framework_core::types::FunctionCallContent::new(
+            "id", "f", None,
+        ));
+        let err = client()
+            .build_body(&[EmbeddingInput::new(vec![png(), call])], None)
+            .expect_err("a function call cannot be embedded");
+        assert!(err.to_string().contains("text, data and URI"), "{err}");
+    }
+
     #[test]
     fn dimensions_are_sent_per_request_and_zero_is_refused() {
         let options = doc_options();
         let (body, _) = client()
             .build_body(
-                &["a".to_string()],
+                &["a".into()],
                 Some(&EmbeddingGenerationOptions {
                     dimensions: Some(768),
                     ..options.clone()
@@ -697,15 +842,13 @@ mod tests {
         assert_eq!(body["requests"][0]["outputDimensionality"], json!(768));
 
         // Omitted when unset, so the model's native width is used.
-        let (body, _) = client()
-            .build_body(&["a".to_string()], Some(&options))
-            .unwrap();
+        let (body, _) = client().build_body(&["a".into()], Some(&options)).unwrap();
         assert!(body["requests"][0].get("outputDimensionality").is_none());
 
         // Zero type-checks but the service rejects it; named here instead.
         let err = client()
             .build_body(
-                &["a".to_string()],
+                &["a".into()],
                 Some(&EmbeddingGenerationOptions {
                     dimensions: Some(0),
                     ..options
@@ -731,18 +874,14 @@ mod tests {
             model: Some("gemini-embedding-001".into()),
             ..doc_options()
         };
-        assert!(client()
-            .build_body(&["a".to_string()], Some(&options))
-            .is_err());
+        assert!(client().build_body(&["a".into()], Some(&options)).is_err());
         // A supported per-call override is honoured, and reported back so the
         // response is attributed to the model that produced it.
         let options = EmbeddingGenerationOptions {
             model: Some("gemini-embedding-2-preview".into()),
             ..doc_options()
         };
-        let (body, model) = client()
-            .build_body(&["a".to_string()], Some(&options))
-            .unwrap();
+        let (body, model) = client().build_body(&["a".into()], Some(&options)).unwrap();
         assert_eq!(model, "gemini-embedding-2-preview");
         assert_eq!(
             body["requests"][0]["model"],

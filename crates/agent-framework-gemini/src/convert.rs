@@ -288,13 +288,29 @@ fn function_response_value(fr: &FunctionResultContent) -> Value {
 /// URI, without needing a base64 encoder: [`DataContent::uri`] is already
 /// base64 text after the `base64,` marker (per `DataContent::from_bytes` in
 /// `agent-framework-core`), so it is just sliced out.
-fn data_part(dc: &DataContent) -> Option<Value> {
+pub(crate) fn data_part(dc: &DataContent) -> Option<Value> {
     let (parsed_media_type, data) = split_data_uri(&dc.uri)?;
     let media_type = dc.media_type.clone().unwrap_or(parsed_media_type);
     Some(json!({ "inlineData": { "mimeType": media_type, "data": data } }))
 }
 
-fn uri_part(uc: &UriContent) -> Value {
+/// [`data_part`] for callers that must refuse anything Gemini would not
+/// accept as `inlineData`: the URI has to carry the `;base64` marker, since
+/// Gemini requires base64 data. The chat path keeps the looser
+/// [`data_part`] so its existing behaviour is unchanged.
+pub(crate) fn base64_data_part(dc: &DataContent) -> Option<Value> {
+    let meta = dc.uri.strip_prefix("data:")?.split_once(',')?.0;
+    if !meta
+        .split(';')
+        .skip(1)
+        .any(|p| p.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    data_part(dc)
+}
+
+pub(crate) fn uri_part(uc: &UriContent) -> Value {
     json!({ "fileData": { "mimeType": uc.media_type, "fileUri": uc.uri } })
 }
 

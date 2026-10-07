@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{EmbeddingGenerationOptions, GeneratedEmbeddings};
+use agent_framework_core::types::{
+    EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings,
+};
 use serde_json::{json, Map, Value};
 
 use crate::{base_url_from_host, DEFAULT_BASE_URL, OLLAMA_HOST_ENV};
@@ -88,9 +90,10 @@ impl OllamaEmbeddingClient {
 impl EmbeddingClient for OllamaEmbeddingClient {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
+        let values = EmbeddingInput::into_texts(values, "Ollama")?;
         let mut body = Map::new();
         let model = options
             .as_ref()

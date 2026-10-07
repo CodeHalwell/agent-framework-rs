@@ -14,7 +14,7 @@ use base64::Engine as _;
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{
-    Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings, UsageDetails,
+    Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -227,9 +227,10 @@ pub fn parse_embeddings_response(value: &Value) -> Result<GeneratedEmbeddings> {
 impl EmbeddingClient for OpenAIEmbeddingClient {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
+        let values = EmbeddingInput::into_texts(values, "OpenAI")?;
         let body = self.build_body(&values, options.as_ref());
         let url = format!("{}/embeddings", self.inner.base_url.trim_end_matches('/'));
         let mut req = self

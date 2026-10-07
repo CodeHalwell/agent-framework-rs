@@ -22,14 +22,14 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 async fn main() -> Result<()> {
     let client = OpenAIEmbeddingClient::from_env("text-embedding-3-small")?;
 
-    let inputs = vec![
-        "The cat sat on the mat.".to_string(),
-        "A feline rested on the rug.".to_string(),
-        "Quarterly revenue grew by 12%.".to_string(),
+    let inputs = [
+        "The cat sat on the mat.",
+        "A feline rested on the rug.",
+        "Quarterly revenue grew by 12%.",
     ];
     let batch = client
         .get_embeddings(
-            inputs.clone(),
+            inputs.into_iter().map(Into::into).collect(),
             // Shortened vectors: text-embedding-3-* supports requesting a
             // lower dimensionality.
             Some(EmbeddingGenerationOptions::new().with_dimensions(256)),

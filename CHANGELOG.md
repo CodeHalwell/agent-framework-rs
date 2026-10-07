@@ -7,6 +7,27 @@ may break APIs).
 
 ## [Unreleased]
 
+### Multimodal embedding inputs (breaking)
+
+`EmbeddingClient::get_embeddings` takes `Vec<EmbeddingInput>` instead of
+`Vec<String>`, matching upstream's generic `EmbeddingInputT`. An
+`EmbeddingInput` is one or more `Content` items embedded into a single
+vector. Strings convert with `.into()`, so most callers change
+`vec![text.to_string()]` to `vec![text.into()]`, and a custom
+`EmbeddingClient` can call `EmbeddingInput::into_texts` to keep handling text
+only.
+
+- **Gemini** embeds images and other media (`Content::Data` inline,
+  `Content::Uri` as `fileData`), alone or with text parts, as upstream does.
+  A task is needed only when the batch has a text input.
+- **Foundry** embeds images through the Models inference endpoint's
+  `/images/embeddings` route, with an optional caption. A mixed batch is split
+  across both routes and reassembled in input order. Set the image model with
+  `with_image_model`, `FOUNDRY_IMAGE_EMBEDDING_MODEL` or the `image_model`
+  option; it falls back to the text model.
+- OpenAI, Azure OpenAI, Bedrock, Mistral and Ollama embed text only, as
+  upstream does, and return an error naming the first non-text input.
+
 ### Feature stages (breaking)
 
 APIs that upstream still marks experimental now sit behind `experimental-*`

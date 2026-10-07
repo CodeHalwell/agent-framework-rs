@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
         ("n3", "Our launch date is March 14th.", "other"),
     ];
     let embeddings = embedder
-        .get_embeddings(seed.iter().map(|(_, t, _)| t.to_string()).collect(), None)
+        .get_embeddings(seed.iter().map(|(_, t, _)| (*t).into()).collect(), None)
         .await?;
     collection
         .upsert(

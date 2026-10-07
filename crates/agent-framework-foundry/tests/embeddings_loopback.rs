@@ -7,12 +7,14 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use agent_framework_azure::StaticTokenCredential;
 use agent_framework_core::client::EmbeddingClient;
-use agent_framework_core::types::EmbeddingGenerationOptions;
+use agent_framework_core::types::{
+    Content, DataContent, EmbeddingGenerationOptions, EmbeddingInput,
+};
 use agent_framework_foundry::FoundryEmbeddingClient;
 
 /// One recorded request: its start-line, headers (lowercased names), body.
@@ -31,54 +33,81 @@ fn one_shot_server(status: u16, body: &'static str) -> (String, Arc<Mutex<Option
     let seen_writer = seen.clone();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let (mut header_end, mut content_length) = (None, 0usize);
-        loop {
-            let n = stream.read(&mut chunk).expect("read request");
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if header_end.is_none() {
-                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    header_end = Some(pos);
-                    let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
-                    content_length = headers
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                }
-            }
-            if let Some(pos) = header_end {
-                if buf.len() >= pos + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        let raw = String::from_utf8_lossy(&buf).to_string();
-        let (head, req_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
-        let mut lines = head.lines();
-        let start_line = lines.next().unwrap_or_default().to_string();
-        let headers = lines
-            .filter_map(|l| l.split_once(':'))
-            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-            .collect();
-        *seen_writer.lock().unwrap() = Some(Recorded {
-            start_line,
-            headers,
-            body: req_body.to_string(),
+        serve_one(&mut stream, status, body, |recorded| {
+            *seen_writer.lock().unwrap() = Some(recorded);
         });
-
-        let reason = if status == 200 { "OK" } else { "ERR" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len(),
-        );
-        stream.write_all(response.as_bytes()).expect("write");
     });
     (format!("http://{addr}"), seen)
+}
+
+/// Serve one 200 response per entry of `bodies`, in order, recording each
+/// request.
+fn sequential_server(bodies: Vec<&'static str>) -> (String, Arc<Mutex<Vec<Recorded>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_writer = seen.clone();
+    std::thread::spawn(move || {
+        for body in bodies {
+            let (mut stream, _) = listener.accept().expect("accept");
+            serve_one(&mut stream, 200, body, |recorded| {
+                seen_writer.lock().unwrap().push(recorded);
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+/// Read one request from `stream`, hand it to `record`, then answer it with
+/// `(status, body)`. Recording comes first so a test that reads what was
+/// asked as soon as its call returns never races the server.
+fn serve_one(stream: &mut TcpStream, status: u16, body: &str, record: impl FnOnce(Recorded)) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let (mut header_end, mut content_length) = (None, 0usize);
+    loop {
+        let n = stream.read(&mut chunk).expect("read request");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos);
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                content_length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        if let Some(pos) = header_end {
+            if buf.len() >= pos + 4 + content_length {
+                break;
+            }
+        }
+    }
+    let raw = String::from_utf8_lossy(&buf).to_string();
+    let (head, req_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let mut lines = head.lines();
+    let start_line = lines.next().unwrap_or_default().to_string();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    record(Recorded {
+        start_line,
+        headers,
+        body: req_body.to_string(),
+    });
+
+    let reason = if status == 200 { "OK" } else { "ERR" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).expect("write");
 }
 
 /// Two vectors returned out of order, each tagged with its input `index` —
@@ -90,6 +119,14 @@ const OUT_OF_ORDER_BODY: &str = r#"{
   ],
   "model": "text-embedding-3-small",
   "usage": {"prompt_tokens": 7, "total_tokens": 7}
+}"#;
+
+/// One vector for a one-input request: the client refuses a response that
+/// does not hold exactly one vector per input.
+const ONE_VECTOR_BODY: &str = r#"{
+  "data": [{"index": 0, "embedding": [1.0, 1.5]}],
+  "model": "text-embedding-3-small",
+  "usage": {"prompt_tokens": 3, "total_tokens": 3}
 }"#;
 
 #[tokio::test]
@@ -142,7 +179,7 @@ async fn posts_to_the_models_embeddings_route_with_the_api_key_header() {
 
 #[tokio::test]
 async fn a_token_credential_authenticates_with_a_bearer_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = Arc::new(StaticTokenCredential::new("entra-token"));
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -193,7 +230,7 @@ impl agent_framework_azure::TokenCredential for RecordingCredential {
 /// rather than falling through to the credential's own default.
 #[tokio::test]
 async fn the_credential_is_asked_for_the_models_inference_scope() {
-    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = RecordingCredential::default();
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -216,7 +253,7 @@ async fn the_credential_is_asked_for_the_models_inference_scope() {
 
 #[tokio::test]
 async fn an_overridden_scope_reaches_the_credential() {
-    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = RecordingCredential::default();
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -260,7 +297,7 @@ async fn a_response_without_a_model_falls_back_to_the_requested_one() {
 
 #[tokio::test]
 async fn an_overridden_api_version_reaches_the_query_string() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k")
         .with_api_version("2099-01-01");
 
@@ -283,7 +320,7 @@ async fn an_overridden_api_version_reaches_the_query_string() {
 /// header would turn a call that works upstream into a 4xx.
 #[tokio::test]
 async fn expanded_extras_carry_the_pass_through_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
 
     let mut options = EmbeddingGenerationOptions::new();
@@ -308,7 +345,7 @@ async fn expanded_extras_carry_the_pass_through_header() {
 
 #[tokio::test]
 async fn no_extras_means_no_pass_through_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
 
     client
@@ -349,4 +386,157 @@ async fn empty_input_short_circuits_without_a_request() {
     let batch = client.get_embeddings(Vec::new(), None).await.expect("ok");
     assert!(batch.embeddings.is_empty());
     assert!(batch.usage.is_none());
+}
+
+#[tokio::test]
+async fn a_mixed_batch_splits_across_both_routes_and_keeps_input_order() {
+    let text_body = r#"{
+      "data": [
+        {"index": 0, "embedding": [1.0, 1.0]},
+        {"index": 1, "embedding": [3.0, 3.0]}
+      ],
+      "usage": {"prompt_tokens": 4, "total_tokens": 4}
+    }"#;
+    let image_body = r#"{
+      "data": [{"index": 0, "embedding": [2.0, 2.0]}],
+      "model": "Cohere-embed-v3-english",
+      "usage": {"prompt_tokens": 1000, "total_tokens": 1000}
+    }"#;
+    let (endpoint, seen) = sequential_server(vec![text_body, image_body]);
+    let client = FoundryEmbeddingClient::new(
+        format!("{endpoint}/models"),
+        "text-embedding-3-small",
+        "secret-key",
+    )
+    .with_image_model("Cohere-embed-v3-english");
+
+    let image = Content::Data(DataContent::from_bytes(&[0x89, 0x50], "image/png"));
+    let batch = client
+        .get_embeddings(
+            vec![
+                "first".into(),
+                EmbeddingInput::new(vec![image, Content::text("a caption")]),
+                "third".into(),
+            ],
+            None,
+        )
+        .await
+        .expect("embeddings");
+
+    let vectors: Vec<_> = batch.iter().map(|e| e.vector.clone()).collect();
+    assert_eq!(
+        vectors,
+        vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]]
+    );
+    assert_eq!(batch[0].model.as_deref(), Some("text-embedding-3-small"));
+    assert_eq!(batch[1].model.as_deref(), Some("Cohere-embed-v3-english"));
+    assert_eq!(batch.usage.as_ref().unwrap().input_token_count, Some(1004));
+
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .start_line
+            .starts_with("POST /models/embeddings?"),
+        "{}",
+        requests[0].start_line
+    );
+    let text: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(text["input"], serde_json::json!(["first", "third"]));
+    assert!(
+        requests[1]
+            .start_line
+            .starts_with("POST /models/images/embeddings?"),
+        "{}",
+        requests[1].start_line
+    );
+    let images: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert_eq!(
+        images["model"],
+        serde_json::json!("Cohere-embed-v3-english")
+    );
+    assert_eq!(images["input"][0]["text"], serde_json::json!("a caption"));
+    assert!(images["input"][0]["image"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+}
+
+#[tokio::test]
+async fn image_inputs_are_refused_on_a_project_endpoint_and_non_images_anywhere() {
+    let project = FoundryEmbeddingClient::with_project_endpoint(
+        "https://res.services.ai.azure.com/api/projects/p",
+        "text-embedding-3-small",
+        Arc::new(StaticTokenCredential::new("t")),
+    )
+    .unwrap();
+    let image = Content::Data(DataContent::from_bytes(&[1], "image/png"));
+    let err = project
+        .get_embeddings(vec![image.into()], None)
+        .await
+        .expect_err("no image route on a project");
+    assert!(
+        err.to_string().contains("Models inference endpoint"),
+        "{err}"
+    );
+
+    let models = FoundryEmbeddingClient::new("http://127.0.0.1:9/models", "m", "k");
+    let audio = Content::Data(DataContent::from_bytes(&[1], "audio/wav"));
+    let err = models
+        .get_embeddings(vec!["ok".into(), audio.into()], None)
+        .await
+        .expect_err("audio is not embeddable here");
+    assert!(err.to_string().contains("input 1"), "{err}");
+}
+
+#[tokio::test]
+async fn an_image_with_no_uri_is_refused_before_any_request() {
+    // Nothing is listening on port 9, so a request would fail differently.
+    let models = FoundryEmbeddingClient::new("http://127.0.0.1:9/models", "m", "k");
+    let empty = Content::Uri(agent_framework_core::types::UriContent {
+        uri: String::new(),
+        media_type: "image/png".into(),
+    });
+    let err = models
+        .get_embeddings(vec!["ok".into(), empty.into()], None)
+        .await
+        .expect_err("an image needs a URI");
+    assert!(
+        matches!(err, agent_framework_core::error::Error::Content(_)),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("input 1 is an image with no URI"),
+        "{err}"
+    );
+}
+
+/// Every route, not only the mixed one, must return one vector per input: a
+/// short or padded single-route batch would misalign the caller's data.
+#[tokio::test]
+async fn a_single_route_batch_with_the_wrong_vector_count_errors() {
+    // Text only: two vectors for one input.
+    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+    let err = client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect_err("padded text batch");
+    assert!(
+        err.to_string().contains("2 embeddings for 1 inputs"),
+        "{err}"
+    );
+
+    // Images only: one vector for two inputs.
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+    let image = || Content::Data(DataContent::from_bytes(&[0x89, 0x50], "image/png"));
+    let err = client
+        .get_embeddings(vec![image().into(), image().into()], None)
+        .await
+        .expect_err("short image batch");
+    assert!(
+        err.to_string().contains("1 embeddings for 2 inputs"),
+        "{err}"
+    );
 }

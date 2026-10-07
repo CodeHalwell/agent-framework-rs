@@ -41,13 +41,10 @@ async fn main() -> Result<()> {
     }
 
     let client = FoundryEmbeddingClient::from_env(None)?;
-    let inputs = vec![
-        "The cat sat on the mat.".to_string(),
-        "Quarterly revenue grew by 12%.".to_string(),
-    ];
+    let inputs = ["The cat sat on the mat.", "Quarterly revenue grew by 12%."];
     let batch = client
         .get_embeddings(
-            inputs.clone(),
+            inputs.into_iter().map(Into::into).collect(),
             Some(EmbeddingGenerationOptions::new().with_dimensions(256)),
         )
         .await?;

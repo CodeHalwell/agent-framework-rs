@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{
-    Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings, UsageDetails,
+    Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -307,9 +307,10 @@ impl BedrockEmbeddingClient {
 impl EmbeddingClient for BedrockEmbeddingClient {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
+        let values = EmbeddingInput::into_texts(values, "Bedrock")?;
         // Upstream returns an empty batch without calling the service.
         if values.is_empty() {
             return Ok(GeneratedEmbeddings::new(Vec::new()));
