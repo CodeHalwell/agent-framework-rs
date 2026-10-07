@@ -1247,6 +1247,133 @@ async fn a_settled_approval_in_history_does_not_rerun_the_tool_when_streaming() 
     let _ = &mut thread;
 }
 
+#[tokio::test]
+async fn a_settled_approval_in_history_does_not_rerun_the_tool_after_compaction() {
+    // Regression: compaction ran before settlement was decided. A window of
+    // three keeps the approval response, its result and the final answer;
+    // the orphan repair then drops the result (its call fell outside the
+    // window), and the old approval looked pending again.
+    let counter = Arc::new(Mutex::new(0));
+    let client = MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+        ChatResponse::from_text("You're welcome."),
+    ]);
+    let seen = client.seen.clone();
+    let agent = Agent::builder(client)
+        .tool(approval_tool(counter.clone()))
+        .with_compaction(SlidingWindow::new(3))
+        .build();
+    let mut thread = AgentSession::new();
+    thread
+        .context_providers
+        .push(Arc::new(InMemoryHistoryProvider::new()));
+
+    let resp1 = agent
+        .run(vec![Message::user("get the secret")], Some(&mut thread))
+        .await
+        .unwrap();
+    let approval = resp1.user_input_requests()[0].create_response(true);
+    agent
+        .run(
+            vec![Message::with_contents(
+                Role::user(),
+                vec![Content::FunctionApprovalResponse(approval)],
+            )],
+            Some(&mut thread),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*counter.lock().unwrap(), 1);
+
+    let resp3 = agent
+        .run(vec![Message::user("thanks")], Some(&mut thread))
+        .await
+        .unwrap();
+    assert!(resp3.text().contains("welcome"), "got: {}", resp3.text());
+    assert_eq!(
+        *counter.lock().unwrap(),
+        1,
+        "settled approval re-ran the tool after compaction"
+    );
+    let third = seen.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        !third
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .any(|c| matches!(
+                c,
+                Content::FunctionApprovalRequest(_) | Content::FunctionApprovalResponse(_)
+            )),
+        "settled approval resent: {third:?}"
+    );
+}
+
+#[tokio::test]
+async fn settled_approvals_are_normalized_when_no_tools_are_executable() {
+    // A later call without executable tools takes the fast path; the settled
+    // request and response in its history must still not reach the provider.
+    let counter = Arc::new(Mutex::new(0));
+    let first = FunctionInvokingChatClient::new(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("The secret is 42."),
+    ]));
+    let options = ChatOptions::new().with_tool(approval_tool(counter.clone()));
+    let resp1 = first
+        .get_response(vec![Message::user("get the secret")], options.clone())
+        .await
+        .unwrap();
+    let approval = resp1.user_input_requests()[0].create_response(true);
+    let mut history = vec![Message::user("get the secret")];
+    history.extend(resp1.messages.clone());
+    history.push(Message::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(approval)],
+    ));
+    let resp2 = first.get_response(history.clone(), options).await.unwrap();
+    assert_eq!(*counter.lock().unwrap(), 1);
+    history.extend(resp2.messages.clone());
+    history.push(Message::user("thanks"));
+
+    let inner = MockClient::new(vec![ChatResponse::from_text("You're welcome.")]);
+    let seen = inner.seen.clone();
+    let client = FunctionInvokingChatClient::new(inner);
+    for streaming in [false, true] {
+        if streaming {
+            let _: Vec<_> = client
+                .get_streaming_response(history.clone(), ChatOptions::new())
+                .await
+                .unwrap()
+                .collect()
+                .await;
+        } else {
+            client
+                .get_response(history.clone(), ChatOptions::new())
+                .await
+                .unwrap();
+        }
+        let sent = seen.lock().unwrap().last().cloned().unwrap();
+        let contents: Vec<&Content> = sent.iter().flat_map(|m| m.contents.iter()).collect();
+        assert!(
+            !contents.iter().any(|c| matches!(
+                c,
+                Content::FunctionApprovalRequest(_) | Content::FunctionApprovalResponse(_)
+            )),
+            "settled approval sent (streaming: {streaming}): {sent:?}"
+        );
+        let calls = contents
+            .iter()
+            .filter(|c| matches!(c, Content::FunctionCall(_)))
+            .count();
+        let results = contents
+            .iter()
+            .filter(|c| matches!(c, Content::FunctionResult(_)))
+            .count();
+        assert_eq!((calls, results), (1, 1), "{sent:?}");
+    }
+    assert_eq!(*counter.lock().unwrap(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // SupportsAgentRun-as-tool
 // ---------------------------------------------------------------------------

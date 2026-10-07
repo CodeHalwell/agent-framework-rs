@@ -656,11 +656,16 @@ fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalRespo
 /// Both halves go. The settled response is dropped, and so is the approval
 /// request it answered (an earlier request with the response's id); left in,
 /// a converter such as OpenAI Responses would resend it as a fresh
-/// `mcp_approval_request`. A request whose call is not otherwise declared
-/// earlier in history becomes that call instead, so the result that follows
-/// still has a call to answer. A later request reusing the id is a new,
-/// pending approval and is kept. A message left empty is dropped.
-fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
+/// `mcp_approval_request`. A request whose call is not *outstanding* at that
+/// point (declared and not yet answered by a result) becomes that call
+/// instead, so the result that follows still has a call to answer. A later
+/// request reusing the id is a new, pending approval and is kept. A message
+/// left empty is dropped.
+///
+/// Runs ahead of anything that might cut history apart (compaction, the
+/// function-invocation fast paths): settlement is only decidable while the
+/// result that settles a response is still in view.
+pub(crate) fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
     let settled = settled_approval_responses(messages);
     if settled.is_empty() {
         return;
@@ -676,7 +681,17 @@ fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
             }
         }
     }
-    let mut declared: Vec<FunctionCallContent> = Vec::new();
+    /// A call awaiting its result. `from_request` marks a call that exists
+    /// because a settled request expanded, so a real copy arriving after it is
+    /// the duplicate instead.
+    struct Outstanding {
+        call: FunctionCallContent,
+        from_request: bool,
+    }
+    // Only calls still awaiting a result count as declared: ids are reused,
+    // so a call answered earlier must not swallow a later request for the
+    // same invocation (that would orphan the later request's result).
+    let mut outstanding: Vec<Outstanding> = Vec::new();
     let mut m = 0usize;
     messages.retain_mut(|msg| {
         let before = msg.contents.len();
@@ -687,19 +702,45 @@ fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
             }
             match content {
                 Content::FunctionCall(fc) => {
-                    declared.push(fc.clone());
+                    if let Some(position) = outstanding
+                        .iter()
+                        .position(|entry| entry.from_request && entry.call.same_invocation(&fc))
+                    {
+                        outstanding[position].from_request = false;
+                        continue;
+                    }
+                    if !fc.call_id.is_empty() {
+                        outstanding.push(Outstanding {
+                            call: fc.clone(),
+                            from_request: false,
+                        });
+                    }
                     kept.push(Content::FunctionCall(fc));
+                }
+                Content::FunctionResult(fr) => {
+                    if !fr.call_id.is_empty() {
+                        if let Some(position) = outstanding
+                            .iter()
+                            .rposition(|entry| entry.call.call_id == fr.call_id)
+                        {
+                            outstanding.remove(position);
+                        }
+                    }
+                    kept.push(Content::FunctionResult(fr));
                 }
                 Content::FunctionApprovalRequest(req)
                     if settled_ids
                         .get(req.id.as_str())
                         .is_some_and(|&position| (m, c) < position) =>
                 {
-                    if !declared
+                    if !outstanding
                         .iter()
-                        .any(|fc| fc.same_invocation(&req.function_call))
+                        .any(|entry| entry.call.same_invocation(&req.function_call))
                     {
-                        declared.push(req.function_call.clone());
+                        outstanding.push(Outstanding {
+                            call: req.function_call.clone(),
+                            from_request: true,
+                        });
                         kept.push(Content::FunctionCall(req.function_call));
                     }
                 }
@@ -882,6 +923,11 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 options.tool_choice = Some(ToolMode::Auto);
             }
 
+            // Settled approvals leave the input before any fast path: a
+            // later request without executable tools still replays the
+            // history that carries them.
+            let mut messages = messages;
+            drop_settled_approval_responses(&mut messages);
             if executable_tools(&options).is_empty() || !self.config.enabled {
                 return self.inner_get_response(messages, options).await;
             }
@@ -1406,6 +1452,8 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
     ) -> Result<ChatStream> {
         let tools = executable_tools(&options);
         if tools.is_empty() || !self.config.enabled {
+            let mut messages = messages;
+            drop_settled_approval_responses(&mut messages);
             return self.inner.get_streaming_response(messages, options).await;
         }
         // With tools, run the full loop then stream the aggregated result.
@@ -2194,5 +2242,82 @@ mod approval_replacement_tests {
         replace_approval_contents_with_results(&mut messages, &HashMap::new());
         // Both the completed call and the freshly restored one are present.
         assert_eq!(function_calls(&messages), vec!["c1", "c1"]);
+    }
+}
+
+#[cfg(test)]
+mod settled_approval_tests {
+    use super::*;
+    use crate::types::FunctionApprovalRequestContent;
+
+    fn request(id: &str, call_id: &str) -> FunctionApprovalRequestContent {
+        FunctionApprovalRequestContent {
+            id: id.to_string(),
+            function_call: FunctionCallContent::new(call_id, "get_weather", None),
+        }
+    }
+
+    fn msg(role: Role, content: Content) -> Message {
+        Message::with_contents(role, vec![content])
+    }
+
+    fn result(call_id: &str) -> Content {
+        Content::FunctionResult(FunctionResultContent::new(call_id, Some(Value::from("ok"))))
+    }
+
+    fn kinds(messages: &[Message]) -> Vec<&'static str> {
+        messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .map(|c| match c {
+                Content::FunctionCall(_) => "call",
+                Content::FunctionResult(_) => "result",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reused_id_settled_twice_keeps_a_call_for_each_result() {
+        // The same approval id and invocation, approved and answered twice.
+        // The first result retires the first call, so the second request is
+        // not a duplicate of it: it must become the second result's call.
+        let req = request("a1", "c1");
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            messages.push(msg(
+                Role::assistant(),
+                Content::FunctionApprovalRequest(req.clone()),
+            ));
+            messages.push(msg(
+                Role::user(),
+                Content::FunctionApprovalResponse(req.create_response(true)),
+            ));
+            messages.push(msg(Role::tool(), result("c1")));
+        }
+        drop_settled_approval_responses(&mut messages);
+        assert_eq!(kinds(&messages), vec!["call", "result", "call", "result"]);
+    }
+
+    #[test]
+    fn a_settled_request_beside_its_outstanding_call_is_dropped() {
+        let req = request("a1", "c1");
+        let mut messages = vec![
+            Message::with_contents(
+                Role::assistant(),
+                vec![
+                    Content::FunctionCall(req.function_call.clone()),
+                    Content::FunctionApprovalRequest(req.clone()),
+                ],
+            ),
+            msg(
+                Role::user(),
+                Content::FunctionApprovalResponse(req.create_response(true)),
+            ),
+            msg(Role::tool(), result("c1")),
+        ];
+        drop_settled_approval_responses(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(kinds(&messages), vec!["call", "result"]);
     }
 }
