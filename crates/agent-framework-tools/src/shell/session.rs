@@ -17,7 +17,7 @@ use super::process::{
     apply_env, isolate_process_group, kill_process_tree, kill_tree_now, KILL_GRACE,
 };
 use super::resolve::is_powershell;
-use super::truncate::{truncate_head_tail, truncate_text_head_tail, HeadTailBuffer};
+use super::truncate::{truncate_text_head_tail, HeadTailBuffer};
 use super::types::{ShellError, ShellResult};
 
 const READ_CHUNK: usize = 64 * 1024;
@@ -25,18 +25,121 @@ const READ_CHUNK: usize = 64 * 1024;
 const STDERR_QUIESCENCE: Duration = Duration::from_millis(50);
 /// Exit code reported when a timed-out command could not be recovered.
 const TIMEOUT_EXIT_CODE: i32 = 124;
-/// stdout is kept up to this many times `max_output_bytes` while waiting
-/// for the sentinel; past it the command counts as runaway output.
-const STDOUT_CAP_FACTOR: usize = 4;
+/// Extra stdout kept beyond the tail budget, so a sentinel split across two
+/// reads is still found after older bytes were dropped.
+const WINDOW_SLACK: usize = 1024;
+/// Bytes kept after the sentinel: enough for its `_<exit code>` line.
+const RC_SLACK: usize = 64;
+
+/// stdout of the current command in bounded storage: the first
+/// `keep / 2` bytes, then a rolling window of the most recent bytes, with
+/// whatever fell between them only counted. The sentinel is looked for as
+/// bytes arrive, before anything is dropped, so a command may print any
+/// amount and still finish normally with head/tail-truncated output.
+struct StdoutCapture {
+    /// `max_output_bytes`.
+    keep: usize,
+    buf: Vec<u8>,
+    /// Bytes dropped from between the head and the window.
+    elided: usize,
+    needle: Option<Vec<u8>>,
+    /// Offset of the sentinel in `buf`, once seen. Storage stops shortly
+    /// after it.
+    found: Option<usize>,
+}
+
+impl StdoutCapture {
+    fn new(keep: usize) -> Self {
+        Self {
+            keep: keep.max(1),
+            buf: Vec::new(),
+            elided: 0,
+            needle: None,
+            found: None,
+        }
+    }
+
+    fn head_cap(&self) -> usize {
+        self.keep / 2
+    }
+
+    fn window_cap(&self) -> usize {
+        self.keep - self.keep / 2 + WINDOW_SLACK
+    }
+
+    /// Forget everything and look for `needle` from now on.
+    fn reset(&mut self, needle: Option<Vec<u8>>) {
+        self.buf = Vec::new();
+        self.elided = 0;
+        self.needle = needle;
+        self.found = None;
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        let needle_len = self.needle.as_ref().map_or(0, Vec::len);
+        if let Some(idx) = self.found {
+            // Past the sentinel only its exit-code line matters; anything
+            // else (a background job) is drained, not stored.
+            let limit = idx + needle_len + RC_SLACK;
+            if self.buf.len() < limit {
+                let take = (limit - self.buf.len()).min(chunk.len());
+                self.buf.extend_from_slice(&chunk[..take]);
+            }
+            return;
+        }
+        // A sentinel may straddle the previous read and this one.
+        let from = self.buf.len().saturating_sub(needle_len.saturating_sub(1));
+        self.buf.extend_from_slice(chunk);
+        if let Some(needle) = &self.needle {
+            if let Some(pos) = find(&self.buf[from..], needle) {
+                let idx = from + pos;
+                self.found = Some(idx);
+                self.buf.truncate(idx + needle_len + RC_SLACK);
+                return;
+            }
+        }
+        let max = self.head_cap() + self.window_cap();
+        if self.buf.len() > max {
+            let excess = self.buf.len() - max;
+            let head = self.head_cap();
+            self.buf.drain(head..head + excess);
+            self.elided += excess;
+        }
+    }
+
+    /// The text of `buf[..end]` (optionally without trailing newlines),
+    /// head/tail truncated to `keep` bytes.
+    fn render(&self, end: usize, trim: bool) -> (String, bool) {
+        let mut data = &self.buf[..end.min(self.buf.len())];
+        if trim {
+            while let [rest @ .., b'\r' | b'\n'] = data {
+                data = rest;
+            }
+        }
+        if self.elided == 0 {
+            return truncate_text_head_tail(&String::from_utf8_lossy(data), self.keep);
+        }
+        let head_cap = self.head_cap().min(data.len());
+        let tail_cap = self.keep - self.keep / 2;
+        let tail_start = data.len().saturating_sub(tail_cap).max(head_cap);
+        let kept = head_cap + (data.len() - tail_start);
+        let dropped = data.len() + self.elided - kept;
+        (
+            format!(
+                "{}\n[... truncated {dropped} bytes ...]\n{}",
+                String::from_utf8_lossy(&data[..head_cap]),
+                String::from_utf8_lossy(&data[tail_start..])
+            ),
+            true,
+        )
+    }
+}
 
 /// Output captured since the current command was written. Both streams are
-/// bounded, so neither a runaway command nor a background job writing
-/// between commands can grow memory without limit.
+/// bounded, so neither a command printing without end nor a background job
+/// writing between commands can grow memory without limit.
 struct Buffers {
-    /// Raw stdout, kept up to `stdout_cap` (plus at most one read chunk) so
-    /// the sentinel can be found; the overflow check fires past `stdout_cap`,
-    /// and the result is head/tail truncated from it.
-    stdout: Vec<u8>,
+    stdout: StdoutCapture,
     /// stderr in head/tail storage of `max_output_bytes`.
     stderr: HeadTailBuffer,
     stdout_closed: bool,
@@ -45,27 +148,25 @@ struct Buffers {
 struct Shared {
     buffers: StdMutex<Buffers>,
     stdout_changed: Notify,
-    stdout_cap: usize,
     stderr_cap: usize,
 }
 
 impl Shared {
-    fn new(stdout_cap: usize, stderr_cap: usize) -> Self {
+    fn new(max_output_bytes: usize) -> Self {
         Self {
             buffers: StdMutex::new(Buffers {
-                stdout: Vec::new(),
-                stderr: HeadTailBuffer::new(stderr_cap),
+                stdout: StdoutCapture::new(max_output_bytes),
+                stderr: HeadTailBuffer::new(max_output_bytes),
                 stdout_closed: false,
             }),
             stdout_changed: Notify::new(),
-            stdout_cap,
-            stderr_cap,
+            stderr_cap: max_output_bytes,
         }
     }
 
-    /// Drop everything captured so far.
-    fn clear(&self, bufs: &mut Buffers) {
-        bufs.stdout.clear();
+    /// Drop everything captured so far; stdout looks for `needle` next.
+    fn clear(&self, bufs: &mut Buffers, needle: Option<Vec<u8>>) {
+        bufs.stdout.reset(needle);
         bufs.stderr = HeadTailBuffer::new(self.stderr_cap);
     }
 
@@ -97,12 +198,8 @@ impl Drop for Live {
     }
 }
 
-enum WaitError {
-    /// The shell closed stdout before printing the sentinel.
-    Closed,
-    /// More than the hard cap arrived without a sentinel.
-    Overflow,
-}
+/// The shell closed stdout before printing the sentinel.
+struct Closed;
 
 /// A [`ShellSession`] runs one long-lived shell and feeds it commands on
 /// stdin, each followed by a **sentinel** line that reports the exit status.
@@ -254,10 +351,7 @@ impl ShellSession {
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
-        let shared = Arc::new(Shared::new(
-            self.max_output_bytes.saturating_mul(STDOUT_CAP_FACTOR),
-            self.max_output_bytes,
-        ));
+        let shared = Arc::new(Shared::new(self.max_output_bytes));
         let readers = vec![
             spawn_reader(stdout, shared.clone(), true),
             spawn_reader(stderr, shared.clone(), false),
@@ -282,7 +376,7 @@ impl ShellSession {
     }
 
     /// Whether a shell is currently running. `false` after [`close`](Self::close)
-    /// and after a timeout or runaway output tore the shell down.
+    /// and after an unrecoverable timeout tore the shell down.
     pub(crate) async fn is_live(&self) -> bool {
         match self.live.lock().await.as_mut() {
             Some(live) => matches!(live.child.try_wait(), Ok(None)),
@@ -354,6 +448,7 @@ impl ShellSession {
     ) -> Result<ShellResult, ShellError> {
         let sentinel = format!("__AF_END_{}_{}__", self.tag, random_hex(8));
         let script = self.build_script(command, &sentinel);
+        let needle = sentinel.into_bytes();
 
         let (shared, pid) = {
             let mut guard = self.live.lock().await;
@@ -365,7 +460,7 @@ impl ShellSession {
             // Only output produced after the command is written belongs to it.
             {
                 let mut bufs = shared.lock();
-                shared.clear(&mut bufs);
+                shared.clear(&mut bufs, Some(needle));
             }
             if let Err(err) = write_all(&mut live.stdin, &script).await {
                 drop(guard);
@@ -378,38 +473,20 @@ impl ShellSession {
         };
 
         let started = Instant::now();
-        let needle = sentinel.into_bytes();
-        let hard_cap = shared.stdout_cap;
 
+        // Output is bounded however much the command prints, so there is no
+        // separate output limit: a command that never stops printing is
+        // ended by the timeout like any other long-running command.
         let first = match timeout {
-            Some(limit) => {
-                tokio::time::timeout(limit, wait_for_sentinel(&shared, &needle, hard_cap))
-                    .await
-                    .ok()
-            }
-            None => Some(wait_for_sentinel(&shared, &needle, hard_cap).await),
+            Some(limit) => tokio::time::timeout(limit, wait_for_sentinel(&shared))
+                .await
+                .ok(),
+            None => Some(wait_for_sentinel(&shared).await),
         };
 
         let (found, timed_out) = match first {
             Some(Ok(found)) => (found, false),
-            Some(Err(WaitError::Overflow)) => {
-                // Runaway output with no sentinel: interrupt and restart.
-                interrupt(pid);
-                self.close().await;
-                let mut bufs = shared.lock();
-                let end = bufs.stdout.len().min(hard_cap);
-                let (stdout, _) = truncate_head_tail(&bufs.stdout[..end], self.max_output_bytes);
-                let (stderr, _) = take_stderr(&shared, &mut bufs);
-                return Ok(ShellResult {
-                    stdout,
-                    stderr,
-                    exit_code: -1,
-                    duration: started.elapsed(),
-                    truncated: true,
-                    timed_out: false,
-                });
-            }
-            Some(Err(WaitError::Closed)) => {
+            Some(Err(Closed)) => {
                 self.close().await;
                 return Err(ShellError::Execution(
                     "shell closed stdout before emitting sentinel".into(),
@@ -417,20 +494,14 @@ impl ShellSession {
             }
             None => {
                 interrupt(pid);
-                match tokio::time::timeout(
-                    KILL_GRACE,
-                    wait_for_sentinel(&shared, &needle, hard_cap),
-                )
-                .await
-                {
+                match tokio::time::timeout(KILL_GRACE, wait_for_sentinel(&shared)).await {
                     Ok(Ok(found)) => (found, true),
                     _ => {
                         // Unrecoverable: tear down so the next call gets a
                         // fresh shell.
                         self.close().await;
                         let mut bufs = shared.lock();
-                        let (stdout, out_t) =
-                            truncate_head_tail(&bufs.stdout, self.max_output_bytes);
+                        let (stdout, out_t) = bufs.stdout.render(usize::MAX, false);
                         let (stderr, err_t) = take_stderr(&shared, &mut bufs);
                         return Ok(ShellResult {
                             stdout,
@@ -449,12 +520,10 @@ impl ShellSession {
         let duration = started.elapsed();
         let (sentinel_idx, exit_code) = found;
         let mut bufs = shared.lock();
-        let stdout_text = String::from_utf8_lossy(&bufs.stdout[..sentinel_idx]);
-        let stdout_text = stdout_text.trim_end_matches(['\r', '\n']);
-        let (stdout, out_t) = truncate_text_head_tail(stdout_text, self.max_output_bytes);
+        let (stdout, out_t) = bufs.stdout.render(sentinel_idx, true);
         let (stderr, err_t) = take_stderr(&shared, &mut bufs);
         // Everything needed has been copied; release it.
-        shared.clear(&mut bufs);
+        shared.clear(&mut bufs, None);
 
         Ok(ShellResult {
             stdout,
@@ -515,12 +584,7 @@ where
                     {
                         let mut bufs = shared.lock();
                         if is_stdout {
-                            // Past the cap the command has overflowed (or a
-                            // background job is flooding between commands):
-                            // keep draining the pipe, but stop storing.
-                            if bufs.stdout.len() <= shared.stdout_cap {
-                                bufs.stdout.extend_from_slice(&chunk[..n]);
-                            }
+                            bufs.stdout.push(&chunk[..n]);
                         } else {
                             bufs.stderr.push(&chunk[..n]);
                         }
@@ -548,13 +612,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Wait until the sentinel and its exit-code line have arrived. Returns the
-/// sentinel's offset in stdout and the parsed exit code.
-async fn wait_for_sentinel(
-    shared: &Shared,
-    needle: &[u8],
-    hard_cap: usize,
-) -> Result<(usize, i32), WaitError> {
-    let mut found_at: Option<usize> = None;
+/// sentinel's offset in the captured stdout and the parsed exit code.
+async fn wait_for_sentinel(shared: &Shared) -> Result<(usize, i32), Closed> {
     let mut tail_deadline: Option<Instant> = None;
     loop {
         // Register interest before checking, so a write between the check
@@ -564,24 +623,18 @@ async fn wait_for_sentinel(
         changed.as_mut().enable();
         {
             let bufs = shared.lock();
-            if found_at.is_none() {
-                found_at = find(&bufs.stdout, needle);
-            }
-            if let Some(idx) = found_at {
-                let after = &bufs.stdout[idx + needle.len()..];
+            let capture = &bufs.stdout;
+            if let Some(idx) = capture.found {
+                let needle_len = capture.needle.as_ref().map_or(0, Vec::len);
+                let after = &capture.buf[idx + needle_len..];
                 let deadline =
                     *tail_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
                 // Wait briefly for the exit-code digits and their newline.
                 if after.contains(&b'\n') || bufs.stdout_closed || Instant::now() >= deadline {
                     return Ok((idx, parse_rc(after)));
                 }
-            } else {
-                if bufs.stdout_closed {
-                    return Err(WaitError::Closed);
-                }
-                if bufs.stdout.len() > hard_cap {
-                    return Err(WaitError::Overflow);
-                }
+            } else if bufs.stdout_closed {
+                return Err(Closed);
             }
         }
         let _ = tokio::time::timeout(Duration::from_millis(100), changed).await;
@@ -662,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn readers_bound_both_streams() {
         use tokio::io::AsyncReadExt as _;
-        let shared = Arc::new(Shared::new(4096, 1024));
+        let shared = Arc::new(Shared::new(1024));
         let flood = 10 * 1024 * 1024;
         let out = spawn_reader(tokio::io::repeat(b'o').take(flood), shared.clone(), true);
         let err = spawn_reader(tokio::io::repeat(b'e').take(flood), shared.clone(), false);
@@ -670,15 +723,47 @@ mod tests {
         err.await.unwrap();
         let mut bufs = shared.lock();
         assert!(
-            bufs.stdout.len() <= 4096 + READ_CHUNK,
+            bufs.stdout.buf.len() <= 1024 + WINDOW_SLACK,
             "{}",
-            bufs.stdout.len()
+            bufs.stdout.buf.len()
         );
-        assert!(bufs.stdout.len() > 4096, "overflow must stay detectable");
+        let (stdout, truncated) = bufs.stdout.render(usize::MAX, false);
+        assert!(truncated);
+        assert!(stdout.contains(&format!("truncated {} bytes", flood - 1024)));
         let (stderr, truncated) = take_stderr(&shared, &mut bufs);
         assert!(truncated);
         assert!(stderr.len() < 1024 + 64, "{}", stderr.len());
         assert!(stderr.contains(&format!("truncated {} bytes", flood - 1024)));
+    }
+
+    /// However much a command prints, the sentinel is found (even split
+    /// across reads after older bytes were dropped) and the output matches
+    /// one-shot head/tail truncation of everything before it.
+    #[test]
+    fn capture_finds_the_sentinel_after_dropping_output() {
+        let needle = b"__AF_END_tag_1234__".to_vec();
+        let body: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut stream = body.clone();
+        stream.extend_from_slice(b"\n");
+        stream.extend_from_slice(&needle);
+        stream.extend_from_slice(b"_7\nlate background output");
+        for keep in [1usize, 2, 7, 100, 4096] {
+            for chunk in [1usize, 5, 13, 4096, 65536] {
+                let mut capture = StdoutCapture::new(keep);
+                capture.reset(Some(needle.clone()));
+                for piece in stream.chunks(chunk) {
+                    capture.push(piece);
+                }
+                assert!(capture.buf.len() <= keep + WINDOW_SLACK + chunk + needle.len() + RC_SLACK);
+                let idx = capture.found.expect("sentinel found");
+                assert_eq!(parse_rc(&capture.buf[idx + needle.len()..]), 7);
+                assert_eq!(
+                    capture.render(idx, true),
+                    super::super::truncate::truncate_head_tail(&body, keep),
+                    "keep {keep} chunk {chunk}"
+                );
+            }
+        }
     }
 
     #[test]

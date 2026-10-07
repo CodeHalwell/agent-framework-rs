@@ -31,6 +31,11 @@ shlex = "2"
 # killpg(2) for process-group termination on timeout.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Job Objects, so a stateless command's leftover processes can be killed
+# after its shell exits. Already in the tree through tokio.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }

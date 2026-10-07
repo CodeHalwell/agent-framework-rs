@@ -359,6 +359,83 @@ async fn cancelled_persistent_command_is_reaped_before_the_next_call() {
     tool.close().await.unwrap();
 }
 
+/// Cancelling a persistent call kills the command inside the container
+/// right away, not only when (or if) another call comes along: killing the
+/// local `docker exec` does not stop it, since the container's init is
+/// `sleep infinity`.
+#[tokio::test]
+async fn cancelled_persistent_command_is_reaped_immediately() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake)
+        .container_name("af-now-box")
+        .timeout(None)
+        .build()
+        .unwrap();
+    tool.start().await.unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)).await;
+    assert!(dropped.is_err());
+    // No further call: the reap must come from the cancellation itself.
+    let reap = "exec af-now-box sh -c kill -KILL -1 2>/dev/null; exit 0";
+    let calls = fake.wait_for_call(|c| c == reap).await;
+    assert!(calls.iter().any(|c| c == reap), "{calls:?}");
+    // A caller-chosen container is kept, and the next call still works.
+    assert!(!calls.iter().any(|c| c.starts_with("rm")), "{calls:?}");
+    assert_eq!(tool.run("echo next", None).await.unwrap().stdout, "next");
+    tool.close().await.unwrap();
+}
+
+/// When the immediate reap fails, a container whose name the tool generated
+/// is removed at once, and the next call starts a new one.
+#[tokio::test]
+async fn failed_cancel_reap_removes_a_generated_container() {
+    let fake = FakeDocker::with_reap_rc(0, 0, 1);
+    let tool = builder(&fake).timeout(None).build().unwrap();
+    let name = tool.container_name().to_string();
+    tool.start().await.unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)).await;
+    assert!(dropped.is_err());
+    let rm = format!("rm -f {name}");
+    let calls = fake.wait_for_call(|c| c == rm).await;
+    assert!(calls.contains(&rm), "{calls:?}");
+    assert_eq!(tool.run("echo next", None).await.unwrap().stdout, "next");
+    let calls = fake.calls();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("run -d")).count(),
+        2,
+        "the next call must recreate the removed container: {calls:?}"
+    );
+    tool.close().await.unwrap();
+}
+
+/// ... but a caller-chosen name is never removed from the drop path.
+#[tokio::test]
+async fn failed_cancel_reap_keeps_an_explicit_container() {
+    let fake = FakeDocker::with_reap_rc(0, 0, 1);
+    let tool = builder(&fake)
+        .container_name("af-explicit-box")
+        .timeout(None)
+        .build()
+        .unwrap();
+    tool.start().await.unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)).await;
+    assert!(dropped.is_err());
+    let calls = fake
+        .wait_for_call(|c| c.starts_with("exec af-explicit-box sh -c kill -KILL -1"))
+        .await;
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("exec af-explicit-box sh -c kill -KILL -1")),
+        "{calls:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let calls = fake.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("rm")), "{calls:?}");
+}
+
 /// A fake CLI whose `docker run` hangs, so a start can be cancelled before
 /// it reports anything (such as a name conflict).
 fn slow_docker() -> (TempDir, PathBuf, PathBuf) {

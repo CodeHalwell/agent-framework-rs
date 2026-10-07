@@ -504,17 +504,52 @@ async fn persistent_timeout_returns_and_next_command_works() {
     tool.close().await.unwrap();
 }
 
+/// Large output is not an error in persistent mode: the command runs to
+/// completion and its output is head/tail truncated, as in stateless mode.
 #[tokio::test]
-async fn persistent_runaway_output_is_capped_and_session_restarts() {
+async fn persistent_large_output_completes_with_truncated_output() {
     let tool = persistent()
         .max_output_bytes(1024)
         .timeout(Some(Duration::from_secs(20)))
         .build()
         .unwrap();
-    let result = tool.run("yes x", None).await.unwrap();
+    // ~200x the limit, well past what used to count as runaway output.
+    let result = tool
+        .run(
+            "echo FIRST; i=0; while [ $i -lt 2000 ]; do printf '%0100d\\n' $i; i=$((i+1)); done; echo LAST; export AF_KEPT=1; exit_code_check() { return 3; }; exit_code_check",
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!result.timed_out);
+    assert_eq!(result.exit_code, 3, "{result:?}");
     assert!(result.truncated);
-    assert_eq!(result.exit_code, -1);
-    assert!(result.stdout.len() < 4096);
+    assert!(result.stdout.starts_with("FIRST\n"), "{}", result.stdout);
+    assert!(result.stdout.ends_with("\nLAST"), "{}", result.stdout);
+    assert!(
+        result.stdout.contains("[... truncated "),
+        "{}",
+        result.stdout
+    );
+    assert!(result.stdout.len() < 1024 + 64, "{}", result.stdout.len());
+    // The same shell carries on: state from the command is still there.
+    assert_eq!(tool.run("echo $AF_KEPT", None).await.unwrap().stdout, "1");
+    tool.close().await.unwrap();
+}
+
+/// A command that never stops printing is ended by the timeout, with
+/// bounded output, and the next command still works.
+#[tokio::test]
+async fn persistent_endless_output_is_bounded_and_ends_at_the_timeout() {
+    let tool = persistent()
+        .max_output_bytes(1024)
+        .timeout(Some(Duration::from_millis(500)))
+        .build()
+        .unwrap();
+    let result = tool.run("yes x", None).await.unwrap();
+    assert!(result.timed_out);
+    assert!(result.truncated);
+    assert!(result.stdout.len() < 1024 + 64, "{}", result.stdout.len());
     assert_eq!(tool.run("echo fresh", None).await.unwrap().stdout, "fresh");
     tool.close().await.unwrap();
 }

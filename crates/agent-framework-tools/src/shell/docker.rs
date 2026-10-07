@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use agent_framework_core::tools::{ApprovalMode, ToolDefinition};
@@ -35,7 +35,7 @@ pub const DEFAULT_PIDS_LIMIT: u32 = 256;
 /// Default working directory inside the container.
 pub const DEFAULT_WORKDIR: &str = "/workspace";
 const TMPFS: &str = "/tmp:rw,nosuid,nodev,size=64m";
-/// Run inside the persistent container after a timeout, runaway output or
+/// Run inside the persistent container after a timeout or
 /// a cancelled command: kills every process the container user may signal
 /// except the container's init (`sleep infinity`) and this shell itself.
 const REAP_SCRIPT: &str = "kill -KILL -1 2>/dev/null; exit 0";
@@ -492,6 +492,7 @@ impl DockerShellToolBuilder {
                 config: self,
                 state: Mutex::new(PersistentState::default()),
                 run_lock: Mutex::new(()),
+                pending_reap: StdMutex::new(None),
             }),
         })
     }
@@ -572,6 +573,108 @@ impl Drop for ContainerCleanup {
     }
 }
 
+/// What the reap started by a cancelled persistent call achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReapOutcome {
+    /// Leftover processes in the container were killed.
+    Reaped,
+    /// The reap failed and the (generated) container was removed.
+    Removed,
+    /// Neither worked; the next call must recover on its own.
+    Failed,
+}
+
+/// Run `binary args...` synchronously, killing it after `limit`. For drop
+/// paths, on a detached thread.
+fn run_blocking(binary: &str, args: &[&str], limit: Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Armed while a persistent command (and its recovery) is in flight. If the
+/// `run` future is dropped there, the session kills the local `docker exec`
+/// only; the command keeps running inside the container, whose init is
+/// `sleep infinity`. This starts the in-container reap at once, on a
+/// detached thread, instead of leaving the command running until the next
+/// call. If the reap fails, a container whose name this tool generated is
+/// removed; a caller-chosen name is never removed from here.
+///
+/// The next call waits for this reap before touching the container, so it
+/// cannot kill that call's fresh shell, and still runs its own deferred reap
+/// as a backstop.
+struct CancelReap<'a> {
+    inner: &'a DockerInner,
+    armed: bool,
+}
+
+impl Drop for CancelReap<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let c = &self.inner.config;
+        let binary = c.docker_binary.clone();
+        let shell = c.shell.clone();
+        let name = self.inner.container_name.clone();
+        let generated = self.inner.generated_name;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("af-shell-docker-reap".into())
+            .spawn(move || {
+                let outcome = if run_blocking(
+                    &binary,
+                    &["exec", &name, &shell, "-c", REAP_SCRIPT],
+                    Duration::from_secs(10),
+                ) {
+                    tracing::info!(container = %name, "killed the cancelled command in the container");
+                    CancelReapOutcome::Reaped
+                } else if generated
+                    && run_blocking(&binary, &["rm", "-f", &name], Duration::from_secs(10))
+                {
+                    tracing::warn!(container = %name, "could not kill the cancelled command; removed the container");
+                    CancelReapOutcome::Removed
+                } else {
+                    tracing::warn!(container = %name, "could not kill the cancelled command in the container; the next call will retry");
+                    CancelReapOutcome::Failed
+                };
+                let _ = tx.send(outcome);
+            });
+        match spawned {
+            Ok(_) => {
+                *self
+                    .inner
+                    .pending_reap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(rx);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not start the container reap thread; the next call will reap")
+            }
+        }
+    }
+}
+
 fn generate_container_name() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     format!("af-shell-{}", &id[..12])
@@ -595,6 +698,9 @@ struct DockerInner {
     /// after a timeout or cancellation, so a queued call never starts on a
     /// shell that recovery is about to kill.
     run_lock: Mutex<()>,
+    /// The reap started when a persistent call was cancelled, until the
+    /// next call has waited for it.
+    pending_reap: StdMutex<Option<tokio::sync::oneshot::Receiver<CancelReapOutcome>>>,
 }
 
 /// A shell tool that runs commands inside a Docker (or compatible)
@@ -887,7 +993,7 @@ impl DockerShellTool {
     }
 
     /// Stop whatever the persistent container is still running after a
-    /// timeout, runaway output or a cancelled command. Killing the local
+    /// timeout or a cancelled command. Killing the local
     /// `docker exec` CLI does not stop the shell or the command inside the
     /// container, so they would keep running and overlap the next call.
     /// Kills every process except the container's init; if that fails, the
@@ -1002,11 +1108,32 @@ impl ShellExecutor for DockerShellTool {
         // container) the reap is about to kill.
         let _serial = self.inner.run_lock.lock().await;
         {
-            // A previous call was cancelled mid-command: its command may still
-            // be running in the container. Reap it before the session is
-            // replaced.
+            // A cancelled call started reaping the container as it was
+            // dropped. Let that finish first: it kills every process in the
+            // container, including a shell this call is about to start.
+            let pending = self
+                .inner
+                .pending_reap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            let outcome = match pending {
+                Some(rx) => Some(rx.await.unwrap_or(CancelReapOutcome::Failed)),
+                None => None,
+            };
             let mut state = self.inner.state.lock().await;
-            if state.session.as_ref().is_some_and(|s| s.is_poisoned()) {
+            if outcome == Some(CancelReapOutcome::Removed) {
+                // The container is gone; start over from a new one.
+                if let Some(session) = state.session.take() {
+                    session.close().await;
+                }
+                state.container_started = false;
+            } else if outcome == Some(CancelReapOutcome::Failed)
+                || state.session.as_ref().is_some_and(|s| s.is_poisoned())
+            {
+                // A previous call was cancelled mid-command: its command may
+                // still be running in the container. Reap it (again, as a
+                // backstop) before the session is replaced.
                 self.reap_container(&mut state).await;
             }
         }
@@ -1021,6 +1148,10 @@ impl ShellExecutor for DockerShellTool {
             .ok_or_else(|| {
                 ShellError::Execution("DockerShellTool session failed to start".into())
             })?;
+        let mut cancel_reap = CancelReap {
+            inner: &self.inner,
+            armed: true,
+        };
         let result = session.run(command, timeout).await;
         let timed_out = matches!(&result, Ok(r) if r.timed_out);
         if timed_out || !session.is_live().await {
@@ -1030,6 +1161,7 @@ impl ShellExecutor for DockerShellTool {
             let mut state = self.inner.state.lock().await;
             self.reap_container(&mut state).await;
         }
+        cancel_reap.armed = false;
         result
     }
 
