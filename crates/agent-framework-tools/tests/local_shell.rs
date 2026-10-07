@@ -561,6 +561,40 @@ async fn persistent_timeout_returns_and_next_command_works() {
     tool.close().await.unwrap();
 }
 
+/// A command that handles SIGINT lets the wrapper print its sentinel during
+/// the grace wait, while a descendant that ignores SIGINT keeps running. The
+/// timeout must still take the whole process group down.
+#[tokio::test]
+async fn persistent_timeout_kills_sigint_ignoring_descendant() {
+    let dir = TempDir::new("sigint-ignore");
+    let pidfile = dir.path().join("pid");
+    let tool = persistent()
+        .timeout(Some(Duration::from_millis(500)))
+        .build()
+        .unwrap();
+    let first_shell = tool.run("echo $$", None).await.unwrap().stdout;
+    let command = format!(
+        "trap ':' INT; (trap '' INT; exec sleep 30) & echo $! > '{}'; wait",
+        pidfile.display()
+    );
+    let result = tool.run(&command, None).await.unwrap();
+    assert!(result.timed_out);
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        eventually(|| !process_alive(pid)).await,
+        "SIGINT-ignoring child {pid} survived the timeout"
+    );
+    // The next call runs in a fresh shell.
+    let next = tool.run("echo $$", None).await.unwrap();
+    assert!(!next.timed_out);
+    assert_ne!(next.stdout, first_shell);
+    tool.close().await.unwrap();
+}
+
 /// Large output is not an error in persistent mode: the command runs to
 /// completion and its output is head/tail truncated, as in stateless mode.
 #[tokio::test]

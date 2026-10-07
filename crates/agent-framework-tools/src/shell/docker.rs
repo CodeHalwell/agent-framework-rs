@@ -286,13 +286,17 @@ impl DockerShellToolBuilder {
         self
     }
 
-    /// The memory limit (`512m`, `2g`). Default `512m`.
+    /// The memory limit (`512m`, `2g`). Default `512m`. `0` (or any value
+    /// that is not a positive size) removes the limit, which counts as
+    /// weakened isolation (see [`approval_mode`](Self::approval_mode)).
     pub fn memory(mut self, memory: impl Into<String>) -> Self {
         self.memory = memory.into();
         self
     }
 
-    /// The process limit inside the container. Default 256.
+    /// The process limit inside the container. Default 256. Docker treats `0`
+    /// as unlimited, which counts as weakened isolation (see
+    /// [`approval_mode`](Self::approval_mode)).
     pub fn pids_limit(mut self, limit: u32) -> Self {
         self.pids_limit = limit;
         self
@@ -356,8 +360,9 @@ impl DockerShellToolBuilder {
     /// With the isolation defaults kept, [`ApprovalMode::NeverRequire`] needs
     /// no acknowledgement, because the container (with a trusted runtime) is
     /// the intended boundary. If the configuration weakens that boundary
-    /// (root user, a writable host mount, a writable root filesystem, or a
-    /// network other than `none`), [`build`](Self::build) fails unless
+    /// (root user, a writable host mount, a writable root filesystem, a
+    /// network other than `none`, or a disabled memory or process limit),
+    /// [`build`](Self::build) fails unless
     /// [`acknowledge_unsafe`](Self::acknowledge_unsafe) is also set.
     pub fn approval_mode(mut self, mode: ApprovalMode) -> Self {
         self.approval_mode = mode;
@@ -387,6 +392,12 @@ impl DockerShellToolBuilder {
         }
         if self.network != DEFAULT_NETWORK {
             weakened.push("the container has network access");
+        }
+        if !is_positive_memory_size(&self.memory) {
+            weakened.push("the memory limit is disabled");
+        }
+        if self.pids_limit == 0 {
+            weakened.push("the process limit is disabled");
         }
         weakened
     }
@@ -980,6 +991,47 @@ impl DockerShellTool {
     }
 }
 
+/// Whether `value` is a memory size docker enforces as a limit: a positive
+/// number with an optional unit (`512m`, `1.5g`, `2GiB`). `0`, `-1`, an
+/// empty string, or anything docker would not parse as a size counts as no
+/// limit.
+fn is_positive_memory_size(value: &str) -> bool {
+    let v = value.trim();
+    let digits_end = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let (number, unit) = v.split_at(digits_end);
+    let unit = unit.trim_start().to_ascii_lowercase();
+    let unit_ok = matches!(
+        unit.as_str(),
+        "" | "b"
+            | "k"
+            | "kb"
+            | "kib"
+            | "m"
+            | "mb"
+            | "mib"
+            | "g"
+            | "gb"
+            | "gib"
+            | "t"
+            | "tb"
+            | "tib"
+            | "p"
+            | "pb"
+            | "pib"
+            | "ki"
+            | "mi"
+            | "gi"
+            | "ti"
+            | "pi"
+    );
+    unit_ok
+        && number
+            .parse::<f64>()
+            .is_ok_and(|n| n.is_finite() && n > 0.0)
+}
+
 /// Run a container-CLI housekeeping command with a time limit.
 async fn docker_quiet(binary: &str, args: &[&str], limit: Duration) -> Result<(), String> {
     let mut cmd = Command::new(binary);
@@ -1460,6 +1512,12 @@ mod tests {
             ),
             (|b| b.read_only_root(false), "root filesystem is writable"),
             (|b| b.network("bridge"), "network access"),
+            (|b| b.memory("0"), "memory limit is disabled"),
+            (|b| b.memory("0m"), "memory limit is disabled"),
+            (|b| b.memory("-1"), "memory limit is disabled"),
+            (|b| b.memory(""), "memory limit is disabled"),
+            (|b| b.memory("unlimited"), "memory limit is disabled"),
+            (|b| b.pids_limit(0), "process limit is disabled"),
         ];
         for (weaken, reason) in cases {
             let never =
@@ -1470,6 +1528,18 @@ mod tests {
             assert!(never().acknowledge_unsafe(true).build().is_ok());
             // With approval on, weakening needs no acknowledgement.
             assert!(weaken(DockerShellTool::builder()).build().is_ok());
+        }
+    }
+
+    #[test]
+    fn positive_memory_sizes_are_limits() {
+        for ok in ["512m", "2g", "1.5g", "2GiB", "1024", "64 MB", " 512m "] {
+            assert!(is_positive_memory_size(ok), "{ok}");
+        }
+        for unlimited in [
+            "0", "0b", "0.0g", "-1", "-512m", "", "m", "512x", "inf", "NaN",
+        ] {
+            assert!(!is_positive_memory_size(unlimited), "{unlimited}");
         }
     }
 

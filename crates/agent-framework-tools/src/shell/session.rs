@@ -428,10 +428,13 @@ impl ShellSession {
     /// Run `command` and return its result. Calls are serialised.
     ///
     /// On timeout the running command is interrupted (`SIGINT` to the
-    /// session's process group on Unix). If the shell recovers within the
-    /// grace period the result is returned with `timed_out` set; otherwise
-    /// the session is torn down, so the next call starts a fresh shell, and
-    /// the result reports exit code 124.
+    /// session's process group on Unix) and the session is always torn down
+    /// afterwards, killing the whole process group, so the next call starts
+    /// a fresh shell (shell state is lost). A descendant that ignores
+    /// `SIGINT` would otherwise keep running after the wrapper reported the
+    /// command done. If the shell emits its result within the grace period
+    /// that result is returned with `timed_out` set; otherwise the result
+    /// reports exit code 124.
     pub async fn run(
         &self,
         command: &str,
@@ -534,11 +537,21 @@ impl ShellSession {
         tokio::time::sleep(STDERR_QUIESCENCE).await;
         let duration = started.elapsed();
         let (sentinel_idx, exit_code) = found;
-        let mut bufs = shared.lock();
-        let (stdout, out_t) = bufs.stdout.render(sentinel_idx, true);
-        let (stderr, err_t) = take_stderr(&shared, &mut bufs);
-        // Everything needed has been copied; release it.
-        shared.clear(&mut bufs, None);
+        let (stdout, out_t, stderr, err_t) = {
+            let mut bufs = shared.lock();
+            let (stdout, out_t) = bufs.stdout.render(sentinel_idx, true);
+            let (stderr, err_t) = take_stderr(&shared, &mut bufs);
+            // Everything needed has been copied; release it.
+            shared.clear(&mut bufs, None);
+            (stdout, out_t, stderr, err_t)
+        };
+        if timed_out {
+            // The sentinel only shows the shell got control back. A
+            // descendant that ignored SIGINT (`(trap '' INT; sleep 30) &`)
+            // can still be running in the session's process group and would
+            // overlap later calls, so tear the session down regardless.
+            self.close().await;
+        }
 
         Ok(ShellResult {
             stdout,
