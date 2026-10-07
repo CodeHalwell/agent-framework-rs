@@ -28,6 +28,7 @@ only.
 - OpenAI, Azure OpenAI, Bedrock, Mistral and Ollama embed text only, as
   upstream does, and return an error naming the first non-text input.
 
+### Feature stages (breaking)
 
 APIs that upstream still marks experimental now sit behind `experimental-*`
 cargo features and carry no semver promise, mirroring Python's

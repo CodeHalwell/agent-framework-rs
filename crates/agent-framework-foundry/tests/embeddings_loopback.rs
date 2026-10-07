@@ -121,6 +121,14 @@ const OUT_OF_ORDER_BODY: &str = r#"{
   "usage": {"prompt_tokens": 7, "total_tokens": 7}
 }"#;
 
+/// One vector for a one-input request: the client refuses a response that
+/// does not hold exactly one vector per input.
+const ONE_VECTOR_BODY: &str = r#"{
+  "data": [{"index": 0, "embedding": [1.0, 1.5]}],
+  "model": "text-embedding-3-small",
+  "usage": {"prompt_tokens": 3, "total_tokens": 3}
+}"#;
+
 #[tokio::test]
 async fn posts_to_the_models_embeddings_route_with_the_api_key_header() {
     let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
@@ -171,7 +179,7 @@ async fn posts_to_the_models_embeddings_route_with_the_api_key_header() {
 
 #[tokio::test]
 async fn a_token_credential_authenticates_with_a_bearer_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = Arc::new(StaticTokenCredential::new("entra-token"));
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -222,7 +230,7 @@ impl agent_framework_azure::TokenCredential for RecordingCredential {
 /// rather than falling through to the credential's own default.
 #[tokio::test]
 async fn the_credential_is_asked_for_the_models_inference_scope() {
-    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = RecordingCredential::default();
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -245,7 +253,7 @@ async fn the_credential_is_asked_for_the_models_inference_scope() {
 
 #[tokio::test]
 async fn an_overridden_scope_reaches_the_credential() {
-    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let credential = RecordingCredential::default();
     let client = FoundryEmbeddingClient::with_credential(
         format!("{endpoint}/models"),
@@ -289,7 +297,7 @@ async fn a_response_without_a_model_falls_back_to_the_requested_one() {
 
 #[tokio::test]
 async fn an_overridden_api_version_reaches_the_query_string() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k")
         .with_api_version("2099-01-01");
 
@@ -312,7 +320,7 @@ async fn an_overridden_api_version_reaches_the_query_string() {
 /// header would turn a call that works upstream into a 4xx.
 #[tokio::test]
 async fn expanded_extras_carry_the_pass_through_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
 
     let mut options = EmbeddingGenerationOptions::new();
@@ -337,7 +345,7 @@ async fn expanded_extras_carry_the_pass_through_header() {
 
 #[tokio::test]
 async fn no_extras_means_no_pass_through_header() {
-    let (endpoint, seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let (endpoint, seen) = one_shot_server(200, ONE_VECTOR_BODY);
     let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
 
     client
@@ -479,4 +487,56 @@ async fn image_inputs_are_refused_on_a_project_endpoint_and_non_images_anywhere(
         .await
         .expect_err("audio is not embeddable here");
     assert!(err.to_string().contains("input 1"), "{err}");
+}
+
+#[tokio::test]
+async fn an_image_with_no_uri_is_refused_before_any_request() {
+    // Nothing is listening on port 9, so a request would fail differently.
+    let models = FoundryEmbeddingClient::new("http://127.0.0.1:9/models", "m", "k");
+    let empty = Content::Uri(agent_framework_core::types::UriContent {
+        uri: String::new(),
+        media_type: "image/png".into(),
+    });
+    let err = models
+        .get_embeddings(vec!["ok".into(), empty.into()], None)
+        .await
+        .expect_err("an image needs a URI");
+    assert!(
+        matches!(err, agent_framework_core::error::Error::Content(_)),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("input 1 is an image with no URI"),
+        "{err}"
+    );
+}
+
+/// Every route, not only the mixed one, must return one vector per input: a
+/// short or padded single-route batch would misalign the caller's data.
+#[tokio::test]
+async fn a_single_route_batch_with_the_wrong_vector_count_errors() {
+    // Text only: two vectors for one input.
+    let (endpoint, _seen) = one_shot_server(200, OUT_OF_ORDER_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+    let err = client
+        .get_embeddings(vec!["alpha".into()], None)
+        .await
+        .expect_err("padded text batch");
+    assert!(
+        err.to_string().contains("2 embeddings for 1 inputs"),
+        "{err}"
+    );
+
+    // Images only: one vector for two inputs.
+    let (endpoint, _seen) = one_shot_server(200, ONE_VECTOR_BODY);
+    let client = FoundryEmbeddingClient::new(format!("{endpoint}/models"), "m", "k");
+    let image = || Content::Data(DataContent::from_bytes(&[0x89, 0x50], "image/png"));
+    let err = client
+        .get_embeddings(vec![image().into(), image().into()], None)
+        .await
+        .expect_err("short image batch");
+    assert!(
+        err.to_string().contains("1 embeddings for 2 inputs"),
+        "{err}"
+    );
 }
