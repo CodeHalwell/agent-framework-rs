@@ -357,7 +357,7 @@ fn split_top_level(list: &str) -> Vec<&str> {
 /// Names lose their namespace, enclosing type and generic arity; C# keyword
 /// aliases take their CLR names; nullability (`?`, `Nullable<T>`), by-ref
 /// (`&`) and parameter modifiers drop out; and a generic placeholder (`!0`,
-/// `!!0`) becomes `*`, which matches any one name.
+/// `!!0`) stays one token for [`bind_placeholders`] to name.
 fn parameter_type(spelling: &str) -> Vec<String> {
     let mut rest = spelling.trim();
     while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
@@ -382,13 +382,15 @@ fn parameter_type(spelling: &str) -> Vec<String> {
             let name = name.split('`').next().unwrap_or_default();
             tokens.push(clr_alias(name).to_string());
         } else if c == '!' {
-            while chars
-                .peek()
-                .is_some_and(|n| *n == '!' || n.is_ascii_digit())
-            {
+            let mut placeholder = c.to_string();
+            while let Some(&n) = chars.peek() {
+                if !(n == '!' || n.is_ascii_digit()) {
+                    break;
+                }
+                placeholder.push(n);
                 chars.next();
             }
-            tokens.push("*".to_string());
+            tokens.push(placeholder);
         } else if !(c.is_whitespace() || matches!(c, '?' | '&')) {
             tokens.push(c.to_string());
         }
@@ -440,9 +442,24 @@ fn clr_alias(name: &str) -> &str {
     }
 }
 
-/// `(base name, parameter types or None for a property-like key)`, the
-/// types normalised by [`parameter_type`].
-fn member_shape(key: &str) -> (String, Option<Vec<Vec<String>>>) {
+/// Matches any one name: a type's generic parameter (`!N`) that the key
+/// does not spell out.
+const ANY: &str = "!?";
+
+/// A member key reduced to what identifies its overload.
+#[derive(Debug, PartialEq)]
+struct Shape {
+    name: String,
+    /// The method's own generic parameters: their names in the source
+    /// spelling (`SetValue<T>` → `["T"]`), `!!0`, `!!1`, … in the CLR one
+    /// (``SetValue``1`` → `["!!0"]`). Its length is the generic arity.
+    generics: Vec<String>,
+    /// Parameter types normalised by [`parameter_type`]; `None` for a
+    /// property-like key.
+    params: Option<Vec<Vec<String>>>,
+}
+
+fn member_shape(key: &str) -> Shape {
     let head = key.split(" -> ").next().unwrap_or(key);
     let (name, params) = match head.split_once('(') {
         Some((name, rest)) => {
@@ -455,19 +472,94 @@ fn member_shape(key: &str) -> (String, Option<Vec<Vec<String>>>) {
         }
         None => (head, None),
     };
-    let name = name.split(['<', '`']).next().unwrap_or(name).trim();
-    (name.to_string(), params)
+    let name = name.trim();
+    let (base, generics) = if let Some((base, arity)) = name.split_once("``") {
+        let arity: usize = arity.parse().unwrap_or(0);
+        (base, (0..arity).map(|i| format!("!!{i}")).collect())
+    } else if let Some((base, args)) = name.split_once('<') {
+        let names = split_top_level(args.strip_suffix('>').unwrap_or(args))
+            .into_iter()
+            .map(|n| n.trim().to_string())
+            .collect();
+        (base, names)
+    } else {
+        (name, Vec::new())
+    };
+    Shape {
+        name: base.trim().to_string(),
+        generics,
+        params,
+    }
+}
+
+/// The generic parameters a source-spelled type key declares, outermost
+/// first (`Outer<K>.Inner<V>` → `["K", "V"]`): the order the CLR numbers
+/// `!0`, `!1`, … in.
+fn type_generics(ty: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = ty;
+    while let Some((_, after)) = rest.split_once('<') {
+        let mut depth = 1;
+        let end = after
+            .char_indices()
+            .find(|&(_, c)| {
+                match c {
+                    '<' => depth += 1,
+                    '>' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map_or(after.len(), |(i, _)| i);
+        out.extend(
+            split_top_level(&after[..end])
+                .into_iter()
+                .map(|n| n.trim().to_string()),
+        );
+        rest = &after[end..];
+    }
+    out
+}
+
+/// A CLR parameter list with its placeholders named: `!!N` becomes the key
+/// method's Nth generic parameter and `!N` the key type's Nth, or [`ANY`]
+/// when the key does not spell that one out. A `!!N` past the key method's
+/// arity stays as it is and so matches nothing.
+fn bind_placeholders(params: &[Vec<String>], method: &[String], ty: &[String]) -> Vec<Vec<String>> {
+    let bind = |token: &String| -> Vec<String> {
+        if let Some(n) = token.strip_prefix("!!") {
+            match n.parse::<usize>().ok().and_then(|i| method.get(i)) {
+                Some(name) => parameter_type(name),
+                None => vec![token.clone()],
+            }
+        } else if let Some(n) = token.strip_prefix('!') {
+            match n.parse::<usize>().ok().and_then(|i| ty.get(i)) {
+                Some(name) => parameter_type(name),
+                None => vec![ANY.to_string()],
+            }
+        } else {
+            vec![token.clone()]
+        }
+    };
+    params
+        .iter()
+        .map(|p| p.iter().flat_map(bind).collect())
+        .collect()
 }
 
 /// Whether two normalised parameter lists name the same overload: same
-/// length, and each type equal token for token, `*` matching any one token.
+/// length, and each type equal token for token, [`ANY`] matching any one
+/// token.
 fn same_parameters(a: &[Vec<String>], b: &[Vec<String>]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
-            x.len() == y.len() && x.iter().zip(y).all(|(s, t)| s == t || s == "*" || t == "*")
+            x.len() == y.len() && x.iter().zip(y).all(|(s, t)| s == t || s == ANY || t == ANY)
         })
 }
 
+/// Whether the inventory declares `key`. A member must match by name,
+/// generic arity and parameter types, with the inventory's placeholders
+/// bound to the generic parameters the key names.
 fn resolves_in_inventory(inventory: &Value, key: &Key) -> bool {
     let (ns, ty, group, member) = key;
     let Some(entry) = inventory["types"].get(clr_type_key(ns, ty)) else {
@@ -476,16 +568,20 @@ fn resolves_in_inventory(inventory: &Value, key: &Key) -> bool {
     if group == "type" {
         return true;
     }
-    let (mut name, params) = member_shape(member);
+    let mut want = member_shape(member);
     if group == "constructors" {
-        name = ".ctor".to_string();
+        want.name = ".ctor".to_string();
     }
+    let ty_generics = type_generics(ty);
     entry[group.as_str()].as_object().is_some_and(|members| {
         members.keys().any(|k| {
-            let (n, p) = member_shape(k);
-            n == name
-                && match (&params, &p) {
-                    (Some(a), Some(b)) => same_parameters(a, b),
+            let have = member_shape(k);
+            have.name == want.name
+                && have.generics.len() == want.generics.len()
+                && match (&want.params, &have.params) {
+                    (Some(a), Some(b)) => {
+                        same_parameters(a, &bind_placeholders(b, &want.generics, &ty_generics))
+                    }
                     _ => true,
                 }
         })
@@ -1075,41 +1171,58 @@ mod tests {
         }
     }
 
-    fn shape(key: &str) -> (String, Option<Vec<String>>) {
-        let (name, params) = member_shape(key);
+    type Flat = (String, Vec<String>, Option<Vec<String>>);
+
+    fn shape(key: &str) -> Flat {
+        let Shape {
+            name,
+            generics,
+            params,
+        } = member_shape(key);
         let params = params.map(|ps| ps.into_iter().map(|p| p.join(" ")).collect());
-        (name, params)
+        (name, generics, params)
+    }
+
+    fn flat(name: &str, generics: &[&str], params: Option<&[&str]>) -> Flat {
+        let strings = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect();
+        (name.into(), strings(generics), params.map(strings))
     }
 
     #[test]
-    fn member_shapes_ignore_generics_and_return_types() {
+    fn member_shapes_keep_generic_arity_and_drop_return_types() {
         assert_eq!(
             shape("RunAsync<T>(string, AgentSession, CancellationToken)"),
-            (
-                "RunAsync".into(),
-                Some(vec![
-                    "String".into(),
-                    "AgentSession".into(),
-                    "CancellationToken".into()
-                ])
+            flat(
+                "RunAsync",
+                &["T"],
+                Some(&["String", "AgentSession", "CancellationToken"])
             )
         );
         assert_eq!(
             shape("GetService``1(System.Object) -> !!0"),
-            ("GetService".into(), Some(vec!["Object".into()]))
+            flat("GetService", &["!!0"], Some(&["Object"]))
+        );
+        assert_eq!(
+            shape("Convert<TIn, TOut>(TIn)"),
+            flat("Convert", &["TIn", "TOut"], Some(&["TIn"]))
         );
         assert_eq!(
             shape("AddEdge(Microsoft.Agents.AI.Workflows.ExecutorBinding,System.Func`2<System.Object,System.Boolean>) -> X"),
-            (
-                "AddEdge".into(),
-                Some(vec![
-                    "ExecutorBinding".into(),
-                    "Func < Object , Boolean >".into()
-                ])
+            flat(
+                "AddEdge",
+                &[],
+                Some(&["ExecutorBinding", "Func < Object , Boolean >"])
             )
         );
-        assert_eq!(shape("Name -> System.String"), ("Name".into(), None));
-        assert_eq!(shape("Build()"), ("Build".into(), Some(vec![])));
+        assert_eq!(shape("Name -> System.String"), flat("Name", &[], None));
+        assert_eq!(shape("Build()"), flat("Build", &[], Some(&[])));
+    }
+
+    #[test]
+    fn type_generics_list_enclosing_parameters_first() {
+        assert_eq!(type_generics("Box"), Vec::<String>::new());
+        assert_eq!(type_generics("AgentResponse<T>"), ["T"]);
+        assert_eq!(type_generics("Outer<K, V>.Inner<W>"), ["K", "V", "W"]);
     }
 
     #[test]
@@ -1135,7 +1248,8 @@ mod tests {
                 "{ledger}"
             );
         }
-        assert_eq!(parameter_type("!!0"), ["*"]);
+        assert_eq!(parameter_type("!!0"), ["!!0"]);
+        assert_eq!(parameter_type("!1[]"), ["!1", "[", "]"]);
     }
 
     #[test]
@@ -1170,6 +1284,69 @@ mod tests {
                 resolves_in_inventory(&inventory, &key(group, member)),
                 found,
                 "{group}::{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_lookup_binds_generic_placeholders() {
+        let inventory = serde_json::json!({"types": {
+            "Microsoft.Agents.AI.AgentSessionStateBag": {"methods": {
+                "SetValue``1(System.String,!!0,System.Text.Json.JsonSerializerOptions) -> System.Void": {},
+                "Get(System.String) -> System.Object": {}
+            }},
+            "N.Box`1": {"methods": {
+                "Put(!0) -> System.Void": {},
+                "Map``1(System.Func`2<!0,!!0>) -> N.Box`1<!!0>": {}
+            }},
+            "N.Outer`1+Inner`1": {"methods": {"Pair(!0,!1) -> System.Void": {}}}
+        }});
+        for (ns, ty, member, found) in [
+            // `!!0` is `T`, so the misspelled `string` second parameter
+            // no longer matches.
+            (
+                "Microsoft.Agents.AI",
+                "AgentSessionStateBag",
+                "SetValue<T>(string, T, JsonSerializerOptions)",
+                true,
+            ),
+            (
+                "Microsoft.Agents.AI",
+                "AgentSessionStateBag",
+                "SetValue<T>(string, string, JsonSerializerOptions)",
+                false,
+            ),
+            // Generic arity is part of the overload.
+            (
+                "Microsoft.Agents.AI",
+                "AgentSessionStateBag",
+                "SetValue(string, T, JsonSerializerOptions)",
+                false,
+            ),
+            (
+                "Microsoft.Agents.AI",
+                "AgentSessionStateBag",
+                "Get<T>(string)",
+                false,
+            ),
+            // `!0` is the type's own parameter, as the key names it.
+            ("N", "Box<T>", "Put(T)", true),
+            ("N", "Box<T>", "Put(string)", false),
+            ("N", "Box<T>", "Map<TOut>(Func<T, TOut>)", true),
+            ("N", "Box<T>", "Map<TOut>(Func<TOut, T>)", false),
+            ("N", "Outer<K>.Inner<V>", "Pair(K, V)", true),
+            ("N", "Outer<K>.Inner<V>", "Pair(V, K)", false),
+        ] {
+            let key = (
+                ns.to_string(),
+                ty.to_string(),
+                "methods".to_string(),
+                member.to_string(),
+            );
+            assert_eq!(
+                resolves_in_inventory(&inventory, &key),
+                found,
+                "{ty}::{member}"
             );
         }
     }
