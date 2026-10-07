@@ -2,10 +2,17 @@
 
 All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
-adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
-may break APIs).
+adheres to [Semantic Versioning](https://semver.org/). From 1.0, APIs behind
+an `experimental-*` cargo feature are exempt (see `docs/feature-stages.md`);
+before 1.0, minor bumps could break APIs.
 
-## [Unreleased]
+## [1.0.0] — Unreleased
+
+The first stable release. From here the public API follows semantic
+versioning, except for surfaces behind `experimental-*` features, which track
+what upstream still marks experimental. Alongside the breaking changes below,
+the release adds `SCOPE.md` (what this port deliberately does not carry) and
+a symbol-level parity ledger against .NET and Go in `docs/parity/`.
 
 ### Multimodal embedding inputs (breaking)
 

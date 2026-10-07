@@ -119,11 +119,20 @@ parity with the Python and .NET implementations.
 | [`agent-framework-purview`](crates/agent-framework-purview) | Microsoft Purview compliance middleware (`processContent` DLP checks). |
 | [`agent-framework`](crates/agent-framework) | Umbrella crate re-exporting the core plus everything above behind cargo features. |
 
+## Stability
+
+From 1.0 the public API follows [Semantic Versioning](https://semver.org/):
+breaking changes wait for a major release. The exception is anything behind
+an `experimental-*` cargo feature, which tracks APIs upstream still marks
+experimental and can change in any minor release
+([`docs/feature-stages.md`](docs/feature-stages.md)). The minimum supported
+Rust version can rise in a minor release.
+
 ## Quick start
 
 ```toml
 [dependencies]
-agent-framework = "0.1"
+agent-framework = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -223,9 +232,9 @@ features and carry no semver promise. `full` leaves them out, and
 
 ```toml
 # Everything:
-agent-framework = { version = "0.1", features = ["full"] }
+agent-framework = { version = "1", features = ["full"] }
 # Just OpenAI (the default) plus Anthropic:
-agent-framework = { version = "0.1", features = ["anthropic"] }
+agent-framework = { version = "1", features = ["anthropic"] }
 ```
 
 ## Examples
