@@ -118,6 +118,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-cosmos`](crates/agent-framework-cosmos) | Azure Cosmos DB NoSQL `ChatMessageStore`, workflow checkpoints, and vector store (master key or Entra ID, REST). |
 | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) | Microsoft Copilot Studio agent client (Direct-to-Engine). |
 | [`agent-framework-purview`](crates/agent-framework-purview) | Microsoft Purview compliance middleware (`processContent` DLP checks). |
+| [`agent-framework-tools`](crates/agent-framework-tools) | Built-in tools: a local shell tool (approval required by default, policy pre-filter, persistent or stateless sessions) and a Docker shell tool with locked-down container defaults. |
 | [`agent-framework`](crates/agent-framework) | Umbrella crate re-exporting the core plus everything above behind cargo features. |
 
 ## Quick start
@@ -207,6 +208,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
+| `tools` | [`agent-framework-tools`](crates/agent-framework-tools) — local and Docker shell tools (re-exported as `builtin_tools`) | no |
 | `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
 | `full` | all of the above except `otel-metrics` | no |
 
@@ -285,6 +287,7 @@ one-to-one:
 | `redis` / `mem0` packages | [`agent-framework-redis`](crates/agent-framework-redis) / [`agent-framework-mem0`](crates/agent-framework-mem0) |
 | `foundry` / `azure-ai-search` packages | [`agent-framework-foundry`](crates/agent-framework-foundry) / [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) |
 | `copilotstudio` / `purview` packages | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) / [`agent-framework-purview`](crates/agent-framework-purview) |
+| `tools` package (`agent_framework_tools.shell`) | [`agent-framework-tools`](crates/agent-framework-tools) (`shell::LocalShellTool`, `shell::DockerShellTool`, `shell::ShellPolicy`, `shell::ShellEnvironmentProvider`) |
 | (.NET `Microsoft.Agents.AI.CosmosNoSql`) | [`agent-framework-cosmos`](crates/agent-framework-cosmos) |
 
 Cross-cutting behavior implemented in Python via class decorators

@@ -51,7 +51,6 @@ from the roadmap, not from this file.
 - **Agent hooks**, **evaluation** and **security (FIDES)**: all marked
   experimental upstream; when ported they go behind `experimental-*`
   features (see `docs/feature-stages.md`).
-- **Local shell tool** (hosted shell content types exist).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control
