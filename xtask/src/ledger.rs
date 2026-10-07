@@ -497,8 +497,25 @@ fn counts(map: &BTreeMap<String, usize>) -> String {
         .join(" / ")
 }
 
+/// Loads the inputs for a read-only command, failing on any parse problem so
+/// a malformed ledger or catalog is never reported, or written, as partial.
+fn load_strict(root: &Path) -> Result<Inputs, String> {
+    let mut errors = Vec::new();
+    let inputs = load(root, &mut errors)?;
+    if errors.is_empty() {
+        return Ok(inputs);
+    }
+    for e in &errors {
+        eprintln!("  {e}");
+    }
+    Err(format!(
+        "{} problem(s) reading the parity ledger; run `cargo xtask parity check`",
+        errors.len()
+    ))
+}
+
 pub fn summary(root: &Path) -> Result<(), String> {
-    let inputs = load(root, &mut Vec::new())?;
+    let inputs = load_strict(root)?;
     println!("counts are {}", STATUSES.join(" / "));
     for (ns, r) in tally(&inputs) {
         println!(
@@ -539,7 +556,7 @@ fn gap_rows(inputs: &Inputs) -> Vec<(Key, String, String, String)> {
 }
 
 pub fn gaps(root: &Path, namespace: Option<&str>) -> Result<(), String> {
-    let inputs = load(root, &mut Vec::new())?;
+    let inputs = load_strict(root)?;
     for (key, rust, go, note) in gap_rows(&inputs) {
         if namespace.is_some_and(|ns| !key.0.contains(ns)) {
             continue;
@@ -553,7 +570,7 @@ pub fn gaps(root: &Path, namespace: Option<&str>) -> Result<(), String> {
 }
 
 pub fn write_report(root: &Path) -> Result<(), String> {
-    let inputs = load(root, &mut Vec::new())?;
+    let inputs = load_strict(root)?;
     fs::write(root.join(REPORT), render_report(&inputs))
         .map_err(|e| format!("writing {REPORT}: {e}"))?;
     println!("wrote {REPORT}");
@@ -679,6 +696,28 @@ mod tests {
             clr_type_key("Microsoft.Agents.AI.Workflows", "Executor<TInput, TOutput>"),
             "Microsoft.Agents.AI.Workflows.Executor`2"
         );
+    }
+
+    #[test]
+    fn report_refuses_to_write_from_a_malformed_ledger() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let root = std::env::temp_dir().join(format!("parity-report-{}", std::process::id()));
+        let upstream = root.join("docs/parity/upstream");
+        fs::create_dir_all(&upstream).unwrap();
+        for file in [INVENTORY, GO_MAPPING] {
+            fs::copy(repo.join(file), root.join(file)).unwrap();
+        }
+        let ledger = serde_json::json!({
+            "schema_version": 1,
+            "namespaces": { "Microsoft.Agents.AI": { "AIAgent": { "bogus_group": {} } } }
+        });
+        fs::write(root.join(LEDGER), ledger.to_string()).unwrap();
+
+        let result = write_report(&root);
+        let written = root.join(REPORT).exists();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(result.is_err(), "report accepted a malformed ledger");
+        assert!(!written, "report was written from a malformed ledger");
     }
 
     fn flatten_errors(tree: Value) -> Vec<String> {
