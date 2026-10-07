@@ -435,6 +435,63 @@ async fn persistent_confines_workdir_by_default() {
     tool.close().await.unwrap();
 }
 
+/// A relative workdir is resolved once, at build, so the re-anchor does not
+/// look for `repo/repo` from inside `repo`.
+#[tokio::test]
+async fn persistent_relative_workdir_reanchors_to_the_same_directory() {
+    /// Removes the directory it names, relative to the test's cwd.
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Relative to the test's cwd, and not resolvable from inside itself.
+    let relative =
+        std::path::PathBuf::from(format!(".af-tools-relative-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(relative.join("sub")).unwrap();
+    let _cleanup = Cleanup(relative.clone());
+    let dir = std::fs::canonicalize(&relative).unwrap();
+    let tool = persistent().workdir(&relative).build().unwrap();
+    let first = tool.run("cd sub; pwd", None).await.unwrap();
+    assert_eq!(first.exit_code, 0, "{first:?}");
+    assert!(first.stderr.is_empty(), "{first:?}");
+    // The shell is now in `sub`; the next call must still land in `dir`.
+    let pwd = tool.run("pwd", None).await.unwrap();
+    assert_eq!(pwd.exit_code, 0, "{pwd:?}");
+    assert!(pwd.stderr.is_empty(), "{pwd:?}");
+    assert_eq!(std::fs::canonicalize(pwd.stdout.trim()).unwrap(), dir);
+    tool.close().await.unwrap();
+}
+
+/// When the re-anchor fails the command does not run in whatever directory
+/// the shell was left in, and the session survives.
+#[tokio::test]
+async fn persistent_failed_reanchor_stops_the_command() {
+    let dir = TempDir::new("reanchor-fail");
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let marker = dir.path().join("marker");
+    let tool = persistent().workdir(&work).build().unwrap();
+    assert_eq!(tool.run("echo $$", None).await.unwrap().exit_code, 0);
+    std::fs::remove_dir(&work).unwrap();
+    let result = tool
+        .run(&format!("touch '{}'", marker.display()), None)
+        .await
+        .unwrap();
+    assert_ne!(result.exit_code, 0, "{result:?}");
+    assert!(!marker.exists(), "command ran after a failed re-anchor");
+    std::fs::create_dir(&work).unwrap();
+    let after = tool.run("pwd", None).await.unwrap();
+    assert_eq!(after.exit_code, 0, "{after:?}");
+    assert_eq!(std::fs::canonicalize(after.stdout.trim()).unwrap(), work);
+    tool.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn persistent_reports_exit_codes_and_stderr() {
     let tool = persistent().build().unwrap();
@@ -568,6 +625,24 @@ async fn persistent_close_then_run_starts_a_new_shell() {
         "old shell {pid} survived close"
     );
     tool.close().await.unwrap();
+}
+
+/// The shell exits normally on `close`, but its background jobs are still
+/// in its process group and must not outlive the session.
+#[tokio::test]
+async fn persistent_close_kills_background_jobs() {
+    let tool = persistent().build().unwrap();
+    let result = tool
+        .run("sleep 3600 >/dev/null 2>&1 & echo $!", None)
+        .await
+        .unwrap();
+    let pid: u32 = result.stdout.trim().parse().unwrap();
+    assert!(process_alive(pid));
+    tool.close().await.unwrap();
+    assert!(
+        eventually(|| !process_alive(pid)).await,
+        "background job {pid} survived close"
+    );
 }
 
 #[tokio::test]

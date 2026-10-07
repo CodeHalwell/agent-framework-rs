@@ -192,6 +192,8 @@ impl LocalShellToolBuilder {
     }
 
     /// The working directory for commands. Defaults to the process's own.
+    /// A relative path is resolved against the process's current directory
+    /// when the tool is built.
     pub fn workdir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.workdir = Some(dir.into());
         self
@@ -316,12 +318,24 @@ impl LocalShellToolBuilder {
             merged.extend(self.env);
             Some(merged)
         };
+        // Absolute now, so the persistent shell's per-command re-anchor does
+        // not resolve a relative path against the directory it already
+        // started in (`repo/repo`), and a later change of the host process's
+        // directory does not move the tool.
+        let workdir = self
+            .workdir
+            .map(|dir| {
+                std::path::absolute(&dir).map_err(|e| {
+                    ShellError::Config(format!("cannot resolve workdir {}: {e}", dir.display()))
+                })
+            })
+            .transpose()?;
         let interactive_argv = resolve_shell(self.shell.as_ref(), true)?;
         let stateless_argv = resolve_shell(self.shell.as_ref(), false)?;
         let session = (self.mode == ShellMode::Persistent).then(|| {
             ShellSession::new(
                 interactive_argv.clone(),
-                self.workdir.clone(),
+                workdir.clone(),
                 env.clone(),
                 self.max_output_bytes,
             )
@@ -329,7 +343,7 @@ impl LocalShellToolBuilder {
         Ok(LocalShellTool {
             inner: Arc::new(Inner {
                 mode: self.mode,
-                workdir: self.workdir,
+                workdir,
                 confine_workdir: self.confine_workdir,
                 env,
                 policy: self.policy,
@@ -491,6 +505,10 @@ impl LocalShellTool {
     }
 
     /// Prefix a `cd` back into the working directory, when confinement is on.
+    /// If the `cd` fails (the directory was removed, say) the command does
+    /// not run and the call reports a failure, rather than running in
+    /// whatever directory the shell was left in. Neither form exits the
+    /// persistent shell.
     fn reanchor(&self, command: &str) -> String {
         let Some(dir) = self
             .inner
@@ -502,12 +520,20 @@ impl LocalShellTool {
         };
         let dir = dir.to_string_lossy();
         if is_powershell(&self.inner.interactive_argv) {
+            // A stopping error ends the script inside the session's `try`,
+            // which reports exit code 1.
             format!(
-                "Set-Location -LiteralPath {}\n{command}",
+                "Set-Location -LiteralPath {} -ErrorAction Stop\n{command}",
                 quote_powershell(&dir)
             )
         } else {
-            format!("cd -- {}\n{command}", quote_posix(&dir))
+            // `exit` would end the persistent shell and `return` is invalid
+            // outside a function, so the command runs only in the `then`
+            // branch (`:` keeps a comment-only command valid syntax).
+            format!(
+                "if cd -- {}; then :\n{command}\nelse (exit 1); fi",
+                quote_posix(&dir)
+            )
         }
     }
 }
@@ -595,25 +621,32 @@ mod tests {
     }
 
     #[test]
-    fn reanchors_powershell_paths() {
+    fn reanchors_powershell_paths_and_stops_on_failure() {
+        // Absolute on the host, so `build` keeps it as given.
+        let dir = if cfg!(windows) { "C:\\repo" } else { "/repo" };
         let tool = LocalShellTool::builder()
             .shell("pwsh")
-            .workdir("C:\\repo")
+            .workdir(dir)
             .build()
             .unwrap();
-        assert!(tool
-            .reanchor("Get-ChildItem")
-            .starts_with("Set-Location -LiteralPath 'C:\\repo'\nGet-ChildItem"));
+        assert_eq!(
+            tool.reanchor("Get-ChildItem"),
+            format!("Set-Location -LiteralPath '{dir}' -ErrorAction Stop\nGet-ChildItem")
+        );
     }
 
     #[test]
+    #[cfg(unix)]
     fn reanchors_posix_paths_with_quoting() {
         let tool = LocalShellTool::builder()
             .shell("/bin/sh")
             .workdir("/srv/it's here")
             .build()
             .unwrap();
-        assert_eq!(tool.reanchor("ls"), "cd -- '/srv/it'\\''s here'\nls");
+        assert_eq!(
+            tool.reanchor("ls"),
+            "if cd -- '/srv/it'\\''s here'; then :\nls\nelse (exit 1); fi"
+        );
         let unconfined = LocalShellTool::builder()
             .shell("/bin/sh")
             .workdir("/srv")
@@ -621,5 +654,20 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(unconfined.reanchor("ls"), "ls");
+    }
+
+    #[test]
+    fn relative_workdir_is_made_absolute_at_build() {
+        let tool = LocalShellTool::builder()
+            .shell("/bin/sh")
+            .workdir("repo")
+            .build()
+            .unwrap();
+        let expected = std::env::current_dir().unwrap().join("repo");
+        assert_eq!(tool.inner.workdir.as_deref(), Some(expected.as_path()));
+        assert!(tool.reanchor("ls").starts_with(&format!(
+            "if cd -- {};",
+            quote_posix(&expected.to_string_lossy())
+        )));
     }
 }

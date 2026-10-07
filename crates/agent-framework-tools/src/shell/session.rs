@@ -181,6 +181,9 @@ struct Live {
     stdin: ChildStdin,
     shared: Arc<Shared>,
     readers: Vec<JoinHandle<()>>,
+    /// The shell's pid (and, on Unix, its process group id), kept because
+    /// `child.id()` is `None` once the shell has been reaped.
+    pid: Option<u32>,
 }
 
 impl Drop for Live {
@@ -189,11 +192,20 @@ impl Drop for Live {
             reader.abort();
         }
         // `kill_on_drop` reaches only the shell; take its process tree with
-        // it while the shell is still alive to anchor the tree.
+        // it.
+        let Some(pid) = self.pid else {
+            return;
+        };
+        // On Unix the shell leads its own process group, which outlives it:
+        // a background job (`sleep 3600 &`) is still in the group after the
+        // shell exited normally, so the group is killed either way.
+        #[cfg(unix)]
+        kill_tree_now(pid);
+        // Elsewhere the tree is found from the shell, which must be alive to
+        // anchor it.
+        #[cfg(not(unix))]
         if matches!(self.child.try_wait(), Ok(None)) {
-            if let Some(pid) = self.child.id() {
-                kill_tree_now(pid);
-            }
+            kill_tree_now(pid);
         }
     }
 }
@@ -357,6 +369,7 @@ impl ShellSession {
             spawn_reader(stderr, shared.clone(), false),
         ];
         let mut started = Live {
+            pid: child.id(),
             child,
             stdin,
             shared,
@@ -406,7 +419,9 @@ impl ShellSession {
                     kill_process_tree(&mut live.child, KILL_GRACE).await;
                 }
             }
-            // Dropping `live` aborts the readers.
+            // Dropping `live` aborts the readers and, on Unix, kills what is
+            // left of the shell's process group (background jobs survive a
+            // normal `exit`).
         }
     }
 

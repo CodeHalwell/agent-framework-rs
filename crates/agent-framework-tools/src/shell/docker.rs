@@ -90,27 +90,6 @@ pub(crate) const BLOCKED_EXTRA_RUN_FLAGS: &[&str] = &[
     "--name",
 ];
 
-/// `docker run` long options that take no value. Any other long option is
-/// assumed to take the next token, so a detached value that starts with a
-/// dash (`--env-file -vars.env`) is not misread as an option.
-pub(crate) const VALUELESS_LONG_FLAGS: &[&str] = &[
-    "--detach",
-    "--disable-content-trust",
-    "--help",
-    "--init",
-    "--interactive",
-    "--no-healthcheck",
-    "--oom-kill-disable",
-    "--privileged",
-    "--publish-all",
-    "--quiet",
-    "--read-only",
-    "--rm",
-    "--sig-proxy",
-    "--tty",
-    "--use-api-socket",
-];
-
 /// Boolean `docker run` shorthands (may be clustered: `-it`).
 pub(crate) const BOOLEAN_SHORT_FLAGS: &str = "diPqt";
 /// Value-taking `docker run` shorthands (the rest of the token is the value:
@@ -145,58 +124,31 @@ fn is_blocked_token(raw: &str) -> bool {
         .any(|s| BLOCKED_EXTRA_RUN_FLAGS.contains(&s.as_str()))
 }
 
-/// Whether `raw` takes the following token as its value.
-pub(crate) fn consumes_next_token(raw: &str) -> bool {
-    let (name, attached) = match raw.split_once('=') {
-        Some((name, _)) => (name, true),
-        None => (raw, false),
-    };
-    if attached {
-        return false;
-    }
-    if name.starts_with("--") {
-        return !VALUELESS_LONG_FLAGS.contains(&name);
-    }
-    let shorts = short_flags_in_token(name);
-    let Some(last) = shorts.last() else {
-        return false;
-    };
-    if name.chars().count() - 1 > shorts.len() {
-        // Trailing text is the value: `-v/:/host:rw`, `-m0`.
-        return false;
-    }
-    last.chars()
-        .nth(1)
-        .is_some_and(|c| VALUE_SHORT_FLAGS.contains(c))
-}
-
 /// Reject `extra_run_args` that would break the isolation contract,
 /// including attached (`-v/:/host`) and clustered (`-itv/:/host`) forms.
+///
+/// Fails closed: every token that starts with `-` is checked on its own,
+/// whatever precedes it. Guessing which tokens are option values would need
+/// every runtime's flag table (Podman's valueless `--no-hosts` followed by
+/// `--privileged` would otherwise hide the second flag as the first one's
+/// value). A legitimate value that starts with `-` and reads as a blocked
+/// flag must use the attached form (`--label=-v`).
 pub(crate) fn validate_extra_run_args(args: &[String]) -> Result<(), ShellError> {
-    let mut bad = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let raw = &args[i];
-        i += 1;
+    let bad: Vec<&String> = args
+        .iter()
         // "-" is a positional and "--" only ends option parsing; arguments
         // after "--" are still checked so nothing hides behind it.
-        if raw == "-" || raw == "--" || !raw.starts_with('-') {
-            continue;
-        }
-        if is_blocked_token(raw) {
-            bad.push(raw.clone());
-        }
-        if consumes_next_token(raw) {
-            i += 1;
-        }
-    }
+        .filter(|raw| raw.starts_with('-') && *raw != "-" && *raw != "--")
+        .filter(|raw| is_blocked_token(raw))
+        .collect();
     if bad.is_empty() {
         return Ok(());
     }
     Err(ShellError::Config(format!(
         "extra_run_args contains flags that would dismantle DockerShellTool's isolation \
          defaults: {bad:?}. Use the dedicated builder methods (network, host_workdir, \
-         mount_readonly, read_only_root, memory, pids_limit, user) instead."
+         mount_readonly, read_only_root, memory, pids_limit, user) instead. Every token \
+         is checked, so pass a value that starts with '-' attached: --flag=value."
     )))
 }
 
@@ -360,7 +312,9 @@ impl DockerShellToolBuilder {
 
     /// Extra `docker run` arguments, appended after the isolation defaults.
     /// Flags that would undo those defaults are rejected by
-    /// [`build`](Self::build); use the dedicated methods instead.
+    /// [`build`](Self::build); use the dedicated methods instead. Every
+    /// token is checked on its own, so give a value that starts with `-` in
+    /// attached form (`--label=-x`).
     pub fn extra_run_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1377,6 +1331,15 @@ mod tests {
             &["-itd"],
             &["--name", "other"],
             &["--name=other"],
+            // An unknown valueless flag must not hide the next one as its
+            // value (Podman's `--no-hosts`).
+            &["--no-hosts", "--privileged"],
+            &["--no-hosts", "-v/:/host:rw"],
+            &["--some-future-flag", "--network=host"],
+            // Dash-leading detached values fail closed.
+            &["--label", "-v/:/host:rw"],
+            &["--entrypoint", "-v"],
+            &["--hostname", "-unusual"],
         ];
         for extra in cases {
             assert!(rejects(extra), "{extra:?} should be rejected");
@@ -1407,12 +1370,12 @@ mod tests {
             &["-it"],
             &["--"],
             &["-"],
-            &["--env-file", "-variables.env"],
-            &["--label", "-upper"],
-            &["--label", "-v/:/host:rw"],
-            &["--entrypoint", "-v"],
-            &["-e", "-value"],
-            &["--hostname", "-unusual"],
+            &["--no-hosts", "--label", "x=1"],
+            &["--env-file", "-xyz.env"],
+            &["--label=-upper"],
+            &["--label=-v/:/host:rw"],
+            &["--entrypoint=-v"],
+            &["-e=-value"],
             &["--env-file=-variables.env"],
         ];
         for extra in cases {
@@ -1469,48 +1432,6 @@ mod tests {
         assert!(!BOOLEAN_SHORT_FLAGS
             .chars()
             .any(|c| VALUE_SHORT_FLAGS.contains(c)));
-    }
-
-    #[test]
-    fn valueless_long_flags_cover_every_docker_boolean() {
-        for flag in [
-            "--detach",
-            "--help",
-            "--init",
-            "--interactive",
-            "--no-healthcheck",
-            "--oom-kill-disable",
-            "--privileged",
-            "--publish-all",
-            "--quiet",
-            "--read-only",
-            "--rm",
-            "--sig-proxy",
-            "--tty",
-            "--use-api-socket",
-        ] {
-            assert!(VALUELESS_LONG_FLAGS.contains(&flag), "{flag}");
-        }
-    }
-
-    #[test]
-    fn consumes_next_token_cases() {
-        for (token, consumes) in [
-            ("--env-file", true),
-            ("--env-file=vars.env", false),
-            ("--privileged", false),
-            ("--read-only", false),
-            ("--network", true),
-            ("-v", true),
-            ("-v/:/host:rw", false),
-            ("-m", true),
-            ("-m0", false),
-            ("-it", false),
-            ("-itv", true),
-            ("-e", true),
-        ] {
-            assert_eq!(consumes_next_token(token), consumes, "{token}");
-        }
     }
 
     #[test]
