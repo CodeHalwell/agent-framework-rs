@@ -188,9 +188,16 @@ impl TodoCompleteInput {
     }
 }
 
-/// Clamp `next_id` so it can never collide with a persisted item id.
-fn safe_next_id(items: &[TodoItem], next_id: u64) -> u64 {
-    next_id.max(items.iter().map(|i| i.id).max().unwrap_or(0) + 1)
+/// Clamp `next_id` so it can never collide with a persisted item id. Errors
+/// when a persisted id leaves no id after it.
+fn safe_next_id(items: &[TodoItem], next_id: u64) -> Result<u64> {
+    let after_max = match items.iter().map(|i| i.id).max() {
+        None => 1,
+        Some(max) => max.checked_add(1).ok_or_else(|| {
+            Error::Serialization(format!("todo item id {max} leaves no id to assign next"))
+        })?,
+    };
+    Ok(next_id.max(after_max))
 }
 
 /// The backing store for a session's todo items.
@@ -270,7 +277,7 @@ impl TodoStore for TodoSessionStore {
                 ))
             })?,
         };
-        let next_id = safe_next_id(&items, next_id);
+        let next_id = safe_next_id(&items, next_id)?;
         Ok((items, next_id))
     }
 
@@ -290,7 +297,7 @@ impl TodoStore for TodoSessionStore {
             "items".into(),
             Value::Array(items.iter().map(TodoItem::to_value).collect()),
         );
-        state.insert("next_id".into(), json!(safe_next_id(items, next_id)));
+        state.insert("next_id".into(), json!(safe_next_id(items, next_id)?));
         session.state.insert(source_id, Value::Object(state));
         Ok(())
     }
@@ -461,7 +468,9 @@ impl TodoProvider {
                         );
                         created.push(item.to_value());
                         items.push(item);
-                        next_id += 1;
+                        next_id = next_id
+                            .checked_add(1)
+                            .ok_or_else(|| Error::tool("The todo list has run out of item ids."))?;
                     }
                     inner
                         .store
@@ -713,6 +722,43 @@ mod tests {
         assert!(store.load_state(&session, "todo").await.is_err());
         session.state.insert("todo", json!("not an object"));
         assert!(store.load_state(&session, "todo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_store_rejects_an_exhausted_id_space() {
+        let session = AgentSession::new();
+        session.state.insert(
+            "todo",
+            json!({"items": [{"id": u64::MAX, "title": "last"}], "next_id": 1}),
+        );
+        let err = TodoSessionStore
+            .load_state(&session, "todo")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Serialization(_)), "{err:?}");
+        assert!(safe_next_id(&[], 1).is_ok_and(|id| id == 1));
+    }
+
+    #[tokio::test]
+    async fn add_tool_errors_instead_of_wrapping_the_last_id() {
+        let provider = TodoProvider::new();
+        let session = AgentSession::new();
+        session
+            .state
+            .insert("todo", json!({"items": [], "next_id": u64::MAX}));
+        let tools = provider.tools(&session);
+        let err = call(
+            &tools,
+            "todos_add",
+            json!({"todos": [{"title": "last"}, {"title": "one too many"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("run out of item ids"), "{err}");
+        // Nothing was saved.
+        let (items, next_id) = TodoSessionStore.load_state(&session, "todo").await.unwrap();
+        assert!(items.is_empty());
+        assert_eq!(next_id, u64::MAX);
     }
 
     #[tokio::test]

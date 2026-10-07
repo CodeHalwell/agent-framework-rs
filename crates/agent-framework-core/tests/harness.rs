@@ -26,6 +26,7 @@ struct MockState {
     options: Vec<ChatOptions>,
     service_mode: bool,
     conversations: usize,
+    fail_next: bool,
 }
 
 /// Returns scripted responses in order, then "response to: <last text>".
@@ -54,6 +55,10 @@ impl Mock {
     fn calls(&self) -> usize {
         self.0.lock().unwrap().received.len()
     }
+    /// Make the next model call fail.
+    fn fail_next(&self) {
+        self.0.lock().unwrap().fail_next = true;
+    }
     /// The message texts of call `i`.
     fn received(&self, i: usize) -> Vec<String> {
         self.0.lock().unwrap().received[i]
@@ -80,6 +85,11 @@ impl ChatClient for Mock {
         let last = messages.last().map(Message::text).unwrap_or_default();
         state.received.push(messages);
         state.options.push(options);
+        if std::mem::take(&mut state.fail_next) {
+            return Err(agent_framework_core::error::Error::Service(
+                "scripted failure".into(),
+            ));
+        }
         let mut response = state
             .scripted
             .pop_front()
@@ -1024,20 +1034,6 @@ fn approval_fixture(
 }
 
 impl ApprovalFixture {
-    /// How many times a tool ran with exactly `args`. The standing-approval
-    /// tests count executions per argument set because the core function
-    /// invocation loop replays approved calls still present in the session
-    /// history on later runs (independent of the harness), so total counts
-    /// would over-report.
-    fn executed_with(&self, args: Value) -> usize {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, a)| *a == args)
-            .count()
-    }
-
     fn executed(&self) -> Vec<String> {
         self.calls
             .lock()
@@ -1149,6 +1145,163 @@ async fn fully_auto_approved_batch_reruns_without_asking() {
     assert_eq!(f.executed(), ["safe"]);
 }
 
+#[test]
+fn auto_approval_cap_defaults_to_forty_and_rejects_zero() {
+    let f = approval_fixture(&[], |a| a);
+    assert_eq!(DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS, 40);
+    assert_eq!(f.agent.max_auto_approval_iterations(), 40);
+    assert!(f
+        .agent
+        .clone()
+        .with_max_auto_approval_iterations(0)
+        .is_err());
+}
+
+/// A model that keeps calling an auto-approved tool.
+fn endless_safe_calls(f: &ApprovalFixture, n: usize) {
+    for i in 0..n {
+        let id = format!("c{i}");
+        f.client.push(call_response(&[(id.as_str(), "safe", "{}")]));
+    }
+}
+
+#[tokio::test]
+async fn auto_approval_reruns_stop_at_the_cap() {
+    let mut f = approval_fixture(&["safe"], |a| {
+        a.with_auto_approval_rule(|call: &FunctionCallContent| call.name == "safe")
+            .with_max_auto_approval_iterations(2)
+            .unwrap()
+    });
+    endless_safe_calls(&f, 10);
+    let response = f.run(Message::user("go")).await;
+    // Two auto-approved re-runs, then one final turn returned as-is.
+    assert_eq!(f.client.calls(), 3);
+    assert_eq!(f.executed().len(), 2);
+    let requests = approval_requests(&response);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].function_call.call_id, "c2");
+}
+
+#[tokio::test]
+async fn streaming_auto_approval_reruns_stop_at_the_cap() {
+    let f = approval_fixture(&["safe"], |a| {
+        a.with_auto_approval_rule(|call: &FunctionCallContent| call.name == "safe")
+            .with_max_auto_approval_iterations(2)
+            .unwrap()
+    });
+    endless_safe_calls(&f, 10);
+    let updates = collect(
+        f.agent
+            .run_stream(vec![Message::user("go")], Some(f.session.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(f.client.calls(), 3);
+    assert_eq!(f.executed().len(), 2);
+    let requests: Vec<_> = updates
+        .iter()
+        .flat_map(|u| &u.contents)
+        .filter_map(|c| match c {
+            Content::FunctionApprovalRequest(r) => Some(r.function_call.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests, ["c2"]);
+}
+
+#[tokio::test]
+async fn collected_approvals_survive_a_failed_inner_run() {
+    let mut f = approval_fixture(&["first_tool", "second_tool"], |a| a);
+    f.client.push(call_response(&[
+        ("call_first", "first_tool", "{}"),
+        ("call_second", "second_tool", "{}"),
+    ]));
+    let first = f.run(Message::user("call both")).await;
+    let second = f.run(approve(&approval_requests(&first)[0])).await;
+    let last_request = approval_requests(&second).remove(0);
+
+    f.client.fail_next();
+    assert!(f
+        .agent
+        .run(vec![approve(&last_request)], Some(&mut f.session))
+        .await
+        .is_err());
+    assert_eq!(
+        f.agent
+            .state(&f.session)
+            .unwrap()
+            .collected_approval_responses
+            .len(),
+        2
+    );
+
+    // The batch ran before the model call failed; nothing of that run was
+    // stored, so retrying the last answer sends (and runs) the whole batch.
+    assert_eq!(f.executed(), ["first_tool", "second_tool"]);
+    f.client.push(ChatResponse::from_text("done"));
+    let last = f.run(approve(&last_request)).await;
+    assert_eq!(last.text(), "done");
+    assert_eq!(
+        f.executed(),
+        ["first_tool", "second_tool", "first_tool", "second_tool"]
+    );
+    assert!(f
+        .agent
+        .state(&f.session)
+        .unwrap()
+        .collected_approval_responses
+        .is_empty());
+}
+
+#[tokio::test]
+async fn streaming_collected_approvals_survive_a_failed_inner_run() {
+    let mut f = approval_fixture(&["first_tool", "second_tool"], |a| a);
+    f.client.push(call_response(&[
+        ("call_first", "first_tool", "{}"),
+        ("call_second", "second_tool", "{}"),
+    ]));
+    let first = f.run(Message::user("call both")).await;
+    let second = f.run(approve(&approval_requests(&first)[0])).await;
+    let last_request = approval_requests(&second).remove(0);
+
+    f.client.fail_next();
+    let results: Vec<_> = f
+        .agent
+        .run_stream(vec![approve(&last_request)], Some(f.session.clone()), None)
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(results.iter().any(|r| r.is_err()));
+    assert_eq!(f.executed(), ["first_tool", "second_tool"]);
+    assert_eq!(
+        f.agent
+            .state(&f.session)
+            .unwrap()
+            .collected_approval_responses
+            .len(),
+        2
+    );
+
+    f.client.push(ChatResponse::from_text("done"));
+    let updates = collect(
+        f.agent
+            .run_stream(vec![approve(&last_request)], Some(f.session.clone()), None)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(updates
+        .iter()
+        .flat_map(|u| &u.contents)
+        .any(|c| matches!(c, Content::Text(t) if t.text == "done")));
+    assert_eq!(
+        f.executed(),
+        ["first_tool", "second_tool", "first_tool", "second_tool"]
+    );
+}
+
 #[tokio::test]
 async fn always_approve_tool_adds_a_standing_rule() {
     let mut f = approval_fixture(&["dangerous_tool"], |a| a);
@@ -1186,7 +1339,7 @@ async fn always_approve_tool_adds_a_standing_rule() {
     let second = f.run(Message::user("call again")).await;
     assert!(approval_requests(&second).is_empty());
     assert_eq!(second.text(), "second done");
-    assert_eq!(f.executed_with(json!({"value": "two"})), 1);
+    assert_eq!(f.executed().len(), 2);
 }
 
 #[tokio::test]
@@ -1218,6 +1371,7 @@ async fn always_approve_with_arguments_only_covers_identical_arguments() {
     let second = f.run(Message::user("second")).await;
     assert!(approval_requests(&second).is_empty());
     assert_eq!(second.text(), "again");
+    assert_eq!(f.executed().len(), 2);
 
     // Different arguments: asked again.
     f.client.push(call_response(&[(
@@ -1227,7 +1381,7 @@ async fn always_approve_with_arguments_only_covers_identical_arguments() {
     )]));
     let third = f.run(Message::user("third")).await;
     assert_eq!(approval_requests(&third).len(), 1);
-    assert_eq!(f.executed_with(json!({"value": "other"})), 0);
+    assert_eq!(f.executed().len(), 2);
 }
 
 #[tokio::test]
@@ -1257,7 +1411,7 @@ async fn empty_arguments_rule_is_not_tool_wide() {
     let second = f.run(Message::user("with args")).await;
     let requests = approval_requests(&second);
     assert_eq!(requests.len(), 1);
-    assert_eq!(f.executed_with(json!({"value": "custom"})), 0);
+    assert_eq!(f.executed().len(), 1);
 }
 
 #[tokio::test]

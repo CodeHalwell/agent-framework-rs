@@ -75,7 +75,7 @@ pub use todo::{
 };
 pub use tool_approval::{
     ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope, ToolApprovalState,
-    ToolAutoApprovalRule, DEFAULT_TOOL_APPROVAL_SOURCE_ID,
+    ToolAutoApprovalRule, DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS, DEFAULT_TOOL_APPROVAL_SOURCE_ID,
 };
 
 use std::future::Future;

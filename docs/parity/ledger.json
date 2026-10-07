@@ -487,11 +487,12 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
@@ -2184,11 +2185,12 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
@@ -2942,11 +2944,12 @@
           },
           "Session": {
             "rust": [
+              "agent_framework_core::memory::SessionContext::session",
               "agent_framework_core::memory::SessionContext::session_id",
               "agent_framework_core::memory::SessionContext::service_session_id"
             ],
-            "status": "partial",
-            "note": "before_run sees only the session ids, not the AgentSession or its state bag."
+            "status": "mapped",
+            "note": "SessionContext::session is the run's AgentSession (set by Agent runs; None when before_run is called without one), alongside its ids."
           }
         }
       },
@@ -3006,7 +3009,7 @@
             "agent_framework_core::session::SessionState"
           ],
           "status": "partial",
-          "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+          "note": "before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session)."
         },
         "methods": {
           "GetOrInitializeState(AgentSession)": {
@@ -3014,15 +3017,15 @@
               "agent_framework_core::session::SessionState::get",
               "agent_framework_core::session::SessionState::insert"
             ],
-            "status": "partial",
-            "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+            "status": "adapted",
+            "note": "A provider reads and writes its JSON state through SessionContext::session in before_run; there is no typed wrapper."
           },
           "SaveState(AgentSession, TState)": {
             "rust": [
               "agent_framework_core::session::SessionState::insert"
             ],
-            "status": "partial",
-            "note": "ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag."
+            "status": "adapted",
+            "note": "A provider reads and writes its JSON state through SessionContext::session in before_run; there is no typed wrapper."
           }
         }
       },
@@ -3217,7 +3220,7 @@
               "agent_framework_core::harness::tool_approval::ToolApprovalAgent::new"
             ],
             "status": "adapted",
-            "note": "new(inner) with with_auto_approval_rule and with_source_id builders."
+            "note": "new(inner) with with_auto_approval_rule, with_source_id and with_max_auto_approval_iterations builders."
           }
         },
         "properties": {
@@ -3229,9 +3232,11 @@
         },
         "constants": {
           "DefaultMaxAutoApprovalIterations": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No separate cap on auto-approval re-runs; only the function-invocation budget, which those re-runs share, bounds them."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS"
+            ],
+            "status": "mapped",
+            "note": "40, as in .NET; a module constant."
           }
         }
       },
@@ -3257,9 +3262,11 @@
             "note": "Rule arguments and state are serialized with serde; there are no serializer options."
           },
           "MaxAutoApprovalIterations": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No configurable cap on auto-approval re-runs; only the shared function-invocation budget bounds them."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::ToolApprovalAgent::with_max_auto_approval_iterations"
+            ],
+            "status": "adapted",
+            "note": "A builder taking a usize (zero is a configuration error); unset means the default of 40. On reaching the cap the final inner turn is returned as-is, as in .NET."
           }
         }
       },

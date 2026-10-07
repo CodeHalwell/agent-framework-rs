@@ -21,9 +21,14 @@
 //!   [`AgentModeProvider::set_mode`] and
 //!   [`AgentModeProvider::set_mode_without_notification`] (upstream's
 //!   `notify=False`).
-//! - Configuration errors (no modes, duplicate modes, an unknown default
-//!   mode) are reported by [`AgentModeProviderBuilder::build`] rather than a
-//!   constructor exception.
+//! - Step 5 of the built-in `plan` mode instructions has the agent keep the
+//!   plan in its todo list rather than a memory file, since file memory is
+//!   not ported; the todo list lives in the session, so it survives
+//!   compaction as upstream's memory file does.
+//! - Configuration errors (no modes, an empty or whitespace-only mode name,
+//!   duplicate modes, an unknown default mode) are reported by
+//!   [`AgentModeProviderBuilder::build`] rather than a constructor
+//!   exception.
 
 use std::sync::Arc;
 
@@ -92,8 +97,8 @@ user, so they can choose the option instead of having to retype the entire respo
 3. Do not proceed until you have received all the needed clarifications.\n   \
 4. Do short exploratory research if it helps with being able to ask sensible clarifications \
 from the user.\n\
-5. Write the plan to a memory file, so that it is retained even if compaction happens. Make \
-sure to update the plan file if the user requests changes.\n\
+5. Record the plan as todo items, so that it is retained even if compaction happens. Make \
+sure to update the todo items if the user requests changes.\n\
 6. Present the plan to the user and ask for approval to switch to execute mode and process the \
 plan.\n\
 7. When approval is granted, always switch to execute mode (using the `mode_set` tool), and \
@@ -135,6 +140,11 @@ impl ModeConfig {
         let mut modes: Vec<(String, String)> = Vec::new();
         for mode in display_modes {
             let display = mode.trim().to_string();
+            if display.is_empty() {
+                return Err(Error::Configuration(
+                    "agent mode names must be non-empty strings.".into(),
+                ));
+            }
             let normalized = display.to_lowercase();
             if modes.iter().any(|(n, _)| *n == normalized) {
                 return Err(Error::Configuration(format!(
@@ -604,6 +614,10 @@ mod tests {
             .is_err());
         assert!(AgentModeProvider::builder()
             .mode_instructions([("Plan", "a"), ("plan", "b")])
+            .build()
+            .is_err());
+        assert!(AgentModeProvider::builder()
+            .mode_instructions([("   ", "blank"), ("plan", "b")])
             .build()
             .is_err());
         assert!(AgentModeProvider::builder()

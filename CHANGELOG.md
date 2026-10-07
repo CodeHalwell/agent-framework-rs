@@ -25,7 +25,9 @@ module, a port of upstream's experimental harness:
   pluggable `TodoStore`; `TodoSessionStore` keeps the list in session state.
 - **Tool approval**: `ToolApprovalAgent` adds standing "always approve"
   rules (per tool, or per tool and arguments), auto-approval rules, and
-  presents several pending approvals one at a time.
+  presents several pending approvals one at a time. Auto-approval re-runs
+  are capped per run (`with_max_auto_approval_iterations`, default 40, as
+  .NET's `DefaultMaxAutoApprovalIterations`).
 - **Agent mode**: `AgentModeProvider` with `mode_set` / `mode_get` tools,
   per-mode instructions and a one-time mode-change notification.
 
@@ -59,6 +61,7 @@ only.
 - OpenAI, Azure OpenAI, Bedrock, Mistral and Ollama embed text only, as
   upstream does, and return an error naming the first non-text input.
 
+### Feature stages (breaking)
 
 APIs that upstream still marks experimental now sit behind `experimental-*`
 cargo features and carry no semver promise, mirroring Python's
@@ -72,6 +75,7 @@ CI. To keep using a gated API, enable its feature:
 | `experimental-file-history` | `FileHistoryProvider` | core |
 | `experimental-progressive-tools` | `LiveToolList`, and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}` | core |
 | `experimental-declarative-agents` | the whole `agent-framework-declarative` crate | declarative |
+| `experimental-harness` | `agent_framework_core::harness` (`LoopAgent`, `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`) | core |
 
 The umbrella crate re-exposes each feature under the same name and adds
 `experimental` to turn them all on. **Its `declarative` feature is now

@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 84 / 134 / 29 / 193 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 88 / 137 / 24 / 191 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
@@ -47,7 +47,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run receives no agent reference. |
 | `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Session` | unmapped | adapted | after_run receives no session, so a provider cannot read the session or its state bag after a run. |
 | `Microsoft.Agents.AI::AIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::AIContextProvider.InvokingContext properties::Session` | partial | adapted | before_run sees only the session ids, not the AgentSession or its state bag. |
 | `Microsoft.Agents.AI::AIJudgeLoopEvaluator constants::GapAnalysisPlaceholder` | unmapped | intentional | Judge feedback is not templated; judge_feedback_message inserts the judge's reasoning directly. |
 | `Microsoft.Agents.AI::AgentFileSkill properties::Path` | unmapped | unmapped | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
 | `Microsoft.Agents.AI::AgentFileSkill` | unmapped | adapted | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
@@ -168,7 +167,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run receives no agent reference. |
 | `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Session` | unmapped | adapted | after_run receives no session, so a provider cannot read the session or its state bag after a run. |
 | `Microsoft.Agents.AI::ChatHistoryProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::ChatHistoryProvider.InvokingContext properties::Session` | partial | adapted | before_run sees only the session ids, not the AgentSession or its state bag. |
 | `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceId(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
 | `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceType(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
 | `Microsoft.Agents.AI::ChatMessageExtensions methods::WithAgentRequestMessageSource(ChatMessage, AgentRequestMessageSourceType, string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
@@ -237,20 +235,15 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::LoopContext properties::Agent` | unmapped | adapted | The context carries no agent; helpers that need a provider take it explicitly. |
 | `Microsoft.Agents.AI::LoopContext properties::RunOptions` | unmapped | adapted | The run options are not exposed to loop callbacks. |
 | `Microsoft.Agents.AI::MessageAIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::MessageAIContextProvider.InvokingContext properties::Session` | partial | adapted | before_run sees only the session ids, not the AgentSession or its state bag. |
 | `Microsoft.Agents.AI::MessageInjectingChatClient methods::EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::MessageInjectingChatClient methods::GetPendingMessagesAsync(AgentSession, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::MessageInjectingChatClient` | unmapped | adapted | No message-injecting chat client: messages cannot be queued into a run in progress. |
-| `Microsoft.Agents.AI::ProviderSessionState<TState> methods::GetOrInitializeState(AgentSession)` | partial | adapted | ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag. |
-| `Microsoft.Agents.AI::ProviderSessionState<TState> methods::SaveState(AgentSession, TState)` | partial | adapted | ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag. |
-| `Microsoft.Agents.AI::ProviderSessionState<TState>` | partial | adapted | ContextProvider hooks get no AgentSession, so a provider cannot keep typed state in the session bag. |
+| `Microsoft.Agents.AI::ProviderSessionState<TState>` | partial | adapted | before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session). |
 | `Microsoft.Agents.AI::TodoCompletionLoopEvaluator constants::RemainingTodosPlaceholder` | unmapped | intentional | The todo reminder is not templated; todos_remaining_message lists the open items directly. |
 | `Microsoft.Agents.AI::TodoProviderOptions properties::SuppressTodoListMessage` | unmapped | mapped | The current-list message is always injected; there is no option to suppress it. |
 | `Microsoft.Agents.AI::TodoProviderOptions properties::TodoListMessageBuilder` | unmapped | mapped | The current-list message has a fixed format; there is no custom builder. |
-| `Microsoft.Agents.AI::ToolApprovalAgent constants::DefaultMaxAutoApprovalIterations` | unmapped | mapped | No separate cap on auto-approval re-runs; only the function-invocation budget, which those re-runs share, bounds them. |
 | `Microsoft.Agents.AI::ToolApprovalAgent properties::AllToolsAutoApprovalRule` | unmapped | mapped | No predefined approve-everything rule; the closure \|_: &FunctionCallContent\| true serves. |
 | `Microsoft.Agents.AI::ToolApprovalAgentOptions properties::JsonSerializerOptions` | unmapped | adapted | Rule arguments and state are serialized with serde; there are no serializer options. |
-| `Microsoft.Agents.AI::ToolApprovalAgentOptions properties::MaxAutoApprovalIterations` | unmapped | mapped | No configurable cap on auto-approval re-runs; only the shared function-invocation budget bounds them. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext constructors::ToolAutoApprovalRuleContext(FunctionCallContent, AIAgent, AgentSession, IReadOnlyCollection<ChatMessage>, AgentRunOptions)` | unmapped | adapted | No rule context type; rules receive the function call directly. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext properties::Agent` | unmapped | mapped | Auto-approval rules do not receive the agent. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext properties::RequestMessages` | unmapped | mapped | Auto-approval rules do not receive the request messages. |

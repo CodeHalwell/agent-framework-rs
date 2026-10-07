@@ -44,7 +44,13 @@
 //!   as received.
 //! - The function-invocation budget is shared across auto-approval
 //!   re-runs by the function-invocation loop itself (it parks the budget in
-//!   the session), so there is no extra plumbing for it here.
+//!   the session), so there is no extra plumbing for it here. Re-runs are
+//!   also capped by [`ToolApprovalAgent::with_max_auto_approval_iterations`]
+//!   (default [`DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS`]), as in .NET: each
+//!   re-run is a fresh inner run, so the inner per-run iteration limit
+//!   restarts every time and cannot bound the chain.
+//! - If the inner run fails, the approvals collected for it are put back, so
+//!   retrying the last answer still sends the whole batch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -66,6 +72,11 @@ use super::{channel_stream, json_type_name};
 
 /// The default `source_id` (state key) of a [`ToolApprovalAgent`].
 pub const DEFAULT_TOOL_APPROVAL_SOURCE_ID: &str = "tool_approval";
+
+/// The default cap on how many times a [`ToolApprovalAgent`] re-runs its
+/// inner agent within one run because every approval request was
+/// auto-approved. Matches .NET's `DefaultMaxAutoApprovalIterations`.
+pub const DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS: usize = 40;
 
 /// What a standing approval covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +232,7 @@ pub struct ToolApprovalAgent {
     inner: Arc<dyn SupportsAgentRun>,
     source_id: String,
     auto_approval_rules: Vec<Arc<dyn ToolAutoApprovalRule>>,
+    max_auto_approval_iterations: usize,
 }
 
 impl std::fmt::Debug for ToolApprovalAgent {
@@ -229,6 +241,10 @@ impl std::fmt::Debug for ToolApprovalAgent {
             .field("inner", &self.inner.id())
             .field("source_id", &self.source_id)
             .field("auto_approval_rules", &self.auto_approval_rules.len())
+            .field(
+                "max_auto_approval_iterations",
+                &self.max_auto_approval_iterations,
+            )
             .finish()
     }
 }
@@ -240,6 +256,7 @@ impl ToolApprovalAgent {
             inner,
             source_id: DEFAULT_TOOL_APPROVAL_SOURCE_ID.to_string(),
             auto_approval_rules: Vec::new(),
+            max_auto_approval_iterations: DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS,
         }
     }
 
@@ -254,6 +271,29 @@ impl ToolApprovalAgent {
     pub fn with_auto_approval_rule(mut self, rule: impl ToolAutoApprovalRule + 'static) -> Self {
         self.auto_approval_rules.push(Arc::new(rule));
         self
+    }
+
+    /// Builder: cap how many times one run re-invokes the inner agent because
+    /// every approval request it surfaced was auto-approved (default
+    /// [`DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS`]). On reaching the cap the
+    /// agent takes one final inner turn without auto-approving, and returns
+    /// it as-is, so any approval request in it goes to the caller (possibly
+    /// several at once). Errors when `max` is zero.
+    ///
+    /// Counterpart of .NET `ToolApprovalAgentOptions.MaxAutoApprovalIterations`.
+    pub fn with_max_auto_approval_iterations(mut self, max: usize) -> Result<Self> {
+        if max == 0 {
+            return Err(Error::Configuration(
+                "max_auto_approval_iterations must be at least 1.".into(),
+            ));
+        }
+        self.max_auto_approval_iterations = max;
+        Ok(self)
+    }
+
+    /// The cap on auto-approval re-runs within one run.
+    pub fn max_auto_approval_iterations(&self) -> usize {
+        self.max_auto_approval_iterations
     }
 
     /// The wrapped agent.
@@ -391,6 +431,11 @@ impl ToolApprovalAgent {
                                 }
                             }
                         }
+                        // A retry after a failed inner run resends an answer
+                        // that is already collected; keep one copy.
+                        state
+                            .collected_approval_responses
+                            .retain(|existing| existing.id != response.id);
                         state.collected_approval_responses.push(response);
                     }
                     other => kept.push(other),
@@ -513,14 +558,31 @@ impl ToolApprovalAgent {
             self.save_state(session, &state)?;
             return Ok(Self::queued_response(next));
         }
+        let mut iteration = 0usize;
         loop {
+            let collected = state.collected_approval_responses.clone();
             messages = Self::inject_collected(messages, &mut state);
             self.save_state(session, &state)?;
 
-            let mut response = self
+            let result = self
                 .inner
                 .run_with_options(messages, Some(&mut *session), options.clone())
-                .await?;
+                .await;
+            let mut response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    // Keep the batch so a retry can still send it.
+                    state.collected_approval_responses = collected;
+                    self.save_state(session, &state)?;
+                    return Err(error);
+                }
+            };
+            if iteration >= self.max_auto_approval_iterations {
+                // Cap reached: return this turn as-is, without auto-approving
+                // again, so the caller decides on any request in it.
+                return Ok(response);
+            }
+            iteration += 1;
 
             let preserve_batch =
                 has_other_user_input(response.messages.iter().flat_map(|m| &m.contents));
@@ -564,21 +626,44 @@ impl ToolApprovalAgent {
             .await;
             return Ok(());
         }
+        let mut iteration = 0usize;
         loop {
+            let collected = state.collected_approval_responses.clone();
             messages = Self::inject_collected(messages, &mut state);
             self.save_state(&session, &state)?;
+            // On reaching the cap this pass streams through as-is.
+            let capped = iteration >= self.max_auto_approval_iterations;
+            iteration += 1;
 
-            let mut inner = self
+            // Keep the batch so a retry can still send it.
+            let restore = |state: &mut ToolApprovalState, session: &AgentSession| {
+                state.collected_approval_responses = collected.clone();
+                self.save_state(session, state)
+            };
+            let mut inner = match self
                 .inner
                 .run_stream(messages, Some(session.clone()), options.clone())
-                .await?;
+                .await
+            {
+                Ok(inner) => inner,
+                Err(error) => {
+                    restore(&mut state, &session)?;
+                    return Err(error);
+                }
+            };
             // Stream until the first approval request, then buffer the rest
             // so auto-approved or queued requests never reach the caller.
             let mut buffered: Vec<AgentResponseUpdate> = Vec::new();
             let mut saw_other_input = false;
             let mut conversation_id: Option<String> = None;
             while let Some(update) = inner.next().await {
-                let update = update?;
+                let update = match update {
+                    Ok(update) => update,
+                    Err(error) => {
+                        restore(&mut state, &session)?;
+                        return Err(error);
+                    }
+                };
                 if let Some(cid) = &update.conversation_id {
                     conversation_id = Some(cid.clone());
                 }
@@ -586,7 +671,7 @@ impl ToolApprovalAgent {
                     .contents
                     .iter()
                     .any(|c| matches!(c, Content::FunctionApprovalRequest(_)));
-                if buffered.is_empty() && !has_request {
+                if capped || (buffered.is_empty() && !has_request) {
                     saw_other_input |= has_other_user_input(update.contents.iter());
                     if !sink.send(update).await {
                         return Ok(());
