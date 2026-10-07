@@ -43,8 +43,11 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Harness** (agent loop, todo, tool approval, agent mode, file memory,
-  background agents), **agent hooks**, **evaluation** and **security
+- **Harness, remainder**: file access, file memory, memory, background
+  agents (and the loop's `background_tasks_running` condition),
+  `TodoFileStore` and the `create_harness_agent` assembly. The agent loop,
+  todo, tool approval and agent mode are ported behind
+  `experimental-harness`. **Agent hooks**, **evaluation** and **security
   (FIDES)**: all marked experimental upstream. They wait on a
   feature-stage mechanism so they can ship without semver commitments.
 - **AG-UI client** (the hosting crate has the server side only).

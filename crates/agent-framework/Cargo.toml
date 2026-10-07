@@ -50,6 +50,7 @@ experimental-vector-stores = [
 ]
 experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
+experimental-harness = ["agent-framework-core/experimental-harness"]
 experimental-declarative-agents = [
     "dep:agent-framework-declarative",
     "agent-framework-declarative/experimental-declarative-agents",
@@ -58,6 +59,7 @@ experimental = [
     "experimental-vector-stores",
     "experimental-file-history",
     "experimental-progressive-tools",
+    "experimental-harness",
     "experimental-declarative-agents",
 ]
 full = [

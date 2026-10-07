@@ -83,6 +83,12 @@ impl SessionState {
     pub fn shares_storage_with(&self, other: &SessionState) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// Replace the whole bag's contents in place, so every clone sees them.
+    #[cfg(feature = "experimental-harness")]
+    pub(crate) fn replace_all(&self, map: HashMap<String, Value>) {
+        *self.inner.lock().unwrap() = map;
+    }
 }
 
 impl From<HashMap<String, Value>> for SessionState {
@@ -225,6 +231,18 @@ impl AgentSession {
             "service_session_id": self.service_session_id,
             "state": self.state.snapshot(),
         })
+    }
+
+    /// Reset this session in place to an [`AgentSession::to_dict`] snapshot:
+    /// the service conversation id and the state bag's contents (which every
+    /// clone shares) are restored; the session id and context providers are
+    /// kept. Used by the harness loop's fresh-context mode.
+    #[cfg(feature = "experimental-harness")]
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &Value) -> Result<()> {
+        let restored = Self::from_dict(snapshot)?;
+        self.service_session_id = restored.service_session_id;
+        self.state.replace_all(restored.state.snapshot());
+        Ok(())
     }
 
     /// Reconstruct a session from state produced by [`AgentSession::to_dict`].

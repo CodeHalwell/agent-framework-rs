@@ -13,6 +13,9 @@
 //! - [`tools`] — executable tools and hosted-tool markers.
 //! - [`session`] — [`AgentSession`](session::AgentSession), a lightweight
 //!   conversation identity + state container.
+//! - `harness` (feature `experimental-harness`) — the experimental agent
+//!   harness: an agent loop, a todo list, standing tool approvals and
+//!   operating modes.
 //! - [`history`] — [`HistoryProvider`](history::HistoryProvider)s: conversation
 //!   history as a [`ContextProvider`](memory::ContextProvider).
 //! - [`memory`] — context / memory providers.
@@ -32,9 +35,9 @@
 //! APIs that upstream still marks experimental sit behind `experimental-*`
 //! cargo features and carry no semver promise: `experimental-vector-stores`
 //! (the `vectors` module), `experimental-file-history`
-//! (`history::FileHistoryProvider`) and `experimental-progressive-tools`
-//! (`middleware::LiveToolList`). See `docs/feature-stages.md` in the
-//! repository.
+//! (`history::FileHistoryProvider`), `experimental-progressive-tools`
+//! (`middleware::LiveToolList`) and `experimental-harness` (the `harness`
+//! module). See `docs/feature-stages.md` in the repository.
 //!
 //! ## Example
 //!
@@ -75,6 +78,9 @@ pub mod agent;
 pub mod client;
 pub mod compaction;
 pub mod error;
+#[cfg(feature = "experimental-harness")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-harness")))]
+pub mod harness;
 pub mod history;
 pub mod memory;
 pub mod middleware;
