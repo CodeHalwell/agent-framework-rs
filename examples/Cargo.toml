@@ -7,7 +7,7 @@ license = "MIT"
 description = "Runnable examples for agent-framework, organized by topic"
 
 [dependencies]
-agent-framework = { path = "../crates/agent-framework", features = ["full", "otel-metrics", "otel-export"] }
+agent-framework = { path = "../crates/agent-framework", features = ["full", "experimental", "otel-metrics", "otel-export"] }
 agent-framework-core = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

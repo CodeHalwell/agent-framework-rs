@@ -31,6 +31,8 @@
 //! ## Example
 //!
 //! ```no_run
+//! # #[cfg(feature = "experimental-declarative-agents")]
+//! # mod example {
 //! use std::sync::Arc;
 //! use agent_framework_core::prelude::*;
 //! use agent_framework_declarative::{ChatClientFactory, DeclarativeLoader};
@@ -58,9 +60,14 @@
 //! println!("{}", response.text());
 //! # Ok(())
 //! # }
+//! # }
 //! ```
 
 #![warn(missing_docs)]
+// Upstream marks declarative agents experimental (Python `DECLARATIVE_AGENTS`),
+// so the whole crate is behind a feature and is empty without it. See
+// docs/feature-stages.md.
+#![cfg(feature = "experimental-declarative-agents")]
 
 pub mod agent;
 pub mod condition;

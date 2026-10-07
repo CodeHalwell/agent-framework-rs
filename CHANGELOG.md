@@ -5,6 +5,29 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Feature stages (breaking)
+
+APIs that upstream still marks experimental now sit behind `experimental-*`
+cargo features and carry no semver promise, mirroring Python's
+`@experimental` and .NET's `[Experimental]`. The rules are in
+`docs/feature-stages.md`, and `cargo xtask features check` enforces them in
+CI. To keep using a gated API, enable its feature:
+
+| Feature | Gates | Crates |
+|---|---|---|
+| `experimental-vector-stores` | `agent_framework_core::vectors`, `CosmosVectorStore`, `AzureAISearchStore` | core, cosmos, azure-ai-search |
+| `experimental-file-history` | `FileHistoryProvider` | core |
+| `experimental-progressive-tools` | `LiveToolList`, and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}` | core |
+| `experimental-declarative-agents` | the whole `agent-framework-declarative` crate | declarative |
+
+The umbrella crate re-exposes each feature under the same name and adds
+`experimental` to turn them all on. **Its `declarative` feature is now
+`experimental-declarative-agents`**, and `full` no longer includes it.
+`agent_framework_cosmos::DEFAULT_VECTOR_API_VERSION` moves behind
+`experimental-vector-stores` with the store it configures.
+
 ## [0.10.0] — 2026-10-05
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).

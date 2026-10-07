@@ -24,7 +24,6 @@ github-copilot = ["dep:agent-framework-github-copilot"]
 azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
-declarative = ["dep:agent-framework-declarative"]
 hosting = ["dep:agent-framework-hosting"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
@@ -41,6 +40,26 @@ otel-metrics = ["agent-framework-core/otel-metrics"]
 # (`observability::export`). Implies `otel-metrics`; the only feature here that
 # pulls an OpenTelemetry *SDK*.
 otel-export = ["agent-framework-core/otel-export"]
+# Experimental surfaces (docs/feature-stages.md): APIs upstream still marks
+# experimental, with no semver promise. Not part of `full`; `experimental`
+# turns them all on.
+experimental-vector-stores = [
+    "agent-framework-core/experimental-vector-stores",
+    "agent-framework-cosmos?/experimental-vector-stores",
+    "agent-framework-azure-ai-search?/experimental-vector-stores",
+]
+experimental-file-history = ["agent-framework-core/experimental-file-history"]
+experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
+experimental-declarative-agents = [
+    "dep:agent-framework-declarative",
+    "agent-framework-declarative/experimental-declarative-agents",
+]
+experimental = [
+    "experimental-vector-stores",
+    "experimental-file-history",
+    "experimental-progressive-tools",
+    "experimental-declarative-agents",
+]
 full = [
     "openai",
     "anthropic",
@@ -53,7 +72,6 @@ full = [
     "azure",
     "mcp",
     "a2a",
-    "declarative",
     "hosting",
     "redis",
     "mem0",

@@ -9,3 +9,4 @@ description = "Repository tooling for agent-framework-rs (parity ledger); not pu
 
 [dependencies]
 serde_json = { workspace = true }
+toml = "0.8"

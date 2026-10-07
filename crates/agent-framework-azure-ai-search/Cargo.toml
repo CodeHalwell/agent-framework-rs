@@ -11,6 +11,11 @@ categories.workspace = true
 readme.workspace = true
 description = "Azure AI Search context provider"
 
+[features]
+# VECTOR_STORES (experimental upstream): the vector store over this service.
+# See docs/feature-stages.md. Never on by default.
+experimental-vector-stores = ["agent-framework-core/experimental-vector-stores"]
+
 [dependencies]
 agent-framework-core = { workspace = true }
 agent-framework-azure = { workspace = true }
@@ -25,3 +30,14 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
+
+[[test]]
+name = "vector_store_loopback"
+required-features = ["experimental-vector-stores"]

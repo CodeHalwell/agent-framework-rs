@@ -197,17 +197,29 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `azure` | [`agent-framework-azure`](crates/agent-framework-azure) — Azure OpenAI (api-key / Entra ID) | no |
 | `mcp` | [`agent-framework-mcp`](crates/agent-framework-mcp) — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 | `a2a` | [`agent-framework-a2a`](crates/agent-framework-a2a) — Agent2Agent protocol client | no |
-| `declarative` | [`agent-framework-declarative`](crates/agent-framework-declarative) — YAML/JSON agents & workflows | no |
 | `hosting` | [`agent-framework-hosting`](crates/agent-framework-hosting) — serve agents over HTTP (DevUI-style, A2A, AG-UI, OpenAI-compatible) | no |
 | `redis` | [`agent-framework-redis`](crates/agent-framework-redis) — Redis chat-message store & context provider | no |
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
 | `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, embeddings, and managed memory | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
-| `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store, checkpoints, and vector store | no |
+| `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
 | `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
 | `full` | all of the above except `otel-metrics` | no |
+
+APIs that upstream still marks experimental sit behind `experimental-*`
+features and carry no semver promise. `full` leaves them out, and
+`experimental` turns them all on. The rules are in
+[docs/feature-stages.md](docs/feature-stages.md).
+
+| Feature | What it gates |
+| --- | --- |
+| `experimental-vector-stores` | `agent_framework_core::vectors`, plus the Cosmos DB and Azure AI Search vector stores |
+| `experimental-file-history` | `FileHistoryProvider` |
+| `experimental-progressive-tools` | `LiveToolList`, and adding or removing tools mid-run from `FunctionInvocationContext` |
+| `experimental-declarative-agents` | [`agent-framework-declarative`](crates/agent-framework-declarative): YAML/JSON agents and workflows |
+| `experimental` | all four |
 
 ```toml
 # Everything:

@@ -34,8 +34,13 @@
 //! # }
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "experimental-vector-stores")]
 mod vector_store;
 
+#[cfg(feature = "experimental-vector-stores")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
 pub use vector_store::{AzureAISearchCollection, AzureAISearchStore};
 
 use std::future::Future;
@@ -73,6 +78,7 @@ pub(crate) enum SearchAuth {
 
 impl SearchAuth {
     /// Which mode this is, for a `Debug` impl that must not print the key.
+    #[cfg_attr(not(feature = "experimental-vector-stores"), allow(dead_code))]
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::ApiKey(_) => "api-key",

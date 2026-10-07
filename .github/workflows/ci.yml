@@ -45,6 +45,19 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features --verbose
 
+      # Experimental surfaces sit behind `experimental-*` features
+      # (docs/feature-stages.md). The steps above build with every feature on,
+      # and a workspace-wide build unifies features through the examples
+      # crate, so check the gated crates on their own with their features
+      # off, doctests included.
+      - name: Feature-stage rules
+        run: cargo xtask features check
+
+      - name: Gated crates without experimental features
+        run: |
+          cargo check --all-targets -p agent-framework-core -p agent-framework-cosmos -p agent-framework-azure-ai-search -p agent-framework-declarative
+          cargo test --doc -p agent-framework-core -p agent-framework-cosmos -p agent-framework-azure-ai-search -p agent-framework-declarative
+
   msrv:
     name: MSRV (Rust 1.88)
     runs-on: ubuntu-latest
