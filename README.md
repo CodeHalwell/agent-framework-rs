@@ -277,9 +277,10 @@ types (`FunctionInvokingChatClient`, `RetryingChatClient`,
 
 ## Roadmap
 
-See [PARITY.md](PARITY.md) for the feature matrix and
-[GAP_ANALYSIS.md](GAP_ANALYSIS.md) for the audited gap list and its status
-section (the current source of truth). The remaining gaps:
+[SCOPE.md](SCOPE.md) records what this port deliberately leaves out and
+why, and the per-pass upstream drift log is in [docs/drift/](docs/drift/README.md).
+[PARITY.md](PARITY.md) and [GAP_ANALYSIS.md](GAP_ANALYSIS.md) are the
+December 2025 matrix and audit, kept for history. The remaining gaps:
 
 - [ ] Workflow depth: typed executor routing / multiple handlers,
       `AgentExecutorRequest`-style envelopes, sub-workflow request
@@ -293,8 +294,7 @@ section (the current source of truth). The remaining gaps:
       directory-based entity discovery, auth; the React frontend
 - [ ] A2A serving: streaming, non-terminal task lifecycle, file/data parts,
       push-notification config, `tasks/resubscribe`, extended card
-- [ ] Providers: `AzureOpenAIAssistantsClient` wrapper, the new Foundry
-      Prompt-Agent client; `as_mcp_server`
+- [ ] `as_mcp_server`
 - [ ] MCP client: standalone GET-based SSE listening, automatic reconnect,
       elicitation
 - [ ] Redis provider: embeddings/vector-KNN and hybrid search (BM25
@@ -307,14 +307,11 @@ section (the current source of truth). The remaining gaps:
 - [ ] Azure: a Content Understanding context provider, Foundry evaluations,
       and the image half of Foundry embeddings (the text half, over both
       endpoints, ships; the Foundry memory provider ships)
-- [ ] The upstream Copilot-Studio declarative *workflow* DSL (declarative
-      agents already follow the official schema)
 - [ ] Purview: protection-scopes precheck/caching, background
       content-activity logging, JWT-derived identity fallback
 - [ ] OTel SDK exporter wiring stays the application's job by design
       (spans and `otel-metrics` histograms are emitted and bridge-ready)
-- [ ] Remaining ecosystem: ChatKit, the `lab` experimental packages,
-      DurableTask/Azure Functions hosting
+- [ ] Remaining ecosystem: DurableTask/Azure Functions hosting
 
 Done — everything else, including:
 
