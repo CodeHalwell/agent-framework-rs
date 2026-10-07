@@ -65,7 +65,9 @@ pub struct ShellEnvironmentProviderOptions {
     /// (`[A-Za-z0-9._-]+`) are skipped, because the name is spliced into a
     /// shell command.
     pub probe_tools: Vec<String>,
-    /// Override the detected family, e.g. bash on Windows or pwsh on Linux.
+    /// Override the family. Without it the executor's
+    /// [`shell_family`](ShellExecutor::shell_family) is used, then the host
+    /// platform's default shell.
     pub override_family: Option<ShellFamily>,
     /// Timeout for each probe command. Default 5 seconds.
     pub probe_timeout: Duration,
@@ -201,6 +203,7 @@ impl ShellEnvironmentProvider {
         let family = self
             .options
             .override_family
+            .or_else(|| self.executor.shell_family())
             .unwrap_or_else(ShellFamily::detect);
         self.executor.start().await?;
         let (shell_version, working_directory) = self.probe_shell_and_cwd(family).await?;
@@ -219,7 +222,10 @@ impl ShellEnvironmentProvider {
 
         Ok(ShellEnvironmentSnapshot {
             family,
-            os_description: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+            os_description: self
+                .executor
+                .os_description()
+                .unwrap_or_else(|| format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
             shell_version,
             working_directory,
             tool_versions,

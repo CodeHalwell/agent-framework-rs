@@ -26,6 +26,12 @@ impl FakeDocker {
     /// `kill_rc` is what `docker kill` exits with; `run_rc` what
     /// `docker run -d` exits with.
     fn new(kill_rc: i32, run_rc: i32) -> Self {
+        Self::with_reap_rc(kill_rc, run_rc, 0)
+    }
+
+    /// `reap_rc` is what a non-interactive `docker exec` (the in-container
+    /// process reaper) exits with.
+    fn with_reap_rc(kill_rc: i32, run_rc: i32, reap_rc: i32) -> Self {
         let dir = TempDir::new("fake-docker");
         let log = dir.path().join("calls.log");
         let binary = dir.path().join("docker");
@@ -40,7 +46,9 @@ case "$1" in
     fi
     for last; do :; done
     exec /bin/sh -c "$last" ;;
-  exec) exec /bin/sh ;;
+  exec)
+    if [ "$2" = "-i" ]; then exec /bin/sh; fi
+    exit {reap_rc} ;;
   kill) exit {kill_rc} ;;
   rm) exit 0 ;;
   version) echo 27.0.0 ;;
@@ -67,6 +75,18 @@ esac
             binary,
             log,
         }
+    }
+
+    /// Poll the call log until `pred` matches a line or two seconds pass.
+    async fn wait_for_call(&self, pred: impl Fn(&str) -> bool) -> Vec<String> {
+        for _ in 0..100 {
+            let calls = self.calls();
+            if calls.iter().any(|c| pred(c)) {
+                return calls;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.calls()
     }
 
     fn calls(&self) -> Vec<String> {
@@ -144,12 +164,7 @@ async fn stateless_timeout_kills_then_removes_the_container() {
     assert!(result.timed_out);
 
     let calls = fake.calls();
-    let name = calls[0]
-        .split_whitespace()
-        .skip_while(|t| *t != "--name")
-        .nth(1)
-        .unwrap()
-        .to_string();
+    let name = container_name_of(&calls[0]);
     assert!(
         calls.contains(&format!("kill --signal KILL {name}")),
         "{calls:?}"
@@ -223,4 +238,184 @@ async fn policy_rejects_before_any_container_starts() {
         json!("Command rejected by policy: matches denylist pattern: curl")
     );
     assert!(fake.calls().is_empty());
+}
+
+fn container_name_of(call: &str) -> String {
+    call.split_whitespace()
+        .skip_while(|t| *t != "--name")
+        .nth(1)
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn cancelled_stateless_run_removes_the_container() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake)
+        .mode(ShellMode::Stateless)
+        .timeout(None)
+        .build()
+        .unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)).await;
+    assert!(dropped.is_err(), "the run should still be going");
+    let calls = fake.calls();
+    let name = container_name_of(&calls[0]);
+    let calls = fake.wait_for_call(|c| c == format!("rm -f {name}")).await;
+    assert!(calls.contains(&format!("rm -f {name}")), "{calls:?}");
+}
+
+#[tokio::test]
+async fn finished_stateless_run_does_not_remove_by_name() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake).mode(ShellMode::Stateless).build().unwrap();
+    tool.run("echo hi", None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let calls = fake.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("rm -f")), "{calls:?}");
+}
+
+#[tokio::test]
+async fn persistent_timeout_reaps_processes_in_the_container() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake)
+        .container_name("af-reap-box")
+        .timeout(Some(Duration::from_millis(300)))
+        .build()
+        .unwrap();
+    assert!(tool.run("sleep 30", None).await.unwrap().timed_out);
+    let calls = fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("exec af-reap-box sh -c kill -KILL -1")),
+        "{calls:?}"
+    );
+    // The container is kept; the next call gets a fresh shell in it.
+    assert_eq!(tool.run("echo again", None).await.unwrap().stdout, "again");
+    let calls = fake.calls();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("run -d")).count(),
+        1,
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| *c == "exec -i af-reap-box sh")
+            .count(),
+        2,
+        "{calls:?}"
+    );
+    tool.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_reap_failure_recreates_the_container() {
+    let fake = FakeDocker::with_reap_rc(0, 0, 1);
+    let tool = builder(&fake)
+        .container_name("af-recreate-box")
+        .timeout(Some(Duration::from_millis(300)))
+        .build()
+        .unwrap();
+    assert!(tool.run("sleep 30", None).await.unwrap().timed_out);
+    assert!(fake.calls().contains(&"rm -f af-recreate-box".to_string()));
+    assert_eq!(tool.run("echo again", None).await.unwrap().stdout, "again");
+    let calls = fake.calls();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("run -d")).count(),
+        2,
+        "{calls:?}"
+    );
+    tool.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_persistent_command_is_reaped_before_the_next_call() {
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake)
+        .container_name("af-cancel-box")
+        .timeout(None)
+        .build()
+        .unwrap();
+    tool.start().await.unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(300), tool.run("sleep 30", None)).await;
+    assert!(dropped.is_err());
+    assert_eq!(tool.run("echo next", None).await.unwrap().stdout, "next");
+    let calls = fake.calls();
+    let reap = calls
+        .iter()
+        .position(|c| c.starts_with("exec af-cancel-box sh -c kill -KILL -1"))
+        .unwrap_or_else(|| panic!("no reap: {calls:?}"));
+    let second_shell = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| *c == "exec -i af-cancel-box sh")
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("no second shell: {calls:?}"));
+    assert!(reap < second_shell, "{calls:?}");
+    tool.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_container_start_removes_the_container() {
+    let dir = TempDir::new("slow-docker");
+    let log = dir.path().join("calls.log");
+    let binary = dir.path().join("docker");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in run) exec sleep 30 ;; esac\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..200 {
+        match std::process::Command::new(&binary).arg("version").output() {
+            Err(err) if err.raw_os_error() == Some(26) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            _ => break,
+        }
+    }
+    let tool = DockerShellTool::builder()
+        .docker_binary(binary.to_string_lossy())
+        .container_name("af-slow-box")
+        .build()
+        .unwrap();
+    let dropped = tokio::time::timeout(Duration::from_millis(300), tool.start()).await;
+    assert!(dropped.is_err());
+    let mut calls = Vec::new();
+    for _ in 0..100 {
+        calls = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if calls.iter().any(|c| c == "rm -f af-slow-box") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        calls.contains(&"rm -f af-slow-box".to_string()),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn docker_reports_its_own_shell_family_and_system() {
+    use agent_framework_tools::shell::ShellFamily;
+    let fake = FakeDocker::new(0, 0);
+    let tool = builder(&fake).build().unwrap();
+    assert_eq!(tool.shell_family(), Some(ShellFamily::Posix));
+    assert_eq!(
+        tool.os_description().as_deref(),
+        Some("a Linux container (alpine:3)")
+    );
+    let pwsh = builder(&fake).shell("pwsh").build().unwrap();
+    assert_eq!(pwsh.shell_family(), Some(ShellFamily::PowerShell));
 }

@@ -41,6 +41,9 @@ struct FakeExecutor {
     delay: Option<Duration>,
     /// Fail every command with `ShellError::Other` until cleared.
     fail_other: Mutex<bool>,
+    /// What the executor reports about itself.
+    family: Option<ShellFamily>,
+    os: Option<&'static str>,
 }
 
 impl FakeExecutor {
@@ -70,6 +73,14 @@ impl ShellExecutor for FakeExecutor {
 
     async fn close(&self) -> Result<(), ShellError> {
         Ok(())
+    }
+
+    fn shell_family(&self) -> Option<ShellFamily> {
+        self.family
+    }
+
+    fn os_description(&self) -> Option<String> {
+        self.os.map(str::to_string)
     }
 
     async fn run(
@@ -369,4 +380,37 @@ async fn probes_a_real_local_shell() {
     let snapshot = provider.refresh().await.unwrap();
     assert!(!snapshot.working_directory.is_empty());
     assert_eq!(snapshot.tool_versions["sh-definitely-missing-af"], None);
+}
+
+#[tokio::test]
+async fn executor_reported_family_and_system_beat_the_host_defaults() {
+    // A PowerShell family on any host proves the executor, not the host OS,
+    // picked the probe.
+    let exec = Arc::new(FakeExecutor {
+        family: Some(ShellFamily::PowerShell),
+        os: Some("a Linux container (img)"),
+        ..FakeExecutor::with(&[("shell", ok("VERSION=7.4.0\nCWD=/w\n"))])
+    });
+    let options = ShellEnvironmentProviderOptions {
+        probe_tools: Vec::new(),
+        ..Default::default()
+    };
+    let snapshot = ShellEnvironmentProvider::new(exec.clone(), Some(options))
+        .refresh()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.family, ShellFamily::PowerShell);
+    assert_eq!(snapshot.os_description, "a Linux container (img)");
+    assert!(exec.commands()[0].starts_with("Write-Output (\"VERSION="));
+
+    // An explicit override still wins.
+    let exec = Arc::new(FakeExecutor {
+        family: Some(ShellFamily::PowerShell),
+        ..Default::default()
+    });
+    let snapshot = ShellEnvironmentProvider::new(exec, Some(posix_options(&[])))
+        .refresh()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.family, ShellFamily::Posix);
 }

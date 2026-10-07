@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::environment::ShellFamily;
 use super::types::{ShellError, ShellResult};
 
 /// A backend that runs shell commands.
@@ -43,4 +44,19 @@ pub trait ShellExecutor: Send + Sync {
         command: &str,
         timeout: Option<Duration>,
     ) -> Result<ShellResult, ShellError>;
+
+    /// The family of the shell commands run in, when the executor knows it.
+    /// [`ShellEnvironmentProvider`](super::ShellEnvironmentProvider) uses it
+    /// to pick its probe and instructions; `None` (the default) falls back to
+    /// the host platform's default shell.
+    fn shell_family(&self) -> Option<ShellFamily> {
+        None
+    }
+
+    /// A short description of the system commands run on (`linux x86_64`,
+    /// `a Linux container (alpine:3)`), when it differs from the host.
+    /// `None` (the default) describes the host.
+    fn os_description(&self) -> Option<String> {
+        None
+    }
 }

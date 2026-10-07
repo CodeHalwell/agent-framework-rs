@@ -9,6 +9,7 @@ use agent_framework_core::tools::{ApprovalMode, FunctionTool, ToolDefinition};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use super::environment::ShellFamily;
 use super::executor::ShellExecutor;
 use super::policy::{ShellDecision, ShellPolicy, ShellRequest};
 use super::process::run_stateless;
@@ -558,6 +559,14 @@ impl ShellExecutor for LocalShellTool {
                 .await
             }
         }
+    }
+
+    fn shell_family(&self) -> Option<ShellFamily> {
+        Some(if is_powershell(&self.inner.interactive_argv) {
+            ShellFamily::PowerShell
+        } else {
+            ShellFamily::Posix
+        })
     }
 }
 

@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use super::environment::ShellFamily;
 use super::executor::ShellExecutor;
 use super::policy::ShellPolicy;
 use super::process::{run_to_completion, OnTimeout};
+use super::resolve::is_powershell;
 use super::session::ShellSession;
 use super::tool::{
     admit, shell_function, CommandHook, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT,
@@ -33,6 +35,10 @@ pub const DEFAULT_PIDS_LIMIT: u32 = 256;
 /// Default working directory inside the container.
 pub const DEFAULT_WORKDIR: &str = "/workspace";
 const TMPFS: &str = "/tmp:rw,nosuid,nodev,size=64m";
+/// Run inside the persistent container after a timeout, runaway output or
+/// a cancelled command: kills every process the container user may signal
+/// except the container's init (`sleep infinity`) and this shell itself.
+const REAP_SCRIPT: &str = "kill -KILL -1 2>/dev/null; exit 0";
 
 const PERSISTENT_DESCRIPTION: &str =
     "Execute a single shell command inside an isolated Docker container \
@@ -73,6 +79,15 @@ pub(crate) const BLOCKED_EXTRA_RUN_FLAGS: &[&str] = &[
     "-m",
     "--memory-swap",
     "--pids-limit",
+    // Binds the Docker API socket into the container: full daemon access.
+    "--use-api-socket",
+    // Imports another container's mounts, which may be host-backed.
+    "--volumes-from",
+    // A detached or renamed container escapes the timeout and cancellation
+    // cleanup, which addresses the container by its generated name.
+    "--detach",
+    "-d",
+    "--name",
 ];
 
 /// `docker run` long options that take no value. Any other long option is
@@ -222,6 +237,7 @@ pub struct DockerShellToolBuilder {
     timeout: Option<Duration>,
     max_output_bytes: usize,
     approval_mode: ApprovalMode,
+    acknowledge_unsafe: bool,
     on_command: Option<CommandHook>,
     docker_binary: String,
     shell: String,
@@ -247,6 +263,7 @@ impl Default for DockerShellToolBuilder {
             timeout: Some(DEFAULT_TIMEOUT),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             approval_mode: ApprovalMode::AlwaysRequire,
+            acknowledge_unsafe: false,
             on_command: None,
             docker_binary: "docker".into(),
             shell: "bash".into(),
@@ -375,13 +392,44 @@ impl DockerShellToolBuilder {
     }
 
     /// The approval mode of [`DockerShellTool::as_function`]. Default
-    /// [`ApprovalMode::AlwaysRequire`]. Unlike the local tool,
-    /// [`ApprovalMode::NeverRequire`] needs no acknowledgement, because the
-    /// container (with the default flags and a trusted runtime) is the
-    /// intended boundary.
+    /// [`ApprovalMode::AlwaysRequire`].
+    ///
+    /// With the isolation defaults kept, [`ApprovalMode::NeverRequire`] needs
+    /// no acknowledgement, because the container (with a trusted runtime) is
+    /// the intended boundary. If the configuration weakens that boundary
+    /// (root user, a writable host mount, a writable root filesystem, or a
+    /// network other than `none`), [`build`](Self::build) fails unless
+    /// [`acknowledge_unsafe`](Self::acknowledge_unsafe) is also set.
     pub fn approval_mode(mut self, mode: ApprovalMode) -> Self {
         self.approval_mode = mode;
         self
+    }
+
+    /// Confirm that running without approval is intended even though the
+    /// isolation defaults were weakened (see
+    /// [`approval_mode`](Self::approval_mode)).
+    pub fn acknowledge_unsafe(mut self, acknowledge: bool) -> Self {
+        self.acknowledge_unsafe = acknowledge;
+        self
+    }
+
+    /// The isolation defaults this configuration gives up, if any.
+    fn weakened_isolation(&self) -> Vec<&'static str> {
+        let mut weakened = Vec::new();
+        let uid = self.user.split(':').next().unwrap_or("").trim();
+        if uid.is_empty() || uid == "0" || uid.eq_ignore_ascii_case("root") {
+            weakened.push("the container runs as root");
+        }
+        if self.host_workdir.is_some() && !self.mount_readonly {
+            weakened.push("the host directory is mounted writable");
+        }
+        if !self.read_only_root {
+            weakened.push("the root filesystem is writable");
+        }
+        if self.network != DEFAULT_NETWORK {
+            weakened.push("the container has network access");
+        }
+        weakened
     }
 
     /// An audit hook called with every command that passes the policy.
@@ -410,6 +458,18 @@ impl DockerShellToolBuilder {
     /// until the first command or [`start`](ShellExecutor::start).
     pub fn build(self) -> Result<DockerShellTool, ShellError> {
         validate_extra_run_args(&self.extra_run_args)?;
+        if self.approval_mode == ApprovalMode::NeverRequire && !self.acknowledge_unsafe {
+            let weakened = self.weakened_isolation();
+            if !weakened.is_empty() {
+                return Err(ShellError::Config(format!(
+                    "Setting approval mode to NeverRequire relies on the container as the \
+                     security boundary, but this configuration weakens it ({}). Restore the \
+                     isolation defaults, keep approval on, or call acknowledge_unsafe(true) if \
+                     unapproved model commands with these privileges are intended.",
+                    weakened.join("; ")
+                )));
+            }
+        }
         if self.max_output_bytes == 0 {
             return Err(ShellError::Config(
                 "max_output_bytes must be positive".into(),
@@ -426,6 +486,81 @@ impl DockerShellToolBuilder {
                 state: Mutex::new(PersistentState::default()),
             }),
         })
+    }
+}
+
+/// Removes a container by name when dropped while armed, i.e. when the
+/// future that created it was cancelled and nothing else will clean it up.
+/// Killing the local CLI (`kill_on_drop`) does not stop the container, and
+/// `--rm` reaps it only once it exits on its own.
+///
+/// `Drop` cannot await, so `docker rm -f` is spawned synchronously and
+/// waited on (with a short retry, in case the daemon is still creating the
+/// container) on a detached thread.
+struct ContainerCleanup {
+    binary: String,
+    name: String,
+    armed: bool,
+}
+
+impl ContainerCleanup {
+    fn new(binary: &str, name: &str) -> Self {
+        Self {
+            binary: binary.to_string(),
+            name: name.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let binary = std::mem::take(&mut self.binary);
+        let name = std::mem::take(&mut self.name);
+        let spawn = move |binary: &str, name: &str| {
+            std::process::Command::new(binary)
+                .args(["rm", "-f", name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let first = match spawn(&binary, &name) {
+            Ok(child) => child,
+            Err(err) => {
+                tracing::error!(container = %name, error = %err, "could not run docker rm -f after cancellation; the container may be leaked");
+                return;
+            }
+        };
+        let reaper = std::thread::Builder::new()
+            .name("af-shell-docker-rm".into())
+            .spawn(move || {
+                let mut child = first;
+                for attempt in 1..=3 {
+                    if child.wait().is_ok_and(|status| status.success()) {
+                        return;
+                    }
+                    if attempt == 3 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                    child = match spawn(&binary, &name) {
+                        Ok(child) => child,
+                        Err(_) => break,
+                    };
+                }
+                tracing::warn!(container = %name, "docker rm -f after cancellation did not succeed; the container may need manual cleanup");
+            });
+        if let Err(err) = reaper {
+            tracing::warn!(error = %err, "could not start the docker rm -f reaper thread");
+        }
     }
 }
 
@@ -635,13 +770,20 @@ impl DockerShellTool {
 
     async fn start_container(&self) -> Result<(), ShellError> {
         let argv = self.run_argv();
+        // If this future is dropped mid-start the daemon may still create the
+        // container, and nothing has recorded it yet: remove it by name.
+        let mut cleanup =
+            ContainerCleanup::new(&self.inner.config.docker_binary, &self.inner.container_name);
         let out = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output()
-            .await
-            .map_err(|e| ShellError::io("failed to run the container CLI", e))?;
+            .await;
+        // A refused start is not cleaned up by name: with an explicit
+        // `container_name` the name may belong to someone else's container.
+        cleanup.disarm();
+        let out = out.map_err(|e| ShellError::io("failed to run the container CLI", e))?;
         if !out.status.success() {
             return Err(ShellError::Execution(format!(
                 "Failed to start container ({}): {}",
@@ -688,6 +830,7 @@ impl DockerShellTool {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         let binary = self.inner.config.docker_binary.clone();
+        let mut cleanup = ContainerCleanup::new(&binary, &name);
         let on_timeout: OnTimeout<'_> = Box::new(move || {
             Box::pin(async move {
                 // Killing the local CLI does not stop the container: kill it
@@ -708,13 +851,49 @@ impl DockerShellTool {
                 }
             })
         });
-        run_to_completion(
+        let result = run_to_completion(
             cmd,
             timeout,
             self.inner.config.max_output_bytes,
             Some(on_timeout),
         )
+        .await;
+        // Finished, or timed out and already killed by name.
+        cleanup.disarm();
+        result
+    }
+
+    /// Stop whatever the persistent container is still running after a
+    /// timeout, runaway output or a cancelled command. Killing the local
+    /// `docker exec` CLI does not stop the shell or the command inside the
+    /// container, so they would keep running and overlap the next call.
+    /// Kills every process except the container's init; if that fails, the
+    /// container is removed so the next call recreates it.
+    async fn reap_container(&self, state: &mut PersistentState) {
+        if !state.container_started {
+            return;
+        }
+        let c = &self.inner.config;
+        let name = &self.inner.container_name;
+        match docker_quiet(
+            &c.docker_binary,
+            &["exec", name, &c.shell, "-c", REAP_SCRIPT],
+            Duration::from_secs(10),
+        )
         .await
+        {
+            Ok(()) => {
+                tracing::info!(container = %name, "killed leftover processes in the container")
+            }
+            Err(err) => {
+                tracing::warn!(container = %name, error = %err, "could not kill leftover processes in the container; recreating it");
+                if let Some(session) = state.session.take() {
+                    session.close().await;
+                }
+                self.stop_container().await;
+                state.container_started = false;
+            }
+        }
     }
 }
 
@@ -794,6 +973,15 @@ impl ShellExecutor for DockerShellTool {
         if c.mode == ShellMode::Stateless {
             return self.run_stateless(command, timeout).await;
         }
+        {
+            // A previous call was cancelled mid-command: its command may still
+            // be running in the container. Reap it before the session is
+            // replaced.
+            let mut state = self.inner.state.lock().await;
+            if state.session.as_ref().is_some_and(|s| s.is_poisoned()) {
+                self.reap_container(&mut state).await;
+            }
+        }
         self.start().await?;
         let session = self
             .inner
@@ -805,7 +993,30 @@ impl ShellExecutor for DockerShellTool {
             .ok_or_else(|| {
                 ShellError::Execution("DockerShellTool session failed to start".into())
             })?;
-        session.run(command, timeout).await
+        let result = session.run(command, timeout).await;
+        let timed_out = matches!(&result, Ok(r) if r.timed_out);
+        if timed_out || !session.is_live().await {
+            // The session interrupted (or gave up on) the local CLI only.
+            // Start the next call from a fresh shell with nothing left over.
+            session.close().await;
+            let mut state = self.inner.state.lock().await;
+            self.reap_container(&mut state).await;
+        }
+        result
+    }
+
+    fn shell_family(&self) -> Option<ShellFamily> {
+        Some(
+            if is_powershell(std::slice::from_ref(&self.inner.config.shell)) {
+                ShellFamily::PowerShell
+            } else {
+                ShellFamily::Posix
+            },
+        )
+    }
+
+    fn os_description(&self) -> Option<String> {
+        Some(format!("a Linux container ({})", self.inner.config.image))
     }
 }
 
@@ -997,6 +1208,15 @@ mod tests {
             &["--", "-u0:0"],
             &["-it", "-u0:0"],
             &["--privileged", "-v/:/host:rw"],
+            &["--use-api-socket"],
+            &["--volumes-from", "other"],
+            &["--volumes-from=other"],
+            &["--detach"],
+            &["-d"],
+            &["-dit"],
+            &["-itd"],
+            &["--name", "other"],
+            &["--name=other"],
         ];
         for extra in cases {
             assert!(rejects(extra), "{extra:?} should be rejected");
@@ -1018,7 +1238,6 @@ mod tests {
         let cases: &[&[&str]] = &[
             &["--label", "team=af", "--name-suffix", "x"],
             &["--userland-proxy=false"],
-            &["--volumes-from", "other"],
             &["--network-alias", "svc"],
             &["-l", "team=af"],
             &["-lversion=1"],
@@ -1029,7 +1248,7 @@ mod tests {
             &["--"],
             &["-"],
             &["--env-file", "-variables.env"],
-            &["--name", "-upper"],
+            &["--label", "-upper"],
             &["--label", "-v/:/host:rw"],
             &["--entrypoint", "-v"],
             &["-e", "-value"],
@@ -1141,9 +1360,36 @@ mod tests {
         assert!(tool.as_function().requires_approval());
         let open = DockerShellTool::builder()
             .approval_mode(ApprovalMode::NeverRequire)
+            .host_workdir("/repo")
             .build()
             .unwrap();
         assert!(!open.as_function().requires_approval());
+    }
+
+    #[test]
+    fn never_require_with_weakened_isolation_needs_acknowledgement() {
+        type Weaken = fn(DockerShellToolBuilder) -> DockerShellToolBuilder;
+        let cases: &[(Weaken, &str)] = &[
+            (|b| b.user("0:0"), "root"),
+            (|b| b.user("root"), "root"),
+            (|b| b.user("0"), "root"),
+            (
+                |b| b.host_workdir("/").mount_readonly(false),
+                "mounted writable",
+            ),
+            (|b| b.read_only_root(false), "root filesystem is writable"),
+            (|b| b.network("bridge"), "network access"),
+        ];
+        for (weaken, reason) in cases {
+            let never =
+                || weaken(DockerShellTool::builder()).approval_mode(ApprovalMode::NeverRequire);
+            let err = never().build().unwrap_err().to_string();
+            assert!(err.contains("acknowledge_unsafe"), "{err}");
+            assert!(err.contains(reason), "{err}");
+            assert!(never().acknowledge_unsafe(true).build().is_ok());
+            // With approval on, weakening needs no acknowledgement.
+            assert!(weaken(DockerShellTool::builder()).build().is_ok());
+        }
     }
 
     #[test]

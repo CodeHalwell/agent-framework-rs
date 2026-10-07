@@ -150,12 +150,30 @@ pub(crate) async fn kill_process_tree(child: &mut Child, grace: Duration) {
     }
 }
 
-/// Kills the process group of a running stateless command if the future
+/// Kill `pid` and everything it spawned, synchronously, for drop paths that
+/// cannot await. Unix: `SIGKILL` to its process group. Windows: a blocking
+/// `taskkill /T /F`, which walks the tree from `pid`, so it must run while
+/// that process is still alive.
+pub(crate) fn kill_tree_now(pid: u32) {
+    #[cfg(unix)]
+    signal_group(pid, libc::SIGKILL);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new(taskkill_path())
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+/// Kills the process tree of a running stateless command if the future
 /// running it is dropped (cancelled) before it finished. `kill_on_drop` alone
 /// would only reach the shell, not what it spawned.
 pub(crate) struct GroupGuard {
-    // Read only by the Unix drop path.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
 }
 
@@ -171,9 +189,10 @@ impl GroupGuard {
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // Declared after the child in `run_to_completion`, so this runs
+        // before `kill_on_drop` takes the shell down.
         if let Some(pid) = self.pid {
-            signal_group(pid, libc::SIGKILL);
+            kill_tree_now(pid);
         }
     }
 }

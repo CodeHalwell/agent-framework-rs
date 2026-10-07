@@ -13,9 +13,11 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use super::process::{apply_env, isolate_process_group, kill_process_tree, KILL_GRACE};
+use super::process::{
+    apply_env, isolate_process_group, kill_process_tree, kill_tree_now, KILL_GRACE,
+};
 use super::resolve::is_powershell;
-use super::truncate::{truncate_head_tail, truncate_text_head_tail};
+use super::truncate::{truncate_head_tail, truncate_text_head_tail, HeadTailBuffer};
 use super::types::{ShellError, ShellResult};
 
 const READ_CHUNK: usize = 64 * 1024;
@@ -23,21 +25,50 @@ const READ_CHUNK: usize = 64 * 1024;
 const STDERR_QUIESCENCE: Duration = Duration::from_millis(50);
 /// Exit code reported when a timed-out command could not be recovered.
 const TIMEOUT_EXIT_CODE: i32 = 124;
+/// stdout is kept up to this many times `max_output_bytes` while waiting
+/// for the sentinel; past it the command counts as runaway output.
+const STDOUT_CAP_FACTOR: usize = 4;
 
-#[derive(Default)]
+/// Output captured since the current command was written. Both streams are
+/// bounded, so neither a runaway command nor a background job writing
+/// between commands can grow memory without limit.
 struct Buffers {
+    /// Raw stdout, kept up to `stdout_cap` (plus at most one read chunk) so
+    /// the sentinel can be found; the overflow check fires past `stdout_cap`,
+    /// and the result is head/tail truncated from it.
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    /// stderr in head/tail storage of `max_output_bytes`.
+    stderr: HeadTailBuffer,
     stdout_closed: bool,
 }
 
-#[derive(Default)]
 struct Shared {
     buffers: StdMutex<Buffers>,
     stdout_changed: Notify,
+    stdout_cap: usize,
+    stderr_cap: usize,
 }
 
 impl Shared {
+    fn new(stdout_cap: usize, stderr_cap: usize) -> Self {
+        Self {
+            buffers: StdMutex::new(Buffers {
+                stdout: Vec::new(),
+                stderr: HeadTailBuffer::new(stderr_cap),
+                stdout_closed: false,
+            }),
+            stdout_changed: Notify::new(),
+            stdout_cap,
+            stderr_cap,
+        }
+    }
+
+    /// Drop everything captured so far.
+    fn clear(&self, bufs: &mut Buffers) {
+        bufs.stdout.clear();
+        bufs.stderr = HeadTailBuffer::new(self.stderr_cap);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Buffers> {
         // A reader that panicked mid-push leaves valid bytes behind; keep going.
         self.buffers.lock().unwrap_or_else(|e| e.into_inner())
@@ -56,11 +87,11 @@ impl Drop for Live {
         for reader in &self.readers {
             reader.abort();
         }
-        // `kill_on_drop` reaches only the shell; take its group with it.
-        #[cfg(unix)]
+        // `kill_on_drop` reaches only the shell; take its process tree with
+        // it while the shell is still alive to anchor the tree.
         if matches!(self.child.try_wait(), Ok(None)) {
             if let Some(pid) = self.child.id() {
-                super::process::signal_group(pid, libc::SIGKILL);
+                kill_tree_now(pid);
             }
         }
     }
@@ -204,7 +235,10 @@ impl ShellSession {
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new(
+            self.max_output_bytes.saturating_mul(STDOUT_CAP_FACTOR),
+            self.max_output_bytes,
+        ));
         let readers = vec![
             spawn_reader(stdout, shared.clone(), true),
             spawn_reader(stderr, shared.clone(), false),
@@ -226,6 +260,21 @@ impl ShellSession {
         }
         *live = Some(started);
         Ok(())
+    }
+
+    /// Whether a shell is currently running. `false` after [`close`](Self::close)
+    /// and after a timeout or runaway output tore the shell down.
+    pub(crate) async fn is_live(&self) -> bool {
+        match self.live.lock().await.as_mut() {
+            Some(live) => matches!(live.child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
+    /// Whether a `run` was cancelled mid-command, so the shell may still be
+    /// running it.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     /// Stop the shell: ask it to `exit`, then kill its process tree if it
@@ -289,8 +338,7 @@ impl ShellSession {
             // Only output produced after the command is written belongs to it.
             {
                 let mut bufs = shared.lock();
-                bufs.stdout.clear();
-                bufs.stderr.clear();
+                shared.clear(&mut bufs);
             }
             if let Err(err) = write_all(&mut live.stdin, &script).await {
                 drop(guard);
@@ -304,7 +352,7 @@ impl ShellSession {
 
         let started = Instant::now();
         let needle = sentinel.into_bytes();
-        let hard_cap = self.max_output_bytes.saturating_mul(4);
+        let hard_cap = shared.stdout_cap;
 
         let first = match timeout {
             Some(limit) => {
@@ -321,10 +369,10 @@ impl ShellSession {
                 // Runaway output with no sentinel: interrupt and restart.
                 interrupt(pid);
                 self.close().await;
-                let bufs = shared.lock();
+                let mut bufs = shared.lock();
                 let end = bufs.stdout.len().min(hard_cap);
                 let (stdout, _) = truncate_head_tail(&bufs.stdout[..end], self.max_output_bytes);
-                let (stderr, _) = truncate_head_tail(&bufs.stderr, self.max_output_bytes);
+                let (stderr, _) = take_stderr(&shared, &mut bufs);
                 return Ok(ShellResult {
                     stdout,
                     stderr,
@@ -353,11 +401,10 @@ impl ShellSession {
                         // Unrecoverable: tear down so the next call gets a
                         // fresh shell.
                         self.close().await;
-                        let bufs = shared.lock();
+                        let mut bufs = shared.lock();
                         let (stdout, out_t) =
                             truncate_head_tail(&bufs.stdout, self.max_output_bytes);
-                        let (stderr, err_t) =
-                            truncate_head_tail(&bufs.stderr, self.max_output_bytes);
+                        let (stderr, err_t) = take_stderr(&shared, &mut bufs);
                         return Ok(ShellResult {
                             stdout,
                             stderr,
@@ -377,13 +424,10 @@ impl ShellSession {
         let mut bufs = shared.lock();
         let stdout_text = String::from_utf8_lossy(&bufs.stdout[..sentinel_idx]);
         let stdout_text = stdout_text.trim_end_matches(['\r', '\n']);
-        let stderr_text = String::from_utf8_lossy(&bufs.stderr);
         let (stdout, out_t) = truncate_text_head_tail(stdout_text, self.max_output_bytes);
-        let (stderr, err_t) = truncate_text_head_tail(&stderr_text, self.max_output_bytes);
-        // Everything needed has been copied; keep memory bounded across
-        // many commands.
-        bufs.stdout.clear();
-        bufs.stderr.clear();
+        let (stderr, err_t) = take_stderr(&shared, &mut bufs);
+        // Everything needed has been copied; release it.
+        shared.clear(&mut bufs);
 
         Ok(ShellResult {
             stdout,
@@ -444,9 +488,14 @@ where
                     {
                         let mut bufs = shared.lock();
                         if is_stdout {
-                            bufs.stdout.extend_from_slice(&chunk[..n]);
+                            // Past the cap the command has overflowed (or a
+                            // background job is flooding between commands):
+                            // keep draining the pipe, but stop storing.
+                            if bufs.stdout.len() <= shared.stdout_cap {
+                                bufs.stdout.extend_from_slice(&chunk[..n]);
+                            }
                         } else {
-                            bufs.stderr.extend_from_slice(&chunk[..n]);
+                            bufs.stderr.push(&chunk[..n]);
                         }
                     }
                     if is_stdout {
@@ -456,6 +505,12 @@ where
             }
         }
     })
+}
+
+/// Take the captured stderr as head/tail-truncated text, leaving an empty
+/// buffer behind.
+fn take_stderr(shared: &Shared, bufs: &mut Buffers) -> (String, bool) {
+    std::mem::replace(&mut bufs.stderr, HeadTailBuffer::new(shared.stderr_cap)).finish()
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -575,6 +630,28 @@ mod tests {
         assert!(script.contains("[Console]::WriteLine('__AF_END_x___' + $__af_rc)"));
         assert!(script.ends_with("}\n"));
         assert_eq!(script.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn readers_bound_both_streams() {
+        use tokio::io::AsyncReadExt as _;
+        let shared = Arc::new(Shared::new(4096, 1024));
+        let flood = 10 * 1024 * 1024;
+        let out = spawn_reader(tokio::io::repeat(b'o').take(flood), shared.clone(), true);
+        let err = spawn_reader(tokio::io::repeat(b'e').take(flood), shared.clone(), false);
+        out.await.unwrap();
+        err.await.unwrap();
+        let mut bufs = shared.lock();
+        assert!(
+            bufs.stdout.len() <= 4096 + READ_CHUNK,
+            "{}",
+            bufs.stdout.len()
+        );
+        assert!(bufs.stdout.len() > 4096, "overflow must stay detectable");
+        let (stderr, truncated) = take_stderr(&shared, &mut bufs);
+        assert!(truncated);
+        assert!(stderr.len() < 1024 + 64, "{}", stderr.len());
+        assert!(stderr.contains(&format!("truncated {} bytes", flood - 1024)));
     }
 
     #[test]

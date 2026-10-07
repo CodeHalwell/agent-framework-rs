@@ -23,7 +23,8 @@
 //!    memory and process caps). [`LocalShellTool`] has no isolation at all.
 //! 2. **Approval in the loop.** The function from `as_function` requires a
 //!    human to approve every call by default. On [`LocalShellTool`]
-//!    switching that off needs an explicit `acknowledge_unsafe(true)`.
+//!    switching that off needs an explicit `acknowledge_unsafe(true)`, as it
+//!    does on [`DockerShellTool`] when its isolation defaults are weakened.
 //! 3. **[`ShellPolicy`]**: a UX pre-filter for operator-specific patterns.
 //!    A model can trivially bypass it; it ships with no patterns so it does
 //!    not suggest otherwise.
