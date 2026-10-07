@@ -42,6 +42,8 @@ struct Inputs {
     rust: BTreeMap<Key, Leaf>,
     go: BTreeMap<Key, Leaf>,
     inventory: Value,
+    /// Type-level keys for .NET types that neither catalog lists.
+    inventory_only: BTreeSet<Key>,
 }
 
 fn read_json(root: &Path, rel: &str) -> Result<Value, String> {
@@ -51,13 +53,43 @@ fn read_json(root: &Path, rel: &str) -> Result<Value, String> {
 
 /// Flattens a namespace → type → group → member tree into leaves. `symbols`
 /// names the field holding counterparts (`rust` here, `go_symbols` in Go's).
-fn flatten(tree: &Value, symbols: &str, errors: &mut Vec<String>) -> BTreeMap<Key, Leaf> {
+///
+/// `source` names the file in diagnostics. A missing `namespaces`, or any
+/// container or leaf that is not a JSON object, is an error rather than an
+/// empty container, so a malformed entry cannot vanish before validation.
+fn flatten(
+    tree: &Value,
+    source: &str,
+    symbols: &str,
+    errors: &mut Vec<String>,
+) -> BTreeMap<Key, Leaf> {
     let mut out = BTreeMap::new();
-    let empty = Map::new();
-    for (ns, types) in tree["namespaces"].as_object().unwrap_or(&empty) {
-        for (ty, entry) in types.as_object().unwrap_or(&empty) {
+    let Some(namespaces) = object(
+        &tree["namespaces"],
+        &format!("{source}: `namespaces`"),
+        errors,
+    ) else {
+        return out;
+    };
+    for (ns, types) in namespaces {
+        let Some(types) = object(types, &format!("{source}: namespace {ns}"), errors) else {
+            continue;
+        };
+        for (ty, entry) in types {
+            let Some(entry_map) = object(entry, &format!("{source}: {ns}::{ty}"), errors) else {
+                continue;
+            };
             let area = entry["area"].as_str().unwrap_or_default().to_string();
-            let mut push = |group: &str, member: &str, leaf: &Value| {
+            let mut push = |group: &str, member: &str, leaf: &Value, errors: &mut Vec<String>| {
+                let at = label(&(
+                    ns.clone(),
+                    ty.clone(),
+                    group.to_string(),
+                    member.to_string(),
+                ));
+                if object(leaf, &format!("{source}: {at}"), errors).is_none() {
+                    return;
+                }
                 let key = (
                     ns.clone(),
                     ty.clone(),
@@ -81,18 +113,23 @@ fn flatten(tree: &Value, symbols: &str, errors: &mut Vec<String>) -> BTreeMap<Ke
                 out.insert(key, parsed);
             };
             if let Some(m) = entry.get("mapping") {
-                push("type", "", m);
+                push("type", "", m, errors);
             }
-            for (group, members) in entry.as_object().unwrap_or(&empty) {
+            for (group, members) in entry_map {
                 if matches!(group.as_str(), "area" | "assembly" | "mapping") {
                     continue;
                 }
                 if !GROUPS.contains(&group.as_str()) {
-                    errors.push(format!("{ns}::{ty}: unknown group `{group}`"));
+                    errors.push(format!("{source}: {ns}::{ty}: unknown group `{group}`"));
                     continue;
                 }
-                for (member, leaf) in members.as_object().unwrap_or(&empty) {
-                    push(group, member, leaf);
+                let Some(members) =
+                    object(members, &format!("{source}: {ns}::{ty} {group}"), errors)
+                else {
+                    continue;
+                };
+                for (member, leaf) in members {
+                    push(group, member, leaf, errors);
                 }
             }
         }
@@ -100,18 +137,117 @@ fn flatten(tree: &Value, symbols: &str, errors: &mut Vec<String>) -> BTreeMap<Ke
     out
 }
 
+/// `value` as a JSON object, or an error naming `at`.
+fn object<'a>(
+    value: &'a Value,
+    at: &str,
+    errors: &mut Vec<String>,
+) -> Option<&'a Map<String, Value>> {
+    let map = value.as_object();
+    if map.is_none() {
+        let found = match value {
+            Value::Null => "nothing",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+            Value::String(_) => "a string",
+            Value::Array(_) => "an array",
+            Value::Object(_) => unreachable!(),
+        };
+        errors.push(format!("{at}: expected an object, found {found}"));
+    }
+    map
+}
+
 fn load(root: &Path, errors: &mut Vec<String>) -> Result<Inputs, String> {
     let ledger = read_json(root, LEDGER)?;
     let go_tree = read_json(root, GO_MAPPING)?;
     let inventory = read_json(root, INVENTORY)?;
-    let rust = flatten(&ledger, "rust", errors);
-    let go = flatten(&go_tree, "go_symbols", errors);
+    let rust = flatten(&ledger, LEDGER, "rust", errors);
+    let go = flatten(&go_tree, GO_MAPPING, "go_symbols", errors);
+    let inventory_only = inventory_only_types(&inventory, &rust, &go, errors);
     Ok(Inputs {
         ledger,
         rust,
         go,
         inventory,
+        inventory_only,
     })
+}
+
+// --- .NET declarations neither catalog lists ------------------------------
+
+/// `Microsoft.Agents.AI.AIContextProvider+InvokedContext` →
+/// `("Microsoft.Agents.AI", "AIContextProvider.InvokedContext")`, and a
+/// generic arity becomes the parameter names (``AgentResponse`1`` →
+/// `AgentResponse<T>`): the inverse of [`clr_type_key`]. A nested type's
+/// `generic_parameters` list the enclosing types' parameters first.
+fn catalog_type_key(clr: &str, generic_parameters: &Value) -> (String, String) {
+    let (outer, nested) = match clr.split_once('+') {
+        Some((outer, nested)) => (outer, Some(nested)),
+        None => (clr, None),
+    };
+    let (ns, first) = outer.rsplit_once('.').unwrap_or(("", outer));
+    let names: Vec<&str> = generic_parameters
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    let mut next = 0;
+    let segments: Vec<String> = std::iter::once(first)
+        .chain(nested.into_iter().flat_map(|n| n.split('+')))
+        .map(|segment| match segment.split_once('`') {
+            Some((name, arity)) => {
+                let arity: usize = arity.parse().unwrap_or(0);
+                let params: Vec<String> = (next..next + arity)
+                    .map(|i| {
+                        names
+                            .get(i)
+                            .map_or_else(|| format!("T{i}"), |n| n.to_string())
+                    })
+                    .collect();
+                next += arity;
+                format!("{name}<{}>", params.join(", "))
+            }
+            None => segment.to_string(),
+        })
+        .collect();
+    (ns.to_string(), segments.join("."))
+}
+
+/// Types in the .NET inventory that neither Go's catalog nor the Rust ledger
+/// lists at all, as type-level keys. They are unreviewed: a refresh that adds
+/// a .NET type surfaces it here even before Go catalogs it. Members are not
+/// listed one by one, because the inventory also carries compiler-generated
+/// members (record equality, `<Clone>$`, `Deconstruct`) that no catalog
+/// reviews; a type is counted once and its members follow once it is
+/// reviewed.
+fn inventory_only_types(
+    inventory: &Value,
+    rust: &BTreeMap<Key, Leaf>,
+    go: &BTreeMap<Key, Leaf>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<Key> {
+    let Some(types) = object(
+        &inventory["types"],
+        &format!("{INVENTORY}: `types`"),
+        errors,
+    ) else {
+        return BTreeSet::new();
+    };
+    let catalogued: BTreeSet<String> = go
+        .keys()
+        .chain(rust.keys())
+        .map(|(ns, ty, ..)| clr_type_key(ns, ty))
+        .collect();
+    types
+        .iter()
+        .filter(|(clr, _)| !catalogued.contains(*clr))
+        .map(|(clr, entry)| {
+            let (ns, ty) = catalog_type_key(clr, &entry["generic_parameters"]);
+            (ns, ty, "type".to_string(), String::new())
+        })
+        .collect()
 }
 
 // --- resolving a ledger key against the .NET inventory -------------------
@@ -245,6 +381,17 @@ fn validate(inputs: &Inputs, rust_index: &RustIndex, errors: &mut Vec<String>) {
     if inputs.ledger["schema_version"].as_u64() != Some(1) {
         errors.push("ledger schema_version must be 1".into());
     }
+    // Go's statuses feed the report's counts, which tally only the known
+    // ones, so an unsupported status would silently drop a declaration.
+    for (key, leaf) in &inputs.go {
+        if !STATUSES.contains(&leaf.status.as_str()) {
+            errors.push(format!(
+                "{GO_MAPPING}: {}: unsupported status `{}`",
+                label(key),
+                leaf.status
+            ));
+        }
+    }
     for (key, leaf) in &inputs.rust {
         let at = label(key);
         if !STATUSES.contains(&leaf.status.as_str()) {
@@ -336,6 +483,9 @@ fn tally(inputs: &Inputs) -> BTreeMap<String, Row> {
             r.rust_only += 1;
         }
     }
+    for key in &inputs.inventory_only {
+        row(&mut rows, &key.0).unreviewed += 1;
+    }
     rows
 }
 
@@ -367,6 +517,7 @@ fn gap_rows(inputs: &Inputs) -> Vec<(Key, String, String, String)> {
     let mut rows = Vec::new();
     let mut keys: BTreeSet<&Key> = inputs.go.keys().collect();
     keys.extend(inputs.rust.keys());
+    keys.extend(inputs.inventory_only.iter());
     for key in keys {
         let go = inputs.go.get(key).map(|l| l.status.as_str()).unwrap_or("-");
         let (rust, note) = match inputs.rust.get(key) {
@@ -473,18 +624,39 @@ fn render_report(inputs: &Inputs) -> String {
         }
     }
     let _ = writeln!(out, "\n## Not yet reviewed\n");
+    let (dotnet_only, in_go): (Vec<_>, Vec<_>) = unreviewed
+        .into_iter()
+        .partition(|(key, ..)| inputs.inventory_only.contains(key));
     let _ = writeln!(
         out,
-        "{} declarations in Go's catalog that the Rust ledger has not assessed yet ({} unreviewed in all), by type:\n",
-        unreviewed.len(),
-        total_unreviewed
+        "{total_unreviewed} declarations the Rust ledger has not assessed yet.\n"
+    );
+    let _ = writeln!(
+        out,
+        "### In Go's catalog\n\n{} declarations, by type:\n",
+        in_go.len()
     );
     let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
-    for (key, ..) in &unreviewed {
+    for (key, ..) in &in_go {
         *by_type.entry(format!("{}::{}", key.0, key.1)).or_default() += 1;
+    }
+    if by_type.is_empty() {
+        let _ = writeln!(out, "None.");
     }
     for (ty, n) in by_type {
         let _ = writeln!(out, "- `{ty}` ({n})");
+    }
+    let _ = writeln!(
+        out,
+        "\n### Only in the .NET inventory\n\n{} types that neither Go's catalog nor the Rust ledger lists. \
+         Each counts once; review its members when it is assessed.\n",
+        dotnet_only.len()
+    );
+    if dotnet_only.is_empty() {
+        let _ = writeln!(out, "None.");
+    }
+    for (key, ..) in &dotnet_only {
+        let _ = writeln!(out, "- `{}::{}`", key.0, key.1);
     }
     out
 }
@@ -506,6 +678,165 @@ mod tests {
         assert_eq!(
             clr_type_key("Microsoft.Agents.AI.Workflows", "Executor<TInput, TOutput>"),
             "Microsoft.Agents.AI.Workflows.Executor`2"
+        );
+    }
+
+    fn flatten_errors(tree: Value) -> Vec<String> {
+        let mut errors = Vec::new();
+        let leaves = flatten(&tree, "ledger.json", "rust", &mut errors);
+        assert!(leaves.is_empty(), "malformed input yielded leaves");
+        errors
+    }
+
+    #[test]
+    fn flatten_rejects_malformed_containers_at_every_level() {
+        use serde_json::json;
+        let cases = [
+            (
+                json!({}),
+                "ledger.json: `namespaces`: expected an object, found nothing",
+            ),
+            (
+                json!({"namespaces": []}),
+                "ledger.json: `namespaces`: expected an object, found an array",
+            ),
+            (
+                json!({"namespaces": {"N": []}}),
+                "ledger.json: namespace N: expected an object, found an array",
+            ),
+            (
+                json!({"namespaces": {"N": {"T": "x"}}}),
+                "ledger.json: N::T: expected an object, found a string",
+            ),
+            (
+                json!({"namespaces": {"N": {"T": {"methods": []}}}}),
+                "ledger.json: N::T methods: expected an object, found an array",
+            ),
+            (
+                json!({"namespaces": {"N": {"T": {"methods": {"M()": []}}}}}),
+                "ledger.json: N::T methods::M(): expected an object, found an array",
+            ),
+            (
+                json!({"namespaces": {"N": {"T": {"mapping": 1}}}}),
+                "ledger.json: N::T: expected an object, found a number",
+            ),
+            (
+                json!({"namespaces": {"N": {"T": {"method": {}}}}}),
+                "ledger.json: N::T: unknown group `method`",
+            ),
+        ];
+        for (tree, expected) in cases {
+            assert_eq!(flatten_errors(tree), [expected]);
+        }
+    }
+
+    #[test]
+    fn flatten_reads_a_well_formed_tree() {
+        let tree = serde_json::json!({"namespaces": {"N": {"T": {
+            "area": "core",
+            "mapping": {"status": "unmapped", "note": "n"},
+            "methods": {"M()": {"status": "mapped", "note": "n", "rust": ["k::m"]}}
+        }}}});
+        let mut errors = Vec::new();
+        let leaves = flatten(&tree, "ledger.json", "rust", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(leaves.len(), 2);
+        let m = &leaves[&("N".into(), "T".into(), "methods".into(), "M()".into())];
+        assert_eq!(m.rust, ["k::m"]);
+        assert_eq!(m.area, "core");
+    }
+
+    #[test]
+    fn catalog_type_keys_invert_the_clr_spelling() {
+        let params = serde_json::json!([{"name": "TInput"}, {"name": "TOutput"}]);
+        assert_eq!(
+            catalog_type_key("Microsoft.Agents.AI.Workflows.Executor`2", &params),
+            (
+                "Microsoft.Agents.AI.Workflows".into(),
+                "Executor<TInput, TOutput>".into()
+            )
+        );
+        assert_eq!(
+            catalog_type_key(
+                "Microsoft.Agents.AI.ChatHistoryMemoryProvider+State",
+                &Value::Null
+            ),
+            (
+                "Microsoft.Agents.AI".into(),
+                "ChatHistoryMemoryProvider.State".into()
+            )
+        );
+        // Every vendored inventory type round-trips through both spellings.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let inventory = read_json(&root, INVENTORY).unwrap();
+        for (clr, entry) in inventory["types"].as_object().unwrap() {
+            let (ns, ty) = catalog_type_key(clr, &entry["generic_parameters"]);
+            assert_eq!(&clr_type_key(&ns, &ty), clr);
+        }
+    }
+
+    #[test]
+    fn inventory_only_types_are_unreviewed_and_counted_once() {
+        let inventory = serde_json::json!({"types": {
+            "N.Listed": {"methods": {"M() -> System.Void": {}}},
+            "N.Store": {"methods": {"A() -> System.Void": {}, "B() -> System.Void": {}}},
+            "N.Box`1": {"generic_parameters": [{"name": "T"}]}
+        }});
+        let leaf = Leaf {
+            status: "mapped".into(),
+            note: "n".into(),
+            rust: vec![],
+            area: String::new(),
+        };
+        let go = BTreeMap::from([(
+            (
+                "N".to_string(),
+                "Listed".to_string(),
+                "methods".to_string(),
+                "M()".to_string(),
+            ),
+            leaf,
+        )]);
+        let mut errors = Vec::new();
+        let only = inventory_only_types(&inventory, &BTreeMap::new(), &go, &mut errors);
+        assert!(errors.is_empty());
+        let inputs = Inputs {
+            ledger: Value::Null,
+            rust: BTreeMap::new(),
+            go,
+            inventory,
+            inventory_only: only,
+        };
+        let rows = tally(&inputs);
+        // `Listed`'s method is unreviewed through Go's catalog; `Store` and
+        // `Box<T>` once each through the inventory.
+        assert_eq!(rows["N"].unreviewed, 3);
+        let gaps: Vec<String> = gap_rows(&inputs).iter().map(|(k, ..)| label(k)).collect();
+        assert_eq!(gaps, ["N::Box<T>", "N::Listed methods::M()", "N::Store"]);
+        let report = render_report(&inputs);
+        assert!(report.contains("- `N::Store`"), "{report}");
+    }
+
+    #[test]
+    fn go_leaves_with_unsupported_statuses_are_rejected() {
+        let tree = serde_json::json!({"namespaces": {"N": {"T": {
+            "methods": {"M()": {"status": "done", "note": "n"}}
+        }}}});
+        let mut errors = Vec::new();
+        let go = flatten(&tree, GO_MAPPING, "go_symbols", &mut errors);
+        let inputs = Inputs {
+            ledger: serde_json::json!({"schema_version": 1}),
+            rust: BTreeMap::new(),
+            go,
+            inventory: Value::Null,
+            inventory_only: BTreeSet::new(),
+        };
+        validate(&inputs, &RustIndex::new(), &mut errors);
+        assert_eq!(
+            errors,
+            [format!(
+                "{GO_MAPPING}: N::T methods::M(): unsupported status `done`"
+            )]
         );
     }
 
