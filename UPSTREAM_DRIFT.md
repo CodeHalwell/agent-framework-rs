@@ -1,5 +1,9 @@
 # Upstream drift: re-baselining agent-framework-rs against current upstream
 
+> **Historical (July 2026).** This is the `68136ee` re-baseline. For the
+> current position see [`SCOPE.md`](SCOPE.md) and the weekly passes in
+> [`docs/drift/`](docs/drift/README.md).
+
 This document catalogs **everything that must change across the whole library**
 to bring this Rust port back in line with the current
 [Microsoft Agent Framework](https://github.com/microsoft/agent-framework).

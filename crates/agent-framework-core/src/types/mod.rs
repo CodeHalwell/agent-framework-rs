@@ -12,9 +12,9 @@ pub use content::{
     prepare_function_call_results, Annotation, AnnotationKind, Content, DataContent, ErrorContent,
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
-    ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
-    TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
-    FUNCTION_INVOCATION_ERROR_MARKER,
+    McpServerToolCallContent, McpServerToolResultContent, ShellCommandOutputContent,
+    ShellToolCallContent, ShellToolResultContent, TextContent, TextReasoningContent,
+    TextSpanRegion, UriContent, UsageContent, UsageDetails, FUNCTION_INVOCATION_ERROR_MARKER,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};

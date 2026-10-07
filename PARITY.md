@@ -7,10 +7,12 @@
 > configs, trait-level streaming, per-run options, typed tool schemas,
 > thread persistence, fan-in checkpointing, concurrent supersteps, the
 > OpenAI Assistants and Azure Responses clients, first-class MCP tools,
-> granular errors, GenAI metrics, and a 69-example gallery). See
-> [GAP_ANALYSIS.md](GAP_ANALYSIS.md) — its status section is the current
-> source of truth for what remains open; this matrix has not been
-> re-edited row by row.
+> granular errors, GenAI metrics, and a 69-example gallery). This matrix has
+> not been re-edited row by row and is kept as history.
+>
+> **Current sources:** [`SCOPE.md`](SCOPE.md) for what is deliberately out of
+> scope or not yet ported, and [`docs/drift/`](docs/drift/README.md) for the
+> weekly passes against upstream.
 
 A snapshot of `agent-framework-rs` against the upstream [Microsoft Agent
 Framework](https://github.com/microsoft/agent-framework) (Python and .NET), as
