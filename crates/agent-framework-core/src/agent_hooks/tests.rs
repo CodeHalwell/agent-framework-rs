@@ -421,20 +421,76 @@ async fn pre_tool_call_deny_blocks_the_call_and_the_loop_continues() {
     assert_eq!(count.load(Ordering::SeqCst), 0);
     // §6.2: no post_tool_call for a blocked pre_tool_call.
     assert!(!points(&seen).contains(&"post_tool_call"));
+    // §6.2: the loop continues as if the call failed: an error result whose
+    // blocked-call payload reaches the model under the default config.
     let requests = requests.lock().unwrap();
     let result = requests[1]
         .iter()
         .flat_map(|m| m.contents.iter())
         .find_map(Content::as_function_result)
         .unwrap();
+    assert!(result.is_error());
+    assert_eq!(result.result, None);
+    let payload: Value = serde_json::from_str(result.exception.as_deref().unwrap()).unwrap();
     assert_eq!(
-        result.result,
-        Some(json!({
+        payload,
+        json!({
             "error": "Tool call blocked by agent-hooks at pre_tool_call.",
             "reason": "tool_denied",
             "message": "not now"
-        }))
+        })
     );
+}
+
+/// Calls `lookup` until tools are switched off, then answers in text.
+struct KeepsCalling {
+    requests: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ChatClient for KeepsCalling {
+    async fn get_response(&self, _: Vec<Message>, options: ChatOptions) -> Result<ChatResponse> {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            if options.tool_choice == Some(crate::types::ToolMode::None) {
+                text_reply("gave up")
+            } else {
+                tool_call_reply(&format!("c{n}"), "lookup", json!({"q": "x"}))
+            },
+        )
+    }
+
+    async fn get_streaming_response(&self, _: Vec<Message>, _: ChatOptions) -> Result<ChatStream> {
+        unreachable!("not streamed")
+    }
+}
+
+#[tokio::test]
+async fn denied_tool_calls_count_as_consecutive_errors() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let client = KeepsCalling {
+        requests: requests.clone(),
+    };
+    let (interceptor, _) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PreToolCall => Verdict::deny("tool_denied"),
+        _ => Verdict::allow(),
+    });
+    let config = crate::tools::FunctionInvocationConfig {
+        max_consecutive_errors_per_request: 1,
+        ..Default::default()
+    };
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_invocation_config(config),
+    );
+    let response = agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(response.text(), "gave up");
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    // Two denied iterations exceed the limit of one; the third request has
+    // tools switched off.
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -453,9 +509,16 @@ async fn post_tool_call_deny_discards_the_result() {
     agent.run(vec![Message::user("go")], None).await.unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 1);
     let requests = requests.lock().unwrap();
-    let wire = serde_json::to_string(&requests[1]).unwrap();
-    assert!(!wire.contains("found"), "{wire}");
-    assert!(wire.contains("leaky_result"));
+    let result = requests[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(Content::as_function_result)
+        .unwrap();
+    // §6.1: discarded as if it had errored.
+    assert_eq!(result.result, None);
+    let exception = result.exception.as_deref().unwrap();
+    assert!(exception.contains("leaky_result"), "{exception}");
+    assert!(!exception.contains("found"), "{exception}");
 }
 
 #[tokio::test]
@@ -821,15 +884,9 @@ async fn post_tool_call_transform_rewrites_an_errored_result() {
         InterceptionPoint::PostToolCall => Verdict::transform("$target", json!("sanitized")),
         _ => Verdict::allow(),
     });
-    let config = crate::tools::FunctionInvocationConfig {
-        include_detailed_errors: true,
-        ..Default::default()
-    };
-    let agent = hooks(interceptor).build_agent(
-        Agent::builder(client)
-            .tool(failing)
-            .function_invocation_config(config),
-    );
+    // The default config (no detailed errors): the transformed text is the
+    // interceptor's, addressed to the model, so it still gets through.
+    let agent = hooks(interceptor).build_agent(Agent::builder(client).tool(failing));
     agent.run(vec![Message::user("go")], None).await.unwrap();
     assert_eq!(
         seen.lock()
@@ -847,8 +904,7 @@ async fn post_tool_call_transform_rewrites_an_errored_result() {
         .find_map(Content::as_function_result)
         .and_then(|r| r.exception.clone())
         .unwrap();
-    assert!(exception.contains("sanitized"), "{exception}");
-    assert!(!exception.contains("raw internal detail"), "{exception}");
+    assert_eq!(exception, "sanitized");
 }
 
 fn host_calls(response: &ChatResponse) -> Vec<(String, Value)> {

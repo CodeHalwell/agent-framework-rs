@@ -1617,6 +1617,43 @@ async fn ordinary_middleware_error_is_still_absorbed_into_a_tool_error() {
     );
 }
 
+/// `Error::ToolRejected` is absorbed like any tool error, but its message is
+/// addressed to the model, so it gets through without detailed errors.
+#[tokio::test]
+async fn tool_rejected_message_reaches_the_model_without_detailed_errors() {
+    struct Reject;
+    #[async_trait]
+    impl Middleware<FunctionInvocationContext> for Reject {
+        async fn process(
+            &self,
+            _ctx: FunctionInvocationContext,
+            _next: Next<FunctionInvocationContext>,
+        ) -> Result<FunctionInvocationContext> {
+            Err(Error::tool_rejected("blocked by policy: try another tool"))
+        }
+    }
+    let client = MockClient::new(vec![
+        tool_calls_response(&[("call_1", "noop")]),
+        ChatResponse::from_text("done"),
+    ]);
+    let seen = client.seen.clone();
+    let agent = Agent::builder(client)
+        .tool(noop_tool("noop"))
+        .function_middleware(Arc::new(Reject))
+        .build();
+    agent.run_once("go").await.expect("run should not fail");
+    let seen = seen.lock().unwrap();
+    let exception = seen[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(|c| match c {
+            Content::FunctionResult(fr) => fr.exception.clone(),
+            _ => None,
+        })
+        .expect("an error result");
+    assert_eq!(exception, "blocked by policy: try another tool");
+}
+
 /// A failure in one call of a parallel batch takes the batch down with it: the
 /// siblings still in flight are dropped rather than left to complete.
 #[tokio::test]

@@ -32,6 +32,20 @@ pub enum Error {
     #[error("tool error: {0}")]
     Tool(String),
 
+    /// A function middleware rejected a tool call (or rewrote its failure)
+    /// with a message written for the model.
+    ///
+    /// The function-invocation loop absorbs it like any other tool error: the
+    /// call's result is an error result and counts toward
+    /// `max_consecutive_errors_per_request`. Unlike other errors, its message
+    /// always reaches the model verbatim, even with `include_detailed_errors`
+    /// off: that setting hides tool-internal diagnostics, while this message
+    /// is one the middleware deliberately addressed to the model (a policy
+    /// gate's "call blocked" notice, say). Put nothing in it the model must
+    /// not see.
+    #[error("tool call rejected: {0}")]
+    ToolRejected(String),
+
     /// A chat client / service returned an error.
     ///
     /// Used for non-HTTP service failures (transport errors, stream-decode
@@ -258,6 +272,12 @@ impl Error {
     /// Create an [`Error::Tool`] from anything displayable.
     pub fn tool(msg: impl fmt::Display) -> Self {
         Error::Tool(msg.to_string())
+    }
+
+    /// Create an [`Error::ToolRejected`] from anything displayable: a tool
+    /// error whose message the model sees verbatim.
+    pub fn tool_rejected(msg: impl fmt::Display) -> Self {
+        Error::ToolRejected(msg.to_string())
     }
 
     /// Create an [`Error::MiddlewareFailure`] from anything displayable: the

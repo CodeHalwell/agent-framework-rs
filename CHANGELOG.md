@@ -28,7 +28,12 @@ exists; it supports the `sequential/first_deny` profile without an approval
 resolver or identity provider.
 
 The function-invocation loop now puts the model's `call_id` in
-`FunctionInvocationContext::metadata["call_id"]`, as upstream does.
+`FunctionInvocationContext::metadata["call_id"]`, as upstream does. A new
+`Error::ToolRejected` lets function middleware fail a call with a message
+written for the model: the loop records it as an error result (counted toward
+`max_consecutive_errors_per_request`) and shows the model that message even
+with `include_detailed_errors` off. The tool seam uses it for blocked calls
+and for a `post_tool_call` transform of a failed call.
 
 ### Multimodal embedding inputs (breaking)
 

@@ -560,10 +560,12 @@ async fn execute_tool_call(
                 // other error keeps the absorb-and-continue contract below.
                 Err(e) if e.is_middleware_failure() => Err(e),
                 Err(e) => {
-                    let msg = if include_detailed_errors {
-                        format!("{e}")
-                    } else {
-                        "tool execution failed".to_string()
+                    let msg = match e {
+                        // Addressed to the model by the middleware itself:
+                        // shown verbatim whatever the detail setting.
+                        Error::ToolRejected(msg) => msg,
+                        e if include_detailed_errors => format!("{e}"),
+                        _ => "tool execution failed".to_string(),
                     };
                     // The pipeline ran and the tool failed, which is an
                     // execution: charged like any other.

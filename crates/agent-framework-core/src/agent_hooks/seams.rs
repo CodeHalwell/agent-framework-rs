@@ -690,8 +690,11 @@ const TOOL_TOKEN_KEY: &str = "agent_hooks.invocation";
 /// reports the arguments the inner half saw dispatched (§4.2).
 ///
 /// A policy deny blocks the call (the tool is not run, or its result is
-/// discarded) and hands the model a tool-error payload so the loop can
-/// continue (§6.2). A `host_error:*` deny, or a failure of this seam itself,
+/// discarded) and fails it with [`Error::ToolRejected`] carrying the
+/// blocked-call payload, so the loop continues as if the call had failed
+/// (§6.1-§6.2): it is an error result, counts toward the consecutive-error
+/// limit, and the model sees the payload whatever `include_detailed_errors`
+/// says. A `host_error:*` deny, or a failure of this seam itself,
 /// halts the run instead: the loop absorbs ordinary errors into tool results
 /// (fail open for an enforcement failure), so the seam returns
 /// [`Error::MiddlewareFailure`], the loop's one fail-closed escape, and the
@@ -731,16 +734,13 @@ fn blocked_payload(b: &InterceptionBlocked) -> Value {
     payload
 }
 
-fn block_tool(
-    state: &RunState,
-    mut ctx: FunctionInvocationContext,
-    b: Box<InterceptionBlocked>,
-) -> Result<FunctionInvocationContext> {
+/// Enforce a tool-seam deny: a host error halts the run; a policy deny fails
+/// the call with the blocked-call payload as its model-visible error.
+fn block_tool(state: &RunState, b: Box<InterceptionBlocked>) -> Error {
     if b.is_host_error() {
-        return Err(state.halt(Halt::Blocked(b)));
+        return state.halt(Halt::Blocked(b));
     }
-    ctx.result = Some(blocked_payload(&b));
-    Ok(ctx)
+    Error::ToolRejected(blocked_payload(&b).to_string())
 }
 
 #[async_trait]
@@ -790,13 +790,15 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
                     .builder
                     .post_tool_call(&call_id, &name, args, value.clone(), true);
                 match state.emitter.emit(post).await {
-                    // A transform rewrites the error the loop hands the model.
+                    // A transform rewrites the error the loop hands the
+                    // model; it is the interceptor's model-facing text, so
+                    // it reaches the model even without detailed errors.
                     Ok(outcome) if outcome.target != value => {
                         let text = match outcome.target {
                             Value::String(s) => s,
                             other => other.to_string(),
                         };
-                        Err(Error::Tool(text))
+                        Err(Error::ToolRejected(text))
                     }
                     Ok(_) => Err(error),
                     // A host error halts the run; a policy deny over an
@@ -820,7 +822,7 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
                         Ok(ctx)
                     }
                     // §6.1: the result is discarded as if the call errored.
-                    Err(b) => block_tool(&state, ctx, b),
+                    Err(b) => Err(block_tool(&state, b)),
                 }
             }
         }
@@ -868,7 +870,7 @@ impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
                     .lock()
                     .unwrap()
                     .insert(token, ToolTrack::Blocked);
-                return block_tool(&state, ctx, b);
+                return Err(block_tool(&state, b));
             }
         }
         state
