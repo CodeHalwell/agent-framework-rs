@@ -18,9 +18,9 @@ use crate::session::AgentSession;
 use crate::tools::{FunctionInvocationConfig, ToolDefinition, ToolKind};
 use crate::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, EmbeddingGenerationOptions,
-    FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
-    FunctionResultContent, GeneratedEmbeddings, Message, Role, ToolMode, UsageContent,
-    UsageDetails,
+    EmbeddingInput, FunctionApprovalRequestContent, FunctionApprovalResponseContent,
+    FunctionCallContent, FunctionResultContent, GeneratedEmbeddings, Message, Role, ToolMode,
+    UsageContent, UsageDetails,
 };
 
 /// A boxed stream of streaming chat updates.
@@ -78,15 +78,16 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
 /// The interface every embedding client implements.
 ///
 /// Rust equivalent of upstream's `SupportsGetEmbeddings` protocol /
-/// `BaseEmbeddingClient` (`_clients.py`): generate one embedding per input
-/// string, batched in a single request. Vectors are `Vec<f32>` — see the
+/// `BaseEmbeddingClient` (`_clients.py`): generate one embedding per
+/// [`EmbeddingInput`], batched in a single request. Text-only clients reject
+/// media inputs with an error. Vectors are `Vec<f32>` — see the
 /// note on [`crate::types::Embedding`] about upstream's genericity.
 #[async_trait]
 pub trait EmbeddingClient: Send + Sync {
     /// Generate embeddings for the given values (one per value, in order).
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings>;
 
@@ -102,7 +103,7 @@ pub trait EmbeddingClient: Send + Sync {
 impl<T: EmbeddingClient + ?Sized> EmbeddingClient for Arc<T> {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
         (**self).get_embeddings(values, options).await

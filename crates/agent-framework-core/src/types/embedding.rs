@@ -1,7 +1,8 @@
 //! Embedding generation types.
 //!
 //! Rust equivalent of upstream's `Embedding` / `GeneratedEmbeddings` /
-//! `EmbeddingGenerationOptions` (`_types.py`). The client-side counterpart —
+//! `EmbeddingGenerationOptions` (`_types.py`), plus [`EmbeddingInput`] for
+//! upstream's `EmbeddingInputT`. The client-side counterpart —
 //! the [`EmbeddingClient`](crate::client::EmbeddingClient) trait mirroring
 //! upstream's `SupportsGetEmbeddings` protocol — lives in
 //! [`crate::client`], next to `ChatClient`.
@@ -16,7 +17,109 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::content::UsageDetails;
+use super::content::{Content, UsageDetails};
+use crate::error::{Error, Result};
+
+/// One value to embed.
+///
+/// Upstream is generic over the input type (`EmbeddingInputT`): text-only
+/// clients take `str`, while Foundry takes `Content | str` and Gemini takes
+/// `str` or a multimodal `Content`. This port uses one input type for every
+/// client so the trait stays object-safe. An input is a list of
+/// [`Content`] items embedded together as **one** vector: usually a single
+/// text, or a single image as [`Content::Data`] or [`Content::Uri`], and
+/// several items where a provider can combine them (Gemini embeds text and
+/// media parts together; Foundry pairs an image with a caption).
+///
+/// Strings convert directly, so text callers write
+/// `vec!["hello".into()]`:
+///
+/// ```
+/// # use agent_framework_core::types::{Content, DataContent, EmbeddingInput};
+/// let text: EmbeddingInput = "a cat on a mat".into();
+/// assert_eq!(text.as_text(), Some("a cat on a mat"));
+///
+/// let png = [0x89, 0x50, 0x4e, 0x47];
+/// let image = EmbeddingInput::from(Content::Data(DataContent::from_bytes(&png, "image/png")));
+/// assert_eq!(image.as_text(), None);
+/// ```
+///
+/// A client that cannot embed some input returns an error naming its index
+/// rather than skipping it, so results always line up with inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingInput {
+    /// The items embedded together into one vector.
+    pub contents: Vec<Content>,
+}
+
+impl EmbeddingInput {
+    /// An input from content items embedded together.
+    pub fn new(contents: Vec<Content>) -> Self {
+        Self { contents }
+    }
+
+    /// A text input.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::new(vec![Content::text(text)])
+    }
+
+    /// The text, when this input is exactly one text item.
+    pub fn as_text(&self) -> Option<&str> {
+        match self.contents.as_slice() {
+            [Content::Text(t)] => Some(&t.text),
+            _ => None,
+        }
+    }
+
+    /// Converts a batch to plain strings for a client that embeds text only.
+    ///
+    /// Fails on the first input that is not exactly one text item, naming
+    /// `provider` and the input's index.
+    pub fn into_texts(values: Vec<EmbeddingInput>, provider: &str) -> Result<Vec<String>> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(
+                |(i, value)| match <[Content; 1]>::try_from(value.contents) {
+                    Ok([Content::Text(t)]) => Ok(t.text),
+                    _ => Err(Error::Content(format!(
+                    "{provider} embeddings accept text only; input {i} is not a single text item"
+                ))),
+                },
+            )
+            .collect()
+    }
+}
+
+impl From<&str> for EmbeddingInput {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<String> for EmbeddingInput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&String> for EmbeddingInput {
+    fn from(text: &String) -> Self {
+        Self::text(text.as_str())
+    }
+}
+
+impl From<Content> for EmbeddingInput {
+    fn from(content: Content) -> Self {
+        Self::new(vec![content])
+    }
+}
+
+impl From<Vec<Content>> for EmbeddingInput {
+    fn from(contents: Vec<Content>) -> Self {
+        Self::new(contents)
+    }
+}
 
 /// Common request settings for embedding generation.
 ///
@@ -156,6 +259,7 @@ impl<'a> IntoIterator for &'a GeneratedEmbeddings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DataContent, UriContent};
 
     #[test]
     fn embedding_dimensions_is_the_vector_length() {
@@ -199,5 +303,46 @@ mod tests {
         );
         let back: GeneratedEmbeddings = serde_json::from_value(json).unwrap();
         assert_eq!(back, batch);
+    }
+
+    #[test]
+    fn strings_become_single_text_inputs() {
+        let inputs: Vec<EmbeddingInput> = vec!["a".into(), String::from("b").into()];
+        assert_eq!(
+            EmbeddingInput::into_texts(inputs, "Test").unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_text_only_client_names_the_first_non_text_input() {
+        let image = Content::Uri(UriContent {
+            uri: "https://example.com/a.png".into(),
+            media_type: "image/png".into(),
+        });
+        let inputs = vec![
+            EmbeddingInput::text("a"),
+            image.clone().into(),
+            EmbeddingInput::new(vec![Content::text("b"), Content::text("c")]),
+        ];
+        let err = EmbeddingInput::into_texts(inputs, "Test").unwrap_err();
+        assert!(err.to_string().contains("input 1"), "{err}");
+
+        let two_texts = vec![EmbeddingInput::new(vec![
+            Content::text("b"),
+            Content::text("c"),
+        ])];
+        assert!(EmbeddingInput::into_texts(two_texts, "Test").is_err());
+        assert!(EmbeddingInput::into_texts(vec![EmbeddingInput::new(vec![])], "Test").is_err());
+    }
+
+    #[test]
+    fn as_text_is_none_for_media_and_multi_part_inputs() {
+        let data = Content::Data(DataContent::from_bytes(&[1, 2, 3], "image/png"));
+        assert_eq!(EmbeddingInput::from(data.clone()).as_text(), None);
+        assert_eq!(
+            EmbeddingInput::new(vec![Content::text("caption"), data]).as_text(),
+            None
+        );
     }
 }

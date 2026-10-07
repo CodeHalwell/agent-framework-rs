@@ -100,10 +100,7 @@ async fn main() -> Result<()> {
     ];
     let embeddings = embedder
         .get_embeddings(
-            corpus
-                .iter()
-                .map(|(_, title, _)| title.to_string())
-                .collect(),
+            corpus.iter().map(|(_, title, _)| (*title).into()).collect(),
             None,
         )
         .await?;
@@ -124,7 +121,7 @@ async fn main() -> Result<()> {
     println!("upserted {} records", corpus.len());
 
     let query = embedder
-        .get_embeddings(vec!["quarterly results".to_string()], None)
+        .get_embeddings(vec!["quarterly results".into()], None)
         .await?;
     let query_vector = query.embeddings[0].vector.clone();
 

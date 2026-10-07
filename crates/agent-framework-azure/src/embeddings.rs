@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{EmbeddingGenerationOptions, GeneratedEmbeddings};
+use agent_framework_core::types::{
+    EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings,
+};
 use serde_json::{json, Map, Value};
 
 use crate::credential::TokenCredential;
@@ -166,9 +168,10 @@ fn arc_inner(inner: &mut Arc<Inner>) -> &mut Inner {
 impl EmbeddingClient for AzureOpenAIEmbeddingClient {
     async fn get_embeddings(
         &self,
-        values: Vec<String>,
+        values: Vec<EmbeddingInput>,
         options: Option<EmbeddingGenerationOptions>,
     ) -> Result<GeneratedEmbeddings> {
+        let values = EmbeddingInput::into_texts(values, "Azure OpenAI")?;
         let body = self.build_body(&values, options.as_ref());
         let (header_name, header_value) = self.auth_header().await?;
         let resp = self

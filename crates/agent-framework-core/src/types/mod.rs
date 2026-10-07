@@ -15,7 +15,7 @@ pub use content::{
     TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
     FUNCTION_INVOCATION_ERROR_MARKER,
 };
-pub use embedding::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
+pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{

@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         .get_embeddings(
             documents
                 .iter()
-                .map(|(_, title, ..)| title.to_string())
+                .map(|(_, title, ..)| (*title).into())
                 .collect(),
             None,
         )

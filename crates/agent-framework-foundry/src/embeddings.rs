@@ -28,14 +28,20 @@
 //!
 //! # Divergences from upstream
 //!
-//! - **Text inputs only.** Upstream accepts `Content | str` and splits a batch
-//!   across two endpoints, sending image content to
-//!   `ImageEmbeddingsClient` (`/images/embeddings`) and reassembling both
-//!   result sets into input order. The core [`EmbeddingClient`] trait takes
-//!   `Vec<String>`, so an image input cannot be expressed here at all: the
-//!   image half is structurally out of reach rather than merely unimplemented,
-//!   and adding it means widening a shared trait, not extending this client.
-//!   `FOUNDRY_IMAGE_EMBEDDING_MODEL` is correspondingly not read.
+//! # Image inputs
+//!
+//! As upstream does, a batch may mix text and images. Text inputs go to
+//! `/embeddings` and image inputs to `/images/embeddings`, in one request
+//! each, and the vectors come back in input order with the usage summed. An
+//! image input is one [`Content::Data`] or [`Content::Uri`] item with an
+//! `image/*` media type, optionally with one text item as its caption
+//! (upstream's `ImageEmbeddingInput(image, text)`). Images need the Models
+//! inference endpoint and an image model: [`FoundryEmbeddingClient::with_image_model`],
+//! `FOUNDRY_IMAGE_EMBEDDING_MODEL`, or the `image_model` option, falling back
+//! to the text model as upstream does.
+//!
+//! # Divergences from upstream
+//!
 //! - **API version.** Upstream passes none, inheriting whatever
 //!   `azure-ai-inference` (pinned to `1.0.0b9`) sends. [`DEFAULT_API_VERSION`]
 //!   reproduces that SDK's default; it is the one value here taken from an
@@ -47,7 +53,9 @@ use std::sync::Arc;
 use agent_framework_azure::TokenCredential;
 use agent_framework_core::client::EmbeddingClient;
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{EmbeddingGenerationOptions, GeneratedEmbeddings};
+use agent_framework_core::types::{
+    Content, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings, UsageDetails,
+};
 use serde_json::{json, Map, Value};
 
 /// The Foundry Models inference endpoint (e.g.
@@ -57,6 +65,8 @@ pub const FOUNDRY_MODELS_ENDPOINT_ENV: &str = "FOUNDRY_MODELS_ENDPOINT";
 pub const FOUNDRY_MODELS_API_KEY_ENV: &str = "FOUNDRY_MODELS_API_KEY";
 /// The default text embedding model (deployment) name.
 pub const FOUNDRY_EMBEDDING_MODEL_ENV: &str = "FOUNDRY_EMBEDDING_MODEL";
+/// The image embedding model (deployment) name. Falls back to the text model.
+pub const FOUNDRY_IMAGE_EMBEDDING_MODEL_ENV: &str = "FOUNDRY_IMAGE_EMBEDDING_MODEL";
 /// The Foundry **project** endpoint (e.g.
 /// `https://<resource>.services.ai.azure.com/api/projects/<project>`) — the
 /// same endpoint [`crate::FoundryChatClient`] takes.
@@ -189,6 +199,7 @@ struct Inner {
     http: reqwest::Client,
     endpoint: String,
     model: String,
+    image_model: Option<String>,
     api_version: String,
     scope: String,
     auth: Auth,
@@ -255,6 +266,7 @@ impl FoundryEmbeddingClient {
                 http: reqwest::Client::new(),
                 endpoint: endpoint.into().trim_end_matches('/').to_string(),
                 model: model.into(),
+                image_model: None,
                 api_version: DEFAULT_API_VERSION.to_string(),
                 scope: DEFAULT_SCOPE.to_string(),
                 auth,
@@ -345,15 +357,21 @@ impl FoundryEmbeddingClient {
             );
             return Self::with_project_endpoint(&project_endpoint, model, credential);
         };
-        match std::env::var(FOUNDRY_MODELS_API_KEY_ENV) {
-            Ok(api_key) if !api_key.trim().is_empty() => Ok(Self::new(endpoint, model, api_key)),
+        let client = match std::env::var(FOUNDRY_MODELS_API_KEY_ENV) {
+            Ok(api_key) if !api_key.trim().is_empty() => Self::new(endpoint, model, api_key),
             _ => {
                 let credential: Arc<dyn TokenCredential> = Arc::new(
                     agent_framework_azure::DefaultAzureCredential::new(DEFAULT_SCOPE),
                 );
-                Ok(Self::with_credential(endpoint, model, credential))
+                Self::with_credential(endpoint, model, credential)
             }
-        }
+        };
+        // Only the Models endpoint serves image embeddings, so only it reads
+        // the image model.
+        Ok(match non_blank(FOUNDRY_IMAGE_EMBEDDING_MODEL_ENV) {
+            Some(image_model) => client.with_image_model(image_model),
+            None => client,
+        })
     }
 
     /// Override the `api-version` query parameter (see
@@ -370,6 +388,13 @@ impl FoundryEmbeddingClient {
         self
     }
 
+    /// Set the image embedding model, used for image inputs (see the module
+    /// docs). Without one, image inputs use the text model, as upstream does.
+    pub fn with_image_model(mut self, image_model: impl Into<String>) -> Self {
+        arc_inner(&mut self.inner).image_model = Some(image_model.into());
+        self
+    }
+
     /// The default embedding model.
     pub fn model(&self) -> &str {
         &self.inner.model
@@ -379,15 +404,25 @@ impl FoundryEmbeddingClient {
     ///
     /// The project route is path-versioned, so it carries no `api-version`
     /// query parameter; appending one there is rejected by the service.
+    #[cfg(test)]
     fn url(&self) -> String {
+        self.url_for("embeddings")
+    }
+
+    /// The request URL for `path` (`embeddings` or `images/embeddings`).
+    fn url_for(&self, path: &str) -> String {
         match self.inner.route {
             Route::Models => format!(
-                "{}/embeddings?api-version={}",
+                "{}/{path}?api-version={}",
                 self.inner.endpoint, self.inner.api_version
             ),
-            Route::ProjectOpenAI => format!("{}/embeddings", self.inner.endpoint),
+            Route::ProjectOpenAI => format!("{}/{path}", self.inner.endpoint),
         }
     }
+
+    /// The option key naming a per-call image model, as upstream's
+    /// `image_model` option does.
+    const IMAGE_MODEL_KEY: &'static str = "image_model";
 
     /// The option key upstream maps onto the Azure AI Inference SDK's
     /// `model_extras`: a map of model-specific parameters that belong in the
@@ -409,12 +444,48 @@ impl FoundryEmbeddingClient {
         values: &[String],
         options: Option<&EmbeddingGenerationOptions>,
     ) -> (Value, bool) {
+        self.body_with(
+            json!(values),
+            Self::effective_model(&self.inner.model, options),
+            options,
+        )
+    }
+
+    /// The `/images/embeddings` body. It takes the same options as text, as
+    /// upstream passes the same kwargs to both clients.
+    fn image_body_for(
+        &self,
+        images: &[ImageInput],
+        options: Option<&EmbeddingGenerationOptions>,
+    ) -> (Value, bool) {
+        let input: Vec<Value> = images
+            .iter()
+            .map(|img| match &img.text {
+                Some(text) => json!({ "image": img.image, "text": text }),
+                None => json!({ "image": img.image }),
+            })
+            .collect();
+        self.body_with(json!(input), self.image_model(options), options)
+    }
+
+    fn image_model(&self, options: Option<&EmbeddingGenerationOptions>) -> String {
+        options
+            .and_then(|o| o.additional_properties.get(Self::IMAGE_MODEL_KEY))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.inner.image_model.clone())
+            .unwrap_or_else(|| self.inner.model.clone())
+    }
+
+    fn body_with(
+        &self,
+        input: Value,
+        model: String,
+        options: Option<&EmbeddingGenerationOptions>,
+    ) -> (Value, bool) {
         let mut body = Map::new();
-        body.insert("input".into(), json!(values));
-        body.insert(
-            "model".into(),
-            json!(Self::effective_model(&self.inner.model, options)),
-        );
+        body.insert("input".into(), input);
+        body.insert("model".into(), json!(model));
         if let Some(dimensions) = options.and_then(|o| o.dimensions) {
             body.insert("dimensions".into(), json!(dimensions));
         }
@@ -469,6 +540,7 @@ fn arc_inner(inner: &mut Arc<Inner>) -> &mut Inner {
             http: inner.http.clone(),
             endpoint: inner.endpoint.clone(),
             model: inner.model.clone(),
+            image_model: inner.image_model.clone(),
             api_version: inner.api_version.clone(),
             scope: inner.scope.clone(),
             auth: match &inner.auth {
@@ -489,20 +561,67 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
         .and_then(|v| v.trim().parse::<f64>().ok())
 }
 
-#[async_trait::async_trait]
-impl EmbeddingClient for FoundryEmbeddingClient {
-    async fn get_embeddings(
-        &self,
-        values: Vec<String>,
-        options: Option<EmbeddingGenerationOptions>,
-    ) -> Result<GeneratedEmbeddings> {
-        // Upstream returns an empty batch without calling the service.
-        if values.is_empty() {
-            return Ok(GeneratedEmbeddings::new(Vec::new()));
-        }
+/// An image input for `/images/embeddings`: the image as a data URI or URL,
+/// with an optional caption.
+#[derive(Debug, Clone, PartialEq)]
+struct ImageInput {
+    image: String,
+    text: Option<String>,
+}
 
-        let (body, expanded_extras) = self.body_for(&values, options.as_ref());
-        let mut request = self.inner.http.post(self.url()).json(&body);
+/// Where each input of a batch goes.
+enum Routed {
+    Text(String),
+    Image(ImageInput),
+}
+
+/// Sort an input into text or image, as upstream does, refusing anything
+/// else with its index.
+fn route_input(value: EmbeddingInput, index: usize) -> Result<Routed> {
+    let unsupported = || {
+        Error::Content(format!(
+            "Foundry embedding input {index} is not supported: expected one text item, or one \
+             image (data or URI content with an image/* media type) with an optional text caption"
+        ))
+    };
+    let mut image = None;
+    let mut text = None;
+    for content in value.contents {
+        match content {
+            Content::Text(t) if text.is_none() => text = Some(t.text),
+            Content::Data(d)
+                if image.is_none()
+                    && d.media_type
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with("image/")) =>
+            {
+                image = Some(d.uri)
+            }
+            Content::Uri(u) if image.is_none() && u.media_type.starts_with("image/") => {
+                image = Some(u.uri)
+            }
+            _ => return Err(unsupported()),
+        }
+    }
+    match (image, text) {
+        (Some(image), text) => Ok(Routed::Image(ImageInput { image, text })),
+        (None, Some(text)) => Ok(Routed::Text(text)),
+        (None, None) => Err(unsupported()),
+    }
+}
+
+impl FoundryEmbeddingClient {
+    /// Send one embeddings request and parse its batch, stamping the
+    /// requested model on vectors the service left unattributed (upstream
+    /// stamps `response.model or model` the same way).
+    async fn embed(
+        &self,
+        path: &str,
+        body: Value,
+        expanded_extras: bool,
+    ) -> Result<GeneratedEmbeddings> {
+        let requested = body["model"].as_str().unwrap_or_default().to_string();
+        let mut request = self.inner.http.post(self.url_for(path)).json(&body);
         if expanded_extras && self.inner.route == Route::Models {
             // Azure AI Inference rejects body fields it does not recognise
             // unless this header opts into passing them to the model. The SDK
@@ -545,16 +664,103 @@ impl EmbeddingClient for FoundryEmbeddingClient {
             .await
             .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
         let mut batch = agent_framework_openai::embeddings::parse_embeddings_response(&value)?;
-
-        // Upstream stamps `response.model or text_model`: when the service
-        // omits the model, the requested one still identifies the vectors.
-        let requested = Self::effective_model(&self.inner.model, options.as_ref());
         for embedding in &mut batch.embeddings {
             if embedding.model.is_none() {
                 embedding.model = Some(requested.clone());
             }
         }
         Ok(batch)
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingClient for FoundryEmbeddingClient {
+    async fn get_embeddings(
+        &self,
+        values: Vec<EmbeddingInput>,
+        options: Option<EmbeddingGenerationOptions>,
+    ) -> Result<GeneratedEmbeddings> {
+        // Upstream returns an empty batch without calling the service.
+        if values.is_empty() {
+            return Ok(GeneratedEmbeddings::new(Vec::new()));
+        }
+
+        let count = values.len();
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        for (index, value) in values.into_iter().enumerate() {
+            match route_input(value, index)? {
+                Routed::Text(text) => texts.push((index, text)),
+                Routed::Image(image) => images.push((index, image)),
+            }
+        }
+        if !images.is_empty() && self.inner.route != Route::Models {
+            return Err(Error::Configuration(
+                "image embeddings need a Foundry Models inference endpoint; a project endpoint \
+                 serves text embeddings only"
+                    .into(),
+            ));
+        }
+
+        let text_inputs: Vec<String> = texts.iter().map(|(_, t)| t.clone()).collect();
+        let image_inputs: Vec<ImageInput> = images.iter().map(|(_, img)| img.clone()).collect();
+        let (text_body, text_extras) = self.body_for(&text_inputs, options.as_ref());
+        let (image_body, image_extras) = self.image_body_for(&image_inputs, options.as_ref());
+
+        // A batch on one route is that route's response, unchanged.
+        if images.is_empty() {
+            return self.embed("embeddings", text_body, text_extras).await;
+        }
+        if texts.is_empty() {
+            return self
+                .embed("images/embeddings", image_body, image_extras)
+                .await;
+        }
+
+        // A mixed batch is reassembled into input order, so each response
+        // must account for exactly its own inputs.
+        let mut slots = vec![None; count];
+        let mut usage: Option<UsageDetails> = None;
+        for (path, body, expanded_extras, indices) in [
+            (
+                "embeddings",
+                text_body,
+                text_extras,
+                texts.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            ),
+            (
+                "images/embeddings",
+                image_body,
+                image_extras,
+                images.iter().map(|(i, _)| *i).collect(),
+            ),
+        ] {
+            let batch = self.embed(path, body, expanded_extras).await?;
+            if batch.embeddings.len() != indices.len() {
+                return Err(Error::service(format!(
+                    "Foundry returned {} embeddings for {} inputs",
+                    batch.embeddings.len(),
+                    indices.len()
+                )));
+            }
+            for (index, embedding) in indices.into_iter().zip(batch.embeddings) {
+                slots[index] = Some(embedding);
+            }
+            if let Some(batch_usage) = batch.usage {
+                usage
+                    .get_or_insert_with(UsageDetails::default)
+                    .add_assign(&batch_usage);
+            }
+        }
+
+        let mut result = GeneratedEmbeddings::new(
+            slots
+                .into_iter()
+                .map(|e| e.expect("every input was routed to exactly one request"))
+                .collect(),
+        );
+        result.usage = usage;
+        Ok(result)
     }
 
     fn model(&self) -> Option<&str> {

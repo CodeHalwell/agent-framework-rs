@@ -128,9 +128,10 @@ pub mod prelude {
     };
     pub use crate::types::{
         AgentResponse, AgentResponseUpdate, ChatOptions, ChatResponse, ChatResponseUpdate, Content,
-        Embedding, EmbeddingGenerationOptions, FinishReason, FunctionApprovalRequestContent,
-        FunctionApprovalResponseContent, FunctionCallContent, FunctionResultContent,
-        GeneratedEmbeddings, Message, ResponseFormat, Role, TextContent, ToolMode, UsageDetails,
+        Embedding, EmbeddingGenerationOptions, EmbeddingInput, FinishReason,
+        FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionCallContent,
+        FunctionResultContent, GeneratedEmbeddings, Message, ResponseFormat, Role, TextContent,
+        ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
         CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,

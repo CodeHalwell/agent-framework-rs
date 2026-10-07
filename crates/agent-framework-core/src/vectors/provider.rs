@@ -57,7 +57,7 @@ use crate::client::EmbeddingClient;
 use crate::error::{Error, Result};
 use crate::memory::{ContextProvider, SessionContext};
 use crate::tools::{ApprovalMode, FunctionTool, ToolDefinition};
-use crate::types::EmbeddingGenerationOptions;
+use crate::types::{EmbeddingGenerationOptions, EmbeddingInput};
 
 /// The default cap on how many records or keys one tool call may carry.
 ///
@@ -829,7 +829,7 @@ fn build_search_tool(
                     .filter(|q| !q.trim().is_empty())
                     .ok_or_else(|| Error::Tool("`query` must be a non-empty string".into()))?;
                 let embeddings = embedder
-                    .get_embeddings(vec![query.to_string()], embedding_options)
+                    .get_embeddings(vec![query.into()], embedding_options)
                     .await?;
                 let vector = embeddings
                     .embeddings
@@ -1028,7 +1028,8 @@ fn build_upsert_tool(
                     }
                 }
 
-                let embeddings = embedder.get_embeddings(texts, embedding_options).await?;
+                let inputs = texts.into_iter().map(EmbeddingInput::from).collect();
+                let embeddings = embedder.get_embeddings(inputs, embedding_options).await?;
                 if embeddings.embeddings.len() != records.len() {
                     return Err(Error::Tool(format!(
                         "the embedding service returned {} vectors for {} records",
@@ -1127,7 +1128,9 @@ fn json_type_for(hint: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Embedding, EmbeddingGenerationOptions, GeneratedEmbeddings};
+    use crate::types::{
+        Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings,
+    };
     use crate::vectors::{Filter, InMemoryVectorStore, VectorStore, VectorStoreField};
 
     /// A deterministic stand-in: each value becomes a three-dimensional vector
@@ -1139,14 +1142,14 @@ mod tests {
     impl EmbeddingClient for StubEmbedder {
         async fn get_embeddings(
             &self,
-            values: Vec<String>,
+            values: Vec<EmbeddingInput>,
             _options: Option<EmbeddingGenerationOptions>,
         ) -> Result<GeneratedEmbeddings> {
             Ok(GeneratedEmbeddings {
                 embeddings: values
                     .iter()
                     .map(|v| Embedding {
-                        vector: vec![v.len() as f32, 1.0, 0.0],
+                        vector: vec![v.as_text().map_or(0, str::len) as f32, 1.0, 0.0],
                         ..Default::default()
                     })
                     .collect(),
@@ -1196,7 +1199,7 @@ mod tests {
     impl EmbeddingClient for OptionRecordingEmbedder {
         async fn get_embeddings(
             &self,
-            values: Vec<String>,
+            values: Vec<EmbeddingInput>,
             options: Option<EmbeddingGenerationOptions>,
         ) -> Result<GeneratedEmbeddings> {
             self.seen.lock().unwrap().push(options);
