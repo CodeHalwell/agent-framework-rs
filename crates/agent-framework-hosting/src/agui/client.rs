@@ -38,17 +38,17 @@
 //! | AG-UI event | Update |
 //! |---|---|
 //! | `RUN_STARTED` | `additional_properties` `thread_id`, `run_id` |
-//! | `TEXT_MESSAGE_START` | assistant update carrying the `messageId` |
-//! | `TEXT_MESSAGE_CONTENT`, `TEXT_MESSAGE_CHUNK` | text delta |
+//! | `TEXT_MESSAGE_START` | an update carrying the `messageId`, under the event's `role` (`assistant` by default; `developer`, `system` and `user` are kept) |
+//! | `TEXT_MESSAGE_CONTENT`, `TEXT_MESSAGE_CHUNK` | text delta, under the role its message declared (a chunk's `role` opens the message) |
 //! | `TEXT_MESSAGE_END`, `TOOL_CALL_END` | nothing |
 //! | `TOOL_CALL_START` | a [`FunctionCallContent`] with empty arguments, on the `parentMessageId` message when given (as are the call's later fragments) |
 //! | `TOOL_CALL_ARGS` | an argument fragment of the call its `toolCallId` names (the latest open call when it has none) |
 //! | `TOOL_CALL_CHUNK` | a call fragment: opens the call on its first chunk, later chunks without an id continue it |
 //! | `TOOL_CALL_RESULT` | a tool-role [`FunctionResultContent`] carrying the event's `messageId` |
 //! | `REASONING_MESSAGE_CONTENT`, `REASONING_MESSAGE_CHUNK` | reasoning delta |
-//! | `REASONING_ENCRYPTED_VALUE` | `protected_data` on the named message's reasoning (`message`) or on the named call (`tool-call`); sent back as `encryptedValue` |
+//! | `REASONING_ENCRYPTED_VALUE` | `protected_data` on a textless reasoning item in the named message, under that message's role (`message`), or on the named call (`tool-call`); sent back as `encryptedValue` |
 //! | `STATE_SNAPSHOT`, `STATE_DELTA` | JSON [`DataContent`] (`application/json`, `application/json-patch+json`) |
-//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]`, plus an update per `assistant` / `tool` / `reasoning` message neither sent nor streamed (matched by message id and `toolCallId`) |
+//! | `MESSAGES_SNAPSHOT` | `additional_properties["ag_ui_messages_snapshot"]`, plus an update per `assistant` / `tool` / `reasoning` / `user` / `system` / `developer` message neither sent nor streamed (matched by message id and `toolCallId`), under its own role, with every `encryptedValue` (message or `ToolCall`) kept as `protected_data` |
 //! | `RUN_FINISHED` | finish reason `stop`; `interrupt`, `outcome`, `interrupts`, `result` metadata; `usage` entries summed into one [`UsageContent`] |
 //! | `RUN_ERROR` | an [`ErrorContent`] with code `RUN_ERROR`, plus any reported `usage` |
 //! | `CUSTOM` | `additional_properties["ag_ui_custom_event"]`; an `annotations` event restores text annotations |
@@ -344,6 +344,9 @@ fn split_mixed_message(
     struct Splitter<'a> {
         role: &'a str,
         source_id: Option<String>,
+        /// The source message's own `encryptedValue`; it goes on the wire
+        /// message that carries the source id (the first one emitted).
+        encrypted: Option<String>,
         segment: Vec<&'a Content>,
         segment_has_call: bool,
         segment_call_ids: HashSet<String>,
@@ -353,6 +356,16 @@ fn split_mixed_message(
     impl<'a> Splitter<'a> {
         fn next_id(&mut self) -> String {
             self.source_id.take().unwrap_or_else(new_message_id)
+        }
+
+        /// A wire message with the next id; the first one emitted also takes
+        /// the source message's `encryptedValue`.
+        fn wire_message(&mut self, mut message: Value) -> Value {
+            message["id"] = Value::String(self.next_id());
+            if let Some(value) = self.encrypted.take() {
+                message["encryptedValue"] = Value::String(value);
+            }
+            message
         }
 
         fn flush(&mut self, unresolved: &mut HashSet<String>, out: &mut Vec<Value>) {
@@ -367,8 +380,7 @@ fn split_mixed_message(
             if empty_text && tool_calls.is_empty() {
                 return;
             }
-            let mut message =
-                json!({ "id": self.next_id(), "role": self.role, "content": content });
+            let mut message = self.wire_message(json!({ "role": self.role, "content": content }));
             if !tool_calls.is_empty() {
                 for call in &tool_calls {
                     if let Some(id) = call["id"].as_str() {
@@ -386,12 +398,12 @@ fn split_mixed_message(
             unresolved: &mut HashSet<String>,
             out: &mut Vec<Value>,
         ) {
-            out.push(json!({
-                "id": self.next_id(),
+            let message = self.wire_message(json!({
                 "role": "tool",
                 "content": result_content(result),
                 "toolCallId": result.call_id,
             }));
+            out.push(message);
             unresolved.remove(&result.call_id);
         }
 
@@ -409,6 +421,9 @@ fn split_mixed_message(
     let mut splitter = Splitter {
         role,
         source_id: msg.message_id.clone().filter(|id| !id.is_empty()),
+        encrypted: encrypted_reasoning(msg)
+            .last()
+            .map(|(_, value)| (*value).to_string()),
         segment: Vec::new(),
         segment_has_call: false,
         segment_call_ids: HashSet::new(),
@@ -461,10 +476,12 @@ fn split_mixed_message(
 ///   {name, arguments}}`, arguments as a JSON string), with the call's
 ///   `protected_data` as `encryptedValue`;
 /// - reasoning is display-only and not sent, except an encrypted value a
-///   server attached (`REASONING_ENCRYPTED_VALUE`): a message of reasoning
-///   alone becomes a `reasoning` message (`{content, encryptedValue}`), and
-///   on any other message the value is the message's `encryptedValue`
-///   (an extension: upstream sends no reasoning back);
+///   server attached (`REASONING_ENCRYPTED_VALUE`): an assistant message of
+///   reasoning alone becomes a `reasoning` message (`{content,
+///   encryptedValue}`); on any other message, of any role, the value is the
+///   message's `encryptedValue` (on a `tool` message, or a message split into
+///   several, the wire message carrying the source id); an extension:
+///   upstream sends no reasoning back;
 /// - each function result becomes its own `tool` message (`{toolCallId,
 ///   content}`), ordered so that no result precedes its call and no assistant
 ///   message separates an open call from its result;
@@ -489,6 +506,7 @@ pub fn messages_to_agui(messages: &[Message]) -> Vec<Value> {
 
         let encrypted = encrypted_reasoning(msg);
         if !encrypted.is_empty()
+            && role == "assistant"
             && msg
                 .contents
                 .iter()
@@ -518,8 +536,9 @@ pub fn messages_to_agui(messages: &[Message]) -> Vec<Value> {
             .filter(|id| !id.is_empty())
             .unwrap_or_else(new_message_id);
         let mut message = json!({ "id": id, "role": role, "content": content });
-        // An encrypted value the server attached to this (assistant) message
-        // itself goes back on it, as the protocol's `encryptedValue`.
+        // An encrypted value the server attached to this message itself (any
+        // role: every AG-UI message type may carry one) goes back on it, as
+        // the protocol's `encryptedValue`.
         if let Some((_, value)) = encrypted.last() {
             message["encryptedValue"] = Value::String((*value).to_string());
         }
@@ -761,6 +780,12 @@ pub struct AgUiEventConverter {
     known_result_call_ids: HashSet<String>,
     /// Calls whose `TOOL_CALL_RESULT` this run streamed.
     seen_result_call_ids: HashSet<String>,
+    /// The framework role of every message this run has produced, by
+    /// message id: the role a `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CHUNK`
+    /// declared, `tool` for a `TOOL_CALL_RESULT`, a snapshot message's own
+    /// role. Later fragments of the message, and a `REASONING_ENCRYPTED_VALUE`
+    /// naming it, keep that role. A chunked message with no id is under "".
+    message_roles: HashMap<String, Role>,
     thread_id: Option<String>,
     run_id: Option<String>,
 }
@@ -793,6 +818,33 @@ fn assistant_update(contents: Vec<Content>) -> ChatResponseUpdate {
         role: Some(Role::assistant()),
         ..Default::default()
     }
+}
+
+/// The framework role for an AG-UI message role, `None` for a role with no
+/// framework counterpart (`activity`, `reasoning`, unknown values).
+/// `developer` stays `developer` (an open [`Role`]), as the request path
+/// sends it.
+fn framework_role(role: &str) -> Option<Role> {
+    match role {
+        "assistant" => Some(Role::assistant()),
+        "user" => Some(Role::user()),
+        "system" => Some(Role::system()),
+        "developer" => Some(Role::new("developer")),
+        "tool" => Some(Role::tool()),
+        _ => None,
+    }
+}
+
+/// The opaque `encryptedValue` a message (any role) carries, as the textless
+/// reasoning item that holds it: the shape a `REASONING_ENCRYPTED_VALUE`
+/// (`message`) produces and [`messages_to_agui`] sends back.
+fn encrypted_marker(message: &Value) -> Option<Content> {
+    let value = str_field(message, &["encryptedValue", "encrypted_value"])
+        .filter(|value| !value.is_empty())?;
+    Some(Content::TextReasoning(TextReasoningContent {
+        protected_data: Some(value),
+        ..Default::default()
+    }))
 }
 
 /// JSON as a base64 data item, the way the Go provider surfaces state events.
@@ -926,10 +978,14 @@ impl AgUiEventConverter {
     /// `toolCallId` the run already has is left out too (a result counts as
     /// known only when its call was already answered, not merely sent). Each
     /// new `reasoning` message becomes reasoning content, its `encryptedValue`
-    /// as `protected_data`, as the reasoning events would have built it. Other
-    /// roles (`user`, `system`, `developer`, `activity`) are input or
-    /// client-side display and are not added. A snapshot does not edit or
-    /// remove messages already produced; the raw list stays available as
+    /// as `protected_data`, as the reasoning events would have built it. A
+    /// new `user`, `system` or `developer` message is added under its own
+    /// role (its text and media parts), as the text events would have
+    /// produced it. An `encryptedValue` on any message becomes a textless
+    /// reasoning item holding it, and one on a `ToolCall` the call's
+    /// `protected_data`, so both go back to the server. `activity` messages
+    /// are client-side display and are not added. A snapshot does not edit
+    /// or remove messages already produced; the raw list stays available as
     /// `ag_ui_messages_snapshot`.
     pub fn convert_event_all(&mut self, event: &Value) -> Vec<ChatResponseUpdate> {
         let mut out: Vec<ChatResponseUpdate> = self.convert_one(event).into_iter().collect();
@@ -964,34 +1020,52 @@ impl AgUiEventConverter {
             }
             event_type::TEXT_MESSAGE_START => {
                 self.current_message_id = str_field(event, &["messageId", "message_id"]);
-                let mut update = assistant_update(Vec::new());
-                update.message_id = self.current_message_id.clone();
-                Some(update)
+                let key = self.current_message_id.clone().unwrap_or_default();
+                let role = self.declare_role(key, event);
+                Some(ChatResponseUpdate {
+                    role: Some(role),
+                    message_id: self.current_message_id.clone(),
+                    ..Default::default()
+                })
             }
             event_type::TEXT_MESSAGE_CONTENT => {
                 let message_id = str_field(event, &["messageId", "message_id"]);
                 if message_id != self.current_message_id {
                     self.current_message_id = message_id;
                 }
-                let mut update = assistant_update(vec![Content::text(delta_of(event))]);
-                update.message_id = self.current_message_id.clone();
-                Some(update)
+                let key = self.current_message_id.clone().unwrap_or_default();
+                Some(ChatResponseUpdate {
+                    contents: vec![Content::text(delta_of(event))],
+                    role: Some(self.role_of(&key)),
+                    message_id: self.current_message_id.clone(),
+                    ..Default::default()
+                })
             }
             event_type::TEXT_MESSAGE_CHUNK => {
                 let delta = delta_of(event);
                 if let Some(id) = str_field(event, &["messageId", "message_id"]) {
                     self.last_chunk_message_id = Some(id);
                 }
+                // The chunk that opens a message declares its role; later
+                // chunks (which may omit `role`) keep it.
+                let key = self.last_chunk_message_id.clone().unwrap_or_default();
+                let role = self.declare_role(key, event);
                 if delta.is_empty() {
                     return None;
                 }
-                let mut update = assistant_update(vec![Content::text(delta)]);
-                update.message_id = self.last_chunk_message_id.clone();
-                Some(update)
+                Some(ChatResponseUpdate {
+                    contents: vec![Content::text(delta)],
+                    role: Some(role),
+                    message_id: self.last_chunk_message_id.clone(),
+                    ..Default::default()
+                })
             }
             event_type::REASONING_MESSAGE_CONTENT | event_type::REASONING_MESSAGE_CHUNK => {
                 let delta = delta_of(event);
                 if let Some(id) = str_field(event, &["messageId", "message_id"]) {
+                    self.message_roles
+                        .entry(id.clone())
+                        .or_insert_with(Role::assistant);
                     self.last_reasoning_message_id = Some(id);
                 }
                 if delta.is_empty() {
@@ -1063,12 +1137,16 @@ impl AgUiEventConverter {
                     .or_else(|| event.get("content"))
                     .cloned()
                     .filter(|v| !v.is_null());
+                let message_id = str_field(event, &["messageId", "message_id"]);
+                if let Some(id) = &message_id {
+                    self.message_roles.insert(id.clone(), Role::tool());
+                }
                 Some(ChatResponseUpdate {
                     contents: vec![Content::FunctionResult(FunctionResultContent::new(
                         call_id, result,
                     ))],
                     role: Some(Role::tool()),
-                    message_id: str_field(event, &["messageId", "message_id"]),
+                    message_id,
                     ..Default::default()
                 })
             }
@@ -1145,6 +1223,38 @@ impl AgUiEventConverter {
         }
     }
 
+    /// Record the role a text event declares for message `key` and return the
+    /// message's role. An explicit `role` (`developer`, `system`, `user`,
+    /// `assistant`) is honoured; without one the message keeps the role it
+    /// already has, or is `assistant`, the protocol's default.
+    fn declare_role(&mut self, key: String, event: &Value) -> Role {
+        let declared = str_field(event, &["role"]).map(|role| {
+            framework_role(&role).unwrap_or_else(|| {
+                tracing::warn!(role, "unknown AG-UI text message role; using assistant");
+                Role::assistant()
+            })
+        });
+        match declared {
+            Some(role) => {
+                self.message_roles.insert(key, role.clone());
+                role
+            }
+            None => self
+                .message_roles
+                .entry(key)
+                .or_insert_with(Role::assistant)
+                .clone(),
+        }
+    }
+
+    /// The role message `key` was produced with, `assistant` when unknown.
+    fn role_of(&self, key: &str) -> Role {
+        self.message_roles
+            .get(key)
+            .cloned()
+            .unwrap_or_else(Role::assistant)
+    }
+
     /// Record `id` as open, replacing an earlier call with the same id.
     fn open_call(&mut self, id: String, name: String) {
         self.open_tool_calls.retain(|(open, _)| *open != id);
@@ -1156,7 +1266,12 @@ impl AgUiEventConverter {
     /// names, as `protected_data`, so it survives aggregation and is sent back
     /// as `encryptedValue` on the next turn. A `message` value becomes a
     /// textless reasoning fragment on that message (aggregation merges it
-    /// into the message's reasoning); a `tool-call` value becomes a fragment
+    /// into the message's reasoning), under the role the message was
+    /// produced with, so a value for a `tool` (or `user`, `system`,
+    /// `developer`) message neither turns it into an assistant message nor
+    /// is lost; a value for a message this run has not produced carries no
+    /// role, so the message takes whatever role it later declares. A
+    /// `tool-call` value becomes a fragment
     /// of that call. A value for a call this run never opened is dropped, as
     /// a fragment would otherwise start a new, empty call.
     fn encrypted_value(&self, event: &Value) -> Option<ChatResponseUpdate> {
@@ -1169,15 +1284,15 @@ impl AgUiEventConverter {
             return None;
         };
         match subtype.as_str() {
-            "message" => {
-                let mut update =
-                    assistant_update(vec![Content::TextReasoning(TextReasoningContent {
-                        protected_data: Some(value),
-                        ..Default::default()
-                    })]);
-                update.message_id = Some(entity_id);
-                Some(update)
-            }
+            "message" => Some(ChatResponseUpdate {
+                contents: vec![Content::TextReasoning(TextReasoningContent {
+                    protected_data: Some(value),
+                    ..Default::default()
+                })],
+                role: self.message_roles.get(&entity_id).cloned(),
+                message_id: Some(entity_id),
+                ..Default::default()
+            }),
             "tool-call" => {
                 let Some(name) = self.seen_tool_calls.get(&entity_id) else {
                     tracing::warn!(
@@ -1242,9 +1357,13 @@ impl AgUiEventConverter {
                 "assistant" => self.snapshot_assistant(message),
                 "tool" => self.snapshot_tool(message),
                 "reasoning" => snapshot_reasoning(message),
+                "user" | "system" | "developer" => snapshot_input(message, role),
                 _ => None,
             };
             if let Some(mut update) = update {
+                if let Some(role) = &update.role {
+                    self.message_roles.insert(id.clone(), role.clone());
+                }
                 update.message_id = Some(id);
                 out.push(update);
             }
@@ -1286,8 +1405,20 @@ impl AgUiEventConverter {
                 Some(other) => other.to_string(),
             };
             self.seen_tool_calls.insert(call_id.clone(), name.clone());
-            contents.push(call_fragment(call_id, name, arguments));
+            let mut fragment = FunctionCallContent::new(
+                call_id,
+                name,
+                Some(agent_framework_core::types::FunctionArguments::Raw(
+                    arguments,
+                )),
+            );
+            // The call's own opaque value, as a `REASONING_ENCRYPTED_VALUE`
+            // (`tool-call`) would have attached it.
+            fragment.protected_data = str_field(call, &["encryptedValue", "encrypted_value"])
+                .filter(|value| !value.is_empty());
+            contents.push(Content::FunctionCall(fragment));
         }
+        contents.extend(encrypted_marker(message));
         (!contents.is_empty()).then(|| assistant_update(contents))
     }
 
@@ -1302,10 +1433,12 @@ impl AgUiEventConverter {
         }
         self.seen_result_call_ids.insert(call_id.clone());
         let result = message.get("content").cloned().filter(|v| !v.is_null());
+        let mut contents = vec![Content::FunctionResult(FunctionResultContent::new(
+            call_id, result,
+        ))];
+        contents.extend(encrypted_marker(message));
         Some(ChatResponseUpdate {
-            contents: vec![Content::FunctionResult(FunctionResultContent::new(
-                call_id, result,
-            ))],
+            contents,
             role: Some(Role::tool()),
             ..Default::default()
         })
@@ -1390,6 +1523,54 @@ fn snapshot_reasoning(message: &Value) -> Option<ChatResponseUpdate> {
             ..Default::default()
         },
     )]))
+}
+
+/// A snapshot `user`, `system` or `developer` message under its own role:
+/// its text, or for a multimodal `content` its ordered text and media parts,
+/// plus its `encryptedValue`.
+fn snapshot_input(message: &Value, role: &str) -> Option<ChatResponseUpdate> {
+    let mut contents = match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => vec![Content::text(text.as_str())],
+        Some(Value::Array(parts)) => parts.iter().filter_map(input_part).collect(),
+        _ => Vec::new(),
+    };
+    contents.extend(encrypted_marker(message));
+    if contents.is_empty() {
+        return None;
+    }
+    Some(ChatResponseUpdate {
+        contents,
+        role: framework_role(role),
+        ..Default::default()
+    })
+}
+
+/// One AG-UI input content part (the inverse of [`media_part`]): `text`, or
+/// an `image` / `audio` / `video` / `document` part whose `source` is inline
+/// `data` (base64) or a `url`.
+fn input_part(part: &Value) -> Option<Content> {
+    let kind = part.get("type").and_then(Value::as_str)?;
+    if kind == "text" {
+        let text = part.get("text").and_then(Value::as_str)?;
+        return (!text.is_empty()).then(|| Content::text(text));
+    }
+    let source = part.get("source")?;
+    let value = source.get("value").and_then(Value::as_str)?;
+    let media_type = str_field(source, &["mimeType", "mime_type"]);
+    match source.get("type").and_then(Value::as_str)? {
+        "data" => {
+            let media_type = media_type.unwrap_or_else(|| "application/octet-stream".into());
+            Some(Content::Data(DataContent {
+                uri: format!("data:{media_type};base64,{value}"),
+                media_type: Some(media_type),
+            }))
+        }
+        "url" => Some(Content::Uri(agent_framework_core::types::UriContent {
+            uri: value.to_string(),
+            media_type: media_type.unwrap_or_else(|| "application/octet-stream".into()),
+        })),
+        _ => None,
+    }
 }
 
 /// Whether `update` is an annotation batch from [`AgUiEventConverter`].
@@ -2531,11 +2712,14 @@ mod tests {
             updates[2].additional_properties["ag_ui_messages_snapshot"][0]["content"],
             "hi"
         );
+        // The snapshot's user message is new to the run: added as a user one.
+        assert_eq!(updates[3].role, Some(Role::user()));
+        assert_eq!(updates[3].message_id.as_deref(), Some("1"));
         assert!(
-            matches!(&updates[3].contents[0], Content::TextReasoning(r) if r.text == "thinking")
+            matches!(&updates[4].contents[0], Content::TextReasoning(r) if r.text == "thinking")
         );
         // A chunk without an id continues the previous chunk's message.
-        assert_eq!(updates[5].message_id.as_deref(), Some("c"));
+        assert_eq!(updates[6].message_id.as_deref(), Some("c"));
     }
 
     // --- request building (ports of test_ag_ui_client.py) ----------------
@@ -3196,5 +3380,228 @@ mod tests {
             &updates[1].contents[..],
             [Content::FunctionResult(r)] if r.call_id == "c1"
         ));
+    }
+
+    // --- roles and encrypted values (AG-UI 1.0 sweep) --------------------
+
+    #[test]
+    fn encrypted_value_on_a_tool_result_keeps_the_tool_role_and_round_trips() {
+        let events = [
+            json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "lookup",
+                   "parentMessageId": "a1"}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "c1"}),
+            json!({"type": "TOOL_CALL_RESULT", "messageId": "t1", "toolCallId": "c1",
+                   "content": "sunny"}),
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message",
+                   "entityId": "t1", "encryptedValue": "dG9vbA=="}),
+        ];
+        let updates = convert_all(&events);
+        assert_eq!(updates.last().unwrap().role, Some(Role::tool()));
+        let response = finalize_response(updates);
+        let tool = response
+            .messages
+            .iter()
+            .find(|m| m.message_id.as_deref() == Some("t1"))
+            .unwrap();
+        assert_eq!(tool.role, Role::tool());
+        assert!(tool
+            .contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionResult(r) if r.call_id == "c1")));
+
+        let out = messages_to_agui(&response.messages);
+        let tool = out.iter().find(|m| m["id"] == "t1").unwrap();
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["toolCallId"], "c1");
+        assert_eq!(tool["content"], "sunny");
+        assert_eq!(tool["encryptedValue"], "dG9vbA==");
+    }
+
+    #[test]
+    fn encrypted_value_before_its_message_takes_the_declared_role() {
+        let response = finalize_response(convert_all(&[
+            json!({"type": "REASONING_ENCRYPTED_VALUE", "subtype": "message",
+                   "entityId": "s1", "encryptedValue": "c3lz"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "s1", "role": "system"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "s1", "delta": "Be brief."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "s1"}),
+        ]));
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.messages[0].role, Role::system());
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(
+            out,
+            [json!({"id": "s1", "role": "system", "content": "Be brief.",
+                    "encryptedValue": "c3lz"})]
+        );
+    }
+
+    #[test]
+    fn text_message_roles_are_kept_for_every_fragment() {
+        let updates = convert_all(&[
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "d1", "role": "developer"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "d1", "delta": "Use metric."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "d1"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "u1", "role": "user"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "u1", "delta": "Hi"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "u1"}),
+            // No role: the protocol's default.
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "a1"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "a1", "delta": "Hello"}),
+            // A chunked message: the first chunk's role holds for the rest,
+            // including chunks that omit the id.
+            json!({"type": "TEXT_MESSAGE_CHUNK", "messageId": "s1", "role": "system", "delta": "Be"}),
+            json!({"type": "TEXT_MESSAGE_CHUNK", "messageId": "s1", "delta": " kind"}),
+            json!({"type": "TEXT_MESSAGE_CHUNK", "delta": "."}),
+            json!({"type": "TEXT_MESSAGE_CHUNK", "messageId": "a2", "delta": "Done"}),
+        ]);
+        let roles: Vec<_> = updates
+            .iter()
+            .map(|u| {
+                format!(
+                    "{}:{}",
+                    u.message_id.as_deref().unwrap_or("-"),
+                    u.role.as_ref().map(Role::as_str).unwrap_or("-")
+                )
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                "d1:developer",
+                "d1:developer",
+                "u1:user",
+                "u1:user",
+                "a1:assistant",
+                "a1:assistant",
+                "s1:system",
+                "s1:system",
+                "s1:system",
+                "a2:assistant",
+            ]
+        );
+
+        let response = finalize_response(updates);
+        let roles: Vec<_> = response
+            .messages
+            .iter()
+            .map(|m| m.role.as_str().to_string())
+            .collect();
+        assert_eq!(
+            roles,
+            ["developer", "user", "assistant", "system", "assistant"]
+        );
+        assert_eq!(response.messages[3].text(), "Be kind.");
+        // And they go back to the server under the same roles.
+        let out = messages_to_agui(&response.messages);
+        let wire: Vec<_> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            wire,
+            ["developer", "user", "assistant", "system", "assistant"]
+        );
+    }
+
+    #[test]
+    fn snapshot_tool_call_and_message_encrypted_values_round_trip() {
+        let mut c = AgUiEventConverter::new();
+        let updates = c.convert_event_all(&json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+            {"id": "a1", "role": "assistant", "content": "Checking.", "encryptedValue": "msg-a",
+             "toolCalls": [
+                {"id": "c1", "type": "function", "encryptedValue": "call-1",
+                 "function": {"name": "lookup", "arguments": "{}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "lookup", "arguments": "{}"}},
+            ]},
+            {"id": "t1", "role": "tool", "toolCallId": "c1", "content": "sunny",
+             "encryptedValue": "msg-t"},
+        ]}));
+        let response = finalize_response(updates);
+        assert_eq!(response.messages.len(), 2);
+        let calls: Vec<_> = response.messages[0]
+            .contents
+            .iter()
+            .filter_map(Content::as_function_call)
+            .collect();
+        assert_eq!(calls[0].protected_data.as_deref(), Some("call-1"));
+        assert_eq!(calls[1].protected_data, None);
+        assert_eq!(response.messages[1].role, Role::tool());
+
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(out[0]["id"], "a1");
+        assert_eq!(out[0]["encryptedValue"], "msg-a");
+        assert_eq!(out[0]["toolCalls"][0]["encryptedValue"], "call-1");
+        assert!(out[0]["toolCalls"][1].get("encryptedValue").is_none());
+        assert_eq!(out[1]["id"], "t1");
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["encryptedValue"], "msg-t");
+    }
+
+    #[test]
+    fn snapshot_input_messages_keep_their_roles_parts_and_encrypted_values() {
+        let mut c = AgUiEventConverter::new()
+            .with_request_messages(&[json!({"id": "sent", "role": "user", "content": "old"})]);
+        let updates = c.convert_event_all(&json!({"type": "MESSAGES_SNAPSHOT", "messages": [
+            {"id": "sent", "role": "user", "content": "old"},
+            {"id": "d1", "role": "developer", "content": "Use metric.", "encryptedValue": "dev"},
+            {"id": "s1", "role": "system", "content": "Be brief."},
+            {"id": "u1", "role": "user", "content": [
+                {"type": "text", "text": "Look:"},
+                {"type": "image", "source": {"type": "data", "value": "aGk=", "mimeType": "image/png"}},
+                {"type": "document", "source": {"type": "url", "value": "https://x.test/a.pdf",
+                                                "mimeType": "application/pdf"}},
+            ]},
+            {"id": "e1", "role": "user", "content": "", "encryptedValue": "only"},
+            {"id": "act", "role": "activity", "activityType": "progress", "content": {}},
+        ]}));
+        let response = finalize_response(updates);
+        let shape: Vec<_> = response
+            .messages
+            .iter()
+            .map(|m| format!("{}:{}", m.message_id.as_deref().unwrap(), m.role.as_str()))
+            .collect();
+        assert_eq!(shape, ["d1:developer", "s1:system", "u1:user", "e1:user"]);
+        let media = &response.messages[2].contents;
+        assert!(matches!(&media[1], Content::Data(d)
+            if d.uri == "data:image/png;base64,aGk=" && d.media_type.as_deref() == Some("image/png")));
+        assert!(matches!(&media[2], Content::Uri(u)
+            if u.uri == "https://x.test/a.pdf" && u.media_type == "application/pdf"));
+
+        let out = messages_to_agui(&response.messages);
+        assert_eq!(
+            out[0],
+            json!({"id": "d1", "role": "developer", "content": "Use metric.", "encryptedValue": "dev"})
+        );
+        assert_eq!(
+            out[2]["content"][0],
+            json!({"type": "text", "text": "Look:"})
+        );
+        assert_eq!(out[2]["content"][1]["source"]["value"], "aGk=");
+        // A user message that carries only its encrypted value stays a user
+        // message; it is not mistaken for a reasoning message.
+        assert_eq!(
+            out[3],
+            json!({"id": "e1", "role": "user", "content": "", "encryptedValue": "only"})
+        );
+    }
+
+    #[test]
+    fn split_message_puts_its_encrypted_value_on_the_wire_message_with_its_id() {
+        let msg = mixed(
+            "m1",
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    protected_data: Some("enc".into()),
+                    ..Default::default()
+                }),
+                call("c1"),
+                result("c1"),
+            ],
+        );
+        let out = messages_to_agui(&[msg]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["id"], "m1");
+        assert_eq!(out[0]["encryptedValue"], "enc");
+        assert_eq!(out[1]["role"], "tool");
+        assert!(out[1].get("encryptedValue").is_none());
     }
 }
