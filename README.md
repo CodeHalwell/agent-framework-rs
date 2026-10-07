@@ -76,7 +76,8 @@ parity with the Python and .NET implementations.
 - **Hosting** — serve agents/workflows over HTTP with axum: a DevUI-style API
   (`/v1/entities`, `/v1/responses` with SSE) with an embedded zero-dependency
   debug page at `/`, A2A serving (agent card + JSON-RPC), the AG-UI protocol
-  (`AgUiRouter` SSE events for CopilotKit frontends), and an OpenAI-compatible
+  (`AgUiRouter` SSE events for CopilotKit frontends, plus `AgUiChatClient` to
+  use a remote AG-UI server as a chat client), and an OpenAI-compatible
   `/v1/chat/completions`.
 - **Memory & storage** — Redis-backed history and long-term memory (BM25 via
   RediSearch, SCAN fallback on plain Redis), Mem0, Azure Cosmos DB message
@@ -111,7 +112,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
 | [`agent-framework-declarative`](crates/agent-framework-declarative) | Declarative YAML/JSON agents and workflows with provider/tool registries. |
-| [`agent-framework-hosting`](crates/agent-framework-hosting) | HTTP serving (axum): DevUI-style API + embedded debug UI, A2A, AG-UI, OpenAI-compatible. |
+| [`agent-framework-hosting`](crates/agent-framework-hosting) | HTTP serving (axum): DevUI-style API + embedded debug UI, A2A, AG-UI, OpenAI-compatible; an AG-UI chat client behind `agui-client`. |
 | [`agent-framework-redis`](crates/agent-framework-redis) | Redis-backed `ChatMessageStore` and long-term-memory `ContextProvider` (RediSearch BM25). |
 | [`agent-framework-mem0`](crates/agent-framework-mem0) | Mem0 hosted-API long-term-memory `ContextProvider`. |
 | [`agent-framework-cosmos`](crates/agent-framework-cosmos) | Azure Cosmos DB NoSQL `ChatMessageStore`, workflow checkpoints, and vector store (master key or Entra ID, REST). |
@@ -199,6 +200,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `mcp` | [`agent-framework-mcp`](crates/agent-framework-mcp) — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 | `a2a` | [`agent-framework-a2a`](crates/agent-framework-a2a) — Agent2Agent protocol client | no |
 | `hosting` | [`agent-framework-hosting`](crates/agent-framework-hosting) — serve agents over HTTP (DevUI-style, A2A, AG-UI, OpenAI-compatible) | no |
+| `agui-client` | `AgUiChatClient` in [`agent-framework-hosting`](crates/agent-framework-hosting) — a chat client for remote AG-UI servers (implies `hosting`) | no |
 | `redis` | [`agent-framework-redis`](crates/agent-framework-redis) — Redis chat-message store & context provider | no |
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
 | `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, embeddings, and managed memory | no |
@@ -280,7 +282,7 @@ one-to-one:
 | `_mcp` | [`agent-framework-mcp`](crates/agent-framework-mcp) (`McpStdioTool`, `McpStreamableHttpTool`, `McpWebsocketTool`, prompts, sampling, roots) |
 | `a2a` package | [`agent-framework-a2a`](crates/agent-framework-a2a) (`A2AAgent`, `A2AClient`) |
 | `declarative` package | [`agent-framework-declarative`](crates/agent-framework-declarative) (`DeclarativeLoader`) |
-| `devui` / `ag-ui` packages | [`agent-framework-hosting`](crates/agent-framework-hosting) (`AgentHost`, `A2ARouter`, `AgUiRouter`, `OpenAiRouter`, embedded debug UI) |
+| `devui` / `ag-ui` packages | [`agent-framework-hosting`](crates/agent-framework-hosting) (`AgentHost`, `A2ARouter`, `AgUiRouter`, `AgUiChatClient`, `OpenAiRouter`, embedded debug UI) |
 | `redis` / `mem0` packages | [`agent-framework-redis`](crates/agent-framework-redis) / [`agent-framework-mem0`](crates/agent-framework-mem0) |
 | `foundry` / `azure-ai-search` packages | [`agent-framework-foundry`](crates/agent-framework-foundry) / [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) |
 | `copilotstudio` / `purview` packages | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) / [`agent-framework-purview`](crates/agent-framework-purview) |
@@ -305,7 +307,7 @@ December 2025 matrix and audit, kept for history. The remaining gaps:
       options, event origin/warning events, viz file export
 - [ ] Cross-language wire compatibility: `type`-tagged message payloads,
       `raw_representation`/`additional_properties` on content types
-- [ ] AG-UI: the client (`AGUIChatClient`) and predictive-state events
+- [ ] AG-UI: predictive-state events from the server
       (`STATE_SNAPSHOT`/`STATE_DELTA`, `confirm_changes`)
 - [ ] DevUI parity: conversations API, run cancellation, `/meta`,
       directory-based entity discovery, auth (the frontend itself is out of

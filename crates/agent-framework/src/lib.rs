@@ -20,7 +20,8 @@
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
 //! | `experimental-declarative-agents` | [`agent_framework_declarative`] — YAML/JSON agents & workflows (experimental) | no |
-//! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, OpenAI-compatible) | no |
+//! | `hosting` | [`agent_framework_hosting`] — serve agents over HTTP (DevUI-style, A2A, AG-UI, OpenAI-compatible) | no |
+//! | `agui-client` | `agent_framework_hosting::agui::AgUiChatClient` — a chat client for remote AG-UI servers (implies `hosting`) | no |
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
