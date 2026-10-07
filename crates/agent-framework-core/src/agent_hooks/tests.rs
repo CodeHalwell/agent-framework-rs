@@ -442,6 +442,70 @@ async fn pre_tool_call_deny_blocks_the_call_and_the_loop_continues() {
     );
 }
 
+/// A user function middleware (between the tool seam's halves) that
+/// swallows any downstream error and substitutes a successful result.
+struct SwallowToolErrors;
+
+#[async_trait]
+impl Middleware<FunctionInvocationContext> for SwallowToolErrors {
+    async fn process(
+        &self,
+        ctx: FunctionInvocationContext,
+        next: Next<FunctionInvocationContext>,
+    ) -> Result<FunctionInvocationContext> {
+        let mut fallback =
+            FunctionInvocationContext::new(ctx.function_name.clone(), ctx.arguments.clone());
+        fallback.metadata = ctx.metadata.clone();
+        match next.run(ctx).await {
+            Ok(ctx) => Ok(ctx),
+            Err(_) => {
+                fallback.result = Some(json!({"found": "fallback"}));
+                Ok(fallback)
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_call_deny_survives_a_swallowing_function_middleware() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let (client, requests) = Scripted::new(vec![
+        tool_call_reply("c1", "lookup", json!({"q": "x"})),
+        text_reply("handled"),
+    ]);
+    let (interceptor, seen) = recorder(|ctx| match ctx.point() {
+        InterceptionPoint::PreToolCall => Verdict::deny("tool_denied"),
+        _ => Verdict::allow(),
+    });
+    let agent = hooks(interceptor).build_agent(
+        Agent::builder(client)
+            .tool(echo_tool(count.clone()))
+            .function_middleware(Arc::new(SwallowToolErrors)),
+    );
+    let response = agent.run(vec![Message::user("go")], None).await.unwrap();
+    assert_eq!(response.text(), "handled");
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(!points(&seen).contains(&"post_tool_call"));
+    // The substituted success never reaches the model: it sees the
+    // blocked-call error instead.
+    let requests = requests.lock().unwrap();
+    let result = requests[1]
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .find_map(Content::as_function_result)
+        .unwrap();
+    assert!(result.is_error());
+    assert_eq!(result.result, None);
+    let payload: Value = serde_json::from_str(result.exception.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "error": "Tool call blocked by agent-hooks at pre_tool_call.",
+            "reason": "tool_denied"
+        })
+    );
+}
+
 /// Calls `lookup` until tools are switched off, then answers in text.
 struct KeepsCalling {
     requests: Arc<AtomicUsize>,

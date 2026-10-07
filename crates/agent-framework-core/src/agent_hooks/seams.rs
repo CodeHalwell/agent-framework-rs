@@ -132,8 +132,11 @@ struct RunState {
 enum ToolTrack {
     /// The inner seam has not run (yet): no `pre_tool_call` was emitted.
     Pending,
-    /// `pre_tool_call` blocked the call; no `post_tool_call` follows (§6.2).
-    Blocked,
+    /// `pre_tool_call` blocked the call with this deny; no `post_tool_call`
+    /// follows (§6.2). The outer half re-emits the deny, so a middleware
+    /// between the halves that swallows it cannot turn the unexecuted call
+    /// into a success.
+    Blocked(Box<InterceptionBlocked>),
     /// The call was dispatched to the named tool with these
     /// (post-transform) arguments.
     Dispatched(String, Map<String, Value>),
@@ -809,9 +812,13 @@ impl Middleware<FunctionInvocationContext> for ToolPostMiddleware {
         // cannot rewrite; post_tool_call names the same tool.
         let (name, args) = match track {
             Some(ToolTrack::Dispatched(name, args)) => (name, args),
-            // Blocked at pre_tool_call (§6.2: no post_tool_call), or no tool
-            // was reached at all.
-            Some(ToolTrack::Blocked | ToolTrack::Pending) | None => {
+            // Blocked at pre_tool_call (§6.2: no post_tool_call). Fail
+            // closed: re-emit the stored deny whatever the middleware
+            // between the halves returned, so a fallback success for the
+            // unexecuted call never reaches the model.
+            Some(ToolTrack::Blocked(b)) => return Err(block_tool(&state, b)),
+            // No tool was reached at all.
+            Some(ToolTrack::Pending) | None => {
                 return result.map(|mut ctx| {
                     ctx.metadata.remove(TOOL_TOKEN_KEY);
                     ctx
@@ -936,7 +943,7 @@ impl Middleware<FunctionInvocationContext> for ToolPreMiddleware {
                     .tool_calls
                     .lock()
                     .unwrap()
-                    .insert(token, ToolTrack::Blocked);
+                    .insert(token, ToolTrack::Blocked(b.clone()));
                 return Err(block_tool(&state, b));
             }
         }
