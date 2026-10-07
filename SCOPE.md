@@ -43,10 +43,11 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Harness** (agent loop, todo, tool approval, agent mode, file memory,
-  background agents), **evaluation** and **security (FIDES)**: all marked
-  experimental upstream. They wait on a feature-stage mechanism so they can
-  ship without semver commitments.
+- **Harness, remainder**: file access, file memory, memory, background
+  agents (and the loop's `background_tasks_running` condition),
+  `TodoFileStore` and the `create_harness_agent` assembly. The agent loop,
+  todo, tool approval and agent mode are ported behind
+  `experimental-harness`.
 - **Agent hooks, remainder** (`experimental-agent-hooks` ships the
   enforcement bundle): the approval seam (liftable denies are enforced as
   plain denies), the `sequential/run_all` and parallel composition profiles,
@@ -55,6 +56,9 @@ from the roadmap, not from this file.
   result-label flow (labels reach the combined verdict and the record but
   are not persisted with the produced data or resurfaced as
   `source_labels`; upstream's framework layer does not do this either).
+- **Evaluation** and **security (FIDES)**: both marked experimental
+  upstream; when ported they go behind `experimental-*` features (see
+  `docs/feature-stages.md`).
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control

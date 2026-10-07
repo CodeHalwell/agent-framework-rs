@@ -582,6 +582,7 @@ impl Agent {
         let mut ctx = SessionContext::new(input.to_vec());
         ctx.session_id = Some(session.session_id().to_string());
         ctx.service_session_id = service_session_id.clone();
+        ctx.session = Some(session.clone());
         for provider in &providers {
             provider.before_run(&mut ctx).await?;
         }
