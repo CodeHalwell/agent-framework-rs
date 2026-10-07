@@ -649,23 +649,63 @@ fn collect_approval_responses(messages: &[Message]) -> Vec<FunctionApprovalRespo
     out
 }
 
-/// Remove settled approval responses from the model input: their calls were
-/// already answered by the results that follow them in history. A message
-/// left empty by the removal is dropped.
+/// Remove settled approvals from the model input: their calls were already
+/// answered by the results that follow them in history.
+///
+/// Both halves go. The settled response is dropped, and so is the approval
+/// request it answered (an earlier request with the response's id); left in,
+/// a converter such as OpenAI Responses would resend it as a fresh
+/// `mcp_approval_request`. A request whose call is not otherwise declared
+/// earlier in history becomes that call instead, so the result that follows
+/// still has a call to answer. A later request reusing the id is a new,
+/// pending approval and is kept. A message left empty is dropped.
 fn drop_settled_approval_responses(messages: &mut Vec<Message>) {
     let settled = settled_approval_responses(messages);
     if settled.is_empty() {
         return;
     }
+    // The latest settled position for each settled response id: requests
+    // before it with that id are answered.
+    let mut settled_ids: HashMap<String, (usize, usize)> = HashMap::new();
+    for &(m, c) in &settled {
+        if let Content::FunctionApprovalResponse(resp) = &messages[m].contents[c] {
+            if !resp.id.is_empty() {
+                let entry = settled_ids.entry(resp.id.clone()).or_insert((m, c));
+                *entry = (*entry).max((m, c));
+            }
+        }
+    }
+    let mut declared: Vec<FunctionCallContent> = Vec::new();
     let mut m = 0usize;
     messages.retain_mut(|msg| {
         let before = msg.contents.len();
-        let mut c = 0usize;
-        msg.contents.retain(|_| {
-            let keep = !settled.contains(&(m, c));
-            c += 1;
-            keep
-        });
+        let mut kept = Vec::with_capacity(before);
+        for (c, content) in std::mem::take(&mut msg.contents).into_iter().enumerate() {
+            if settled.contains(&(m, c)) {
+                continue;
+            }
+            match content {
+                Content::FunctionCall(fc) => {
+                    declared.push(fc.clone());
+                    kept.push(Content::FunctionCall(fc));
+                }
+                Content::FunctionApprovalRequest(req)
+                    if settled_ids
+                        .get(req.id.as_str())
+                        .is_some_and(|&position| (m, c) < position) =>
+                {
+                    if !declared
+                        .iter()
+                        .any(|fc| fc.same_invocation(&req.function_call))
+                    {
+                        declared.push(req.function_call.clone());
+                        kept.push(Content::FunctionCall(req.function_call));
+                    }
+                }
+                other => kept.push(other),
+            }
+        }
+        msg.contents = kept;
         m += 1;
         before == 0 || !msg.contents.is_empty()
     });

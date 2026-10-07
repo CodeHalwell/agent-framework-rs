@@ -1114,13 +1114,15 @@ async fn a_settled_approval_in_history_does_not_rerun_the_tool() {
     // collected again on every later run, re-executing the approved tool each
     // turn. A response whose call already has a result is settled history.
     let counter = Arc::new(Mutex::new(0));
-    let agent = Agent::builder(MockClient::new(vec![
+    let client = MockClient::new(vec![
         secret_call(),
         ChatResponse::from_text("The secret is 42."),
         ChatResponse::from_text("You're welcome."),
-    ]))
-    .tool(approval_tool(counter.clone()))
-    .build();
+    ]);
+    let seen = client.seen.clone();
+    let agent = Agent::builder(client)
+        .tool(approval_tool(counter.clone()))
+        .build();
     let mut thread = AgentSession::new();
     thread
         .context_providers
@@ -1153,6 +1155,27 @@ async fn a_settled_approval_in_history_does_not_rerun_the_tool() {
         1,
         "settled approval re-ran the tool"
     );
+
+    // The third model call sees the settled approval as a plain call and its
+    // result: neither the request nor the response is resent.
+    let third = seen.lock().unwrap().last().cloned().unwrap();
+    let contents: Vec<&Content> = third.iter().flat_map(|m| m.contents.iter()).collect();
+    assert!(
+        !contents.iter().any(|c| matches!(
+            c,
+            Content::FunctionApprovalRequest(_) | Content::FunctionApprovalResponse(_)
+        )),
+        "settled approval resent: {third:?}"
+    );
+    let calls = contents
+        .iter()
+        .filter(|c| matches!(c, Content::FunctionCall(_)))
+        .count();
+    let results = contents
+        .iter()
+        .filter(|c| matches!(c, Content::FunctionResult(_)))
+        .count();
+    assert_eq!((calls, results), (1, 1), "{third:?}");
 }
 
 #[tokio::test]
