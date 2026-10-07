@@ -33,7 +33,9 @@ fn one_shot_server(status: u16, body: &'static str) -> (String, Arc<Mutex<Option
     let seen_writer = seen.clone();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        *seen_writer.lock().unwrap() = Some(serve_one(&mut stream, status, body));
+        serve_one(&mut stream, status, body, |recorded| {
+            *seen_writer.lock().unwrap() = Some(recorded);
+        });
     });
     (format!("http://{addr}"), seen)
 }
@@ -48,16 +50,18 @@ fn sequential_server(bodies: Vec<&'static str>) -> (String, Arc<Mutex<Vec<Record
     std::thread::spawn(move || {
         for body in bodies {
             let (mut stream, _) = listener.accept().expect("accept");
-            let recorded = serve_one(&mut stream, 200, body);
-            seen_writer.lock().unwrap().push(recorded);
+            serve_one(&mut stream, 200, body, |recorded| {
+                seen_writer.lock().unwrap().push(recorded);
+            });
         }
     });
     (format!("http://{addr}"), seen)
 }
 
-/// Read one request from `stream`, answer it with `(status, body)`, and
-/// return what was asked.
-fn serve_one(stream: &mut TcpStream, status: u16, body: &str) -> Recorded {
+/// Read one request from `stream`, hand it to `record`, then answer it with
+/// `(status, body)`. Recording comes first so a test that reads what was
+/// asked as soon as its call returns never races the server.
+fn serve_one(stream: &mut TcpStream, status: u16, body: &str, record: impl FnOnce(Recorded)) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let (mut header_end, mut content_length) = (None, 0usize);
@@ -92,6 +96,11 @@ fn serve_one(stream: &mut TcpStream, status: u16, body: &str) -> Recorded {
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
+    record(Recorded {
+        start_line,
+        headers,
+        body: req_body.to_string(),
+    });
 
     let reason = if status == 200 { "OK" } else { "ERR" };
     let response = format!(
@@ -99,11 +108,6 @@ fn serve_one(stream: &mut TcpStream, status: u16, body: &str) -> Recorded {
         body.len(),
     );
     stream.write_all(response.as_bytes()).expect("write");
-    Recorded {
-        start_line,
-        headers,
-        body: req_body.to_string(),
-    }
 }
 
 /// Two vectors returned out of order, each tagged with its input `index` —
