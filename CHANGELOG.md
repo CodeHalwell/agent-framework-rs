@@ -40,6 +40,26 @@ loop has no `background_tasks_running` condition), `TodoFileStore` and
 upstream's `before_run(session=...)` allows. Code that builds a
 `SessionContext` with a struct literal must set it.
 
+### AG-UI client
+
+`agent_framework_hosting::agui::AgUiChatClient`, behind the new
+`agui-client` feature (in `agent-framework-hosting`, and in the umbrella
+crate, where it implies `hosting` and is part of `full`), is a `ChatClient`
+for any AG-UI server, ported from upstream's `AGUIChatClient`. It posts a
+`RunAgentInput` and maps the server's SSE events (text, tool calls and
+results, reasoning, state and message snapshots, run finished/error, custom
+and annotation events) to chat updates, streaming or not. The function tools
+in a request are declared to the server; when its model calls one, an
+`Agent` wrapping the client runs it locally and sends the result back, while
+tools the server ran itself are left alone. `state_carrier` sends shared
+state, and interrupt/resume options are forwarded in canonical form.
+`AgUiEventConverter` and `messages_to_agui` are public for custom transports.
+
+The feature is off by default, so serving AG-UI does not pull in `reqwest`.
+The router and client share the wire model: `RunAgentInput` now also
+serializes and gains `available_interrupts` and `resume` fields (ignored by
+the router), and the event names are in `agui::event_type`.
+
 ### Multimodal embedding inputs (breaking)
 
 `EmbeddingClient::get_embeddings` takes `Vec<EmbeddingInput>` instead of

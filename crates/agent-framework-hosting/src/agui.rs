@@ -68,6 +68,14 @@
 //!   `state_schema` (agentic generative-UI / predictive-state features) which
 //!   have no equivalent on the core `SupportsAgentRun` trait. Inbound `state` is accepted
 //!   and ignored. `CUSTOM` is emitted only for approval requests.
+//!
+//! # Client
+//! With the `agui-client` feature, `client::AgUiChatClient` (re-exported
+//! here) is the other end of this protocol: a
+//! [`ChatClient`](agent_framework_core::client::ChatClient) that posts a
+//! [`RunAgentInput`] to any AG-UI server and turns the event stream back into
+//! chat updates. It shares this module's wire model ([`RunAgentInput`],
+//! [`event_type`]) with the router.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -77,7 +85,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use agent_framework_core::agent::{AgentRunOptions, SupportsAgentRun};
@@ -90,6 +98,62 @@ use agent_framework_core::types::{
 use crate::registry::IntoAgentRegistration;
 use crate::sse::sse_events_stream;
 use crate::util;
+
+#[cfg(feature = "agui-client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agui-client")))]
+pub mod client;
+#[cfg(feature = "agui-client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "agui-client")))]
+pub use client::{
+    messages_to_agui, state_carrier, AgUiChatClient, AgUiEventConverter, STATE_CARRIER_KEY,
+};
+
+/// The AG-UI event `type` discriminators, spelled as the protocol spells them.
+///
+/// The router emits these and the `agui-client` feature's `AgUiChatClient`
+/// parses them, so both ends share one set of names.
+pub mod event_type {
+    /// A run began: `{threadId, runId}`.
+    pub const RUN_STARTED: &str = "RUN_STARTED";
+    /// A run ended normally: `{threadId, runId, result?, outcome?}`.
+    pub const RUN_FINISHED: &str = "RUN_FINISHED";
+    /// A run failed: `{message, code?}`, in place of `RUN_FINISHED`.
+    pub const RUN_ERROR: &str = "RUN_ERROR";
+    /// An assistant text message opens: `{messageId, role}`.
+    pub const TEXT_MESSAGE_START: &str = "TEXT_MESSAGE_START";
+    /// A text delta: `{messageId, delta}`.
+    pub const TEXT_MESSAGE_CONTENT: &str = "TEXT_MESSAGE_CONTENT";
+    /// An assistant text message closes: `{messageId}`.
+    pub const TEXT_MESSAGE_END: &str = "TEXT_MESSAGE_END";
+    /// A self-contained text delta: `{messageId?, delta?}`.
+    pub const TEXT_MESSAGE_CHUNK: &str = "TEXT_MESSAGE_CHUNK";
+    /// A tool call opens: `{toolCallId, toolCallName, parentMessageId?}`.
+    pub const TOOL_CALL_START: &str = "TOOL_CALL_START";
+    /// A tool-call argument delta: `{toolCallId, delta}`.
+    pub const TOOL_CALL_ARGS: &str = "TOOL_CALL_ARGS";
+    /// A tool call closes: `{toolCallId}`.
+    pub const TOOL_CALL_END: &str = "TOOL_CALL_END";
+    /// A self-contained tool-call fragment, shorthand for start/args/end:
+    /// `{toolCallId?, toolCallName?, parentMessageId?, delta?}`.
+    pub const TOOL_CALL_CHUNK: &str = "TOOL_CALL_CHUNK";
+    /// A server-side tool result: `{messageId, toolCallId, content, role}`.
+    pub const TOOL_CALL_RESULT: &str = "TOOL_CALL_RESULT";
+    /// A reasoning delta: `{messageId, delta}`.
+    pub const REASONING_MESSAGE_CONTENT: &str = "REASONING_MESSAGE_CONTENT";
+    /// A self-contained reasoning delta: `{messageId?, delta?}`.
+    pub const REASONING_MESSAGE_CHUNK: &str = "REASONING_MESSAGE_CHUNK";
+    /// An opaque encrypted reasoning value for a message or tool call:
+    /// `{subtype: "message" | "tool-call", entityId, encryptedValue}`.
+    pub const REASONING_ENCRYPTED_VALUE: &str = "REASONING_ENCRYPTED_VALUE";
+    /// The whole shared state: `{snapshot}`.
+    pub const STATE_SNAPSHOT: &str = "STATE_SNAPSHOT";
+    /// A JSON Patch (RFC 6902) against the shared state: `{delta}`.
+    pub const STATE_DELTA: &str = "STATE_DELTA";
+    /// The whole message list: `{messages}`.
+    pub const MESSAGES_SNAPSHOT: &str = "MESSAGES_SNAPSHOT";
+    /// An application-defined event: `{name, value}`.
+    pub const CUSTOM: &str = "CUSTOM";
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -257,7 +321,7 @@ async fn run_agent(State(state): State<Arc<AgUiState>>, body: String) -> Respons
                             // error in-band).
                             Err(e) => {
                                 let _ = tx
-                                    .send(json!({ "type": "RUN_ERROR", "message": e.to_string() }))
+                                    .send(json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }))
                                     .await;
                                 return;
                             }
@@ -275,7 +339,7 @@ async fn run_agent(State(state): State<Arc<AgUiState>>, body: String) -> Respons
                 // Failure before the stream even opens.
                 Err(e) => {
                     let _ = tx
-                        .send(json!({ "type": "RUN_ERROR", "message": e.to_string() }))
+                        .send(json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }))
                         .await;
                 }
             }
@@ -330,11 +394,11 @@ fn parse_client_tools(tools: &[Value]) -> Vec<ToolDefinition> {
 // ---------------------------------------------------------------------------
 
 fn run_started(thread_id: &str, run_id: &str) -> Value {
-    json!({ "type": "RUN_STARTED", "threadId": thread_id, "runId": run_id })
+    json!({ "type": event_type::RUN_STARTED, "threadId": thread_id, "runId": run_id })
 }
 
 fn run_finished(thread_id: &str, run_id: &str) -> Value {
-    json!({ "type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id })
+    json!({ "type": event_type::RUN_FINISHED, "threadId": thread_id, "runId": run_id })
 }
 
 /// Incremental AG-UI event framing, driven one streamed update's contents at a
@@ -370,7 +434,7 @@ impl AgUiFraming {
                         None => {
                             let mid = util::msg_id();
                             out.push(json!({
-                                "type": "TEXT_MESSAGE_START",
+                                "type": event_type::TEXT_MESSAGE_START,
                                 "messageId": mid,
                                 "role": "assistant",
                             }));
@@ -379,7 +443,7 @@ impl AgUiFraming {
                         }
                     };
                     out.push(json!({
-                        "type": "TEXT_MESSAGE_CONTENT",
+                        "type": event_type::TEXT_MESSAGE_CONTENT,
                         "messageId": mid,
                         "delta": text,
                     }));
@@ -388,7 +452,7 @@ impl AgUiFraming {
                     let tool_call_id = coalesce_call_id(fc, self.started_tools.last());
                     if !fc.name.is_empty() {
                         let mut start = json!({
-                            "type": "TOOL_CALL_START",
+                            "type": event_type::TOOL_CALL_START,
                             "toolCallId": tool_call_id,
                             "toolCallName": fc.name,
                         });
@@ -403,7 +467,7 @@ impl AgUiFraming {
                     if let Some(delta) = arguments_delta(fc) {
                         if !delta.is_empty() {
                             out.push(json!({
-                                "type": "TOOL_CALL_ARGS",
+                                "type": event_type::TOOL_CALL_ARGS,
                                 "toolCallId": tool_call_id,
                                 "delta": delta,
                             }));
@@ -412,11 +476,13 @@ impl AgUiFraming {
                 }
                 Content::FunctionResult(fr) => {
                     if !fr.call_id.is_empty() {
-                        out.push(json!({ "type": "TOOL_CALL_END", "toolCallId": fr.call_id }));
+                        out.push(
+                            json!({ "type": event_type::TOOL_CALL_END, "toolCallId": fr.call_id }),
+                        );
                         self.ended_tools.insert(fr.call_id.clone());
                     }
                     out.push(json!({
-                        "type": "TOOL_CALL_RESULT",
+                        "type": event_type::TOOL_CALL_RESULT,
                         "messageId": util::msg_id(),
                         "toolCallId": fr.call_id,
                         "content": result_content(fr),
@@ -426,7 +492,7 @@ impl AgUiFraming {
                 Content::FunctionApprovalRequest(ar) => {
                     if !ar.function_call.call_id.is_empty() {
                         out.push(json!({
-                            "type": "TOOL_CALL_END",
+                            "type": event_type::TOOL_CALL_END,
                             "toolCallId": ar.function_call.call_id,
                         }));
                         self.ended_tools.insert(ar.function_call.call_id.clone());
@@ -447,11 +513,11 @@ impl AgUiFraming {
     fn finalize(&mut self, out: &mut Vec<Value>) {
         for tool_call_id in &self.started_tools {
             if !self.ended_tools.contains(tool_call_id) {
-                out.push(json!({ "type": "TOOL_CALL_END", "toolCallId": tool_call_id }));
+                out.push(json!({ "type": event_type::TOOL_CALL_END, "toolCallId": tool_call_id }));
             }
         }
         if let Some(mid) = &self.message_id {
-            out.push(json!({ "type": "TEXT_MESSAGE_END", "messageId": mid }));
+            out.push(json!({ "type": event_type::TEXT_MESSAGE_END, "messageId": mid }));
         }
     }
 }
@@ -465,7 +531,7 @@ fn approval_custom_event(ar: &FunctionApprovalRequestContent) -> Value {
         .map(|m| Value::Object(m.into_iter().collect()))
         .unwrap_or(Value::Null);
     json!({
-        "type": "CUSTOM",
+        "type": event_type::CUSTOM,
         "name": "function_approval_request",
         "value": {
             "id": ar.id,
@@ -522,14 +588,18 @@ fn result_content(fr: &FunctionResultContent) -> String {
 /// Fields are camelCase per the protocol; snake_case aliases are also accepted
 /// for the routing ids (the Python server reads `input_data["thread_id"]` /
 /// `["run_id"]`). Unknown fields are ignored.
-#[derive(Debug, Clone, Deserialize, Default)]
+///
+/// It also serializes, as the request body the `agui-client` feature's
+/// `AgUiChatClient` posts: camelCase, unset optional fields left out, the
+/// list fields always present.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RunAgentInput {
     /// Conversation thread id (echoed on `RUN_STARTED`/`RUN_FINISHED`).
-    #[serde(alias = "thread_id")]
+    #[serde(alias = "thread_id", skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// Current run id (echoed on `RUN_STARTED`/`RUN_FINISHED`).
-    #[serde(alias = "run_id")]
+    #[serde(alias = "run_id", skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     /// Conversation history (AG-UI `Message` objects).
     pub messages: Vec<Value>,
@@ -537,11 +607,21 @@ pub struct RunAgentInput {
     /// their calls round-trip back to the browser (see module docs).
     pub tools: Vec<Value>,
     /// Shared state (accepted and ignored — see module docs).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
     /// Contextual objects (accepted and ignored).
     pub context: Vec<Value>,
     /// Extra forwarded properties (accepted and ignored).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub forwarded_props: Option<Value>,
+    /// Interrupt descriptors the client can resume from (accepted and
+    /// ignored by the router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_interrupts: Option<Value>,
+    /// Resume entries that continue a paused run (accepted and ignored by
+    /// the router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Value>,
 }
 
 /// Map AG-UI `messages[]` to core [`Message`]s.

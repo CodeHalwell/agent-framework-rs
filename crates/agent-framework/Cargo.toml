@@ -25,6 +25,8 @@ azure = ["dep:agent-framework-azure"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
 hosting = ["dep:agent-framework-hosting"]
+# `AgUiChatClient`: a chat client for a remote AG-UI server. Implies `hosting`.
+agui-client = ["hosting", "agent-framework-hosting/agui-client"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
@@ -75,6 +77,7 @@ full = [
     "mcp",
     "a2a",
     "hosting",
+    "agui-client",
     "redis",
     "mem0",
     "foundry",

@@ -520,7 +520,15 @@ fn coalesce_text(contents: &mut Vec<Content>) {
             // answer as a refusal. Upstream splits on the same boundary
             // (#7992).
             (Some(Content::Text(prev)), Content::Text(cur)) if prev.refusal == cur.refusal => {
-                prev.text.push_str(&cur.text)
+                prev.text.push_str(&cur.text);
+                // Annotations often arrive on their own (textless) fragment
+                // after the text they cite; appending only the text dropped
+                // them. Concatenated as upstream's `TextContent.__add__` does.
+                if let Some(more) = cur.annotations.as_ref().filter(|a| !a.is_empty()) {
+                    prev.annotations
+                        .get_or_insert_with(Vec::new)
+                        .extend(more.iter().cloned());
+                }
             }
             // Reasoning fragments merge only within one provider block, and
             // two things close a block.
@@ -1150,6 +1158,39 @@ mod tests {
         coalesce_text(&mut contents);
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].as_text(), Some("abc"));
+    }
+
+    #[test]
+    fn coalescing_text_keeps_annotations_from_every_fragment() {
+        use crate::types::content::{Annotation, TextContent};
+        let cite = |url: &str| Annotation {
+            url: Some(url.into()),
+            ..Default::default()
+        };
+        let mut first = TextContent::new("cited");
+        first.annotations = Some(vec![cite("https://a")]);
+        // A textless fragment that only carries annotations, as streaming
+        // providers and the AG-UI client emit them.
+        let mut late = TextContent::new("");
+        late.annotations = Some(vec![cite("https://b")]);
+        let mut contents = vec![
+            Content::Text(first),
+            Content::Text(TextContent::new(" text")),
+            Content::Text(late),
+        ];
+        coalesce_text(&mut contents);
+        assert_eq!(contents.len(), 1);
+        let Content::Text(t) = &contents[0] else {
+            panic!("expected text")
+        };
+        assert_eq!(t.text, "cited text");
+        let urls: Vec<_> = t
+            .annotations
+            .iter()
+            .flatten()
+            .map(|a| a.url.as_deref().unwrap())
+            .collect();
+        assert_eq!(urls, ["https://a", "https://b"]);
     }
 
     // region: opaque fields survive streaming coalescence (PR #12 review)
