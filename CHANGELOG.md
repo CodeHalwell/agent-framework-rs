@@ -5,6 +5,34 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+### Fixed
+
+- **An approved tool re-ran on every later turn of a session.** The approval
+  response stayed in session history and the function-invocation loop
+  collected it again on each run, executing the tool every turn. As upstream's
+  `_collect_approval_responses` does, a response is now settled once a later
+  function result answers its `call_id` (or a later request reuses its id), and
+  settled responses neither execute nor reach the model. The results resolving
+  an approval are also returned ahead of the model's answer, so history records
+  the approval as settled. Streaming and non-streaming runs share the fix.
+  Settlement is decided before history compaction (a window could keep the
+  response but drop the result that settled it) and before the no-tools fast
+  path, so a settled approval never reaches the model on either route.
+- **OpenAI Responses dropped completed hosted MCP calls.** An `mcp_call`
+  output item (streamed: its completed `output_item.done` item, which carries
+  the final arguments) is now parsed into
+  `McpServerToolCall`/`McpServerToolResult` contents and replayed as one
+  `mcp_call` input item carrying its output, as upstream does. A call that
+  failed keeps its `error` (new `McpServerToolResultContent::error`) and
+  replays it, so it does not look unfinished; upstream drops both the error
+  and, when streamed, the arguments. A hosted
+  approval replayed from local history is therefore followed by the call it
+  approved, rather than standing alone as an approval still to act on.
+  `McpServerToolCallContent` and `McpServerToolResultContent` are now exported
+  from `agent_framework_core::types`.
+
 ## [0.10.0] — 2026-10-05
 
 Upstream moved 119 non-merge commits in the week to `301a43c` (2026-10-05).
