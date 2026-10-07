@@ -18,10 +18,13 @@ can upstream.
   `experimental-vector-stores`). One upstream id gives one feature name,
   whichever crates declare it.
 - **Defaults:** an `experimental-*` feature is never in a crate's `default`
-  set and never in the umbrella crate's `full`. The umbrella's
+  set and never in the umbrella crate's `full`, directly or through another
+  feature or a dependency's feature. The umbrella's
   `experimental` feature turns them all on.
 - **Forwarding:** a crate whose experimental surface builds on another
-  crate's enables that crate's feature of the same name. The umbrella
+  crate's enables that crate's feature of the same name: any crate that
+  declares `experimental-x` and depends on another crate declaring it
+  forwards it (`dep/experimental-x` or `dep?/experimental-x`). The umbrella
   crate re-exposes every `experimental-*` feature under the same name.
 - **Docs:** each gated item carries `doc(cfg(...))`, so docs.rs (built with
   all features) labels it with the feature it needs.
