@@ -921,6 +921,49 @@ async fn streaming_carries_service_conversation_id_between_passes() {
     assert_eq!(client.options(2).conversation_id.as_deref(), Some("conv-2"));
 }
 
+/// Fresh context on a service-managed session sends every pass with the
+/// pre-loop conversation id (documented: isolated only when that id is an
+/// immutable response to branch from), and with no id yet every pass starts
+/// its own conversation.
+#[tokio::test]
+async fn fresh_context_resends_the_pre_loop_service_conversation_id() {
+    let client = Mock::service();
+    let looping = LoopAgent::builder(agent(&client), always)
+        .max_iterations(Some(3))
+        .fresh_context(true)
+        .build()
+        .unwrap();
+    let mut session = AgentSession::service("conv-0");
+    looping
+        .run(vec![Message::user("start")], Some(&mut session))
+        .await
+        .unwrap();
+    for pass in 0..3 {
+        assert_eq!(
+            client.options(pass).conversation_id.as_deref(),
+            Some("conv-0")
+        );
+    }
+    // The session ends on the final pass's conversation.
+    assert_eq!(session.service_session_id(), Some("conv-3"));
+
+    let client = Mock::service();
+    let looping = LoopAgent::builder(agent(&client), always)
+        .max_iterations(Some(3))
+        .fresh_context(true)
+        .build()
+        .unwrap();
+    let mut session = AgentSession::new();
+    looping
+        .run(vec![Message::user("start")], Some(&mut session))
+        .await
+        .unwrap();
+    for pass in 0..3 {
+        assert_eq!(client.options(pass).conversation_id, None);
+    }
+    assert_eq!(session.service_session_id(), Some("conv-3"));
+}
+
 // region: approval escape hatch
 
 fn call_response(calls: &[(&str, &str, &str)]) -> ChatResponse {
@@ -1495,6 +1538,89 @@ async fn streaming_collected_approvals_survive_a_failed_inner_run() {
     );
 }
 
+/// An inner agent whose stream yields one update and then never ends, so a
+/// test can stop reading mid-run.
+#[derive(Default)]
+struct StallingAgent {
+    received: Mutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl SupportsAgentRun for StallingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        unreachable!("only streamed")
+    }
+
+    async fn run_stream(
+        &self,
+        messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<agent_framework_core::agent::AgentRunStream> {
+        self.received.lock().unwrap().push(messages);
+        let first = AgentResponseUpdate {
+            contents: vec![Content::Text(TextContent::new("working"))],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        };
+        Ok(futures::stream::iter([Ok(first)])
+            .chain(futures::stream::pending())
+            .boxed())
+    }
+
+    fn id(&self) -> &str {
+        "stalling"
+    }
+}
+
+#[tokio::test]
+async fn streaming_collected_approvals_survive_a_consumer_that_stops_reading() {
+    let inner = Arc::new(StallingAgent::default());
+    let agent = ToolApprovalAgent::new(inner.clone() as Arc<dyn SupportsAgentRun>);
+    let session = AgentSession::new();
+    let request = FunctionApprovalRequestContent {
+        id: "r1".into(),
+        function_call: FunctionCallContent::new("c1", "guarded", None),
+    };
+    let has_approval = |messages: &[Message]| {
+        messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .any(|c| matches!(c, Content::FunctionApprovalResponse(r) if r.id == "r1"))
+    };
+
+    let mut stream = agent
+        .run_stream(vec![approve(&request)], Some(session.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().text(), "working");
+    drop(stream);
+    assert!(has_approval(&inner.received.lock().unwrap()[0]));
+    // The inner run never finished, so nothing of it was recorded: the
+    // approval stays collected...
+    assert_eq!(
+        agent
+            .state(&session)
+            .unwrap()
+            .collected_approval_responses
+            .len(),
+        1
+    );
+
+    // ...and the next turn sends it again.
+    let mut stream = agent
+        .run_stream(vec![Message::user("again")], Some(session.clone()), None)
+        .await
+        .unwrap();
+    stream.next().await.unwrap().unwrap();
+    drop(stream);
+    assert!(has_approval(&inner.received.lock().unwrap()[1]));
+}
+
 #[tokio::test]
 async fn always_approve_tool_adds_a_standing_rule() {
     let mut f = approval_fixture(&["dangerous_tool"], |a| a);
@@ -1850,4 +1976,36 @@ async fn mode_provider_runs_through_an_agent() {
         .await
         .unwrap();
     assert!(!any_contains(&client.received(3), "[Mode changed"));
+}
+
+#[tokio::test]
+async fn mode_change_announcement_survives_a_failed_run() {
+    let client = Mock::new();
+    let modes = AgentModeProvider::new();
+    let agent = Agent::builder(client.clone())
+        .context_provider(Arc::new(modes.clone()))
+        .build();
+    let mut session = agent.create_session();
+    modes.set_mode(&session, "plan").unwrap();
+    modes.set_mode(&session, "execute").unwrap();
+
+    client.fail_next();
+    assert!(agent
+        .run(vec![Message::user("go")], Some(&mut session))
+        .await
+        .is_err());
+    assert!(any_contains(&client.received(0), "[Mode changed"));
+
+    // The failed run did not deliver it: the retry announces it again, and
+    // only a successful run clears it.
+    agent
+        .run(vec![Message::user("go")], Some(&mut session))
+        .await
+        .unwrap();
+    assert!(any_contains(&client.received(1), "[Mode changed"));
+    agent
+        .run(vec![Message::user("again")], Some(&mut session))
+        .await
+        .unwrap();
+    assert!(!any_contains(&client.received(2), "[Mode changed"));
 }

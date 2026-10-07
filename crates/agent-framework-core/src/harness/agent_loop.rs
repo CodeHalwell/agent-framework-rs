@@ -45,6 +45,22 @@
 //! registered on the wrapped *agent* (rather than the session) are not
 //! swapped.
 //!
+//! **Service-managed sessions.** For a session whose history lives on the
+//! service, every further pass is sent with the *pre-loop* service
+//! conversation id, as upstream does. Whether that isolates the passes
+//! depends on what the id names:
+//!
+//! - A response to continue from (OpenAI Responses `previous_response_id`)
+//!   is immutable, so each pass branches from the pre-loop point and does
+//!   not see earlier passes: the passes are fresh.
+//! - A server-side thread or conversation that the service appends to
+//!   (Assistants-style threads, a Responses `conversation`) is shared by
+//!   every pass, so later passes still see earlier ones and the passes are
+//!   **not** fresh. The client cannot fork such a conversation. Run such a
+//!   loop on a session with no service conversation id yet (each pass then
+//!   starts its own conversation, and the session ends on the final pass's)
+//!   or without `fresh_context`.
+//!
 //! # Divergences
 //!
 //! - A wrapper agent rather than `AgentMiddleware`; see the
@@ -357,7 +373,9 @@ impl LoopAgentBuilder {
 
     /// Start every further pass from the original input plus the progress
     /// log, resetting the session in between (default `false`). See
-    /// [fresh context](self#fresh-context).
+    /// [fresh context](self#fresh-context), including what it means for a
+    /// session whose conversation id names a server-side thread: those
+    /// passes are not isolated.
     pub fn fresh_context(mut self, fresh: bool) -> Self {
         self.fresh_context = fresh;
         self

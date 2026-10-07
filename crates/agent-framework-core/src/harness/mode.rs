@@ -10,7 +10,9 @@
 //! [`AgentModeProvider::set_mode`]), the previous mode is remembered and the
 //! next run injects a `user` message announcing the switch: a model that
 //! earlier called `mode_set` itself tends to keep following that call over
-//! a changed system prompt.
+//! a changed system prompt. The marker is cleared only when a run carrying
+//! the announcement succeeds, so a failed run announces again next time
+//! (upstream drops it as soon as the run starts).
 //!
 //! # Divergences
 //!
@@ -30,7 +32,8 @@
 //!   [`AgentModeProviderBuilder::build`] rather than a constructor
 //!   exception.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -38,7 +41,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::memory::{ContextProvider, SessionContext};
-use crate::session::AgentSession;
+use crate::session::{AgentSession, SessionState};
 use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::Message;
 
@@ -236,13 +239,24 @@ impl ModeConfig {
         Ok(normalized)
     }
 
-    fn take_previous(&self, session: &AgentSession) -> Result<Option<String>> {
-        let mut state = read_state_object(session, &self.source_id)?;
-        let previous = state.remove(PREVIOUS_MODE_STATE_KEY);
-        if previous.is_some() {
-            session.state.insert(&self.source_id, Value::Object(state));
+    /// The pending external-change marker, left in place: it is cleared
+    /// only once a run that announced it succeeds ([`Self::clear_previous`]).
+    fn previous(&self, session: &AgentSession) -> Result<Option<String>> {
+        let state = read_state_object(session, &self.source_id)?;
+        Ok(state
+            .get(PREVIOUS_MODE_STATE_KEY)
+            .and_then(|v| v.as_str().map(str::to_string)))
+    }
+
+    /// Clear the marker `announced`, unless it has since been replaced by a
+    /// newer change (or cleared by `mode_set`).
+    fn clear_previous(&self, state: &SessionState, announced: &str) {
+        if let Some(Value::Object(mut map)) = state.get(&self.source_id) {
+            if map.get(PREVIOUS_MODE_STATE_KEY).and_then(Value::as_str) == Some(announced) {
+                map.remove(PREVIOUS_MODE_STATE_KEY);
+                state.insert(&self.source_id, Value::Object(map));
+            }
         }
-        Ok(previous.and_then(|v| v.as_str().map(str::to_string)))
     }
 }
 
@@ -271,7 +285,26 @@ struct ModeInner {
     instructions: Option<String>,
     expose_mode_set: bool,
     expose_mode_get: bool,
+    /// Runs that announced a mode change and have not finished yet; see
+    /// [`AgentModeProvider::after_run`](ContextProvider::after_run).
+    announced: Mutex<VecDeque<Announced>>,
 }
+
+/// A run that carries a mode-change announcement.
+struct Announced {
+    /// The run's input, which `after_run` receives again and is matched on.
+    input: Vec<Message>,
+    /// The run's session state bag (a shared handle).
+    state: SessionState,
+    /// The announced previous mode.
+    previous: String,
+}
+
+/// At most this many announcing runs are tracked. A run that never reaches
+/// `after_run` (its stream was dropped, or another provider failed first)
+/// keeps its marker, so the next run announces again; this cap only bounds
+/// the bookkeeping such runs leave behind.
+const MAX_ANNOUNCED_IN_FLIGHT: usize = 64;
 
 /// Tracks an agent's operating mode per session and gives it `mode_set` /
 /// `mode_get` tools.
@@ -439,16 +472,55 @@ impl ContextProvider for AgentModeProvider {
             Error::Configuration("AgentModeProvider requires an agent session.".into())
         })?;
         let current = self.mode(&session)?;
-        // Pop the external-change marker so the agent sees it only once.
-        let previous = self.inner.config.take_previous(&session)?;
+        // The external-change marker stays in the session until a run that
+        // announced it succeeds (see `after_run`), so a failed run does not
+        // lose the announcement.
+        let previous = self.inner.config.previous(&session)?;
         ctx.add_instructions(self.render_instructions(&current));
         ctx.tools.extend(self.tools(&session));
-        if let Some(previous) = previous.filter(|p| *p != current) {
-            let config = &self.inner.config;
-            let notification = DEFAULT_MODE_CHANGE_NOTIFICATION
-                .replace("{previous_mode}", config.display(&previous))
-                .replace("{current_mode}", config.display(&current));
-            ctx.messages.push(Message::user(notification));
+        if let Some(previous) = previous {
+            if previous != current {
+                let config = &self.inner.config;
+                let notification = DEFAULT_MODE_CHANGE_NOTIFICATION
+                    .replace("{previous_mode}", config.display(&previous))
+                    .replace("{current_mode}", config.display(&current));
+                ctx.messages.push(Message::user(notification));
+            }
+            let mut announced = self.inner.announced.lock().expect("lock poisoned");
+            if announced.len() >= MAX_ANNOUNCED_IN_FLIGHT {
+                announced.pop_front();
+            }
+            announced.push_back(Announced {
+                input: ctx.input_messages.clone(),
+                state: session.state.clone(),
+                previous,
+            });
+        }
+        Ok(())
+    }
+
+    /// Settle the run's announcement: cleared on success, kept for the next
+    /// run on failure.
+    ///
+    /// `after_run` does not receive the session, so the run is found by its
+    /// input among the runs this provider announced to. Two concurrent
+    /// announcing runs with identical input may be told apart wrongly; the
+    /// worst case is one announcement too many or one lost.
+    async fn after_run(
+        &self,
+        request_messages: &[Message],
+        _response_messages: &[Message],
+        error: Option<&Error>,
+    ) -> Result<()> {
+        let run = {
+            let mut announced = self.inner.announced.lock().expect("lock poisoned");
+            match announced.iter().position(|a| a.input == request_messages) {
+                Some(index) => announced.remove(index),
+                None => None,
+            }
+        };
+        if let (Some(run), None) = (run, error) {
+            self.inner.config.clear_previous(&run.state, &run.previous);
         }
         Ok(())
     }
@@ -564,6 +636,7 @@ impl AgentModeProviderBuilder {
                 instructions: self.instructions,
                 expose_mode_set: self.expose_mode_set,
                 expose_mode_get: self.expose_mode_get,
+                announced: Mutex::new(VecDeque::new()),
             }),
         })
     }
@@ -697,11 +770,25 @@ mod tests {
              You must now adjust your behavior to match the \"execute\" mode.]"
         );
 
-        // The announcement is delivered once.
+        // A failed run keeps the announcement for the next run.
+        provider
+            .after_run(&[], &[], Some(&Error::Service("boom".into())))
+            .await
+            .unwrap();
+        let mut ctx = SessionContext::new(vec![]);
+        ctx.session = Some(session.clone());
+        provider.before_run(&mut ctx).await.unwrap();
+        assert_eq!(ctx.messages.len(), 1);
+
+        // Once a run carrying it succeeds, it is delivered and gone.
+        provider.after_run(&[], &[], None).await.unwrap();
         let mut ctx = SessionContext::new(vec![]);
         ctx.session = Some(session.clone());
         provider.before_run(&mut ctx).await.unwrap();
         assert!(ctx.messages.is_empty());
+        assert!(
+            session.state.get(DEFAULT_MODE_SOURCE_ID).unwrap()[PREVIOUS_MODE_STATE_KEY].is_null()
+        );
     }
 
     #[tokio::test]

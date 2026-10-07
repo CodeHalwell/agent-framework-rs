@@ -49,8 +49,10 @@
 //!   (default [`DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS`]), as in .NET: each
 //!   re-run is a fresh inner run, so the inner per-run iteration limit
 //!   restarts every time and cannot bound the chain.
-//! - If the inner run fails, the approvals collected for it are put back, so
-//!   retrying the last answer still sends the whole batch.
+//! - The approvals collected for an inner run stay in session state until
+//!   that run completes. If it fails, or a streaming consumer stops reading
+//!   before it ends, retrying the last answer still sends the whole batch;
+//!   approved calls that already executed run again (at-least-once).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -498,6 +500,14 @@ impl ToolApprovalAgent {
 
     /// Prepend the collected approvals to `messages` as one `user` message,
     /// followed by any input held back while the queue was being answered.
+    ///
+    /// Callers save the state *before* draining it and save the drained
+    /// state only once the inner run has completed. Until then the inner
+    /// agent has recorded nothing in history, so a run that fails, is
+    /// cancelled, or whose stream consumer stops reading keeps the batch
+    /// for the next turn. The approved calls may already have executed by
+    /// then; they run again on that turn (at-least-once), which is what a
+    /// failed run already did.
     fn inject_collected(messages: Vec<Message>, state: &mut ToolApprovalState) -> Vec<Message> {
         if state.collected_approval_responses.is_empty() && state.held_messages.is_empty() {
             return messages;
@@ -582,25 +592,16 @@ impl ToolApprovalAgent {
         // discarded, but its tokens were still spent.
         let mut usage: Option<UsageDetails> = None;
         loop {
-            let collected = state.collected_approval_responses.clone();
-            let held = state.held_messages.clone();
-            messages = Self::inject_collected(messages, &mut state);
+            // The stored state keeps the batch until the inner run completes
+            // (see `inject_collected`), so a failed or cancelled run leaves
+            // it for a retry to send.
             self.save_state(session, &state)?;
+            messages = Self::inject_collected(messages, &mut state);
 
-            let result = self
+            let mut response = self
                 .inner
                 .run_with_options(messages, Some(&mut *session), options.clone())
-                .await;
-            let mut response = match result {
-                Ok(response) => response,
-                Err(error) => {
-                    // Keep the batch so a retry can still send it.
-                    state.collected_approval_responses = collected;
-                    state.held_messages = held;
-                    self.save_state(session, &state)?;
-                    return Err(error);
-                }
-            };
+                .await?;
             if let Some(run_usage) = response.usage_details.take() {
                 usage = Some(match usage {
                     Some(total) => total + run_usage,
@@ -611,6 +612,7 @@ impl ToolApprovalAgent {
             if iteration >= self.max_auto_approval_iterations {
                 // Cap reached: return this turn as-is, without auto-approving
                 // again, so the caller decides on any request in it.
+                self.save_state(session, &state)?;
                 return Ok(response);
             }
             iteration += 1;
@@ -660,44 +662,27 @@ impl ToolApprovalAgent {
         }
         let mut iteration = 0usize;
         loop {
-            let collected = state.collected_approval_responses.clone();
-            let held = state.held_messages.clone();
-            messages = Self::inject_collected(messages, &mut state);
+            // The stored state keeps the batch until the inner stream has
+            // ended (see `inject_collected`): a failed run, a consumer that
+            // stops reading, or a dropped stream all leave it for the next
+            // turn to send.
             self.save_state(&session, &state)?;
+            messages = Self::inject_collected(messages, &mut state);
             // On reaching the cap this pass streams through as-is.
             let capped = iteration >= self.max_auto_approval_iterations;
             iteration += 1;
 
-            // Keep the batch so a retry can still send it.
-            let restore = |state: &mut ToolApprovalState, session: &AgentSession| {
-                state.collected_approval_responses = collected.clone();
-                state.held_messages = held.clone();
-                self.save_state(session, state)
-            };
-            let mut inner = match self
+            let mut inner = self
                 .inner
                 .run_stream(messages, Some(session.clone()), options.clone())
-                .await
-            {
-                Ok(inner) => inner,
-                Err(error) => {
-                    restore(&mut state, &session)?;
-                    return Err(error);
-                }
-            };
+                .await?;
             // Stream until the first approval request, then buffer the rest
             // so auto-approved or queued requests never reach the caller.
             let mut buffered: Vec<AgentResponseUpdate> = Vec::new();
             let mut saw_other_input = false;
             let mut conversation_id: Option<String> = None;
             while let Some(update) = inner.next().await {
-                let update = match update {
-                    Ok(update) => update,
-                    Err(error) => {
-                        restore(&mut state, &session)?;
-                        return Err(error);
-                    }
-                };
+                let update = update?;
                 if let Some(cid) = &update.conversation_id {
                     conversation_id = Some(cid.clone());
                 }
@@ -708,6 +693,9 @@ impl ToolApprovalAgent {
                 if capped || (buffered.is_empty() && !has_request) {
                     saw_other_input |= has_other_user_input(update.contents.iter());
                     if !sink.send(update).await {
+                        // The consumer is gone mid-run. Dropping the inner
+                        // stream means its history is never recorded, so the
+                        // stored batch stays to be sent again.
                         return Ok(());
                     }
                     continue;
@@ -720,6 +708,7 @@ impl ToolApprovalAgent {
                 session.try_adopt_service_session_id(&cid);
             }
             if buffered.is_empty() {
+                self.save_state(&session, &state)?;
                 return Ok(());
             }
 
