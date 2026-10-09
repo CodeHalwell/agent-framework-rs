@@ -5,7 +5,23 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.11.0] — 2026-10-09
+
+Three experimental ports and a new crate. The **agent harness** (loop, todo,
+tool approval, agent mode) and **agent hooks** (AGENT-HOOKS-0.1 interception)
+land behind `experimental-harness` and `experimental-agent-hooks`, and the
+**local and Docker shell tools** ship stable in the new
+`agent-framework-tools` crate. Hosting gains an **AG-UI client**, and Gemini
+and Foundry can embed images.
+
+**Breaking, in four places.** `EmbeddingClient::get_embeddings` takes
+`Vec<EmbeddingInput>` (most callers change `text.to_string()` to
+`text.into()`). APIs upstream still marks experimental move behind
+`experimental-*` features, and the umbrella crate's `declarative` feature is
+now `experimental-declarative-agents` and has left `full`. `SessionContext`
+gains a public `session` field and `McpServerToolResultContent` an `error`
+field, so code building either with a struct literal must set them. Pre-1.0,
+minor bumps may break APIs; the sections below give the details.
 
 ### Agent hooks (experimental)
 

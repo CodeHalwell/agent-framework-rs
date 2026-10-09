@@ -7,7 +7,7 @@ name: Release
 #                   everything downstream is skipped (ordinary merges are
 #                   no-ops; only a version bump releases).
 #   2. `verify`   — full workspace verification at the merge commit.
-#   3. `release`  — publishes all 22 crates to crates.io tier by tier
+#   3. `release`  — publishes all 23 crates to crates.io tier by tier
 #                   (PUBLISHING.md), then tags v<version> and creates the
 #                   GitHub Release (notes from the matching CHANGELOG.md
 #                   section). Publishing comes FIRST so a failed publish
