@@ -854,8 +854,8 @@ pub struct FunctionInvocationConfig {
     pub terminate_on_unknown_calls: bool,
     /// Whether a failed call's error text reaches the model (`false`, the
     /// default, sends a generic "tool execution failed"). An
-    /// [`Error::ToolRejected`](crate::error::Error::ToolRejected) message is
-    /// addressed to the model and always reaches it.
+    /// [`Error::ToolRejected`] message is addressed to the model and always
+    /// reaches it.
     pub include_detailed_errors: bool,
     /// Whether the executable calls of one model response may run
     /// concurrently. `true` (the default) is what a model asking for parallel

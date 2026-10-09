@@ -54,7 +54,8 @@ cargo publish -p agent-framework
 
 - **Names are free** ✅ — checked against the crates.io API on 2026-07-13:
   all 22 `agent-framework*` names in this workspace returned 404 (not
-  registered). `agent-framework-tools` was added after that check.
+  registered). `agent-framework-tools` was added later and returned 404 on
+  2026-10-09.
   Re-check just before publishing (`https://crates.io/api/v1/crates/<name>`
   with a User-Agent header); names are first-come-first-served.
 - **Trademark note.** This is an independent port, not affiliated with or
@@ -69,7 +70,7 @@ cargo publish -p agent-framework
 Releases are **automated on merge to `main`**
 (`.github/workflows/release.yml`): when `main`'s `[workspace.package]
 version` has no `v<version>` tag yet, the workflow verifies the merge
-commit (build/test/clippy/fmt/doc/examples), publishes all 22 crates tier
+commit (build/test/clippy/fmt/doc/examples), publishes all 23 crates tier
 by tier using the `CRATES_TOKEN` secret, then pushes the tag and creates
 the GitHub Release with that version's `CHANGELOG.md` section as notes.
 Publishing comes before tagging so a failed publish does not burn the

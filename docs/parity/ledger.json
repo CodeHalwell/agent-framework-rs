@@ -4,7 +4,7 @@
     "checked_at": "2026-10-07",
     "dotnet_inventory_release": "1.22.0",
     "go_commit": "21528e2a869036953b37da872dd8f21d4481515c",
-    "rust_version": "0.10.0",
+    "rust_version": "0.11.0",
     "scope": "Public declarations from the .NET core packages (Microsoft.Agents.AI, .Abstractions, .Workflows) and the Go team's .NET-to-Go catalog, assessed against this workspace's public Rust API. A mapping records a counterpart, not equivalent behaviour."
   },
   "namespaces": {
