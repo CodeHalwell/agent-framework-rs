@@ -7,7 +7,7 @@ use agent_framework_core::prelude::*;
 use agent_framework_core::types::{
     ChatResponseUpdate, Content, FinishReason, FunctionArguments, FunctionCallContent, Role,
 };
-use agent_framework_core::workflow::HandoffUserInputRequest;
+use agent_framework_core::workflow::{handoff_tool_name, HandoffUserInputRequest};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::json;
@@ -63,9 +63,15 @@ impl ChatClient for MockClient {
 
 /// A response containing a single handoff tool call to `target`.
 fn handoff_response(call_id: &str, target: &str) -> ChatResponse {
+    tool_call_response(call_id, &format!("handoff_to_{target}"))
+}
+
+/// A response containing a single tool call named exactly `tool`, for the
+/// cases where the name the model sees is not `handoff_to_<participant>`.
+fn tool_call_response(call_id: &str, tool: &str) -> ChatResponse {
     let call = FunctionCallContent::new(
         call_id,
-        format!("handoff_to_{target}"),
+        tool.to_string(),
         Some(FunctionArguments::Raw("{}".into())),
     );
     ChatResponse {
@@ -348,5 +354,72 @@ async fn specialist_to_specialist_handoff_chains() {
     assert!(
         texts.iter().any(|t| t.contains("C final answer")),
         "chained: {texts:?}"
+    );
+}
+
+/// A participant name long enough that `handoff_to_<name>` would pass the 64
+/// characters model providers accept for a tool name (upstream #9035).
+///
+/// The model can only call the name it was offered, so the cut name is what
+/// comes back — and it has to resolve to the participant anyway.
+#[tokio::test]
+async fn a_cut_handoff_tool_name_still_routes_to_its_participant() {
+    let long = "Specialist Agent For Extremely Detailed Billing And Invoicing Questions";
+    let tool = handoff_tool_name(long);
+    assert!(
+        tool.len() < format!("handoff_to_{long}").len(),
+        "this name should be long enough to cut: {tool}"
+    );
+    assert!(
+        tool.len() <= 64,
+        "a handoff tool name must fit what providers accept: {tool}"
+    );
+
+    let a = agent_with("A", vec![tool_call_response("c1", &tool)]);
+    let b = agent_with(long, vec![ChatResponse::from_text("billing handled it")]);
+
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .participant(long, b)
+        .initial_agent("A")
+        .autonomous()
+        .build()
+        .unwrap();
+
+    let run = workflow.run("please help").await.unwrap();
+    let conv = conversation(run.last_output().expect("autonomous run yields output"));
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("billing handled it")),
+        "the cut handoff tool name must route to its participant: {texts:?}"
+    );
+}
+
+/// Two participants whose names are identical for the first 64 characters of
+/// their handoff tool name would leave one unreachable.
+#[tokio::test]
+async fn participants_colliding_once_cut_are_rejected() {
+    let base = "Specialist Agent For Extremely Detailed Billing And Invoicing";
+    let one = format!("{base} In Europe");
+    let two = format!("{base} In North America");
+    assert_eq!(
+        handoff_tool_name(&one),
+        handoff_tool_name(&two),
+        "this pair should collide once cut"
+    );
+
+    let built = HandoffBuilder::new()
+        .participant(&one, agent_with(&one, vec![]))
+        .participant(&two, agent_with(&two, vec![]))
+        .initial_agent(&one)
+        .autonomous()
+        .build();
+    let message = match built {
+        Ok(_) => panic!("a collision must be reported, not silently routed"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        message.contains("handoff tool name"),
+        "the error should name the collision: {message}"
     );
 }

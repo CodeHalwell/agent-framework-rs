@@ -57,8 +57,8 @@ pub use group_chat::{
     DEFAULT_MANAGER_INSTRUCTIONS, DEFAULT_MANAGER_STRUCTURED_OUTPUT_PROMPT,
 };
 pub use handoff::{
-    handoff_tool_spec, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
-    HandoffUserInputRequest,
+    handoff_tool_name, handoff_tool_spec, HandoffBuilder, HandoffEdgeBuilder,
+    HandoffInteractionMode, HandoffUserInputRequest,
 };
 pub use magentic::{
     MagenticBuilder, MagenticContext, MagenticManager, MagenticPlanReviewDecision,

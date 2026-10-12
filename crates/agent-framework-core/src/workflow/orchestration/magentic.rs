@@ -302,15 +302,36 @@ fn extract_json(text: &str) -> Result<Value> {
 
 /// The first balanced `{...}` span in `text`, for output that carries no
 /// fenced object.
+///
+/// Braces inside a string value are not structure: a ledger answer that
+/// mentions a brace ("the f-string is missing its closing `}`") would
+/// otherwise close the object early and the span would fail to parse
+/// (upstream #9089). The scan tracks string and escape state so only braces
+/// outside strings move the depth.
 fn first_balanced_object(text: &str) -> Result<&str> {
     let start = text
         .find('{')
         .ok_or_else(|| Error::Workflow("no JSON object found in model output".into()))?;
     let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
     for (i, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => {
+                // The scan starts on a `{`, so depth is at least 1 here and
+                // the subtraction cannot wrap.
                 depth -= 1;
                 if depth == 0 {
                     return Ok(&text[start..start + i + 1]);
@@ -1638,5 +1659,47 @@ impl MagenticBuilder {
             builder = builder.name(name);
         }
         builder.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // region: progress-ledger JSON extraction (upstream #8850/#9089)
+
+    #[test]
+    fn extract_json_ignores_braces_inside_strings() {
+        // A ledger answer is free text, so it can carry braces of its own.
+        // Counting those as structure closes the object early and the span
+        // fails to parse, stalling the round (upstream #9089).
+        for text in [
+            r#"{"is_request_satisfied": true, "answer": "The f-string is missing its closing } so add it."}"#,
+            r#"Ledger: {"is_request_satisfied": true, "answer": "Open the block with { and keep going"} done"#,
+            r#"{"is_request_satisfied": true, "answer": "Escaped quote \" then a brace }"}"#,
+        ] {
+            let value = extract_json(text)
+                .unwrap_or_else(|e| panic!("expected {text:?} to parse, got {e}"));
+            assert_eq!(
+                value.get("is_request_satisfied"),
+                Some(&Value::Bool(true)),
+                "wrong object extracted from {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_json_still_reads_a_nested_object() {
+        // Braces outside strings must keep counting, or a nested object ends
+        // the span at the inner `}`.
+        let value = extract_json(r#"{"a": {"b": 1}, "is_request_satisfied": true}"#).unwrap();
+        assert_eq!(value.get("is_request_satisfied"), Some(&Value::Bool(true)));
+        assert_eq!(value["a"]["b"], Value::from(1));
+    }
+
+    #[test]
+    fn extract_json_reports_an_unterminated_object() {
+        // An unterminated string must not be read as a closed object.
+        assert!(extract_json(r#"{"answer": "no end"#).is_err());
     }
 }

@@ -217,16 +217,34 @@ impl AzureOpenAIClient {
     /// `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME`, and
     /// optional `AZURE_OPENAI_API_VERSION`.
     pub fn from_env() -> Result<Self> {
-        let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
-            .map_err(|_| Error::Configuration("AZURE_OPENAI_ENDPOINT is not set".into()))?;
-        let api_key = std::env::var("AZURE_OPENAI_API_KEY")
-            .map_err(|_| Error::Configuration("AZURE_OPENAI_API_KEY is not set".into()))?;
-        let deployment = std::env::var("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME").map_err(|_| {
+        Self::from_env_vars(|key| std::env::var(key).ok())
+    }
+
+    /// Implementation of [`from_env`](Self::from_env), parameterized over an
+    /// environment lookup function so unit tests can exercise it against an
+    /// in-memory map rather than the process-global environment (the same
+    /// split [`AzureOpenAIResponsesClient::from_env`](crate::AzureOpenAIResponsesClient::from_env)
+    /// uses).
+    fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let endpoint = get("AZURE_OPENAI_ENDPOINT")
+            .ok_or_else(|| Error::Configuration("AZURE_OPENAI_ENDPOINT is not set".into()))?;
+        let api_key = get("AZURE_OPENAI_API_KEY")
+            .ok_or_else(|| Error::Configuration("AZURE_OPENAI_API_KEY is not set".into()))?;
+        let deployment = get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME").ok_or_else(|| {
             Error::Configuration("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME is not set".into())
         })?;
         let mut client = Self::new(endpoint, deployment, api_key);
-        if let Ok(v) = std::env::var("AZURE_OPENAI_API_VERSION") {
-            client = client.with_api_version(v);
+        // A variable that is set but blank leaves [`DEFAULT_CHAT_API_VERSION`]
+        // in place. Chat Completions requires the `api-version` query
+        // parameter, so forwarding a blank one produces a 400 rather than a
+        // service default; upstream applies its own default to an unset *or*
+        // empty value the same way (#9098). The Responses client differs on
+        // purpose: there a blank value opts out of the parameter, which its
+        // GA v1 route accepts.
+        if let Some(v) = get("AZURE_OPENAI_API_VERSION") {
+            if !v.trim().is_empty() {
+                client = client.with_api_version(v);
+            }
         }
         Ok(client)
     }
@@ -599,6 +617,45 @@ mod tests {
             std::env::remove_var("AZURE_OPENAI_API_KEY");
             std::env::remove_var("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME");
         }
+    }
+
+    /// The in-memory lookup the `from_env_vars` tests below use, so they do
+    /// not need `ENV_MUTEX` or the process environment at all.
+    fn env_with(api_version: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| match key {
+            "AZURE_OPENAI_ENDPOINT" => Some("https://res.openai.azure.com".into()),
+            "AZURE_OPENAI_API_KEY" => Some("test-key-123".into()),
+            "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME" => Some("gpt-4o-deployment".into()),
+            "AZURE_OPENAI_API_VERSION" => api_version.map(str::to_string),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn from_env_defaults_api_version_when_blank() {
+        // A variable set but blank is how a shell or CI config passes
+        // "unset" through. Forwarding it builds `...?api-version=`, which
+        // Chat Completions rejects outright, so the dated default has to
+        // stand instead (upstream #9098). The Responses client treats blank
+        // as opting out of the parameter, which its GA v1 route accepts —
+        // that difference is deliberate.
+        for blank in ["", "   "] {
+            let client = AzureOpenAIClient::from_env_vars(env_with(Some(blank))).unwrap();
+            assert_eq!(client.inner.api_version, DEFAULT_CHAT_API_VERSION);
+            assert!(
+                client
+                    .url()
+                    .ends_with(&format!("api-version={DEFAULT_CHAT_API_VERSION}")),
+                "a blank variable must not reach the query string: {}",
+                client.url()
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_honors_a_set_api_version_over_the_default() {
+        let client = AzureOpenAIClient::from_env_vars(env_with(Some("2025-02-01"))).unwrap();
+        assert_eq!(client.inner.api_version, "2025-02-01");
     }
 
     #[test]

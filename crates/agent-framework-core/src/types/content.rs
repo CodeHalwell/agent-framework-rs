@@ -245,9 +245,15 @@ impl DataContent {
 
     /// Validate a `data:` URI and return the media type it declares.
     ///
-    /// An empty media type (`data:;base64,...`) is permitted — the URI is
-    /// well-formed and the type is simply unstated — and yields an empty
-    /// string, matching upstream, which only rejects structural problems.
+    /// An omitted media type (`data:;base64,...`) is permitted — the URI is
+    /// well-formed and the type is simply unstated — and reads as
+    /// `text/plain`, the default RFC 2397 gives it and the one upstream
+    /// applies (#8918).
+    ///
+    /// Parameters between the media type and the `;base64` marker must be
+    /// `name=value` pairs (`charset=utf-8`). A second bare token names a
+    /// transfer encoding this crate cannot decode, so it is rejected rather
+    /// than read as base64.
     pub fn media_type_from_uri(uri: &str) -> Result<String> {
         let Some(rest) = uri.strip_prefix("data:") else {
             return Err(Error::Content(format!(
@@ -271,7 +277,23 @@ impl DataContent {
         // [`Self::media_type`], which the Anthropic and Gemini converters
         // prefer over their own parse, and it falls outside Anthropic's
         // accepted image media types, so the attachment is rejected.
-        let media_type = parameters.split(';').next().unwrap_or(parameters);
+        let mut fields = parameters.split(';');
+        let media_type = fields.next().unwrap_or(parameters);
+        for parameter in fields {
+            // `strip_suffix` above already required `base64` to be the last
+            // field, so any other bare token here names a further transfer
+            // encoding. Accepting it would decode the payload as plain
+            // base64 and hand back mangled bytes.
+            if !parameter.is_empty() && !parameter.contains('=') {
+                return Err(Error::Content(format!(
+                    "invalid data URI: unsupported encoding parameter {parameter:?}"
+                )));
+            }
+        }
+        if media_type.is_empty() {
+            // RFC 2397's default for an omitted type.
+            return Ok("text/plain".to_string());
+        }
         Ok(media_type.to_string())
     }
 }
@@ -950,11 +972,50 @@ mod tests {
     }
 
     #[test]
-    fn data_content_from_uri_allows_an_unstated_media_type() {
+    fn data_content_from_uri_defaults_an_unstated_media_type() {
         // `data:;base64,...` is structurally well-formed; the type is simply
-        // unstated. Upstream rejects only structural problems.
+        // unstated, and RFC 2397 gives it `text/plain`. Reading it as an
+        // empty string instead leaves the type unusable to every converter
+        // that switches on it (upstream #8918).
         let dc = DataContent::from_uri("data:;base64,AAAA").unwrap();
-        assert_eq!(dc.media_type.as_deref(), Some(""));
+        assert_eq!(dc.media_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            DataContent::media_type_from_uri("data:;base64,AAAA").unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn data_content_from_uri_rejects_a_second_encoding_marker() {
+        // `base64` is the only transfer encoding this crate decodes. A URI
+        // that also declares `gzip` carries bytes that are not what a plain
+        // base64 decode returns, so it is refused rather than mangled
+        // (upstream #8918).
+        for bad in [
+            "data:text/plain;gzip;base64,AAAA",
+            "data:image/png;charset=utf-8;deflate;base64,AAAA",
+        ] {
+            let err =
+                DataContent::from_uri(bad).expect_err(&format!("expected {bad:?} to be rejected"));
+            assert!(
+                err.to_string().contains("unsupported encoding parameter"),
+                "error should name the offending parameter: {err}"
+            );
+        }
+        // A `name=value` parameter is metadata, not an encoding, and stays
+        // acceptable.
+        assert_eq!(
+            DataContent::media_type_from_uri("data:image/png;charset=utf-8;base64,AAAA").unwrap(),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn data_content_from_uri_ignores_a_base64_marker_inside_the_payload() {
+        // Only the header is inspected, so a payload that happens to contain
+        // `;base64,` cannot smuggle in a marker.
+        let err = DataContent::from_uri("data:image/png,AAA;base64,BBB");
+        assert!(err.is_err(), "the header declares no base64 encoding");
     }
 
     #[test]
