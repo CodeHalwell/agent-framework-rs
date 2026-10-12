@@ -259,7 +259,7 @@ impl FoundryMemoryProvider {
         credential: Arc<dyn TokenCredential>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             memory_store_name: memory_store_name.into(),
             scope: None,

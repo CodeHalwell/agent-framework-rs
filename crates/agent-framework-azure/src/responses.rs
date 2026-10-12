@@ -280,7 +280,7 @@ impl AzureOpenAIResponsesClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),
@@ -300,7 +300,7 @@ impl AzureOpenAIResponsesClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),

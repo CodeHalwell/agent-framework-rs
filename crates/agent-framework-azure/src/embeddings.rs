@@ -49,7 +49,7 @@ impl AzureOpenAIEmbeddingClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_EMBEDDING_API_VERSION.to_string(),
@@ -67,7 +67,7 @@ impl AzureOpenAIEmbeddingClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_EMBEDDING_API_VERSION.to_string(),

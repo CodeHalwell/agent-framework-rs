@@ -111,6 +111,42 @@ pub const DEFAULT_CHAT_API_VERSION: &str = "2024-12-01-preview";
 /// stays on `2024-10-21`.
 pub const DEFAULT_EMBEDDING_API_VERSION: &str = "2024-10-21";
 
+/// The product token Azure requests from this port carry.
+///
+/// Azure reads `User-Agent` for service telemetry, throttling diagnostics and
+/// supportability, so a request that sends none is traffic the platform — and
+/// anyone reading a support case — cannot attribute. Upstream identifies
+/// itself the same way, per package (#9223).
+pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
+
+/// The `User-Agent` value for an Azure call made by `component` at `version`.
+///
+/// `component` is the crate making the call and `version` its
+/// `CARGO_PKG_VERSION`, so a request names both the framework and the
+/// connector inside it: `agent-framework-rust/0.11.0
+/// (agent-framework-azure-cosmos)`.
+pub fn azure_user_agent(component: &str, version: &str) -> String {
+    format!("{USER_AGENT_PRODUCT}/{version} ({component})")
+}
+
+/// A [`reqwest::Client`] whose requests carry [`azure_user_agent`].
+///
+/// Each Azure-facing crate builds its clients through this, passing its own
+/// `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")`, so the header
+/// format lives in one place. A static ASCII token cannot fail to become a
+/// header, so the fallback exists only to keep the signature infallible.
+pub fn azure_http_client(component: &str, version: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(azure_user_agent(component, version))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// This crate's own [`azure_http_client`].
+pub(crate) fn http_client() -> reqwest::Client {
+    azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 /// Parse a `Retry-After` header into a delay in seconds.
 ///
 /// Mirrors the OpenAI/Anthropic clients: Azure OpenAI returns the
@@ -186,7 +222,7 @@ impl AzureOpenAIClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_CHAT_API_VERSION.to_string(),
@@ -204,7 +240,7 @@ impl AzureOpenAIClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_CHAT_API_VERSION.to_string(),
@@ -617,6 +653,23 @@ mod tests {
             std::env::remove_var("AZURE_OPENAI_API_KEY");
             std::env::remove_var("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME");
         }
+    }
+
+    #[test]
+    fn the_user_agent_names_the_framework_and_the_component() {
+        // Azure attributes traffic by `User-Agent`; a request that sends
+        // none is traffic the platform cannot place (#9223).
+        assert_eq!(
+            azure_user_agent("agent-framework-azure-cosmos", "0.11.0"),
+            "agent-framework-rust/0.11.0 (agent-framework-azure-cosmos)"
+        );
+        // This crate's own clients carry it, built from its package
+        // metadata rather than a hand-written string.
+        assert!(
+            azure_user_agent(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                .starts_with("agent-framework-rust/"),
+            "the product token leads the header"
+        );
     }
 
     /// The in-memory lookup the `from_env_vars` tests below use, so they do

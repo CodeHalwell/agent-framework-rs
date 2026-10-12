@@ -73,6 +73,13 @@
 //! ```
 
 pub mod client_headers;
+/// This crate's HTTP client, carrying the framework `User-Agent` Azure reads
+/// for telemetry and supportability (see
+/// [`agent_framework_azure::azure_user_agent`]).
+pub(crate) fn http_client() -> reqwest::Client {
+    agent_framework_azure::azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 pub mod embeddings;
 pub mod memory;
 mod tool_definition_wire;

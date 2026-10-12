@@ -59,6 +59,13 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod auth;
+/// This crate's HTTP client, carrying the framework `User-Agent` Azure reads
+/// for telemetry and supportability (see
+/// [`agent_framework_azure::azure_user_agent`]).
+pub(crate) fn http_client() -> reqwest::Client {
+    agent_framework_azure::azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 mod chat_message_store;
 mod checkpoint_storage;
 mod client;
