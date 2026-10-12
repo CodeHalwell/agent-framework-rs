@@ -18,7 +18,8 @@
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Message, Role, ToolMode, UsageDetails,
+    FunctionCallContent, FunctionResultContent, Message, Role, TextReasoningContent, ToolMode,
+    UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -217,6 +218,9 @@ fn normalize_role_alternation(turns: Vec<Value>) -> Vec<Value> {
 fn content_to_block(content: &Content, in_user_turn: bool) -> Option<Value> {
     match content {
         Content::Text(t) => Some(json!({ "text": t.text })),
+        // Extended thinking, assistant turns only: Converse has no place for
+        // reasoning in a user turn.
+        Content::TextReasoning(tr) if !in_user_turn => reasoning_to_block(tr),
         Content::FunctionCall(fc) => Some(tool_use_block(fc)),
         Content::FunctionResult(fr) => Some(tool_result_block(fr)),
         // Converse accepts image blocks only inside `user` turns; emitting one
@@ -443,6 +447,9 @@ fn parse_content_block(block: &Value) -> Option<Content> {
     if let Some(text) = block.get("text").and_then(Value::as_str) {
         return Some(Content::text(text));
     }
+    if let Some(reasoning) = block.get("reasoningContent") {
+        return Some(reasoning_to_content(reasoning, block));
+    }
     if let Some(tool_use) = block.get("toolUse") {
         let call_id = tool_use
             .get("toolUseId")
@@ -463,6 +470,65 @@ fn parse_content_block(block: &Value) -> Option<Content> {
         )));
     }
     None
+}
+
+/// Decode a Converse `reasoningContent` block into reasoning content.
+///
+/// Extended thinking returns either a `reasoningText` block — the thinking
+/// text plus a `signature` Bedrock checks when that turn is sent back — or an
+/// opaque `redactedContent` blob, which can only be replayed verbatim. Both
+/// keep the original block in [`TextReasoningContent::raw_representation`] so
+/// [`content_to_block`] can re-emit it byte for byte.
+///
+/// Dropping either is what made extended thinking fail as soon as a tool was
+/// involved: Converse rejects an assistant turn that carries a `toolUse`
+/// whose reasoning is missing or no longer matches its signature, so the
+/// follow-up turn after a tool result failed rather than continuing the
+/// thought (upstream #8936).
+fn reasoning_to_content(reasoning: &Value, block: &Value) -> Content {
+    let reasoning_text = reasoning.get("reasoningText");
+    let text = reasoning_text
+        .and_then(|rt| rt.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let signature = reasoning_text
+        .and_then(|rt| rt.get("signature"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Content::TextReasoning(TextReasoningContent {
+        text,
+        annotations: None,
+        // The whole block, not just the parts read above: a `redactedContent`
+        // blob has no text or signature at all and is only ever sent back as
+        // it arrived.
+        raw_representation: Some(block.clone()),
+        protected_data: signature,
+    })
+}
+
+/// Build a Converse `reasoningContent` block from reasoning content, or
+/// `None` when it cannot be expressed in a form Converse accepts.
+///
+/// A block decoded from Converse is replayed verbatim. Reasoning from
+/// anywhere else (another provider, or a hand-built message) needs both text
+/// and a signature, because Converse refuses a `reasoningText` block without
+/// one — so it is dropped rather than sent in a shape the service rejects.
+fn reasoning_to_block(tr: &TextReasoningContent) -> Option<Value> {
+    if let Some(raw) = &tr.raw_representation {
+        if raw.get("reasoningContent").is_some() {
+            return Some(raw.clone());
+        }
+    }
+    let signature = tr.protected_data.as_ref()?;
+    if tr.text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "reasoningContent": {
+            "reasoningText": { "text": tr.text, "signature": signature }
+        }
+    }))
 }
 
 /// Map a Converse `stopReason` to a [`FinishReason`].
@@ -885,6 +951,112 @@ mod tests {
         assert_eq!(usage.input_token_count, Some(10));
         assert_eq!(usage.output_token_count, Some(5));
         assert_eq!(usage.total_token_count, Some(15));
+    }
+
+    #[test]
+    fn extended_thinking_survives_a_tool_call_round_trip() {
+        // Converse checks an assistant turn's reasoning against its
+        // signature, so a turn replayed after a tool result has to carry the
+        // reasoning block exactly as it arrived. Dropping it is what broke
+        // extended thinking as soon as a tool was involved (#8936).
+        let value = json!({
+            "output": { "message": { "role": "assistant", "content": [
+                { "reasoningContent": { "reasoningText": {
+                    "text": "Paris is in France, so I need the French forecast.",
+                    "signature": "sig-abc123",
+                } } },
+                { "toolUse": { "toolUseId": "call_1", "name": "get_weather", "input": { "city": "Paris" } } },
+            ] } },
+            "stopReason": "tool_use",
+        });
+        let resp = parse_response(&value);
+
+        let reasoning: Vec<&TextReasoningContent> = resp.messages[0]
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                Content::TextReasoning(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.len(), 1, "the reasoning block must be decoded");
+        assert!(reasoning[0].text.starts_with("Paris is in France"));
+        assert_eq!(reasoning[0].protected_data.as_deref(), Some("sig-abc123"));
+
+        // Sending that turn back must reproduce the block, signature and all.
+        let (_, turns) = messages_to_bedrock(&resp.messages);
+        let blocks = turns
+            .iter()
+            .find(|t| t["role"] == "assistant")
+            .and_then(|t| t["content"].as_array())
+            .expect("an assistant turn with content");
+        let replayed = blocks
+            .iter()
+            .find(|b| b.get("reasoningContent").is_some())
+            .expect("the reasoning block is replayed, not dropped");
+        assert_eq!(
+            replayed["reasoningContent"]["reasoningText"]["signature"],
+            json!("sig-abc123")
+        );
+        assert!(blocks.iter().any(|b| b.get("toolUse").is_some()));
+    }
+
+    #[test]
+    fn redacted_thinking_is_replayed_verbatim() {
+        // A `redactedContent` blob has no text or signature to rebuild from,
+        // so the original block is the only thing that can be sent back.
+        let value = json!({
+            "output": { "message": { "role": "assistant", "content": [
+                { "reasoningContent": { "redactedContent": "cmVkYWN0ZWQ=" } },
+                { "text": "Done." },
+            ] } },
+            "stopReason": "end_turn",
+        });
+        let resp = parse_response(&value);
+        let (_, turns) = messages_to_bedrock(&resp.messages);
+        let blocks = turns
+            .iter()
+            .find(|t| t["role"] == "assistant")
+            .and_then(|t| t["content"].as_array())
+            .expect("an assistant turn with content");
+        assert_eq!(
+            blocks
+                .iter()
+                .find(|b| b.get("reasoningContent").is_some())
+                .expect("the redacted block is replayed"),
+            &json!({ "reasoningContent": { "redactedContent": "cmVkYWN0ZWQ=" } })
+        );
+    }
+
+    #[test]
+    fn reasoning_without_a_signature_is_not_sent() {
+        // Converse refuses a `reasoningText` block with no signature, so
+        // reasoning carried over from another provider is dropped rather
+        // than sent in a shape the service rejects.
+        let message = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "thinking from somewhere else".to_string(),
+                    ..Default::default()
+                }),
+                Content::text("the answer"),
+            ],
+        );
+        let (_, turns) = messages_to_bedrock(&[message]);
+        // A conversation opening on an assistant turn gets a synthetic user
+        // turn in front of it, so find the assistant one rather than
+        // indexing.
+        let blocks = turns
+            .iter()
+            .find(|t| t["role"] == "assistant")
+            .and_then(|t| t["content"].as_array())
+            .expect("an assistant turn with content");
+        assert!(
+            blocks.iter().all(|b| b.get("reasoningContent").is_none()),
+            "unsigned reasoning must not reach Converse: {blocks:?}"
+        );
+        assert_eq!(blocks, &[json!({ "text": "the answer" })]);
     }
 
     #[test]
