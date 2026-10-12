@@ -7,7 +7,7 @@ was already satisfied, and what does not apply here. Every item recorded as
 landed was verified (full workspace build, `cargo test`, clippy
 `--all-targets` and rustfmt, all green) before commit.
 
-**Current upstream baseline: `301a43c` (2026-10-05).**
+**Current upstream baseline: `a75e803e` (2026-10-12).**
 
 Deliberate exclusions live in [`SCOPE.md`](../../SCOPE.md); cite it rather
 than re-arguing a boundary in a new pass. The July re-baseline's catalogue
@@ -24,6 +24,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-10-12-a75e803e`](2026-10-12-a75e803e.md) | Post-`301a43c` drift + Azure-ecosystem review (checked against `a75e803e`, 2026-10-12) |
 | [`2026-10-05-301a43c`](2026-10-05-301a43c.md) | Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05) |
 | [`2026-09-30-dc8e226-hosting-tool-calls`](2026-09-30-dc8e226-hosting-tool-calls.md) | Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`) |
 | [`2026-09-30-dc8e226-pr28-review`](2026-09-30-dc8e226-pr28-review.md) | Review round on PR #28 (same upstream baseline, `dc8e226`) |

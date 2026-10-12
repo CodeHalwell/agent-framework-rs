@@ -715,6 +715,12 @@ impl HandoffBuilder {
 
     /// Cap the number of agent turns per user message (Python's autonomous turn
     /// limit; default 50).
+    ///
+    /// `0` is raised to `1`: a cap of zero would yield an empty conversation
+    /// on any input, since no agent would ever run. Upstream's `0` means
+    /// something different — no autonomous *continuation* after the agent
+    /// answers — which is what [`HandoffInteractionMode::Autonomous`]
+    /// already expresses here, so there is nothing for a zero cap to say.
     pub fn max_iterations(mut self, limit: usize) -> Self {
         self.turn_limit = limit.max(1);
         self
