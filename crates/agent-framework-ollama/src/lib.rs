@@ -241,6 +241,10 @@ impl ChatClient for OllamaChatClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 type ByteStream =
@@ -336,6 +340,14 @@ fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_configured_base_url() {
+        // Read by the observability layer as `server.address` (#9225, #9222).
+        let client =
+            OllamaChatClient::new("llama3.1").with_base_url("http://ollama.example:9999/v1");
+        assert_eq!(client.service_url(), Some("http://ollama.example:9999/v1"));
+    }
 
     // region: base URL derivation
 

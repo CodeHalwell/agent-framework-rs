@@ -51,6 +51,18 @@ pub trait ChatClient: Send + Sync {
     fn model(&self) -> Option<&str> {
         None
     }
+
+    /// The endpoint this client sends requests to, if it has one.
+    ///
+    /// Recorded as `server.address` on the `chat` span by
+    /// [`ObservableChatClient`](crate::observability::ObservableChatClient),
+    /// so traces show *which* deployment served a call — two clients for the
+    /// same provider and model pointed at different hosts are otherwise
+    /// indistinguishable. Wrappers forward their inner client's value.
+    /// Mirrors upstream's `service_url()` (#9225, #9222).
+    fn service_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Blanket impl so `Arc<dyn ChatClient>` and wrappers are usable as clients.
@@ -72,6 +84,10 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
     }
     fn model(&self) -> Option<&str> {
         (**self).model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        (**self).service_url()
     }
 }
 
@@ -1570,6 +1586,10 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
     fn model(&self) -> Option<&str> {
         self.inner.model()
     }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,6 +1935,10 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 

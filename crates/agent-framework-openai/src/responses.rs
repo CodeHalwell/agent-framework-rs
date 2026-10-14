@@ -255,6 +255,10 @@ impl ChatClient for OpenAIChatClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 // region: request conversion
@@ -1536,6 +1540,14 @@ fn parse_responses_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_configured_base_url() {
+        // Read by the observability layer as `server.address` (#9225, #9222).
+        let client =
+            OpenAIChatClient::new("k", "gpt-4o-mini").with_base_url("http://gateway.example/v1");
+        assert_eq!(client.service_url(), Some("http://gateway.example/v1"));
+    }
     use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
     use agent_framework_core::types::{
         FunctionApprovalResponseContent, FunctionResultContent, HostedFileContent,

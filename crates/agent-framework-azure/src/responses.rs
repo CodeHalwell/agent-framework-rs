@@ -637,6 +637,16 @@ impl ChatClient for AzureOpenAIResponsesClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        // An explicit base URL is where requests actually go.
+        Some(
+            self.inner
+                .base_url
+                .as_deref()
+                .unwrap_or(&self.inner.endpoint),
+        )
+    }
 }
 
 #[cfg(test)]

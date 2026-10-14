@@ -32,6 +32,7 @@ use tracing_subscriber::Layer;
 struct StubClient {
     fail: bool,
     response_model: Option<String>,
+    service_url: Option<String>,
 }
 
 #[async_trait]
@@ -66,6 +67,10 @@ impl ChatClient for StubClient {
 
     fn model(&self) -> Option<&str> {
         Some("stub-model")
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.service_url.as_deref()
     }
 }
 
@@ -440,6 +445,40 @@ fn chat_span_records_request_attributes() {
 }
 
 #[test]
+fn chat_span_records_the_service_url_as_server_address() {
+    // Two clients for the same provider and model pointed at different
+    // hosts were indistinguishable in a trace: no `server.address` was ever
+    // recorded (#9225, #9222). It is read through wrappers too, so a
+    // tool-invoking client still reports its inner client's endpoint.
+    let capture = run_captured(|| async {
+        let stub = StubClient {
+            service_url: Some("http://ollama.example:9999/v1".to_string()),
+            ..Default::default()
+        };
+        let client = ObservableChatClient::new(FunctionInvokingChatClient::new(stub), "ollama");
+        let _ = client
+            .get_response(vec![Message::user("hello")], ChatOptions::new())
+            .await;
+    });
+    let span = capture.by_name("chat").expect("expected a chat span");
+    assert_eq!(
+        span.fields.get(attr::SERVER_ADDRESS).map(String::as_str),
+        Some("http://ollama.example:9999/v1")
+    );
+
+    // A client with no endpoint leaves the attribute off rather than
+    // recording a placeholder.
+    let capture = run_captured(|| async {
+        let client = ObservableChatClient::new(StubClient::default(), "stub-provider");
+        let _ = client
+            .get_response(vec![Message::user("hello")], ChatOptions::new())
+            .await;
+    });
+    let span = capture.by_name("chat").expect("expected a chat span");
+    assert!(!span.fields.contains_key(attr::SERVER_ADDRESS));
+}
+
+#[test]
 fn chat_span_omits_unset_request_attributes() {
     let capture = run_captured(|| async {
         let client = ObservableChatClient::new(StubClient::default(), "stub-provider");
@@ -746,6 +785,7 @@ fn chat_span_records_response_model() {
             StubClient {
                 fail: false,
                 response_model: Some("resolved-model".to_string()),
+                ..Default::default()
             },
             "p",
         );
@@ -827,6 +867,7 @@ fn chat_span_records_error_status_on_failure() {
             StubClient {
                 fail: true,
                 response_model: None,
+                ..Default::default()
             },
             "p",
         );

@@ -139,6 +139,8 @@ pub mod attr {
     pub const REQUEST_PRESENCE_PENALTY: &str = "gen_ai.request.presence_penalty";
     pub const REQUEST_STOP_SEQUENCES: &str = "gen_ai.request.stop_sequences";
     pub const CONVERSATION_ID: &str = "gen_ai.conversation.id";
+    /// The endpoint the request went to, from [`crate::client::ChatClient::service_url`].
+    pub const SERVER_ADDRESS: &str = "server.address";
     /// Content-capture-gated: the system/instructions prompt, JSON-encoded as
     /// `[{"type":"text","content":...}]` (mirrors
     /// `observability.py:1444-1448`).
@@ -238,6 +240,7 @@ pub fn chat_span(system: &str, model: &str, latest_semconv: bool) -> Span {
         gen_ai.request.presence_penalty = Empty,
         gen_ai.request.stop_sequences = Empty,
         gen_ai.conversation.id = Empty,
+        server.address = Empty,
         gen_ai.system_instructions = Empty,
         gen_ai.tool.definitions = Empty,
         error.type = Empty,
@@ -597,6 +600,9 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             &request_model,
             self.config.use_latest_experimental_gen_ai_semconv(),
         );
+        if let Some(url) = self.inner.service_url() {
+            span.record(attr::SERVER_ADDRESS, url);
+        }
         record_request(&span, &options, &self.config);
         if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
@@ -657,6 +663,9 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             &request_model,
             self.config.use_latest_experimental_gen_ai_semconv(),
         );
+        if let Some(url) = self.inner.service_url() {
+            span.record(attr::SERVER_ADDRESS, url);
+        }
         record_request(&span, &options, &self.config);
         if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
@@ -763,6 +772,10 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 

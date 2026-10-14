@@ -401,6 +401,10 @@ impl ChatClient for BedrockChatClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.host)
+    }
 }
 
 #[cfg(test)]

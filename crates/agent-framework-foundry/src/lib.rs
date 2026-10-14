@@ -266,6 +266,10 @@ impl ChatClient for FoundryChatClient {
     fn model(&self) -> Option<&str> {
         self.inner.model()
     }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
+    }
 }
 
 // ---------------------------------------------------------------------------

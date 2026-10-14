@@ -411,6 +411,10 @@ impl ChatClient for AzureOpenAIClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.endpoint)
+    }
 }
 
 #[cfg(test)]
