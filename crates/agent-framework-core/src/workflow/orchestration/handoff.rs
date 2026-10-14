@@ -769,23 +769,28 @@ impl HandoffBuilder {
         // target is actually *permitted* for the currently active source is
         // enforced separately via `handoff_map` (see `is_permitted_target`).
         let mut tool_targets: HashMap<String, String> = HashMap::new();
+        // The segment after `handoff_to_` in each offered tool name is what
+        // `target_from_call` hands `detect`, so those segments are keyed
+        // first and only ever by their own participant. The looser aliases
+        // (the full tool name, the sanitized name, the raw name) are added
+        // afterwards and never overwrite one: otherwise participants `foo`
+        // and `handoff_to_foo` would fight over the key `handoff_to_foo`,
+        // and the call `handoff_to_handoff_to_foo` could route to `foo`
+        // depending on registration order.
+        let mut cut_owners: HashMap<String, &String> = HashMap::new();
         for (name, _) in &self.participants {
-            let sanitized = sanitize_identifier(name);
-            // The model is offered `handoff_to_<sanitized>` cut to 64
-            // characters, and `target_from_call` hands `detect` what follows
-            // the prefix — so the cut segment has to be a key too, or a
-            // participant whose name was long enough to cut would resolve as
-            // unknown.
             let tool_name = handoff_tool_name(name);
             let cut = tool_name
                 .strip_prefix(HANDOFF_TOOL_PREFIX)
-                .unwrap_or(&sanitized)
+                .unwrap_or(&tool_name)
                 .to_string();
-            // Two participants that collide once cut would leave one of them
-            // unreachable, so say so instead of silently routing both to
-            // whichever was registered last.
-            if let Some(existing) = tool_targets.get(&cut) {
-                if existing != name {
+            // Two participants whose offered tool names are identical once
+            // cut to 64 characters would leave one of them unreachable, so
+            // say so instead of silently routing both to one of them. Only
+            // offered names are compared: an alias of one participant that
+            // happens to equal another's tool segment is not a collision.
+            if let Some(existing) = cut_owners.get(&cut) {
+                if *existing != name {
                     return Err(Error::Workflow(format!(
                         "participants '{existing}' and '{name}' both produce the handoff tool \
                          name '{tool_name}' once sanitized and cut to {MAX_TOOL_NAME_LENGTH} \
@@ -793,10 +798,17 @@ impl HandoffBuilder {
                     )));
                 }
             }
+            cut_owners.insert(cut.clone(), name);
             tool_targets.insert(cut, name.clone());
-            tool_targets.insert(tool_name, name.clone());
-            tool_targets.insert(sanitized, name.clone());
-            tool_targets.insert(name.to_lowercase(), name.clone());
+        }
+        for (name, _) in &self.participants {
+            for alias in [
+                handoff_tool_name(name),
+                sanitize_identifier(name),
+                name.to_lowercase(),
+            ] {
+                tool_targets.entry(alias).or_insert_with(|| name.clone());
+            }
         }
 
         // Validate the declared mesh edges: every source and target named via

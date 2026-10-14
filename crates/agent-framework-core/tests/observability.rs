@@ -15,8 +15,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_framework_core::observability::{
-    attr, record_error, record_tool_arguments, record_tool_result, tool_span, tool_span_ex,
-    ObservabilityConfig, ObservableChatClient, GEN_AI_LATEST_EXPERIMENTAL_OPT_IN,
+    attr, record_error, record_tool_arguments, record_tool_result, server_address_and_port,
+    tool_span, tool_span_ex, ObservabilityConfig, ObservableChatClient,
+    GEN_AI_LATEST_EXPERIMENTAL_OPT_IN,
 };
 use agent_framework_core::prelude::*;
 use agent_framework_core::types::FunctionArguments;
@@ -461,9 +462,15 @@ fn chat_span_records_the_service_url_as_server_address() {
             .await;
     });
     let span = capture.by_name("chat").expect("expected a chat span");
+    // `server.address` is the host alone, per the semantic conventions; the
+    // port goes in `server.port`.
     assert_eq!(
         span.fields.get(attr::SERVER_ADDRESS).map(String::as_str),
-        Some("http://ollama.example:9999/v1")
+        Some("ollama.example")
+    );
+    assert_eq!(
+        span.fields.get(attr::SERVER_PORT).map(String::as_str),
+        Some("9999")
     );
 
     // A client with no endpoint leaves the attribute off rather than
@@ -476,6 +483,38 @@ fn chat_span_records_the_service_url_as_server_address() {
     });
     let span = capture.by_name("chat").expect("expected a chat span");
     assert!(!span.fields.contains_key(attr::SERVER_ADDRESS));
+    assert!(!span.fields.contains_key(attr::SERVER_PORT));
+}
+
+#[test]
+fn service_urls_split_into_host_and_port() {
+    for (url, expected) in [
+        (
+            "https://api.openai.com/v1",
+            Some(("api.openai.com", Some(443))),
+        ),
+        (
+            "http://ollama.example:9999/v1",
+            Some(("ollama.example", Some(9999))),
+        ),
+        ("http://localhost:11434", Some(("localhost", Some(11434)))),
+        (
+            "https://user:secret@host.example/path?q=1",
+            Some(("host.example", Some(443))),
+        ),
+        ("http://[::1]:8080/v1", Some(("::1", Some(8080)))),
+        ("https://[2001:db8::1]/", Some(("2001:db8::1", Some(443)))),
+        // A bare host with no scheme (Bedrock's regional host).
+        (
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            Some(("bedrock-runtime.us-east-1.amazonaws.com", None)),
+        ),
+        ("https:///v1", None),
+    ] {
+        let got = server_address_and_port(url);
+        let got = got.as_ref().map(|(h, p)| (h.as_str(), *p));
+        assert_eq!(got, expected, "{url}");
+    }
 }
 
 #[test]

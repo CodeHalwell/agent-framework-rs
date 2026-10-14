@@ -22,8 +22,12 @@ are the same once cut to 64 characters.
 ### Added
 
 - `ChatClient::service_url()` returns the endpoint a client sends requests
-  to, and `ObservableChatClient` records it as `server.address` on the
-  `chat` span (upstream #9225, #9222). It defaults to `None`, and every
+  to, and `ObservableChatClient` records its host as `server.address` and
+  its port as `server.port` on the `chat` span (upstream #9225, #9222).
+  Upstream records the whole URL; this follows the OpenTelemetry semantic
+  conventions instead, so these spans group with other network spans. The
+  new `observability::server_address_and_port` does the split. It defaults
+  to `None`, and every
   wrapper forwards it. It is implemented for OpenAI chat completions and
   Responses, Ollama, Mistral, Anthropic, Gemini, Foundry Local, Bedrock, and
   Azure OpenAI chat and Responses.
@@ -48,7 +52,9 @@ are the same once cut to 64 characters.
   Anthropic and Gemini enforce. A long participant name used to make the
   provider reject the whole request. Routing uses the shortened name, and
   two participants that collide once shortened are a build error (upstream
-  #9035).
+  #9035). Only the offered names are compared, and a participant's offered
+  name can no longer be overridden by another participant's alias, which
+  used to make routing depend on registration order.
 
 ### Fixed
 
