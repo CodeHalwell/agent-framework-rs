@@ -835,6 +835,14 @@ impl WorkflowRun {
         match self.run_loop().await {
             Ok(()) => Ok(()),
             Err(e) => {
+                // A failed superstep never reaches `commit()`, but its staged
+                // writes are still sitting in the pending buffer — visible to
+                // `SharedState::get`, and folded in by the next superstep's
+                // commit if the caller resumes this run (`send_responses` on
+                // a request still pending). Drop them here, on every failure
+                // path, so they never reach committed state or a checkpoint
+                // (upstream #8819).
+                self.shared_state.discard().await;
                 self.state = WorkflowRunState::Failed;
                 self.emit(WorkflowEvent::Failed {
                     error: e.to_string(),
@@ -1002,7 +1010,8 @@ impl WorkflowRun {
             // etc.), and there is no rollback for those. `SharedState` writes,
             // however, are staged: they land in the pending buffer during a
             // superstep and are folded into committed state only by the
-            // `commit()` below, which a failed superstep never reaches. So a
+            // `commit()` below, which a failed superstep never reaches, and
+            // `drive()` discards them on failure. So a
             // failed superstep discards its shared-state writes rather than
             // persisting a partial, branch-dependent state — matching upstream's
             // Pregel-style commit-at-boundary model (`_state.py` / `_runner.py`),
@@ -1060,7 +1069,7 @@ impl WorkflowRun {
             // writes into committed state before emitting completion or
             // checkpointing, so a checkpoint captures exactly the committed
             // boundary. Only reached when every executor succeeded (an error
-            // returns above, leaving the writes discarded).
+            // returns above, and `drive()` then discards the staged writes).
             self.shared_state.commit().await;
 
             self.emit(WorkflowEvent::SuperStepCompleted(step));

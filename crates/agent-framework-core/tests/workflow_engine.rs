@@ -255,6 +255,94 @@ fn viz_mermaid_snapshot() {
     }
 }
 
+/// Mermaid node ids declared in `mermaid`, i.e. the token before `[` / `((`.
+fn mermaid_node_ids(mermaid: &str) -> Vec<String> {
+    mermaid
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let end = l.find("[\"").or_else(|| l.find("(("))?;
+            Some(l[..end].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn viz_mermaid_keeps_ids_that_sanitize_alike_distinct() {
+    // Mermaid ids are limited to `[0-9A-Za-z_]`, so each pair below
+    // sanitizes to the same id; mapped one by one they collapsed into a
+    // single node and the edge between them drew as a self-loop (#9082).
+    for (first, second) in [
+        ("step-a", "step_a"),
+        ("1step", "n_1step"),
+        ("步骤甲", "步骤乙"),
+    ] {
+        let workflow = WorkflowBuilder::new()
+            .add_executor(noop(first))
+            .add_executor(noop(second))
+            .set_start(first)
+            .add_edge(first, second)
+            .build()
+            .unwrap();
+        let mermaid = workflow.viz().to_mermaid();
+        let ids = mermaid_node_ids(&mermaid);
+        assert_eq!(ids.len(), 2, "two declared nodes:\n{mermaid}");
+        assert_ne!(ids[0], ids[1], "{first} and {second} collapsed:\n{mermaid}");
+        assert!(
+            mermaid.contains(&format!("{} --> {}", ids[0], ids[1])),
+            "edge must join the two distinct nodes:\n{mermaid}"
+        );
+        // An id that is already valid Mermaid keeps its own name.
+        if second == "step_a" || second == "n_1step" {
+            assert!(ids.contains(&second.to_string()), "{mermaid}");
+        }
+    }
+}
+
+#[test]
+fn viz_fan_in_node_never_takes_an_executor_id() {
+    // The generated join node used to be named `fan_in_{target}_{n}`
+    // unconditionally, so an executor with that id merged into it.
+    let workflow = WorkflowBuilder::new()
+        .add_executor(noop("a"))
+        .add_executor(noop("fan_in_joiner_0"))
+        .add_executor(noop("joiner"))
+        .set_start("a")
+        .add_edge("a", "fan_in_joiner_0")
+        .add_fan_in(
+            vec!["a".to_string(), "fan_in_joiner_0".to_string()],
+            "joiner",
+        )
+        .build()
+        .unwrap();
+
+    let mermaid = workflow.viz().to_mermaid();
+    let ids = mermaid_node_ids(&mermaid);
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "duplicate node ids:\n{mermaid}");
+    assert!(
+        mermaid.contains("fan_in_joiner_0[\"fan_in_joiner_0\"]"),
+        "{mermaid}"
+    );
+    assert!(mermaid.contains("fan_in_joiner_0_2((fan-in))"), "{mermaid}");
+    assert!(
+        mermaid.contains("fan_in_joiner_0 --> fan_in_joiner_0_2"),
+        "{mermaid}"
+    );
+
+    let dot = workflow.viz().to_dot();
+    assert!(
+        dot.contains("\"fan_in_joiner_0\" -> \"fan_in_joiner_0_2\";"),
+        "{dot}"
+    );
+    assert!(
+        dot.contains("\"fan_in_joiner_0_2\" -> \"joiner\";"),
+        "{dot}"
+    );
+}
+
 #[test]
 fn viz_dot_snapshot() {
     let workflow = viz_workflow();
@@ -787,6 +875,49 @@ async fn agent_executor_emits_incremental_agent_run_updates() {
         .filter(|e| matches!(e, WorkflowEvent::AgentRun { .. }))
         .count();
     assert_eq!(run_count, 1, "exactly one terminal AgentRun");
+}
+
+#[tokio::test]
+async fn failed_superstep_discards_pending_shared_state() {
+    // A superstep that fails never commits, but its staged writes used to
+    // stay in the pending buffer: readable through `SharedState::get`, and
+    // folded into committed state by the next superstep if the caller
+    // answered another still-pending request on the same run (#8819).
+    let asker = FunctionExecutor::new("asker", |msg, ctx| async move {
+        if let Some(resp) = RequestResponse::from_message(&msg) {
+            if resp.data == json!("boom") {
+                ctx.shared_state().set("secret", json!(1)).await;
+                return Err(Error::Workflow("executor failed".into()));
+            }
+            ctx.yield_output(resp.data).await?;
+        } else {
+            ctx.request_info(json!("first")).await?;
+            ctx.request_info(json!("second")).await?;
+        }
+        Ok(())
+    });
+    let workflow = WorkflowBuilder::new()
+        .add_executor(Arc::new(asker))
+        .set_start("asker")
+        .build()
+        .unwrap();
+
+    let mut run = workflow.run(json!("go")).await.unwrap();
+    let pending = run.pending_requests();
+    assert_eq!(pending.len(), 2);
+    let (r1, r2) = (pending[0].request_id.clone(), pending[1].request_id.clone());
+
+    assert!(run.send_response(r1, json!("boom")).await.is_err());
+    assert_eq!(run.state(), WorkflowRunState::Failed);
+    assert_eq!(
+        run.shared_state().get("secret").await,
+        None,
+        "a failed superstep's writes must not stay visible"
+    );
+
+    // Resuming the run on the other request must not commit them either.
+    run.send_response(r2, json!("ok")).await.unwrap();
+    assert!(!run.shared_state().export().await.contains_key("secret"));
 }
 
 #[tokio::test]
