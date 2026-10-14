@@ -2609,6 +2609,96 @@ async fn declaration_only_tool_call_is_returned_to_caller() {
     assert!(!has_result, "declaration-only call must not be executed");
 }
 
+/// One model turn calling a local tool and a declaration-only tool together,
+/// run with `allow_concurrent_invocation` set as given.
+async fn mixed_declaration_only_batch(concurrent: bool, stream: bool) {
+    let runs = Arc::new(Mutex::new(0usize));
+    let counted = runs.clone();
+    let local = FunctionTool::new(
+        "get_weather",
+        "",
+        json!({ "type": "object", "properties": {} }),
+        move |_args: Value| {
+            let counted = counted.clone();
+            async move {
+                *counted.lock().unwrap() += 1;
+                Ok(json!("sunny"))
+            }
+        },
+    )
+    .into_definition();
+    let resp = ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::FunctionCall(FunctionCallContent::new("c1", "get_weather", None)),
+                Content::FunctionCall(FunctionCallContent::new("c2", "frontend_tool", None)),
+            ],
+        )],
+        ..Default::default()
+    };
+    let client = budgeted_client(vec![resp], |config| {
+        config.allow_concurrent_invocation = concurrent
+    });
+    let options = ChatOptions {
+        tools: vec![local, declaration_only_tool("frontend_tool")],
+        ..Default::default()
+    };
+    let out = if stream {
+        let updates: Vec<_> = client
+            .get_streaming_response(vec![Message::user("go")], options)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|u| u.unwrap())
+            .collect();
+        ChatResponse::from_updates(updates)
+    } else {
+        client
+            .get_response(vec![Message::user("go")], options)
+            .await
+            .unwrap()
+    };
+
+    // The local sibling ran exactly once, on this turn…
+    assert_eq!(*runs.lock().unwrap(), 1);
+    let results: Vec<&FunctionResultContent> = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .filter_map(|c| match c {
+            Content::FunctionResult(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "only the local call is answered");
+    assert_eq!(results[0].call_id, "c1");
+    // …the caller-owned call came back for the caller to answer…
+    assert!(out
+        .function_calls()
+        .iter()
+        .any(|c| c.name == "frontend_tool"));
+    // …and the model was not called again.
+    assert_eq!(client.inner().seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mixed_declaration_only_batch_executes_local_sibling() {
+    // A declaration-only call used to send the *whole* batch back
+    // unexecuted, so a tool the framework owns was handed to a caller who
+    // can only answer its own — the replayed turn then carried an
+    // unanswered call providers reject (#9050).
+    mixed_declaration_only_batch(true, false).await;
+    mixed_declaration_only_batch(false, false).await;
+}
+
+#[tokio::test]
+async fn mixed_declaration_only_batch_executes_local_sibling_streaming() {
+    mixed_declaration_only_batch(true, true).await;
+}
+
 #[tokio::test]
 async fn unknown_tool_call_is_not_declaration_only() {
     // A genuinely unknown tool name keeps the not-found error behavior (an
