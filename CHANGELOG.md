@@ -5,6 +5,77 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [0.12.0] — 2026-10-14
+
+A parity release: ten fixes from the upstream window `301a43c..a75e803e`
+(2026-10-05 to 2026-10-12), recorded in
+[`docs/drift/2026-10-12-a75e803e.md`](docs/drift/2026-10-12-a75e803e.md).
+Azure clients now identify themselves with a `User-Agent`, and chat spans
+record which endpoint served the request.
+
+**No public API breaks**, but two behaviour changes need attention.
+`FunctionInvokingChatClient` now runs local tools that share a turn with a
+declaration-only call instead of returning them unexecuted, and
+`HandoffBuilder::build` rejects two participants whose handoff tool names
+are the same once cut to 64 characters.
+
+### Added
+
+- `ChatClient::service_url()` returns the endpoint a client sends requests
+  to, and `ObservableChatClient` records it as `server.address` on the
+  `chat` span (upstream #9225, #9222). It defaults to `None`, and every
+  wrapper forwards it. It is implemented for OpenAI chat completions and
+  Responses, Ollama, Mistral, Anthropic, Gemini, Foundry Local, Bedrock, and
+  Azure OpenAI chat and Responses.
+- Azure requests now carry a framework `User-Agent`:
+  `agent-framework-rust/<version> (<crate>)`. The new
+  `agent_framework_azure::{azure_user_agent, azure_http_client,
+  USER_AGENT_PRODUCT}` build it, and the Azure OpenAI chat, embeddings and
+  Responses clients, Cosmos DB, Azure AI Search and Foundry use them. Azure
+  reads this header for telemetry, throttling diagnostics and support cases.
+- `handoff_tool_name` is exported, so marker tools attached by hand use the
+  same name the coordinator resolves.
+
+### Changed
+
+- **Mixed declaration-only tool batches.** When a model turn calls both a
+  declaration-only tool and a local tool, the local tool now runs on that
+  turn. Its result comes back in a tool message alongside the caller-owned
+  call, which is still returned intact. Before, the whole batch came back
+  unexecuted, so the replayed turn carried an unanswered call that
+  providers reject (upstream #9050).
+- **Handoff tool names are capped at 64 characters**, the limit OpenAI,
+  Anthropic and Gemini enforce. A long participant name used to make the
+  provider reject the whole request. Routing uses the shortened name, and
+  two participants that collide once shortened are a build error (upstream
+  #9035).
+
+### Fixed
+
+- **Bedrock extended thinking with tools.** `reasoningContent` blocks were
+  dropped on the way in and on the way out. Converse rejects an assistant
+  turn whose reasoning no longer matches its signature, so the turn after a
+  tool result failed. Signed reasoning and redacted blocks now round-trip
+  exactly (upstream #8936).
+- **Magentic progress ledger.** Braces inside JSON string values ended the
+  ledger object early, so a ledger answer that mentioned a brace failed to
+  parse and stalled the round (upstream #9089).
+- **Azure OpenAI `api-version`.** A blank `AZURE_OPENAI_API_VERSION` was
+  sent as `?api-version=`, which the chat and embeddings routes answer with
+  a 400. A blank value now keeps the dated default (upstream #9098).
+- **Data URIs.** An omitted media type now defaults to `text/plain`, as
+  RFC 2397 specifies. A second encoding marker such as
+  `data:text/plain;gzip;base64,...` is refused; before, it was decoded as
+  plain base64 and returned corrupted bytes (upstream #8918).
+- **Workflow diagrams.** Executor ids that sanitize to the same Mermaid id
+  (`step-a` and `step_a`, or any two non-Latin ids) rendered as one node,
+  and a fan-in node could take an executor's id in Mermaid and DOT. Node
+  ids are now unique (upstream #9082).
+- **Failed workflow supersteps.** A failed superstep's staged shared-state
+  writes stayed readable, and the next superstep committed them if the
+  caller answered another pending request on the same run. They are now
+  discarded on failure (upstream #8819).
+
 ## [0.11.0] — 2026-10-09
 
 Three experimental ports and a new crate. The **agent harness** (loop, todo,

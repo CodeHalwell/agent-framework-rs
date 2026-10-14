@@ -72,7 +72,7 @@ const MAX_TOOL_NAME_LENGTH: usize = 64;
 const HANDOFF_TOOL_PREFIX: &str = "handoff_to_";
 
 /// The handoff marker tool name for `target`: `handoff_to_<sanitized>`, cut to
-/// the [64 characters](MAX_TOOL_NAME_LENGTH) providers accept. Rust analogue
+/// the 64 characters providers accept. Rust analogue
 /// of Python's `get_handoff_tool_name`.
 ///
 /// [`handoff_tool_spec`] and the coordinator's name-resolution table are both
