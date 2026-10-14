@@ -397,6 +397,18 @@ impl AzureOpenAIResponsesClient {
         self
     }
 
+    /// Replace the HTTP client requests go through.
+    ///
+    /// The default is [`azure_http_client`](crate::azure_http_client) for this
+    /// crate, which carries its `User-Agent`. A crate that builds on this
+    /// client passes its own, so requests are attributed to the connector the
+    /// caller actually used. Foundry does this. A caller can also pass a
+    /// client configured with a proxy or timeouts.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        Arc::make_mut(&mut self.inner).http = http;
+        self
+    }
+
     /// Override the full base URL used to build requests, taking precedence
     /// over the endpoint-derived `/openai/v1/` route. Mirrors upstream's
     /// `base_url` parameter, which "must end with `/openai/v1/`"

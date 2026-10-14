@@ -152,7 +152,8 @@ impl FoundryChatClient {
         let model = model.into();
         let inner = AzureOpenAIResponsesClient::new(endpoint.clone(), model.clone(), api_key)
             .without_api_version()
-            .without_implicit_encrypted_reasoning();
+            .without_implicit_encrypted_reasoning()
+            .with_http_client(http_client());
         Self {
             inner,
             endpoint,
@@ -177,7 +178,10 @@ impl FoundryChatClient {
             credential,
         )
         .without_api_version()
-        .without_implicit_encrypted_reasoning();
+        .without_implicit_encrypted_reasoning()
+        // Requests go out under this crate's `User-Agent`, not the Azure
+        // OpenAI crate's it delegates to.
+        .with_http_client(http_client());
         Self {
             inner,
             endpoint,

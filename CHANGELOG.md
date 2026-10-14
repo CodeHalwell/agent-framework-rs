@@ -37,6 +37,10 @@ are the same once cut to 64 characters.
   USER_AGENT_PRODUCT}` build it, and the Azure OpenAI chat, embeddings and
   Responses clients, Cosmos DB, Azure AI Search and Foundry use them. Azure
   reads this header for telemetry, throttling diagnostics and support cases.
+- `AzureOpenAIResponsesClient::with_http_client` replaces the client that
+  requests go through. Foundry chat uses it so its requests carry the
+  Foundry `User-Agent` rather than the Azure OpenAI one; callers can use it
+  for a proxy or timeouts.
 - `handoff_tool_name` is exported, so marker tools attached by hand use the
   same name the coordinator resolves.
 
