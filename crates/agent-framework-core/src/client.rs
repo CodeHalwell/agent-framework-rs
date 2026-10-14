@@ -51,6 +51,18 @@ pub trait ChatClient: Send + Sync {
     fn model(&self) -> Option<&str> {
         None
     }
+
+    /// The endpoint this client sends requests to, if it has one.
+    ///
+    /// Recorded as `server.address` on the `chat` span by
+    /// [`ObservableChatClient`](crate::observability::ObservableChatClient),
+    /// so traces show *which* deployment served a call — two clients for the
+    /// same provider and model pointed at different hosts are otherwise
+    /// indistinguishable. Wrappers forward their inner client's value.
+    /// Mirrors upstream's `service_url()` (#9225, #9222).
+    fn service_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Blanket impl so `Arc<dyn ChatClient>` and wrappers are usable as clients.
@@ -72,6 +84,10 @@ impl<T: ChatClient + ?Sized> ChatClient for Arc<T> {
     }
     fn model(&self) -> Option<&str> {
         (**self).model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        (**self).service_url()
     }
 }
 
@@ -1312,29 +1328,35 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
                 // Declaration-only calls: a call targeting a KNOWN tool that has
                 // no local executor (declaration-only — e.g. an AG-UI frontend
-                // tool, or a per-run `additional_tools` entry) terminates the
-                // loop and returns the response with the `FunctionCallContent`
-                // intact, so the caller can execute it. Mirrors Python's
-                // `_try_execute_function_calls` `declaration_only` branch
-                // (`_tools.py:1396-1420`): if *any* requested call is
-                // declaration-only, the whole response is returned unexecuted.
-                // A genuinely unknown tool name is NOT declaration-only and
-                // keeps today's not-found handling in `execute_tool_call`.
-                let has_declaration_only = calls.iter().any(|c| {
+                // tool, or a per-run `additional_tools` entry) belongs to the
+                // caller, so it ends the loop and comes back with its
+                // `FunctionCallContent` intact. A genuinely unknown tool name
+                // is NOT declaration-only and keeps the not-found handling in
+                // `execute_tool_call`.
+                //
+                // Its *local* siblings in the same batch still run here, on
+                // this turn. Returning them unexecuted too — what this did
+                // until upstream #9050 — handed a tool the framework owns to a
+                // caller who can only answer the declaration-only call, so the
+                // replayed turn carried an unanswered call providers reject,
+                // and any answer the caller invented had bypassed function
+                // middleware.
+                let is_caller_owned = |c: &FunctionCallContent| {
                     options
                         .tools
                         .iter()
                         .any(|t| t.name == c.name && is_declaration_only(t))
-                });
-                if has_declaration_only {
-                    InvocationBudget::clear(session.as_ref());
-                    let mut resp = response;
-                    let mut msgs = std::mem::take(&mut carried);
-                    msgs.append(&mut resp.messages);
-                    resp.messages = msgs;
-                    resp.usage_details = aggregated_usage;
-                    return Ok(resp);
-                }
+                };
+                let has_declaration_only = calls.iter().any(&is_caller_owned);
+                let local_calls: Vec<FunctionCallContent> = if has_declaration_only {
+                    calls
+                        .iter()
+                        .filter(|c| !is_caller_owned(c))
+                        .cloned()
+                        .collect()
+                } else {
+                    calls.clone()
+                };
 
                 // Record the assistant message(s) that requested the calls.
                 carried.extend(response.messages.iter().cloned());
@@ -1345,7 +1367,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 // caller asked for that, which
                 // `FunctionInvocationConfig::allow_concurrent_invocation`
                 // turns off.
-                let invocations = calls.iter().map(|call| {
+                let invocations = local_calls.iter().map(|call| {
                     let tool = tools.iter().find(|t| t.name == call.name).cloned();
                     let call = call.clone();
                     let include_detailed_errors = self.config.include_detailed_errors;
@@ -1406,6 +1428,20 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 {
                     had_error |= is_error;
                     result_contents.push(Content::FunctionResult(content));
+                }
+
+                if has_declaration_only {
+                    InvocationBudget::clear(session.as_ref());
+                    let mut resp = response;
+                    // `carried` already holds this response's messages
+                    // (recorded above, before the calls ran).
+                    let mut msgs = std::mem::take(&mut carried);
+                    if !result_contents.is_empty() {
+                        msgs.push(Message::with_contents(Role::tool(), result_contents));
+                    }
+                    resp.messages = msgs;
+                    resp.usage_details = aggregated_usage;
+                    return Ok(resp);
                 }
 
                 if had_error {
@@ -1549,6 +1585,10 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 
@@ -1895,6 +1935,10 @@ impl<C: ChatClient> ChatClient for RetryingChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 

@@ -375,6 +375,10 @@ impl ChatClient for OpenAIChatCompletionClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 type ByteStream =
@@ -636,6 +640,14 @@ fn parse_delta(value: &Value, tool_ids: &mut HashMap<i64, String>) -> Option<Cha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_configured_base_url() {
+        // Read by the observability layer as `server.address` (#9225, #9222).
+        let client = OpenAIChatCompletionClient::new("k", "gpt-4o-mini")
+            .with_base_url("http://gateway.example/v1");
+        assert_eq!(client.service_url(), Some("http://gateway.example/v1"));
+    }
 
     // -- classify_service_error --------------------------------------------
     //

@@ -246,6 +246,15 @@ fn assert_valid_cosmos_headers(request: &CapturedRequest, expected_partition_key
         Some("2018-12-31")
     );
 
+    // Azure reads `User-Agent` for service telemetry, throttling diagnostics
+    // and supportability, so every request names the framework and the
+    // connector that made it.
+    let ua = request.header("user-agent").expect("User-Agent present");
+    assert!(
+        ua.starts_with("agent-framework-rust/") && ua.contains("(agent-framework-cosmos)"),
+        "unexpected User-Agent: {ua}"
+    );
+
     let pk_header = request
         .header("x-ms-documentdb-partitionkey")
         .expect("partition key header present");

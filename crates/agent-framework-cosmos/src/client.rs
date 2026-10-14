@@ -245,7 +245,7 @@ impl CosmosRestClient {
         let key = key.into();
         let key_bytes = decode_master_key(&key)?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             account_endpoint,
             auth: CosmosAuth::MasterKey { key, key_bytes },
             api_version: DEFAULT_API_VERSION.to_string(),
@@ -266,7 +266,7 @@ impl CosmosRestClient {
         let account_endpoint = normalize_endpoint(account_endpoint.into())?;
         let scope = resolve_scope(scope, std::env::var(SCOPE_OVERRIDE_ENV).ok());
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             account_endpoint,
             auth: CosmosAuth::Credential { credential, scope },
             api_version: DEFAULT_API_VERSION.to_string(),

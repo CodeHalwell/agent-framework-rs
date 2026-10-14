@@ -111,6 +111,42 @@ pub const DEFAULT_CHAT_API_VERSION: &str = "2024-12-01-preview";
 /// stays on `2024-10-21`.
 pub const DEFAULT_EMBEDDING_API_VERSION: &str = "2024-10-21";
 
+/// The product token Azure requests from this port carry.
+///
+/// Azure reads `User-Agent` for service telemetry, throttling diagnostics and
+/// supportability, so a request that sends none is traffic the platform — and
+/// anyone reading a support case — cannot attribute. Upstream identifies
+/// itself the same way, per package (#9223).
+pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
+
+/// The `User-Agent` value for an Azure call made by `component` at `version`.
+///
+/// `component` is the crate making the call and `version` its
+/// `CARGO_PKG_VERSION`, so a request names both the framework and the
+/// connector inside it: `agent-framework-rust/0.11.0
+/// (agent-framework-azure-cosmos)`.
+pub fn azure_user_agent(component: &str, version: &str) -> String {
+    format!("{USER_AGENT_PRODUCT}/{version} ({component})")
+}
+
+/// A [`reqwest::Client`] whose requests carry [`azure_user_agent`].
+///
+/// Each Azure-facing crate builds its clients through this, passing its own
+/// `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")`, so the header
+/// format lives in one place. A static ASCII token cannot fail to become a
+/// header, so the fallback exists only to keep the signature infallible.
+pub fn azure_http_client(component: &str, version: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(azure_user_agent(component, version))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// This crate's own [`azure_http_client`].
+pub(crate) fn http_client() -> reqwest::Client {
+    azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 /// Parse a `Retry-After` header into a delay in seconds.
 ///
 /// Mirrors the OpenAI/Anthropic clients: Azure OpenAI returns the
@@ -186,7 +222,7 @@ impl AzureOpenAIClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_CHAT_API_VERSION.to_string(),
@@ -204,7 +240,7 @@ impl AzureOpenAIClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: http_client(),
                 endpoint: endpoint.into(),
                 deployment: deployment.into(),
                 api_version: DEFAULT_CHAT_API_VERSION.to_string(),
@@ -217,16 +253,34 @@ impl AzureOpenAIClient {
     /// `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME`, and
     /// optional `AZURE_OPENAI_API_VERSION`.
     pub fn from_env() -> Result<Self> {
-        let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
-            .map_err(|_| Error::Configuration("AZURE_OPENAI_ENDPOINT is not set".into()))?;
-        let api_key = std::env::var("AZURE_OPENAI_API_KEY")
-            .map_err(|_| Error::Configuration("AZURE_OPENAI_API_KEY is not set".into()))?;
-        let deployment = std::env::var("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME").map_err(|_| {
+        Self::from_env_vars(|key| std::env::var(key).ok())
+    }
+
+    /// Implementation of [`from_env`](Self::from_env), parameterized over an
+    /// environment lookup function so unit tests can exercise it against an
+    /// in-memory map rather than the process-global environment (the same
+    /// split [`AzureOpenAIResponsesClient::from_env`](crate::AzureOpenAIResponsesClient::from_env)
+    /// uses).
+    fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let endpoint = get("AZURE_OPENAI_ENDPOINT")
+            .ok_or_else(|| Error::Configuration("AZURE_OPENAI_ENDPOINT is not set".into()))?;
+        let api_key = get("AZURE_OPENAI_API_KEY")
+            .ok_or_else(|| Error::Configuration("AZURE_OPENAI_API_KEY is not set".into()))?;
+        let deployment = get("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME").ok_or_else(|| {
             Error::Configuration("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME is not set".into())
         })?;
         let mut client = Self::new(endpoint, deployment, api_key);
-        if let Ok(v) = std::env::var("AZURE_OPENAI_API_VERSION") {
-            client = client.with_api_version(v);
+        // A variable that is set but blank leaves [`DEFAULT_CHAT_API_VERSION`]
+        // in place. Chat Completions requires the `api-version` query
+        // parameter, so forwarding a blank one produces a 400 rather than a
+        // service default; upstream applies its own default to an unset *or*
+        // empty value the same way (#9098). The Responses client differs on
+        // purpose: there a blank value opts out of the parameter, which its
+        // GA v1 route accepts.
+        if let Some(v) = get("AZURE_OPENAI_API_VERSION") {
+            if !v.trim().is_empty() {
+                client = client.with_api_version(v);
+            }
         }
         Ok(client)
     }
@@ -356,6 +410,10 @@ impl ChatClient for AzureOpenAIClient {
 
     fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.endpoint)
     }
 }
 
@@ -599,6 +657,62 @@ mod tests {
             std::env::remove_var("AZURE_OPENAI_API_KEY");
             std::env::remove_var("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME");
         }
+    }
+
+    #[test]
+    fn the_user_agent_names_the_framework_and_the_component() {
+        // Azure attributes traffic by `User-Agent`; a request that sends
+        // none is traffic the platform cannot place (#9223).
+        assert_eq!(
+            azure_user_agent("agent-framework-azure-cosmos", "0.11.0"),
+            "agent-framework-rust/0.11.0 (agent-framework-azure-cosmos)"
+        );
+        // This crate's own clients carry it, built from its package
+        // metadata rather than a hand-written string.
+        assert!(
+            azure_user_agent(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                .starts_with("agent-framework-rust/"),
+            "the product token leads the header"
+        );
+    }
+
+    /// The in-memory lookup the `from_env_vars` tests below use, so they do
+    /// not need `ENV_MUTEX` or the process environment at all.
+    fn env_with(api_version: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| match key {
+            "AZURE_OPENAI_ENDPOINT" => Some("https://res.openai.azure.com".into()),
+            "AZURE_OPENAI_API_KEY" => Some("test-key-123".into()),
+            "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME" => Some("gpt-4o-deployment".into()),
+            "AZURE_OPENAI_API_VERSION" => api_version.map(str::to_string),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn from_env_defaults_api_version_when_blank() {
+        // A variable set but blank is how a shell or CI config passes
+        // "unset" through. Forwarding it builds `...?api-version=`, which
+        // Chat Completions rejects outright, so the dated default has to
+        // stand instead (upstream #9098). The Responses client treats blank
+        // as opting out of the parameter, which its GA v1 route accepts —
+        // that difference is deliberate.
+        for blank in ["", "   "] {
+            let client = AzureOpenAIClient::from_env_vars(env_with(Some(blank))).unwrap();
+            assert_eq!(client.inner.api_version, DEFAULT_CHAT_API_VERSION);
+            assert!(
+                client
+                    .url()
+                    .ends_with(&format!("api-version={DEFAULT_CHAT_API_VERSION}")),
+                "a blank variable must not reach the query string: {}",
+                client.url()
+            );
+        }
+    }
+
+    #[test]
+    fn from_env_honors_a_set_api_version_over_the_default() {
+        let client = AzureOpenAIClient::from_env_vars(env_with(Some("2025-02-01"))).unwrap();
+        assert_eq!(client.inner.api_version, "2025-02-01");
     }
 
     #[test]

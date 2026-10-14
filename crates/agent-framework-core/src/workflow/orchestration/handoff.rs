@@ -62,6 +62,30 @@ pub struct HandoffUserInputRequest {
 /// The default handoff turn limit (Python's `_DEFAULT_AUTONOMOUS_TURN_LIMIT`).
 const DEFAULT_TURN_LIMIT: usize = 50;
 
+/// The longest tool name model providers accept. OpenAI, Anthropic and Gemini
+/// all cap function names at 64 characters and reject the request outright
+/// past it, so a handoff marker built from a long participant name has to be
+/// cut rather than sent (Python's `_MAX_TOOL_NAME_LENGTH`).
+const MAX_TOOL_NAME_LENGTH: usize = 64;
+
+/// The prefix every handoff marker tool name carries.
+const HANDOFF_TOOL_PREFIX: &str = "handoff_to_";
+
+/// The handoff marker tool name for `target`: `handoff_to_<sanitized>`, cut to
+/// the 64 characters providers accept. Rust analogue
+/// of Python's `get_handoff_tool_name`.
+///
+/// [`handoff_tool_spec`] and the coordinator's name-resolution table are both
+/// built from this one function, so a name long enough to be cut still
+/// resolves back to its participant. [`HandoffBuilder::build`] rejects two
+/// participants whose names collide once cut.
+pub fn handoff_tool_name(target: &str) -> String {
+    let mut name = format!("{HANDOFF_TOOL_PREFIX}{}", sanitize_identifier(target));
+    // `sanitize_identifier` emits ASCII only, so this is a char boundary.
+    name.truncate(MAX_TOOL_NAME_LENGTH);
+    name
+}
+
 /// Build the marker tool spec for handing off to `target`. Rust analogue of
 /// Python's `_create_handoff_tool`.
 ///
@@ -69,7 +93,7 @@ const DEFAULT_TURN_LIMIT: usize = 50;
 /// executor): the coordinator intercepts calls to it rather than running it.
 /// Attach it to an agent's tools so its model can request the transfer.
 pub fn handoff_tool_spec(target: &str, description: Option<&str>) -> ToolDefinition {
-    let name = format!("handoff_to_{}", sanitize_identifier(target));
+    let name = handoff_tool_name(target);
     let desc = description
         .map(str::to_string)
         .unwrap_or_else(|| format!("Handoff to the {target} agent."));
@@ -691,6 +715,12 @@ impl HandoffBuilder {
 
     /// Cap the number of agent turns per user message (Python's autonomous turn
     /// limit; default 50).
+    ///
+    /// `0` is raised to `1`: a cap of zero would yield an empty conversation
+    /// on any input, since no agent would ever run. Upstream's `0` means
+    /// something different — no autonomous *continuation* after the agent
+    /// answers — which is what [`HandoffInteractionMode::Autonomous`]
+    /// already expresses here, so there is nothing for a zero cap to say.
     pub fn max_iterations(mut self, limit: usize) -> Self {
         self.turn_limit = limit.max(1);
         self
@@ -739,11 +769,46 @@ impl HandoffBuilder {
         // target is actually *permitted* for the currently active source is
         // enforced separately via `handoff_map` (see `is_permitted_target`).
         let mut tool_targets: HashMap<String, String> = HashMap::new();
+        // The segment after `handoff_to_` in each offered tool name is what
+        // `target_from_call` hands `detect`, so those segments are keyed
+        // first and only ever by their own participant. The looser aliases
+        // (the full tool name, the sanitized name, the raw name) are added
+        // afterwards and never overwrite one: otherwise participants `foo`
+        // and `handoff_to_foo` would fight over the key `handoff_to_foo`,
+        // and the call `handoff_to_handoff_to_foo` could route to `foo`
+        // depending on registration order.
+        let mut cut_owners: HashMap<String, &String> = HashMap::new();
         for (name, _) in &self.participants {
-            let sanitized = sanitize_identifier(name);
-            tool_targets.insert(format!("handoff_to_{sanitized}"), name.clone());
-            tool_targets.insert(sanitized, name.clone());
-            tool_targets.insert(name.to_lowercase(), name.clone());
+            let tool_name = handoff_tool_name(name);
+            let cut = tool_name
+                .strip_prefix(HANDOFF_TOOL_PREFIX)
+                .unwrap_or(&tool_name)
+                .to_string();
+            // Two participants whose offered tool names are identical once
+            // cut to 64 characters would leave one of them unreachable, so
+            // say so instead of silently routing both to one of them. Only
+            // offered names are compared: an alias of one participant that
+            // happens to equal another's tool segment is not a collision.
+            if let Some(existing) = cut_owners.get(&cut) {
+                if *existing != name {
+                    return Err(Error::Workflow(format!(
+                        "participants '{existing}' and '{name}' both produce the handoff tool \
+                         name '{tool_name}' once sanitized and cut to {MAX_TOOL_NAME_LENGTH} \
+                         characters; rename one so the model can address them separately"
+                    )));
+                }
+            }
+            cut_owners.insert(cut.clone(), name);
+            tool_targets.insert(cut, name.clone());
+        }
+        for (name, _) in &self.participants {
+            for alias in [
+                handoff_tool_name(name),
+                sanitize_identifier(name),
+                name.to_lowercase(),
+            ] {
+                tool_targets.entry(alias).or_insert_with(|| name.clone());
+            }
         }
 
         // Validate the declared mesh edges: every source and target named via

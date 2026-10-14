@@ -91,7 +91,7 @@ impl std::fmt::Debug for AzureAISearchStore {
 impl AzureAISearchStore {
     fn build(endpoint: String, auth: SearchAuth) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_version: DEFAULT_API_VERSION.to_string(),
             scope: SEARCH_SCOPE.to_string(),

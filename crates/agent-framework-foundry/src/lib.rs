@@ -73,6 +73,13 @@
 //! ```
 
 pub mod client_headers;
+/// This crate's HTTP client, carrying the framework `User-Agent` Azure reads
+/// for telemetry and supportability (see
+/// [`agent_framework_azure::azure_user_agent`]).
+pub(crate) fn http_client() -> reqwest::Client {
+    agent_framework_azure::azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 pub mod embeddings;
 pub mod memory;
 mod tool_definition_wire;
@@ -145,7 +152,8 @@ impl FoundryChatClient {
         let model = model.into();
         let inner = AzureOpenAIResponsesClient::new(endpoint.clone(), model.clone(), api_key)
             .without_api_version()
-            .without_implicit_encrypted_reasoning();
+            .without_implicit_encrypted_reasoning()
+            .with_http_client(http_client());
         Self {
             inner,
             endpoint,
@@ -170,7 +178,10 @@ impl FoundryChatClient {
             credential,
         )
         .without_api_version()
-        .without_implicit_encrypted_reasoning();
+        .without_implicit_encrypted_reasoning()
+        // Requests go out under this crate's `User-Agent`, not the Azure
+        // OpenAI crate's it delegates to.
+        .with_http_client(http_client());
         Self {
             inner,
             endpoint,
@@ -258,6 +269,10 @@ impl ChatClient for FoundryChatClient {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 

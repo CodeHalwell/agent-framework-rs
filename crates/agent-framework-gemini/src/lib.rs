@@ -287,6 +287,10 @@ impl ChatClient for GeminiChatClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 type ByteStream =

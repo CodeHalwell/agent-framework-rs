@@ -263,7 +263,7 @@ impl FoundryEmbeddingClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into().trim_end_matches('/').to_string(),
                 model: model.into(),
                 image_model: None,

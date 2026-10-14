@@ -154,6 +154,25 @@ fn client(endpoint: &str) -> FoundryChatClient {
     )
 }
 
+/// Foundry chat delegates to the Azure OpenAI Responses client, so without
+/// passing its own HTTP client its traffic was attributed to
+/// `agent-framework-azure`. Both constructors are checked: the token-credential
+/// one through the test below, and the API-key one here.
+#[tokio::test]
+async fn api_key_client_requests_carry_the_foundry_user_agent() {
+    let server = FakeServer::start(false, OK_BODY);
+    let c = FoundryChatClient::new(&server.addr, "gpt-4o", "test-key");
+    c.get_response(vec![Message::user("hi")], ChatOptions::default())
+        .await
+        .unwrap();
+    let (_line, headers, _body) = server.requests().remove(0);
+    let headers = headers.to_ascii_lowercase();
+    assert!(
+        headers.contains("(agent-framework-foundry)"),
+        "headers: {headers}"
+    );
+}
+
 /// The point of the whole `x-client-*` capability: a header stamped on the
 /// per-call `ChatOptions` has to arrive on the outbound HTTP request, and must
 /// *not* arrive in the request body. Nothing else in this port proves the
@@ -184,6 +203,13 @@ async fn stamped_client_headers_reach_the_wire_and_stay_out_of_the_body() {
         headers.contains("x-client-request-id: req-7"),
         "a header name's case is the caller's; only the prefix check is \
          case-insensitive. headers: {headers}"
+    );
+    // Chat requests delegate to the Azure OpenAI Responses client, but are
+    // attributed to Foundry, the connector the caller used.
+    assert!(
+        headers.contains("user-agent: agent-framework-rust/")
+            && headers.contains("(agent-framework-foundry)"),
+        "headers: {headers}"
     );
     // The client's own credential still goes, beside them rather than
     // replaced by them.

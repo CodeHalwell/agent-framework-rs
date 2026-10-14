@@ -383,6 +383,10 @@ impl ChatClient for GitHubCopilotChatClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 type ByteStream =
@@ -478,6 +482,13 @@ fn drain_or_end(mut state: SseState) -> Option<(Result<ChatResponseUpdate>, SseS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_api_base_url() {
+        // Read by the observability layer as `server.address` / `server.port`.
+        let client = GitHubCopilotChatClient::new("t", "gpt-4o");
+        assert_eq!(client.service_url(), Some(DEFAULT_BASE_URL));
+    }
 
     // region: base URL and constructor defaults
 

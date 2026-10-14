@@ -143,6 +143,9 @@ struct Inner {
     http: reqwest::Client,
     project_id: String,
     region: String,
+    /// `https://{region}-aiplatform.googleapis.com`, the host every request
+    /// URL is built on; held so `service_url()` can lend it out.
+    endpoint: String,
     model: String,
     token_provider: Arc<dyn VertexTokenProvider>,
     max_tokens: u32,
@@ -168,11 +171,13 @@ impl AnthropicVertexClient {
         model: impl Into<String>,
         token_provider: Arc<dyn VertexTokenProvider>,
     ) -> Self {
+        let region = region.into();
         Self {
             inner: Arc::new(Inner {
                 http: reqwest::Client::new(),
                 project_id: project_id.into(),
-                region: region.into(),
+                endpoint: format!("https://{region}-aiplatform.googleapis.com"),
+                region,
                 model: model.into(),
                 token_provider,
                 max_tokens: DEFAULT_MAX_TOKENS,
@@ -238,7 +243,8 @@ impl AnthropicVertexClient {
             "rawPredict"
         };
         format!(
-            "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:{action}",
+            "{endpoint}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:{action}",
+            endpoint = self.inner.endpoint,
             region = self.inner.region,
             project = self.inner.project_id,
         )
@@ -337,11 +343,25 @@ impl ChatClient for AnthropicVertexClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.endpoint)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_regional_endpoint() {
+        // Read by the observability layer as `server.address` / `server.port`.
+        let client = client();
+        assert_eq!(
+            client.service_url(),
+            Some("https://us-east5-aiplatform.googleapis.com")
+        );
+    }
 
     fn client() -> AnthropicVertexClient {
         AnthropicVertexClient::new(

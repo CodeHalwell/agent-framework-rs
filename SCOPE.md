@@ -70,7 +70,31 @@ from the roadmap, not from this file.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
 - **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
-  on the Agent Memory Toolkit), the dedicated Application Insights exporter.
+  on the Agent Memory Toolkit), the dedicated Application Insights exporter,
+  and Cosmos chat history decoupled from its partition-key strategy
+  (upstream #9214: tenant/user metadata persisted whatever the strategy, plus
+  a caller-chosen partition key). `CosmosChatMessageStore` partitions by
+  `threadId` alone and carries no tenant/user fields.
+- **A framework `User-Agent` outside the Azure crates**. The Azure-facing
+  crates send `agent-framework-rust/<version> (<component>)` via
+  `agent_framework_azure::azure_http_client`; the other provider clients, and
+  `agent-framework-purview` and `agent-framework-foundry-local`, still build
+  bare `reqwest` clients. A framework-wide header needs the helper somewhere
+  every crate can reach, and `agent-framework-core` carries no `reqwest`
+  dependency by design.
+- **Function-invocation pauses with mixed batches**. A declaration-only
+  call's local siblings run on the same turn. Upstream instead holds them
+  until the caller answers whenever a session is present (#9050). An
+  approval batch also defers a declaration-only sibling as an approval,
+  where upstream pauses it as Host input (#9203).
+- **Streamed code-interpreter content**. The OpenAI Responses client
+  produces no `CodeInterpreterToolCallContent`, so there is nothing to
+  stream or merge.
+- **Per-agent handoff autonomous turn limits**. Upstream's
+  `with_autonomous_mode(agents=[...], turn_limits={...})` is per participant.
+  Here there is one `HandoffBuilder::max_iterations` cap plus a global
+  `HandoffInteractionMode`, whose `Autonomous` variant already expresses
+  upstream's zero-continuation case.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline skills (scripts, file-based sources, source

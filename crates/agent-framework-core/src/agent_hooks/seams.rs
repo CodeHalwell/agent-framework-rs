@@ -671,6 +671,10 @@ impl ChatClient for GuardedChatClient {
     fn model(&self) -> Option<&str> {
         self.inner.model()
     }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
+    }
 }
 
 /// Re-derive stream updates from a (transformed) response: one per message,

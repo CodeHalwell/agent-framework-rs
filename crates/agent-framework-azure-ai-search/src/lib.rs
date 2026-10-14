@@ -38,6 +38,12 @@
 
 #[cfg(feature = "experimental-vector-stores")]
 mod vector_store;
+/// This crate's HTTP client, carrying the framework `User-Agent` Azure reads
+/// for telemetry and supportability (see
+/// [`agent_framework_azure::azure_user_agent`]).
+pub(crate) fn http_client() -> reqwest::Client {
+    agent_framework_azure::azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
 
 #[cfg(feature = "experimental-vector-stores")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
@@ -132,7 +138,7 @@ impl std::fmt::Debug for AzureAISearchProvider {
 impl AzureAISearchProvider {
     fn build(endpoint: String, index_name: String, auth: SearchAuth) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             endpoint,
             index_name,
             api_version: DEFAULT_API_VERSION.to_string(),

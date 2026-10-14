@@ -280,7 +280,7 @@ impl AzureOpenAIResponsesClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),
@@ -300,7 +300,7 @@ impl AzureOpenAIResponsesClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 endpoint: endpoint.into(),
                 base_url: None,
                 deployment: deployment.into(),
@@ -394,6 +394,18 @@ impl AzureOpenAIResponsesClient {
     /// only what the client adds unprompted.
     pub fn without_implicit_encrypted_reasoning(mut self) -> Self {
         Arc::make_mut(&mut self.inner).implicit_encrypted_reasoning = false;
+        self
+    }
+
+    /// Replace the HTTP client requests go through.
+    ///
+    /// The default is [`azure_http_client`](crate::azure_http_client) for this
+    /// crate, which carries its `User-Agent`. A crate that builds on this
+    /// client passes its own, so requests are attributed to the connector the
+    /// caller actually used. Foundry does this. A caller can also pass a
+    /// client configured with a proxy or timeouts.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        Arc::make_mut(&mut self.inner).http = http;
         self
     }
 
@@ -636,6 +648,16 @@ impl ChatClient for AzureOpenAIResponsesClient {
 
     fn model(&self) -> Option<&str> {
         Some(&self.inner.deployment)
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        // An explicit base URL is where requests actually go.
+        Some(
+            self.inner
+                .base_url
+                .as_deref()
+                .unwrap_or(&self.inner.endpoint),
+        )
     }
 }
 

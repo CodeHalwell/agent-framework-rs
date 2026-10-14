@@ -139,6 +139,13 @@ pub mod attr {
     pub const REQUEST_PRESENCE_PENALTY: &str = "gen_ai.request.presence_penalty";
     pub const REQUEST_STOP_SEQUENCES: &str = "gen_ai.request.stop_sequences";
     pub const CONVERSATION_ID: &str = "gen_ai.conversation.id";
+    /// The host the request went to, parsed from
+    /// [`crate::client::ChatClient::service_url`]: a domain name or IP
+    /// address, never a URL (OpenTelemetry semantic conventions).
+    pub const SERVER_ADDRESS: &str = "server.address";
+    /// The port the request went to: the URL's explicit port, else the
+    /// scheme's default (`443` for `https`, `80` for `http`).
+    pub const SERVER_PORT: &str = "server.port";
     /// Content-capture-gated: the system/instructions prompt, JSON-encoded as
     /// `[{"type":"text","content":...}]` (mirrors
     /// `observability.py:1444-1448`).
@@ -238,6 +245,8 @@ pub fn chat_span(system: &str, model: &str, latest_semconv: bool) -> Span {
         gen_ai.request.presence_penalty = Empty,
         gen_ai.request.stop_sequences = Empty,
         gen_ai.conversation.id = Empty,
+        server.address = Empty,
+        server.port = Empty,
         gen_ai.system_instructions = Empty,
         gen_ai.tool.definitions = Empty,
         error.type = Empty,
@@ -256,6 +265,60 @@ pub fn chat_span(system: &str, model: &str, latest_semconv: bool) -> Span {
     }
     span.record(attr::OTEL_NAME, format!("{} {}", op::CHAT, model).as_str());
     span
+}
+
+/// Split a service URL into the host and port OpenTelemetry's `server.*`
+/// attributes take.
+///
+/// `server.address` is a domain name or IP address, not a URL, so the scheme,
+/// credentials, path and query are dropped and an IPv6 literal loses its
+/// brackets. The port is the URL's explicit one, else the scheme's default; a
+/// bare host with no scheme (Bedrock's regional host) has no port to report.
+/// Returns `None` when no host can be found.
+pub fn server_address_and_port(service_url: &str) -> Option<(String, Option<u16>)> {
+    let (scheme, rest) = match service_url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, service_url),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let (host, port) = if let Some(after) = host_port.strip_prefix('[') {
+        // `[::1]:8080` — the port follows the closing bracket.
+        let (host, tail) = after.split_once(']')?;
+        (host, tail.strip_prefix(':'))
+    } else if host_port.matches(':').count() > 1 {
+        // An unbracketed IPv6 literal (`::1`, `2001:db8::1`): its colons are
+        // part of the address, so there is no port to split off.
+        (host_port, None)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port.and_then(|p| p.parse::<u16>().ok()) {
+        Some(p) => Some(p),
+        None => match scheme.as_deref() {
+            Some("https") => Some(443),
+            Some("http") => Some(80),
+            _ => None,
+        },
+    };
+    Some((host.to_string(), port))
+}
+
+/// Record `server.address` / `server.port` on `span` from a client's
+/// service URL, leaving both off when there is none.
+fn record_server(span: &Span, service_url: Option<&str>) {
+    if let Some((host, port)) = service_url.and_then(server_address_and_port) {
+        span.record(attr::SERVER_ADDRESS, host.as_str());
+        if let Some(port) = port {
+            span.record(attr::SERVER_PORT, i64::from(port));
+        }
+    }
 }
 
 /// Build an `invoke_agent {agent}` span for an agent run.
@@ -597,6 +660,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             &request_model,
             self.config.use_latest_experimental_gen_ai_semconv(),
         );
+        record_server(&span, self.inner.service_url());
         record_request(&span, &options, &self.config);
         if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
@@ -657,6 +721,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
             &request_model,
             self.config.use_latest_experimental_gen_ai_semconv(),
         );
+        record_server(&span, self.inner.service_url());
         record_request(&span, &options, &self.config);
         if self.config.enable_sensitive_data {
             span.record(attr::INPUT_MESSAGES, messages_json(&messages).as_str());
@@ -763,6 +828,10 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
 
     fn model(&self) -> Option<&str> {
         self.inner.model()
+    }
+
+    fn service_url(&self) -> Option<&str> {
+        self.inner.service_url()
     }
 }
 

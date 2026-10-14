@@ -311,12 +311,30 @@ impl ChatClient for AnthropicFoundryClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.base_url)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_framework_azure::StaticTokenCredential;
+
+    #[test]
+    fn service_url_reports_the_deployment_base_url() {
+        // Read by the observability layer as `server.address` / `server.port`.
+        let client = AnthropicFoundryClient::with_token_credential(
+            "https://res.services.ai.azure.com/anthropic",
+            "claude",
+            Arc::new(StaticTokenCredential::new("t")),
+        );
+        assert_eq!(
+            client.service_url(),
+            Some("https://res.services.ai.azure.com/anthropic")
+        );
+    }
 
     fn client() -> AnthropicFoundryClient {
         AnthropicFoundryClient::with_token_credential(

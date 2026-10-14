@@ -366,11 +366,25 @@ impl ChatClient for AnthropicBedrockClient {
     fn model(&self) -> Option<&str> {
         Some(&self.inner.model)
     }
+
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.inner.host)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_regional_host() {
+        // Read by the observability layer as `server.address` / `server.port`.
+        let client = AnthropicBedrockClient::new("ak", "sk", "us-west-2", "claude");
+        assert_eq!(
+            client.service_url(),
+            Some("bedrock-runtime.us-west-2.amazonaws.com")
+        );
+    }
 
     fn client() -> AnthropicBedrockClient {
         AnthropicBedrockClient::new(
