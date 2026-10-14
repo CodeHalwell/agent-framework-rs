@@ -2019,6 +2019,10 @@ impl AgUiChatClient {
 
 #[async_trait]
 impl ChatClient for AgUiChatClient {
+    fn service_url(&self) -> Option<&str> {
+        Some(&self.endpoint)
+    }
+
     async fn get_response(
         &self,
         messages: Vec<Message>,
@@ -2051,6 +2055,14 @@ impl ChatClient for AgUiChatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_url_reports_the_agent_endpoint() {
+        // Read by the observability layer as `server.address` / `server.port`.
+        // The trailing `/` is dropped at construction, as upstream drops it.
+        let client = AgUiChatClient::new("http://localhost:8888/");
+        assert_eq!(client.service_url(), Some("http://localhost:8888"));
+    }
     use agent_framework_core::types::{FunctionArguments, UriContent};
 
     fn convert_all(events: &[Value]) -> Vec<ChatResponseUpdate> {

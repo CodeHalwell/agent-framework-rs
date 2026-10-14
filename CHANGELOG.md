@@ -26,11 +26,12 @@ are the same once cut to 64 characters.
   its port as `server.port` on the `chat` span (upstream #9225, #9222).
   Upstream records the whole URL; this follows the OpenTelemetry semantic
   conventions instead, so these spans group with other network spans. The
-  new `observability::server_address_and_port` does the split. It defaults
-  to `None`, and every
-  wrapper forwards it. It is implemented for OpenAI chat completions and
-  Responses, Ollama, Mistral, Anthropic, Gemini, Foundry Local, Bedrock, and
-  Azure OpenAI chat and Responses.
+  new `observability::server_address_and_port` does the split.
+  `service_url()` defaults to `None`, and every wrapper forwards it. Every
+  built-in chat client implements it: OpenAI chat completions and Responses,
+  Azure OpenAI chat and Responses, Foundry (through its Responses client),
+  Anthropic (direct, on Foundry, on Bedrock and on Vertex), Bedrock, Gemini,
+  Mistral, Ollama, Foundry Local, GitHub Copilot and the AG-UI client.
 - Azure requests now carry a framework `User-Agent`:
   `agent-framework-rust/<version> (<crate>)`. The new
   `agent_framework_azure::{azure_user_agent, azure_http_client,
