@@ -286,6 +286,10 @@ pub fn server_address_and_port(service_url: &str) -> Option<(String, Option<u16>
         // `[::1]:8080` — the port follows the closing bracket.
         let (host, tail) = after.split_once(']')?;
         (host, tail.strip_prefix(':'))
+    } else if host_port.matches(':').count() > 1 {
+        // An unbracketed IPv6 literal (`::1`, `2001:db8::1`): its colons are
+        // part of the address, so there is no port to split off.
+        (host_port, None)
     } else {
         match host_port.rsplit_once(':') {
             Some((host, port)) => (host, Some(port)),

@@ -509,6 +509,9 @@ fn service_urls_split_into_host_and_port() {
             "bedrock-runtime.us-east-1.amazonaws.com",
             Some(("bedrock-runtime.us-east-1.amazonaws.com", None)),
         ),
+        // Unbracketed IPv6 literals are hosts, not `host:port`.
+        ("::1", Some(("::1", None))),
+        ("2001:db8::1", Some(("2001:db8::1", None))),
         ("https:///v1", None),
     ] {
         let got = server_address_and_port(url);
