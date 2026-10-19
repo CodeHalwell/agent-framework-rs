@@ -658,8 +658,36 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
             "filename": DEFAULT_FILENAME,
         })),
         "application" => Some(json!({ "type": "input_file", "file_url": uri })),
+        // Text, Markdown and CSV attachments are files too. There was no arm
+        // for them, so they were dropped without a word. The service infers
+        // a file's type from its name, so inline text gets a matching
+        // extension rather than the bare default.
+        "text" if uri.starts_with("data:") => Some(json!({
+            "type": "input_file",
+            "file_data": uri,
+            "filename": text_filename(media_type),
+        })),
+        "text" => Some(json!({ "type": "input_file", "file_url": uri })),
         _ => None,
     }
+}
+
+/// A filename for an inline `text/*` file, whose extension tells the
+/// service what it holds.
+fn text_filename(media_type: &str) -> String {
+    let subtype = media_type
+        .split(';')
+        .next()
+        .and_then(|t| t.split_once('/'))
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase());
+    let ext = match subtype.as_deref() {
+        Some("markdown") => "md",
+        Some("csv") => "csv",
+        Some("html") => "html",
+        Some("xml") => "xml",
+        _ => "txt",
+    };
+    format!("{DEFAULT_FILENAME}.{ext}")
 }
 
 fn flush_text(out: &mut Vec<Value>, buffered: &mut Vec<Value>, role: &str) {
@@ -955,21 +983,28 @@ fn oauth_consent_content(item: &Value) -> Option<Content> {
     Some(Content::OauthConsentRequest(content))
 }
 
-/// Whether `link` is an `https://` URL with a non-empty host.
+/// Whether `link` is an `https` URL with a real host.
 ///
-/// Hand-rolled rather than pulling in a URL parser for one check: the
-/// scheme is matched case-insensitively (a URL scheme is case-insensitive),
-/// and the authority is whatever precedes the first `/`, `?` or `#`.
+/// Two checks, because each alone has a gap. The literal one — an
+/// `https://` prefix followed by a non-empty authority — accepts
+/// `https://user@/consent` and `https://:443/consent`, whose authority names
+/// no host. The WHATWG parser `reqwest` re-exports (so no new dependency)
+/// rejects those, but repairs `https:///consent` into `https://consent/`, as
+/// a browser would. A consent link only usable after such a repair is not
+/// one to hand a human, so it must pass both.
 fn is_https_url(link: &str) -> bool {
-    let Some(authority) = link
+    let literal = link
         .get(..8)
         .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
         .map(|_| &link[8..])
-    else {
-        return false;
-    };
-    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    !authority[..end].is_empty()
+        .is_some_and(|authority| {
+            let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+            !authority[..end].is_empty()
+        });
+    literal
+        && reqwest::Url::parse(link).is_ok_and(|url| {
+            url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty())
+        })
 }
 
 fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
@@ -2434,6 +2469,41 @@ mod tests {
     // endregion
 
     // region: multimodal input (Responses)
+
+    #[test]
+    fn a_text_file_is_sent_as_a_file() {
+        assert_eq!(
+            content_to_input_part("data:text/plain;base64,aGk=", Some("text/plain")),
+            Some(
+                json!({ "type": "input_file", "file_data": "data:text/plain;base64,aGk=", "filename": "file.txt" })
+            )
+        );
+        assert_eq!(
+            content_to_input_part("data:text/markdown;base64,Iw==", Some("text/markdown")).unwrap()
+                ["filename"],
+            "file.md"
+        );
+        assert_eq!(
+            content_to_input_part("https://example.com/notes.csv", Some("text/csv")),
+            Some(json!({ "type": "input_file", "file_url": "https://example.com/notes.csv" }))
+        );
+    }
+
+    #[test]
+    fn a_consent_link_must_name_a_real_host() {
+        assert!(is_https_url("https://login.example.com/consent?x=1"));
+        assert!(is_https_url("HTTPS://login.example.com/consent"));
+        for bad in [
+            "https://user@/consent",
+            "https://:443/consent",
+            "https:///consent",
+            "http://login.example.com/consent",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(!is_https_url(bad), "{bad} accepted");
+        }
+    }
 
     #[test]
     fn a_remote_file_uri_goes_by_file_url() {

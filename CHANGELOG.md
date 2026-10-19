@@ -73,8 +73,9 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   `Content::OauthConsentRequest` on the non-streaming path, on
   `response.output_item.added`, and from the top-level
   `response.oauth_consent_requested` event (upstream #8976). The consent
-  link is validated as HTTPS with a host before it is surfaced; anything
-  else is dropped with a warning rather than handed to a human to click.
+  link must be HTTPS and parse with a real host before it is surfaced;
+  anything else is dropped with a warning rather than handed to a human to
+  click.
   `OauthConsentRequestContent` gained `id` (the provider's item id, which a
   workflow registers the request under) and the
   `OauthConsentRequestContent::new` / `with_id` constructors.
@@ -135,7 +136,9 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   `file_url`. It put every such URI in `file_data`, which the service reads
   as the file's contents, so `https://example.com/report.pdf` arrived as a
   file whose bytes were that string. Inline `data:` URIs still go in
-  `file_data`.
+  `file_data`. `text/*` files (plain text, Markdown, CSV) are sent as
+  `input_file` too, with a matching filename extension; the converter had
+  no arm for them and dropped them.
 - A Magentic progress ledger naming a participant that does not exist is
   retried against the existing `progress_ledger_retry_count` budget instead
   of ending the run on the first bad answer (upstream #9181). If every
