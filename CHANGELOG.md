@@ -86,9 +86,12 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   accept the attachment. A part with no URL is skipped and the rest of the
   message survives. `input_file` reads every spelling the
   Responses API accepts — `file_url`, `file_data` as a data URL or as bare
-  base64 beside a `filename`, and `file_id` (as hosted-file content, like
-  `input_image`'s `file_id`). A malformed `data:` URL is skipped with a
-  warning rather than passed on as a URI no provider can fetch.
+  base64 beside a `filename`, and `file_id` (as hosted-file content). An
+  `input_image` given by `file_id` is skipped with a warning, as upstream
+  rejects it: a hosted file carries no media type in the core model, so it
+  would reach the provider as an `input_file`. A malformed `data:` URL is
+  skipped with a warning rather than passed on as a URI no provider can
+  fetch.
 
 ### Changed
 
@@ -128,6 +131,11 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   Delivering twice ran the executor twice on one message and double-counted
   toward a fan-in sink's barrier. The runner's selector-free branch
   deduplicates too, since `EdgeGroup::FanOut` can be built by hand.
+- The OpenAI Responses converter sends a remote `application/*` file by
+  `file_url`. It put every such URI in `file_data`, which the service reads
+  as the file's contents, so `https://example.com/report.pdf` arrived as a
+  file whose bytes were that string. Inline `data:` URIs still go in
+  `file_data`.
 - A Magentic progress ledger naming a participant that does not exist is
   retried against the existing `progress_ledger_retry_count` budget instead
   of ending the run on the first bad answer (upstream #9181). If every

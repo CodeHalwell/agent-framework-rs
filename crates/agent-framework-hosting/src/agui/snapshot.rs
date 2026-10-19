@@ -547,26 +547,33 @@ fn overlap_length(stored: &[Value], incoming: &[Value], start: usize) -> usize {
 
 /// Tool calls the server issued on this thread that nothing has answered,
 /// plus the pending interrupts' call ids.
+///
+/// Calls and results are paired in transcript order — a result answers the
+/// nearest preceding unanswered call with its id — so a provider reusing an
+/// id does not let an earlier completed call cancel out a later open one.
 fn unanswered_call_ids<'a>(stored: &'a [Value], interrupts: &'a [Value]) -> HashSet<&'a str> {
-    let mut issued = HashSet::new();
-    let mut answered = HashSet::new();
+    let mut outstanding: Vec<&str> = Vec::new();
     for m in stored {
         if let Some(calls) = m
             .get("toolCalls")
             .or_else(|| m.get("tool_calls"))
             .and_then(Value::as_array)
         {
-            issued.extend(
+            outstanding.extend(
                 calls
                     .iter()
                     .filter_map(|c| c.get("id").and_then(Value::as_str)),
             );
         }
         if role(m) == "tool" {
-            answered.extend(tool_call_id(m));
+            if let Some(id) = tool_call_id(m) {
+                if let Some(i) = outstanding.iter().rposition(|o| *o == id) {
+                    outstanding.remove(i);
+                }
+            }
         }
     }
-    let mut known: HashSet<&str> = issued.difference(&answered).copied().collect();
+    let mut known: HashSet<&str> = outstanding.into_iter().collect();
     for i in interrupts {
         known.extend(i.get("toolCallId").and_then(Value::as_str));
     }
@@ -1025,6 +1032,29 @@ mod tests {
         incoming.push(json!({ "id": "u2", "role": "user", "content": "next" }));
         let merged = reconcile_messages(&stored, &incoming, &[]);
         assert_eq!(ids(&merged[3..]), vec!["u2"]);
+    }
+
+    #[test]
+    fn reconcile_accepts_the_result_for_a_reused_call_id() {
+        // `c1` completed, then a later frontend call reused `c1`. The client's
+        // result for the later call must extend the record.
+        let call = |id: &str| {
+            json!({ "id": id, "role": "assistant", "toolCalls": [
+                { "id": "c1", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+            ]})
+        };
+        let stored = vec![
+            json!({ "id": "u1", "role": "user", "content": "go" }),
+            call("a1"),
+            json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "done" }),
+            call("a2"),
+        ];
+        let incoming = [
+            json!({ "id": "r2", "role": "tool", "toolCallId": "c1", "content": "browser ran it" }),
+        ];
+        let merged = reconcile_messages(&stored, &incoming, &[]);
+        assert_eq!(merged.len(), 5, "the later call's result was dropped");
+        assert_eq!(merged[4]["id"], "r2");
     }
 
     fn pending(id: &str, call_id: &str) -> Value {

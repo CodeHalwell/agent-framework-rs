@@ -649,11 +649,15 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
                 },
             }))
         }
-        "application" => Some(json!({
+        // Inline bytes go in `file_data`; a remote file goes by `file_url`.
+        // Putting a URL in `file_data` makes the service read the URL
+        // itself as the file's contents.
+        "application" if uri.starts_with("data:") => Some(json!({
             "type": "input_file",
             "file_data": uri,
             "filename": DEFAULT_FILENAME,
         })),
+        "application" => Some(json!({ "type": "input_file", "file_url": uri })),
         _ => None,
     }
 }
@@ -2430,6 +2434,20 @@ mod tests {
     // endregion
 
     // region: multimodal input (Responses)
+
+    #[test]
+    fn a_remote_file_uri_goes_by_file_url() {
+        assert_eq!(
+            content_to_input_part("https://example.com/report.pdf", Some("application/pdf")),
+            Some(json!({ "type": "input_file", "file_url": "https://example.com/report.pdf" }))
+        );
+        assert_eq!(
+            content_to_input_part("data:application/pdf;base64,JV", Some("application/pdf")),
+            Some(
+                json!({ "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" })
+            )
+        );
+    }
 
     #[test]
     fn input_image_uri_becomes_input_image_part() {

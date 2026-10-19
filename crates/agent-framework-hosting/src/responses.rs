@@ -512,8 +512,15 @@ fn content_part(part: &Value) -> Option<Content> {
     }
     match part.get("type").and_then(Value::as_str) {
         Some("input_image") => {
-            if let Some(file_id) = non_empty_str(part.get("file_id")) {
-                return Some(Content::HostedFile(HostedFileContent { file_id }));
+            // A hosted file reference carries no media type in the core
+            // model, so forwarding one would turn an image into an
+            // `input_file` downstream. Upstream accepts only `image_url`
+            // here and rejects the rest; this skips it with a warning.
+            if part.get("image_url").is_none() && part.get("file_id").is_some() {
+                tracing::warn!(
+                    "skipping an input_image given by file_id; only image_url is supported"
+                );
+                return None;
             }
             // A `data:` URL already declares what it holds, and that is
             // more than `image/*` tells a converter: Anthropic and Gemini
@@ -992,13 +999,14 @@ mod tests {
                 { "type": "input_file", "file_id": "file-123" },
                 { "type": "input_file", "filename": "report.pdf", "file_data": "JVBERi0=" },
                 { "type": "input_file", "file_data": "data:text/plain;base64,aGk=" },
+                // Not forwarded: it would reach the provider as a file.
                 { "type": "input_image", "file_id": "file-456" },
                 // Malformed: skipped, not passed on as an unfetchable URI.
                 { "type": "input_image", "image_url": "data:image/png,not-base64" },
             ]},
         ]);
         let contents = &responses_to_run(&req(input))[0].contents;
-        assert_eq!(contents.len(), 4, "{contents:?}");
+        assert_eq!(contents.len(), 3, "{contents:?}");
         assert!(matches!(&contents[0], Content::HostedFile(f) if f.file_id == "file-123"));
         let Content::Data(pdf) = &contents[1] else {
             panic!("{contents:?}")
@@ -1008,7 +1016,6 @@ mod tests {
         assert!(
             matches!(&contents[2], Content::Data(d) if d.media_type.as_deref() == Some("text/plain"))
         );
-        assert!(matches!(&contents[3], Content::HostedFile(f) if f.file_id == "file-456"));
     }
 
     #[test]
