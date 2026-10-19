@@ -36,6 +36,8 @@ bytes = { workspace = true, optional = true }
 agui-client = ["dep:reqwest", "dep:base64", "dep:bytes"]
 
 [dev-dependencies]
+# The AG-UI snapshot tests drive a real `ToolApprovalAgent`.
+agent-framework-core = { workspace = true, features = ["experimental-harness"] }
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 
 use agent_framework_core::types::{
     AgentResponse, Content, DataContent, FinishReason, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Message, Role, TextContent, UriContent, UsageDetails,
+    FunctionResultContent, HostedFileContent, Message, Role, TextContent, UriContent, UsageDetails,
 };
 
 /// `POST /v1/responses` request — a subset of DevUI's `AgentFrameworkRequest`
@@ -512,28 +512,33 @@ fn content_part(part: &Value) -> Option<Content> {
     }
     match part.get("type").and_then(Value::as_str) {
         Some("input_image") => {
-            let uri = url_field(part.get("image_url"))?;
+            if let Some(file_id) = non_empty_str(part.get("file_id")) {
+                return Some(Content::HostedFile(HostedFileContent { file_id }));
+            }
             // A `data:` URL already declares what it holds, and that is
             // more than `image/*` tells a converter: Anthropic and Gemini
             // both need the concrete type to accept the attachment. A
             // remote URL declares nothing, so it keeps the generic type.
-            Some(match DataContent::from_uri(uri.clone()) {
-                Ok(data) => Content::Data(data),
-                Err(_) => Content::Uri(UriContent {
-                    uri,
-                    media_type: "image/*".to_string(),
-                }),
-            })
+            attachment(url_field(part.get("image_url"))?, "image/*")
         }
         Some("input_file") => {
-            let uri = url_field(part.get("file_url").or_else(|| part.get("file_data")))?;
-            Some(match DataContent::from_uri(uri.clone()) {
-                Ok(data) => Content::Data(data),
-                Err(_) => Content::Uri(UriContent {
-                    uri,
-                    media_type: "application/octet-stream".to_string(),
-                }),
-            })
+            if let Some(file_id) = non_empty_str(part.get("file_id")) {
+                return Some(Content::HostedFile(HostedFileContent { file_id }));
+            }
+            if let Some(url) = url_field(part.get("file_url")) {
+                return attachment(url, "application/octet-stream");
+            }
+            // `file_data` is a data URL, or — as the Responses API also
+            // accepts — bare base64 beside a `filename`.
+            let data = non_empty_str(part.get("file_data"))?;
+            if data.starts_with("data:") {
+                return attachment(data, "application/octet-stream");
+            }
+            let media_type = media_type_for_filename(part.get("filename").and_then(Value::as_str));
+            Some(Content::Data(DataContent {
+                uri: format!("data:{media_type};base64,{data}"),
+                media_type: Some(media_type.to_string()),
+            }))
         }
         // A replayed assistant turn can carry a refusal, which is not the
         // answer and must not read as one.
@@ -554,12 +559,57 @@ fn content_part(part: &Value) -> Option<Content> {
 /// object with a `url` key.
 fn url_field(value: Option<&Value>) -> Option<String> {
     let value = value?;
-    let uri = match value {
-        Value::String(s) => s.as_str(),
-        Value::Object(_) => value.get("url").and_then(Value::as_str)?,
-        _ => return None,
-    };
-    (!uri.is_empty()).then(|| uri.to_string())
+    match value {
+        Value::String(_) => non_empty_str(Some(value)),
+        Value::Object(_) => non_empty_str(value.get("url")),
+        _ => None,
+    }
+}
+
+fn non_empty_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// An attachment at `uri`: data content for a `data:` URL, which carries its
+/// own media type, or a URI reference typed `default_media_type`. A
+/// malformed `data:` URL is skipped with a warning rather than passed on as
+/// a "URI" no provider can fetch.
+fn attachment(uri: String, default_media_type: &str) -> Option<Content> {
+    if uri.starts_with("data:") {
+        return match DataContent::from_uri(uri) {
+            Ok(data) => Some(Content::Data(data)),
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping a malformed data URL in a Responses content part");
+                None
+            }
+        };
+    }
+    Some(Content::Uri(UriContent {
+        uri,
+        media_type: default_media_type.to_string(),
+    }))
+}
+
+/// A media type for bare base64 file data, from its filename's extension.
+fn media_type_for_filename(filename: Option<&str>) -> &'static str {
+    let ext = filename
+        .and_then(|f| f.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
 }
 
 fn role_from(role: &str) -> Role {
@@ -933,6 +983,32 @@ mod tests {
             panic!("expected a uri content, got {:?}", messages[0].contents);
         };
         assert_eq!(file.uri, "https://example.com/report.pdf");
+    }
+
+    #[test]
+    fn responses_to_run_reads_every_file_part_spelling() {
+        let input = serde_json::json!([
+            { "role": "user", "content": [
+                { "type": "input_file", "file_id": "file-123" },
+                { "type": "input_file", "filename": "report.pdf", "file_data": "JVBERi0=" },
+                { "type": "input_file", "file_data": "data:text/plain;base64,aGk=" },
+                { "type": "input_image", "file_id": "file-456" },
+                // Malformed: skipped, not passed on as an unfetchable URI.
+                { "type": "input_image", "image_url": "data:image/png,not-base64" },
+            ]},
+        ]);
+        let contents = &responses_to_run(&req(input))[0].contents;
+        assert_eq!(contents.len(), 4, "{contents:?}");
+        assert!(matches!(&contents[0], Content::HostedFile(f) if f.file_id == "file-123"));
+        let Content::Data(pdf) = &contents[1] else {
+            panic!("{contents:?}")
+        };
+        assert_eq!(pdf.uri, "data:application/pdf;base64,JVBERi0=");
+        assert_eq!(pdf.media_type.as_deref(), Some("application/pdf"));
+        assert!(
+            matches!(&contents[2], Content::Data(d) if d.media_type.as_deref() == Some("text/plain"))
+        );
+        assert!(matches!(&contents[3], Content::HostedFile(f) if f.file_id == "file-456"));
     }
 
     #[test]

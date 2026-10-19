@@ -721,7 +721,7 @@ impl MagenticManager for StandardMagenticManager {
                         return Ok(ledger);
                     }
                     last_error = Some(Error::Workflow(format!(
-                        "progress ledger named unknown next speaker '{next}';                          valid names: {names_csv}"
+                        "progress ledger named unknown next speaker '{next}'; valid names: {names_csv}"
                     )));
                     unknown_speaker_ledger = Some(ledger);
                 }

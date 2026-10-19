@@ -104,16 +104,6 @@ from the roadmap, not from this file.
   session.
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
-- **AG-UI thread snapshot persistence.** The router is stateless: inbound
-  `state` is accepted and ignored, nothing is persisted per thread, and no
-  `STATE_SNAPSHOT`/`STATE_DELTA`/`MESSAGES_SNAPSHOT` event is emitted. So
-  multi-turn AG-UI state, and resuming a HITL interrupt across requests,
-  are not supported. Whoever builds a store should read upstream #9413 and
-  #9316 first: a thread id identifies a thread but does not authorize
-  access to it, so the store wants an explicit authorization scope rather
-  than the client's own `threadId`, and the client's `state` must not be
-  able to write into the namespaces the framework keeps its approval
-  bookkeeping in.
 - **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
   revision it was written against.
 - **`SequentialBuilder::ensure_trailing_user_turn`** (upstream #8779): an
