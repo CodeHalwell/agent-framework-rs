@@ -627,6 +627,10 @@ async fn run_with_snapshots(
                 run_finished(&thread_id, &run_id),
             ]);
         };
+        // Under the thread lock: a resume spends its interrupts in one save
+        // and records the run in a later one, and a hydration between the
+        // two would show neither the pending approval nor its outcome.
+        let _guard = state.thread_locks.lock(&scope, &thread_id).await;
         let stored = match store.get(&scope, &thread_id).await {
             Ok(stored) => stored.unwrap_or_default(),
             Err(e) => {

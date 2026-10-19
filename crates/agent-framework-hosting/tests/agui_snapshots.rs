@@ -1107,3 +1107,109 @@ async fn a_turn_past_pending_approvals_is_refused_not_lost() {
     .await;
     assert_eq!(wired.lock().unwrap().len(), 1);
 }
+
+/// The bank client, slow once the approved call has run, so a resume
+/// stays in flight long enough for a concurrent hydration to arrive.
+struct SlowAfterToolClient;
+
+#[async_trait]
+impl ChatClient for SlowAfterToolClient {
+    async fn get_response(
+        &self,
+        messages: Vec<Message>,
+        options: ChatOptions,
+    ) -> Result<ChatResponse> {
+        if messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .any(|c| matches!(c, Content::FunctionResult(_)))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        BankClient.get_response(messages, options).await
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<Message>,
+        options: ChatOptions,
+    ) -> Result<ChatStream> {
+        let resp = self.get_response(messages, options).await?;
+        let updates: Vec<Result<ChatResponseUpdate>> = resp
+            .messages
+            .into_iter()
+            .map(|m| {
+                Ok(ChatResponseUpdate {
+                    contents: m.contents,
+                    role: Some(m.role),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+#[tokio::test]
+async fn hydration_during_a_resume_sees_the_finished_thread() {
+    // A resume spends its interrupts in one save and records the run in a
+    // later one. Hydrating between the two used to show neither the pending
+    // approval nor its outcome.
+    let wired = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(InMemoryAgUiThreadSnapshotStore::new());
+    let agent = Agent::builder(SlowAfterToolClient)
+        .name("bank")
+        .tool(wire_tool(wired.clone()))
+        .build();
+    let app = scoped_router(Arc::new(agent), store.clone());
+
+    let (_, first) = post_as(
+        &app,
+        Some("alice"),
+        json!({ "threadId": "t", "messages": [{ "id": "u1", "role": "user", "content": "send 10" }] }),
+    )
+    .await;
+    let id = interrupt_id(&first);
+
+    let resume = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            post_as(
+                &app,
+                Some("alice"),
+                json!({ "threadId": "t", "messages": [],
+                        "resume": [{ "interruptId": id, "payload": { "approved": true } }] }),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (_, hydrated) = post_as(
+        &app,
+        Some("alice"),
+        json!({ "threadId": "t", "messages": [] }),
+    )
+    .await;
+    resume.await.unwrap();
+
+    let finished = hydrated
+        .iter()
+        .find(|e| e["type"] == "RUN_FINISHED")
+        .unwrap();
+    let pending = finished.get("outcome").is_some();
+    let completed = hydrated
+        .iter()
+        .find(|e| e["type"] == "MESSAGES_SNAPSHOT")
+        .is_some_and(|s| {
+            s["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "tool")
+        });
+    assert!(
+        pending || completed,
+        "hydration saw a thread with neither the approval nor its outcome: {:?}",
+        event_types(&hydrated)
+    );
+}

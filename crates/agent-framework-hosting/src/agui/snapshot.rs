@@ -597,11 +597,17 @@ fn unanswered_call_ids<'a>(
 /// plus the function call it approves, which a resume rebuilds the approval
 /// from.
 pub(crate) fn approval_interrupt(ar: &FunctionApprovalRequestContent) -> Value {
-    let arguments = ar
-        .function_call
-        .parse_arguments()
-        .map(|m| Value::Object(m.into_iter().collect()))
-        .unwrap_or(Value::Null);
+    // Arguments that do not parse are kept as the raw string, not dropped:
+    // a resume rebuilds the call from this record, and `null` would come
+    // back as no arguments at all — turning a call the invocation loop
+    // would have refused into one it runs with an empty argument map.
+    let arguments = match ar.function_call.parse_arguments() {
+        Ok(m) => Value::Object(m.into_iter().collect()),
+        Err(_) => match &ar.function_call.arguments {
+            Some(FunctionArguments::Raw(raw)) => Value::String(raw.clone()),
+            _ => Value::Null,
+        },
+    };
     json!({
         "id": ar.id,
         "reason": "tool_call",
@@ -1120,6 +1126,33 @@ mod tests {
         let fc = &resolved[0].response.function_call;
         assert_eq!(fc.id.as_deref(), Some("af-call-1"));
         assert_eq!(fc.protected_data.as_deref(), Some("c2ln"));
+    }
+
+    #[test]
+    fn a_resumed_call_keeps_arguments_that_do_not_parse() {
+        // Approving a malformed call must not run it with no arguments.
+        let interrupt = approval_interrupt(&FunctionApprovalRequestContent {
+            id: "req_1".into(),
+            function_call: FunctionCallContent::new(
+                "c1",
+                "transfer",
+                Some(FunctionArguments::Raw(r#"{"amount": 10"#.into())),
+            ),
+        });
+        let resolved = resolve_resume(
+            &json!([{ "interruptId": "req_1", "payload": { "approved": true } }]),
+            &[interrupt],
+        )
+        .unwrap();
+        let fc = &resolved[0].response.function_call;
+        assert_eq!(
+            fc.arguments,
+            Some(FunctionArguments::Raw(r#"{"amount": 10"#.into()))
+        );
+        assert!(
+            fc.parse_arguments().is_err(),
+            "the resumed call must still be refused"
+        );
     }
 
     fn pending(id: &str, call_id: &str) -> Value {
