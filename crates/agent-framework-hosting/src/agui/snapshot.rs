@@ -35,8 +35,13 @@
 //!   standing approval for a tool, or plant an approval response for the
 //!   function-invocation loop to run, on a brand-new thread where nothing
 //!   is stored yet;
-//! - a session key the server wrote — present in the restored session but
-//!   never part of the client's shared state — cannot be overwritten.
+//! - a session key the server owns cannot be overwritten. The snapshot
+//!   tracks which keys the client owns — ones it wrote that the server has
+//!   not since changed — and every other key in the restored session is
+//!   the server's. Keys under the framework's reserved prefixes (`__af_`,
+//!   `__ag_ui`) are refused outright, so a client cannot seed, say, a
+//!   parked function-invocation budget on a fresh thread before the server
+//!   ever writes it.
 //!
 //! # Interrupts are bound to their thread
 //!
@@ -114,6 +119,14 @@ pub struct AgUiThreadSnapshot {
     /// The agent session's private state. Never replayed to the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_state: Option<Value>,
+    /// The session-state keys the client owns: keys it wrote that the
+    /// server has not since taken over. Private, like `session_state`.
+    ///
+    /// Tracked here rather than read off the shared state, which keeps
+    /// every key the client ever sent — including ones the merge refused —
+    /// and so cannot say who owns a key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_state_keys: Vec<String>,
 }
 
 /// Storage for the latest [`AgUiThreadSnapshot`] of each thread, keyed by
@@ -275,29 +288,36 @@ pub(crate) enum AuthorizationMode {
     SingleUser,
 }
 
+/// Session-state key prefixes the framework reserves. A client key under
+/// one is refused even on a fresh thread: the function-invocation loop
+/// reads `__af_function_invocation_budget__` at the start of every run, so
+/// a client-seeded one would reset `max_function_calls` and
+/// `max_duration_seconds` before the server ever wrote its own.
+pub const RESERVED_STATE_KEY_PREFIXES: [&str; 2] = ["__af_", "__ag_ui"];
+
 /// Merge client shared state into `session`, keeping server-owned state out
 /// of the client's reach (upstream #9368, tightened).
 ///
-/// `client_keys` are the keys of the thread's stored *shared* state — the
-/// keys the client has written before. A key is refused when:
+/// `client_keys` are the session keys the client owns (see
+/// [`AgUiThreadSnapshot::client_state_keys`]). A key is refused when:
 ///
+/// - it is under a [`RESERVED_STATE_KEY_PREFIXES`] prefix;
 /// - its client value is shaped like tool-approval state (any
 ///   [`TOOL_APPROVAL_STATE_FIELDS`] field, empty or not). By shape, because
 ///   a tool-approval agent keeps its state under an application-chosen
 ///   `source_id` the router cannot know;
-/// - the restored session holds tool-approval state under it, whoever wrote
-///   the key first;
-/// - the restored session holds it and the client never wrote it: the
-///   server did, so it is the server's.
+/// - the restored session holds tool-approval state under it;
+/// - the restored session holds it and the client does not own it.
 ///
-/// Returns the client keys that were ignored, for logging.
+/// Returns `(accepted, ignored)` client keys; the accepted ones feed
+/// [`owned_client_keys`] after the run.
 pub(crate) fn merge_client_state(
     session: &AgentSession,
     client_state: &Value,
     client_keys: &HashSet<String>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let Some(client) = client_state.as_object() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let server_owned: HashSet<String> = session
         .state
@@ -306,16 +326,45 @@ pub(crate) fn merge_client_state(
         .filter(|(k, v)| is_tool_approval_state(v) || !client_keys.contains(k))
         .map(|(k, _)| k)
         .collect();
+    let mut accepted = Vec::new();
     let mut ignored = Vec::new();
     for (key, value) in client {
-        if server_owned.contains(key) || is_tool_approval_state(value) {
+        let reserved = RESERVED_STATE_KEY_PREFIXES
+            .iter()
+            .any(|p| key.starts_with(p));
+        if reserved || server_owned.contains(key) || is_tool_approval_state(value) {
             ignored.push(key.clone());
             continue;
         }
         session.state.insert(key.clone(), value.clone());
+        accepted.push(key.clone());
     }
+    accepted.sort();
     ignored.sort();
-    ignored
+    (accepted, ignored)
+}
+
+/// The client-owned keys after a run: of the keys the client owned before
+/// and the ones it wrote this turn, those whose session value is still the
+/// value the client wrote. A key the server changed during the run — a
+/// middleware parking state under a name the client happened to send — is
+/// the server's from then on.
+pub(crate) fn owned_client_keys(
+    candidates: impl IntoIterator<Item = String>,
+    client_values: Option<&Value>,
+    session: &AgentSession,
+) -> Vec<String> {
+    let client_values = client_values.and_then(Value::as_object);
+    let mut owned: Vec<String> = candidates
+        .into_iter()
+        .filter(|k| {
+            let written = client_values.and_then(|c| c.get(k));
+            written.is_some() && session.state.get(k).as_ref() == written
+        })
+        .collect();
+    owned.sort();
+    owned.dedup();
+    owned
 }
 
 /// Whether a value is shaped like a tool-approval agent's state: an object
@@ -326,14 +375,6 @@ fn is_tool_approval_state(value: &Value) -> bool {
             .iter()
             .any(|f| o.contains_key(*f))
     })
-}
-
-/// The keys of a stored shared state.
-pub(crate) fn state_keys(state: Option<&Value>) -> HashSet<String> {
-    state
-        .and_then(Value::as_object)
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default()
 }
 
 /// Overlay request state onto stored state: request keys win, stored keys
@@ -820,9 +861,10 @@ mod tests {
         // happens to use, on a thread where nothing is stored yet (upstream
         // #9368, plus the two fields upstream does not check).
         let session = AgentSession::new();
-        let ignored = merge_client_state(
+        let (_, ignored) = merge_client_state(
             &session,
             &json!({
+                "__af_function_invocation_budget__": { "executed": 0 },
                 "tool_approval": { "rules": [{ "tool_name": "delete_everything" }] },
                 "custom_ns": { "collected_approval_responses": [["anything"]] },
                 // Replayed into the inner run as input, where the
@@ -837,7 +879,14 @@ mod tests {
         );
         assert_eq!(
             ignored,
-            vec!["custom_ns", "empty", "held", "standing", "tool_approval"]
+            vec![
+                "__af_function_invocation_budget__",
+                "custom_ns",
+                "empty",
+                "held",
+                "standing",
+                "tool_approval"
+            ]
         );
         for key in ["tool_approval", "custom_ns", "held", "standing", "empty"] {
             assert!(
@@ -856,7 +905,7 @@ mod tests {
         let server = json!({ "rules": [{ "tool_name": "search" }] });
         session.state.insert("approvals", server.clone());
         let client_keys = HashSet::from(["approvals".to_string()]);
-        let ignored = merge_client_state(&session, &json!({ "approvals": 1 }), &client_keys);
+        let (_, ignored) = merge_client_state(&session, &json!({ "approvals": 1 }), &client_keys);
         assert_eq!(ignored, vec!["approvals"]);
         assert_eq!(session.state.get("approvals"), Some(server));
     }
@@ -871,17 +920,31 @@ mod tests {
             .insert("agent_mode", json!({ "current_mode": "plan" }));
         session.state.insert("theme", json!("light"));
         let client_keys = HashSet::from(["theme".to_string()]);
-        let ignored = merge_client_state(
+        let (accepted, ignored) = merge_client_state(
             &session,
             &json!({ "agent_mode": { "current_mode": "execute" }, "theme": "dark" }),
             &client_keys,
         );
         assert_eq!(ignored, vec!["agent_mode"]);
+        assert_eq!(accepted, vec!["theme"]);
         assert_eq!(
             session.state.get("agent_mode"),
             Some(json!({ "current_mode": "plan" }))
         );
         assert_eq!(session.state.get("theme"), Some(json!("dark")));
+    }
+
+    #[test]
+    fn a_key_the_server_changes_stops_being_the_clients() {
+        // The client sends `parked` on the turn that pauses; a middleware
+        // then writes its own value there. Ownership must follow the
+        // server's write, or the next turn could overwrite it.
+        let session = AgentSession::new();
+        let client = json!({ "parked": 1, "theme": "dark" });
+        let (accepted, _) = merge_client_state(&session, &client, &HashSet::new());
+        session.state.insert("parked", json!({ "executed": 3 }));
+        let owned = owned_client_keys(accepted, Some(&client), &session);
+        assert_eq!(owned, vec!["theme"]);
     }
 
     #[test]

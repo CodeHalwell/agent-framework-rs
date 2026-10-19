@@ -974,3 +974,99 @@ fn the_protected_field_list_matches_tool_approval_state() {
         );
     }
 }
+
+/// An agent that parks its own value under `parked` during every run, as a
+/// middleware does with server-owned state, and records what it found.
+#[derive(Default)]
+struct ParkingAgent {
+    found: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl SupportsAgentRun for ParkingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        let session = session.expect("snapshot runs pass a session");
+        self.found
+            .lock()
+            .unwrap()
+            .push(json!(session.state.snapshot()));
+        session
+            .state
+            .insert("parked", json!({ "executed": 3, "server": true }));
+        Ok(AgentResponse {
+            messages: vec![Message::assistant("ok")],
+            ..Default::default()
+        })
+    }
+
+    fn id(&self) -> &str {
+        "parking"
+    }
+}
+
+#[tokio::test]
+async fn a_key_the_server_takes_over_cannot_be_reclaimed_by_the_client() {
+    // The client seeds `parked` on the turn that pauses; the server then
+    // writes its own value there. Shared state still lists the key, but
+    // ownership follows the server's write, so the next turn cannot
+    // overwrite it — the shape a parked function-invocation budget has.
+    let agent = Arc::new(ParkingAgent::default());
+    let store = Arc::new(InMemoryAgUiThreadSnapshotStore::new());
+    let app = scoped_router(agent.clone(), store.clone());
+
+    for (id, parked) in [
+        ("u1", json!({ "executed": 0 })),
+        ("u2", json!({ "executed": 0 })),
+    ] {
+        post_as(
+            &app,
+            Some("alice"),
+            json!({
+                "threadId": "t",
+                "state": { "parked": parked, "theme": "dark" },
+                "messages": [{ "id": id, "role": "user", "content": "x" }],
+            }),
+        )
+        .await;
+    }
+    let found = agent.found.lock().unwrap();
+    assert_eq!(
+        found[1]["parked"],
+        json!({ "executed": 3, "server": true }),
+        "the client reclaimed a key the server took over: {}",
+        found[1]
+    );
+    assert_eq!(found[1]["theme"], "dark");
+}
+
+#[tokio::test]
+async fn reserved_framework_keys_are_refused_on_a_fresh_thread() {
+    // The function-invocation loop reads its parked budget at the start of
+    // every run; a client-seeded one would reset the limits on turn one.
+    let agent = Arc::new(ParkingAgent::default());
+    let store = Arc::new(InMemoryAgUiThreadSnapshotStore::new());
+    let app = scoped_router(agent.clone(), store.clone());
+    post_as(
+        &app,
+        Some("alice"),
+        json!({
+            "threadId": "fresh",
+            "state": {
+                "__af_function_invocation_budget__": { "executed": 0, "started_millis": 99999999999999u64 },
+                "__ag_ui_anything": 1,
+            },
+            "messages": [{ "id": "u1", "role": "user", "content": "x" }],
+        }),
+    )
+    .await;
+    let found = &agent.found.lock().unwrap()[0];
+    assert!(
+        found.get("__af_function_invocation_budget__").is_none(),
+        "{found}"
+    );
+    assert!(found.get("__ag_ui_anything").is_none(), "{found}");
+}

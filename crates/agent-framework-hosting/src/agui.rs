@@ -730,7 +730,7 @@ async fn run_with_snapshots(
         transcript.push(json!({ "id": util::msg_id(), "role": "assistant", "toolCalls": calls }));
     }
 
-    let client_keys = snapshot::state_keys(stored.state.as_ref());
+    let client_keys: HashSet<String> = stored.client_state_keys.iter().cloned().collect();
     let effective_state = snapshot::effective_state(stored.state.as_ref(), input.state.as_ref());
 
     // The thread's session, restored without its service conversation id:
@@ -743,8 +743,11 @@ async fn run_with_snapshots(
         }),
         None => AgentSession::new(),
     };
+    let mut accepted_keys = Vec::new();
     if let Some(client_state) = &input.state {
-        let ignored = snapshot::merge_client_state(&session, client_state, &client_keys);
+        let (accepted, ignored) =
+            snapshot::merge_client_state(&session, client_state, &client_keys);
+        accepted_keys = accepted;
         if !ignored.is_empty() {
             tracing::warn!(
                 keys = ?ignored,
@@ -817,6 +820,11 @@ async fn run_with_snapshots(
                 .iter()
                 .map(snapshot::approval_interrupt)
                 .collect();
+            let client_state_keys = snapshot::owned_client_keys(
+                client_keys.into_iter().chain(accepted_keys),
+                effective_state.as_ref(),
+                &session_handle,
+            );
             let mut session_state = session_handle.to_dict();
             session_state["service_session_id"] = Value::Null;
             // Saved before the closing events, so a client that hydrates on
@@ -827,6 +835,7 @@ async fn run_with_snapshots(
                 state: effective_state,
                 interrupt: (!interrupts.is_empty()).then(|| interrupts.clone()),
                 session_state: Some(session_state),
+                client_state_keys,
             };
             if let Err(e) = store.save(&scope, &thread_id, saved).await {
                 tracing::error!(error = %e, "AG-UI snapshot save failed; keeping the previous snapshot");
@@ -951,14 +960,28 @@ impl AgUiFraming {
     /// the run paused on for approval is left out — it is the interrupt, and
     /// a resume records it once it is answered.
     fn transcript(&self) -> Vec<Value> {
-        let pending: HashSet<&str> = self
+        // Each pending approval is for the latest declaration of its call id:
+        // a provider can reuse an id within one run, and dropping an earlier,
+        // completed declaration would orphan its result.
+        let mut unmatched: Vec<&str> = self
             .approvals
             .iter()
             .map(|a| a.function_call.call_id.as_str())
             .collect();
+        let mut skip: HashSet<(usize, usize)> = HashSet::new();
+        for (si, segment) in self.segments.iter().enumerate().rev() {
+            if let Segment::Calls(calls) = segment {
+                for (ci, (id, _, _)) in calls.iter().enumerate().rev() {
+                    if let Some(pos) = unmatched.iter().position(|p| *p == id.as_str()) {
+                        unmatched.swap_remove(pos);
+                        skip.insert((si, ci));
+                    }
+                }
+            }
+        }
         let mut first_text = true;
         let mut out = Vec::new();
-        for segment in &self.segments {
+        for (si, segment) in self.segments.iter().enumerate() {
             match segment {
                 Segment::Text(text) => {
                     let id = match (&self.message_id, first_text) {
@@ -971,8 +994,9 @@ impl AgUiFraming {
                 Segment::Calls(calls) => {
                     let calls: Vec<Value> = calls
                         .iter()
-                        .filter(|(id, _, _)| !pending.contains(id.as_str()))
-                        .map(|(id, name, args)| tool_call_message_entry(id, name, args))
+                        .enumerate()
+                        .filter(|(ci, _)| !skip.contains(&(si, *ci)))
+                        .map(|(_, (id, name, args))| tool_call_message_entry(id, name, args))
                         .collect();
                     if !calls.is_empty() {
                         out.push(
@@ -1367,4 +1391,47 @@ fn error_response(status: axum::http::StatusCode, message: String) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(id: &str) -> Content {
+        Content::FunctionCall(FunctionCallContent::new(
+            id,
+            "f",
+            Some(FunctionArguments::Raw("{}".into())),
+        ))
+    }
+
+    #[test]
+    fn a_reused_call_id_keeps_the_completed_declaration() {
+        // A provider reused `c1`: the first call completed, the second is
+        // paused for approval. Only the paused declaration is left out of
+        // the transcript; the completed one keeps its result company.
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        framing.push_contents(
+            &[
+                call("c1"),
+                Content::FunctionResult(FunctionResultContent::new("c1", Some(json!("done")))),
+                call("c1"),
+                Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                    id: "req_1".into(),
+                    function_call: FunctionCallContent::new("c1", "f", None),
+                }),
+            ],
+            &mut out,
+        );
+        let transcript = framing.transcript();
+        let declared: Vec<&Value> = transcript
+            .iter()
+            .filter_map(|m| m.get("toolCalls"))
+            .flat_map(|c| c.as_array().unwrap())
+            .collect();
+        assert_eq!(declared.len(), 1, "{transcript:?}");
+        assert_eq!(transcript[0]["toolCalls"][0]["id"], "c1");
+        assert_eq!(transcript[1]["role"], "tool");
+    }
 }

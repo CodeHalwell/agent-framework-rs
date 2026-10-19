@@ -47,7 +47,13 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
     fields, where upstream checks three. `held_messages` is replayed into
     the inner run as input, so the two upstream misses let a client plant
     an approval response and run a tool unprompted. A session key the
-    server wrote, such as an agent's mode, cannot be overwritten either.
+    server owns, such as an agent's mode, cannot be overwritten either:
+    the snapshot tracks which keys the client owns (ones it wrote that the
+    server has not since changed), and keys under the framework's reserved
+    `__af_` / `__ag_ui` prefixes are refused outright — the
+    function-invocation loop reads its parked budget at the start of every
+    run, so a client-seeded one would reset `max_function_calls` and
+    `max_duration_seconds` on a fresh thread.
   - **Interrupts are bound to their thread** (#9365). A resume must answer
     exactly the interrupts stored for that scope and thread, or the run
     ends with `RUN_ERROR` and an `APPROVAL_RESUME_*` code. The approved
