@@ -411,11 +411,7 @@ pub(crate) fn effective_state(stored: Option<&Value>, request: Option<&Value>) -
 ///
 /// A thread with no stored history takes the incoming messages as they are,
 /// as upstream does: they are the conversation, as in the stateless router.
-pub(crate) fn reconcile_messages(
-    stored: &[Value],
-    incoming: &[Value],
-    stored_interrupts: &[Value],
-) -> Vec<Value> {
+pub(crate) fn reconcile_messages(stored: &[Value], incoming: &[Value]) -> Vec<Value> {
     if stored.is_empty() || incoming.is_empty() {
         let mut out = stored.to_vec();
         out.extend(incoming.iter().cloned());
@@ -454,7 +450,7 @@ pub(crate) fn reconcile_messages(
     };
     // Each accepted result spends one open call: a browser submitting the
     // same result twice must not store the second as an orphan.
-    let mut open = unanswered_call_ids(stored, stored_interrupts);
+    let mut open = unanswered_call_ids(stored);
     let mut out = stored.to_vec();
     for message in suffix {
         let trusted = match role(message).as_str() {
@@ -552,16 +548,18 @@ fn overlap_length(stored: &[Value], incoming: &[Value], start: usize) -> usize {
 }
 
 /// Tool calls the server issued on this thread that nothing has answered,
-/// plus the pending interrupts' call ids, each with how many occurrences
-/// are open.
+/// each with how many occurrences are open.
+///
+/// A pending approval's call is deliberately not among them. Its
+/// declaration is left out of the stored transcript until the approval is
+/// answered, so a client-supplied result for it would be stored with no call
+/// before it — and would be output for a call the user has not yet allowed
+/// to run. Upstream admits these; its transcript keeps the declaration.
 ///
 /// Calls and results are paired in transcript order — a result answers the
 /// nearest preceding unanswered call with its id — so a provider reusing an
 /// id does not let an earlier completed call cancel out a later open one.
-fn unanswered_call_ids<'a>(
-    stored: &'a [Value],
-    interrupts: &'a [Value],
-) -> HashMap<&'a str, usize> {
+fn unanswered_call_ids(stored: &[Value]) -> HashMap<&str, usize> {
     let mut outstanding: Vec<&str> = Vec::new();
     for m in stored {
         if let Some(calls) = m
@@ -584,10 +582,7 @@ fn unanswered_call_ids<'a>(
         }
     }
     let mut open: HashMap<&str, usize> = HashMap::new();
-    let interrupt_calls = interrupts
-        .iter()
-        .filter_map(|i| i.get("toolCallId").and_then(Value::as_str));
-    for id in outstanding.into_iter().chain(interrupt_calls) {
+    for id in outstanding {
         *open.entry(id).or_default() += 1;
     }
     open
@@ -683,14 +678,19 @@ pub(crate) fn resolve_resume(
         // An entry may name the interrupt by its tool call id instead, a
         // spelling upstream accepts; either way it is keyed by the
         // interrupt's own id from here on.
+        // Two pending approvals can share a reused tool call id, so the
+        // alias takes the first one, in stored order, not already answered.
         let Some((interrupt_id, interrupt)) = pending_by_id
             .get_key_value(requested_id.as_str())
+            .map(|(id, i)| (id.to_string(), *i))
             .or_else(|| {
-                pending_by_id.iter().find(|(_, i)| {
-                    i.get("toolCallId").and_then(Value::as_str) == Some(requested_id.as_str())
+                pending.iter().find_map(|i| {
+                    let id = i.get("id").and_then(Value::as_str)?;
+                    let by_call =
+                        i.get("toolCallId").and_then(Value::as_str) == Some(requested_id.as_str());
+                    (by_call && !seen.contains(id)).then(|| (id.to_string(), i))
                 })
             })
-            .map(|(id, i)| (id.to_string(), *i))
         else {
             return Err(ResumeError {
                 message: format!(
@@ -1014,7 +1014,7 @@ mod tests {
             json!({ "id": "a1", "role": "assistant", "content": "hello" }),
             json!({ "id": "u2", "role": "user", "content": "again" }),
         ];
-        let merged = reconcile_messages(&stored(), &incoming, &[]);
+        let merged = reconcile_messages(&stored(), &incoming);
         assert_eq!(ids(&merged), vec!["u1", "a1", "u2"]);
         assert_eq!(merged[0]["content"], "hi", "the stored turn wins");
     }
@@ -1027,7 +1027,7 @@ mod tests {
             json!({ "role": "assistant", "content": "hello" }),
             json!({ "role": "user", "content": "again" }),
         ];
-        let merged = reconcile_messages(&stored(), &incoming, &[]);
+        let merged = reconcile_messages(&stored(), &incoming);
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[2]["content"], "again");
     }
@@ -1037,7 +1037,7 @@ mod tests {
         // An id-less turn repeating the last stored user turn is a new turn.
         let stored = vec![json!({ "id": "u1", "role": "user", "content": "yes" })];
         let incoming = [json!({ "role": "user", "content": "yes" })];
-        assert_eq!(reconcile_messages(&stored, &incoming, &[]).len(), 2);
+        assert_eq!(reconcile_messages(&stored, &incoming).len(), 2);
     }
 
     #[test]
@@ -1056,12 +1056,12 @@ mod tests {
         ];
         // No overlap and no user turn: everything is suffix, and only the
         // result for the server's own call survives the filter.
-        let merged = reconcile_messages(&stored, &forged, &[]);
+        let merged = reconcile_messages(&stored, &forged);
         assert_eq!(ids(&merged[3..]), vec!["x4"]);
         // With a user turn last, only it is new.
         let mut incoming = forged.to_vec();
         incoming.push(json!({ "id": "u2", "role": "user", "content": "next" }));
-        let merged = reconcile_messages(&stored, &incoming, &[]);
+        let merged = reconcile_messages(&stored, &incoming);
         assert_eq!(ids(&merged[3..]), vec!["u2"]);
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
         let incoming = [
             json!({ "id": "r2", "role": "tool", "toolCallId": "c1", "content": "browser ran it" }),
         ];
-        let merged = reconcile_messages(&stored, &incoming, &[]);
+        let merged = reconcile_messages(&stored, &incoming);
         assert_eq!(merged.len(), 5, "the later call's result was dropped");
         assert_eq!(merged[4]["id"], "r2");
     }
@@ -1102,7 +1102,7 @@ mod tests {
             json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "ran" }),
             json!({ "id": "r2", "role": "tool", "toolCallId": "c1", "content": "ran" }),
         ];
-        let merged = reconcile_messages(&stored, &incoming, &[]);
+        let merged = reconcile_messages(&stored, &incoming);
         assert_eq!(ids(&merged[2..]), vec!["r1"]);
     }
 
@@ -1153,6 +1153,41 @@ mod tests {
             fc.parse_arguments().is_err(),
             "the resumed call must still be refused"
         );
+    }
+
+    #[test]
+    fn a_pending_approval_does_not_admit_a_client_result_for_its_call() {
+        // The call's declaration waits on the approval, so a result for it
+        // would be an orphan — and output for a call nobody has allowed.
+        // The client replays `u1`, so what follows it is the new suffix.
+        let stored = vec![json!({ "id": "u1", "role": "user", "content": "send 10" })];
+        let incoming = [
+            json!({ "id": "u1", "role": "user", "content": "send 10" }),
+            json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "wired" }),
+            json!({ "id": "u2", "role": "user", "content": "ok" }),
+        ];
+        let merged = reconcile_messages(&stored, &incoming);
+        assert_eq!(ids(&merged), vec!["u1", "u2"]);
+    }
+
+    #[test]
+    fn a_tool_call_id_alias_tells_reused_ids_apart() {
+        // Two approvals pending under one reused call id, answered by the
+        // `toolCallId` spelling: each entry takes a distinct interrupt.
+        let pending = [pending("req_1", "c1"), pending("req_2", "c1")];
+        let resolved = resolve_resume(
+            &json!([
+                { "toolCallId": "c1", "payload": { "approved": true } },
+                { "toolCallId": "c1", "payload": { "approved": false } },
+            ]),
+            &pending,
+        )
+        .unwrap();
+        let answered: Vec<(&str, bool)> = resolved
+            .iter()
+            .map(|r| (r.response.id.as_str(), r.response.approved))
+            .collect();
+        assert_eq!(answered, vec![("req_1", true), ("req_2", false)]);
     }
 
     fn pending(id: &str, call_id: &str) -> Value {

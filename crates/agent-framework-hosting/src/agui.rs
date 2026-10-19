@@ -715,7 +715,7 @@ async fn run_with_snapshots(
         }
     }
 
-    let mut transcript = snapshot::reconcile_messages(&stored.messages, &input.messages, &pending);
+    let mut transcript = snapshot::reconcile_messages(&stored.messages, &input.messages);
     let mut messages = input_to_messages(&transcript);
     prune_unanswered_calls(&mut messages);
     if !resolved.is_empty() {
