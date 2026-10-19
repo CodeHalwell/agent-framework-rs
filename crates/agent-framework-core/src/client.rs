@@ -539,7 +539,11 @@ async fn execute_tool_call(
                     let outcome = async {
                         let result = exec.invoke_in_context(ctx.arguments.clone(), &ctx).await;
                         if let Err(e) = &result {
-                            crate::observability::record_error(&tracing::Span::current(), e);
+                            crate::observability::record_error(
+                                &tracing::Span::current(),
+                                e,
+                                &obs_config,
+                            );
                         }
                         result
                     }

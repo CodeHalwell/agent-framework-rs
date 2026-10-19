@@ -31,9 +31,9 @@ use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
-    McpServerToolCallContent, McpServerToolResultContent, Message, ResponseFormat, Role,
-    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
-    UsageDetails,
+    McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
+    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
+    UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -918,6 +918,56 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     response
 }
 
+/// Build the consent content for an `oauth_consent_request` output item,
+/// or `None` when its link cannot be trusted.
+///
+/// An Azure AI Foundry project's Responses endpoint emits this item when a
+/// hosted tool needs the user to complete an OAuth consent flow; OpenAI's
+/// own Responses API does not. It is handled in this shared parser because
+/// `agent-framework-azure` and `agent-framework-foundry` both reuse it
+/// verbatim rather than re-implementing the Responses wire — a Foundry-only
+/// item type that costs an unreachable match arm on the OpenAI path.
+///
+/// The link is checked before it is handed on. It is a URL the framework is
+/// asking a human to open and authenticate at, arriving from the service as
+/// free-form text, so a `http://` or `javascript:` one is dropped with a
+/// warning rather than surfaced as something to click. Upstream validates
+/// the same two things: an HTTPS scheme and a non-empty host.
+fn oauth_consent_content(item: &Value) -> Option<Content> {
+    let item_id = item.get("id").and_then(Value::as_str);
+    let consent_link = item
+        .get("consent_link")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_https_url(consent_link) {
+        tracing::warn!(
+            item_id = item_id.unwrap_or("<unknown>"),
+            "dropping oauth_consent_request without an https consent_link"
+        );
+        return None;
+    }
+    let mut content = OauthConsentRequestContent::new(consent_link);
+    content.id = item_id.filter(|id| !id.is_empty()).map(str::to_string);
+    Some(Content::OauthConsentRequest(content))
+}
+
+/// Whether `link` is an `https://` URL with a non-empty host.
+///
+/// Hand-rolled rather than pulling in a URL parser for one check: the
+/// scheme is matched case-insensitively (a URL scheme is case-insensitive),
+/// and the authority is whatever precedes the first `/`, `?` or `#`.
+fn is_https_url(link: &str) -> bool {
+    let Some(authority) = link
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &link[8..])
+    else {
+        return false;
+    };
+    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    !authority[..end].is_empty()
+}
+
 fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
@@ -942,6 +992,13 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                     }
                 }
             }
+        }
+        // Foundry only — see `oauth_consent_content`. Upstream surfaced it
+        // on the stream first and from the completed response later
+        // (#8976); a non-streaming run that needed consent otherwise came
+        // back as an empty answer with no way to learn why.
+        Some("oauth_consent_request") => {
+            contents.extend(oauth_consent_content(item));
         }
         Some("function_call") => {
             let call_id = item
@@ -1400,6 +1457,20 @@ fn parse_responses_event(
         "response.output_item.added" => {
             let item = value.get("item");
             let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+            // A consent request is complete the moment it is added — it
+            // has no deltas to wait for, and the run is blocked on the
+            // user until it is answered, so holding it back to `done`
+            // would be holding back the one thing the caller needs.
+            if item_type == Some("oauth_consent_request") {
+                return match item.and_then(oauth_consent_content) {
+                    Some(content) => EventOutcome::Update(ChatResponseUpdate {
+                        contents: vec![content],
+                        role: Some(Role::assistant()),
+                        ..Default::default()
+                    }),
+                    None => EventOutcome::None,
+                };
+            }
             // A hosted MCP call is emitted whole from `done` (below): on
             // `added` its arguments are still empty and only stream in
             // through `response.mcp_call_arguments.*`, so a call recorded
@@ -1430,6 +1501,17 @@ fn parse_responses_event(
                 ..Default::default()
             })
         }
+        // Foundry also emits the consent request as a top-level event
+        // rather than an output item, carrying the link on the event
+        // itself. Same content either way.
+        "response.oauth_consent_requested" => match oauth_consent_content(value) {
+            Some(content) => EventOutcome::Update(ChatResponseUpdate {
+                contents: vec![content],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            }),
+            None => EventOutcome::None,
+        },
         "response.function_call_arguments.delta" => {
             let output_index = value
                 .get("output_index")
@@ -2862,6 +2944,132 @@ mod tests {
             reasoning_event(json!({ "type": "response.refusal.done", "refusal": "I can't help" }));
         assert!(matches!(done, EventOutcome::None));
     }
+
+    // region: Foundry oauth consent
+
+    #[test]
+    fn a_completed_response_surfaces_its_oauth_consent_request() {
+        // A Foundry hosted tool that needs consent finishes the turn with
+        // an `oauth_consent_request` output item and no text. Ignored, the
+        // run came back as an empty answer and the caller had no way to
+        // learn what it was waiting for (upstream #8976).
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "oauth_consent_request",
+                    "id": "oauth_7",
+                    "consent_link": "https://login.example.com/consent?state=abc",
+                }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let Content::OauthConsentRequest(consent) = &resp.messages[0].contents[0] else {
+            panic!(
+                "expected a consent request, got {:?}",
+                resp.messages[0].contents
+            );
+        };
+        assert_eq!(
+            consent.consent_link,
+            "https://login.example.com/consent?state=abc"
+        );
+        // The id is what a workflow registers the request under, so the
+        // user's answer has something to correlate against.
+        assert_eq!(consent.id.as_deref(), Some("oauth_7"));
+    }
+
+    #[test]
+    fn a_streamed_oauth_consent_request_is_emitted_when_the_item_is_added() {
+        // It has no deltas to wait for and the run is blocked on the user
+        // until it is answered, so it is emitted on `added` rather than
+        // held back to `done` like a hosted MCP call.
+        let EventOutcome::Update(update) = reasoning_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "oauth_consent_request",
+                "id": "oauth_7",
+                "consent_link": "https://login.example.com/consent",
+            },
+        })) else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::OauthConsentRequest(c)
+                if c.consent_link == "https://login.example.com/consent"
+                    && c.id.as_deref() == Some("oauth_7")
+        ));
+    }
+
+    #[test]
+    fn a_top_level_oauth_consent_event_carries_the_same_content() {
+        // Foundry also emits the request as a top-level event with the link
+        // on the event itself rather than on an output item.
+        let EventOutcome::Update(update) = reasoning_event(json!({
+            "type": "response.oauth_consent_requested",
+            "id": "oauth_9",
+            "consent_link": "https://login.example.com/consent",
+        })) else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::OauthConsentRequest(c) if c.id.as_deref() == Some("oauth_9")
+        ));
+    }
+
+    #[test]
+    fn an_untrustworthy_consent_link_is_dropped_rather_than_surfaced() {
+        // The framework is asking a human to open this URL and
+        // authenticate at it, and it arrives from the service as free-form
+        // text. Anything that is not https with a host is dropped.
+        for link in [
+            json!("http://login.example.com/consent"),
+            json!("javascript:alert(1)"),
+            json!("https:///no-host"),
+            json!(""),
+            Value::Null,
+        ] {
+            let value = json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    { "type": "oauth_consent_request", "id": "oauth_7", "consent_link": link }
+                ],
+            });
+            let resp = parse_response(&value, None);
+            let found = resp
+                .messages
+                .iter()
+                .flat_map(|m| &m.contents)
+                .any(|c| matches!(c, Content::OauthConsentRequest(_)));
+            assert!(!found, "accepted consent_link {link:?}");
+        }
+
+        // The scheme is case-insensitive, so an upper-case one is accepted.
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "oauth_consent_request",
+                    "consent_link": "HTTPS://login.example.com/consent",
+                }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let Content::OauthConsentRequest(consent) = &resp.messages[0].contents[0] else {
+            panic!("expected a consent request");
+        };
+        // No `id` on the item: the content carries none rather than an
+        // empty string that would correlate against nothing.
+        assert_eq!(consent.id, None);
+    }
+
+    // endregion
 
     #[test]
     fn reasoning_text_delta_streams_and_done_is_terminal_metadata() {

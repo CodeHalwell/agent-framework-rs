@@ -5,6 +5,77 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+Six fixes from the upstream window `a75e803e..9d308951` (2026-10-12 to
+2026-10-19), recorded in
+[`docs/drift/2026-10-19-9d308951.md`](docs/drift/2026-10-19-9d308951.md).
+Two gaps the review surfaced rather than commits asking to be ported: the
+hosting Responses route discarded image and file input, and Foundry OAuth
+consent requests had no producer anywhere in the workspace.
+
+**Two public API breaks**, both small and mechanical — see *Changed*.
+
+### Added
+
+- Foundry **OAuth consent requests** now reach the caller. A hosted tool
+  that needs the user to complete a consent flow produces
+  `Content::OauthConsentRequest` on the non-streaming path, on
+  `response.output_item.added`, and from the top-level
+  `response.oauth_consent_requested` event (upstream #8976). The consent
+  link is validated as HTTPS with a host before it is surfaced; anything
+  else is dropped with a warning rather than handed to a human to click.
+  `OauthConsentRequestContent` gained `id` (the provider's item id, which a
+  workflow registers the request under) and the
+  `OauthConsentRequestContent::new` / `with_id` constructors.
+- The hosting **Responses route accepts multimodal input**. `input_image`
+  and `input_file` content parts become data or URI content instead of
+  being discarded, and a `refusal` part becomes a marked refusal. A `data:`
+  URL keeps the media type it declares rather than being flattened to
+  `image/*` (upstream #9298), which is what Anthropic and Gemini need to
+  accept the attachment. A part with no URL is skipped and the rest of the
+  message survives.
+
+### Changed
+
+- **Breaking:** `observability::record_error` takes an
+  `&ObservabilityConfig`. The error's `Display` text is now recorded as
+  `otel.status_message` only with content capture on (upstream #9288): a
+  provider's 400 quotes the request back, a tool's failure prints the
+  argument it choked on, and a transport error carries the URL, so it is
+  sensitive data like any other. `error.type` and the ERROR status are
+  still always recorded. `Agent` retains its `ObservabilityConfig` for the
+  `invoke_agent` span, defaulting to `ObservabilityConfig::from_env()` —
+  the rule `FunctionInvokingChatClient::new` already followed.
+- **Breaking:** `OauthConsentRequestContent` gained an `id` field, so a
+  struct literal naming every field needs updating. `::new` or
+  `..Default::default()` do not.
+- Switch-case branches may share a target executor. `add_switch` builds one
+  edge per distinct target and joins the branch labels of the cases that
+  share it (upstream #9300); previously the duplicate reached `targets()`
+  and `flat_edges()`, so validation and both graph renderings saw an edge
+  that does not exist.
+
+### Fixed
+
+- A streamed update whose `author_name` differs from the message it would
+  continue now starts a new message (upstream #9353). Two agents streaming
+  in turn — a sequential orchestration, a handoff — emit assistant updates
+  with no `message_id`, so their text was folded into one message
+  attributed to whoever spoke last. An explicit `message_id` still wins: it
+  relabels the message rather than splitting it.
+- `add_fan_out` and `add_multi_selection` deduplicate their targets, so a
+  broadcast declared with a repeated id delivers once (upstream #9432).
+  Delivering twice ran the executor twice on one message and double-counted
+  toward a fan-in sink's barrier. The runner's selector-free branch
+  deduplicates too, since `EdgeGroup::FanOut` can be built by hand.
+- A Magentic progress ledger naming a participant that does not exist is
+  retried against the existing `progress_ledger_retry_count` budget instead
+  of ending the run on the first bad answer (upstream #9181). If every
+  attempt names an unknown participant the last ledger is returned, so the
+  orchestrator takes the invalid-speaker path it already has rather than
+  reading the failure as a parse error and replanning.
+
 ## [0.12.0] — 2026-10-14
 
 A parity release: ten fixes from the upstream window `301a43c..a75e803e`

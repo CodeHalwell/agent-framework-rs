@@ -403,3 +403,91 @@ async fn an_unfenced_ledger_still_parses() {
         "{texts:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Progress-ledger retries (upstream #9181)
+// ---------------------------------------------------------------------
+
+/// An unsatisfied, progressing ledger naming `next_speaker`.
+fn ledger_naming(next_speaker: &str) -> String {
+    ledger_json(false, true, false, next_speaker, "go on")
+}
+
+fn ledger_context() -> MagenticContext {
+    MagenticContext::new(
+        Message::user("do the thing"),
+        vec![
+            ("writer".to_string(), "writes".to_string()),
+            ("editor".to_string(), "edits".to_string()),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn an_unknown_next_speaker_is_retried_like_a_parse_failure() {
+    // A ledger naming a participant that does not exist is as unusable as
+    // one that will not parse, and the retry budget already exists for
+    // exactly that. Without this, one bad answer ended the whole run
+    // (upstream #9181).
+    let manager_agent = agent(
+        "manager",
+        vec![&ledger_naming("ghost"), &ledger_naming("writer")],
+    );
+    let manager = StandardMagenticManager::new(manager_agent);
+
+    let ledger = manager
+        .create_progress_ledger(&ledger_context())
+        .await
+        .expect("the retry should reach the valid ledger");
+    assert_eq!(ledger.next_speaker.answer_str(), "writer");
+}
+
+#[tokio::test]
+async fn every_attempt_naming_an_unknown_speaker_still_returns_the_ledger() {
+    // Running out of attempts must hand the orchestrator the ledger it
+    // already knows how to end a run on, not an error — an error reads as
+    // a parse failure and triggers a reset-and-replan instead.
+    let manager_agent = agent(
+        "manager",
+        vec![&ledger_naming("ghost"), &ledger_naming("phantom")],
+    );
+    let manager = StandardMagenticManager::new(manager_agent).progress_ledger_retry_count(2);
+
+    let ledger = manager
+        .create_progress_ledger(&ledger_context())
+        .await
+        .expect("an exhausted retry budget returns the last unknown-speaker ledger");
+    assert_eq!(ledger.next_speaker.answer_str(), "phantom");
+}
+
+#[tokio::test]
+async fn a_satisfied_request_is_returned_whatever_it_names() {
+    // The final answer is about to be prepared and the speaker is never
+    // consulted, so an unusable name there is not worth another round trip.
+    let satisfied = ledger_json(true, true, false, "", "");
+    let manager_agent = agent("manager", vec![&satisfied, &ledger_naming("writer")]);
+    let manager = StandardMagenticManager::new(manager_agent);
+
+    let ledger = manager
+        .create_progress_ledger(&ledger_context())
+        .await
+        .unwrap();
+    assert!(ledger.is_request_satisfied.answer_bool());
+}
+
+#[tokio::test]
+async fn an_unparseable_ledger_still_fails_after_every_attempt() {
+    // The parse path is unchanged: nothing usable ever arrived, so there
+    // is no ledger to hand back and the manager reports the failure.
+    let manager_agent = agent("manager", vec!["not json", "still not json"]);
+    let manager = StandardMagenticManager::new(manager_agent).progress_ledger_retry_count(2);
+
+    let err = manager
+        .create_progress_ledger(&ledger_context())
+        .await
+        .expect_err("expected a parse failure");
+    assert!(
+        err.to_string().contains("progress ledger parse failed"),
+        "got: {err}"
+    );
+}

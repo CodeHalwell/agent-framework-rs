@@ -420,16 +420,28 @@ pub fn record_tool_result(span: &Span, result: &serde_json::Value, config: &Obse
 /// Record an error onto a span following the existing `error.type` pattern:
 /// `error.type` (the framework [`Error`] variant tag), plus the
 /// `tracing-opentelemetry` "special fields" `otel.status_code` (`"ERROR"`)
-/// and `otel.status_message` (the exception's `Display` text) so that a
-/// bridge sets real OTel span status. This mirrors Python's
-/// `capture_exception` (`record_exception` + `set_status`,
+/// and — only with content capture on — `otel.status_message` (the error's
+/// `Display` text), so that a bridge sets real OTel span status. This
+/// mirrors Python's `capture_exception` (`record_exception` + `set_status`,
 /// `observability.py:1407-1411`) as far as bare `tracing` fields allow —
 /// there is no span-events API here without also taking on an SDK
 /// dependency.
-pub fn record_error(span: &Span, err: &Error) {
+///
+/// The message is treated as sensitive, like message content and tool
+/// arguments (upstream #9288). An error's `Display` text is not metadata: a
+/// provider's 400 quotes the request back, a tool's failure prints the
+/// argument it choked on, a transport error carries the URL — query string,
+/// SAS token and all. Spans leave the process, so an error string sent
+/// unconditionally publishes to the telemetry backend exactly the content
+/// `enable_sensitive_data` exists to withhold. `error.type` and the ERROR
+/// status always go, so a redacted span still says *that* the call failed
+/// and in which variant; only the free-form text waits for the opt-in.
+pub fn record_error(span: &Span, err: &Error, config: &ObservabilityConfig) {
     span.record(attr::ERROR_TYPE, error_type(err).as_str());
     span.record(attr::OTEL_STATUS_CODE, "ERROR");
-    span.record(attr::OTEL_STATUS_MESSAGE, err.to_string().as_str());
+    if config.enable_sensitive_data {
+        span.record(attr::OTEL_STATUS_MESSAGE, err.to_string().as_str());
+    }
 }
 
 /// Record the response-side attributes (finish reason, usage, id, model) onto
@@ -693,7 +705,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                     }
                 }
                 Err(err) => {
-                    record_error(&span, err);
+                    record_error(&span, err, &config);
                     #[cfg(feature = "otel-metrics")]
                     metrics::record_chat_error(
                         &self.system,
@@ -741,7 +753,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
         let inner = match inner {
             Ok(s) => s,
             Err(err) => {
-                record_error(&span, &err);
+                record_error(&span, &err, &config);
                 #[cfg(feature = "otel-metrics")]
                 metrics::record_chat_error(
                     &self.system,
@@ -780,7 +792,7 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
                     }
                     Some(Err(err)) => {
                         if let Some(span) = &span {
-                            record_error(span, &err);
+                            record_error(span, &err, &telemetry.config);
                         }
                         // This ends the stream, so the completion arm below
                         // never runs: without recording here, a call that

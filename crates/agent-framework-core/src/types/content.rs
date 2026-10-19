@@ -741,6 +741,29 @@ pub struct ShellCommandOutputContent {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OauthConsentRequestContent {
     pub consent_link: String,
+    /// The provider's id for the output item this request came from, when it
+    /// named one. A consent request is a user-input request, so a workflow
+    /// registers it under this id and matches the user's answer back to it;
+    /// without the id the answer has nothing to correlate against.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
+}
+
+impl OauthConsentRequestContent {
+    /// A consent request for `consent_link`, with no provider item id.
+    pub fn new(consent_link: impl Into<String>) -> Self {
+        Self {
+            consent_link: consent_link.into(),
+            id: None,
+        }
+    }
+
+    /// Set the provider's id for the output item this request came from.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
 }
 
 /// The unified content union, discriminated by the `type` tag.
@@ -1173,9 +1196,9 @@ mod tests {
                 "shell_command_output",
             ),
             (
-                Content::OauthConsentRequest(OauthConsentRequestContent {
-                    consent_link: "https://example/consent".into(),
-                }),
+                Content::OauthConsentRequest(OauthConsentRequestContent::new(
+                    "https://example/consent",
+                )),
                 "oauth_consent_request",
             ),
         ];

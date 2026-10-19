@@ -349,12 +349,30 @@ impl ChatResponse {
 
         let role = update.role.clone().unwrap_or_else(Role::assistant);
         // Find or create the target message by message_id.
+        //
+        // Without an id to key on, the fallback is the last message of the
+        // same role — but only when the update's author can be the same
+        // author. Two agents streaming in turn (a sequential orchestration,
+        // a handoff) both emit assistant updates carrying only an
+        // `author_name`, so keying on the role alone folded the second
+        // agent's text onto the first agent's message and overwrote the name
+        // with the later one: one message, two authors' text, attributed to
+        // whoever spoke last. A differing author starts a new message
+        // (upstream #9353).
+        //
+        // Only a *conflict* splits: an update with no author, or one landing
+        // on a message that has none yet, still continues the message, which
+        // is what lets the first update of a run name its message.
         let idx = match &update.message_id {
             Some(mid) => self
                 .messages
                 .iter()
                 .position(|m| m.message_id.as_deref() == Some(mid.as_str())),
-            None => self.messages.iter().rposition(|m| m.role == role),
+            None => self
+                .messages
+                .iter()
+                .rposition(|m| m.role == role)
+                .filter(|&i| authors_compatible(&self.messages[i], update.author_name.as_deref())),
         };
         let msg_idx = match idx {
             Some(i) => i,
@@ -469,6 +487,20 @@ fn same_occurrence(existing: Option<&str>, incoming: Option<&str>) -> bool {
         (Some(existing), Some(incoming)) => existing == incoming,
         (Some(_), None) => false,
         (None, _) => true,
+    }
+}
+
+/// Whether a streamed update naming `incoming` as its author may continue
+/// `message`.
+///
+/// Only a conflict — two different names — says no. An update that names no
+/// author, or a message that does not have one yet, continues the message;
+/// that is what lets the first update of a run name the message it started
+/// rather than opening a second one.
+fn authors_compatible(message: &Message, incoming: Option<&str>) -> bool {
+    match (message.author_name.as_deref(), incoming) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
     }
 }
 
@@ -1521,6 +1553,117 @@ mod tests {
             Some(&json!("openai"))
         );
         assert_eq!(resp.additional_properties.get("region"), Some(&json!("us")));
+    }
+
+    #[test]
+    fn a_different_author_starts_a_new_message() {
+        // Two agents streaming in turn — a sequential orchestration, a
+        // handoff — both emit assistant updates with no message_id, telling
+        // themselves apart only by `author_name`. Keyed on the role alone
+        // they folded into one message attributed to whoever spoke last
+        // (upstream #9353).
+        let writer = ChatResponseUpdate {
+            contents: vec![Content::text("draft")],
+            role: Some(Role::assistant()),
+            author_name: Some("writer".into()),
+            ..Default::default()
+        };
+        let editor = ChatResponseUpdate {
+            contents: vec![Content::text("revision")],
+            role: Some(Role::assistant()),
+            author_name: Some("editor".into()),
+            ..Default::default()
+        };
+
+        let resp = ChatResponse::from_updates(vec![writer, editor]);
+        assert_eq!(resp.messages.len(), 2);
+        assert_eq!(resp.messages[0].author_name.as_deref(), Some("writer"));
+        assert_eq!(resp.messages[0].text(), "draft");
+        assert_eq!(resp.messages[1].author_name.as_deref(), Some("editor"));
+        assert_eq!(resp.messages[1].text(), "revision");
+    }
+
+    #[test]
+    fn the_same_author_keeps_streaming_into_one_message() {
+        // The split is on a conflict, not on the field being set: an agent
+        // naming itself on every fragment still produces one message.
+        let updates = ["a", "b", "c"].map(|text| ChatResponseUpdate {
+            contents: vec![Content::text(text)],
+            role: Some(Role::assistant()),
+            author_name: Some("writer".into()),
+            ..Default::default()
+        });
+
+        let resp = ChatResponse::from_updates(updates.to_vec());
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].text(), "abc");
+        assert_eq!(resp.messages[0].author_name.as_deref(), Some("writer"));
+    }
+
+    #[test]
+    fn an_unnamed_update_continues_a_named_message() {
+        // Half-named streams are ordinary: a provider names the author on
+        // the opening fragment and omits it after, or the other way round.
+        // Neither is a change of author, so neither splits.
+        let named = ChatResponseUpdate {
+            contents: vec![Content::text("one")],
+            role: Some(Role::assistant()),
+            author_name: Some("writer".into()),
+            ..Default::default()
+        };
+        let unnamed = ChatResponseUpdate {
+            contents: vec![Content::text(" two")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        };
+
+        let resp = ChatResponse::from_updates(vec![named, unnamed]);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].text(), "one two");
+        assert_eq!(resp.messages[0].author_name.as_deref(), Some("writer"));
+
+        let unnamed_first = ChatResponseUpdate {
+            contents: vec![Content::text("one")],
+            role: Some(Role::assistant()),
+            ..Default::default()
+        };
+        let named_second = ChatResponseUpdate {
+            contents: vec![Content::text(" two")],
+            role: Some(Role::assistant()),
+            author_name: Some("writer".into()),
+            ..Default::default()
+        };
+
+        let resp = ChatResponse::from_updates(vec![unnamed_first, named_second]);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].text(), "one two");
+        assert_eq!(resp.messages[0].author_name.as_deref(), Some("writer"));
+    }
+
+    #[test]
+    fn a_shared_message_id_outranks_a_changed_author() {
+        // An explicit id is the stronger signal: the provider said these
+        // fragments are one message, so a renamed author relabels it rather
+        // than splitting it. Mirrors upstream, which tests the id first.
+        let first = ChatResponseUpdate {
+            contents: vec![Content::text("a")],
+            role: Some(Role::assistant()),
+            message_id: Some("m1".into()),
+            author_name: Some("writer".into()),
+            ..Default::default()
+        };
+        let second = ChatResponseUpdate {
+            contents: vec![Content::text("b")],
+            role: Some(Role::assistant()),
+            message_id: Some("m1".into()),
+            author_name: Some("editor".into()),
+            ..Default::default()
+        };
+
+        let resp = ChatResponse::from_updates(vec![first, second]);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].text(), "ab");
+        assert_eq!(resp.messages[0].author_name.as_deref(), Some("editor"));
     }
 
     #[test]
