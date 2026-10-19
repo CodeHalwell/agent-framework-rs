@@ -452,12 +452,18 @@ pub(crate) fn reconcile_messages(
             None => incoming,
         }
     };
-    let known = unanswered_call_ids(stored, stored_interrupts);
+    // Each accepted result spends one open call: a browser submitting the
+    // same result twice must not store the second as an orphan.
+    let mut open = unanswered_call_ids(stored, stored_interrupts);
     let mut out = stored.to_vec();
     for message in suffix {
         let trusted = match role(message).as_str() {
             "user" => true,
-            "tool" => tool_call_id(message).is_some_and(|id| known.contains(id)),
+            "tool" => tool_call_id(message)
+                .and_then(|id| open.get_mut(id))
+                .filter(|n| **n > 0)
+                .map(|n| *n -= 1)
+                .is_some(),
             _ => false,
         };
         if trusted {
@@ -546,12 +552,16 @@ fn overlap_length(stored: &[Value], incoming: &[Value], start: usize) -> usize {
 }
 
 /// Tool calls the server issued on this thread that nothing has answered,
-/// plus the pending interrupts' call ids.
+/// plus the pending interrupts' call ids, each with how many occurrences
+/// are open.
 ///
 /// Calls and results are paired in transcript order — a result answers the
 /// nearest preceding unanswered call with its id — so a provider reusing an
 /// id does not let an earlier completed call cancel out a later open one.
-fn unanswered_call_ids<'a>(stored: &'a [Value], interrupts: &'a [Value]) -> HashSet<&'a str> {
+fn unanswered_call_ids<'a>(
+    stored: &'a [Value],
+    interrupts: &'a [Value],
+) -> HashMap<&'a str, usize> {
     let mut outstanding: Vec<&str> = Vec::new();
     for m in stored {
         if let Some(calls) = m
@@ -573,11 +583,14 @@ fn unanswered_call_ids<'a>(stored: &'a [Value], interrupts: &'a [Value]) -> Hash
             }
         }
     }
-    let mut known: HashSet<&str> = outstanding.into_iter().collect();
-    for i in interrupts {
-        known.extend(i.get("toolCallId").and_then(Value::as_str));
+    let mut open: HashMap<&str, usize> = HashMap::new();
+    let interrupt_calls = interrupts
+        .iter()
+        .filter_map(|i| i.get("toolCallId").and_then(Value::as_str));
+    for id in outstanding.into_iter().chain(interrupt_calls) {
+        *open.entry(id).or_default() += 1;
     }
-    known
+    open
 }
 
 /// The stored form of a pending approval: the canonical interrupt fields,
@@ -598,6 +611,12 @@ pub(crate) fn approval_interrupt(ar: &FunctionApprovalRequestContent) -> Value {
                 "call_id": ar.function_call.call_id,
                 "name": ar.function_call.name,
                 "arguments": arguments,
+                // The occurrence id tells two pending approvals under one
+                // reused `call_id` apart; the protected data is a provider
+                // replay token (Gemini's signature) the call must carry
+                // when it is sent back. A resume needs both.
+                "id": ar.function_call.id,
+                "protected_data": ar.function_call.protected_data,
             },
         },
     })
@@ -803,7 +822,13 @@ fn stored_function_call(interrupt: &Value) -> Option<FunctionCallContent> {
         Some(Value::String(s)) => Some(FunctionArguments::Raw(s.clone())),
         _ => None,
     };
-    Some(FunctionCallContent::new(call_id, name, arguments))
+    let mut call = FunctionCallContent::new(call_id, name, arguments);
+    call.id = fc.get("id").and_then(Value::as_str).map(str::to_string);
+    call.protected_data = fc
+        .get("protected_data")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(call)
 }
 
 #[cfg(test)]
@@ -1055,6 +1080,46 @@ mod tests {
         let merged = reconcile_messages(&stored, &incoming, &[]);
         assert_eq!(merged.len(), 5, "the later call's result was dropped");
         assert_eq!(merged[4]["id"], "r2");
+    }
+
+    #[test]
+    fn reconcile_admits_one_result_per_open_call() {
+        // A browser submitting the same frontend-tool result twice: the
+        // second would be an orphan that breaks every later turn.
+        let stored = vec![
+            json!({ "id": "u1", "role": "user", "content": "go" }),
+            json!({ "id": "a1", "role": "assistant", "toolCalls": [
+                { "id": "c1", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+            ]}),
+        ];
+        let incoming = [
+            json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "ran" }),
+            json!({ "id": "r2", "role": "tool", "toolCallId": "c1", "content": "ran" }),
+        ];
+        let merged = reconcile_messages(&stored, &incoming, &[]);
+        assert_eq!(ids(&merged[2..]), vec!["r1"]);
+    }
+
+    #[test]
+    fn a_resumed_call_keeps_its_occurrence_id_and_replay_token() {
+        // Two pending approvals can share a reused `call_id`; only the
+        // occurrence id tells them apart on resume. Gemini's signature must
+        // ride along too, or the replayed call is rejected.
+        let mut call = FunctionCallContent::new("c1", "transfer", None);
+        call.id = Some("af-call-1".into());
+        call.protected_data = Some("c2ln".into());
+        let interrupt = approval_interrupt(&FunctionApprovalRequestContent {
+            id: "req_1".into(),
+            function_call: call,
+        });
+        let resolved = resolve_resume(
+            &json!([{ "interruptId": "req_1", "payload": { "approved": true } }]),
+            &[interrupt],
+        )
+        .unwrap();
+        let fc = &resolved[0].response.function_call;
+        assert_eq!(fc.id.as_deref(), Some("af-call-1"));
+        assert_eq!(fc.protected_data.as_deref(), Some("c2ln"));
     }
 
     fn pending(id: &str, call_id: &str) -> Value {
