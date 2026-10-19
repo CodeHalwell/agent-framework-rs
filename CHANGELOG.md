@@ -5,19 +5,61 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
-## [Unreleased]
+## [0.13.0] — 2026-10-19
 
-Six fixes from the upstream window `a75e803e..9d308951` (2026-10-12 to
-2026-10-19), recorded in
+A parity release from the upstream window `a75e803e..9d308951`
+(2026-10-12 to 2026-10-19), recorded in
 [`docs/drift/2026-10-19-9d308951.md`](docs/drift/2026-10-19-9d308951.md).
-Two gaps the review surfaced rather than commits asking to be ported: the
-hosting Responses route discarded image and file input, and Foundry OAuth
-consent requests had no producer anywhere in the workspace.
+The headline is **AG-UI thread snapshots**: the AG-UI router can now
+persist threads, replay them to a reconnecting client, and resume a paused
+approval across requests, behind an explicit authorization scope. Alongside
+it come six fixes, two of them gaps the review surfaced rather than commits
+asking to be ported: the hosting Responses route discarded image and file
+input, and Foundry OAuth consent requests had no producer anywhere in the
+workspace.
 
-**Two public API breaks**, both small and mechanical — see *Changed*.
+**Two public API breaks**, both small and mechanical — see *Changed*. The
+AG-UI router's behaviour without a snapshot store is unchanged, apart from
+no longer emitting a `TOOL_CALL_END` for a call the run never started.
 
 ### Added
 
+- **AG-UI thread snapshots** (`agent_framework_hosting::agui::snapshot`).
+  `AgUiRouter::snapshot_store` persists each thread — transcript, shared
+  state, pending interrupts, and the agent session's private state — in an
+  `AgUiThreadSnapshotStore` (`InMemoryAgUiThreadSnapshotStore` included,
+  bounded and process-local). With a store the router emits
+  `STATE_SNAPSHOT` at the start of a run and `MESSAGES_SNAPSHOT` at the
+  end, replays a thread to a request that sends no messages, records
+  pending approvals as `RUN_FINISHED` interrupts, and resumes them from
+  `resume` entries. Upstream's eight AG-UI hardening commits this window
+  shape the design:
+  - **Explicit authorization scope** (#9413, #9316). Snapshots are keyed by
+    scope *and* thread id, and a store without an authorization mode does
+    not build: `AgUiRouter::authorization_scope` resolves the scope from
+    the request head (an `Err(status)` rejects the request before any state
+    is read), and `AgUiRouter::single_user` declares one principal.
+    `AgUiRouter::try_into_router` reports a bad configuration;
+    `into_router` panics on one.
+  - **Client state cannot reach server-owned session state** (#9368,
+    tightened). A client value shaped like tool-approval state is never
+    merged into the session — checking all five `ToolApprovalState`
+    fields, where upstream checks three. `held_messages` is replayed into
+    the inner run as input, so the two upstream misses let a client plant
+    an approval response and run a tool unprompted. A session key the
+    server wrote, such as an agent's mode, cannot be overwritten either.
+  - **Interrupts are bound to their thread** (#9365). A resume must answer
+    exactly the interrupts stored for that scope and thread, or the run
+    ends with `RUN_ERROR` and an `APPROVAL_RESUME_*` code. The approved
+    call is rebuilt from the stored interrupt, never from the request, and
+    the interrupts are spent before the agent runs, so an approved call
+    runs at most once even if the run fails or the client disconnects.
+    Turns on one thread are serialized within the process, so a
+    double-click cannot resume an approval twice.
+  - **The stored transcript is the server's record** (port of upstream's
+    `_reconstruct_messages_from_thread_snapshot`). A client replaying
+    history, with or without ids, does not duplicate it, and only user turns
+    and results for server-issued tool calls extend it.
 - Foundry **OAuth consent requests** now reach the caller. A hosted tool
   that needs the user to complete a consent flow produces
   `Content::OauthConsentRequest` on the non-streaming path, on
@@ -34,7 +76,11 @@ consent requests had no producer anywhere in the workspace.
   URL keeps the media type it declares rather than being flattened to
   `image/*` (upstream #9298), which is what Anthropic and Gemini need to
   accept the attachment. A part with no URL is skipped and the rest of the
-  message survives.
+  message survives. `input_file` reads every spelling the
+  Responses API accepts — `file_url`, `file_data` as a data URL or as bare
+  base64 beside a `filename`, and `file_id` (as hosted-file content, like
+  `input_image`'s `file_id`). A malformed `data:` URL is skipped with a
+  warning rather than passed on as a URI no provider can fetch.
 
 ### Changed
 
@@ -50,6 +96,10 @@ consent requests had no producer anywhere in the workspace.
 - **Breaking:** `OauthConsentRequestContent` gained an `id` field, so a
   struct literal naming every field needs updating. `::new` or
   `..Default::default()` do not.
+- The AG-UI router emits `TOOL_CALL_END` only for a call this run
+  started and has not closed. A result or approval for a call started in
+  an earlier request — a resumed approval — used to get an end with no
+  matching start, which AG-UI clients reject (upstream does the same).
 - Switch-case branches may share a target executor. `add_switch` builds one
   edge per distinct target and joins the branch labels of the cases that
   share it (upstream #9300); previously the duplicate reached `targets()`
