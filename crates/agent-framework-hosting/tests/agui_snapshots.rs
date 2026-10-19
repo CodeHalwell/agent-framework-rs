@@ -1070,3 +1070,40 @@ async fn reserved_framework_keys_are_refused_on_a_fresh_thread() {
     );
     assert!(found.get("__ag_ui_anything").is_none(), "{found}");
 }
+
+#[tokio::test]
+async fn a_turn_past_pending_approvals_is_refused_not_lost() {
+    // Running a new turn past a pending approval used to save over it, so
+    // the approval vanished. The turn is refused until the client answers
+    // or cancels it, as upstream does.
+    let wired = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(InMemoryAgUiThreadSnapshotStore::new());
+    let app = scoped_router(Arc::new(bank_agent(wired.clone())), store.clone());
+
+    let (_, first) = post_as(
+        &app,
+        Some("alice"),
+        json!({ "threadId": "t", "messages": [{ "id": "u1", "role": "user", "content": "send 10" }] }),
+    )
+    .await;
+    let id = interrupt_id(&first);
+    let (_, second) = post_as(
+        &app,
+        Some("alice"),
+        json!({ "threadId": "t", "messages": [{ "id": "u2", "role": "user", "content": "also hi" }] }),
+    )
+    .await;
+    assert_eq!(event_types(&second), vec!["RUN_STARTED", "RUN_ERROR"]);
+    assert_eq!(second[1]["code"], "APPROVAL_RESUME_REQUIRED");
+    // Still pending, and still resumable.
+    let stored = store.get("user:alice", "t").await.unwrap().unwrap();
+    assert_eq!(stored.interrupt.unwrap()[0]["id"], id);
+    post_as(
+        &app,
+        Some("alice"),
+        json!({ "threadId": "t", "messages": [],
+                "resume": [{ "interruptId": id, "payload": { "approved": true } }] }),
+    )
+    .await;
+    assert_eq!(wired.lock().unwrap().len(), 1);
+}

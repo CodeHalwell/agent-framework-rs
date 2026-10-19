@@ -56,7 +56,9 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
     `max_duration_seconds` on a fresh thread.
   - **Interrupts are bound to their thread** (#9365). A resume must answer
     exactly the interrupts stored for that scope and thread, or the run
-    ends with `RUN_ERROR` and an `APPROVAL_RESUME_*` code. The approved
+    ends with `RUN_ERROR` and an `APPROVAL_RESUME_*` code. A thread with
+    interrupts pending refuses any other turn (`APPROVAL_RESUME_REQUIRED`)
+    until they are answered or cancelled, rather than saving over them. The approved
     call is rebuilt from the stored interrupt, never from the request, and
     the interrupts are spent before the agent runs, so an approved call
     runs at most once even if the run fails or the client disconnects.
@@ -103,7 +105,8 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   struct literal naming every field needs updating. `::new` or
   `..Default::default()` do not.
 - The AG-UI router emits `TOOL_CALL_END` only for a call this run
-  started and has not closed. A result or approval for a call started in
+  started and has not closed, tracked per occurrence so a call id the
+  provider reuses within a run still gets one end per start. A result or approval for a call started in
   an earlier request — a resumed approval — used to get an end with no
   matching start, which AG-UI clients reject (upstream does the same).
 - Switch-case branches may share a target executor. `add_switch` builds one

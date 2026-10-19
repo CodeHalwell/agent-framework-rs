@@ -100,7 +100,9 @@
 //!   before the closing events go out.
 //! - **A resume.** `resume` entries must answer exactly the interrupts stored
 //!   for this scope and thread (upstream #9365), or the run ends with
-//!   `RUN_ERROR` and an `APPROVAL_RESUME_*` code. The approved call is
+//!   `RUN_ERROR` and an `APPROVAL_RESUME_*` code; a thread with interrupts
+//!   pending refuses any other turn (`APPROVAL_RESUME_REQUIRED`) until they
+//!   are answered or cancelled, as upstream does. The approved call is
 //!   rebuilt from the stored interrupt, never from the request. The
 //!   interrupts are spent — saved as answered — *before* the agent runs, so
 //!   an approved call runs at most once even if the run then fails or the
@@ -664,8 +666,22 @@ async fn run_with_snapshots(
     };
     let pending = stored.interrupt.take().unwrap_or_default();
 
-    // A resume answers exactly the interrupts stored for this thread.
+    // A resume answers exactly the interrupts stored for this thread, and a
+    // thread with interrupts pending takes nothing else: running a new turn
+    // past them would either discard them or leave a call the conversation
+    // has moved on from waiting to run out of context. Upstream's contract;
+    // a client that wants to move on cancels them with a `cancelled` resume.
     let resolved = match &input.resume {
+        None if !pending.is_empty() => {
+            return send_all(vec![
+                run_started(&thread_id, &run_id),
+                json!({
+                    "type": event_type::RUN_ERROR,
+                    "message": "Pending interrupts require a resume entry for every interruptId.",
+                    "code": "APPROVAL_RESUME_REQUIRED",
+                }),
+            ]);
+        }
         None => Vec::new(),
         Some(resume) => match snapshot::resolve_resume(resume, &pending) {
             Ok(resolved) => resolved,
@@ -926,7 +942,10 @@ struct AgUiFraming {
     message_id: Option<String>,
     /// Tool calls opened (in order) and those already closed.
     started_tools: Vec<String>,
-    ended_tools: HashSet<String>,
+    /// Whether each `started_tools` occurrence has been closed. Kept per
+    /// occurrence, not per id: a provider can reuse a call id within one
+    /// run, and each start needs its own end.
+    ended_tools: Vec<bool>,
     /// What the run said, in order, for the thread snapshot.
     segments: Vec<Segment>,
     /// The approvals the run paused on.
@@ -947,7 +966,7 @@ impl AgUiFraming {
         Self {
             message_id: None,
             started_tools: Vec::new(),
-            ended_tools: HashSet::new(),
+            ended_tools: Vec::new(),
             segments: Vec::new(),
             approvals: Vec::new(),
         }
@@ -1014,11 +1033,18 @@ impl AgUiFraming {
     /// result or approval for a call opened in an earlier request — a
     /// resumed approval — gets no `TOOL_CALL_END`, which with no matching
     /// start is a protocol violation clients reject (upstream does the same).
+    /// The earliest open occurrence is the one closed.
     fn end_tool(&mut self, tool_call_id: &str, out: &mut Vec<Value>) {
-        if !tool_call_id.is_empty()
-            && self.started_tools.iter().any(|t| t == tool_call_id)
-            && self.ended_tools.insert(tool_call_id.to_string())
-        {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        let open = self
+            .started_tools
+            .iter()
+            .zip(&self.ended_tools)
+            .position(|(t, ended)| t == tool_call_id && !ended);
+        if let Some(i) = open {
+            self.ended_tools[i] = true;
             out.push(json!({ "type": event_type::TOOL_CALL_END, "toolCallId": tool_call_id }));
         }
     }
@@ -1066,6 +1092,7 @@ impl AgUiFraming {
                         }
                         out.push(start);
                         self.started_tools.push(tool_call_id.clone());
+                        self.ended_tools.push(false);
                         let entry = (tool_call_id.clone(), fc.name.clone(), String::new());
                         match self.segments.last_mut() {
                             Some(Segment::Calls(calls)) => calls.push(entry),
@@ -1126,8 +1153,8 @@ impl AgUiFraming {
     /// message if one was opened. Mirrors the orchestrator's
     /// `pending_without_end` sweep.
     fn finalize(&mut self, out: &mut Vec<Value>) {
-        for tool_call_id in &self.started_tools {
-            if !self.ended_tools.contains(tool_call_id) {
+        for (tool_call_id, ended) in self.started_tools.iter().zip(&self.ended_tools) {
+            if !ended {
                 out.push(json!({ "type": event_type::TOOL_CALL_END, "toolCallId": tool_call_id }));
             }
         }
@@ -1141,19 +1168,36 @@ impl AgUiFraming {
 /// tool call the user never ran stays in the stored record, but sent to a
 /// provider it is an unanswered call, which OpenAI rejects with a 400 —
 /// every later turn on the thread would fail.
+///
+/// Results are paired with calls in order — a result answers the nearest
+/// preceding unanswered call with its id, the rule the function-invocation
+/// loop uses — so an earlier result cannot vouch for a later call that
+/// reuses its id.
 fn prune_unanswered_calls(messages: &mut Vec<Message>) {
-    let answered: HashSet<String> = messages
-        .iter()
-        .flat_map(|m| &m.contents)
-        .filter_map(|c| match c {
-            Content::FunctionResult(r) => Some(r.call_id.clone()),
-            _ => None,
-        })
+    let mut outstanding: Vec<(usize, usize, &str)> = Vec::new();
+    for (mi, message) in messages.iter().enumerate() {
+        for (ci, content) in message.contents.iter().enumerate() {
+            match content {
+                Content::FunctionCall(fc) => outstanding.push((mi, ci, fc.call_id.as_str())),
+                Content::FunctionResult(r) => {
+                    if let Some(i) = outstanding.iter().rposition(|(_, _, id)| *id == r.call_id) {
+                        outstanding.remove(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let unanswered: HashSet<(usize, usize)> = outstanding
+        .into_iter()
+        .map(|(mi, ci, _)| (mi, ci))
         .collect();
-    for message in messages.iter_mut() {
-        message.contents.retain(|c| match c {
-            Content::FunctionCall(fc) => answered.contains(&fc.call_id),
-            _ => true,
+    for (mi, message) in messages.iter_mut().enumerate() {
+        let mut ci = 0;
+        message.contents.retain(|_| {
+            let keep = !unanswered.contains(&(mi, ci));
+            ci += 1;
+            keep
         });
     }
     messages.retain(|m| !m.contents.is_empty() || m.role != Role::assistant());
@@ -1403,6 +1447,44 @@ mod tests {
             "f",
             Some(FunctionArguments::Raw("{}".into())),
         ))
+    }
+
+    #[test]
+    fn a_reused_call_id_gets_an_end_for_each_start() {
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        let result =
+            |id: &str| Content::FunctionResult(FunctionResultContent::new(id, Some(json!("done"))));
+        framing.push_contents(
+            &[call("c1"), result("c1"), call("c1"), result("c1")],
+            &mut out,
+        );
+        framing.finalize(&mut out);
+        let count = |ty: &str| out.iter().filter(|e| e["type"] == ty).count();
+        assert_eq!(count("TOOL_CALL_START"), 2);
+        assert_eq!(count("TOOL_CALL_END"), 2, "{out:?}");
+    }
+
+    #[test]
+    fn pruning_pairs_results_with_calls_in_order() {
+        // `c1` completed, then a later frontend call reused `c1` and was
+        // never answered: only the later declaration is pruned.
+        let mut messages = vec![
+            Message::with_contents(Role::assistant(), vec![call("c1")]),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(FunctionResultContent::new(
+                    "c1",
+                    Some(json!("done")),
+                ))],
+            ),
+            Message::with_contents(Role::assistant(), vec![call("c1")]),
+            Message::user("never mind"),
+        ];
+        prune_unanswered_calls(&mut messages);
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(matches!(messages[0].contents[0], Content::FunctionCall(_)));
+        assert_eq!(messages[2].role, Role::user());
     }
 
     #[test]
