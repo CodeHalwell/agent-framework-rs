@@ -63,7 +63,10 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
     the interrupts are spent before the agent runs, so an approved call
     runs at most once even if the run fails or the client disconnects.
     Turns on one thread are serialized within the process, so a
-    double-click cannot resume an approval twice.
+    double-click cannot resume an approval twice. A run whose final save
+    fails ends with `RUN_ERROR` (`SNAPSHOT_SAVE_FAILED`) rather than
+    `RUN_FINISHED`, which would advertise interrupts that were never
+    stored; upstream logs the failure and finishes.
   - **The stored transcript is the server's record** (port of upstream's
     `_reconstruct_messages_from_thread_snapshot`). A client replaying
     history, with or without ids, does not duplicate it, and only user turns

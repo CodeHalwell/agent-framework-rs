@@ -113,9 +113,13 @@
 //! approval twice and concurrent turns do not overwrite each other. Replicas
 //! sharing a store need the store to serialize writes as well.
 //!
-//! A store failure while saving a finished run is logged and never replaces
-//! events already streamed; the previous snapshot stays authoritative. A run
-//! that fails, or whose client disconnects, is not saved.
+//! A store failure while saving a finished run never touches the events
+//! already streamed, but the run ends with `RUN_ERROR`
+//! (`SNAPSHOT_SAVE_FAILED`) in place of `MESSAGES_SNAPSHOT` and
+//! `RUN_FINISHED`, which would advertise interrupts and a thread record that
+//! were never stored; the previous snapshot stays authoritative. (Upstream
+//! logs the failure and finishes the run.) A run that fails, or whose client
+//! disconnects, is not saved.
 //!
 //! # Client
 //! With the `agui-client` feature, `client::AgUiChatClient` (re-exported
@@ -866,12 +870,29 @@ async fn run_with_snapshots(
                 session_state: Some(session_state),
                 client_state_keys,
             };
-            if let Err(e) = store.save(&scope, &thread_id, saved).await {
-                tracing::error!(error = %e, "AG-UI snapshot save failed; keeping the previous snapshot");
+            // A failed save ends the run in error rather than finishing it:
+            // `RUN_FINISHED` would advertise interrupts that were never
+            // stored (so resuming them finds nothing) and a thread record
+            // that does not exist — and after a resume, whose approval was
+            // already spent, a client must not be told the outcome is safe
+            // to build on. The events already streamed stand; only the
+            // closing ones change. Upstream logs and finishes; this does not.
+            match store.save(&scope, &thread_id, saved).await {
+                Ok(()) => {
+                    events.push(
+                        json!({ "type": event_type::MESSAGES_SNAPSHOT, "messages": transcript }),
+                    );
+                    events.push(run_finished_with(&thread_id, &run_id, &interrupts));
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "AG-UI snapshot save failed; keeping the previous snapshot");
+                    events.push(json!({
+                        "type": event_type::RUN_ERROR,
+                        "message": "The thread could not be saved; this run's outcome is not recorded.",
+                        "code": "SNAPSHOT_SAVE_FAILED",
+                    }));
+                }
             }
-
-            events.push(json!({ "type": event_type::MESSAGES_SNAPSHOT, "messages": transcript }));
-            events.push(run_finished_with(&thread_id, &run_id, &interrupts));
             for ev in events {
                 if tx.send(ev).await.is_err() {
                     return;

@@ -1213,3 +1213,65 @@ async fn hydration_during_a_resume_sees_the_finished_thread() {
         event_types(&hydrated)
     );
 }
+
+/// A store whose saves always fail, wrapping a working one for reads.
+struct FailingSaves(InMemoryAgUiThreadSnapshotStore);
+
+#[async_trait]
+impl AgUiThreadSnapshotStore for FailingSaves {
+    async fn save(
+        &self,
+        _scope: &str,
+        _thread_id: &str,
+        _snapshot: agent_framework_hosting::agui::AgUiThreadSnapshot,
+    ) -> Result<()> {
+        Err(agent_framework_core::error::Error::Other(
+            "disk full".into(),
+        ))
+    }
+    async fn get(
+        &self,
+        scope: &str,
+        thread_id: &str,
+    ) -> Result<Option<agent_framework_hosting::agui::AgUiThreadSnapshot>> {
+        self.0.get(scope, thread_id).await
+    }
+    async fn delete(&self, scope: &str, thread_id: &str) -> Result<bool> {
+        self.0.delete(scope, thread_id).await
+    }
+    async fn clear(&self, scope: Option<&str>) -> Result<()> {
+        self.0.clear(scope).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_save_ends_the_run_in_error_not_finished() {
+    // RUN_FINISHED would advertise an approval interrupt that was never
+    // stored, so resuming it would find nothing.
+    let wired = Arc::new(Mutex::new(Vec::new()));
+    let app = AgUiRouter::for_agent("bank", bank_agent(wired))
+        .snapshot_store(Arc::new(FailingSaves(
+            InMemoryAgUiThreadSnapshotStore::new(),
+        )))
+        .single_user()
+        .into_router();
+    let (_, events) = post_as(
+        &app,
+        None,
+        json!({ "threadId": "t", "messages": [{ "id": "u1", "role": "user", "content": "send 10" }] }),
+    )
+    .await;
+    let types = event_types(&events);
+    assert_eq!(
+        types.last().map(String::as_str),
+        Some("RUN_ERROR"),
+        "{types:?}"
+    );
+    assert_eq!(events.last().unwrap()["code"], "SNAPSHOT_SAVE_FAILED");
+    assert!(
+        !types
+            .iter()
+            .any(|t| t == "RUN_FINISHED" || t == "MESSAGES_SNAPSHOT"),
+        "{types:?}"
+    );
+}
