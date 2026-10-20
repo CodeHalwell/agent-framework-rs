@@ -141,7 +141,9 @@ no longer emitting a `TOOL_CALL_END` for a call the run never started.
   file whose bytes were that string. Inline `data:` URIs still go in
   `file_data`. `text/*` files (plain text, Markdown, CSV) are sent as
   `input_file` too, with a matching filename extension; the converter had
-  no arm for them and dropped them.
+  no arm for them and dropped them. An inline `application/*` file is now
+  named for its type as well (`file.pdf`, `file.docx`) rather than a bare
+  `file`, which the service identifies files by.
 - A Magentic progress ledger naming a participant that does not exist is
   retried against the existing `progress_ledger_retry_count` budget instead
   of ending the run on the first bad answer (upstream #9181). If every

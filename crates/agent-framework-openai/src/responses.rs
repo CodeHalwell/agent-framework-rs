@@ -652,10 +652,12 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
         // Inline bytes go in `file_data`; a remote file goes by `file_url`.
         // Putting a URL in `file_data` makes the service read the URL
         // itself as the file's contents.
+        // The service identifies an inline file by its name, so a known
+        // document type gets a matching extension rather than a bare `file`.
         "application" if uri.starts_with("data:") => Some(json!({
             "type": "input_file",
             "file_data": uri,
-            "filename": DEFAULT_FILENAME,
+            "filename": application_filename(media_type),
         })),
         "application" => Some(json!({ "type": "input_file", "file_url": uri })),
         // Text, Markdown and CSV attachments are files too. There was no arm
@@ -670,6 +672,32 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
         "text" => Some(json!({ "type": "input_file", "file_url": uri })),
         _ => None,
     }
+}
+
+/// A filename for an inline `application/*` file: the bare default with the
+/// extension its media type implies, or the bare default when it implies
+/// none (`application/octet-stream`).
+fn application_filename(media_type: &str) -> String {
+    let subtype = media_type
+        .split(';')
+        .next()
+        .and_then(|t| t.split_once('/'))
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase());
+    let ext = match subtype.as_deref() {
+        Some("pdf") => "pdf",
+        Some("msword") => "doc",
+        Some("vnd.openxmlformats-officedocument.wordprocessingml.document") => "docx",
+        Some("vnd.ms-excel") => "xls",
+        Some("vnd.openxmlformats-officedocument.spreadsheetml.sheet") => "xlsx",
+        Some("vnd.ms-powerpoint") => "ppt",
+        Some("vnd.openxmlformats-officedocument.presentationml.presentation") => "pptx",
+        Some("json") => "json",
+        Some("rtf") => "rtf",
+        Some("xml") => "xml",
+        Some("zip") => "zip",
+        _ => return DEFAULT_FILENAME.to_string(),
+    };
+    format!("{DEFAULT_FILENAME}.{ext}")
 }
 
 /// A filename for an inline `text/*` file, whose extension tells the
@@ -2471,6 +2499,21 @@ mod tests {
     // region: multimodal input (Responses)
 
     #[test]
+    fn an_inline_document_is_named_for_its_type() {
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let uri = format!("data:{docx};base64,UEs=");
+        assert_eq!(
+            content_to_input_part(&uri, Some(docx)).unwrap()["filename"],
+            "file.docx"
+        );
+        let bin = "data:application/octet-stream;base64,AA==";
+        assert_eq!(
+            content_to_input_part(bin, Some("application/octet-stream")).unwrap()["filename"],
+            "file"
+        );
+    }
+
+    #[test]
     fn a_text_file_is_sent_as_a_file() {
         assert_eq!(
             content_to_input_part("data:text/plain;base64,aGk=", Some("text/plain")),
@@ -2514,7 +2557,7 @@ mod tests {
         assert_eq!(
             content_to_input_part("data:application/pdf;base64,JV", Some("application/pdf")),
             Some(
-                json!({ "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" })
+                json!({ "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file.pdf" })
             )
         );
     }
@@ -2557,7 +2600,7 @@ mod tests {
             input[0]["content"],
             json!([
                 { "type": "input_audio", "input_audio": { "data": "QQ", "format": "wav" } },
-                { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" },
+                { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file.pdf" },
                 { "type": "input_file", "file_id": "file-123" },
             ])
         );

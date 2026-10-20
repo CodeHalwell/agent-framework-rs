@@ -601,12 +601,27 @@ fn attachment(uri: String, default_media_type: &str) -> Option<Content> {
 }
 
 /// A media type for bare base64 file data, from its filename's extension.
+///
+/// The filename itself does not survive: the core data content has no field
+/// for it. The media type is what lets a converter give the file a name the
+/// service can identify it by (`file.docx`), so the common document types
+/// are mapped rather than left as `application/octet-stream`.
 fn media_type_for_filename(filename: Option<&str>) -> &'static str {
     let ext = filename
         .and_then(|f| f.rsplit_once('.'))
         .map(|(_, ext)| ext.to_ascii_lowercase());
     match ext.as_deref() {
         Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("rtf") => "application/rtf",
+        Some("xml") => "application/xml",
+        Some("zip") => "application/zip",
+        Some("html" | "htm") => "text/html",
         Some("txt") => "text/plain",
         Some("md") => "text/markdown",
         Some("csv") => "text/csv",
@@ -1016,6 +1031,27 @@ mod tests {
         assert!(
             matches!(&contents[2], Content::Data(d) if d.media_type.as_deref() == Some("text/plain"))
         );
+    }
+
+    #[test]
+    fn bare_base64_office_files_keep_a_real_media_type() {
+        for (name, media_type) in [
+            (
+                "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            (
+                "sheet.XLSX",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+            (
+                "deck.pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ),
+            ("mystery.bin", "application/octet-stream"),
+        ] {
+            assert_eq!(media_type_for_filename(Some(name)), media_type, "{name}");
+        }
     }
 
     #[test]
