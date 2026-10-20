@@ -1091,6 +1091,17 @@ impl AgUiFraming {
     /// Frame one streamed update's `contents`, pushing AG-UI events onto `out`.
     fn push_contents(&mut self, contents: &[Content], out: &mut Vec<Value>) {
         for content in contents {
+            // Content the Gemini converter sends as a wire part breaks a
+            // carrier's pairing with the next call, so a stale signature never
+            // reaches an unrelated one: text (even empty), inline data, URIs
+            // and tool results. A call consumes the carrier itself; approval
+            // requests and responses emit no part and keep it.
+            if matches!(
+                content,
+                Content::Text(_) | Content::Data(_) | Content::Uri(_) | Content::FunctionResult(_)
+            ) {
+                self.pending_signature = None;
+            }
             match content {
                 Content::TextReasoning(t) => {
                     // Only a signed part replaces the carrier: an unsigned
@@ -1101,10 +1112,6 @@ impl AgUiFraming {
                     }
                 }
                 Content::Text(TextContent { text, .. }) if !text.is_empty() => {
-                    // Wire-visible content between a carrier and a call breaks
-                    // the pairing, so a stale signature never reaches an
-                    // unrelated call.
-                    self.pending_signature = None;
                     let mid = match &self.message_id {
                         Some(mid) => mid.clone(),
                         None => {
@@ -1167,7 +1174,8 @@ impl AgUiFraming {
                         }
                     }
                     let delta = arguments_delta(fc).filter(|d| !d.is_empty());
-                    if delta.is_some() || fc.protected_data.is_some() {
+                    if delta.is_some() || fc.protected_data.as_ref().is_some_and(|t| !t.is_empty())
+                    {
                         let entry = self.segments.iter_mut().rev().find_map(|s| match s {
                             Segment::Calls(calls) => {
                                 calls.iter_mut().rev().find(|c| c.id == tool_call_id)
@@ -1179,8 +1187,13 @@ impl AgUiFraming {
                                 entry.arguments.push_str(delta);
                             }
                             // The token can arrive on any fragment.
-                            if fc.protected_data.is_some() {
-                                entry.protected_data = fc.protected_data.clone();
+                            // Only a non-empty token replaces the recorded
+                            // one: an empty fragment must not erase a
+                            // signature backfilled from the carrier.
+                            if let Some(token) =
+                                fc.protected_data.as_ref().filter(|t| !t.is_empty())
+                            {
+                                entry.protected_data = Some(token.clone());
                             }
                         }
                     }
@@ -1193,7 +1206,6 @@ impl AgUiFraming {
                     }
                 }
                 Content::FunctionResult(fr) => {
-                    self.pending_signature = None;
                     self.end_tool(&fr.call_id, out);
                     let message_id = util::msg_id();
                     let content = result_content(fr);
@@ -1671,6 +1683,46 @@ mod tests {
         let transcript = framing.transcript();
         let calls = transcript[0]["toolCalls"].as_array().unwrap();
         assert_eq!(calls[0]["encryptedValue"], "own");
+        assert!(calls[1].get("encryptedValue").is_none(), "{calls:?}");
+    }
+
+    #[test]
+    fn a_carrier_survives_an_empty_token_and_breaks_on_data() {
+        let carrier = || {
+            Content::TextReasoning(agent_framework_core::types::TextReasoningContent {
+                text: "thinking".into(),
+                protected_data: Some("carrier".into()),
+                ..Default::default()
+            })
+        };
+        let mut empty_token =
+            FunctionCallContent::new("c1", "f", Some(FunctionArguments::Raw("{}".into())));
+        empty_token.protected_data = Some(String::new());
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        framing.push_contents(
+            &[
+                // An empty token on the call (or a later fragment) must not
+                // erase the backfilled signature.
+                carrier(),
+                Content::FunctionCall(empty_token),
+                // Inline data is a wire part: it breaks the next pairing.
+                carrier(),
+                Content::Data(agent_framework_core::types::DataContent::from_bytes(
+                    b"x",
+                    "image/png",
+                )),
+                call("c2"),
+            ],
+            &mut out,
+        );
+        let transcript = framing.transcript();
+        let calls: Vec<&Value> = transcript
+            .iter()
+            .filter_map(|m| m.get("toolCalls"))
+            .flat_map(|c| c.as_array().unwrap())
+            .collect();
+        assert_eq!(calls[0]["encryptedValue"], "carrier");
         assert!(calls[1].get("encryptedValue").is_none(), "{calls:?}");
     }
 
