@@ -592,10 +592,18 @@ fn overlap_length(stored: &[Value], incoming: &[Value], start: usize) -> usize {
 ///
 /// Calls and results are paired in transcript order — a result answers the
 /// nearest preceding unanswered call with its id — so a provider reusing an
-/// id does not let an earlier completed call cancel out a later open one.
+/// id does not let an earlier completed call cancel out a later open one. A
+/// call is open only while nothing but tool results follows it.
 fn unanswered_call_ids(stored: &[Value]) -> HashMap<&str, usize> {
     let mut outstanding: Vec<&str> = Vec::new();
     for m in stored {
+        // Only tool results may sit between a call and its answer: providers
+        // such as Anthropic reject a result that arrives after a later turn.
+        // So any other message retires every call still open before it — a
+        // frontend call the user moved on from can no longer be answered.
+        if role(m) != "tool" {
+            outstanding.clear();
+        }
         if let Some(calls) = m
             .get("toolCalls")
             .or_else(|| m.get("tool_calls"))
@@ -1249,6 +1257,29 @@ mod tests {
         ];
         let merged = reconcile_messages(&merged, &follow_up);
         assert_eq!(merged.len(), 2, "{merged:?}");
+    }
+
+    #[test]
+    fn a_result_is_refused_once_the_thread_has_moved_past_its_call() {
+        // The browser never ran `c1` and the user carried on; a late result
+        // would land after intervening turns, which Anthropic rejects.
+        let stored = vec![
+            json!({ "id": "u1", "role": "user", "content": "go" }),
+            json!({ "id": "a1", "role": "assistant", "toolCalls": [
+                { "id": "c1", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+            ]}),
+            json!({ "id": "u2", "role": "user", "content": "never mind" }),
+            json!({ "id": "a2", "role": "assistant", "content": "ok" }),
+        ];
+        let incoming = [
+            json!({ "id": "a2", "role": "assistant", "content": "ok" }),
+            json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "late" }),
+        ];
+        assert_eq!(reconcile_messages(&stored, &incoming).len(), 4);
+        // While it is still the latest thing in the thread, it is answerable.
+        let incoming =
+            [json!({ "id": "r1", "role": "tool", "toolCallId": "c1", "content": "ran" })];
+        assert_eq!(reconcile_messages(&stored[..2], &incoming).len(), 3);
     }
 
     fn pending(id: &str, call_id: &str) -> Value {
