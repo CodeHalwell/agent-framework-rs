@@ -204,6 +204,17 @@ impl std::default::Default for WorkflowBuilder {
     }
 }
 
+/// Collect fan-out targets, keeping the first mention of each and dropping
+/// repeats. Order is the order targets are first named, so a graph still
+/// reads the way it was declared.
+fn dedup_targets(targets: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
 impl WorkflowBuilder {
     /// Create a new, empty builder.
     pub fn new() -> Self {
@@ -274,6 +285,11 @@ impl WorkflowBuilder {
     }
 
     /// Broadcast from `source` to all `targets`.
+    ///
+    /// A target named twice receives the message once. A broadcast edge is a
+    /// set of destinations, not a list of deliveries: delivering twice runs
+    /// the executor twice on one message and, for a fan-in sink,
+    /// double-counts toward its barrier (upstream #9432).
     pub fn add_fan_out(
         mut self,
         source: impl Into<String>,
@@ -281,7 +297,7 @@ impl WorkflowBuilder {
     ) -> Self {
         self.edge_groups.push(EdgeGroup::FanOut {
             source: source.into(),
-            targets: targets.into_iter().collect(),
+            targets: dedup_targets(targets),
             selection: None,
             case_labels: None,
         });
@@ -339,7 +355,7 @@ impl WorkflowBuilder {
     ) -> Self {
         self.edge_groups.push(EdgeGroup::FanOut {
             source: source.into(),
-            targets: targets.into_iter().collect(),
+            targets: dedup_targets(targets),
             selection: Some(selection),
             case_labels: None,
         });
@@ -368,14 +384,38 @@ impl WorkflowBuilder {
         default: SwitchDefault,
     ) -> Self {
         let source = source.into();
+        // Several cases may route to the same executor — a switch whose
+        // "refund" and "chargeback" branches both go to `billing`, or whose
+        // default target is also a case target. That is one edge, not two:
+        // a repeated target would be delivered to twice per message and
+        // drawn twice in the graph (upstream #9300). The branch labels of
+        // the cases that share a target are joined onto that one edge, so
+        // the visualization still names every branch reaching it.
         let mut targets: Vec<String> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
+        let label_for =
+            |target: &str, label: String, targets: &mut Vec<String>, labels: &mut Vec<String>| {
+                match targets.iter().position(|t| t == target) {
+                    Some(i) => {
+                        labels[i].push_str(", ");
+                        labels[i].push_str(&label);
+                    }
+                    None => {
+                        targets.push(target.to_string());
+                        labels.push(label);
+                    }
+                }
+            };
         for (i, case) in cases.iter().enumerate() {
-            targets.push(case.target.clone());
-            labels.push(case.label.clone().unwrap_or_else(|| format!("case {i}")));
+            let label = case.label.clone().unwrap_or_else(|| format!("case {i}"));
+            label_for(&case.target, label, &mut targets, &mut labels);
         }
-        targets.push(default.target.clone());
-        labels.push("default".to_string());
+        label_for(
+            &default.target,
+            "default".to_string(),
+            &mut targets,
+            &mut labels,
+        );
 
         // Extract owned `(condition, target)` pairs so the selection closure
         // below doesn't need to borrow `cases` from its own captured
@@ -1279,7 +1319,15 @@ impl WorkflowRun {
                             }
                         }
                     }
-                    None => targets.extend(outs.clone()),
+                    // Deduped at construction by the builder, but an
+                    // `EdgeGroup::FanOut` is a public enum anyone can build
+                    // by hand, and a double delivery is silent damage —
+                    // the executor runs twice on one message, a fan-in sink
+                    // counts it twice toward its barrier.
+                    None => {
+                        let mut seen = std::collections::HashSet::new();
+                        targets.extend(outs.iter().filter(|id| seen.insert(*id)).cloned());
+                    }
                 },
                 EdgeGroup::FanIn { sources, target } if sources.contains(&msg.source_id) => {
                     targets.push(target.clone());
@@ -1388,6 +1436,93 @@ mod async_condition_tests {
         Arc::new(FunctionExecutor::new(id, |msg, ctx| async move {
             ctx.yield_output(msg).await
         }))
+    }
+
+    /// An executor that forwards its message along its outgoing edges,
+    /// so what the routing layer decided is what the downstream executors
+    /// actually see.
+    fn forward(id: &str) -> Arc<dyn Executor> {
+        Arc::new(FunctionExecutor::new(id, |msg, ctx| async move {
+            ctx.send_message(msg).await
+        }))
+    }
+
+    /// An executor that counts how many messages it received and yields
+    /// each one, so a double delivery is visible as a count of two rather
+    /// than inferred from the outputs.
+    fn counting(id: &str, hits: Arc<std::sync::atomic::AtomicUsize>) -> Arc<dyn Executor> {
+        Arc::new(FunctionExecutor::new(id, move |msg, ctx| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ctx.yield_output(msg).await
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_target_named_twice_is_delivered_once() {
+        // A broadcast edge is a set of destinations, not a list of
+        // deliveries. Named twice, the executor ran twice on one message —
+        // and for a fan-in sink that also double-counts toward its barrier
+        // (upstream #9432).
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workflow = WorkflowBuilder::new()
+            .add_executor(forward("start"))
+            .add_executor(counting("sink", hits.clone()))
+            .set_start("start")
+            .add_fan_out(
+                "start",
+                vec!["sink".to_string(), "sink".to_string(), "sink".to_string()],
+            )
+            .build()
+            .unwrap();
+
+        workflow.run(json!("payload")).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn switch_cases_sharing_a_target_make_one_edge() {
+        // "refund" and "chargeback" both routing to `billing` is one edge,
+        // not two: a repeated target is delivered to twice per message and
+        // drawn twice in the graph (upstream #9300). The branch labels of
+        // the cases that share it are joined onto that one edge, so the
+        // visualization still names every branch reaching it.
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workflow = WorkflowBuilder::new()
+            .add_executor(forward("start"))
+            .add_executor(counting("billing", hits.clone()))
+            .add_executor(echo("other"))
+            .set_start("start")
+            .add_switch(
+                "start",
+                vec![
+                    Case::labeled(|v| v == &json!("refund"), "billing", "refund"),
+                    Case::labeled(|v| v == &json!("chargeback"), "billing", "chargeback"),
+                ],
+                SwitchDefault::new("other"),
+            )
+            .build()
+            .unwrap();
+
+        let group = workflow
+            .shared
+            .edge_groups
+            .iter()
+            .find(|g| matches!(g, EdgeGroup::FanOut { source, .. } if source == "start"))
+            .expect("the switch group");
+        assert_eq!(group.targets(), vec!["billing", "other"]);
+        let EdgeGroup::FanOut { case_labels, .. } = group else {
+            unreachable!("matched above")
+        };
+        assert_eq!(
+            case_labels.as_deref(),
+            Some(["refund, chargeback".to_string(), "default".to_string()].as_slice())
+        );
+
+        workflow.run(json!("refund")).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -929,6 +929,36 @@ fn chat_span_records_error_status_on_failure() {
         span.fields.get(attr::OTEL_STATUS_CODE).map(String::as_str),
         Some("ERROR")
     );
+    // `ObservableChatClient::new` leaves content capture off, and a
+    // provider error's text is content: the failure is reported, its words
+    // are not (upstream #9288).
+    assert!(
+        !span.fields.contains_key(attr::OTEL_STATUS_MESSAGE),
+        "got: {:?}",
+        span.fields.get(attr::OTEL_STATUS_MESSAGE)
+    );
+}
+
+#[test]
+fn chat_span_records_the_error_message_with_content_capture() {
+    let capture = run_captured(|| async {
+        let client = ObservableChatClient::new(
+            StubClient {
+                fail: true,
+                response_model: None,
+                ..Default::default()
+            },
+            "p",
+        )
+        .with_content_capture(true);
+        let _ = client
+            .get_response(
+                vec![Message::user("hi")],
+                ChatOptions::new().with_model("m"),
+            )
+            .await;
+    });
+    let span = capture.by_name("chat").expect("expected a chat span");
     let message = span
         .fields
         .get(attr::OTEL_STATUS_MESSAGE)
@@ -1039,8 +1069,12 @@ fn tool_span_delegates_to_tool_span_ex_with_function_type() {
 fn tool_span_records_error_status() {
     let capture = run_captured(|| async {
         let span = tool_span_ex("flaky", "call-3", None);
-        async {
-            record_error(&tracing::Span::current(), &Error::tool("kaboom"));
+        let config = ObservabilityConfig {
+            enable_sensitive_data: true,
+            ..ObservabilityConfig::default()
+        };
+        async move {
+            record_error(&tracing::Span::current(), &Error::tool("kaboom"), &config);
         }
         .instrument(span)
         .await;
@@ -1061,6 +1095,47 @@ fn tool_span_records_error_status() {
         .get(attr::OTEL_STATUS_MESSAGE)
         .expect("status message present");
     assert!(message.contains("kaboom"), "got: {message}");
+}
+
+/// Without content capture the span still says the call failed, and in
+/// which variant — but not what the error said. An error's text is as
+/// sensitive as the message content and tool arguments beside it: a
+/// provider's 400 quotes the request, a tool's failure prints the argument
+/// it choked on, a transport error carries the URL and its query string
+/// (upstream #9288).
+#[test]
+fn an_error_message_is_withheld_without_content_capture() {
+    let capture = run_captured(|| async {
+        let span = tool_span_ex("flaky", "call-4", None);
+        let config = ObservabilityConfig::default();
+        async move {
+            record_error(
+                &tracing::Span::current(),
+                &Error::tool("secret-bearing failure detail"),
+                &config,
+            );
+        }
+        .instrument(span)
+        .await;
+    });
+    let span = capture
+        .by_name("execute_tool")
+        .expect("expected an execute_tool span");
+    assert_eq!(
+        span.fields.get(attr::ERROR_TYPE).map(String::as_str),
+        Some("tool"),
+        "the error's variant is metadata and always recorded"
+    );
+    assert_eq!(
+        span.fields.get(attr::OTEL_STATUS_CODE).map(String::as_str),
+        Some("ERROR"),
+        "a redacted span still reports the failure"
+    );
+    assert!(
+        !span.fields.contains_key(attr::OTEL_STATUS_MESSAGE),
+        "the error text must not be recorded, got: {:?}",
+        span.fields.get(attr::OTEL_STATUS_MESSAGE)
+    );
 }
 
 // ---------------------------------------------------------------------

@@ -31,9 +31,9 @@ use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
-    McpServerToolCallContent, McpServerToolResultContent, Message, ResponseFormat, Role,
-    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
-    UsageDetails,
+    McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
+    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
+    UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -649,13 +649,73 @@ fn content_to_input_part(uri: &str, media_type: Option<&str>) -> Option<Value> {
                 },
             }))
         }
-        "application" => Some(json!({
+        // Inline bytes go in `file_data`; a remote file goes by `file_url`.
+        // Putting a URL in `file_data` makes the service read the URL
+        // itself as the file's contents.
+        // The service identifies an inline file by its name, so a known
+        // document type gets a matching extension rather than a bare `file`.
+        "application" if uri.starts_with("data:") => Some(json!({
             "type": "input_file",
             "file_data": uri,
-            "filename": DEFAULT_FILENAME,
+            "filename": application_filename(media_type),
         })),
+        "application" => Some(json!({ "type": "input_file", "file_url": uri })),
+        // Text, Markdown and CSV attachments are files too. There was no arm
+        // for them, so they were dropped without a word. The service infers
+        // a file's type from its name, so inline text gets a matching
+        // extension rather than the bare default.
+        "text" if uri.starts_with("data:") => Some(json!({
+            "type": "input_file",
+            "file_data": uri,
+            "filename": text_filename(media_type),
+        })),
+        "text" => Some(json!({ "type": "input_file", "file_url": uri })),
         _ => None,
     }
+}
+
+/// A filename for an inline `application/*` file: the bare default with the
+/// extension its media type implies, or the bare default when it implies
+/// none (`application/octet-stream`).
+fn application_filename(media_type: &str) -> String {
+    let subtype = media_type
+        .split(';')
+        .next()
+        .and_then(|t| t.split_once('/'))
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase());
+    let ext = match subtype.as_deref() {
+        Some("pdf") => "pdf",
+        Some("msword") => "doc",
+        Some("vnd.openxmlformats-officedocument.wordprocessingml.document") => "docx",
+        Some("vnd.ms-excel") => "xls",
+        Some("vnd.openxmlformats-officedocument.spreadsheetml.sheet") => "xlsx",
+        Some("vnd.ms-powerpoint") => "ppt",
+        Some("vnd.openxmlformats-officedocument.presentationml.presentation") => "pptx",
+        Some("json") => "json",
+        Some("rtf") => "rtf",
+        Some("xml") => "xml",
+        Some("zip") => "zip",
+        _ => return DEFAULT_FILENAME.to_string(),
+    };
+    format!("{DEFAULT_FILENAME}.{ext}")
+}
+
+/// A filename for an inline `text/*` file, whose extension tells the
+/// service what it holds.
+fn text_filename(media_type: &str) -> String {
+    let subtype = media_type
+        .split(';')
+        .next()
+        .and_then(|t| t.split_once('/'))
+        .map(|(_, sub)| sub.trim().to_ascii_lowercase());
+    let ext = match subtype.as_deref() {
+        Some("markdown") => "md",
+        Some("csv") => "csv",
+        Some("html") => "html",
+        Some("xml") => "xml",
+        _ => "txt",
+    };
+    format!("{DEFAULT_FILENAME}.{ext}")
 }
 
 fn flush_text(out: &mut Vec<Value>, buffered: &mut Vec<Value>, role: &str) {
@@ -918,6 +978,63 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     response
 }
 
+/// Build the consent content for an `oauth_consent_request` output item,
+/// or `None` when its link cannot be trusted.
+///
+/// An Azure AI Foundry project's Responses endpoint emits this item when a
+/// hosted tool needs the user to complete an OAuth consent flow; OpenAI's
+/// own Responses API does not. It is handled in this shared parser because
+/// `agent-framework-azure` and `agent-framework-foundry` both reuse it
+/// verbatim rather than re-implementing the Responses wire — a Foundry-only
+/// item type that costs an unreachable match arm on the OpenAI path.
+///
+/// The link is checked before it is handed on. It is a URL the framework is
+/// asking a human to open and authenticate at, arriving from the service as
+/// free-form text, so a `http://` or `javascript:` one is dropped with a
+/// warning rather than surfaced as something to click. Upstream validates
+/// the same two things: an HTTPS scheme and a non-empty host.
+fn oauth_consent_content(item: &Value) -> Option<Content> {
+    let item_id = item.get("id").and_then(Value::as_str);
+    let consent_link = item
+        .get("consent_link")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_https_url(consent_link) {
+        tracing::warn!(
+            item_id = item_id.unwrap_or("<unknown>"),
+            "dropping oauth_consent_request without an https consent_link"
+        );
+        return None;
+    }
+    let mut content = OauthConsentRequestContent::new(consent_link);
+    content.id = item_id.filter(|id| !id.is_empty()).map(str::to_string);
+    Some(Content::OauthConsentRequest(content))
+}
+
+/// Whether `link` is an `https` URL with a real host.
+///
+/// Two checks, because each alone has a gap. The literal one — an
+/// `https://` prefix followed by a non-empty authority — accepts
+/// `https://user@/consent` and `https://:443/consent`, whose authority names
+/// no host. The WHATWG parser `reqwest` re-exports (so no new dependency)
+/// rejects those, but repairs `https:///consent` into `https://consent/`, as
+/// a browser would. A consent link only usable after such a repair is not
+/// one to hand a human, so it must pass both.
+fn is_https_url(link: &str) -> bool {
+    let literal = link
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &link[8..])
+        .is_some_and(|authority| {
+            let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+            !authority[..end].is_empty()
+        });
+    literal
+        && reqwest::Url::parse(link).is_ok_and(|url| {
+            url.scheme() == "https" && url.host_str().is_some_and(|host| !host.is_empty())
+        })
+}
+
 fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
@@ -942,6 +1059,13 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                     }
                 }
             }
+        }
+        // Foundry only — see `oauth_consent_content`. Upstream surfaced it
+        // on the stream first and from the completed response later
+        // (#8976); a non-streaming run that needed consent otherwise came
+        // back as an empty answer with no way to learn why.
+        Some("oauth_consent_request") => {
+            contents.extend(oauth_consent_content(item));
         }
         Some("function_call") => {
             let call_id = item
@@ -1400,6 +1524,20 @@ fn parse_responses_event(
         "response.output_item.added" => {
             let item = value.get("item");
             let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+            // A consent request is complete the moment it is added — it
+            // has no deltas to wait for, and the run is blocked on the
+            // user until it is answered, so holding it back to `done`
+            // would be holding back the one thing the caller needs.
+            if item_type == Some("oauth_consent_request") {
+                return match item.and_then(oauth_consent_content) {
+                    Some(content) => EventOutcome::Update(ChatResponseUpdate {
+                        contents: vec![content],
+                        role: Some(Role::assistant()),
+                        ..Default::default()
+                    }),
+                    None => EventOutcome::None,
+                };
+            }
             // A hosted MCP call is emitted whole from `done` (below): on
             // `added` its arguments are still empty and only stream in
             // through `response.mcp_call_arguments.*`, so a call recorded
@@ -1430,6 +1568,17 @@ fn parse_responses_event(
                 ..Default::default()
             })
         }
+        // Foundry also emits the consent request as a top-level event
+        // rather than an output item, carrying the link on the event
+        // itself. Same content either way.
+        "response.oauth_consent_requested" => match oauth_consent_content(value) {
+            Some(content) => EventOutcome::Update(ChatResponseUpdate {
+                contents: vec![content],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            }),
+            None => EventOutcome::None,
+        },
         "response.function_call_arguments.delta" => {
             let output_index = value
                 .get("output_index")
@@ -2350,6 +2499,70 @@ mod tests {
     // region: multimodal input (Responses)
 
     #[test]
+    fn an_inline_document_is_named_for_its_type() {
+        let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let uri = format!("data:{docx};base64,UEs=");
+        assert_eq!(
+            content_to_input_part(&uri, Some(docx)).unwrap()["filename"],
+            "file.docx"
+        );
+        let bin = "data:application/octet-stream;base64,AA==";
+        assert_eq!(
+            content_to_input_part(bin, Some("application/octet-stream")).unwrap()["filename"],
+            "file"
+        );
+    }
+
+    #[test]
+    fn a_text_file_is_sent_as_a_file() {
+        assert_eq!(
+            content_to_input_part("data:text/plain;base64,aGk=", Some("text/plain")),
+            Some(
+                json!({ "type": "input_file", "file_data": "data:text/plain;base64,aGk=", "filename": "file.txt" })
+            )
+        );
+        assert_eq!(
+            content_to_input_part("data:text/markdown;base64,Iw==", Some("text/markdown")).unwrap()
+                ["filename"],
+            "file.md"
+        );
+        assert_eq!(
+            content_to_input_part("https://example.com/notes.csv", Some("text/csv")),
+            Some(json!({ "type": "input_file", "file_url": "https://example.com/notes.csv" }))
+        );
+    }
+
+    #[test]
+    fn a_consent_link_must_name_a_real_host() {
+        assert!(is_https_url("https://login.example.com/consent?x=1"));
+        assert!(is_https_url("HTTPS://login.example.com/consent"));
+        for bad in [
+            "https://user@/consent",
+            "https://:443/consent",
+            "https:///consent",
+            "http://login.example.com/consent",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(!is_https_url(bad), "{bad} accepted");
+        }
+    }
+
+    #[test]
+    fn a_remote_file_uri_goes_by_file_url() {
+        assert_eq!(
+            content_to_input_part("https://example.com/report.pdf", Some("application/pdf")),
+            Some(json!({ "type": "input_file", "file_url": "https://example.com/report.pdf" }))
+        );
+        assert_eq!(
+            content_to_input_part("data:application/pdf;base64,JV", Some("application/pdf")),
+            Some(
+                json!({ "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file.pdf" })
+            )
+        );
+    }
+
+    #[test]
     fn input_image_uri_becomes_input_image_part() {
         let msg = user_with(vec![Content::Uri(UriContent {
             uri: "https://example.com/cat.png".into(),
@@ -2387,7 +2600,7 @@ mod tests {
             input[0]["content"],
             json!([
                 { "type": "input_audio", "input_audio": { "data": "QQ", "format": "wav" } },
-                { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file" },
+                { "type": "input_file", "file_data": "data:application/pdf;base64,JV", "filename": "file.pdf" },
                 { "type": "input_file", "file_id": "file-123" },
             ])
         );
@@ -2862,6 +3075,132 @@ mod tests {
             reasoning_event(json!({ "type": "response.refusal.done", "refusal": "I can't help" }));
         assert!(matches!(done, EventOutcome::None));
     }
+
+    // region: Foundry oauth consent
+
+    #[test]
+    fn a_completed_response_surfaces_its_oauth_consent_request() {
+        // A Foundry hosted tool that needs consent finishes the turn with
+        // an `oauth_consent_request` output item and no text. Ignored, the
+        // run came back as an empty answer and the caller had no way to
+        // learn what it was waiting for (upstream #8976).
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "oauth_consent_request",
+                    "id": "oauth_7",
+                    "consent_link": "https://login.example.com/consent?state=abc",
+                }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let Content::OauthConsentRequest(consent) = &resp.messages[0].contents[0] else {
+            panic!(
+                "expected a consent request, got {:?}",
+                resp.messages[0].contents
+            );
+        };
+        assert_eq!(
+            consent.consent_link,
+            "https://login.example.com/consent?state=abc"
+        );
+        // The id is what a workflow registers the request under, so the
+        // user's answer has something to correlate against.
+        assert_eq!(consent.id.as_deref(), Some("oauth_7"));
+    }
+
+    #[test]
+    fn a_streamed_oauth_consent_request_is_emitted_when_the_item_is_added() {
+        // It has no deltas to wait for and the run is blocked on the user
+        // until it is answered, so it is emitted on `added` rather than
+        // held back to `done` like a hosted MCP call.
+        let EventOutcome::Update(update) = reasoning_event(json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "oauth_consent_request",
+                "id": "oauth_7",
+                "consent_link": "https://login.example.com/consent",
+            },
+        })) else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::OauthConsentRequest(c)
+                if c.consent_link == "https://login.example.com/consent"
+                    && c.id.as_deref() == Some("oauth_7")
+        ));
+    }
+
+    #[test]
+    fn a_top_level_oauth_consent_event_carries_the_same_content() {
+        // Foundry also emits the request as a top-level event with the link
+        // on the event itself rather than on an output item.
+        let EventOutcome::Update(update) = reasoning_event(json!({
+            "type": "response.oauth_consent_requested",
+            "id": "oauth_9",
+            "consent_link": "https://login.example.com/consent",
+        })) else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::OauthConsentRequest(c) if c.id.as_deref() == Some("oauth_9")
+        ));
+    }
+
+    #[test]
+    fn an_untrustworthy_consent_link_is_dropped_rather_than_surfaced() {
+        // The framework is asking a human to open this URL and
+        // authenticate at it, and it arrives from the service as free-form
+        // text. Anything that is not https with a host is dropped.
+        for link in [
+            json!("http://login.example.com/consent"),
+            json!("javascript:alert(1)"),
+            json!("https:///no-host"),
+            json!(""),
+            Value::Null,
+        ] {
+            let value = json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    { "type": "oauth_consent_request", "id": "oauth_7", "consent_link": link }
+                ],
+            });
+            let resp = parse_response(&value, None);
+            let found = resp
+                .messages
+                .iter()
+                .flat_map(|m| &m.contents)
+                .any(|c| matches!(c, Content::OauthConsentRequest(_)));
+            assert!(!found, "accepted consent_link {link:?}");
+        }
+
+        // The scheme is case-insensitive, so an upper-case one is accepted.
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "oauth_consent_request",
+                    "consent_link": "HTTPS://login.example.com/consent",
+                }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let Content::OauthConsentRequest(consent) = &resp.messages[0].contents[0] else {
+            panic!("expected a consent request");
+        };
+        // No `id` on the item: the content carries none rather than an
+        // empty string that would correlate against nothing.
+        assert_eq!(consent.id, None);
+    }
+
+    // endregion
 
     #[test]
     fn reasoning_text_delta_streams_and_done_is_terminal_metadata() {

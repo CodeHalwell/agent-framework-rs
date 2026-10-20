@@ -5,6 +5,152 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [0.13.0] — 2026-10-19
+
+A parity release from the upstream window `a75e803e..9d308951`
+(2026-10-12 to 2026-10-19), recorded in
+[`docs/drift/2026-10-19-9d308951.md`](docs/drift/2026-10-19-9d308951.md).
+The headline is **AG-UI thread snapshots**: the AG-UI router can now
+persist threads, replay them to a reconnecting client, and resume a paused
+approval across requests, behind an explicit authorization scope. Alongside
+it come six fixes, two of them gaps the review surfaced rather than commits
+asking to be ported: the hosting Responses route discarded image and file
+input, and Foundry OAuth consent requests had no producer anywhere in the
+workspace.
+
+**Two public API breaks**, both small and mechanical — see *Changed*. The
+AG-UI router's behaviour without a snapshot store is unchanged, apart from
+no longer emitting a `TOOL_CALL_END` for a call the run never started.
+
+### Added
+
+- **AG-UI thread snapshots** (`agent_framework_hosting::agui::snapshot`).
+  `AgUiRouter::snapshot_store` persists each thread — transcript, shared
+  state, pending interrupts, and the agent session's private state — in an
+  `AgUiThreadSnapshotStore` (`InMemoryAgUiThreadSnapshotStore` included,
+  bounded and process-local). With a store the router emits
+  `STATE_SNAPSHOT` at the start of a run and `MESSAGES_SNAPSHOT` at the
+  end, replays a thread to a request that sends no messages, records
+  pending approvals as `RUN_FINISHED` interrupts, and resumes them from
+  `resume` entries. Upstream's eight AG-UI hardening commits this window
+  shape the design:
+  - **Explicit authorization scope** (#9413, #9316). Snapshots are keyed by
+    scope *and* thread id, and a store without an authorization mode does
+    not build: `AgUiRouter::authorization_scope` resolves the scope from
+    the request head (an `Err(status)` rejects the request before any state
+    is read), and `AgUiRouter::single_user` declares one principal.
+    `AgUiRouter::try_into_router` reports a bad configuration;
+    `into_router` panics on one.
+  - **Client state cannot reach server-owned session state** (#9368,
+    tightened). A client value shaped like tool-approval state is never
+    merged into the session — checking all five `ToolApprovalState`
+    fields, where upstream checks three. `held_messages` is replayed into
+    the inner run as input, so the two upstream misses let a client plant
+    an approval response and run a tool unprompted. A session key the
+    server owns, such as an agent's mode, cannot be overwritten either:
+    the snapshot tracks which keys the client owns (ones it wrote that the
+    server has not since changed), and keys under the framework's reserved
+    `__af_` / `__ag_ui` prefixes are refused outright — the
+    function-invocation loop reads its parked budget at the start of every
+    run, so a client-seeded one would reset `max_function_calls` and
+    `max_duration_seconds` on a fresh thread.
+  - **Interrupts are bound to their thread** (#9365). A resume must answer
+    exactly the interrupts stored for that scope and thread, or the run
+    ends with `RUN_ERROR` and an `APPROVAL_RESUME_*` code. A thread with
+    interrupts pending refuses any other turn (`APPROVAL_RESUME_REQUIRED`)
+    until they are answered or cancelled, rather than saving over them. The approved
+    call is rebuilt from the stored interrupt, never from the request, and
+    the interrupts are spent before the agent runs, so an approved call
+    runs at most once even if the run fails or the client disconnects.
+    Turns on one thread are serialized within the process, so a
+    double-click cannot resume an approval twice. A run whose final save
+    fails ends with `RUN_ERROR` (`SNAPSHOT_SAVE_FAILED`) rather than
+    `RUN_FINISHED`, which would advertise interrupts that were never
+    stored; upstream logs the failure and finishes.
+  - **The stored transcript is the server's record** (port of upstream's
+    `_reconstruct_messages_from_thread_snapshot`). A client replaying
+    history, with or without ids, does not duplicate it, and only user turns
+    and results for server-issued tool calls extend it.
+- Foundry **OAuth consent requests** now reach the caller. A hosted tool
+  that needs the user to complete a consent flow produces
+  `Content::OauthConsentRequest` on the non-streaming path, on
+  `response.output_item.added`, and from the top-level
+  `response.oauth_consent_requested` event (upstream #8976). The consent
+  link must be HTTPS and parse with a real host before it is surfaced;
+  anything else is dropped with a warning rather than handed to a human to
+  click.
+  `OauthConsentRequestContent` gained `id` (the provider's item id, which a
+  workflow registers the request under) and the
+  `OauthConsentRequestContent::new` / `with_id` constructors.
+- The hosting **Responses route accepts multimodal input**. `input_image`
+  and `input_file` content parts become data or URI content instead of
+  being discarded, and a `refusal` part becomes a marked refusal. A `data:`
+  URL keeps the media type it declares rather than being flattened to
+  `image/*` (upstream #9298), which is what Anthropic and Gemini need to
+  accept the attachment. A part with no URL is skipped and the rest of the
+  message survives. `input_file` reads every spelling the
+  Responses API accepts — `file_url`, `file_data` as a data URL or as bare
+  base64 beside a `filename`, and `file_id` (as hosted-file content). An
+  `input_image` given by `file_id` is skipped with a warning, as upstream
+  rejects it: a hosted file carries no media type in the core model, so it
+  would reach the provider as an `input_file`. A malformed `data:` URL is
+  skipped with a warning rather than passed on as a URI no provider can
+  fetch.
+
+### Changed
+
+- **Breaking:** `observability::record_error` takes an
+  `&ObservabilityConfig`. The error's `Display` text is now recorded as
+  `otel.status_message` only with content capture on (upstream #9288): a
+  provider's 400 quotes the request back, a tool's failure prints the
+  argument it choked on, and a transport error carries the URL, so it is
+  sensitive data like any other. `error.type` and the ERROR status are
+  still always recorded. `Agent` retains its `ObservabilityConfig` for the
+  `invoke_agent` span, defaulting to `ObservabilityConfig::from_env()` —
+  the rule `FunctionInvokingChatClient::new` already followed.
+- **Breaking:** `OauthConsentRequestContent` gained an `id` field, so a
+  struct literal naming every field needs updating. `::new` or
+  `..Default::default()` do not.
+- The AG-UI router emits `TOOL_CALL_END` only for a call this run
+  started and has not closed, tracked per occurrence so a call id the
+  provider reuses within a run still gets one end per start. A result or approval for a call started in
+  an earlier request — a resumed approval — used to get an end with no
+  matching start, which AG-UI clients reject (upstream does the same).
+- Switch-case branches may share a target executor. `add_switch` builds one
+  edge per distinct target and joins the branch labels of the cases that
+  share it (upstream #9300); previously the duplicate reached `targets()`
+  and `flat_edges()`, so validation and both graph renderings saw an edge
+  that does not exist.
+
+### Fixed
+
+- A streamed update whose `author_name` differs from the message it would
+  continue now starts a new message (upstream #9353). Two agents streaming
+  in turn — a sequential orchestration, a handoff — emit assistant updates
+  with no `message_id`, so their text was folded into one message
+  attributed to whoever spoke last. An explicit `message_id` still wins: it
+  relabels the message rather than splitting it.
+- `add_fan_out` and `add_multi_selection` deduplicate their targets, so a
+  broadcast declared with a repeated id delivers once (upstream #9432).
+  Delivering twice ran the executor twice on one message and double-counted
+  toward a fan-in sink's barrier. The runner's selector-free branch
+  deduplicates too, since `EdgeGroup::FanOut` can be built by hand.
+- The OpenAI Responses converter sends a remote `application/*` file by
+  `file_url`. It put every such URI in `file_data`, which the service reads
+  as the file's contents, so `https://example.com/report.pdf` arrived as a
+  file whose bytes were that string. Inline `data:` URIs still go in
+  `file_data`. `text/*` files (plain text, Markdown, CSV) are sent as
+  `input_file` too, with a matching filename extension; the converter had
+  no arm for them and dropped them. An inline `application/*` file is now
+  named for its type as well (`file.pdf`, `file.docx`) rather than a bare
+  `file`, which the service identifies files by.
+- A Magentic progress ledger naming a participant that does not exist is
+  retried against the existing `progress_ledger_retry_count` budget instead
+  of ending the run on the first bad answer (upstream #9181). If every
+  attempt names an unknown participant the last ledger is returned, so the
+  orchestrator takes the invalid-speaker path it already has rather than
+  reading the failure as a parse error and replanning.
+
 ## [0.12.0] — 2026-10-14
 
 A parity release: ten fixes from the upstream window `301a43c..a75e803e`

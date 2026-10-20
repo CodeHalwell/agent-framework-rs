@@ -104,3 +104,14 @@ from the roadmap, not from this file.
   session.
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
+- **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
+  revision it was written against.
+- **`SequentialBuilder::ensure_trailing_user_turn`** (upstream #8779): an
+  opt-in that appends a synthetic user continuation message when the
+  conversation handed to the next participant ends on an assistant turn,
+  for providers that answer an assistant-ending prompt with empty text.
+- **Workflow pause/restore bookkeeping** (upstream #9291, #9289):
+  preserving concurrent steps across a pause, and restored sub-workflow
+  sibling requests. Both land on upstream's `WorkflowExecutor`; this
+  runner's superstep and request-info bookkeeping differs enough that
+  neither maps mechanically.

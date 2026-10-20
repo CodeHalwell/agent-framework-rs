@@ -695,6 +695,15 @@ impl MagenticManager for StandardMagenticManager {
         let user = Message::user(prompt);
 
         let mut last_error = None;
+        // A ledger naming a participant that does not exist is as unusable
+        // as one that will not parse, and the retry budget already exists
+        // for exactly that — so spend it here too rather than ending the
+        // whole run on one bad answer (upstream #9181). The last such
+        // ledger is kept: if every attempt names an unknown participant,
+        // returning it hands the orchestrator the invalid-speaker case it
+        // already handles, instead of an error that would read as a parse
+        // failure and trigger a reset-and-replan.
+        let mut unknown_speaker_ledger = None;
         for _ in 0..self.progress_ledger_retry_count {
             let mut msgs = context.chat_history.clone();
             msgs.push(user.clone());
@@ -703,9 +712,27 @@ impl MagenticManager for StandardMagenticManager {
                 serde_json::from_value::<MagenticProgressLedger>(v)
                     .map_err(|e| Error::Workflow(format!("invalid progress ledger: {e}")))
             }) {
-                Ok(ledger) => return Ok(ledger),
-                Err(e) => last_error = Some(e),
+                Ok(ledger) => {
+                    let next = ledger.next_speaker.answer_str();
+                    // A satisfied request is about to produce the final
+                    // answer and never consults the speaker, so an unusable
+                    // name there is not worth another round trip.
+                    if ledger.is_request_satisfied.answer_bool() || names.contains(&next) {
+                        return Ok(ledger);
+                    }
+                    last_error = Some(Error::Workflow(format!(
+                        "progress ledger named unknown next speaker '{next}'; valid names: {names_csv}"
+                    )));
+                    unknown_speaker_ledger = Some(ledger);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    unknown_speaker_ledger = None;
+                }
             }
+        }
+        if let Some(ledger) = unknown_speaker_ledger {
+            return Ok(ledger);
         }
         Err(Error::Workflow(format!(
             "progress ledger parse failed after {} attempt(s): {}",

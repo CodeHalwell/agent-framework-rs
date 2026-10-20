@@ -330,6 +330,13 @@ pub struct Agent {
     /// and appended after the agent's static/context/per-run tools. See
     /// [`ToolSource`] and [`Agent::prepare_request`].
     tool_sources: Vec<Arc<dyn ToolSource>>,
+    /// Content-capture policy for the `invoke_agent` span. Set by
+    /// [`AgentBuilder::with_observability_config`]; without one it is the
+    /// default, which captures nothing. Only the span's error text consults
+    /// it here — request and response content is recorded a layer down, by
+    /// the [`ObservableChatClient`](crate::observability::ObservableChatClient)
+    /// the same builder call installs.
+    observability: crate::observability::ObservabilityConfig,
 }
 
 /// A callback receiving each [`AgentResponseUpdate`] streamed by an agent
@@ -683,7 +690,7 @@ impl Agent {
                     }
                 }
                 Err(err) => {
-                    crate::observability::record_error(&span, err);
+                    crate::observability::record_error(&span, err, &self.observability);
                 }
             }
             result
@@ -1263,9 +1270,14 @@ impl AgentBuilder {
         // builder-collected function middleware is known.
         let mut invoking = FunctionInvokingChatClient::new(self.client)
             .with_function_middleware(self.function_middleware);
-        if let Some(config) = self.observability {
-            invoking = invoking.with_observability_config(config);
-        }
+        // Without an explicit config the agent span follows the same rule
+        // the tool spans already do — `FunctionInvokingChatClient::new`
+        // reads `ENABLE_SENSITIVE_DATA` — so one environment flag governs
+        // both rather than the agent span quietly opting itself out.
+        let observability = self
+            .observability
+            .unwrap_or_else(crate::observability::ObservabilityConfig::from_env);
+        invoking = invoking.with_observability_config(observability.clone());
         if let Some(config) = self.function_invocation_config {
             invoking = invoking.with_config(config);
         }
@@ -1280,6 +1292,7 @@ impl AgentBuilder {
             agent_middleware: MiddlewarePipeline::new(self.agent_middleware),
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
             tool_sources: self.tool_sources,
+            observability,
         }
     }
 }

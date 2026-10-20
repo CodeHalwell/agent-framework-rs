@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use agent_framework_core::types::{
-    AgentResponse, Content, FinishReason, FunctionArguments, FunctionCallContent,
-    FunctionResultContent, Message, Role, UsageDetails,
+    AgentResponse, Content, DataContent, FinishReason, FunctionArguments, FunctionCallContent,
+    FunctionResultContent, HostedFileContent, Message, Role, TextContent, UriContent, UsageDetails,
 };
 
 /// `POST /v1/responses` request — a subset of DevUI's `AgentFrameworkRequest`
@@ -442,8 +442,20 @@ fn item_to_message(item: &Value) -> Option<Message> {
                 .and_then(Value::as_str)
                 .map(role_from)
                 .unwrap_or_else(Role::user);
-            let text = map.get("content").map(content_text).unwrap_or_default();
-            Some(Message::new(role, text))
+            let contents = map.get("content").map(content_parts).unwrap_or_default();
+            // A message whose content held nothing this parser understands
+            // still becomes a turn, as an empty one — the same shape
+            // `Message::new(role, "")` produced before.
+            if contents.is_empty() {
+                return Some(Message::new(role, String::new()));
+            }
+            Some(Message {
+                role,
+                contents,
+                author_name: None,
+                message_id: None,
+                additional_properties: Default::default(),
+            })
         }
         _ => None,
     }
@@ -475,21 +487,150 @@ fn function_result_value(output: Option<&Value>) -> Value {
     }
 }
 
-/// Extract text from an OpenAI `content` value (string or array of parts).
-fn content_text(content: &Value) -> String {
+/// Convert an OpenAI `content` value (a string, or an array of parts) into
+/// content items.
+///
+/// This used to keep only the parts that carried a `text` field, so an
+/// `input_image` or `input_file` part was dropped on the floor and the
+/// hosted agent was asked about an attachment it had never been given. The
+/// client half of this crate's stack has carried multimodal input for a
+/// while; the hosting half silently did not. Upstream's own fault here was
+/// narrower — a data URL's declared media type being overwritten with
+/// `image/*` (#9298) — which is the line below that keeps it.
+fn content_parts(content: &Value) -> Vec<Content> {
     match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| {
-                p.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| p.as_str().map(str::to_string))
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        other => other.to_string(),
+        Value::String(s) => vec![Content::text(s.clone())],
+        Value::Array(parts) => parts.iter().filter_map(content_part).collect(),
+        other => vec![Content::text(other.to_string())],
+    }
+}
+
+/// One content part, or `None` when it carries nothing usable.
+fn content_part(part: &Value) -> Option<Content> {
+    if let Some(s) = part.as_str() {
+        return Some(Content::text(s));
+    }
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") => {
+            // A hosted file reference carries no media type in the core
+            // model, so forwarding one would turn an image into an
+            // `input_file` downstream. Upstream accepts only `image_url`
+            // here and rejects the rest; this skips it with a warning.
+            if part.get("image_url").is_none() && part.get("file_id").is_some() {
+                tracing::warn!(
+                    "skipping an input_image given by file_id; only image_url is supported"
+                );
+                return None;
+            }
+            // A `data:` URL already declares what it holds, and that is
+            // more than `image/*` tells a converter: Anthropic and Gemini
+            // both need the concrete type to accept the attachment. A
+            // remote URL declares nothing, so it keeps the generic type.
+            attachment(url_field(part.get("image_url"))?, "image/*")
+        }
+        Some("input_file") => {
+            if let Some(file_id) = non_empty_str(part.get("file_id")) {
+                return Some(Content::HostedFile(HostedFileContent { file_id }));
+            }
+            if let Some(url) = url_field(part.get("file_url")) {
+                return attachment(url, "application/octet-stream");
+            }
+            // `file_data` is a data URL, or — as the Responses API also
+            // accepts — bare base64 beside a `filename`.
+            let data = non_empty_str(part.get("file_data"))?;
+            if data.starts_with("data:") {
+                return attachment(data, "application/octet-stream");
+            }
+            let media_type = media_type_for_filename(part.get("filename").and_then(Value::as_str));
+            Some(Content::Data(DataContent {
+                uri: format!("data:{media_type};base64,{data}"),
+                media_type: Some(media_type.to_string()),
+            }))
+        }
+        // A replayed assistant turn can carry a refusal, which is not the
+        // answer and must not read as one.
+        Some("refusal") => part
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(|t| Content::Text(TextContent::refusal(t))),
+        // `input_text`, `output_text`, `text`, and anything else that
+        // simply carries text.
+        _ => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| Content::text(t.to_string())),
+    }
+}
+
+/// A URL field that the protocol spells either as a bare string or as an
+/// object with a `url` key.
+fn url_field(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(_) => non_empty_str(Some(value)),
+        Value::Object(_) => non_empty_str(value.get("url")),
+        _ => None,
+    }
+}
+
+fn non_empty_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// An attachment at `uri`: data content for a `data:` URL, which carries its
+/// own media type, or a URI reference typed `default_media_type`. A
+/// malformed `data:` URL is skipped with a warning rather than passed on as
+/// a "URI" no provider can fetch.
+fn attachment(uri: String, default_media_type: &str) -> Option<Content> {
+    if uri.starts_with("data:") {
+        return match DataContent::from_uri(uri) {
+            Ok(data) => Some(Content::Data(data)),
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping a malformed data URL in a Responses content part");
+                None
+            }
+        };
+    }
+    Some(Content::Uri(UriContent {
+        uri,
+        media_type: default_media_type.to_string(),
+    }))
+}
+
+/// A media type for bare base64 file data, from its filename's extension.
+///
+/// The filename itself does not survive: the core data content has no field
+/// for it. The media type is what lets a converter give the file a name the
+/// service can identify it by (`file.docx`), so the common document types
+/// are mapped rather than left as `application/octet-stream`.
+fn media_type_for_filename(filename: Option<&str>) -> &'static str {
+    let ext = filename
+        .and_then(|f| f.rsplit_once('.'))
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("rtf") => "application/rtf",
+        Some("xml") => "application/xml",
+        Some("zip") => "application/zip",
+        Some("html" | "htm") => "text/html",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
     }
 }
 
@@ -805,6 +946,144 @@ mod tests {
         assert_eq!(messages[0].text(), "be terse");
         assert_eq!(messages[1].role, Role::user());
         assert_eq!(messages[1].text(), "hi");
+    }
+
+    #[test]
+    fn responses_to_run_keeps_an_image_part() {
+        // The parser kept only the parts carrying a `text` field, so a
+        // hosted agent was asked about an attachment it was never given.
+        let input = serde_json::json!([
+            { "role": "user", "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "image_url": "https://example.com/cat.png" },
+            ]},
+        ]);
+        let messages = responses_to_run(&req(input));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "what is this?");
+        let Content::Uri(image) = &messages[0].contents[1] else {
+            panic!("expected a uri content, got {:?}", messages[0].contents);
+        };
+        assert_eq!(image.uri, "https://example.com/cat.png");
+        // A remote URL declares nothing about what it holds.
+        assert_eq!(image.media_type, "image/*");
+    }
+
+    #[test]
+    fn responses_to_run_keeps_a_data_urls_declared_media_type() {
+        // `image/*` is not enough for a converter: Anthropic and Gemini
+        // both need the concrete type to accept the attachment, and the
+        // data URL already declares it (upstream #9298).
+        let data_url = "data:image/png;base64,iVBORw0KGgo=";
+        for image_url in [
+            serde_json::json!(data_url),
+            serde_json::json!({ "url": data_url }),
+        ] {
+            let input = serde_json::json!([
+                { "role": "user", "content": [
+                    { "type": "input_image", "image_url": image_url },
+                ]},
+            ]);
+            let messages = responses_to_run(&req(input));
+            let Content::Data(image) = &messages[0].contents[0] else {
+                panic!("expected a data content, got {:?}", messages[0].contents);
+            };
+            assert_eq!(image.uri, data_url);
+            assert_eq!(image.media_type.as_deref(), Some("image/png"));
+        }
+    }
+
+    #[test]
+    fn responses_to_run_keeps_a_file_part() {
+        let input = serde_json::json!([
+            { "role": "user", "content": [
+                { "type": "input_file", "file_url": "https://example.com/report.pdf" },
+            ]},
+        ]);
+        let messages = responses_to_run(&req(input));
+        let Content::Uri(file) = &messages[0].contents[0] else {
+            panic!("expected a uri content, got {:?}", messages[0].contents);
+        };
+        assert_eq!(file.uri, "https://example.com/report.pdf");
+    }
+
+    #[test]
+    fn responses_to_run_reads_every_file_part_spelling() {
+        let input = serde_json::json!([
+            { "role": "user", "content": [
+                { "type": "input_file", "file_id": "file-123" },
+                { "type": "input_file", "filename": "report.pdf", "file_data": "JVBERi0=" },
+                { "type": "input_file", "file_data": "data:text/plain;base64,aGk=" },
+                // Not forwarded: it would reach the provider as a file.
+                { "type": "input_image", "file_id": "file-456" },
+                // Malformed: skipped, not passed on as an unfetchable URI.
+                { "type": "input_image", "image_url": "data:image/png,not-base64" },
+            ]},
+        ]);
+        let contents = &responses_to_run(&req(input))[0].contents;
+        assert_eq!(contents.len(), 3, "{contents:?}");
+        assert!(matches!(&contents[0], Content::HostedFile(f) if f.file_id == "file-123"));
+        let Content::Data(pdf) = &contents[1] else {
+            panic!("{contents:?}")
+        };
+        assert_eq!(pdf.uri, "data:application/pdf;base64,JVBERi0=");
+        assert_eq!(pdf.media_type.as_deref(), Some("application/pdf"));
+        assert!(
+            matches!(&contents[2], Content::Data(d) if d.media_type.as_deref() == Some("text/plain"))
+        );
+    }
+
+    #[test]
+    fn bare_base64_office_files_keep_a_real_media_type() {
+        for (name, media_type) in [
+            (
+                "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            (
+                "sheet.XLSX",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ),
+            (
+                "deck.pptx",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ),
+            ("mystery.bin", "application/octet-stream"),
+        ] {
+            assert_eq!(media_type_for_filename(Some(name)), media_type, "{name}");
+        }
+    }
+
+    #[test]
+    fn responses_to_run_marks_a_replayed_refusal() {
+        // A replayed assistant turn's refusal is not the answer and must
+        // not read as one.
+        let input = serde_json::json!([
+            { "role": "assistant", "content": [
+                { "type": "refusal", "refusal": "I can't help with that" },
+            ]},
+        ]);
+        let messages = responses_to_run(&req(input));
+        assert!(matches!(
+            &messages[0].contents[0],
+            Content::Text(t) if t.refusal && t.text == "I can't help with that"
+        ));
+    }
+
+    #[test]
+    fn responses_to_run_skips_an_image_part_with_no_url() {
+        // Malformed is not the same as unsupported: a part with nothing to
+        // point at is skipped, and the rest of the message survives.
+        let input = serde_json::json!([
+            { "role": "user", "content": [
+                { "type": "input_text", "text": "hi" },
+                { "type": "input_image" },
+                { "type": "input_image", "image_url": "" },
+            ]},
+        ]);
+        let messages = responses_to_run(&req(input));
+        assert_eq!(messages[0].contents.len(), 1);
+        assert_eq!(messages[0].text(), "hi");
     }
 
     #[test]

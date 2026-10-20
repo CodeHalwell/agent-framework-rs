@@ -7,7 +7,13 @@ was already satisfied, and what does not apply here. Every item recorded as
 landed was verified (full workspace build, `cargo test`, clippy
 `--all-targets` and rustfmt, all green) before commit.
 
-**Current upstream baseline: `a75e803e` (2026-10-12).**
+**Current upstream baseline: `9d308951` (2026-10-19).**
+
+> Upstream's repository carries two histories with no merge base, joined by
+> periodic merge commits. A baseline taken from the Python-mirror line makes
+> `<baseline>..HEAD` span the other line's whole history, so prefer a
+> main-line merge commit — `9d308951` is one. See the window note in the
+> 2026-10-19 pass.
 
 Deliberate exclusions live in [`SCOPE.md`](../../SCOPE.md); cite it rather
 than re-arguing a boundary in a new pass. The July re-baseline's catalogue
@@ -24,6 +30,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-10-19-9d308951`](2026-10-19-9d308951.md) | Post-`a75e803e` drift + Azure-ecosystem review (checked against `9d308951`, 2026-10-19) |
 | [`2026-10-12-a75e803e`](2026-10-12-a75e803e.md) | Post-`301a43c` drift + Azure-ecosystem review (checked against `a75e803e`, 2026-10-12) |
 | [`2026-10-05-301a43c`](2026-10-05-301a43c.md) | Post-`dc8e226` drift + Azure-ecosystem review (checked against `301a43c`, 2026-10-05) |
 | [`2026-09-30-dc8e226-hosting-tool-calls`](2026-09-30-dc8e226-hosting-tool-calls.md) | Tool-call serialization on both hosting surfaces (same upstream baseline, `dc8e226`) |
