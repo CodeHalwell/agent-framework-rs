@@ -311,6 +311,14 @@ impl AgUiRouter {
     /// authorization mode — [`Self::authorization_scope`] or
     /// [`Self::single_user`] — or the router does not build.
     ///
+    /// The stored transcript is sent in full on every run, so the router
+    /// clears the thread session's service conversation id. It cannot clear
+    /// an agent's *default* `ChatOptions::conversation_id`, which the agent
+    /// falls back to: an agent built with one would receive every turn twice
+    /// (the transcript and the service conversation), and — on any hosting
+    /// route, snapshots or not — would share that one service conversation
+    /// across every caller. Do not serve such an agent here.
+    ///
     /// Every route shares the store, keyed by authorization scope and thread
     /// id. Clients of two agents on one router that reuse a thread id
     /// therefore share that thread; give each agent its own router and store
@@ -744,6 +752,7 @@ async fn run_with_snapshots(
                     &fc.call_id,
                     &fc.name,
                     &arguments_delta(fc).unwrap_or_default(),
+                    fc.protected_data.as_deref(),
                 )
             })
             .collect();
@@ -956,11 +965,23 @@ struct AgUiFraming {
     approvals: Vec<FunctionApprovalRequestContent>,
 }
 
+/// A tool call as the thread snapshot records it.
+struct RecordedCall {
+    id: String,
+    name: String,
+    /// The argument fragments, accumulated.
+    arguments: String,
+    /// The provider's replay token (Gemini's `thoughtSignature`). A
+    /// completed call is replayed on every later turn, and Gemini rejects
+    /// one that comes back without it.
+    protected_data: Option<String>,
+}
+
 /// One stretch of a run's output, as the thread snapshot records it.
 enum Segment {
     Text(String),
-    /// Consecutive tool calls: `(id, name, accumulated arguments)`.
-    Calls(Vec<(String, String, String)>),
+    /// Consecutive tool calls.
+    Calls(Vec<RecordedCall>),
     /// A tool result, already an AG-UI message.
     Result(Value),
 }
@@ -994,8 +1015,8 @@ impl AgUiFraming {
         let mut skip: HashSet<(usize, usize)> = HashSet::new();
         for (si, segment) in self.segments.iter().enumerate().rev() {
             if let Segment::Calls(calls) = segment {
-                for (ci, (id, _, _)) in calls.iter().enumerate().rev() {
-                    if let Some(pos) = unmatched.iter().position(|p| *p == id.as_str()) {
+                for (ci, call) in calls.iter().enumerate().rev() {
+                    if let Some(pos) = unmatched.iter().position(|p| *p == call.id.as_str()) {
                         unmatched.swap_remove(pos);
                         skip.insert((si, ci));
                     }
@@ -1019,7 +1040,14 @@ impl AgUiFraming {
                         .iter()
                         .enumerate()
                         .filter(|(ci, _)| !skip.contains(&(si, *ci)))
-                        .map(|(_, (id, name, args))| tool_call_message_entry(id, name, args))
+                        .map(|(_, call)| {
+                            tool_call_message_entry(
+                                &call.id,
+                                &call.name,
+                                &call.arguments,
+                                call.protected_data.as_deref(),
+                            )
+                        })
                         .collect();
                     if !calls.is_empty() {
                         out.push(
@@ -1097,29 +1125,41 @@ impl AgUiFraming {
                         out.push(start);
                         self.started_tools.push(tool_call_id.clone());
                         self.ended_tools.push(false);
-                        let entry = (tool_call_id.clone(), fc.name.clone(), String::new());
+                        let entry = RecordedCall {
+                            id: tool_call_id.clone(),
+                            name: fc.name.clone(),
+                            arguments: String::new(),
+                            protected_data: None,
+                        };
                         match self.segments.last_mut() {
                             Some(Segment::Calls(calls)) => calls.push(entry),
                             _ => self.segments.push(Segment::Calls(vec![entry])),
                         }
                     }
-                    if let Some(delta) = arguments_delta(fc) {
-                        if !delta.is_empty() {
-                            let entry = self.segments.iter_mut().rev().find_map(|s| match s {
-                                Segment::Calls(calls) => {
-                                    calls.iter_mut().rev().find(|c| c.0 == tool_call_id)
-                                }
-                                _ => None,
-                            });
-                            if let Some(entry) = entry {
-                                entry.2.push_str(&delta);
+                    let delta = arguments_delta(fc).filter(|d| !d.is_empty());
+                    if delta.is_some() || fc.protected_data.is_some() {
+                        let entry = self.segments.iter_mut().rev().find_map(|s| match s {
+                            Segment::Calls(calls) => {
+                                calls.iter_mut().rev().find(|c| c.id == tool_call_id)
                             }
-                            out.push(json!({
-                                "type": event_type::TOOL_CALL_ARGS,
-                                "toolCallId": tool_call_id,
-                                "delta": delta,
-                            }));
+                            _ => None,
+                        });
+                        if let Some(entry) = entry {
+                            if let Some(delta) = &delta {
+                                entry.arguments.push_str(delta);
+                            }
+                            // The token can arrive on any fragment.
+                            if fc.protected_data.is_some() {
+                                entry.protected_data = fc.protected_data.clone();
+                            }
                         }
+                    }
+                    if let Some(delta) = delta {
+                        out.push(json!({
+                            "type": event_type::TOOL_CALL_ARGS,
+                            "toolCallId": tool_call_id,
+                            "delta": delta,
+                        }));
                     }
                 }
                 Content::FunctionResult(fr) => {
@@ -1207,13 +1247,24 @@ fn prune_unanswered_calls(messages: &mut Vec<Message>) {
     messages.retain(|m| !m.contents.is_empty() || m.role != Role::assistant());
 }
 
-/// One entry of an AG-UI assistant message's `toolCalls`.
-fn tool_call_message_entry(id: &str, name: &str, arguments: &str) -> Value {
-    json!({
+/// One entry of an AG-UI assistant message's `toolCalls`. A provider replay
+/// token rides as `encryptedValue`, the protocol's field for it, which
+/// [`tool_call_to_content`] reads back.
+fn tool_call_message_entry(
+    id: &str,
+    name: &str,
+    arguments: &str,
+    protected_data: Option<&str>,
+) -> Value {
+    let mut entry = json!({
         "id": id,
         "type": "function",
         "function": { "name": name, "arguments": arguments },
-    })
+    });
+    if let Some(token) = protected_data {
+        entry["encryptedValue"] = Value::String(token.to_string());
+    }
+    entry
 }
 
 /// The AG-UI `CUSTOM` event carrying a function-approval request (mirrors the
@@ -1395,7 +1446,12 @@ fn tool_call_to_content(tc: &Value) -> Option<FunctionCallContent> {
         Value::String(s) => FunctionArguments::Raw(s.clone()),
         other => FunctionArguments::Raw(other.to_string()),
     });
-    Some(FunctionCallContent::new(call_id, name, arguments))
+    let mut call = FunctionCallContent::new(call_id, name, arguments);
+    call.protected_data = obj
+        .get("encryptedValue")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(call)
 }
 
 /// Extract display text from an AG-UI `content` value (a string, or an array of
@@ -1489,6 +1545,34 @@ mod tests {
         assert_eq!(messages.len(), 3, "{messages:?}");
         assert!(matches!(messages[0].contents[0], Content::FunctionCall(_)));
         assert_eq!(messages[2].role, Role::user());
+    }
+
+    #[test]
+    fn a_stored_call_keeps_its_replay_token() {
+        // Gemini rejects a replayed call without its `thoughtSignature`; a
+        // snapshot thread replays every completed call on every turn.
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        let mut signed = FunctionCallContent::new("c1", "f", None);
+        signed.protected_data = Some("c2ln".into());
+        let mut args =
+            FunctionCallContent::new("c1", "", Some(FunctionArguments::Raw("{}".into())));
+        args.protected_data = None;
+        framing.push_contents(
+            &[
+                Content::FunctionCall(signed),
+                Content::FunctionCall(args),
+                Content::FunctionResult(FunctionResultContent::new("c1", Some(json!("done")))),
+            ],
+            &mut out,
+        );
+        let transcript = framing.transcript();
+        let entry = &transcript[0]["toolCalls"][0];
+        assert_eq!(entry["encryptedValue"], "c2ln");
+        // And it comes back on the next turn.
+        let call = tool_call_to_content(entry).unwrap();
+        assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
+        assert_eq!(call.arguments, Some(FunctionArguments::Raw("{}".into())));
     }
 
     #[test]
