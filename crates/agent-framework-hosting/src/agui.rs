@@ -963,6 +963,12 @@ struct AgUiFraming {
     segments: Vec<Segment>,
     /// The approvals the run paused on.
     approvals: Vec<FunctionApprovalRequestContent>,
+    /// A replay token carried by reasoning content, waiting for the call it
+    /// belongs to. Gemini's fallback placement puts the signature on the
+    /// thought part just before a call; the Gemini converter backfills an
+    /// unsigned call from it, and recording it on the call keeps that pairing
+    /// once the reasoning itself is gone from the transcript.
+    pending_signature: Option<String>,
 }
 
 /// A tool call as the thread snapshot records it.
@@ -994,6 +1000,7 @@ impl AgUiFraming {
             ended_tools: Vec::new(),
             segments: Vec::new(),
             approvals: Vec::new(),
+            pending_signature: None,
         }
     }
 
@@ -1085,7 +1092,19 @@ impl AgUiFraming {
     fn push_contents(&mut self, contents: &[Content], out: &mut Vec<Value>) {
         for content in contents {
             match content {
+                Content::TextReasoning(t) => {
+                    // Only a signed part replaces the carrier: an unsigned
+                    // one that merely follows must not erase it (the Gemini
+                    // converter's rule).
+                    if let Some(sig) = t.protected_data.as_deref().filter(|s| !s.is_empty()) {
+                        self.pending_signature = Some(sig.to_string());
+                    }
+                }
                 Content::Text(TextContent { text, .. }) if !text.is_empty() => {
+                    // Wire-visible content between a carrier and a call breaks
+                    // the pairing, so a stale signature never reaches an
+                    // unrelated call.
+                    self.pending_signature = None;
                     let mid = match &self.message_id {
                         Some(mid) => mid.clone(),
                         None => {
@@ -1129,7 +1148,12 @@ impl AgUiFraming {
                             id: tool_call_id.clone(),
                             name: fc.name.clone(),
                             arguments: String::new(),
-                            protected_data: None,
+                            // The call's own token wins; else an adjacent
+                            // carrier's backfills it.
+                            protected_data: fc
+                                .protected_data
+                                .clone()
+                                .or_else(|| self.pending_signature.take()),
                         };
                         match self.segments.last_mut() {
                             Some(Segment::Calls(calls)) => calls.push(entry),
@@ -1163,6 +1187,7 @@ impl AgUiFraming {
                     }
                 }
                 Content::FunctionResult(fr) => {
+                    self.pending_signature = None;
                     self.end_tool(&fr.call_id, out);
                     let message_id = util::msg_id();
                     let content = result_content(fr);
@@ -1573,6 +1598,46 @@ mod tests {
         let call = tool_call_to_content(entry).unwrap();
         assert_eq!(call.protected_data.as_deref(), Some("c2ln"));
         assert_eq!(call.arguments, Some(FunctionArguments::Raw("{}".into())));
+    }
+
+    #[test]
+    fn a_signature_on_preceding_reasoning_is_recorded_on_the_call() {
+        // Gemini's fallback placement: the signature rides the thought part
+        // just before the call, which itself carries none.
+        let reasoning = |sig: Option<&str>| {
+            Content::TextReasoning(agent_framework_core::types::TextReasoningContent {
+                text: "thinking".into(),
+                protected_data: sig.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        framing.push_contents(
+            &[
+                reasoning(Some("carrier")),
+                // An unsigned thought that follows must not erase it.
+                reasoning(None),
+                call("c1"),
+                Content::FunctionResult(FunctionResultContent::new("c1", Some(json!("done")))),
+                reasoning(Some("stale")),
+                Content::text("visible text in between"),
+                call("c2"),
+                Content::FunctionResult(FunctionResultContent::new("c2", Some(json!("done")))),
+            ],
+            &mut out,
+        );
+        let transcript = framing.transcript();
+        let calls: Vec<&Value> = transcript
+            .iter()
+            .filter_map(|m| m.get("toolCalls"))
+            .flat_map(|c| c.as_array().unwrap())
+            .collect();
+        assert_eq!(calls[0]["encryptedValue"], "carrier");
+        assert!(
+            calls[1].get("encryptedValue").is_none(),
+            "a signature crossed visible text to an unrelated call: {calls:?}"
+        );
     }
 
     #[test]
