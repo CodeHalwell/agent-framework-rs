@@ -1148,12 +1148,18 @@ impl AgUiFraming {
                             id: tool_call_id.clone(),
                             name: fc.name.clone(),
                             arguments: String::new(),
-                            // The call's own token wins; else an adjacent
-                            // carrier's backfills it.
-                            protected_data: fc
-                                .protected_data
-                                .clone()
-                                .or_else(|| self.pending_signature.take()),
+                            // A call consumes the held carrier whether or not
+                            // it uses it, as the Gemini converter does — a
+                            // call with its own token must not leave the
+                            // carrier for the next, unrelated call. The
+                            // call's own (non-empty) token wins.
+                            protected_data: {
+                                let carrier = self.pending_signature.take();
+                                fc.protected_data
+                                    .clone()
+                                    .filter(|s| !s.is_empty())
+                                    .or(carrier)
+                            },
                         };
                         match self.segments.last_mut() {
                             Some(Segment::Calls(calls)) => calls.push(entry),
@@ -1638,6 +1644,34 @@ mod tests {
             calls[1].get("encryptedValue").is_none(),
             "a signature crossed visible text to an unrelated call: {calls:?}"
         );
+    }
+
+    #[test]
+    fn a_signed_call_consumes_the_carrier_it_does_not_use() {
+        // A call with its own token still uses up the held carrier, or the
+        // next unsigned call would be stamped with a signature belonging to
+        // a different call.
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        let mut own =
+            FunctionCallContent::new("c1", "f", Some(FunctionArguments::Raw("{}".into())));
+        own.protected_data = Some("own".into());
+        framing.push_contents(
+            &[
+                Content::TextReasoning(agent_framework_core::types::TextReasoningContent {
+                    text: "thinking".into(),
+                    protected_data: Some("carrier".into()),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(own),
+                call("c2"),
+            ],
+            &mut out,
+        );
+        let transcript = framing.transcript();
+        let calls = transcript[0]["toolCalls"].as_array().unwrap();
+        assert_eq!(calls[0]["encryptedValue"], "own");
+        assert!(calls[1].get("encryptedValue").is_none(), "{calls:?}");
     }
 
     #[test]
