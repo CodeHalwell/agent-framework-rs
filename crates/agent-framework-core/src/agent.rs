@@ -487,6 +487,7 @@ impl Agent {
         let (final_messages, options) = self
             .prepare_request(&input, &mut session, &run_options)
             .await?;
+        let service_history = options.conversation_id.is_some();
 
         // When agent middleware is configured, route the run through the same
         // pipeline as `run` (so guardrails/rewrites/termination apply) and then
@@ -496,14 +497,14 @@ impl Agent {
             let response = match self.run_core(final_messages, options, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    for cp in self.combined_providers(&session) {
+                    for cp in self.run_providers(&session, service_history) {
                         let _ = cp.after_run(&input, &[], Some(&e)).await;
                     }
                     return Err(e);
                 }
             };
             self.update_session_conversation_id(&mut session, response.conversation_id.as_deref())?;
-            for cp in self.combined_providers(&session) {
+            for cp in self.run_providers(&session, service_history) {
                 cp.after_run(&input, &response.messages, None).await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
@@ -519,7 +520,7 @@ impl Agent {
         // the stream's terminal aggregation can auto-populate `value` (task 3).
         let response_format = options.response_format.clone();
         let agent_name = self.name.clone();
-        let providers = self.combined_providers(&session);
+        let providers = self.run_providers(&session, service_history);
         let inner = match self
             .client
             .get_streaming_response(final_messages, options)
@@ -585,7 +586,9 @@ impl Agent {
         // including, via the auto-attached/explicit `HistoryProvider`, thread
         // history — PREPENDED ahead of the run's own input; provider tools
         // appended, deduplicated by name).
-        let providers = self.combined_providers(session);
+        // A conversation id from the options (an agent default or a per-run
+        // override) means the service stores history too.
+        let providers = self.providers_for(session, options.conversation_id.is_some());
         let mut ctx = SessionContext::new(input.to_vec());
         ctx.session_id = Some(session.session_id().to_string());
         ctx.service_session_id = service_session_id.clone();
@@ -822,10 +825,34 @@ impl Agent {
 
     /// The effective context providers for a run: the session's, combined
     /// with the agent's own. There is no aggregate wrapper any more — callers
-    /// iterate this list directly.
-    fn combined_providers(&self, session: &AgentSession) -> Vec<Arc<dyn ContextProvider>> {
+    /// iterate this list directly. `options_conversation` is whether
+    /// the run's options carried a conversation id; a service id the session
+    /// adopted during the run counts too.
+    fn run_providers(
+        &self,
+        session: &AgentSession,
+        options_conversation: bool,
+    ) -> Vec<Arc<dyn ContextProvider>> {
+        self.providers_for(
+            session,
+            options_conversation || session.service_session_id().is_some(),
+        )
+    }
+
+    /// The session's providers then the agent's, without history providers
+    /// when the service stores the conversation, as .NET's
+    /// `ResolveChatHistoryProvider` does: the service already has those
+    /// turns, so loading them locally would send them twice.
+    fn providers_for(
+        &self,
+        session: &AgentSession,
+        service_stores_history: bool,
+    ) -> Vec<Arc<dyn ContextProvider>> {
         let mut providers = session.context_providers.clone();
         providers.extend(self.context_providers.iter().cloned());
+        if service_stores_history {
+            providers.retain(|p| !p.is_history_provider());
+        }
         providers
     }
 
@@ -943,7 +970,14 @@ fn async_stream_forward(
                                     session.try_adopt_service_session_id(cid);
                                 }
                             }
-                            for cp in providers {
+                            // A conversation id in the reply means the
+                            // service has this turn, so history providers
+                            // must not record it too.
+                            let service_history = response.conversation_id.is_some();
+                            for cp in providers
+                                .into_iter()
+                                .filter(|p| !(service_history && p.is_history_provider()))
+                            {
                                 if let Err(e) = cp.after_run(&input, &response.messages, None).await
                                 {
                                     return Some((Err(e), (inner, collected, true, None)));
@@ -986,13 +1020,14 @@ impl SupportsAgentRun for Agent {
 
         let (final_messages, chat_options) =
             self.prepare_request(&messages, session, &options).await?;
+        let service_history = chat_options.conversation_id.is_some();
         let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
                 // Failure path: let context providers observe the error.
                 // The run's error takes precedence over any hook failure, so
                 // the hook result is intentionally discarded.
-                for cp in self.combined_providers(session) {
+                for cp in self.run_providers(session, service_history) {
                     let _ = cp.after_run(&messages, &[], Some(&e)).await;
                 }
                 return Err(e);
@@ -1006,7 +1041,7 @@ impl SupportsAgentRun for Agent {
 
         // Fire the context providers' success completion hook (this is what
         // records history, for any attached `HistoryProvider`).
-        for cp in self.combined_providers(session) {
+        for cp in self.run_providers(session, service_history) {
             cp.after_run(&messages, &response.messages, None).await?;
         }
 
@@ -1040,7 +1075,7 @@ impl SupportsAgentRun for Agent {
         // exists at clone time.
         //
         // The agent's own context providers are NOT copied onto the session
-        // here: [`Agent::combined_providers`] merges the session's providers
+        // here: [`Agent::providers_for`] merges the session's providers
         // with the agent's own at request time, so copying them here would
         // double-invoke the agent's providers for every run against this
         // session.
@@ -1168,7 +1203,7 @@ impl AgentBuilder {
     /// for a custom tokenizer).
     ///
     /// Registered as one of the agent's own context providers, which
-    /// `Agent::combined_providers` always runs *after* the session's —
+    /// `Agent::providers_for` always runs *after* the session's —
     /// including the auto-attached (or explicitly attached)
     /// [`HistoryProvider`](crate::history::HistoryProvider), which lives on
     /// the session — so compaction sees, and can shrink, the full
@@ -1743,7 +1778,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_compaction_runs_after_the_history_provider_in_combined_providers() {
-        // Direct check on `combined_providers` ordering: the agent-level
+        // Direct check on `providers_for` ordering: the agent-level
         // provider attached by `with_compaction` must come after the
         // session's auto-attached history provider.
         let client = RecordingClient::default();
@@ -1752,7 +1787,7 @@ mod tests {
             .build();
         let session = agent.create_session();
 
-        let providers = agent.combined_providers(&session);
+        let providers = agent.providers_for(&session, false);
         assert_eq!(providers.len(), 2);
         assert!(providers[0].is_history_provider());
         assert!(!providers[1].is_history_provider());
