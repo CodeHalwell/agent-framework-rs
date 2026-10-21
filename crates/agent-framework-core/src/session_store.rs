@@ -277,8 +277,10 @@ impl AgentSessionStore for InMemoryAgentSessionStore {
 /// directory: `<root>/<agent id>/<partitions>/<session id>.json`.
 ///
 /// Each path component is encoded so that any id is a safe, portable file
-/// name and distinct keys never share a file: ASCII letters, digits, `-` and
-/// `_` are kept and every other byte becomes `~XX`. A component longer than
+/// name and distinct keys never share a file: lowercase ASCII letters,
+/// digits, `-` and `_` are kept and every other byte becomes `~XX`.
+/// Uppercase letters are encoded too, so `Foo` and `foo` stay distinct on
+/// a case-insensitive file system. A component longer than
 /// 255 bytes once encoded is refused rather than shortened, since a
 /// shortened name could collide.
 ///
@@ -336,7 +338,7 @@ impl FileAgentSessionStore {
 fn encode_component(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
             out.push(byte as char);
         } else {
             out.push_str(&format!("~{byte:02X}"));
@@ -360,11 +362,9 @@ impl AgentSessionStore for FileAgentSessionStore {
         tokio::fs::create_dir_all(dir).await.map_err(|e| {
             Error::other(format!("failed to create session directory {dir:?}: {e}"))
         })?;
-        let file_name = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .expect("session file names are ASCII");
-        let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        // Named independently of the destination, so a destination name
+        // near the 255-byte limit still leaves room for it.
+        let tmp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         if let Err(e) = tokio::fs::write(&tmp, &json).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(Error::other(format!(

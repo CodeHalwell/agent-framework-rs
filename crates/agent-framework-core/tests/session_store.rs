@@ -208,6 +208,65 @@ async fn file_store_keeps_hostile_ids_inside_the_root() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Every file under `root`, relative to it.
+fn files_under(root: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn file_store_paths_differ_by_more_than_letter_case() {
+    let root = temp_root();
+    let store = FileAgentSessionStore::new(&root);
+    let a = agent("Agent", &Echo::default());
+    for id in ["Foo", "foo"] {
+        store
+            .save_session(&a, &key(id), &a.create_session())
+            .await
+            .unwrap();
+    }
+    let files = files_under(&root);
+    assert_eq!(files.len(), 2);
+    // Folding case leaves the paths distinct, so a case-insensitive file
+    // system keeps two files too.
+    let folded: std::collections::HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
+    assert_eq!(folded.len(), 2, "{files:?}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn a_session_id_near_the_name_limit_still_saves() {
+    let root = temp_root();
+    let store = FileAgentSessionStore::new(&root);
+    let a = agent("agent", &Echo::default());
+    // 250 bytes once ".json" is added: allowed, and the temporary file
+    // must not push the write over the limit.
+    let id = "s".repeat(250);
+    store
+        .save_session(&a, &key(&id), &a.create_session())
+        .await
+        .unwrap();
+    assert!(store.get_session(&a, &key(&id)).await.unwrap().is_some());
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn a_service_session_round_trips_without_history() {
     let store = InMemoryAgentSessionStore::new();
