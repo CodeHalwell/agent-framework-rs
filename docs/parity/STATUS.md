@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 93 / 138 / 24 / 191 / 0 | 50 | 6 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 99 / 143 / 24 / 191 / 0 | 45 | 17 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
@@ -477,7 +477,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 ## Not yet reviewed
 
-108 declarations the Rust ledger has not assessed yet.
+103 declarations the Rust ledger has not assessed yet.
 
 ### In Go's catalog
 
@@ -487,7 +487,7 @@ None.
 
 ### Only in the .NET inventory
 
-108 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
+103 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
 
 - `Microsoft.Agents.AI::AdditionalPropertiesExtensions`
 - `Microsoft.Agents.AI::AgentAbstractionsJsonUtilities`
@@ -532,11 +532,6 @@ None.
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClient`
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClientOptions`
 - `Microsoft.Agents.AI::RubricScore`
-- `Microsoft.Agents.AI::TextSearchProvider`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchProviderState`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchResult`
-- `Microsoft.Agents.AI::TextSearchProviderOptions`
-- `Microsoft.Agents.AI::TextSearchProviderOptions.TextSearchBehavior`
 - `Microsoft.Agents.AI::ToolApprovalAgentBuilderExtensions`
 - `Microsoft.Agents.AI::ToolCalledMode`
 - `Microsoft.Agents.AI.Compaction::ChatReducerCompactionStrategy`
