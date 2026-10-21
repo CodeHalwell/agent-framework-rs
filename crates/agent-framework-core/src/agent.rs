@@ -585,7 +585,9 @@ impl Agent {
         // including, via the auto-attached/explicit `HistoryProvider`, thread
         // history — PREPENDED ahead of the run's own input; provider tools
         // appended, deduplicated by name).
-        let providers = self.combined_providers(session);
+        // A conversation id from the options (an agent default or a per-run
+        // override) means the service stores history too.
+        let providers = self.providers_for(session, options.conversation_id.is_some());
         let mut ctx = SessionContext::new(input.to_vec());
         ctx.session_id = Some(session.session_id().to_string());
         ctx.service_session_id = service_session_id.clone();
@@ -824,8 +826,23 @@ impl Agent {
     /// with the agent's own. There is no aggregate wrapper any more — callers
     /// iterate this list directly.
     fn combined_providers(&self, session: &AgentSession) -> Vec<Arc<dyn ContextProvider>> {
+        self.providers_for(session, session.service_session_id().is_some())
+    }
+
+    /// The session's providers then the agent's, without history providers
+    /// when the service stores the conversation, as .NET's
+    /// `ResolveChatHistoryProvider` does: the service already has those
+    /// turns, so loading them locally would send them twice.
+    fn providers_for(
+        &self,
+        session: &AgentSession,
+        service_stores_history: bool,
+    ) -> Vec<Arc<dyn ContextProvider>> {
         let mut providers = session.context_providers.clone();
         providers.extend(self.context_providers.iter().cloned());
+        if service_stores_history {
+            providers.retain(|p| !p.is_history_provider());
+        }
         providers
     }
 

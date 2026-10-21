@@ -2017,7 +2017,7 @@
           "ClearOnChatHistoryProviderConflict": {
             "rust": [],
             "status": "unmapped",
-            "note": "No configurable policy for a history provider combined with a service-managed conversation id."
+            "note": "No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached."
           },
           "Description": {
             "rust": [
@@ -2053,12 +2053,12 @@
           "ThrowOnChatHistoryProviderConflict": {
             "rust": [],
             "status": "unmapped",
-            "note": "No configurable policy for a history provider combined with a service-managed conversation id."
+            "note": "No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached."
           },
           "WarnOnChatHistoryProviderConflict": {
             "rust": [],
             "status": "unmapped",
-            "note": "No configurable policy for a history provider combined with a service-managed conversation id."
+            "note": "No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached."
           }
         }
       },

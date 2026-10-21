@@ -4431,3 +4431,61 @@ async fn a_call_that_never_reached_a_tool_does_not_spend_the_budget() {
         "the model was not forced into the tools-off failsafe by the miss"
     );
 }
+
+/// A reply carrying a service conversation id, as the Responses API sends.
+fn reply_in_conversation(text: &str, id: &str) -> ChatResponse {
+    let mut response = ChatResponse::from_text(text);
+    response.conversation_id = Some(id.into());
+    response
+}
+
+#[tokio::test]
+async fn local_history_is_not_resent_once_the_service_holds_the_conversation() {
+    // The first reply carries a conversation id, so the session becomes
+    // service-managed. The second request must rely on that id alone, not
+    // replay the turns the service already has (issue #57).
+    let client = MockClient::new(vec![
+        reply_in_conversation("reply 1", "resp_1"),
+        reply_in_conversation("reply 2", "resp_2"),
+    ]);
+    let probe = client.clone();
+    let agent = Agent::builder(client).build();
+    let mut session = agent.create_session();
+    for text in ["one", "two"] {
+        agent
+            .run(vec![Message::user(text)], Some(&mut session))
+            .await
+            .unwrap();
+    }
+    let second: Vec<String> = probe.all_seen()[1].iter().map(Message::text).collect();
+    assert_eq!(second, ["two"]);
+    assert_eq!(
+        probe.all_options()[1].conversation_id.as_deref(),
+        Some("resp_1")
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_id_in_the_options_disengages_local_history() {
+    let client = MockClient::new(vec![
+        ChatResponse::from_text("reply 1"),
+        ChatResponse::from_text("reply 2"),
+    ]);
+    let probe = client.clone();
+    let agent = Agent::builder(client).build();
+    let mut session = agent.create_session();
+    agent
+        .run(vec![Message::user("one")], Some(&mut session))
+        .await
+        .unwrap();
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![Message::user("two")], Some(&mut session), options)
+        .await
+        .unwrap();
+    let second: Vec<String> = probe.all_seen()[1].iter().map(Message::text).collect();
+    assert_eq!(second, ["two"]);
+}
