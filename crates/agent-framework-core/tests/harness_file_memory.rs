@@ -939,6 +939,57 @@ async fn paths_with_a_colon_are_refused() {
 }
 
 #[tokio::test]
+async fn paths_windows_would_reinterpret_are_refused() {
+    // Windows strips a trailing dot or space, so `memories.md.` would open
+    // the index, and a device name opens a device rather than a file.
+    for path in [
+        "memories.md.",
+        "dir /a.md",
+        "dir./a.md",
+        "nul",
+        "CON.txt",
+        "dir/com1.md",
+        "lpt9",
+    ] {
+        assert!(normalize_relative_path(path, false).is_err(), "{path:?}");
+    }
+    for path in ["notes.md", "console.md", "com.md", "null", "a.b.md"] {
+        assert!(normalize_relative_path(path, false).is_ok(), "{path:?}");
+    }
+    let (_, provider) = memory();
+    let ctx = prepare(&provider, &AgentSession::new()).await;
+    let result = call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "memories.md.", "content": "x"}),
+    )
+    .await;
+    assert!(result.as_str().unwrap().contains("device name"), "{result}");
+}
+
+#[tokio::test]
+async fn reserved_scopes_get_usable_folders() {
+    let store = Arc::new(InMemoryAgentFileStore::new());
+    let mut folders = Vec::new();
+    for scope in ["nul", "a.", "com1"] {
+        let scoped = FileMemoryProvider::new(store.clone()).with_scope(scope);
+        let ctx = prepare(&scoped, &AgentSession::new()).await;
+        call(
+            &ctx,
+            "file_memory_write",
+            json!({"file_name": "n.md", "content": scope}),
+        )
+        .await;
+        assert_eq!(
+            call(&ctx, "file_memory_read", json!({"file_name": "n.md"})).await,
+            scope
+        );
+        folders.push(scoped.working_folder(None).unwrap());
+    }
+    assert_eq!(folders, ["~scope-6e756c", "~scope-612e", "~scope-636f6d31"]);
+}
+
+#[tokio::test]
 async fn an_empty_created_directory_exists_in_the_in_memory_store() {
     let store = InMemoryAgentFileStore::new();
     store.create_directory("Empty/Inner").await.unwrap();

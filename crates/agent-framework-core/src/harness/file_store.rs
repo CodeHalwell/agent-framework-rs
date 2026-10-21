@@ -340,6 +340,11 @@ pub fn normalize_relative_path(path: &str, is_directory: bool) -> Result<String>
                     "Invalid path: '{trimmed}'. Paths must not contain '.' or '..' segments."
                 )))
             }
+            _ if is_windows_reserved_segment(segment) => {
+                return Err(Error::tool(format!(
+                    "Invalid path: '{trimmed}'. Path segments must not end with '.' or a space, or be a reserved device name such as 'nul' or 'con.txt'."
+                )))
+            }
             _ => segments.push(segment),
         }
     }
@@ -350,6 +355,23 @@ pub fn normalize_relative_path(path: &str, is_directory: bool) -> Result<String>
         )));
     }
     Ok(result)
+}
+
+/// Whether Win32 would not treat `segment` as an ordinary name: it ends in
+/// `.` or a space, which Windows strips (`memories.md.` opens `memories.md`),
+/// or its stem is a reserved device name (`nul`, `con.txt`, `COM1`), which
+/// opens a device rather than a file. Refused on every platform so a path
+/// means the same thing wherever the store runs.
+pub(crate) fn is_windows_reserved_segment(segment: &str) -> bool {
+    if segment.ends_with('.') || segment.ends_with(' ') {
+        return true;
+    }
+    let stem = segment.split('.').next().unwrap_or("").trim_end();
+    match stem.to_ascii_lowercase().as_bytes() {
+        b"con" | b"prn" | b"aux" | b"nul" | b"conin$" | b"conout$" | b"clock$" => true,
+        [b'c', b'o', b'm', d] | [b'l', b'p', b't', d] => d.is_ascii_digit(),
+        _ => false,
+    }
 }
 
 /// Join a directory and a path relative to it; either may be empty.

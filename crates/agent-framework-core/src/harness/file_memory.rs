@@ -57,8 +57,8 @@ use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::Message;
 
 use super::file_store::{
-    apply_replace, apply_replace_lines, compile_glob, normalize_relative_path, AgentFileStore,
-    FileLineEdit,
+    apply_replace, apply_replace_lines, compile_glob, is_windows_reserved_segment,
+    normalize_relative_path, AgentFileStore, FileLineEdit,
 };
 
 /// The default `source_id` of a [`FileMemoryProvider`].
@@ -214,13 +214,14 @@ impl FileMemoryProvider {
                         .into(),
                 )
             })?;
-        let folder = match raw {
-            // Literal-safe, but not usable as a folder name.
-            "." | ".." => {
-                let hex: String = raw.bytes().map(|b| format!("{b:02x}")).collect();
-                format!("{ENCODED_SCOPE_PREFIX}{hex}")
-            }
-            _ => storage_key_segment(raw, ENCODED_SCOPE_PREFIX),
+        let folder = storage_key_segment(raw, ENCODED_SCOPE_PREFIX);
+        // Literal-safe values such as `.`, `a.` and `nul` are still not
+        // usable as folder names, so encode them the way unsafe ones are.
+        let folder = if is_windows_reserved_segment(&folder) {
+            let hex: String = raw.bytes().map(|b| format!("{b:02x}")).collect();
+            format!("{ENCODED_SCOPE_PREFIX}{hex}")
+        } else {
+            folder
         };
         if folder.len() > MAX_FOLDER_NAME_BYTES {
             return Err(Error::Configuration(format!(
