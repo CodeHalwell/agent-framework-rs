@@ -610,14 +610,22 @@ pub fn apply_replace_lines(content: &str, edits: &[FileLineEdit]) -> Result<Stri
 /// system would refuse them.
 #[derive(Default)]
 pub struct InMemoryAgentFileStore {
+    state: Mutex<InMemoryState>,
+}
+
+#[derive(Default)]
+struct InMemoryState {
     /// Lowercased path to (path as written, content).
-    files: Mutex<HashMap<String, (String, String)>>,
+    files: HashMap<String, (String, String)>,
+    /// Directories made with `create_directory`, lowercased to as written,
+    /// so an empty one still exists. Others are implied by file paths.
+    directories: HashMap<String, String>,
 }
 
 impl fmt::Debug for InMemoryAgentFileStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryAgentFileStore")
-            .field("files", &self.files.lock().unwrap().len())
+            .field("files", &self.state.lock().unwrap().files.len())
             .finish()
     }
 }
@@ -642,10 +650,16 @@ fn check_ancestors(files: &HashMap<String, (String, String)>, key: &str) -> Resu
 }
 
 /// Refuse writing a file where a directory is, as a file system would.
-fn check_file_path(files: &HashMap<String, (String, String)>, key: &str, path: &str) -> Result<()> {
-    check_ancestors(files, key)?;
+fn check_file_path(state: &InMemoryState, key: &str, path: &str) -> Result<()> {
+    check_ancestors(&state.files, key)?;
     let prefix = format!("{key}/");
-    if files.keys().any(|k| k.starts_with(&prefix)) {
+    let is_directory = state.directories.contains_key(key)
+        || state
+            .files
+            .keys()
+            .chain(state.directories.keys())
+            .any(|k| k.starts_with(&prefix));
+    if is_directory {
         return Err(Error::tool(format!("Path is a directory: {path}")));
     }
     Ok(())
@@ -655,33 +669,39 @@ fn check_file_path(files: &HashMap<String, (String, String)>, key: &str, path: &
 impl AgentFileStore for InMemoryAgentFileStore {
     async fn write(&self, path: &str, content: &str) -> Result<()> {
         let display = normalize_relative_path(path, false)?;
-        let mut files = self.files.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let key = display.to_lowercase();
-        check_file_path(&files, &key, path)?;
-        files.insert(key, (display, content.to_string()));
+        check_file_path(&state, &key, path)?;
+        state.files.insert(key, (display, content.to_string()));
         Ok(())
     }
 
     async fn create_new(&self, path: &str, content: &str) -> Result<()> {
         let display = normalize_relative_path(path, false)?;
-        let mut files = self.files.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let key = display.to_lowercase();
-        if files.contains_key(&key) {
+        if state.files.contains_key(&key) {
             return Err(Error::tool(format!("File already exists: '{path}'")));
         }
-        check_file_path(&files, &key, path)?;
-        files.insert(key, (display, content.to_string()));
+        check_file_path(&state, &key, path)?;
+        state.files.insert(key, (display, content.to_string()));
         Ok(())
     }
 
     async fn read(&self, path: &str) -> Result<Option<String>> {
         let key = normalize_relative_path(path, false)?.to_lowercase();
-        Ok(self.files.lock().unwrap().get(&key).map(|(_, c)| c.clone()))
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .files
+            .get(&key)
+            .map(|(_, c)| c.clone()))
     }
 
     async fn delete(&self, path: &str) -> Result<bool> {
         let key = normalize_relative_path(path, false)?.to_lowercase();
-        Ok(self.files.lock().unwrap().remove(&key).is_some())
+        Ok(self.state.lock().unwrap().files.remove(&key).is_some())
     }
 
     async fn list_children(&self, directory: &str) -> Result<Vec<FileStoreEntry>> {
@@ -693,7 +713,17 @@ impl AgentFileStore for InMemoryAgentFileStore {
         let mut directories = Vec::new();
         let mut files = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (key, (display, _)) in self.files.lock().unwrap().iter() {
+        let state = self.state.lock().unwrap();
+        let file_paths = state.files.iter().map(|(key, (display, _))| (key, display));
+        // A created directory is listed by its parent like a directory a
+        // file implies, so give it a trailing segment to cut at.
+        let created: Vec<(String, String)> = state
+            .directories
+            .iter()
+            .map(|(key, display)| (format!("{key}/"), format!("{display}/")))
+            .collect();
+        let dir_paths = created.iter().map(|(key, display)| (key, display));
+        for (key, display) in file_paths.chain(dir_paths) {
             if !key.starts_with(&prefix) {
                 continue;
             }
@@ -701,6 +731,8 @@ impl AgentFileStore for InMemoryAgentFileStore {
             // by segments rather than by the key's offsets.
             let remainder = display.splitn(depth + 1, '/').last().unwrap_or_default();
             match remainder.split_once('/') {
+                // The directory being listed, when it was created itself.
+                None if remainder.is_empty() => {}
                 None => files.push(FileStoreEntry::file(remainder)),
                 Some((segment, _)) if !segment.is_empty() => {
                     if seen.insert(segment.to_lowercase()) {
@@ -718,19 +750,21 @@ impl AgentFileStore for InMemoryAgentFileStore {
 
     async fn file_exists(&self, path: &str) -> Result<bool> {
         let key = normalize_relative_path(path, false)?.to_lowercase();
-        Ok(self.files.lock().unwrap().contains_key(&key))
+        Ok(self.state.lock().unwrap().files.contains_key(&key))
     }
 
     async fn create_directory(&self, path: &str) -> Result<()> {
-        let key = normalize_relative_path(path, true)?.to_lowercase();
-        let files = self.files.lock().unwrap();
+        let display = normalize_relative_path(path, true)?;
+        let key = display.to_lowercase();
+        let mut state = self.state.lock().unwrap();
         if key.is_empty() {
             return Ok(());
         }
-        check_ancestors(&files, &key)?;
-        if files.contains_key(&key) {
+        check_ancestors(&state.files, &key)?;
+        if state.files.contains_key(&key) {
             return Err(Error::tool(format!("Path is a file: {path}")));
         }
+        state.directories.entry(key).or_insert(display);
         Ok(())
     }
 }

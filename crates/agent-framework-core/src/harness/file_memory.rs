@@ -152,10 +152,20 @@ impl FileMemoryProvider {
         }
     }
 
-    fn update(mut self, f: impl FnOnce(&mut Inner)) -> Self {
-        let inner = Arc::get_mut(&mut self.inner).expect("builder methods run before sharing");
-        f(inner);
-        self
+    /// A provider with this one's configuration changed by `f`. It gets a
+    /// fresh write lock, so calling a builder method on a clone is fine.
+    fn update(self, f: impl FnOnce(&mut Inner)) -> Self {
+        let mut inner = Inner {
+            store: self.inner.store.clone(),
+            source_id: self.inner.source_id.clone(),
+            scope: self.inner.scope.clone(),
+            instructions: self.inner.instructions.clone(),
+            write_lock: tokio::sync::Mutex::new(()),
+        };
+        f(&mut inner);
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Set the provider's `source_id`.

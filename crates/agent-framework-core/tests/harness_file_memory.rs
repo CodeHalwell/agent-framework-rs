@@ -937,3 +937,41 @@ async fn paths_with_a_colon_are_refused() {
     .await;
     assert!(result.as_str().unwrap().contains("':'"), "{result}");
 }
+
+#[tokio::test]
+async fn an_empty_created_directory_exists_in_the_in_memory_store() {
+    let store = InMemoryAgentFileStore::new();
+    store.create_directory("Empty/Inner").await.unwrap();
+    // Listed by its parent even with nothing in it, and empty itself.
+    let root: Vec<_> = store
+        .list_children("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.is_file(), e.name))
+        .collect();
+    assert_eq!(root, [(false, "Empty".to_string())]);
+    let inner: Vec<_> = store
+        .list_children("empty")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(inner, ["Inner"]);
+    assert!(store.list_children("empty/inner").await.unwrap().is_empty());
+    // And it can't be overwritten by a file, as on disk.
+    assert!(store.write("empty", "x").await.is_err());
+    assert!(store.write("empty/inner", "x").await.is_err());
+    store.write("empty/inner/n.md", "x").await.unwrap();
+}
+
+#[tokio::test]
+async fn builder_methods_work_on_a_cloned_provider() {
+    let (_, provider) = memory();
+    let clone = provider.clone();
+    let scoped = clone.with_scope("user-1").with_source_id("mine");
+    assert_eq!(scoped.working_folder(None).unwrap(), "user-1");
+    // The original is unchanged.
+    assert!(provider.working_folder(None).is_err());
+}
