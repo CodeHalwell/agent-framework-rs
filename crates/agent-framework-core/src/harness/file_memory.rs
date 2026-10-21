@@ -17,7 +17,7 @@
 //! | `file_memory_replace_lines` | Replace whole lines in a file. |
 //!
 //! Memories live in one flat working folder per scope. A description is
-//! kept in a companion file (`notes.md` → `notes_description.md`), and a
+//! kept in a companion file (`notes.md` → `notes.md_description.md`), and a
 //! `memories.md` index of up to 50 files is rebuilt on every write and
 //! delete. Both are hidden from the agent's listings and searches.
 //!
@@ -308,20 +308,16 @@ impl FileMemoryProvider {
                 let (inner, folder) = (inner.clone(), folder.clone());
                 async move {
                     let name = &args.file_name;
-                    let normalized = match normalize_relative_path(name, false) {
-                        Ok(n) => n,
-                        Err(e) => return Ok(text(format!("Could not delete file '{name}': {}", detail(&e)))),
+                    // The index and description files are not the agent's to
+                    // delete, any more than to edit.
+                    let path = match inner.editable_path(&folder, name, "delete") {
+                        Ok(path) => path,
+                        Err(message) => return Ok(text(message)),
                     };
-                    if normalized.contains('/') {
-                        return Ok(text(format!("File '{name}' not found.")));
-                    }
                     let _guard = inner.write_lock.lock().await;
                     let outcome = async {
-                        let deleted = inner.store.delete(&combine(&folder, &normalized)).await?;
-                        inner
-                            .store
-                            .delete(&combine(&folder, &description_file_name(&normalized)))
-                            .await?;
+                        let deleted = inner.store.delete(&path).await?;
+                        inner.store.delete(&description_file_name(&path)).await?;
                         inner.rebuild_index(&folder).await?;
                         Ok::<_, Error>(deleted)
                     }
@@ -511,8 +507,8 @@ impl FileMemoryProvider {
 }
 
 impl Inner {
-    /// The store path of a file the replace tools may change, or the message
-    /// to return instead.
+    /// The store path of a file the agent may change or delete, or the
+    /// message to return instead.
     fn editable_path(
         &self,
         folder: &str,
@@ -595,12 +591,13 @@ impl ContextProvider for FileMemoryProvider {
     }
 }
 
-/// `notes.md` → `notes_description.md`; `notes` → `notes_description.md`.
+/// `notes.md` → `notes.md_description.md`.
+///
+/// The whole name is kept, as in Go's port, so `notes.md` and `notes.txt`
+/// get separate descriptions. Python and .NET drop the extension
+/// (`notes_description.md`), which makes those two share one.
 fn description_file_name(name: &str) -> String {
-    match name.rfind('.') {
-        Some(dot) if dot > 0 => format!("{}{DESCRIPTION_SUFFIX}", &name[..dot]),
-        _ => format!("{name}{DESCRIPTION_SUFFIX}"),
-    }
+    format!("{name}{DESCRIPTION_SUFFIX}")
 }
 
 /// Whether `name` is a description file or the index, hidden from the agent.
@@ -639,9 +636,12 @@ mod tests {
 
     #[test]
     fn description_and_internal_names() {
-        assert_eq!(description_file_name("notes.md"), "notes_description.md");
+        assert_eq!(description_file_name("notes.md"), "notes.md_description.md");
+        assert_eq!(
+            description_file_name("notes.txt"),
+            "notes.txt_description.md"
+        );
         assert_eq!(description_file_name("notes"), "notes_description.md");
-        assert_eq!(description_file_name(".hidden"), ".hidden_description.md");
         assert!(is_internal_file("Memories.MD"));
         assert!(is_internal_file("x_DESCRIPTION.md"));
         assert!(!is_internal_file("notes.md"));

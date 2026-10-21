@@ -134,7 +134,7 @@ async fn descriptions_are_listed_and_removed_with_their_file() {
     )
     .await;
     assert!(!store
-        .file_exists(&format!("{folder}/plan_description.md"))
+        .file_exists(&format!("{folder}/plan.md_description.md"))
         .await
         .unwrap());
 
@@ -146,7 +146,7 @@ async fn descriptions_are_listed_and_removed_with_their_file() {
     .await;
     call(&ctx, "file_memory_delete", json!({"file_name": "plan.md"})).await;
     assert!(!store
-        .file_exists(&format!("{folder}/plan_description.md"))
+        .file_exists(&format!("{folder}/plan.md_description.md"))
         .await
         .unwrap());
 }
@@ -727,4 +727,65 @@ fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("af-file-store-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[tokio::test]
+async fn delete_refuses_the_index_and_description_files() {
+    let (store, provider) = memory();
+    let session = AgentSession::new();
+    let ctx = prepare(&provider, &session).await;
+    let folder = provider.working_folder(Some(&session)).unwrap();
+    call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "plan.md", "content": "steps", "description": "The plan"}),
+    )
+    .await;
+    for name in ["memories.md", "MEMORIES.md", "plan.md_description.md"] {
+        let result = call(&ctx, "file_memory_delete", json!({"file_name": name})).await;
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("reserved for internal use"),
+            "{result}"
+        );
+    }
+    for kept in ["memories.md", "plan.md_description.md"] {
+        assert!(store
+            .file_exists(&format!("{folder}/{kept}"))
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn files_differing_only_by_extension_keep_their_own_descriptions() {
+    let (_, provider) = memory();
+    let ctx = prepare(&provider, &AgentSession::new()).await;
+    call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "notes.md", "content": "a", "description": "Markdown notes"}),
+    )
+    .await;
+    call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "notes.txt", "content": "b", "description": "Plain notes"}),
+    )
+    .await;
+    assert_eq!(
+        call(&ctx, "file_memory_ls", json!({})).await,
+        json!([
+            {"name": "notes.md", "type": "file", "description": "Markdown notes"},
+            {"name": "notes.txt", "type": "file", "description": "Plain notes"}
+        ])
+    );
+    // Deleting one leaves the other's description alone.
+    call(&ctx, "file_memory_delete", json!({"file_name": "notes.md"})).await;
+    assert_eq!(
+        call(&ctx, "file_memory_ls", json!({})).await,
+        json!([{"name": "notes.txt", "type": "file", "description": "Plain notes"}])
+    );
 }
