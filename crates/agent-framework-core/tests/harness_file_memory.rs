@@ -919,3 +919,21 @@ async fn file_system_store_keeps_files_and_directories_apart() {
     check_file_directory_invariant(&FileSystemAgentFileStore::new(&dir).unwrap()).await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn paths_with_a_colon_are_refused() {
+    // On Windows these name alternate data streams, which listings never
+    // show, and `memories.md::$DATA` would slip past the reserved names.
+    for path in ["notes.md:hidden", "memories.md::$DATA", "dir/a:b"] {
+        assert!(normalize_relative_path(path, false).is_err(), "{path}");
+    }
+    let (_, provider) = memory();
+    let ctx = prepare(&provider, &AgentSession::new()).await;
+    let result = call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "memories.md::$DATA", "content": "x"}),
+    )
+    .await;
+    assert!(result.as_str().unwrap().contains("':'"), "{result}");
+}

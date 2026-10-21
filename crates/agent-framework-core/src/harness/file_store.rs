@@ -318,6 +318,13 @@ pub fn normalize_relative_path(path: &str, is_directory: bool) -> Result<String>
             "Invalid path: '{trimmed}'. Paths must be relative and must not start with '/', '\\', or a drive root."
         )));
     }
+    // Elsewhere in a path, a colon names an NTFS alternate data stream
+    // (`notes.md:hidden`), which a listing never shows.
+    if stripped.contains(':') {
+        return Err(Error::tool(format!(
+            "Invalid path: '{trimmed}'. Paths must not contain ':'."
+        )));
+    }
     let mut segments = Vec::new();
     for segment in stripped.split('/') {
         match segment {
