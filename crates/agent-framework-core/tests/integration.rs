@@ -4489,3 +4489,70 @@ async fn a_conversation_id_in_the_options_disengages_local_history() {
     let second: Vec<String> = probe.all_seen()[1].iter().map(Message::text).collect();
     assert_eq!(second, ["two"]);
 }
+
+#[tokio::test]
+async fn a_per_run_conversation_turn_is_not_recorded_in_local_history() {
+    // The reply doesn't echo an id, so the session stays local; the turn
+    // that went to the service conversation must still stay out of local
+    // history, or a later local run would replay it.
+    let client = MockClient::new(vec![
+        ChatResponse::from_text("reply 1"),
+        ChatResponse::from_text("reply 2"),
+    ]);
+    let probe = client.clone();
+    let agent = Agent::builder(client).build();
+    let mut session = agent.create_session();
+    let options = AgentRunOptions::new().with_chat_options(ChatOptions {
+        conversation_id: Some("conv-override".into()),
+        ..Default::default()
+    });
+    agent
+        .run_with_options(vec![Message::user("one")], Some(&mut session), options)
+        .await
+        .unwrap();
+    agent
+        .run(vec![Message::user("two")], Some(&mut session))
+        .await
+        .unwrap();
+    let second: Vec<String> = probe.all_seen()[1].iter().map(Message::text).collect();
+    assert_eq!(second, ["two"]);
+}
+
+#[tokio::test]
+async fn a_streamed_turn_the_service_keeps_is_not_recorded_locally() {
+    /// Streams one reply that carries a conversation id.
+    struct StreamingService;
+    #[async_trait]
+    impl ChatClient for StreamingService {
+        async fn get_response(&self, _: Vec<Message>, _: ChatOptions) -> Result<ChatResponse> {
+            Ok(reply_in_conversation("reply", "resp_1"))
+        }
+        async fn get_streaming_response(
+            &self,
+            _: Vec<Message>,
+            _: ChatOptions,
+        ) -> Result<agent_framework_core::client::ChatStream> {
+            let mut update = ChatResponseUpdate::text("reply");
+            update.conversation_id = Some("resp_1".into());
+            Ok(Box::pin(futures::stream::iter(vec![Ok(update)])))
+        }
+    }
+
+    let agent = Agent::builder(StreamingService).build();
+    let history = InMemoryHistoryProvider::new();
+    let mut session = agent.create_session();
+    session
+        .context_providers
+        .insert(0, Arc::new(history.clone()));
+    let stream = agent
+        .run_stream(vec![Message::user("one")], Some(session), None)
+        .await
+        .unwrap();
+    let updates: Vec<_> = stream.collect().await;
+    assert!(updates.iter().all(|u| u.is_ok()));
+    assert!(
+        history.list_messages().is_empty(),
+        "{:?}",
+        history.list_messages()
+    );
+}
