@@ -1053,3 +1053,22 @@ async fn an_oversized_glob_is_a_tool_error_not_a_panic() {
     }
     assert!(matches_glob("n.md", Some(&huge)).is_err());
 }
+
+#[tokio::test]
+async fn candidate_discovery_lets_other_tasks_run() {
+    // The in-memory store never waits, so without a yield the search
+    // timeout could not be polled until discovery finished.
+    let store = InMemoryAgentFileStore::new();
+    for i in 0..20 {
+        store.write(&format!("d{i}/n.md"), "x").await.unwrap();
+    }
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = ran.clone();
+    tokio::spawn(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst) });
+    let names = store
+        .find_matching_files("", "x", None, true)
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 20);
+    assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+}

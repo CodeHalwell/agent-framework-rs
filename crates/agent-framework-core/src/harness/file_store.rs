@@ -213,6 +213,9 @@ pub trait AgentFileStore: Send + Sync {
         let mut names = Vec::new();
         let mut pending = vec![String::new()];
         while let Some(relative_dir) = pending.pop() {
+            // A store whose listings complete without waiting, such as the
+            // in-memory one, would otherwise never let the search timeout run.
+            tokio::task::yield_now().await;
             for entry in self
                 .list_children(&combine_search_path(directory, &relative_dir))
                 .await?
