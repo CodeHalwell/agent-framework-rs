@@ -108,13 +108,14 @@ fn doc_url_path(database_id: &str, container_id: &str, doc_id: &str) -> String {
     )
 }
 
-/// The `x-ms-documentdb-partitionkey` header value for a single-value
-/// (non-hierarchical) partition key: a JSON array containing just that one
-/// value, e.g. `["thread-42"]`. `serde_json::to_string` both quotes and
-/// escapes the value correctly for any thread id, including one containing
-/// `"` or other characters that would otherwise corrupt the header.
-pub(crate) fn partition_key_header_value(partition_key: &str) -> Result<String> {
-    Ok(serde_json::to_string(&[partition_key])?)
+/// The `x-ms-documentdb-partitionkey` header value: a JSON array of the
+/// key's values, one for a single-level key (`["thread-42"]`) and one per
+/// level for a hierarchical key (`["t1","u1","thread-42"]`).
+/// `serde_json::to_string` both quotes and escapes each value correctly,
+/// including one containing `"` or other characters that would otherwise
+/// corrupt the header.
+pub(crate) fn partition_key_header_value(partition_key: &[&str]) -> Result<String> {
+    Ok(serde_json::to_string(partition_key)?)
 }
 
 /// Build the `POST .../docs` query-request body:
@@ -600,12 +601,28 @@ impl CosmosRestClient {
         container_id: &str,
         partition_key_path: &str,
     ) -> Result<()> {
+        self.create_container_with_partition_paths(database_id, container_id, &[partition_key_path])
+            .await
+    }
+
+    /// As [`Self::create_container_if_not_exists`], for a partition key of
+    /// one or more levels. More than one path makes a hierarchical key
+    /// (`"kind": "MultiHash"`, `"version": 2`), which Cosmos DB accepts with
+    /// up to three levels.
+    pub(crate) async fn create_container_with_partition_paths(
+        &self,
+        database_id: &str,
+        container_id: &str,
+        partition_key_paths: &[&str],
+    ) -> Result<()> {
+        let partition_key = if partition_key_paths.len() > 1 {
+            serde_json::json!({ "paths": partition_key_paths, "kind": "MultiHash", "version": 2 })
+        } else {
+            serde_json::json!({ "paths": partition_key_paths, "kind": "Hash" })
+        };
         let body = serde_json::json!({
             "id": container_id,
-            "partitionKey": {
-                "paths": [partition_key_path],
-                "kind": "Hash",
-            },
+            "partitionKey": partition_key,
         });
         let resource_link = db_link(database_id);
         let url_path = format!("{resource_link}/colls");
@@ -637,7 +654,7 @@ impl CosmosRestClient {
         &self,
         database_id: &str,
         container_id: &str,
-        partition_key: &str,
+        partition_key: &[&str],
         document: &Value,
     ) -> Result<Value> {
         let resource_link = coll_link(database_id, container_id);
@@ -678,7 +695,7 @@ impl CosmosRestClient {
         &self,
         database_id: &str,
         container_id: &str,
-        partition_key: &str,
+        partition_key: &[&str],
         query: &str,
         parameters: &[(&str, Value)],
     ) -> Result<Vec<Value>> {
@@ -797,7 +814,7 @@ impl CosmosRestClient {
         &self,
         database_id: &str,
         container_id: &str,
-        partition_key: &str,
+        partition_key: &[&str],
         doc_id: &str,
     ) -> Result<Option<Value>> {
         let resource_link = doc_link(database_id, container_id, doc_id);
@@ -841,7 +858,7 @@ impl CosmosRestClient {
         &self,
         database_id: &str,
         container_id: &str,
-        partition_key: &str,
+        partition_key: &[&str],
         document: &Value,
     ) -> Result<Value> {
         let resource_link = coll_link(database_id, container_id);
@@ -883,7 +900,7 @@ impl CosmosRestClient {
         &self,
         database_id: &str,
         container_id: &str,
-        partition_key: &str,
+        partition_key: &[&str],
         doc_id: &str,
     ) -> Result<()> {
         let resource_link = doc_link(database_id, container_id, doc_id);
@@ -1014,14 +1031,17 @@ mod tests {
     #[test]
     fn partition_key_header_value_wraps_in_json_array() {
         assert_eq!(
-            partition_key_header_value("thread-42").unwrap(),
+            partition_key_header_value(&["thread-42"]).unwrap(),
             "[\"thread-42\"]"
         );
     }
 
     #[test]
     fn partition_key_header_value_escapes_embedded_quotes() {
-        assert_eq!(partition_key_header_value("a\"b").unwrap(), "[\"a\\\"b\"]");
+        assert_eq!(
+            partition_key_header_value(&["a\"b"]).unwrap(),
+            "[\"a\\\"b\"]"
+        );
     }
 
     // endregion

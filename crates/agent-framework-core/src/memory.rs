@@ -89,6 +89,20 @@ pub trait ContextProvider: Send + Sync {
     fn is_history_provider(&self) -> bool {
         false
     }
+
+    /// The conversation history this provider keeps only in process memory,
+    /// for a [session store](crate::session_store) snapshot to carry.
+    ///
+    /// Defaults to `None`, which is right for every provider that is not a
+    /// history provider and for one that persists its own messages (a file
+    /// or database history): restoring those means reattaching them, not
+    /// copying their messages. [`InMemoryHistoryProvider`](crate::history::InMemoryHistoryProvider)
+    /// returns its messages.
+    #[cfg(feature = "experimental-session-store")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental-session-store")))]
+    fn snapshot_history(&self) -> Option<Vec<Message>> {
+        None
+    }
 }
 
 #[cfg(test)]

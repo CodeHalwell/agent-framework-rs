@@ -3438,6 +3438,58 @@
           "status": "mapped",
           "note": "BeforeAIInvoke is BeforeInvoke; OnDemandFunctionCalling keeps its name."
         }
+      },
+      "AgentSessionStore": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::session_store::AgentSessionStore"
+          ],
+          "status": "adapted",
+          "note": "The abstract class becomes the AgentSessionStore trait, behind experimental-session-store; GetService has no counterpart."
+        },
+        "methods": {
+          "SaveSessionAsync(AIAgent, AgentSessionStoreKey, AgentSession, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::save_session"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
+          },
+          "GetSessionAsync(AIAgent, AgentSessionStoreKey, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::get_session"
+            ],
+            "status": "mapped",
+            "note": "Returns None when nothing is stored and an independent session otherwise."
+          },
+          "GetOrCreateSessionAsync(AIAgent, AgentSessionStoreKey, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::get_or_create_session"
+            ],
+            "status": "mapped",
+            "note": "Provided method falling back to the agent's create_session, as .NET's virtual default does."
+          }
+        }
+      },
+      "AgentSessionStoreKey": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::session_store::AgentSessionStoreKey"
+          ],
+          "status": "mapped",
+          "note": "Session id plus ordered named partitions, compared by value."
+        },
+        "methods": {
+          "WithPartition(string, string)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStoreKey::with_partition"
+            ],
+            "status": "mapped",
+            "note": "Consumes the key and returns it with the partition set; blank names and values are refused."
+          }
+        }
       }
     },
     "Microsoft.Agents.AI.A2A": {

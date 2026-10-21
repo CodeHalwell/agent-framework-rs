@@ -210,7 +210,7 @@ impl CheckpointStorage for CosmosCheckpointStorage {
         let id = checkpoint.checkpoint_id.clone();
         let document = build_checkpoint_document(&checkpoint)?;
         self.client
-            .upsert_document(&self.database_id, &self.container_id, &id, &document)
+            .upsert_document(&self.database_id, &self.container_id, &[&id], &document)
             .await?;
         Ok(id)
     }
@@ -221,7 +221,7 @@ impl CheckpointStorage for CosmosCheckpointStorage {
             .get_document(
                 &self.database_id,
                 &self.container_id,
-                checkpoint_id,
+                &[checkpoint_id],
                 checkpoint_id,
             )
             .await?;
@@ -268,7 +268,7 @@ impl CheckpointStorage for CosmosCheckpointStorage {
             .get_document(
                 &self.database_id,
                 &self.container_id,
-                checkpoint_id,
+                &[checkpoint_id],
                 checkpoint_id,
             )
             .await?
@@ -278,7 +278,7 @@ impl CheckpointStorage for CosmosCheckpointStorage {
                 .delete_document(
                     &self.database_id,
                     &self.container_id,
-                    checkpoint_id,
+                    &[checkpoint_id],
                     checkpoint_id,
                 )
                 .await?;

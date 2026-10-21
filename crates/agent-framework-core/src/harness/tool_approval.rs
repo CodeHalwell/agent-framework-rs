@@ -54,7 +54,7 @@
 //!   before it ends, retrying the last answer still sends the whole batch;
 //!   approved calls that already executed run again (at-least-once).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -104,9 +104,14 @@ pub struct ToolApprovalRule {
 
 impl ToolApprovalRule {
     /// A rule approving every call to `tool_name`.
+    ///
+    /// The name is kept exactly as given: it must be the identity of the
+    /// approved tool, and `"run_shell "` and `"run_shell"` are different
+    /// tools (upstream #9557). A name that is empty or only whitespace is
+    /// refused.
     pub fn tool(tool_name: impl Into<String>) -> Result<Self> {
-        let tool_name = tool_name.into().trim().to_string();
-        if tool_name.is_empty() {
+        let tool_name = tool_name.into();
+        if tool_name.trim().is_empty() {
             return Err(Error::Configuration(
                 "Tool approval rule tool_name must be a non-empty string.".into(),
             ));
@@ -526,6 +531,51 @@ impl ToolApprovalAgent {
         out
     }
 
+    /// Refuse a batch in which two approval requests share an id (upstream
+    /// #9542).
+    ///
+    /// Everything this agent keeps is keyed by request id: an answer
+    /// replaces an earlier one with its id, and an "always approve" choice is
+    /// recorded against it. Two live requests under one id would let the
+    /// answer to one stand in for the other, or drop an auto-approval when
+    /// the caller answers its namesake. This agent's own inner `Agent` mints
+    /// a unique occurrence id per call, but the inner agent can be anything.
+    ///
+    /// Any state already held under a duplicated id is discarded, so a retry
+    /// cannot pick up half of the broken batch, and the run fails.
+    fn ensure_request_ids_unique<'a>(
+        &self,
+        requests: impl IntoIterator<Item = &'a FunctionApprovalRequestContent>,
+        state: &mut ToolApprovalState,
+        session: &AgentSession,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut duplicates = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.id.as_str()) {
+                duplicates.insert(request.id.clone());
+            }
+        }
+        if duplicates.is_empty() {
+            return Ok(());
+        }
+        state
+            .queued_approval_requests
+            .retain(|r| !duplicates.contains(&r.id));
+        state
+            .collected_approval_responses
+            .retain(|r| !duplicates.contains(&r.id));
+        state
+            .pending_standing_approvals
+            .retain(|id, _| !duplicates.contains(id));
+        self.save_state(session, state)?;
+        let ids: Vec<&str> = duplicates.iter().map(String::as_str).collect();
+        Err(Error::AgentExecution(format!(
+            "Tool approval request IDs '{}' were used more than once.",
+            ids.join("', '")
+        )))
+    }
+
     /// Decide what happens to an outbound batch of approval requests.
     /// Returns the indices to remove from the batch (auto-approved or
     /// queued) and whether every request was auto-approved.
@@ -609,6 +659,12 @@ impl ToolApprovalAgent {
                 });
             }
             response.usage_details = usage.clone();
+            let positions: Vec<(usize, usize)> = approval_positions(&response.messages);
+            let requests: Vec<FunctionApprovalRequestContent> = positions
+                .iter()
+                .map(|&(m, c)| approval_at(&response.messages, m, c).clone())
+                .collect();
+            self.ensure_request_ids_unique(&requests, &mut state, session)?;
             if iteration >= self.max_auto_approval_iterations {
                 // Cap reached: return this turn as-is, without auto-approving
                 // again, so the caller decides on any request in it.
@@ -619,11 +675,6 @@ impl ToolApprovalAgent {
 
             let preserve_batch =
                 has_other_user_input(response.messages.iter().flat_map(|m| &m.contents));
-            let positions: Vec<(usize, usize)> = approval_positions(&response.messages);
-            let requests: Vec<FunctionApprovalRequestContent> = positions
-                .iter()
-                .map(|&(m, c)| approval_at(&response.messages, m, c).clone())
-                .collect();
             let (removed, all_auto_approved) =
                 self.decide(&requests, &mut state, preserve_batch).await;
             if !removed.is_empty() {
@@ -681,10 +732,20 @@ impl ToolApprovalAgent {
             let mut buffered: Vec<AgentResponseUpdate> = Vec::new();
             let mut saw_other_input = false;
             let mut conversation_id: Option<String> = None;
+            // Requests already streamed through on a capped pass, so a later
+            // update reusing one's id is refused before it reaches the caller.
+            let mut passed_through: Vec<FunctionApprovalRequestContent> = Vec::new();
             while let Some(update) = inner.next().await {
                 let update = update?;
                 if let Some(cid) = &update.conversation_id {
                     conversation_id = Some(cid.clone());
+                }
+                if capped {
+                    passed_through.extend(update.contents.iter().filter_map(|c| match c {
+                        Content::FunctionApprovalRequest(r) => Some(r.clone()),
+                        _ => None,
+                    }));
+                    self.ensure_request_ids_unique(&passed_through, &mut state, &session)?;
                 }
                 let has_request = update
                     .contents
@@ -734,6 +795,7 @@ impl ToolApprovalAgent {
                     _ => unreachable!("positions index approval requests"),
                 })
                 .collect();
+            self.ensure_request_ids_unique(&requests, &mut state, &session)?;
             let (removed, all_auto_approved) =
                 self.decide(&requests, &mut state, preserve_batch).await;
             self.save_state(&session, &state)?;
@@ -882,6 +944,20 @@ mod tests {
             canonical_json(&json!({"b": [1, {"d": 1, "c": 2}], "a": "x"})),
             r#"{"a":"x","b":[1,{"c":2,"d":1}]}"#
         );
+    }
+
+    #[test]
+    fn rules_keep_the_exact_tool_name() {
+        // Upstream #9557: trimming made an "always approve" for `run_shell `
+        // a standing approval of the different tool `run_shell`.
+        let rule = ToolApprovalRule::tool("run_shell ").unwrap();
+        assert_eq!(rule.tool_name, "run_shell ");
+        assert!(rule.matches(&call("run_shell ", json!({}))));
+        assert!(!rule.matches(&call("run_shell", json!({}))));
+        let json = serde_json::to_value(&rule).unwrap();
+        let back: ToolApprovalRule = serde_json::from_value(json).unwrap();
+        assert_eq!(back.tool_name, "run_shell ");
+        assert!(ToolApprovalRule::tool("  ").is_err());
     }
 
     #[test]
