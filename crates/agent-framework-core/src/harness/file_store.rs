@@ -362,7 +362,7 @@ pub fn normalize_relative_path(path: &str, is_directory: bool) -> Result<String>
 
 /// Whether Win32 would not treat `segment` as an ordinary name: it ends in
 /// `.` or a space, which Windows strips (`memories.md.` opens `memories.md`),
-/// or its stem is a reserved device name (`nul`, `con.txt`, `COM1`), which
+/// or its stem is a reserved device name (`nul`, `con.txt`, `COM1`, `lpt²`), which
 /// opens a device rather than a file. Refused on every platform so a path
 /// means the same thing wherever the store runs.
 pub(crate) fn is_windows_reserved_segment(segment: &str) -> bool {
@@ -370,10 +370,26 @@ pub(crate) fn is_windows_reserved_segment(segment: &str) -> bool {
         return true;
     }
     let stem = segment.split('.').next().unwrap_or("").trim_end();
-    match stem.to_ascii_lowercase().as_bytes() {
-        b"con" | b"prn" | b"aux" | b"nul" | b"conin$" | b"conout$" | b"clock$" => true,
-        [b'c', b'o', b'm', d] | [b'l', b'p', b't', d] => d.is_ascii_digit(),
-        _ => false,
+    let stem = stem.to_ascii_lowercase();
+    if matches!(
+        stem.as_str(),
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$" | "clock$"
+    ) {
+        return true;
+    }
+    // `com1` and `lpt9`, and also the superscript forms `com¹` to `lpt³`.
+    match stem
+        .strip_prefix("com")
+        .or_else(|| stem.strip_prefix("lpt"))
+    {
+        Some(rest) => {
+            let mut chars = rest.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('0'..='9' | '¹' | '²' | '³'), None)
+            )
+        }
+        None => false,
     }
 }
 

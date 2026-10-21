@@ -950,10 +950,20 @@ async fn paths_windows_would_reinterpret_are_refused() {
         "CON.txt",
         "dir/com1.md",
         "lpt9",
+        "COM¹.txt",
+        "lpt³",
     ] {
         assert!(normalize_relative_path(path, false).is_err(), "{path:?}");
     }
-    for path in ["notes.md", "console.md", "com.md", "null", "a.b.md"] {
+    for path in [
+        "notes.md",
+        "console.md",
+        "com.md",
+        "null",
+        "a.b.md",
+        "com10",
+        "lpt⁴",
+    ] {
         assert!(normalize_relative_path(path, false).is_ok(), "{path:?}");
     }
     let (_, provider) = memory();
