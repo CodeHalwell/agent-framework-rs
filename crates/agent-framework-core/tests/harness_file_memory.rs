@@ -883,3 +883,39 @@ async fn dot_only_scopes_get_their_own_usable_folders() {
     }
     assert_eq!(folders, ["~scope-2e", "~scope-2e2e"]);
 }
+
+/// A path is never both a file and a directory, in either built-in store.
+async fn check_file_directory_invariant(store: &dyn AgentFileStore) {
+    store.write("a", "file").await.unwrap();
+    assert!(store.write("a/b", "x").await.is_err());
+    assert!(store.create_new("a/c", "x").await.is_err());
+    assert!(store.create_directory("a").await.is_err());
+    assert!(store.create_directory("a/d").await.is_err());
+
+    store.write("dir/child", "x").await.unwrap();
+    assert!(store.write("dir", "x").await.is_err());
+
+    let names: Vec<_> = store
+        .list_children("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.is_file(), e.name))
+        .collect();
+    assert_eq!(names, [(false, "dir".to_string()), (true, "a".to_string())]);
+}
+
+#[tokio::test]
+async fn in_memory_store_keeps_files_and_directories_apart() {
+    let store = InMemoryAgentFileStore::new();
+    check_file_directory_invariant(&store).await;
+    // Paths ignore case here, so `DIR` is the directory `dir`.
+    assert!(store.create_new("DIR", "x").await.is_err());
+}
+
+#[tokio::test]
+async fn file_system_store_keeps_files_and_directories_apart() {
+    let dir = tempdir();
+    check_file_directory_invariant(&FileSystemAgentFileStore::new(&dir).unwrap()).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

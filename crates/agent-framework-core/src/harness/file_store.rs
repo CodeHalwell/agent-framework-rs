@@ -598,7 +598,9 @@ pub fn apply_replace_lines(content: &str, edits: &[FileLineEdit]) -> Result<Stri
 ///
 /// Paths are compared case-insensitively, and listings and search results
 /// keep the casing a file was written with. Directories exist implicitly,
-/// as prefixes of file paths.
+/// as prefixes of file paths, and a path is never both a file and a
+/// directory: writes and `create_directory` are refused where a file
+/// system would refuse them.
 #[derive(Default)]
 pub struct InMemoryAgentFileStore {
     /// Lowercased path to (path as written, content).
@@ -620,14 +622,36 @@ impl InMemoryAgentFileStore {
     }
 }
 
+/// Refuse a path whose ancestor is a file, as a file system would.
+fn check_ancestors(files: &HashMap<String, (String, String)>, key: &str) -> Result<()> {
+    for (i, _) in key.match_indices('/') {
+        if let Some((display, _)) = files.get(&key[..i]) {
+            return Err(Error::tool(format!(
+                "Parent path is not a directory: {display}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse writing a file where a directory is, as a file system would.
+fn check_file_path(files: &HashMap<String, (String, String)>, key: &str, path: &str) -> Result<()> {
+    check_ancestors(files, key)?;
+    let prefix = format!("{key}/");
+    if files.keys().any(|k| k.starts_with(&prefix)) {
+        return Err(Error::tool(format!("Path is a directory: {path}")));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AgentFileStore for InMemoryAgentFileStore {
     async fn write(&self, path: &str, content: &str) -> Result<()> {
         let display = normalize_relative_path(path, false)?;
-        self.files
-            .lock()
-            .unwrap()
-            .insert(display.to_lowercase(), (display, content.to_string()));
+        let mut files = self.files.lock().unwrap();
+        let key = display.to_lowercase();
+        check_file_path(&files, &key, path)?;
+        files.insert(key, (display, content.to_string()));
         Ok(())
     }
 
@@ -638,6 +662,7 @@ impl AgentFileStore for InMemoryAgentFileStore {
         if files.contains_key(&key) {
             return Err(Error::tool(format!("File already exists: '{path}'")));
         }
+        check_file_path(&files, &key, path)?;
         files.insert(key, (display, content.to_string()));
         Ok(())
     }
@@ -690,7 +715,15 @@ impl AgentFileStore for InMemoryAgentFileStore {
     }
 
     async fn create_directory(&self, path: &str) -> Result<()> {
-        normalize_relative_path(path, true)?;
+        let key = normalize_relative_path(path, true)?.to_lowercase();
+        let files = self.files.lock().unwrap();
+        if key.is_empty() {
+            return Ok(());
+        }
+        check_ancestors(&files, &key)?;
+        if files.contains_key(&key) {
+            return Err(Error::tool(format!("Path is a file: {path}")));
+        }
         Ok(())
     }
 }
