@@ -1179,6 +1179,52 @@ async fn a_settled_approval_in_history_does_not_rerun_the_tool() {
 }
 
 #[tokio::test]
+async fn a_repeated_answer_to_a_closed_approval_does_not_rerun_the_tool() {
+    // Upstream #9535: an approval answered, executed and closed by its result
+    // is answered again later in the transcript (a client resending the last
+    // answer, or a replay). No new request reuses the id, so the repeat has
+    // nothing left to authorize and must stay inert.
+    let counter = Arc::new(Mutex::new(0));
+    let tool = approval_tool(counter.clone());
+    let client = FunctionInvokingChatClient::new(MockClient::new(vec![
+        secret_call(),
+        ChatResponse::from_text("done"),
+    ]));
+    let options = ChatOptions::new().with_tool(tool);
+
+    let resp1 = client
+        .get_response(vec![Message::user("what is the secret?")], options.clone())
+        .await
+        .unwrap();
+    let request = resp1.user_input_requests()[0].clone();
+    let answer = || {
+        Message::with_contents(
+            Role::user(),
+            vec![Content::FunctionApprovalResponse(
+                request.create_response(true),
+            )],
+        )
+    };
+    let mut conversation = vec![Message::user("what is the secret?")];
+    conversation.extend(resp1.messages.clone());
+    conversation.push(answer());
+    conversation.push(Message::with_contents(
+        Role::tool(),
+        vec![Content::FunctionResult(FunctionResultContent::new(
+            "call_1",
+            Some(json!("42")),
+        ))],
+    ));
+    conversation.push(answer());
+    client.get_response(conversation, options).await.unwrap();
+    assert_eq!(
+        *counter.lock().unwrap(),
+        0,
+        "a closed approval re-ran the tool"
+    );
+}
+
+#[tokio::test]
 async fn a_settled_approval_in_history_does_not_rerun_the_tool_when_streaming() {
     let counter = Arc::new(Mutex::new(0));
     let agent = Agent::builder(MockClient::new(vec![

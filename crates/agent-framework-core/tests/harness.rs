@@ -2102,3 +2102,152 @@ async fn mode_change_announcement_survives_a_failed_run() {
         .unwrap();
     assert!(!any_contains(&client.received(2), "[Mode changed"));
 }
+
+/// An inner agent that asks for two approvals under one request id. With
+/// `auto_first`, its first pass instead asks for one `auto_write` approval.
+#[derive(Default)]
+struct DuplicateRequestAgent {
+    auto_first: bool,
+    passes: Mutex<usize>,
+}
+
+impl DuplicateRequestAgent {
+    fn requests(&self) -> Vec<Content> {
+        let request = |id: &str, name: &str| {
+            Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                id: id.into(),
+                function_call: FunctionCallContent::new(format!("call_{name}"), name, None),
+            })
+        };
+        let mut passes = self.passes.lock().unwrap();
+        *passes += 1;
+        if self.auto_first && *passes == 1 {
+            return vec![request("a1", "auto_write")];
+        }
+        vec![request("dup", "first_tool"), request("dup", "second_tool")]
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for DuplicateRequestAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Ok(AgentResponse {
+            messages: vec![Message::with_contents(Role::assistant(), self.requests())],
+            ..Default::default()
+        })
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<agent_framework_core::agent::AgentRunStream> {
+        let updates: Vec<Result<AgentResponseUpdate>> = self
+            .requests()
+            .into_iter()
+            .map(|content| {
+                Ok(AgentResponseUpdate {
+                    contents: vec![content],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+
+    fn id(&self) -> &str {
+        "duplicate"
+    }
+}
+
+async fn stream_results(
+    agent: &ToolApprovalAgent,
+    session: &AgentSession,
+) -> Vec<Result<AgentResponseUpdate>> {
+    agent
+        .run_stream(vec![Message::user("go")], Some(session.clone()), None)
+        .await
+        .unwrap()
+        .collect()
+        .await
+}
+
+fn streamed_request_ids(results: &[Result<AgentResponseUpdate>]) -> Vec<String> {
+    results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .flat_map(|u| &u.contents)
+        .filter_map(|c| match c {
+            Content::FunctionApprovalRequest(r) => Some(r.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn tool_approval_rejects_duplicate_request_ids() {
+    // Upstream #9542: two live requests under one id would let one answer
+    // stand in for the other, so the batch is refused rather than queued.
+    let agent = ToolApprovalAgent::new(Arc::new(DuplicateRequestAgent::default()));
+    let mut session = AgentSession::new();
+    let err = agent
+        .run(vec![Message::user("go")], Some(&mut session))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("'dup'"), "{err}");
+    let state = agent.state(&session).unwrap();
+    assert!(state.queued_approval_requests.is_empty());
+    assert!(state.collected_approval_responses.is_empty());
+
+    let session = AgentSession::new();
+    let results = stream_results(&agent, &session).await;
+    assert!(
+        streamed_request_ids(&results).is_empty(),
+        "a request reached the caller"
+    );
+    assert!(matches!(results.last(), Some(Err(e)) if e.to_string().contains("'dup'")));
+    assert!(agent
+        .state(&session)
+        .unwrap()
+        .queued_approval_requests
+        .is_empty());
+}
+
+#[tokio::test]
+async fn tool_approval_rejects_duplicate_request_ids_at_the_auto_approval_cap() {
+    // The pass that reaches the cap streams its requests straight through.
+    // The first `dup` goes out; the second, reusing its id, is refused.
+    let inner = DuplicateRequestAgent {
+        auto_first: true,
+        ..Default::default()
+    };
+    let agent = ToolApprovalAgent::new(Arc::new(inner))
+        .with_auto_approval_rule(|call: &FunctionCallContent| call.name == "auto_write")
+        .with_max_auto_approval_iterations(1)
+        .unwrap();
+    let session = AgentSession::new();
+    let results = stream_results(&agent, &session).await;
+    assert_eq!(streamed_request_ids(&results), ["dup"]);
+    assert!(matches!(results.last(), Some(Err(e)) if e.to_string().contains("'dup'")));
+
+    let inner = DuplicateRequestAgent {
+        auto_first: true,
+        ..Default::default()
+    };
+    let agent = ToolApprovalAgent::new(Arc::new(inner))
+        .with_auto_approval_rule(|call: &FunctionCallContent| call.name == "auto_write")
+        .with_max_auto_approval_iterations(1)
+        .unwrap();
+    let mut session = AgentSession::new();
+    let err = agent
+        .run(vec![Message::user("go")], Some(&mut session))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("'dup'"), "{err}");
+}
