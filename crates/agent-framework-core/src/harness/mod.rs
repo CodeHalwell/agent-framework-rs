@@ -1,7 +1,7 @@
 //! The experimental agent harness: an agent loop, a todo list, standing tool
-//! approvals and operating modes.
+//! approvals, operating modes and file-based memory.
 //!
-//! Rust port of four pieces of upstream's `agent_framework._harness` package
+//! Rust port of six pieces of upstream's `agent_framework._harness` package
 //! (Python `ExperimentalFeature.HARNESS`, .NET `Microsoft.Agents.AI.Harness`
 //! `[Experimental]`). Everything here sits behind the `experimental-harness`
 //! cargo feature and carries no semver promise; see `docs/feature-stages.md`.
@@ -12,15 +12,18 @@
 //! | `_todo.py`: `TodoProvider`, `TodoStore`, `TodoSessionStore`, `TodoItem`, … | [`TodoProvider`], [`TodoStore`], [`TodoSessionStore`], [`TodoItem`], … |
 //! | `_tool_approval.py`: `ToolApprovalMiddleware`, `ToolApprovalRule`, `ToolApprovalState`, `create_always_approve_*` | [`ToolApprovalAgent`], [`ToolApprovalRule`], [`ToolApprovalState`], [`ToolApprovalAgent::always_approve_tool_response`], … |
 //! | `_mode.py`: `AgentModeProvider`, `get_agent_mode`, `set_agent_mode` | [`AgentModeProvider`], [`get_agent_mode`], [`set_agent_mode`] |
+//! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
+//! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
 //!
 //! # Not ported here
 //!
 //! - **Background agents** (`_background_agents.py`) have no Rust
 //!   counterpart, so the loop's `background_tasks_running` /
 //!   `background_tasks_running_message` helpers are not ported either.
-//! - **File access, file memory and memory** (`_file_access.py`,
-//!   `_file_memory.py`, `_memory.py`) and the full `create_harness_agent`
-//!   assembly are out of scope for now.
+//! - **File access and memory**: `FileAccessProvider` (the tool half of
+//!   `_file_access.py`), `_memory.py` and the full `create_harness_agent`
+//!   assembly are out of scope for now. The file store they would build on
+//!   is here.
 //! - `TodoFileStore` is not ported: [`TodoStore`] is a public trait, so a
 //!   file-backed store can be supplied by the application.
 //!
@@ -53,6 +56,8 @@
 //! See each submodule's documentation for the divergences specific to it.
 
 pub mod agent_loop;
+pub mod file_memory;
+pub mod file_store;
 pub mod mode;
 pub mod todo;
 pub mod tool_approval;
@@ -63,6 +68,15 @@ pub use agent_loop::{
     LoopDecision, TodosRemaining, TodosRemainingMessage, VerdictParser, CRITERIA_PLACEHOLDER,
     DEFAULT_JUDGE_INSTRUCTIONS, DEFAULT_JUDGE_MAX_ITERATIONS, DEFAULT_MAX_ITERATIONS,
     DEFAULT_NEXT_MESSAGE, JUDGE_VERDICT_DONE, JUDGE_VERDICT_MORE,
+};
+pub use file_memory::{
+    FileMemoryProvider, DEFAULT_FILE_MEMORY_INSTRUCTIONS, DEFAULT_FILE_MEMORY_SOURCE_ID,
+};
+pub use file_store::{
+    apply_replace, apply_replace_lines, compile_search_regex, matches_glob,
+    normalize_relative_path, scan_content, split_lines, AgentFileStore, FileLineEdit,
+    FileSearchMatch, FileSearchResult, FileStoreEntry, FileStoreEntryType,
+    FileSystemAgentFileStore, InMemoryAgentFileStore, MAX_SEARCH_PATTERN_LENGTH, SEARCH_TIMEOUT,
 };
 pub use mode::{
     get_agent_mode, set_agent_mode, AgentModeProvider, AgentModeProviderBuilder,

@@ -23,6 +23,8 @@ uuid = { workspace = true }
 schemars = { workspace = true }
 tokio-stream = { workspace = true }
 pin-project-lite = { workspace = true }
+# Optional: search patterns for the harness file store (`experimental-harness`).
+regex = { workspace = true, optional = true }
 # Optional: GenAI metrics behind the `otel-metrics` feature. API crate only —
 # no SDK/exporter is pulled in; see `observability` module docs.
 opentelemetry = { workspace = true, optional = true }
@@ -58,8 +60,8 @@ experimental-progressive-tools = []
 # contract and the enforcement bundle over the agent, chat and function seams).
 experimental-agent-hooks = []
 # HARNESS: the `harness` module (agent loop, todo list, standing tool
-# approvals, agent mode).
-experimental-harness = []
+# approvals, agent mode, file store and file memory).
+experimental-harness = ["dep:regex"]
 # Enables the three GenAI histograms on `ObservableChatClient` and the
 # function-invocation loop via the `opentelemetry` API crate. Purely additive:
 # default behavior/build is unaffected when this is off, and the instruments
