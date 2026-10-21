@@ -85,7 +85,10 @@ impl SessionState {
     }
 
     /// Replace the whole bag's contents in place, so every clone sees them.
-    #[cfg(feature = "experimental-harness")]
+    #[cfg(any(
+        feature = "experimental-harness",
+        feature = "experimental-session-store"
+    ))]
     pub(crate) fn replace_all(&self, map: HashMap<String, Value>) {
         *self.inner.lock().unwrap() = map;
     }
@@ -243,6 +246,18 @@ impl AgentSession {
         self.service_session_id = restored.service_session_id;
         self.state.replace_all(restored.state.snapshot());
         Ok(())
+    }
+
+    /// Take `other`'s session id, service conversation id and state bag
+    /// contents, keeping this session's context providers. The state bag
+    /// stays this session's own storage (its contents are replaced), so it is
+    /// not shared with `other`.
+    #[cfg(feature = "experimental-session-store")]
+    pub(crate) fn restore_from(&mut self, other: &AgentSession) {
+        self.session_id = other.session_id.clone();
+        self.service_session_id = other.service_session_id.clone();
+        self.state = SessionState::new();
+        self.state.replace_all(other.state.snapshot());
     }
 
     /// Reconstruct a session from state produced by [`AgentSession::to_dict`].

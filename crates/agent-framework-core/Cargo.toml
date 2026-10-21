@@ -60,6 +60,9 @@ experimental-agent-hooks = []
 # HARNESS: the `harness` module (agent loop, todo list, standing tool
 # approvals, agent mode).
 experimental-harness = []
+# SESSION_STORE: the `session_store` module (`AgentSessionStore`, the
+# in-memory and file stores) and `ContextProvider::snapshot_history`.
+experimental-session-store = []
 # Enables the three GenAI histograms on `ObservableChatClient` and the
 # function-invocation loop via the `opentelemetry` API crate. Purely additive:
 # default behavior/build is unaffected when this is off, and the instruments
