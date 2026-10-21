@@ -84,6 +84,8 @@ const MEMORY_INDEX_FILE_NAME: &str = "memories.md";
 const MAX_INDEX_ENTRIES: usize = 50;
 const ENCODED_SCOPE_PREFIX: &str = "~scope-";
 const MAX_FOLDER_NAME_BYTES: usize = 255;
+/// The common file-name limit, which a description file's name must fit.
+const MAX_FILE_NAME_BYTES: usize = 255;
 const INDEX_INTRODUCTION: &str =
     "The following is your memory index \u{2014} a list of files you have previously written. \
 You can read any of these files using the file_memory_read tool.\n\n";
@@ -235,11 +237,21 @@ impl FileMemoryProvider {
                              Please choose a different file name."
                         )));
                     }
+                    // The description file's name is longer than the file's,
+                    // so check it fits before writing anything, rather than
+                    // leaving the file written and its description failed.
+                    let desc_name = description_file_name(&normalized);
+                    if desc_name.len() > MAX_FILE_NAME_BYTES {
+                        return Ok(text(format!(
+                            "Could not write file '{name}': the file name is too long. Please keep it to {} bytes or fewer.",
+                            MAX_FILE_NAME_BYTES - DESCRIPTION_SUFFIX.len()
+                        )));
+                    }
                     let described = args.description.as_deref().is_some_and(|d| !d.trim().is_empty());
                     let _guard = inner.write_lock.lock().await;
                     let outcome = async {
                         inner.store.write(&combine(&folder, &normalized), &args.content).await?;
-                        let desc_path = combine(&folder, &description_file_name(&normalized));
+                        let desc_path = combine(&folder, &desc_name);
                         match args.description.as_deref().filter(|_| described) {
                             Some(description) => inner.store.write(&desc_path, description).await?,
                             None => {

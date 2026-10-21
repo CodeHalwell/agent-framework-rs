@@ -812,3 +812,34 @@ async fn ls_finds_a_description_written_under_different_letter_case() {
         json!([{"name": "Plan.md", "type": "file", "description": "Second"}])
     );
 }
+
+#[tokio::test]
+async fn a_name_too_long_for_its_description_file_is_refused_before_writing() {
+    let dir = tempdir();
+    let store = Arc::new(FileSystemAgentFileStore::new(&dir).unwrap());
+    let provider = FileMemoryProvider::new(store).with_scope("user 1");
+    let ctx = prepare(&provider, &AgentSession::new()).await;
+    let folder = dir.join(provider.working_folder(None).unwrap());
+    // 245 bytes fits a file name, but not with `_description.md` added.
+    let long = format!("{}.md", "n".repeat(242));
+    let result = call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": long, "content": "x", "description": "Note"}),
+    )
+    .await;
+    assert!(result.as_str().unwrap().contains("too long"), "{result}");
+    assert!(!folder.join(&long).exists(), "the file was written anyway");
+    // The longest name that leaves room for the description still works.
+    let longest = format!("{}.md", "n".repeat(255 - "_description.md".len() - 3));
+    assert_eq!(
+        call(
+            &ctx,
+            "file_memory_write",
+            json!({"file_name": longest, "content": "x", "description": "Note"}),
+        )
+        .await,
+        format!("File '{longest}' written with description.")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
