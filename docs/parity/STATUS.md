@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 121 / 158 / 24 / 142 / 0 | 48 | 5 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 132 / 164 / 24 / 142 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
@@ -428,7 +428,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 ## Not yet reviewed
 
-106 declarations the Rust ledger has not assessed yet.
+99 declarations the Rust ledger has not assessed yet.
 
 ### In Go's catalog
 
@@ -438,7 +438,7 @@ None.
 
 ### Only in the .NET inventory
 
-106 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
+99 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
 
 - `Microsoft.Agents.AI::AdditionalPropertiesExtensions`
 - `Microsoft.Agents.AI::AgentAbstractionsJsonUtilities`
@@ -446,8 +446,6 @@ None.
 - `Microsoft.Agents.AI::AgentEvaluationExtensions`
 - `Microsoft.Agents.AI::AgentEvaluationResults`
 - `Microsoft.Agents.AI::AgentSessionStateBagJsonConverter`
-- `Microsoft.Agents.AI::AgentSessionStore`
-- `Microsoft.Agents.AI::AgentSessionStoreKey`
 - `Microsoft.Agents.AI::AgentSkillResourceAttribute`
 - `Microsoft.Agents.AI::AgentSkillScriptAttribute`
 - `Microsoft.Agents.AI::BackgroundAgentsProvider`
@@ -481,11 +479,6 @@ None.
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClient`
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClientOptions`
 - `Microsoft.Agents.AI::RubricScore`
-- `Microsoft.Agents.AI::TextSearchProvider`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchProviderState`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchResult`
-- `Microsoft.Agents.AI::TextSearchProviderOptions`
-- `Microsoft.Agents.AI::TextSearchProviderOptions.TextSearchBehavior`
 - `Microsoft.Agents.AI::ToolApprovalAgentBuilderExtensions`
 - `Microsoft.Agents.AI::ToolCalledMode`
 - `Microsoft.Agents.AI.Compaction::ChatReducerCompactionStrategy`

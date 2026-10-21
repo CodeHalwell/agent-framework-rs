@@ -471,6 +471,11 @@ impl ContextProvider for InMemoryHistoryProvider {
     fn is_history_provider(&self) -> bool {
         true
     }
+
+    #[cfg(feature = "experimental-session-store")]
+    fn snapshot_history(&self) -> Option<Vec<Message>> {
+        Some(self.list_messages())
+    }
 }
 
 impl HistoryProvider for InMemoryHistoryProvider {}

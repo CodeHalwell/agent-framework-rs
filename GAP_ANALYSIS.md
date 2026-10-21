@@ -372,7 +372,7 @@ Persistent/Assistants flavor.
   dead-end validation; viz file export + nested sub-workflow rendering;
   `CosmosCheckpointStore` equivalent (durable checkpoint backend).
 - **Memory/context:** `invoked(invoke_exception=…)`; provider async
-  lifecycle; in-box `ChatHistoryMemoryProvider`/`TextSearchProvider` (.NET);
+  lifecycle; in-box `ChatHistoryMemoryProvider` (.NET; `TextSearchProvider` is now ported as `text_search`);
   Mem0 local/OSS mode + graph `relations`; Redis vector/KNN + hybrid search
   (tracked) *and* hash-vs-JSON wire compatibility (untracked).
 - **Hosting runtime (.NET-only but the production story):** DI agent

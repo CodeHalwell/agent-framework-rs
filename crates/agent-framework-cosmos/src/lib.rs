@@ -6,7 +6,9 @@
 //! .NET Agent Framework.
 //!
 //! - [`CosmosChatMessageStore`] — one container holds every thread's
-//!   messages as individual documents, partitioned by `threadId`. Talks
+//!   messages as individual documents, partitioned by `threadId` or, with
+//!   [`CosmosPartitionStrategy::Hierarchical`], by tenant, user and thread.
+//!   Tenant and user ids are recorded on each message whenever set. Talks
 //!   directly to the [Cosmos DB REST
 //!   API](https://learn.microsoft.com/en-us/rest/api/cosmos-db/) — see the
 //!   internal `auth` module — rather than depending on the
@@ -73,7 +75,9 @@ mod dates;
 #[cfg(feature = "experimental-vector-stores")]
 mod vector_store;
 
-pub use chat_message_store::{CosmosChatMessageStore, DEFAULT_PARTITION_KEY_PATH};
+pub use chat_message_store::{
+    CosmosChatMessageStore, CosmosPartitionStrategy, DEFAULT_PARTITION_KEY_PATH,
+};
 pub use checkpoint_storage::{
     CosmosCheckpointStorage, DEFAULT_PARTITION_KEY_PATH as DEFAULT_CHECKPOINT_PARTITION_KEY_PATH,
 };
