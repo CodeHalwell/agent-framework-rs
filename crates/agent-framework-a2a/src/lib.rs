@@ -76,12 +76,13 @@
 //!   the same session's next [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   call, so a real multi-turn conversation works as long as the same
 //!   session is reused (see the second example above).
-//! - **`input-required` surfaces the agent's question.** If a [`Task`] comes
-//!   back in [`TaskState::InputRequired`], this crate returns
-//!   `task.status.message` as the response text, so the caller has
-//!   something to show/act on. The Python reference has no special case for
-//!   this state and would silently produce no messages unless the server
-//!   happens to also put that message in `history`.
+//! - **A task that stopped for a reason surfaces it.** If a [`Task`] comes
+//!   back waiting for input or authorization, or failed, cancelled or
+//!   rejected, this crate returns `task.status.message` after the task's
+//!   artifacts, so the caller sees the agent's question or the reason it
+//!   gave (as .NET does since upstream #9534). The Python reference has no
+//!   special case for these states and would silently produce no such
+//!   message unless the server happens to also put it in `history`.
 //! - **No polling loop.** [`A2AAgent::run`](agent_framework_core::agent::SupportsAgentRun::run)
 //!   performs exactly one `message/send` call and maps whatever comes back,
 //!   including a still-`working`/`submitted` [`Task`] (which maps to zero
