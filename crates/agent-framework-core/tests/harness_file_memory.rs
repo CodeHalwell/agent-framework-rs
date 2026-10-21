@@ -789,3 +789,26 @@ async fn files_differing_only_by_extension_keep_their_own_descriptions() {
         json!([{"name": "notes.txt", "type": "file", "description": "Plain notes"}])
     );
 }
+
+#[tokio::test]
+async fn ls_finds_a_description_written_under_different_letter_case() {
+    let (store, provider) = memory();
+    let session = AgentSession::new();
+    let ctx = prepare(&provider, &session).await;
+    let folder = provider.working_folder(Some(&session)).unwrap();
+    // What a case-insensitive file system leaves after `Plan.md` is rewritten
+    // as `plan.md` with a new description: the file keeps its first name and
+    // the sidecar takes the new one.
+    store
+        .write(&format!("{folder}/Plan.md"), "c")
+        .await
+        .unwrap();
+    store
+        .write(&format!("{folder}/plan.md_description.md"), "Second")
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&ctx, "file_memory_ls", json!({})).await,
+        json!([{"name": "Plan.md", "type": "file", "description": "Second"}])
+    );
+}

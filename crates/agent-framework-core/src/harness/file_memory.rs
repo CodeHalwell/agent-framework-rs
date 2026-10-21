@@ -360,12 +360,15 @@ impl FileMemoryProvider {
                         if is_internal_file(name) || !matches_glob(name, args.glob_pattern.as_deref()) {
                             continue;
                         }
-                        let desc_name = description_file_name(name);
-                        let description = if names.contains(&desc_name) {
-                            inner.store.read(&combine(&folder, &desc_name)).await.ok().flatten()
-                        } else {
-                            None
-                        };
+                        // Read through the store rather than matching listed
+                        // names, so a sidecar whose letter case differs from
+                        // the file's is still found where the store ignores case.
+                        let description = inner
+                            .store
+                            .read(&combine(&folder, &description_file_name(name)))
+                            .await
+                            .ok()
+                            .flatten();
                         listed.push(json!({"name": name, "type": "file", "description": description}));
                     }
                     Ok(Value::Array(listed))
