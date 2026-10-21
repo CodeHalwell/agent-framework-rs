@@ -843,3 +843,43 @@ async fn a_name_too_long_for_its_description_file_is_refused_before_writing() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn a_shared_scope_gets_instructions_that_do_not_promise_isolation() {
+    let (_, provider) = memory();
+    let ctx = prepare(&provider.with_scope("user-1"), &AgentSession::new()).await;
+    assert_eq!(
+        ctx.instructions.as_deref(),
+        Some(SCOPED_FILE_MEMORY_INSTRUCTIONS)
+    );
+    assert!(!SCOPED_FILE_MEMORY_INSTRUCTIONS.contains("isolated from other sessions"));
+    // Custom instructions still win over either default.
+    let (_, provider) = memory();
+    let custom = provider
+        .with_scope("user-1")
+        .with_instructions("Use memory.");
+    let ctx = prepare(&custom, &AgentSession::new()).await;
+    assert_eq!(ctx.instructions.as_deref(), Some("Use memory."));
+}
+
+#[tokio::test]
+async fn dot_only_scopes_get_their_own_usable_folders() {
+    let store = Arc::new(InMemoryAgentFileStore::new());
+    let mut folders = Vec::new();
+    for scope in [".", ".."] {
+        let scoped = FileMemoryProvider::new(store.clone()).with_scope(scope);
+        let ctx = prepare(&scoped, &AgentSession::new()).await;
+        call(
+            &ctx,
+            "file_memory_write",
+            json!({"file_name": "n.md", "content": scope}),
+        )
+        .await;
+        assert_eq!(
+            call(&ctx, "file_memory_read", json!({"file_name": "n.md"})).await,
+            scope
+        );
+        folders.push(scoped.working_folder(None).unwrap());
+    }
+    assert_eq!(folders, ["~scope-2e", "~scope-2e2e"]);
+}

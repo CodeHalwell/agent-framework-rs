@@ -64,12 +64,10 @@ use super::file_store::{
 /// The default `source_id` of a [`FileMemoryProvider`].
 pub const DEFAULT_FILE_MEMORY_SOURCE_ID: &str = "file_memory";
 
-/// The default instructions a [`FileMemoryProvider`] adds to every run.
-pub const DEFAULT_FILE_MEMORY_INSTRUCTIONS: &str = "## File Based Memory\n\
-You have access to a session-scoped, file-based memory system via the `file_memory_*` tools \
-for storing and retrieving information across interactions. \
-These files act as your working memory for the current session and are isolated from other sessions. \
-Use these tools to store plans, memories, processing results, or downloaded data.\n\n\
+/// The guidance both default instructions end with.
+macro_rules! file_memory_guidance {
+    () => {
+        "\
 - Use descriptive file names (e.g., \"projectarchitecture.md\", \"userpreferences.md\").\n\
 - Include a description when writing a file to help with future discovery.\n\
 - Before starting new tasks, use file_memory_ls and file_memory_grep to check for \
@@ -77,7 +75,32 @@ relevant existing memories to avoid duplicate work.\n\
 - Keep memories up-to-date by overwriting files when information changes.\n\
 - When you receive large amounts of data (e.g., downloaded web pages, API responses, research results), \
 write them to files if they will be required later, so that they are not lost when older context is \
-compacted or truncated. This ensures important data remains accessible across long-running sessions.";
+compacted or truncated. This ensures important data remains accessible across long-running sessions."
+    };
+}
+
+/// The default instructions a [`FileMemoryProvider`] adds to every run.
+pub const DEFAULT_FILE_MEMORY_INSTRUCTIONS: &str = concat!(
+    "## File Based Memory\n\
+You have access to a session-scoped, file-based memory system via the `file_memory_*` tools \
+for storing and retrieving information across interactions. \
+These files act as your working memory for the current session and are isolated from other sessions. \
+Use these tools to store plans, memories, processing results, or downloaded data.\n\n",
+    file_memory_guidance!()
+);
+
+/// The default instructions when [`FileMemoryProvider::with_scope`] is set.
+/// Every session with the same scope shares the files, so unlike
+/// [`DEFAULT_FILE_MEMORY_INSTRUCTIONS`] they do not promise isolation.
+pub const SCOPED_FILE_MEMORY_INSTRUCTIONS: &str = concat!(
+    "## File Based Memory\n\
+You have access to a file-based memory system via the `file_memory_*` tools \
+for storing and retrieving information across interactions. \
+These files are shared with other sessions that use the same memory scope, so they can persist \
+beyond the current session. \
+Use these tools to store plans, memories, processing results, or downloaded data.\n\n",
+    file_memory_guidance!()
+);
 
 const DESCRIPTION_SUFFIX: &str = "_description.md";
 const MEMORY_INDEX_FILE_NAME: &str = "memories.md";
@@ -101,7 +124,8 @@ struct Inner {
     store: Arc<dyn AgentFileStore>,
     source_id: String,
     scope: Option<String>,
-    instructions: String,
+    /// `None` until replaced: the default then depends on the scope.
+    instructions: Option<String>,
     write_lock: tokio::sync::Mutex<()>,
 }
 
@@ -122,7 +146,7 @@ impl FileMemoryProvider {
                 store,
                 source_id: DEFAULT_FILE_MEMORY_SOURCE_ID.to_string(),
                 scope: None,
-                instructions: DEFAULT_FILE_MEMORY_INSTRUCTIONS.to_string(),
+                instructions: None,
                 write_lock: tokio::sync::Mutex::new(()),
             }),
         }
@@ -150,7 +174,7 @@ impl FileMemoryProvider {
     /// Replace the default instructions.
     pub fn with_instructions(self, instructions: impl Into<String>) -> Self {
         let instructions = instructions.into();
-        self.update(|i| i.instructions = instructions)
+        self.update(|i| i.instructions = Some(instructions))
     }
 
     /// The provider's `source_id`.
@@ -178,7 +202,14 @@ impl FileMemoryProvider {
                         .into(),
                 )
             })?;
-        let folder = storage_key_segment(raw, ENCODED_SCOPE_PREFIX);
+        let folder = match raw {
+            // Literal-safe, but not usable as a folder name.
+            "." | ".." => {
+                let hex: String = raw.bytes().map(|b| format!("{b:02x}")).collect();
+                format!("{ENCODED_SCOPE_PREFIX}{hex}")
+            }
+            _ => storage_key_segment(raw, ENCODED_SCOPE_PREFIX),
+        };
         if folder.len() > MAX_FOLDER_NAME_BYTES {
             return Err(Error::Configuration(format!(
                 "The memory scope is too long to use as a folder name ({} bytes encoded, at most {MAX_FOLDER_NAME_BYTES}).",
@@ -583,7 +614,12 @@ impl ContextProvider for FileMemoryProvider {
     async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
         let folder = self.working_folder(ctx.session.as_ref())?;
         self.inner.store.create_directory(&folder).await?;
-        ctx.add_instructions(self.inner.instructions.clone());
+        let instructions = match (&self.inner.instructions, &self.inner.scope) {
+            (Some(custom), _) => custom.as_str(),
+            (None, Some(_)) => SCOPED_FILE_MEMORY_INSTRUCTIONS,
+            (None, None) => DEFAULT_FILE_MEMORY_INSTRUCTIONS,
+        };
+        ctx.add_instructions(instructions.to_string());
         ctx.tools.extend(self.tools(&folder));
         // An unreadable index must not block the run; the next write or
         // delete rebuilds it.

@@ -71,6 +71,7 @@ pub use agent_loop::{
 };
 pub use file_memory::{
     FileMemoryProvider, DEFAULT_FILE_MEMORY_INSTRUCTIONS, DEFAULT_FILE_MEMORY_SOURCE_ID,
+    SCOPED_FILE_MEMORY_INSTRUCTIONS,
 };
 pub use file_store::{
     apply_replace, apply_replace_lines, compile_search_regex, matches_glob,
