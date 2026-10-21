@@ -20,7 +20,9 @@ use agent_framework_azure::TokenCredential;
 use agent_framework_core::memory::{ContextProvider, SessionContext};
 use agent_framework_core::types::Message;
 use agent_framework_core::workflow::{CheckpointStorage, WorkflowCheckpoint};
-use agent_framework_cosmos::{CosmosChatMessageStore, CosmosCheckpointStorage};
+use agent_framework_cosmos::{
+    CosmosChatMessageStore, CosmosCheckpointStorage, CosmosPartitionStrategy,
+};
 use serde_json::{json, Value};
 
 /// A minimal but non-trivial [`WorkflowCheckpoint`] for the checkpoint-storage
@@ -1838,4 +1840,148 @@ mod vector_store {
         let requests = handle.join().expect("server thread panicked");
         assert_eq!(requests[0].path, "/dbs/agent-framework/colls");
     }
+}
+
+// region: tenant/user metadata and partition strategies (upstream #9214)
+
+fn metadata_store(base_url: String) -> CosmosChatMessageStore {
+    CosmosChatMessageStore::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-9".to_string()),
+    )
+    .unwrap()
+    .with_tenant_id("tenant-a")
+    .unwrap()
+    .with_user_id("user-b")
+    .unwrap()
+}
+
+#[tokio::test]
+async fn metadata_is_written_on_a_thread_partitioned_container() {
+    // The default strategy keeps the flat `/threadId` key; the tenant and
+    // user ids still reach every document.
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+    let store = metadata_store(base_url);
+    store.add_messages(vec![Message::user("hi")]).await.unwrap();
+    let requests = handle.join().unwrap();
+    assert_valid_cosmos_headers(&requests[0], "thread-9");
+    let body = requests[0].body_json();
+    assert_eq!(body["tenantId"], json!("tenant-a"));
+    assert_eq!(body["userId"], json!("user-b"));
+    assert_eq!(body["threadId"], json!("thread-9"));
+}
+
+#[tokio::test]
+async fn documents_without_metadata_carry_no_metadata_fields() {
+    let (base_url, handle) = serve_sequence(1, |_i, request| {
+        (201, "Created", vec![], request.body_json())
+    });
+    let store = CosmosChatMessageStore::new(
+        base_url,
+        test_key(),
+        "agent-framework",
+        "chat-messages",
+        Some("thread-1".to_string()),
+    )
+    .unwrap();
+    store.add_messages(vec![Message::user("hi")]).await.unwrap();
+    let body = handle.join().unwrap()[0].body_json();
+    assert!(body.get("tenantId").is_none() && body.get("userId").is_none());
+}
+
+#[tokio::test]
+async fn hierarchical_strategy_sends_the_three_level_key() {
+    let (base_url, handle) = serve_sequence(4, |i, request| match i {
+        0 => (201, "Created", vec![], json!({"id": "agent-framework"})),
+        1 => (201, "Created", vec![], json!({"id": "chat-messages"})),
+        2 => (201, "Created", vec![], request.body_json()),
+        3 => (200, "OK", vec![], json!({"Documents": []})),
+        _ => unreachable!(),
+    });
+    let store =
+        metadata_store(base_url).with_partition_strategy(CosmosPartitionStrategy::Hierarchical);
+    store.ensure_created().await.unwrap();
+    store.add_messages(vec![Message::user("hi")]).await.unwrap();
+    store.list_messages().await.unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(
+        requests[1].body_json()["partitionKey"],
+        json!({
+            "paths": ["/tenantId", "/userId", "/threadId"],
+            "kind": "MultiHash",
+            "version": 2
+        })
+    );
+    for request in &requests[2..] {
+        assert_eq!(
+            request.header("x-ms-documentdb-partitionkey").as_deref(),
+            Some(r#"["tenant-a","user-b","thread-9"]"#)
+        );
+    }
+}
+
+#[tokio::test]
+async fn hierarchical_strategy_without_both_ids_fails_before_any_request() {
+    let store = CosmosChatMessageStore::new(
+        "http://127.0.0.1:9",
+        test_key(),
+        "db",
+        "coll",
+        Some("t".to_string()),
+    )
+    .unwrap()
+    .with_tenant_id("tenant-a")
+    .unwrap()
+    .with_partition_strategy(CosmosPartitionStrategy::Hierarchical);
+    let err = store
+        .add_messages(vec![Message::user("hi")])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("tenant id and a user id"), "{err}");
+    assert!(store.list_messages().await.is_err());
+}
+
+#[tokio::test]
+async fn serialized_state_keeps_metadata_and_strategy() {
+    let store = metadata_store("http://127.0.0.1:9".to_string())
+        .with_partition_strategy(CosmosPartitionStrategy::Hierarchical);
+    let state = store.serialize().await.unwrap();
+    let restored = CosmosChatMessageStore::from_state(&state).unwrap();
+    assert_eq!(restored.tenant_id(), Some("tenant-a"));
+    assert_eq!(restored.user_id(), Some("user-b"));
+    assert_eq!(
+        restored.partition_strategy(),
+        CosmosPartitionStrategy::Hierarchical
+    );
+
+    // State written before these fields existed restores the defaults.
+    let mut old = state.clone();
+    for field in ["tenant_id", "user_id", "partition_strategy"] {
+        old.as_object_mut().unwrap().remove(field);
+    }
+    let restored = CosmosChatMessageStore::from_state(&old).unwrap();
+    assert_eq!(restored.tenant_id(), None);
+    assert_eq!(
+        restored.partition_strategy(),
+        CosmosPartitionStrategy::ThreadId
+    );
+
+    let mut bad = state;
+    bad["partition_strategy"] = json!("sideways");
+    assert!(CosmosChatMessageStore::from_state(&bad).is_err());
+}
+
+#[test]
+fn blank_metadata_is_refused() {
+    let store = || {
+        CosmosChatMessageStore::new("http://127.0.0.1:9", test_key(), "db", "coll", None).unwrap()
+    };
+    assert!(store().with_tenant_id(" ").is_err());
+    assert!(store().with_user_id("").is_err());
 }
