@@ -280,7 +280,9 @@ impl AgentSessionStore for InMemoryAgentSessionStore {
 /// name and distinct keys never share a file: lowercase ASCII letters,
 /// digits, `-` and `_` are kept and every other byte becomes `~XX`.
 /// Uppercase letters are encoded too, so `Foo` and `foo` stay distinct on
-/// a case-insensitive file system. A component longer than
+/// a case-insensitive file system, and the first letter of a Windows
+/// device name (`con`, `nul`, `lpt1`, …) is encoded so such ids stay
+/// writable on Windows. A component longer than
 /// 255 bytes once encoded is refused rather than shortened, since a
 /// shortened name could collide.
 ///
@@ -344,7 +346,22 @@ fn encode_component(raw: &str) -> String {
             out.push_str(&format!("~{byte:02X}"));
         }
     }
+    // Windows reserves device names such as `con` and `lpt1`, even with an
+    // extension, so escape the first letter of one to keep it writable.
+    if is_windows_device_name(&out) {
+        out = format!("~{:02X}{}", out.as_bytes()[0], &out[1..]);
+    }
     out
+}
+
+/// Whether `name` is a Win32 reserved device name (`con`, `prn`, `aux`,
+/// `nul`, `com0`–`com9`, `lpt0`–`lpt9`). Encoded components are lowercase.
+fn is_windows_device_name(name: &str) -> bool {
+    match name.as_bytes() {
+        b"con" | b"prn" | b"aux" | b"nul" => true,
+        [b'c', b'o', b'm', d] | [b'l', b'p', b't', d] => d.is_ascii_digit(),
+        _ => false,
+    }
 }
 
 #[async_trait]
@@ -448,5 +465,10 @@ mod tests {
         assert_eq!(encode_component("~"), "~7E");
         // `~2F` as text and `/` must not collide.
         assert_ne!(encode_component("~2F"), encode_component("/"));
+        assert_eq!(encode_component("con"), "~63on");
+        assert_eq!(encode_component("lpt1"), "~6Cpt1");
+        assert_eq!(encode_component("console"), "console");
+        assert_eq!(encode_component("com10"), "com10");
+        assert_ne!(encode_component("con"), encode_component("~63on"));
     }
 }

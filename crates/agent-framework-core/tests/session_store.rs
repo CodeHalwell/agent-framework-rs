@@ -281,3 +281,24 @@ async fn a_service_session_round_trips_without_history() {
         "a local history was attached to a service session"
     );
 }
+
+#[tokio::test]
+async fn windows_device_names_are_not_used_as_file_names() {
+    let root = temp_root();
+    let store = FileAgentSessionStore::new(&root);
+    let a = agent("con", &Echo::default());
+    store
+        .save_session(&a, &key("nul"), &a.create_session())
+        .await
+        .unwrap();
+    assert!(store.get_session(&a, &key("nul")).await.unwrap().is_some());
+    let files = files_under(&root);
+    assert_eq!(files.len(), 1);
+    let reserved = ["con", "prn", "aux", "nul"];
+    for part in std::path::Path::new(&files[0]).iter() {
+        let part = part.to_string_lossy();
+        let base = part.split('.').next().unwrap().to_lowercase();
+        assert!(!reserved.contains(&base.as_str()), "{files:?}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
