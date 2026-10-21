@@ -94,6 +94,7 @@ pub mod settings;
 pub mod skills;
 pub mod storage_keys;
 pub mod streaming;
+pub mod text_search;
 pub mod tools;
 pub mod types;
 #[cfg(feature = "experimental-vector-stores")]

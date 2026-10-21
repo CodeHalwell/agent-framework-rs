@@ -3332,6 +3332,112 @@
             "note": "Auto-approval rules do not receive the session."
           }
         }
+      },
+      "TextSearchProvider": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider over a caller-supplied async search function."
+        },
+        "constructors": {
+          "TextSearchProvider(Func<string, CancellationToken, Task<IEnumerable<TextSearchProvider.TextSearchResult>>>, TextSearchProviderOptions?, ILoggerFactory?)": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchProvider::new"
+            ],
+            "status": "adapted",
+            "note": "new(search) takes the search closure; options are with_* builders and logging goes to tracing."
+          }
+        },
+        "properties": {
+          "StateKeys": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchProvider::state_key"
+            ],
+            "status": "adapted",
+            "note": "One key, returned as a &str."
+          }
+        }
+      },
+      "TextSearchProvider.TextSearchResult": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchResult"
+          ],
+          "status": "mapped",
+          "note": "A top-level struct rather than a nested class."
+        },
+        "properties": {
+          "SourceName": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::source_name"
+            ],
+            "status": "mapped",
+            "note": "Option<String>."
+          },
+          "SourceLink": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::source_link"
+            ],
+            "status": "mapped",
+            "note": "Option<String>."
+          },
+          "Text": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::text"
+            ],
+            "status": "mapped",
+            "note": "String."
+          },
+          "RawRepresentation": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::raw_representation"
+            ],
+            "status": "adapted",
+            "note": "Option<serde_json::Value> in place of object."
+          }
+        }
+      },
+      "TextSearchProvider.TextSearchProviderState": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider::state_key"
+          ],
+          "status": "adapted",
+          "note": "No public type; the state is stored as {\"recentMessagesText\": [...]} under the provider's state key, the same JSON shape."
+        }
+      },
+      "TextSearchProviderOptions": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider::with_behavior",
+            "agent_framework_core::text_search::TextSearchProvider::with_tool",
+            "agent_framework_core::text_search::TextSearchProvider::with_context_prompt",
+            "agent_framework_core::text_search::TextSearchProvider::with_citations_prompt",
+            "agent_framework_core::text_search::TextSearchProvider::with_context_formatter",
+            "agent_framework_core::text_search::TextSearchProvider::with_recent_message_memory",
+            "agent_framework_core::text_search::TextSearchProvider::with_recent_message_roles",
+            "agent_framework_core::text_search::TextSearchProvider::with_state_key",
+            "agent_framework_core::text_search::TextSearchProvider::with_sensitive_logging"
+          ],
+          "status": "adapted",
+          "note": "No options struct; each option is a with_* builder on TextSearchProvider. The message filters and Redactor have no counterpart: a Rust provider only sees the run's own input and response, and sensitive values are logged only when with_sensitive_logging is on."
+        }
+      },
+      "TextSearchProviderOptions.TextSearchBehavior": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchBehavior"
+          ],
+          "status": "mapped",
+          "note": "BeforeAIInvoke is BeforeInvoke; OnDemandFunctionCalling keeps its name."
+        }
       }
     },
     "Microsoft.Agents.AI.A2A": {
