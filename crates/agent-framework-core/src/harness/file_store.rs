@@ -32,7 +32,8 @@
 //!   catastrophically in Python's and .NET's engines. The `regex` crate
 //!   matches in linear time, so no pattern can do that here. The 256-character
 //!   cap on patterns is kept, and the whole search is still bounded by
-//!   [`SEARCH_TIMEOUT`] to cover a slow store.
+//!   [`SEARCH_TIMEOUT`] to cover a slow store or a very large file; each
+//!   file is scanned on a blocking thread so the timeout can always fire.
 //! - **No `O_NOFOLLOW`.** [`FileSystemAgentFileStore`] refuses a symbolic
 //!   link anywhere on a path before it opens it, as upstream does, but does
 //!   not also ask the kernel to refuse a link that appears between that check
@@ -261,7 +262,12 @@ pub trait AgentFileStore: Send + Sync {
                 }
                 match self.read(&combine_search_path(directory, &name)).await {
                     Ok(Some(content)) => {
-                        if let Some(result) = scan_content(&name, &content, &regex) {
+                        // Off the executor, so a long scan cannot hold a
+                        // worker and keep the timeout below from firing.
+                        let regex = regex.clone();
+                        let scanned =
+                            blocking(move || Ok(scan_content(&name, &content, &regex))).await?;
+                        if let Some(result) = scanned {
                             results.push(result);
                         }
                     }
