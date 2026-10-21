@@ -975,3 +975,30 @@ async fn builder_methods_work_on_a_cloned_provider() {
     // The original is unchanged.
     assert!(provider.working_folder(None).is_err());
 }
+
+#[tokio::test]
+async fn an_oversized_glob_is_a_tool_error_not_a_panic() {
+    let (_, provider) = memory();
+    let ctx = prepare(&provider, &AgentSession::new()).await;
+    call(
+        &ctx,
+        "file_memory_write",
+        json!({"file_name": "n.md", "content": "text"}),
+    )
+    .await;
+    let huge = "[a-z]*".repeat(100_000);
+    for (tool, args) in [
+        ("file_memory_ls", json!({"glob_pattern": huge})),
+        (
+            "file_memory_grep",
+            json!({"regex_pattern": "text", "glob_pattern": huge}),
+        ),
+    ] {
+        let result = call(&ctx, tool, args).await;
+        assert!(
+            result.as_str().unwrap().contains("256 characters or fewer"),
+            "{tool}: {result}"
+        );
+    }
+    assert!(matches_glob("n.md", Some(&huge)).is_err());
+}

@@ -208,7 +208,7 @@ pub trait AgentFileStore: Send + Sync {
         recursive: bool,
     ) -> Result<Vec<String>> {
         let _ = regex_pattern;
-        let glob = compile_glob(glob_pattern);
+        let glob = compile_glob(glob_pattern)?;
         let mut names = Vec::new();
         let mut pending = vec![String::new()];
         while let Some(relative_dir) = pending.pop() {
@@ -249,7 +249,7 @@ pub trait AgentFileStore: Send + Sync {
     ) -> Result<Vec<FileSearchResult>> {
         let regex = compile_search_regex(regex_pattern)?;
         let scan = async {
-            let glob = compile_glob(glob_pattern);
+            let glob = compile_glob(glob_pattern)?;
             let names = self
                 .find_matching_files(directory, regex_pattern, glob_pattern, recursive)
                 .await?;
@@ -367,8 +367,13 @@ impl Glob {
 }
 
 /// Compile an optional glob. A blank pattern matches everything.
-pub(crate) fn compile_glob(pattern: Option<&str>) -> Glob {
-    Glob(pattern.filter(|p| !p.trim().is_empty()).map(glob_regex))
+pub(crate) fn compile_glob(pattern: Option<&str>) -> Result<Glob> {
+    Ok(Glob(
+        pattern
+            .filter(|p| !p.trim().is_empty())
+            .map(glob_regex)
+            .transpose()?,
+    ))
 }
 
 /// Whether `file_name` matches `glob_pattern`, case-insensitively.
@@ -377,14 +382,22 @@ pub(crate) fn compile_glob(pattern: Option<&str>) -> Glob {
 /// The syntax is Python's `fnmatch`: `*` matches any run of characters,
 /// including `/`, so `*.md` matches markdown files at any depth; `?` matches
 /// one character; `[abc]`, `[a-z]` and `[!abc]` match a set. `None` or a blank
-/// pattern matches everything.
-pub fn matches_glob(file_name: &str, glob_pattern: Option<&str>) -> bool {
-    compile_glob(glob_pattern).matches(file_name)
+/// pattern matches everything. A pattern over
+/// [`MAX_SEARCH_PATTERN_LENGTH`] characters is an error, as for a search
+/// regex.
+pub fn matches_glob(file_name: &str, glob_pattern: Option<&str>) -> Result<bool> {
+    Ok(compile_glob(glob_pattern)?.matches(file_name))
 }
 
 /// Translate an `fnmatch` pattern into an anchored, case-insensitive regex.
-fn glob_regex(pattern: &str) -> Regex {
+fn glob_regex(pattern: &str) -> Result<Regex> {
     let chars: Vec<char> = pattern.chars().collect();
+    // Unbounded, a model-supplied glob could pass the regex size limit.
+    if chars.len() > MAX_SEARCH_PATTERN_LENGTH {
+        return Err(Error::tool(format!(
+            "glob_pattern must be {MAX_SEARCH_PATTERN_LENGTH} characters or fewer."
+        )));
+    }
     let mut out = String::from("(?si)^");
     let mut i = 0;
     while i < chars.len() {
@@ -411,9 +424,9 @@ fn glob_regex(pattern: &str) -> Regex {
     // Every piece is escaped or a well-formed class; a reversed range such
     // as `[z-a]` is the only way to fail, and then the pattern is matched
     // literally.
-    Regex::new(&out).unwrap_or_else(|_| {
-        Regex::new(&format!("(?si)^{}$", regex::escape(pattern))).expect("escaped pattern compiles")
-    })
+    Regex::new(&out)
+        .or_else(|_| Regex::new(&format!("(?si)^{}$", regex::escape(pattern))))
+        .map_err(|e| Error::tool(format!("Invalid glob_pattern: {e}")))
 }
 
 /// The regex class for the `[` at `start`, and the index of its `]`, or
@@ -1031,17 +1044,17 @@ mod tests {
 
     #[test]
     fn globs_follow_fnmatch() {
-        assert!(matches_glob("notes.MD", Some("*.md")));
-        assert!(matches_glob("deep/notes.md", Some("*.md")));
-        assert!(matches_glob("research1", Some("research?")));
-        assert!(matches_glob("b.txt", Some("[abc].txt")));
-        assert!(!matches_glob("d.txt", Some("[abc].txt")));
-        assert!(matches_glob("d.txt", Some("[!abc].txt")));
-        assert!(matches_glob("[x", Some("[x")));
-        assert!(matches_glob("a.b", Some("a.b")));
-        assert!(!matches_glob("axb", Some("a.b")));
-        assert!(matches_glob("anything", None));
-        assert!(matches_glob("anything", Some("  ")));
+        assert!(matches_glob("notes.MD", Some("*.md")).unwrap());
+        assert!(matches_glob("deep/notes.md", Some("*.md")).unwrap());
+        assert!(matches_glob("research1", Some("research?")).unwrap());
+        assert!(matches_glob("b.txt", Some("[abc].txt")).unwrap());
+        assert!(!matches_glob("d.txt", Some("[abc].txt")).unwrap());
+        assert!(matches_glob("d.txt", Some("[!abc].txt")).unwrap());
+        assert!(matches_glob("[x", Some("[x")).unwrap());
+        assert!(matches_glob("a.b", Some("a.b")).unwrap());
+        assert!(!matches_glob("axb", Some("a.b")).unwrap());
+        assert!(matches_glob("anything", None).unwrap());
+        assert!(matches_glob("anything", Some("  ")).unwrap());
     }
 
     #[test]

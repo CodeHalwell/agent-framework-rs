@@ -57,7 +57,7 @@ use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::Message;
 
 use super::file_store::{
-    apply_replace, apply_replace_lines, matches_glob, normalize_relative_path, AgentFileStore,
+    apply_replace, apply_replace_lines, compile_glob, normalize_relative_path, AgentFileStore,
     FileLineEdit,
 };
 
@@ -408,9 +408,13 @@ impl FileMemoryProvider {
                     };
                     let names: Vec<String> =
                         entries.into_iter().filter(|e| e.is_file()).map(|e| e.name).collect();
+                    let glob = match compile_glob(args.glob_pattern.as_deref()) {
+                        Ok(glob) => glob,
+                        Err(e) => return Ok(text(format!("Could not list memory files: {}", detail(&e)))),
+                    };
                     let mut listed = Vec::new();
                     for name in &names {
-                        if is_internal_file(name) || !matches_glob(name, args.glob_pattern.as_deref()) {
+                        if is_internal_file(name) || !glob.matches(name) {
                             continue;
                         }
                         // Read through the store rather than matching listed
