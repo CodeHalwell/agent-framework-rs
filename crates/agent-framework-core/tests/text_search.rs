@@ -275,3 +275,51 @@ async fn a_custom_formatter_replaces_the_default() {
     let (messages, _) = client.seen.lock().unwrap()[0].clone();
     assert!(messages.iter().any(|m| m.text() == "hits: a,b"));
 }
+
+#[tokio::test]
+async fn concurrent_runs_of_different_sessions_with_one_input_are_not_cross_recorded() {
+    use agent_framework_core::memory::{ContextProvider, SessionContext};
+
+    let provider = recording_search(Arc::new(Mutex::new(Vec::new())))
+        .with_recent_message_memory(5)
+        .with_recent_message_roles(vec![Role::user(), Role::assistant()]);
+    let input = vec![Message::user("hi")];
+    let (alice, bob) = (AgentSession::new(), AgentSession::new());
+    for session in [&alice, &bob] {
+        let mut ctx = SessionContext::new(input.clone());
+        ctx.session = Some(session.clone());
+        provider.before_run(&mut ctx).await.unwrap();
+    }
+
+    // Bob's run finishes first; nothing says which pending run it is.
+    provider
+        .after_run(&input, &[Message::assistant("bob's secret")], None)
+        .await
+        .unwrap();
+    provider
+        .after_run(&input, &[Message::assistant("alice's reply")], None)
+        .await
+        .unwrap();
+
+    assert_eq!(alice.state.get(DEFAULT_TEXT_SEARCH_STATE_KEY), None);
+    assert_eq!(bob.state.get(DEFAULT_TEXT_SEARCH_STATE_KEY), None);
+
+    // Two runs on clones of one session are not ambiguous, and neither
+    // run's messages are lost.
+    let carol = AgentSession::new();
+    for _ in 0..2 {
+        let mut ctx = SessionContext::new(input.clone());
+        ctx.session = Some(carol.clone());
+        provider.before_run(&mut ctx).await.unwrap();
+    }
+    for reply in ["one", "two"] {
+        provider
+            .after_run(&input, &[Message::assistant(reply)], None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        carol.state.get(DEFAULT_TEXT_SEARCH_STATE_KEY),
+        Some(json!({ "recentMessagesText": ["hi", "one", "hi", "two"] }))
+    );
+}

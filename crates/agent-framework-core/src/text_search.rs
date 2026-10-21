@@ -389,7 +389,9 @@ impl ContextProvider for TextSearchProvider {
     /// Records the run's messages in recent-message memory. `after_run`
     /// receives no session, so the run is matched by its input to the state
     /// handle `before_run` recorded (as the harness mode provider does). A
-    /// failed run records nothing.
+    /// failed run records nothing, and neither does a run whose input
+    /// matches in-flight runs of more than one session, since it cannot be
+    /// told apart from them.
     async fn after_run(
         &self,
         request_messages: &[Message],
@@ -399,14 +401,35 @@ impl ContextProvider for TextSearchProvider {
         if self.memory_limit == 0 {
             return Ok(());
         }
-        let run = {
-            let mut pending = self.pending.lock().unwrap();
-            match pending.iter().position(|p| p.input == request_messages) {
-                Some(index) => pending.remove(index),
-                None => None,
-            }
+        // The read-modify-write of the memory below also happens under this
+        // lock, so two runs on clones of one session cannot lose each
+        // other's messages.
+        let mut pending = self.pending.lock().unwrap();
+        let matches: Vec<usize> = pending
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.input == request_messages)
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&first) = matches.first() else {
+            return Ok(());
         };
-        if let (Some(run), None) = (run, error) {
+        let ambiguous = matches
+            .iter()
+            .any(|&i| !pending[i].state.shares_storage_with(&pending[first].state));
+        if ambiguous {
+            // Runs of different sessions with the same input are in flight,
+            // and nothing says which one this is. Recording into the wrong
+            // session would leak one conversation into another's searches,
+            // so all of them are dropped and none is remembered.
+            for &i in matches.iter().rev() {
+                pending.remove(i);
+            }
+            tracing::debug!("text search memory skipped: concurrent runs of different sessions share this input");
+            return Ok(());
+        }
+        let run = pending.remove(first).expect("index from this queue");
+        if error.is_none() {
             let messages: Vec<&Message> =
                 request_messages.iter().chain(response_messages).collect();
             self.remember(&run.state, &messages);
