@@ -53,10 +53,19 @@
 //!   `POST` per message instead. Functionally equivalent (all messages
 //!   still land, in order), just not atomic as a unit and not as
 //!   RU-efficient for large batches.
-//! - **Hierarchical partitioning**: .NET optionally supports a
-//!   tenant/user/session hierarchical partition key; this store always
-//!   partitions by `threadId` alone (single-level), matching the simpler,
-//!   non-hierarchical .NET constructor overloads.
+//! - **Partitioning and metadata** (upstream #9214). A store can carry a
+//!   tenant id and a user id ([`CosmosChatMessageStore::with_tenant_id`],
+//!   [`CosmosChatMessageStore::with_user_id`]); they are written to every
+//!   document as `tenantId` / `userId` whenever set, independently of how
+//!   the container is partitioned. The partition key is chosen separately
+//!   with [`CosmosPartitionStrategy`]: `threadId` alone (the default, and
+//!   what containers created by earlier versions use) or the hierarchical
+//!   `tenantId` / `userId` / `threadId` key. .NET's default picks the
+//!   hierarchical key whenever both ids are set; here the choice is always
+//!   explicit, because switching an existing `/threadId` container's
+//!   writes to a three-level key would fail every write. .NET's arbitrary
+//!   `PartitionKeyFactory` is not ported: the two strategies cover both
+//!   key shapes its documentation describes.
 //! - **TTL**: .NET defaults to a 24h message TTL (`MessageTtlSeconds`).
 //!   This store does not set a Cosmos `ttl` property — messages persist
 //!   until explicitly [`CosmosChatMessageStore::clear`]ed.
@@ -86,14 +95,73 @@ pub const DEFAULT_PARTITION_KEY_PATH: &str = crate::client::PARTITION_KEY_PATH;
 /// [`Message::message_id`], which travels untouched, still embedded,
 /// inside the serialized `message` string. `seq` is this store's
 /// [module-documented](self) ordering key.
-fn build_message_document(thread_id: &str, seq: i64, message: &Message) -> Result<Value> {
+fn build_message_document(
+    thread_id: &str,
+    tenant_id: Option<&str>,
+    user_id: Option<&str>,
+    seq: i64,
+    message: &Message,
+) -> Result<Value> {
     let message_json = serde_json::to_string(message)?;
-    Ok(serde_json::json!({
+    let mut document = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
         "threadId": thread_id,
         "seq": seq,
         "message": message_json,
-    }))
+    });
+    // Metadata is written whenever it is set, whatever the partition key
+    // (upstream #9214), so a flat container can still be queried by tenant.
+    if let Some(tenant_id) = tenant_id {
+        document["tenantId"] = Value::String(tenant_id.to_string());
+    }
+    if let Some(user_id) = user_id {
+        document["userId"] = Value::String(user_id.to_string());
+    }
+    Ok(document)
+}
+
+/// How a [`CosmosChatMessageStore`] partitions its container. Must match
+/// the container's partition key definition; [`CosmosChatMessageStore::ensure_created`]
+/// creates the container with the matching definition.
+///
+/// Partition keys and the tenant/user metadata organise storage; they are
+/// not an authorization boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CosmosPartitionStrategy {
+    /// Partition by `/threadId` alone. The default, and the layout of
+    /// containers created by earlier versions of this crate.
+    #[default]
+    ThreadId,
+    /// Partition by the hierarchical key `/tenantId`, `/userId`,
+    /// `/threadId`. Needs both a tenant id and a user id on the store.
+    Hierarchical,
+}
+
+impl CosmosPartitionStrategy {
+    /// The container partition key paths this strategy needs.
+    pub fn paths(self) -> &'static [&'static str] {
+        match self {
+            Self::ThreadId => &[DEFAULT_PARTITION_KEY_PATH],
+            Self::Hierarchical => &["/tenantId", "/userId", DEFAULT_PARTITION_KEY_PATH],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ThreadId => "thread_id",
+            Self::Hierarchical => "hierarchical",
+        }
+    }
+
+    fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "thread_id" => Ok(Self::ThreadId),
+            "hierarchical" => Ok(Self::Hierarchical),
+            other => Err(Error::Configuration(format!(
+                "unknown Cosmos partition strategy '{other}'"
+            ))),
+        }
+    }
 }
 
 /// Parse one Cosmos document back into a [`Message`], requiring a
@@ -108,6 +176,15 @@ fn parse_message_document(doc: &Value) -> Result<Message> {
         Error::Serialization("Cosmos document is missing a string 'message' field".into())
     })?;
     serde_json::from_str(raw).map_err(Error::from)
+}
+
+fn non_blank(value: String, name: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(Error::Configuration(format!(
+            "{name} must be a non-empty string"
+        )));
+    }
+    Ok(value)
 }
 
 /// The `seq` base for one `add_messages` batch: current time in Unix
@@ -167,6 +244,9 @@ pub struct CosmosChatMessageStore {
     database_id: String,
     container_id: String,
     thread_id: String,
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+    partition_strategy: CosmosPartitionStrategy,
 }
 
 impl CosmosChatMessageStore {
@@ -194,6 +274,9 @@ impl CosmosChatMessageStore {
             database_id: database_id.into(),
             container_id: container_id.into(),
             thread_id: thread_id.unwrap_or_else(|| format!("thread_{}", Uuid::new_v4())),
+            tenant_id: None,
+            user_id: None,
+            partition_strategy: CosmosPartitionStrategy::default(),
         })
     }
 
@@ -257,13 +340,74 @@ impl CosmosChatMessageStore {
             database_id: database_id.into(),
             container_id: container_id.into(),
             thread_id: thread_id.unwrap_or_else(|| format!("thread_{}", Uuid::new_v4())),
+            tenant_id: None,
+            user_id: None,
+            partition_strategy: CosmosPartitionStrategy::default(),
         })
     }
 
-    /// This thread's id (also its Cosmos partition key value;
-    /// auto-generated if not supplied to [`Self::new`]).
+    /// This thread's id (the partition key value, or its last level under
+    /// [`CosmosPartitionStrategy::Hierarchical`]; auto-generated if not
+    /// supplied to [`Self::new`]).
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    /// Record `tenant_id` on every message this store writes (`tenantId`).
+    /// A blank id is refused.
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Result<Self> {
+        self.tenant_id = Some(non_blank(tenant_id.into(), "tenant_id")?);
+        Ok(self)
+    }
+
+    /// Record `user_id` on every message this store writes (`userId`). A
+    /// blank id is refused.
+    pub fn with_user_id(mut self, user_id: impl Into<String>) -> Result<Self> {
+        self.user_id = Some(non_blank(user_id.into(), "user_id")?);
+        Ok(self)
+    }
+
+    /// Choose how the container is partitioned (default
+    /// [`CosmosPartitionStrategy::ThreadId`]).
+    /// [`CosmosPartitionStrategy::Hierarchical`] needs a tenant id and a
+    /// user id; operations fail with a configuration error until both are
+    /// set.
+    pub fn with_partition_strategy(mut self, strategy: CosmosPartitionStrategy) -> Self {
+        self.partition_strategy = strategy;
+        self
+    }
+
+    /// The tenant id recorded on messages, if any.
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    /// The user id recorded on messages, if any.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    /// The partition strategy.
+    pub fn partition_strategy(&self) -> CosmosPartitionStrategy {
+        self.partition_strategy
+    }
+
+    /// This thread's partition key values, in the order of
+    /// [`CosmosPartitionStrategy::paths`].
+    fn partition_key(&self) -> Result<Vec<&str>> {
+        match self.partition_strategy {
+            CosmosPartitionStrategy::ThreadId => Ok(vec![self.thread_id.as_str()]),
+            CosmosPartitionStrategy::Hierarchical => match (&self.tenant_id, &self.user_id) {
+                (Some(tenant), Some(user)) => Ok(vec![
+                    tenant.as_str(),
+                    user.as_str(),
+                    self.thread_id.as_str(),
+                ]),
+                _ => Err(Error::Configuration(
+                    "hierarchical Cosmos partitioning needs both a tenant id and a user id".into(),
+                )),
+            },
+        }
     }
 
     /// The configured database id.
@@ -278,8 +422,10 @@ impl CosmosChatMessageStore {
 
     /// Create the database and container if they don't already exist yet
     /// (`409 Conflict` from either is treated as success — "already there"
-    /// is not a failure). The container is created with partition key
-    /// [`DEFAULT_PARTITION_KEY_PATH`] (`/threadId`). Mirrors the .NET
+    /// is not a failure). The container is created with the partition key
+    /// [the strategy](CosmosPartitionStrategy::paths) needs (`/threadId` by
+    /// default). An existing container is left as it is, so its partition
+    /// key must already match the strategy. Mirrors the .NET
     /// store's test-fixture use of `CreateDatabaseIfNotExistsAsync` /
     /// `CreateContainerIfNotExistsAsync`, exposed here as a first-class
     /// operation since this crate has no SDK-level `CosmosClient` to reach
@@ -289,10 +435,10 @@ impl CosmosChatMessageStore {
             .create_database_if_not_exists(&self.database_id)
             .await?;
         self.client
-            .create_container_if_not_exists(
+            .create_container_with_partition_paths(
                 &self.database_id,
                 &self.container_id,
-                DEFAULT_PARTITION_KEY_PATH,
+                self.partition_strategy.paths(),
             )
             .await?;
         Ok(())
@@ -304,12 +450,13 @@ impl CosmosChatMessageStore {
     /// additional utility method, matching the equivalent `ClearMessagesAsync`
     /// on the .NET store.
     pub async fn clear(&self) -> Result<()> {
+        let partition_key = self.partition_key()?;
         let ids = self
             .client
             .query_documents(
                 &self.database_id,
                 &self.container_id,
-                &self.thread_id,
+                &partition_key,
                 "SELECT VALUE c.id FROM c WHERE c.threadId = @threadId",
                 &[("@threadId", Value::String(self.thread_id.clone()))],
             )
@@ -317,7 +464,7 @@ impl CosmosChatMessageStore {
         for id in ids {
             if let Some(id) = id.as_str() {
                 self.client
-                    .delete_document(&self.database_id, &self.container_id, &self.thread_id, id)
+                    .delete_document(&self.database_id, &self.container_id, &partition_key, id)
                     .await?;
             }
         }
@@ -362,7 +509,24 @@ impl CosmosChatMessageStore {
             database_id,
             container_id,
             Some(thread_id),
-        )
+        )?
+        .with_state_metadata(state)
+    }
+
+    /// Restore the tenant id, user id and partition strategy recorded by
+    /// [`Self::serialize`]. State written before they existed has none of
+    /// them, which restores the defaults.
+    fn with_state_metadata(mut self, state: &Value) -> Result<Self> {
+        if let Some(tenant_id) = state.get("tenant_id").and_then(Value::as_str) {
+            self = self.with_tenant_id(tenant_id)?;
+        }
+        if let Some(user_id) = state.get("user_id").and_then(Value::as_str) {
+            self = self.with_user_id(user_id)?;
+        }
+        if let Some(name) = state.get("partition_strategy").and_then(Value::as_str) {
+            self = self.with_partition_strategy(CosmosPartitionStrategy::from_name(name)?);
+        }
+        Ok(self)
     }
 
     /// Reconstruct a store from serialized state, supplying the credential
@@ -399,17 +563,19 @@ impl CosmosChatMessageStore {
             field(state, "container_id")?.to_string(),
             Some(field(state, "thread_id")?.to_string()),
             scope,
-        )
+        )?
+        .with_state_metadata(state)
     }
 
     /// The stored messages, in chronological order (`ORDER BY c.seq`).
     pub async fn list_messages(&self) -> Result<Vec<Message>> {
+        let partition_key = self.partition_key()?;
         let docs = self
             .client
             .query_documents(
                 &self.database_id,
                 &self.container_id,
-                &self.thread_id,
+                &partition_key,
                 "SELECT * FROM c WHERE c.threadId = @threadId ORDER BY c.seq",
                 &[("@threadId", Value::String(self.thread_id.clone()))],
             )
@@ -423,14 +589,21 @@ impl CosmosChatMessageStore {
         if messages.is_empty() {
             return Ok(());
         }
+        let partition_key = self.partition_key()?;
         let base_seq = seq_base();
         for (i, message) in messages.iter().enumerate() {
-            let document = build_message_document(&self.thread_id, base_seq + i as i64, message)?;
+            let document = build_message_document(
+                &self.thread_id,
+                self.tenant_id.as_deref(),
+                self.user_id.as_deref(),
+                base_seq + i as i64,
+                message,
+            )?;
             self.client
                 .create_document(
                     &self.database_id,
                     &self.container_id,
-                    &self.thread_id,
+                    &partition_key,
                     &document,
                 )
                 .await?;
@@ -462,6 +635,18 @@ impl CosmosChatMessageStore {
         let map = state
             .as_object_mut()
             .expect("serialize builds a JSON object literal");
+        if let Some(tenant_id) = &self.tenant_id {
+            map.insert("tenant_id".to_string(), Value::String(tenant_id.clone()));
+        }
+        if let Some(user_id) = &self.user_id {
+            map.insert("user_id".to_string(), Value::String(user_id.clone()));
+        }
+        if self.partition_strategy != CosmosPartitionStrategy::ThreadId {
+            map.insert(
+                "partition_strategy".to_string(),
+                Value::String(self.partition_strategy.name().to_string()),
+            );
+        }
         match self.client.master_key() {
             // Field order in the emitted object is not preserved by
             // `serde_json`'s default map anyway, so inserting after the
@@ -617,7 +802,7 @@ mod tests {
     #[test]
     fn build_message_document_shape() {
         let message = Message::user("hello");
-        let doc = build_message_document("thread-1", 42, &message).unwrap();
+        let doc = build_message_document("thread-1", None, None, 42, &message).unwrap();
         assert_eq!(doc["threadId"], serde_json::json!("thread-1"));
         assert_eq!(doc["seq"], serde_json::json!(42));
         assert!(doc["id"].as_str().is_some());
@@ -630,15 +815,15 @@ mod tests {
     #[test]
     fn build_message_document_ids_are_unique_across_calls() {
         let message = Message::user("hi");
-        let a = build_message_document("t", 1, &message).unwrap();
-        let b = build_message_document("t", 1, &message).unwrap();
+        let a = build_message_document("t", None, None, 1, &message).unwrap();
+        let b = build_message_document("t", None, None, 1, &message).unwrap();
         assert_ne!(a["id"], b["id"]);
     }
 
     #[test]
     fn parse_message_document_round_trips_complex_message() {
         let message = Message::new(Role::assistant(), "Hi there!").with_author("bot");
-        let doc = build_message_document("t", 1, &message).unwrap();
+        let doc = build_message_document("t", None, None, 1, &message).unwrap();
         let parsed = parse_message_document(&doc).unwrap();
         assert_eq!(parsed.role, Role::assistant());
         assert_eq!(parsed.text(), "Hi there!");

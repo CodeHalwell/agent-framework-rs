@@ -43,11 +43,11 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Harness, remainder**: file access, file memory, memory, background
-  agents (and the loop's `background_tasks_running` condition),
-  `TodoFileStore` and the `create_harness_agent` assembly. The agent loop,
-  todo, tool approval and agent mode are ported behind
-  `experimental-harness`.
+- **Harness, remainder**: the file access tools (`FileAccessProvider`),
+  memory, background agents (and the loop's `background_tasks_running`
+  condition), `TodoFileStore` and the `create_harness_agent` assembly. The
+  agent loop, todo, tool approval, agent mode, the file store and file
+  memory are ported behind `experimental-harness`.
 - **Agent hooks, remainder** (`experimental-agent-hooks` ships the
   enforcement bundle): the approval seam (liftable denies are enforced as
   plain denies), the `sequential/run_all` and parallel composition profiles,

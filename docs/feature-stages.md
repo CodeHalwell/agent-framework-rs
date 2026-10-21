@@ -47,7 +47,8 @@ can upstream.
 | `experimental-file-history` | `FILE_HISTORY` | `agent-framework-core` | `history::FileHistoryProvider` |
 | `experimental-progressive-tools` | `PROGRESSIVE_TOOLS` | `agent-framework-core` | `middleware::LiveToolList` and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}`. The function-calling loop still uses the live list internally, so behaviour is unchanged; only the public handle is gated. |
 | `experimental-agent-hooks` | `AGENT_HOOKS` | `agent-framework-core` | `agent_framework_core::agent_hooks` (the AGENT-HOOKS-0.1 interception types, emitter and the `AgentHooks` enforcement bundle), `AgentBuilder::build_with_agent_hooks` and `Error::InterceptionBlocked` |
-| `experimental-harness` | `HARNESS` | `agent-framework-core` | `agent_framework_core::harness`: `LoopAgent` (with `Judge` and `todos_remaining`), `TodoProvider`, `ToolApprovalAgent` and `AgentModeProvider`. File access, file memory, memory, background agents and `create_harness_agent` are not ported. |
+| `experimental-harness` | `HARNESS` | `agent-framework-core` | `agent_framework_core::harness`: `LoopAgent` (with `Judge` and `todos_remaining`), `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`, the file store (`AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`) and `FileMemoryProvider`. The file access tools, memory, background agents and `create_harness_agent` are not ported. |
+| `experimental-session-store` | `SESSION_STORE` | `agent-framework-core` | `agent_framework_core::session_store` (`AgentSessionStore`, `AgentSessionStoreKey`, `InMemoryAgentSessionStore`, `FileAgentSessionStore`, `serialize_session`, `deserialize_session`) and `ContextProvider::snapshot_history` |
 | `experimental-declarative-agents` | `DECLARATIVE_AGENTS` | `agent-framework-declarative` | The whole crate, which is empty without it |
 <!-- /feature-table -->
 
@@ -56,4 +57,4 @@ can upstream.
 | Upstream id | Why there is no feature |
 |---|---|
 | `TO_PROMPT_AGENT` | `FoundryAgent::to_prompt_agent` returns the definition the agent was built from. That is a getter, not upstream's conversion of an arbitrary agent. |
-| `EVALS`, `FIDES`, `COMPUTER_USE`, `FUNCTIONAL_WORKFLOWS`, `MCP_LONG_RUNNING_TASKS`, `MCP_SKILLS`, `SESSION_STORE`, `FOUNDRY_TOOLS`, `FOUNDRY_PREVIEW_TOOLS` | Not ported yet. Whichever lands first adds its `experimental-*` feature here. |
+| `EVALS`, `FIDES`, `COMPUTER_USE`, `FUNCTIONAL_WORKFLOWS`, `MCP_LONG_RUNNING_TASKS`, `MCP_SKILLS`, `FOUNDRY_TOOLS`, `FOUNDRY_PREVIEW_TOOLS` | Not ported yet. Whichever lands first adds its `experimental-*` feature here. |

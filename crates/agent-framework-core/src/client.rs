@@ -617,8 +617,13 @@ async fn execute_tool_call(
 /// `_collect_approval_responses`:
 ///
 /// * a response is settled by a later function result for the same `call_id`
-///   (responses for one `call_id` are consumed first-in, first-out), and
-/// * a response is superseded by a later approval request reusing its id.
+///   (responses for one `call_id` are consumed first-in, first-out),
+/// * a response is superseded by a later approval request reusing its id, and
+/// * a response to a request that is already *closed* is settled on arrival
+///   (upstream #9535). A request closes when a response to it is settled by
+///   a result, or when a result answers its call while it is still
+///   unanswered. Only a new request reusing the id can be approved again, so
+///   an answer repeated after the call ran has nothing left to authorize.
 ///
 /// A settled response must never execute its call again: it stays in session
 /// history after the run that acted on it, and every later run sees it.
@@ -626,6 +631,15 @@ fn settled_approval_responses(messages: &[Message]) -> HashSet<(usize, usize)> {
     let mut settled = HashSet::new();
     let mut pending_by_call_id: HashMap<&str, VecDeque<(usize, usize)>> = HashMap::new();
     let mut pending_by_id: HashMap<&str, (usize, usize)> = HashMap::new();
+    // Request occurrences are numbered in order of appearance. `latest_request`
+    // is the occurrence an id currently names; `unanswered` holds the ones no
+    // response has answered yet, by id and (in order) by call id.
+    let mut next_request = 0usize;
+    let mut latest_request: HashMap<&str, usize> = HashMap::new();
+    let mut unanswered: HashMap<&str, usize> = HashMap::new();
+    let mut unanswered_by_call_id: HashMap<&str, VecDeque<(usize, &str)>> = HashMap::new();
+    let mut request_of_response: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut closed: HashSet<usize> = HashSet::new();
     for (m, msg) in messages.iter().enumerate() {
         for (c, content) in msg.contents.iter().enumerate() {
             match content {
@@ -633,10 +647,34 @@ fn settled_approval_responses(messages: &[Message]) -> HashSet<(usize, usize)> {
                     if let Some(position) = pending_by_id.remove(req.id.as_str()) {
                         settled.insert(position);
                     }
+                    if req.function_call.call_id.is_empty()
+                        || unanswered.contains_key(req.id.as_str())
+                    {
+                        continue;
+                    }
+                    let occurrence = next_request;
+                    next_request += 1;
+                    latest_request.insert(req.id.as_str(), occurrence);
+                    unanswered.insert(req.id.as_str(), occurrence);
+                    unanswered_by_call_id
+                        .entry(req.function_call.call_id.as_str())
+                        .or_default()
+                        .push_back((occurrence, req.id.as_str()));
                 }
                 Content::FunctionApprovalResponse(resp) => {
                     if resp.function_call.call_id.is_empty() {
                         continue;
+                    }
+                    let request = latest_request.get(resp.id.as_str()).copied();
+                    if request.is_some_and(|r| closed.contains(&r)) {
+                        settled.insert((m, c));
+                        continue;
+                    }
+                    if let Some(request) = request {
+                        request_of_response.insert((m, c), request);
+                        if unanswered.get(resp.id.as_str()) == Some(&request) {
+                            unanswered.remove(resp.id.as_str());
+                        }
                     }
                     if !resp.id.is_empty() {
                         pending_by_id.insert(resp.id.as_str(), (m, c));
@@ -647,15 +685,32 @@ fn settled_approval_responses(messages: &[Message]) -> HashSet<(usize, usize)> {
                         .push_back((m, c));
                 }
                 Content::FunctionResult(fr) => {
-                    let Some(queue) = pending_by_call_id.get_mut(fr.call_id.as_str()) else {
-                        continue;
-                    };
-                    while queue.front().is_some_and(|p| settled.contains(p)) {
-                        queue.pop_front();
+                    if let Some(queue) = pending_by_call_id.get_mut(fr.call_id.as_str()) {
+                        while queue.front().is_some_and(|p| settled.contains(p)) {
+                            queue.pop_front();
+                        }
+                        if let Some(position) = queue.pop_front() {
+                            settled.insert(position);
+                            pending_by_id.retain(|_, p| *p != position);
+                            if let Some(&request) = request_of_response.get(&position) {
+                                closed.insert(request);
+                            }
+                            continue;
+                        }
                     }
-                    if let Some(position) = queue.pop_front() {
-                        settled.insert(position);
-                        pending_by_id.retain(|_, p| *p != position);
+                    // No response was waiting: the result answers the call of
+                    // a request nobody answered, which closes that request.
+                    if let Some(queue) = unanswered_by_call_id.get_mut(fr.call_id.as_str()) {
+                        while queue
+                            .front()
+                            .is_some_and(|(occurrence, id)| unanswered.get(id) != Some(occurrence))
+                        {
+                            queue.pop_front();
+                        }
+                        if let Some((occurrence, id)) = queue.pop_front() {
+                            unanswered.remove(id);
+                            closed.insert(occurrence);
+                        }
                     }
                 }
                 _ => {}

@@ -730,55 +730,75 @@
       },
       "AgentFileStore": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::AgentFileStore"
+          ],
+          "status": "adapted",
+          "note": "The abstract class becomes the AgentFileStore trait; find_matching_files is the narrowing hook. Behind experimental-harness."
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "CreateDirectoryAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::create_directory"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "DeleteAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DeleteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::delete"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "FileExistsAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileExistsAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::file_exists"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ListChildrenAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ListChildrenAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::list_children"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ReadAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ReadAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
-          },
-          "ScanContent(string, string, Regex)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ScanContent: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::read"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SearchAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
-          },
-          "SplitLines(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SplitLines: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::search"
+            ],
+            "status": "adapted",
+            "note": "search(directory, regex_pattern, glob_pattern, recursive); the glob is Python fnmatch syntax."
           },
           "WriteAsync(string, string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WriteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::write"
+            ],
+            "status": "adapted",
+            "note": "write overwrites; create_new is the exclusive create Python adds."
+          },
+          "ScanContent(string, string, Regex)": {
+            "rust": [
+              "agent_framework_core::harness::file_store::scan_content"
+            ],
+            "status": "mapped",
+            "note": "A free function taking a regex::Regex."
+          },
+          "SplitLines(string)": {
+            "rust": [
+              "agent_framework_core::harness::file_store::split_lines"
+            ],
+            "status": "adapted",
+            "note": "Splits on \\n only, as upstream Python does; .NET also splits on a lone \\r."
           }
         }
       },
@@ -2320,183 +2340,245 @@
       },
       "FileLineEdit": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::FileLineEdit"
+          ],
+          "status": "mapped",
+          "note": "The replace_lines edit; apply_replace_lines applies a list of them. Behind experimental-harness."
         },
         "constructors": {
           "FileLineEdit()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileLineEdit: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileLineEdit::new",
+              "agent_framework_core::harness::file_store::FileLineEdit::expecting"
+            ],
+            "status": "adapted",
+            "note": "new(line_number, new_line), with expecting(text) for the optional check."
           }
         },
         "properties": {
           "ExpectedLine": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ExpectedLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileLineEdit::expected_line"
+            ],
+            "status": "mapped",
+            "note": "Option<String>."
           },
           "LineNumber": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "LineNumber: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileLineEdit::line_number"
+            ],
+            "status": "mapped",
+            "note": "1-based usize."
           },
           "NewLine": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "NewLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileLineEdit::new_line"
+            ],
+            "status": "mapped",
+            "note": "Written verbatim; empty deletes the line."
           }
         }
       },
       "FileSearchMatch": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::FileSearchMatch"
+          ],
+          "status": "mapped",
+          "note": "Serializes with Python's snake_case keys. Behind experimental-harness."
         },
         "constructors": {
           "FileSearchMatch()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileSearchMatch: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchMatch"
+            ],
+            "status": "adapted",
+            "note": "Built with a struct literal."
           }
         },
         "properties": {
           "Line": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Line: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchMatch::line"
+            ],
+            "status": "mapped",
+            "note": "Verbatim, terminator included."
           },
           "LineNumber": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "LineNumber: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchMatch::line_number"
+            ],
+            "status": "mapped",
+            "note": "1-based usize."
           }
         }
       },
       "FileSearchResult": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::FileSearchResult"
+          ],
+          "status": "mapped",
+          "note": "Serializes with Python's snake_case keys. Behind experimental-harness."
         },
         "constructors": {
           "FileSearchResult()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileSearchResult: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchResult"
+            ],
+            "status": "adapted",
+            "note": "Built with a struct literal."
           }
         },
         "properties": {
           "FileName": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileName: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchResult::file_name"
+            ],
+            "status": "mapped",
+            "note": "Relative to the searched directory."
           },
           "MatchingLines": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "MatchingLines: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchResult::matching_lines"
+            ],
+            "status": "mapped",
+            "note": "Vec<FileSearchMatch>."
           },
           "Snippet": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Snippet: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSearchResult::snippet"
+            ],
+            "status": "mapped",
+            "note": "Up to 50 characters either side of the first match."
           }
         }
       },
       "FileStoreEntry": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::FileStoreEntry"
+          ],
+          "status": "adapted",
+          "note": "A struct with an entry_type enum (FileStoreEntryType) in place of the string type; serializes to the same {\"name\",\"type\"} JSON. Behind experimental-harness."
         },
         "constructors": {
           "FileStoreEntry()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntry::file"
+            ],
+            "status": "adapted",
+            "note": "No empty entry; file(name) and directory(name) build one."
           },
           "FileStoreEntry(string, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntry::file",
+              "agent_framework_core::harness::file_store::FileStoreEntry::directory"
+            ],
+            "status": "adapted",
+            "note": "One constructor per entry type."
           }
         },
         "properties": {
           "Name": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Name: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntry::name"
+            ],
+            "status": "mapped",
+            "note": "String field."
           },
           "Type": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Type: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntry::entry_type"
+            ],
+            "status": "adapted",
+            "note": "A FileStoreEntryType enum."
           }
         },
         "constants": {
           "Directory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Directory: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntryType::Directory"
+            ],
+            "status": "adapted",
+            "note": "An enum variant."
           },
           "File": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "File: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileStoreEntryType::File"
+            ],
+            "status": "adapted",
+            "note": "An enum variant."
           }
         }
       },
       "FileSystemAgentFileStore": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::FileSystemAgentFileStore"
+          ],
+          "status": "mapped",
+          "note": "new(root) returns Result and refuses a blank root; symbolic links are refused on every path. Behind experimental-harness."
         },
         "constructors": {
           "FileSystemAgentFileStore(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileSystemAgentFileStore: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::new"
+            ],
+            "status": "mapped",
+            "note": "Creates nothing on disk until the first write."
           }
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "CreateDirectoryAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::create_directory"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "DeleteAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DeleteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::delete"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "FileExistsAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileExistsAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::file_exists"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ListChildrenAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ListChildrenAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::list_children"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ReadAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ReadAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::read"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SearchAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::search"
+            ],
+            "status": "adapted",
+            "note": "Uses the trait's default search over list_children and read; no override."
           },
           "WriteAsync(string, string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WriteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::FileSystemAgentFileStore::write"
+            ],
+            "status": "adapted",
+            "note": "write overwrites; create_new is the exclusive create Python adds."
           }
         }
       },
@@ -2521,52 +2603,70 @@
       },
       "InMemoryAgentFileStore": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+          "rust": [
+            "agent_framework_core::harness::file_store::InMemoryAgentFileStore"
+          ],
+          "status": "mapped",
+          "note": "Case-insensitive paths that keep their written casing. Behind experimental-harness."
         },
         "constructors": {
           "InMemoryAgentFileStore()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "InMemoryAgentFileStore: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::new"
+            ],
+            "status": "mapped",
+            "note": "An empty store."
           }
         },
         "methods": {
           "CreateDirectoryAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "CreateDirectoryAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::create_directory"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "DeleteAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DeleteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::delete"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "FileExistsAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FileExistsAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::file_exists"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ListChildrenAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ListChildrenAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::list_children"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "ReadAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ReadAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::read"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
           },
           "SearchAsync(string, string, string, bool, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SearchAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::AgentFileStore::search"
+            ],
+            "status": "adapted",
+            "note": "Uses the trait's default search over list_children and read; no override."
           },
           "WriteAsync(string, string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WriteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::file_store::InMemoryAgentFileStore::write"
+            ],
+            "status": "adapted",
+            "note": "write overwrites; create_new is the exclusive create Python adds."
           }
         }
       },
@@ -3330,6 +3430,215 @@
             "rust": [],
             "status": "unmapped",
             "note": "Auto-approval rules do not receive the session."
+          }
+        }
+      },
+      "FileMemoryProvider": {
+        "area": "harness",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::harness::file_memory::FileMemoryProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider with the seven file_memory_* tools and the memories.md index. Behind experimental-harness."
+        },
+        "constructors": {
+          "FileMemoryProvider(AgentFileStore, Func<AgentSession?, FileMemoryState>?, FileMemoryProviderOptions?)": {
+            "rust": [
+              "agent_framework_core::harness::file_memory::FileMemoryProvider::new",
+              "agent_framework_core::harness::file_memory::FileMemoryProvider::with_scope",
+              "agent_framework_core::harness::file_memory::FileMemoryProvider::with_instructions"
+            ],
+            "status": "adapted",
+            "note": "new(store); the state initializer becomes with_scope (default: one folder per session id, as upstream Python) and options become with_instructions."
+          }
+        }
+      },
+      "FileMemoryProviderOptions": {
+        "area": "harness",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::harness::file_memory::FileMemoryProvider::with_instructions"
+          ],
+          "status": "adapted",
+          "note": "No options struct; Instructions is with_instructions."
+        }
+      },
+      "FileMemoryState": {
+        "area": "harness",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::harness::file_memory::FileMemoryProvider::working_folder"
+          ],
+          "status": "adapted",
+          "note": "No state type; the working folder is derived from the scope or session id on each run rather than stored in the session."
+        }
+      },
+      "FileListEntry": {
+        "area": "harness",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::harness::file_memory::FileMemoryProvider::tools"
+          ],
+          "status": "adapted",
+          "note": "No public type; file_memory_ls returns the same {\"name\",\"type\",\"description\"} JSON objects."
+        }
+      },
+      "TextSearchProvider": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider"
+          ],
+          "status": "mapped",
+          "note": "A ContextProvider over a caller-supplied async search function."
+        },
+        "constructors": {
+          "TextSearchProvider(Func<string, CancellationToken, Task<IEnumerable<TextSearchProvider.TextSearchResult>>>, TextSearchProviderOptions?, ILoggerFactory?)": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchProvider::new"
+            ],
+            "status": "adapted",
+            "note": "new(search) takes the search closure; options are with_* builders and logging goes to tracing."
+          }
+        },
+        "properties": {
+          "StateKeys": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchProvider::state_key"
+            ],
+            "status": "adapted",
+            "note": "One key, returned as a &str."
+          }
+        }
+      },
+      "TextSearchProvider.TextSearchResult": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchResult"
+          ],
+          "status": "mapped",
+          "note": "A top-level struct rather than a nested class."
+        },
+        "properties": {
+          "SourceName": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::source_name"
+            ],
+            "status": "mapped",
+            "note": "Option<String>."
+          },
+          "SourceLink": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::source_link"
+            ],
+            "status": "mapped",
+            "note": "Option<String>."
+          },
+          "Text": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::text"
+            ],
+            "status": "mapped",
+            "note": "String."
+          },
+          "RawRepresentation": {
+            "rust": [
+              "agent_framework_core::text_search::TextSearchResult::raw_representation"
+            ],
+            "status": "adapted",
+            "note": "Option<serde_json::Value> in place of object."
+          }
+        }
+      },
+      "TextSearchProvider.TextSearchProviderState": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider::state_key"
+          ],
+          "status": "adapted",
+          "note": "No public type; the state is stored as {\"recentMessagesText\": [...]} under the provider's state key, the same JSON shape."
+        }
+      },
+      "TextSearchProviderOptions": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchProvider::with_behavior",
+            "agent_framework_core::text_search::TextSearchProvider::with_tool",
+            "agent_framework_core::text_search::TextSearchProvider::with_context_prompt",
+            "agent_framework_core::text_search::TextSearchProvider::with_citations_prompt",
+            "agent_framework_core::text_search::TextSearchProvider::with_context_formatter",
+            "agent_framework_core::text_search::TextSearchProvider::with_recent_message_memory",
+            "agent_framework_core::text_search::TextSearchProvider::with_recent_message_roles",
+            "agent_framework_core::text_search::TextSearchProvider::with_state_key",
+            "agent_framework_core::text_search::TextSearchProvider::with_sensitive_logging"
+          ],
+          "status": "adapted",
+          "note": "No options struct; each option is a with_* builder on TextSearchProvider. The message filters and Redactor have no counterpart: a Rust provider only sees the run's own input and response, and sensitive values are logged only when with_sensitive_logging is on."
+        }
+      },
+      "TextSearchProviderOptions.TextSearchBehavior": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::text_search::TextSearchBehavior"
+          ],
+          "status": "mapped",
+          "note": "BeforeAIInvoke is BeforeInvoke; OnDemandFunctionCalling keeps its name."
+        }
+      },
+      "AgentSessionStore": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::session_store::AgentSessionStore"
+          ],
+          "status": "adapted",
+          "note": "The abstract class becomes the AgentSessionStore trait, behind experimental-session-store; GetService has no counterpart."
+        },
+        "methods": {
+          "SaveSessionAsync(AIAgent, AgentSessionStoreKey, AgentSession, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::save_session"
+            ],
+            "status": "mapped",
+            "note": "Same contract; Rust cancels by dropping the future."
+          },
+          "GetSessionAsync(AIAgent, AgentSessionStoreKey, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::get_session"
+            ],
+            "status": "mapped",
+            "note": "Returns None when nothing is stored and an independent session otherwise."
+          },
+          "GetOrCreateSessionAsync(AIAgent, AgentSessionStoreKey, CancellationToken)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStore::get_or_create_session"
+            ],
+            "status": "mapped",
+            "note": "Provided method falling back to the agent's create_session, as .NET's virtual default does."
+          }
+        }
+      },
+      "AgentSessionStoreKey": {
+        "area": "core",
+        "mapping": {
+          "rust": [
+            "agent_framework_core::session_store::AgentSessionStoreKey"
+          ],
+          "status": "mapped",
+          "note": "Session id plus ordered named partitions, compared by value."
+        },
+        "methods": {
+          "WithPartition(string, string)": {
+            "rust": [
+              "agent_framework_core::session_store::AgentSessionStoreKey::with_partition"
+            ],
+            "status": "mapped",
+            "note": "Consumes the key and returns it with the partition set; blank names and values are refused."
           }
         }
       }

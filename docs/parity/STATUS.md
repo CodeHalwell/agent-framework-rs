@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 88 / 137 / 24 / 191 / 0 | 52 | 0 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 132 / 164 / 24 / 142 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
@@ -71,16 +71,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ScriptFilter` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
 | `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::SearchDepth` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
 | `Microsoft.Agents.AI::AgentFileSkillsSourceOptions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileStore methods::CreateDirectoryAsync(string, CancellationToken)` | unmapped | intentional | CreateDirectoryAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::DeleteAsync(string, CancellationToken)` | unmapped | intentional | DeleteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::FileExistsAsync(string, CancellationToken)` | unmapped | intentional | FileExistsAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::ListChildrenAsync(string, CancellationToken)` | unmapped | intentional | ListChildrenAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::ReadAsync(string, CancellationToken)` | unmapped | intentional | ReadAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::ScanContent(string, string, Regex)` | unmapped | intentional | ScanContent: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::SearchAsync(string, string, string, bool, CancellationToken)` | unmapped | intentional | SearchAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::SplitLines(string)` | unmapped | intentional | SplitLines: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore methods::WriteAsync(string, string, CancellationToken)` | unmapped | intentional | WriteAsync: no agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::AgentFileStore` | unmapped | intentional | No agent file-store abstraction; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(AgentSkillFrontmatter, string, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name/description/instructions; there is no frontmatter type and no argument marshaler. |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(string, string, string, string, string, string, AdditionalPropertiesDictionary, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name, description and instructions; license, compatibility, allowedTools and metadata have no field. |
 | `Microsoft.Agents.AI::AgentInlineSkill methods::AddResource(string, Delegate, string, JsonSerializerOptions)` | partial | adapted | with_resource stores static string content only; there is no delegate-computed resource. |
@@ -182,46 +172,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::DeduplicatingAgentSkillsSource` | partial | adapted | SkillsProvider::new dedups by name but keeps the last duplicate, while .NET keeps the first and logs a warning. |
 | `Microsoft.Agents.AI::DelegatingAgentSkillsSource methods::GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::DelegatingAgentSkillsSource` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
-| `Microsoft.Agents.AI::FileLineEdit constructors::FileLineEdit()` | unmapped | intentional | FileLineEdit: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileLineEdit properties::ExpectedLine` | unmapped | intentional | ExpectedLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileLineEdit properties::LineNumber` | unmapped | intentional | LineNumber: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileLineEdit properties::NewLine` | unmapped | intentional | NewLine: no line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileLineEdit` | unmapped | intentional | No line-edit type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchMatch constructors::FileSearchMatch()` | unmapped | intentional | FileSearchMatch: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchMatch properties::Line` | unmapped | intentional | Line: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchMatch properties::LineNumber` | unmapped | intentional | LineNumber: no file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchMatch` | unmapped | intentional | No file-search match type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchResult constructors::FileSearchResult()` | unmapped | intentional | FileSearchResult: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchResult properties::FileName` | unmapped | intentional | FileName: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchResult properties::MatchingLines` | unmapped | intentional | MatchingLines: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchResult properties::Snippet` | unmapped | intentional | Snippet: no file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSearchResult` | unmapped | intentional | No file-search result type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry constants::Directory` | unmapped | intentional | Directory: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry constants::File` | unmapped | intentional | File: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry constructors::FileStoreEntry()` | unmapped | intentional | FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry constructors::FileStoreEntry(string, string)` | unmapped | intentional | FileStoreEntry: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry properties::Name` | unmapped | intentional | Name: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry properties::Type` | unmapped | intentional | Type: no file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileStoreEntry` | unmapped | intentional | No file-store entry type for the harness file store, which is not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore constructors::FileSystemAgentFileStore(string)` | unmapped | intentional | FileSystemAgentFileStore: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::CreateDirectoryAsync(string, CancellationToken)` | unmapped | intentional | CreateDirectoryAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::DeleteAsync(string, CancellationToken)` | unmapped | intentional | DeleteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::FileExistsAsync(string, CancellationToken)` | unmapped | intentional | FileExistsAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::ListChildrenAsync(string, CancellationToken)` | unmapped | intentional | ListChildrenAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::ReadAsync(string, CancellationToken)` | unmapped | intentional | ReadAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::SearchAsync(string, string, string, bool, CancellationToken)` | unmapped | intentional | SearchAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore methods::WriteAsync(string, string, CancellationToken)` | unmapped | intentional | WriteAsync: no filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::FileSystemAgentFileStore` | unmapped | intentional | No filesystem-backed agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::FilteringAgentSkillsSource` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore constructors::InMemoryAgentFileStore()` | unmapped | intentional | InMemoryAgentFileStore: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::CreateDirectoryAsync(string, CancellationToken)` | unmapped | intentional | CreateDirectoryAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::DeleteAsync(string, CancellationToken)` | unmapped | intentional | DeleteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::FileExistsAsync(string, CancellationToken)` | unmapped | intentional | FileExistsAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::ListChildrenAsync(string, CancellationToken)` | unmapped | intentional | ListChildrenAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::ReadAsync(string, CancellationToken)` | unmapped | intentional | ReadAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::SearchAsync(string, string, string, bool, CancellationToken)` | unmapped | intentional | SearchAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore methods::WriteAsync(string, string, CancellationToken)` | unmapped | intentional | WriteAsync: no in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::InMemoryAgentFileStore` | unmapped | intentional | No in-memory agent file store; harness file access and file memory are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::InMemoryChatHistoryProvider constructors::InMemoryChatHistoryProvider(InMemoryChatHistoryProviderOptions)` | partial | adapted | InMemoryHistoryProvider takes no options: no reducer, state key or storage filters. |
 | `Microsoft.Agents.AI::InMemoryChatHistoryProviderOptions properties::ChatReducer` | partial | adapted | Compaction trims the outgoing request; the stored history itself is never reduced. |
 | `Microsoft.Agents.AI::InMemoryChatHistoryProviderOptions properties::ProvideOutputMessageFilter` | unmapped | adapted | No filter over messages the provider returns. |
@@ -477,7 +428,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 ## Not yet reviewed
 
-110 declarations the Rust ledger has not assessed yet.
+99 declarations the Rust ledger has not assessed yet.
 
 ### In Go's catalog
 
@@ -487,7 +438,7 @@ None.
 
 ### Only in the .NET inventory
 
-110 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
+99 types that neither Go's catalog nor the Rust ledger lists. Each counts once; review its members when it is assessed.
 
 - `Microsoft.Agents.AI::AdditionalPropertiesExtensions`
 - `Microsoft.Agents.AI::AgentAbstractionsJsonUtilities`
@@ -495,8 +446,6 @@ None.
 - `Microsoft.Agents.AI::AgentEvaluationExtensions`
 - `Microsoft.Agents.AI::AgentEvaluationResults`
 - `Microsoft.Agents.AI::AgentSessionStateBagJsonConverter`
-- `Microsoft.Agents.AI::AgentSessionStore`
-- `Microsoft.Agents.AI::AgentSessionStoreKey`
 - `Microsoft.Agents.AI::AgentSkillResourceAttribute`
 - `Microsoft.Agents.AI::AgentSkillScriptAttribute`
 - `Microsoft.Agents.AI::BackgroundAgentsProvider`
@@ -521,10 +470,6 @@ None.
 - `Microsoft.Agents.AI::FeatureUsage`
 - `Microsoft.Agents.AI::FileAccessProvider`
 - `Microsoft.Agents.AI::FileAccessProviderOptions`
-- `Microsoft.Agents.AI::FileListEntry`
-- `Microsoft.Agents.AI::FileMemoryProvider`
-- `Microsoft.Agents.AI::FileMemoryProviderOptions`
-- `Microsoft.Agents.AI::FileMemoryState`
 - `Microsoft.Agents.AI::FunctionEvaluator`
 - `Microsoft.Agents.AI::GeneratedEvaluatorRef`
 - `Microsoft.Agents.AI::IAgentEvaluator`
@@ -534,11 +479,6 @@ None.
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClient`
 - `Microsoft.Agents.AI::RoutePersistingRoutingChatClientOptions`
 - `Microsoft.Agents.AI::RubricScore`
-- `Microsoft.Agents.AI::TextSearchProvider`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchProviderState`
-- `Microsoft.Agents.AI::TextSearchProvider.TextSearchResult`
-- `Microsoft.Agents.AI::TextSearchProviderOptions`
-- `Microsoft.Agents.AI::TextSearchProviderOptions.TextSearchBehavior`
 - `Microsoft.Agents.AI::ToolApprovalAgentBuilderExtensions`
 - `Microsoft.Agents.AI::ToolCalledMode`
 - `Microsoft.Agents.AI.Compaction::ChatReducerCompactionStrategy`

@@ -681,37 +681,46 @@ fn artifact_to_chat_message(artifact: &Artifact) -> Result<Message> {
 
 /// Map a returned [`Task`] to zero or more [`Message`]s.
 ///
-/// Priority:
-/// 1. If the task is paused in [`TaskState::InputRequired`] and carries a
-///    `status.message`, that message *is* the response — this surfaces what
-///    the remote agent is asking for. This branch has no equivalent in the
-///    Python reference (see the crate docs "Divergences" section): Python
-///    only ever looks at `artifacts`/`history`, so it would silently produce
-///    no messages here unless the server happens to also put the question in
-///    `history`.
-/// 2. Otherwise, mirrors Python's `_task_to_chat_messages`: prefer
-///    `artifacts` (one [`Message`] per artifact), falling back to the
-///    last `history` entry, else no messages at all (the task is still
-///    `working`/`submitted` with nothing to show yet — poll
+/// 1. One [`Message`] per artifact.
+/// 2. Then the task's `status.message`, when the task stopped for a reason
+///    the caller has to see: it is waiting for input or authorization, or it
+///    failed, was cancelled or rejected (or reports a state this crate does
+///    not know). Routine progress (`submitted`, `working`) and successful
+///    completion carry nothing the artifacts do not, so their status message
+///    is skipped. This follows .NET's `AgentTaskStatus.ToChatMessage`
+///    (upstream #9534); before it, a failed task returned only its
+///    artifacts, and the reason it gave for failing was lost. Python looks
+///    only at artifacts and history here, so for `input-required` it would
+///    produce no question unless the server also put it in `history` (see
+///    the crate docs "Divergences" section).
+/// 3. If neither produced anything, Python's `_task_to_chat_messages`
+///    fallback: the last `history` entry, else no messages at all (the task
+///    is still `working`/`submitted` with nothing to show yet — poll
 ///    [`A2AClient::get_task`](crate::client::A2AClient::get_task) for
 ///    updates).
 fn task_to_chat_messages(task: &Task) -> Result<Vec<Message>> {
-    if task.status.state == TaskState::InputRequired {
-        if let Some(msg) = &task.status.message {
-            return Ok(vec![a2a_message_to_chat_message(msg)?]);
+    let mut messages = match &task.artifacts {
+        Some(artifacts) => artifacts
+            .iter()
+            .map(artifact_to_chat_message)
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    let surfaces_status = !matches!(
+        task.status.state,
+        TaskState::Submitted | TaskState::Working | TaskState::Completed
+    );
+    if surfaces_status {
+        if let Some(msg) = task.status.message.as_ref().filter(|m| !m.parts.is_empty()) {
+            messages.push(a2a_message_to_chat_message(msg)?);
         }
     }
-    if let Some(artifacts) = &task.artifacts {
-        if !artifacts.is_empty() {
-            return artifacts.iter().map(artifact_to_chat_message).collect();
+    if messages.is_empty() {
+        if let Some(last) = task.history.as_ref().and_then(|h| h.last()) {
+            messages.push(a2a_message_to_chat_message(last)?);
         }
     }
-    if let Some(history) = &task.history {
-        if let Some(last) = history.last() {
-            return Ok(vec![a2a_message_to_chat_message(last)?]);
-        }
-    }
-    Ok(Vec::new())
+    Ok(messages)
 }
 
 #[cfg(test)]
@@ -1065,6 +1074,86 @@ mod tests {
         let messages = task_to_chat_messages(&task).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text(), "partial");
+    }
+
+    fn status(state: TaskState, text: &str) -> crate::types::TaskStatus {
+        crate::types::TaskStatus {
+            state,
+            message: Some(A2AMessage {
+                kind: "message".to_string(),
+                role: MessageRole::Agent,
+                parts: vec![Part::Text(TextPart {
+                    text: text.into(),
+                    metadata: None,
+                })],
+                message_id: "s1".into(),
+                task_id: None,
+                context_id: None,
+                metadata: None,
+            }),
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn task_to_chat_messages_keeps_the_reason_an_unsuccessful_task_gives() {
+        // Upstream #9534: the status message of a task that failed, was
+        // cancelled or rejected, or needs authorization follows its artifacts.
+        for state in [
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+            TaskState::AuthRequired,
+            TaskState::Unknown,
+        ] {
+            let mut task = completed_task(vec![artifact("art-1", "partial")]);
+            task.status = status(state, "quota exceeded");
+            let texts: Vec<String> = task_to_chat_messages(&task)
+                .unwrap()
+                .iter()
+                .map(Message::text)
+                .collect();
+            assert_eq!(texts, ["partial", "quota exceeded"], "{state:?}");
+        }
+    }
+
+    #[test]
+    fn task_to_chat_messages_prefers_a_failure_reason_to_history() {
+        let mut task = completed_task(vec![]);
+        task.history = Some(vec![A2AMessage {
+            kind: "message".into(),
+            role: MessageRole::User,
+            parts: vec![Part::Text(TextPart {
+                text: "do the thing".into(),
+                metadata: None,
+            })],
+            message_id: "h1".into(),
+            task_id: None,
+            context_id: None,
+            metadata: None,
+        }]);
+        task.status = status(TaskState::Failed, "it broke");
+        let messages = task_to_chat_messages(&task).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "it broke");
+    }
+
+    #[test]
+    fn task_to_chat_messages_skips_routine_status_messages() {
+        for state in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::Completed,
+        ] {
+            let mut task = completed_task(vec![artifact("art-1", "result")]);
+            task.status = status(state, "progress note");
+            let texts: Vec<String> = task_to_chat_messages(&task)
+                .unwrap()
+                .iter()
+                .map(Message::text)
+                .collect();
+            assert_eq!(texts, ["result"], "{state:?}");
+        }
     }
 
     #[test]

@@ -90,10 +90,14 @@ pub mod memory;
 pub mod middleware;
 pub mod observability;
 pub mod session;
+#[cfg(feature = "experimental-session-store")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-session-store")))]
+pub mod session_store;
 pub mod settings;
 pub mod skills;
 pub mod storage_keys;
 pub mod streaming;
+pub mod text_search;
 pub mod tools;
 pub mod types;
 #[cfg(feature = "experimental-vector-stores")]

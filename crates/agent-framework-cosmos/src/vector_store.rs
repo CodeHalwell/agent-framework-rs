@@ -1430,7 +1430,7 @@ impl VectorCollection for CosmosVectorCollection {
                 )));
             }
             self.client
-                .upsert_document(&self.database, &self.container, &key, &stored)
+                .upsert_document(&self.database, &self.container, &[&key], &stored)
                 .await
                 .map_err(|e| {
                     // Each record is its own request, so a mid-batch failure
@@ -1456,7 +1456,7 @@ impl VectorCollection for CosmosVectorCollection {
             // out.
             let found = self
                 .client
-                .get_document(&self.database, &self.container, &key, &key)
+                .get_document(&self.database, &self.container, &[&key], &key)
                 .await?;
             out.push(match found {
                 Some(document) => Some(self.definition.from_storage(&document, include_vectors)?),
@@ -1470,7 +1470,7 @@ impl VectorCollection for CosmosVectorCollection {
         for key in keys {
             let key = validate_key(&key)?;
             self.client
-                .delete_document(&self.database, &self.container, &key, &key)
+                .delete_document(&self.database, &self.container, &[&key], &key)
                 .await?;
         }
         Ok(())
