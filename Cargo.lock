@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-framework"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-a2a",
  "agent-framework-anthropic",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-a2a"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-anthropic"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-azure",
  "agent-framework-bedrock",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-azure"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-azure-ai-search"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-azure",
  "agent-framework-core",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-bedrock"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-copilotstudio"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-cosmos"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-azure",
  "agent-framework-core",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-declarative"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-foundry"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-azure",
  "agent-framework-core",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-foundry-local"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-gemini"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-github-copilot"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-hosting"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-mem0"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-mistral"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-ollama"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "agent-framework-openai",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-openai"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-purview"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-redis"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "agent-framework-tools"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "agent-framework-core",
  "async-trait",

@@ -5,6 +5,105 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [0.14.0] — 2026-10-21
+
+A parity and roadmap release. Four upstream fixes from the window ending
+at `02005995` (2026-10-21), recorded in
+[`docs/drift/2026-10-21-02005995.md`](docs/drift/2026-10-21-02005995.md),
+then four of the gaps that pass confirmed: a **session store**, a
+**text-search context provider**, **file memory** for the agent harness,
+and Cosmos chat metadata that no longer depends on the partition strategy.
+It also fixes a bug where `Agent` sent earlier turns to a service that
+already held them.
+
+There are no breaking API changes. Four behaviour changes are listed under
+*Changed*.
+
+### Added
+
+- **Session store** (`agent_framework_core::session_store`, behind the new
+  `experimental-session-store` feature). Ports .NET's `AgentSessionStore`,
+  including `DeleteSessionAsync` (upstream #8801), and Python's
+  `SessionStore`/`FileSessionStore`. The `AgentSessionStore` trait saves,
+  gets, gets-or-creates and deletes sessions by `AgentSessionStoreKey`, a
+  session id with ordered named partitions. `InMemoryAgentSessionStore` and
+  `FileAgentSessionStore` are included. The file store encodes each path
+  component injectively (so two keys never share a file, even on a
+  case-insensitive disk or where Windows reserves a device name) and writes
+  through a temporary file and a rename. Snapshots carry an in-memory
+  history provider's messages through the new provided method
+  `ContextProvider::snapshot_history`, so a restored session carries on its
+  conversation.
+- **Text-search context provider** (`agent_framework_core::text_search`,
+  stable). Ports .NET's `TextSearchProvider` and Go's `textsearch`.
+  `TextSearchProvider` wraps any async search function. By default it
+  searches the run's input before each call and adds the results ahead of
+  it. With `TextSearchBehavior::OnDemandFunctionCalling` it offers a
+  `Search` tool instead. Optional recent-message memory searches a
+  follow-up together with the messages before it. A failed search does not
+  fail the run, and the memory is updated under a lock so runs on clones
+  of one session do not lose each other's messages. The default context
+  format matches upstream byte for byte.
+- **File memory for the agent harness** (`experimental-harness`). Ports
+  upstream's file store and `FileMemoryProvider` from Python, .NET and Go:
+  - `AgentFileStore`, with `InMemoryAgentFileStore` and
+    `FileSystemAgentFileStore`. Paths are normalized and cannot leave the
+    root. The disk store refuses symbolic links (Windows junctions
+    included). Paths with a colon, a segment ending in `.` or a space, or a
+    Windows device name such as `nul` or `COM¹` are refused on every
+    platform, so a path means the same thing wherever the store runs.
+  - Shared helpers for fnmatch-style globs, case-insensitive regex search
+    (patterns capped at 256 characters, the whole search bounded by a
+    10-second timeout), and literal and line-based edits.
+  - `FileMemoryProvider` provides seven `file_memory_*` tools, keeps
+    descriptions in sidecar files, and rebuilds a `memories.md` index that
+    is given to the next run. Memories are kept per session by default, or
+    per explicit scope with `with_scope`, which gets instructions saying
+    the files are shared.
+  - `regex` is a new optional dependency of `agent-framework-core`,
+    enabled by `experimental-harness`.
+- **Cosmos chat metadata** (upstream #9214). `CosmosChatMessageStore`
+  gains `with_tenant_id` and `with_user_id`, which write `tenantId` and
+  `userId` on every message document whatever the partition strategy. The
+  new `CosmosPartitionStrategy` keeps `ThreadId` as the default, and adds
+  `Hierarchical`, which partitions on tenant, user and thread with a
+  MultiHash key. Both ids survive `serialize` and `from_state`.
+
+### Changed
+
+- `Agent` leaves history providers out of a run when the service stores
+  the conversation: when the session has a service id, or the run's
+  options carry a conversation id (a default or a per-run override). This
+  ports .NET's `ResolveChatHistoryProvider`. It always behaves as .NET's
+  `ClearOnChatHistoryProviderConflict` does and never warns or throws.
+  The fix for #57 is under *Fixed*.
+- `ToolApprovalRule::tool` keeps the tool name exactly as given (upstream
+  #9557). It used to trim it, so a standing approval for `run_shell `
+  approved `run_shell`. An empty or whitespace-only name is still refused.
+- `ToolApprovalAgent` refuses a batch with two live approval requests under
+  one id (upstream #9542). It discards the state held under the duplicated
+  id and fails the run with `Error::AgentExecution`, so the answer to one
+  request can no longer stand in for the other.
+- An A2A task's status message is now kept for every state except
+  `submitted`, `working` and `completed` (upstream #9534), and comes after
+  the artifacts. For `input-required`, a task with artifacts and a question
+  now returns both, not only the question.
+
+### Fixed
+
+- `Agent` no longer sends earlier turns twice when the service holds the
+  conversation (#57). A reply with a conversation id, which OpenAI
+  Responses gives by default, was adopted while the auto-attached
+  `InMemoryHistoryProvider` kept loading and recording. The next request
+  replayed the earlier turns and also set `conversation_id`. Streaming
+  runs were affected in the same way.
+- An approval answer repeated after its call had already run executed the
+  call again (upstream #9535). The function-invocation loop now tracks
+  approval requests as well as responses, and a response to a request that
+  is already closed is settled on arrival.
+- A failed, cancelled or rejected A2A task no longer drops the reason it
+  gave in its status message (upstream #9534).
+
 ## [0.13.0] — 2026-10-19
 
 A parity release from the upstream window `a75e803e..9d308951`
