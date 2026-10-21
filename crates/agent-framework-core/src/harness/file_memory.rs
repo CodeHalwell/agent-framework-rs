@@ -126,7 +126,9 @@ struct Inner {
     scope: Option<String>,
     /// `None` until replaced: the default then depends on the scope.
     instructions: Option<String>,
-    write_lock: tokio::sync::Mutex<()>,
+    /// Shared by every provider derived from one with a builder method,
+    /// since they write to the same store.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FileMemoryProvider {
@@ -147,20 +149,20 @@ impl FileMemoryProvider {
                 source_id: DEFAULT_FILE_MEMORY_SOURCE_ID.to_string(),
                 scope: None,
                 instructions: None,
-                write_lock: tokio::sync::Mutex::new(()),
+                write_lock: Arc::new(tokio::sync::Mutex::new(())),
             }),
         }
     }
 
-    /// A provider with this one's configuration changed by `f`. It gets a
-    /// fresh write lock, so calling a builder method on a clone is fine.
+    /// A provider with this one's configuration changed by `f`, so calling a
+    /// builder method on a clone is fine. It shares this one's write lock.
     fn update(self, f: impl FnOnce(&mut Inner)) -> Self {
         let mut inner = Inner {
             store: self.inner.store.clone(),
             source_id: self.inner.source_id.clone(),
             scope: self.inner.scope.clone(),
             instructions: self.inner.instructions.clone(),
-            write_lock: tokio::sync::Mutex::new(()),
+            write_lock: self.inner.write_lock.clone(),
         };
         f(&mut inner);
         Self {
@@ -710,5 +712,17 @@ mod tests {
         assert!(is_internal_file("Memories.MD"));
         assert!(is_internal_file("x_DESCRIPTION.md"));
         assert!(!is_internal_file("notes.md"));
+    }
+
+    #[test]
+    fn derived_providers_share_one_write_lock() {
+        // They write to the same store, so their writes must not interleave.
+        let store = Arc::new(super::super::file_store::InMemoryAgentFileStore::new());
+        let base = FileMemoryProvider::new(store).with_scope("user-1");
+        let derived = base.clone().with_instructions("Use memory.");
+        assert!(Arc::ptr_eq(
+            &base.inner.write_lock,
+            &derived.inner.write_lock
+        ));
     }
 }
