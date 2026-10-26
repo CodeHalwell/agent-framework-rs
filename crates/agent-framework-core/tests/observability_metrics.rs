@@ -429,3 +429,88 @@ fn function_invocation_duration_records_tool_name_and_error_type() {
         Some("tool")
     );
 }
+
+/// The histogram's dimension set is a cross-language contract (upstream
+/// #9592 pins the same four, plus `error.type` on a failure), so it is
+/// asserted exhaustively: a dimension added here that upstream does not emit
+/// splits a shared dashboard's series, and one carrying tool content would
+/// put prompt data in metrics.
+#[test]
+fn function_invocation_duration_dimensions_match_upstream() {
+    let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+    let (provider, exporter) = harness();
+    exporter.reset();
+
+    metrics::record_function_invocation_duration("my_tool", Duration::from_millis(5), None);
+    metrics::record_function_invocation_duration(
+        "flaky_tool",
+        Duration::from_millis(1),
+        Some("tool"),
+    );
+
+    provider.force_flush().unwrap();
+    let finished = exporter.get_finished_metrics().unwrap();
+    let metric = find_metric(&finished, FUNCTION_INVOCATION_DURATION_METRIC)
+        .unwrap_or_else(|| panic!("{FUNCTION_INVOCATION_DURATION_METRIC} not recorded"));
+    let opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+        opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
+    ) = metric.data()
+    else {
+        panic!("expected an f64 histogram for {FUNCTION_INVOCATION_DURATION_METRIC}");
+    };
+
+    let mut by_tool: Vec<(String, Vec<(String, String)>)> = hist
+        .data_points()
+        .map(|p| {
+            let mut attrs: Vec<(String, String)> = p
+                .attributes()
+                .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                .collect();
+            attrs.sort();
+            let tool = attrs
+                .iter()
+                .find(|(k, _)| k == "gen_ai.tool.name")
+                .map(|(_, v)| v.clone())
+                .expect("gen_ai.tool.name is a dimension");
+            (tool, attrs)
+        })
+        .collect();
+    by_tool.sort();
+
+    assert_eq!(
+        by_tool,
+        vec![
+            (
+                "flaky_tool".to_string(),
+                vec![
+                    (
+                        "agent_framework.function.name".to_string(),
+                        "flaky_tool".to_string()
+                    ),
+                    ("error.type".to_string(), "tool".to_string()),
+                    (
+                        "gen_ai.operation.name".to_string(),
+                        "execute_tool".to_string()
+                    ),
+                    ("gen_ai.tool.name".to_string(), "flaky_tool".to_string()),
+                    ("gen_ai.tool.type".to_string(), "function".to_string()),
+                ]
+            ),
+            (
+                "my_tool".to_string(),
+                vec![
+                    (
+                        "agent_framework.function.name".to_string(),
+                        "my_tool".to_string()
+                    ),
+                    (
+                        "gen_ai.operation.name".to_string(),
+                        "execute_tool".to_string()
+                    ),
+                    ("gen_ai.tool.name".to_string(), "my_tool".to_string()),
+                    ("gen_ai.tool.type".to_string(), "function".to_string()),
+                ]
+            ),
+        ]
+    );
+}

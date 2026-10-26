@@ -415,8 +415,31 @@ pub fn apply_inference_config(body: &mut Map<String, Value>, options: &ChatOptio
 }
 
 /// Parse a Bedrock `Converse` API response body into a [`ChatResponse`].
-pub fn parse_response(value: &Value) -> ChatResponse {
-    let mut response = ChatResponse::default();
+///
+/// `request_model` is the `modelId` the request was sent with. Converse does
+/// not echo the model back in its response body, so without it the parsed
+/// [`ChatResponse::model`] would always be `None` — losing the one place a
+/// caller can see which model actually served a run, and leaving a
+/// per-request `ChatOptions::model` override invisible on the response
+/// (upstream #9399). A `modelId` present in the body is still preferred, in
+/// case a future API revision starts returning one.
+pub fn parse_response(value: &Value, request_model: &str) -> ChatResponse {
+    let model = value
+        .get("modelId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("output")
+                .and_then(|o| o.get("modelId"))
+                .and_then(Value::as_str)
+        })
+        .map(String::from)
+        .unwrap_or_else(|| request_model.to_string());
+
+    let mut response = ChatResponse {
+        model: Some(model),
+        ..Default::default()
+    };
 
     let message = value.get("output").and_then(|o| o.get("message"));
     if let Some(message) = message {
@@ -944,7 +967,7 @@ mod tests {
             "stopReason": "end_turn",
             "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 },
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, "amazon.titan-text");
         assert_eq!(resp.text(), "Hello!");
         assert_eq!(resp.finish_reason, Some(FinishReason::stop()));
         let usage = resp.usage_details.unwrap();
@@ -969,7 +992,7 @@ mod tests {
             ] } },
             "stopReason": "tool_use",
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, "amazon.titan-text");
 
         let reasoning: Vec<&TextReasoningContent> = resp.messages[0]
             .contents
@@ -1012,7 +1035,7 @@ mod tests {
             ] } },
             "stopReason": "end_turn",
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, "amazon.titan-text");
         let (_, turns) = messages_to_bedrock(&resp.messages);
         let blocks = turns
             .iter()
@@ -1068,7 +1091,7 @@ mod tests {
             ] } },
             "stopReason": "tool_use",
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, "amazon.titan-text");
         assert_eq!(resp.finish_reason, Some(FinishReason::tool_calls()));
         let calls = resp.function_calls();
         assert_eq!(calls.len(), 1);
@@ -1105,10 +1128,36 @@ mod tests {
 
     #[test]
     fn parse_response_missing_fields_defaults_gracefully() {
-        let resp = parse_response(&json!({}));
+        let resp = parse_response(&json!({}), "amazon.titan-text");
         assert!(resp.messages.is_empty());
         assert_eq!(resp.finish_reason, None);
         assert_eq!(resp.usage_details, None);
+    }
+
+    /// Regression (upstream #9399): Converse's response body carries no
+    /// `modelId`, so the model a run was served by has to come from the
+    /// request. Before the fix `ChatResponse::model` was always `None` here —
+    /// on both the buffered and the streaming path, which derives its update
+    /// from the same parsed response.
+    #[test]
+    fn parse_response_reports_the_requested_model() {
+        let value = json!({
+            "output": { "message": { "role": "assistant", "content": [{ "text": "hi" }] } },
+            "stopReason": "end_turn",
+        });
+        let resp = parse_response(&value, "us.anthropic.claude-sonnet-4");
+        assert_eq!(resp.model.as_deref(), Some("us.anthropic.claude-sonnet-4"));
+    }
+
+    /// A `modelId` the service does return still wins over the request's.
+    #[test]
+    fn parse_response_prefers_a_model_the_body_reports() {
+        let value = json!({
+            "modelId": "amazon.titan-text-express-v1",
+            "output": { "message": { "role": "assistant", "content": [{ "text": "hi" }] } },
+        });
+        let resp = parse_response(&value, "us.anthropic.claude-sonnet-4");
+        assert_eq!(resp.model.as_deref(), Some("amazon.titan-text-express-v1"));
     }
 
     // endregion

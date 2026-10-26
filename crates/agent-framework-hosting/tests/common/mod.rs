@@ -80,6 +80,84 @@ impl SupportsAgentRun for StreamingAgent {
     }
 }
 
+/// The error text a [`FailingAgent`] produces. Stands in for everything a
+/// real run failure drags along — a provider's raw error body, a connection
+/// string, a local path — none of which belongs in a client-visible reply.
+pub const LEAKY_ERROR_TEXT: &str =
+    "upstream 401 from https://acct.openai.azure.com: api-key sk-secret-abc123 rejected";
+
+/// How a [`FailingAgent`] fails.
+#[derive(Clone, Copy)]
+pub enum FailWhen {
+    /// `run` and `run_stream` both return `Err` before producing anything.
+    OnCall,
+    /// `run_stream` opens, yields one delta, then yields `Err`.
+    MidStream,
+}
+
+/// An agent that fails with [`LEAKY_ERROR_TEXT`], so a test can assert the
+/// hosted surface does not pass that text on to the caller.
+pub struct FailingAgent {
+    id: String,
+    when: FailWhen,
+}
+
+impl FailingAgent {
+    pub fn new(id: impl Into<String>, when: FailWhen) -> Self {
+        Self {
+            id: id.into(),
+            when,
+        }
+    }
+
+    pub fn arc(self) -> Arc<dyn SupportsAgentRun> {
+        Arc::new(self)
+    }
+}
+
+#[async_trait]
+impl SupportsAgentRun for FailingAgent {
+    async fn run(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<&mut AgentSession>,
+    ) -> Result<AgentResponse> {
+        Err(agent_framework_core::Error::Service(
+            LEAKY_ERROR_TEXT.to_string(),
+        ))
+    }
+
+    async fn run_stream(
+        &self,
+        _messages: Vec<Message>,
+        _session: Option<AgentSession>,
+        _options: Option<AgentRunOptions>,
+    ) -> Result<AgentRunStream> {
+        match self.when {
+            FailWhen::OnCall => Err(agent_framework_core::Error::Service(
+                LEAKY_ERROR_TEXT.to_string(),
+            )),
+            FailWhen::MidStream => {
+                let items: Vec<Result<AgentResponseUpdate>> = vec![
+                    Ok(AgentResponseUpdate {
+                        contents: vec![Content::text("partial ")],
+                        role: Some(Role::assistant()),
+                        ..Default::default()
+                    }),
+                    Err(agent_framework_core::Error::Service(
+                        LEAKY_ERROR_TEXT.to_string(),
+                    )),
+                ];
+                Ok(futures::stream::iter(items).boxed())
+            }
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// An agent whose `run_stream` yields an effectively unbounded sequence of
 /// text deltas, tracking how many it produced and flipping a `cancelled` flag
 /// when the stream is dropped. Lets a test assert that a disconnected client

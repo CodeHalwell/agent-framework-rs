@@ -139,6 +139,25 @@ fn fill_request_body(
         body.entry(k.clone()).or_insert_with(|| v.clone());
     }
 
+    // Anthropic exposes parallel tool use *only* through `tool_choice`
+    // (`disable_parallel_tool_use`), so a caller who sets
+    // `allow_multiple_tool_calls` without a `tool_choice` would otherwise have
+    // it silently dropped — including on every turn after the
+    // function-invocation loop stops pinning `tool_choice` (upstream #8980).
+    // Carry it on the API's default `auto` mode instead.
+    //
+    // Only when the request actually declares `tools`: `tool_choice` with no
+    // tools is rejected by the API. As upstream, `mcp_servers` alone does not
+    // count. `or_insert_with` keeps this a *derived default* — an explicit
+    // `options.tool_choice` (inserted above) and a caller's own
+    // `additional_properties["tool_choice"]` (merged just above) both win.
+    if let Some(allow) = options.allow_multiple_tool_calls {
+        if body.contains_key("tools") {
+            body.entry("tool_choice".to_string())
+                .or_insert_with(|| tool_choice_to_anthropic(&ToolMode::Auto, Some(allow)));
+        }
+    }
+
     if stream {
         body.insert("stream".into(), json!(true));
     }
@@ -1397,6 +1416,89 @@ mod tests {
             body["tool_choice"],
             json!({ "type": "auto", "disable_parallel_tool_use": true })
         );
+    }
+
+    /// Regression (upstream #8980): Anthropic only exposes parallel tool use
+    /// through `tool_choice`, so `allow_multiple_tool_calls` set *without* a
+    /// `tool_choice` must still reach the wire on the default `auto` mode.
+    /// Before the fix the setting was dropped and the model was free to
+    /// emit parallel calls a caller had explicitly disabled.
+    #[test]
+    fn build_request_allow_multiple_tool_calls_without_tool_choice() {
+        let mut options = ChatOptions::new().with_tool(weather_tool());
+        options.allow_multiple_tool_calls = Some(false);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "auto", "disable_parallel_tool_use": true })
+        );
+    }
+
+    /// The same derived default carries `true` as `disable_parallel_tool_use:
+    /// false`, which is how a caller re-enables parallel use against a
+    /// provider default they do not control.
+    #[test]
+    fn build_request_allow_multiple_tool_calls_true_without_tool_choice() {
+        let mut options = ChatOptions::new().with_tool(weather_tool());
+        options.allow_multiple_tool_calls = Some(true);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "auto", "disable_parallel_tool_use": false })
+        );
+    }
+
+    /// `tool_choice` with no `tools` is rejected by the API, so the derived
+    /// default only applies to a request that declares some.
+    #[test]
+    fn build_request_allow_multiple_tool_calls_without_tools_sends_no_tool_choice() {
+        let mut options = ChatOptions::new();
+        options.allow_multiple_tool_calls = Some(false);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    /// An explicit `tool_choice` still wins: the derived default must not
+    /// downgrade a `Required` pin to `auto`.
+    #[test]
+    fn build_request_explicit_tool_choice_beats_the_derived_default() {
+        let mut options = ChatOptions::new()
+            .with_tool(weather_tool())
+            .with_tool_choice(ToolMode::Required(None));
+        options.allow_multiple_tool_calls = Some(false);
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "any", "disable_parallel_tool_use": true })
+        );
+    }
+
+    /// So does a caller's own `additional_properties["tool_choice"]`, which is
+    /// merged before the default is derived.
+    #[test]
+    fn build_request_additional_properties_tool_choice_beats_the_derived_default() {
+        let mut options = ChatOptions::new().with_tool(weather_tool());
+        options.allow_multiple_tool_calls = Some(false);
+        options.additional_properties.insert(
+            "tool_choice".into(),
+            json!({ "type": "tool", "name": "get_weather" }),
+        );
+        let body = build_request(&[user("hi")], &options, "claude-x", 4096, false);
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "get_weather" })
+        );
+    }
+
+    fn weather_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "get_weather".into(),
+            description: "Get the weather".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            kind: ToolKind::Function,
+            approval_mode: ApprovalMode::NeverRequire,
+            executor: None,
+        }
     }
 
     #[test]

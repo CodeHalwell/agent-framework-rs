@@ -71,10 +71,14 @@ from the roadmap, not from this file.
   to build on.
 - **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
   on the Agent Memory Toolkit), the dedicated Application Insights exporter,
-  and Cosmos chat history decoupled from its partition-key strategy
-  (upstream #9214: tenant/user metadata persisted whatever the strategy, plus
-  a caller-chosen partition key). `CosmosChatMessageStore` partitions by
-  `threadId` alone and carries no tenant/user fields.
+  and a session store backed by Azure storage. The last one is an
+  implementation of the ported `session_store` abstraction, not new surface:
+  upstream's `AzureBlobAgentSessionStore`
+  (`Microsoft.Agents.AI.Hosting.AzureStorage`) saves, gets and deletes a
+  serialized session as a blob, which `agent-framework-azure`'s Entra
+  credential chain and `azure_http_client` already have what is needed to
+  reach — or `azure_storage_blob` 1.1, which shares the `azure_core` 1.x
+  line the optional `entra-sdk` feature already pulls.
 - **A framework `User-Agent` outside the Azure crates**. The Azure-facing
   crates send `agent-framework-rust/<version> (<component>)` via
   `agent_framework_azure::azure_http_client`; the other provider clients, and

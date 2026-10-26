@@ -10,8 +10,8 @@ use serde_json::json;
 
 use common::{
     echo_workflow, get_json, parse_sse, parse_sse_json, post_json, post_raw,
-    AnnounceThenStreamAgent, MockAgent, RecordingAgent, ResolvedCallAgent, StreamStep,
-    StreamingAgent, ToolCallingAgent,
+    AnnounceThenStreamAgent, FailWhen, FailingAgent, MockAgent, RecordingAgent, ResolvedCallAgent,
+    StreamStep, StreamingAgent, ToolCallingAgent, LEAKY_ERROR_TEXT,
 };
 
 fn host() -> AgentHost {
@@ -837,4 +837,95 @@ async fn an_ordinary_input_item_still_reaches_the_agent_as_text() {
         .contents
         .iter()
         .all(|c| c.as_function_result().is_none()));
+}
+
+// ---------------------------------------------------------------------------
+// A failed run says nothing about why (upstream #9460)
+// ---------------------------------------------------------------------------
+
+fn failing_host(when: FailWhen) -> AgentHost {
+    AgentHost::new().agent("broken", FailingAgent::new("broken-1", when).arc())
+}
+
+/// Regression (upstream #9460): the SSE `error` event used to carry the run
+/// error's own text, so a provider's error body — credentials, endpoints,
+/// whatever the failing layer quoted — reached the caller verbatim.
+#[tokio::test]
+async fn a_stream_that_fails_to_start_does_not_echo_the_error() {
+    let body = json!({ "model": "broken", "input": "hi", "stream": true });
+    let (status, text) = post_raw(
+        failing_host(FailWhen::OnCall).into_router(),
+        "/v1/responses",
+        body.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        !text.contains("sk-secret-abc123") && !text.contains("acct.openai.azure.com"),
+        "the error's text reached the client: {text}"
+    );
+    let events = parse_sse_json(&text);
+    let error = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("an error event");
+    assert_eq!(
+        error["message"],
+        "Request execution failed: an internal server error occurred."
+    );
+}
+
+/// The same holds for a stream that fails after it has already produced
+/// output, which takes the other of the two call sites.
+#[tokio::test]
+async fn a_stream_that_fails_midway_does_not_echo_the_error() {
+    let body = json!({ "model": "broken", "input": "hi", "stream": true });
+    let (status, text) = post_raw(
+        failing_host(FailWhen::MidStream).into_router(),
+        "/v1/responses",
+        body.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !text.contains(LEAKY_ERROR_TEXT),
+        "the error's text reached the client: {text}"
+    );
+
+    let events = parse_sse_json(&text);
+    // The partial output still arrives; only the reason is withheld.
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "response.output_text.delta"));
+    let error = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("an error event");
+    assert_eq!(
+        error["message"],
+        "Request execution failed: an internal server error occurred."
+    );
+}
+
+/// And for the non-streaming 500 body, which leaked the same text.
+#[tokio::test]
+async fn a_failed_run_does_not_echo_the_error_in_its_500() {
+    let request = json!({ "model": "broken", "input": "hi" });
+    let (status, body) = post_json(
+        failing_host(FailWhen::OnCall).into_router(),
+        "/v1/responses",
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        body["error"]["message"],
+        "Request execution failed: an internal server error occurred."
+    );
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        !body.to_string().contains("sk-secret-abc123"),
+        "the error's text reached the client: {body}"
+    );
 }
