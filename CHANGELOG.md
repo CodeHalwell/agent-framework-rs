@@ -5,6 +5,85 @@ on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: minor bumps
 may break APIs).
 
+## [Unreleased]
+
+Upstream drift from the window ending at `67ba500e` (2026-10-24), recorded
+in [`docs/drift/2026-10-26-67ba500e.md`](docs/drift/2026-10-26-67ba500e.md).
+Five changes, three of them defects that were live in this port. One
+behaviour change is listed under *Changed*.
+
+### Security
+
+- The hosted Responses surface no longer tells a client why a run failed
+  (upstream #9460). `devui`'s SSE `error` event and its 500 body carried the
+  run error's own text, which can be a provider's raw HTTP error body, a
+  tool's error text, a deserialization message naming internal types or a
+  filesystem path from a message store — and the router is unauthenticated
+  unless `with_bearer_token` was set. The caller now gets a fixed message;
+  the detail is logged, correlated by the stream's response id, with the
+  error's compact type always logged and its full text gated on
+  `ENABLE_SENSITIVE_DATA`. The hosting layer's own validation messages are
+  unchanged. AG-UI's `RUN_ERROR` events are **not** covered: upstream has
+  not made that call for its AG-UI surface, so it is recorded as a
+  divergence to decide rather than changed unilaterally.
+- A cross-site `POST` no longer reaches the hosted agents (upstream #9575).
+  The `Host` allowlist stops DNS rebinding but not a browser: a page on any
+  origin can make the user's browser `POST
+  http://localhost:8080/v1/responses` with `Host: localhost`, which the
+  allowlist allows. `host_guard` now also rejects `Sec-Fetch-Site:
+  cross-site` and a mismatched `Origin` on state-changing methods. See
+  *Changed*.
+- The bearer token is compared in constant time rather than with `==`, and
+  the `Authorization` scheme is matched case-insensitively with the
+  credential trimmed, per RFC 7235 and upstream.
+
+### Fixed
+
+- `allow_multiple_tool_calls` is no longer dropped by the Anthropic client
+  when no `tool_choice` is set (upstream #8980). Anthropic exposes parallel
+  tool use only as `tool_choice.disable_parallel_tool_use`, and the setting
+  was a parameter of a conversion that only ran when a `tool_choice` was
+  present — so a caller who disabled parallel calls and left `tool_choice`
+  alone got them anyway, as did every turn after the function-invocation
+  loop stopped pinning `tool_choice`. It is now carried on the default
+  `auto` mode, as a derived default an explicit `tool_choice` or an
+  `additional_properties["tool_choice"]` still overrides, and only when the
+  request declares `tools`.
+- The Bedrock client reports which model served a run (upstream #9399).
+  `ChatResponse::model` was always `None`: Converse does not echo `modelId`
+  and nothing supplied the request's, so a per-request `ChatOptions::model`
+  override was invisible on the response. Affected the streaming path too,
+  which derives its update from the same parsed response.
+- The tool-invocation duration histogram emits the same dimensions as
+  upstream (#9592): `gen_ai.operation.name`, `gen_ai.tool.name` and
+  `gen_ai.tool.type` alongside `agent_framework.function.name` and
+  `error.type`. The three were missing, which split a dashboard reading
+  both languages' output. This port never had upstream's underlying bug of
+  copying span attributes — and so tool arguments and results — onto the
+  histogram; the new test pins the dimension set exhaustively so it cannot
+  start.
+
+### Changed
+
+- `host_guard` (applied by `with_allowed_hosts` and `into_secure_router`) is
+  now a local-access guard rather than a `Host` allowlist alone: it also
+  rejects cross-site state-changing requests, as above. A caller serving the
+  router to browsers on another origin should leave the allowlist unset,
+  which is upstream's `AllowRemoteAccess`. Two deliberate divergences from
+  upstream, both documented at the call site: the peer address is not
+  checked (it needs `ConnectInfo<SocketAddr>`, which only exists if the
+  caller serves the router with `into_make_service_with_connect_info`), and
+  an `Origin`'s scheme is not compared (a server-side request carries no
+  trustworthy scheme, and only one process can listen on a host and port).
+- **Breaking (minor, pre-1.0):**
+  `agent_framework_bedrock::convert::parse_response` now takes the request's
+  `modelId` as a second argument, which is what lets it report the model (see
+  *Fixed*). It matches
+  `agent_framework_openai::responses::parse_response(value, store)`, which
+  already takes request state this way. The module is public but the function
+  is only called by the crate's own client; a direct caller passes the
+  `modelId` it sent.
+
 ## [0.14.0] — 2026-10-21
 
 A parity and roadmap release. Four upstream fixes from the window ending

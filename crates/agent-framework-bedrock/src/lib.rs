@@ -351,7 +351,7 @@ impl ChatClient for BedrockChatClient {
             .json()
             .await
             .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        Ok(convert::parse_response(&value))
+        Ok(convert::parse_response(&value, &model))
     }
 
     /// Get a streaming response.

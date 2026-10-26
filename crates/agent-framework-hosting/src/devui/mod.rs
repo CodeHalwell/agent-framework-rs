@@ -48,8 +48,10 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
+use agent_framework_core::observability::{error_type, ObservabilityConfig};
 use agent_framework_core::types::{AgentResponse, AgentResponseUpdate, Message};
 use agent_framework_core::workflow::WorkflowEvent;
+use agent_framework_core::Error;
 
 use crate::registry::{AgentRecord, EntityRecord, HostState, WorkflowRecord};
 use crate::responses::{
@@ -225,7 +227,7 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(framing.error_event(&e.to_string())).await;
+                                    let _ = tx.send(framing.error_event(&e)).await;
                                     return;
                                 }
                             }
@@ -241,7 +243,7 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
                         let _ = tx.send(framing.completed()).await;
                     }
                     Err(e) => {
-                        let _ = tx.send(framing.error_event(&e.to_string())).await;
+                        let _ = tx.send(framing.error_event(&e)).await;
                     }
                 }
             };
@@ -254,7 +256,7 @@ async fn run_agent(agent: &AgentRecord, request: &ResponsesRequest, model: Strin
     } else {
         let response = match agent.agent.run(messages, None).await {
             Ok(r) => r,
-            Err(e) => return execution_error(e.to_string()),
+            Err(e) => return execution_error(&e),
         };
         Json(agent_response_object(&response, &model, input_len)).into_response()
     }
@@ -485,12 +487,17 @@ impl AgentStreamFraming {
     }
 
     /// An in-band error event for a failure that occurs after streaming began.
-    fn error_event(&mut self, message: &str) -> Value {
+    /// The stream's terminal failure event.
+    ///
+    /// The client is told only that the run failed: the error's own text is
+    /// logged server-side instead (see [`log_run_failure`]).
+    fn error_event(&mut self, err: &Error) -> Value {
+        let message = log_run_failure("stream processing", Some(&self.rid), err);
         let seq = self.next();
         json!({
             "type": "error",
             "sequence_number": seq,
-            "message": format!("Request execution failed: {message}"),
+            "message": message,
         })
     }
 }
@@ -508,7 +515,7 @@ async fn run_workflow(
 
     let run = match workflow.workflow.run(input).await {
         Ok(r) => r,
-        Err(e) => return execution_error(e.to_string()),
+        Err(e) => return execution_error(&e),
     };
 
     let outputs = run.outputs();
@@ -853,16 +860,55 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn execution_error(message: String) -> Response {
+fn execution_error(err: &Error) -> Response {
+    let message = log_run_failure("run", None, err);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(openai_error(
-            format!("Request execution failed: {message}"),
-            "server_error",
-            None,
-        )),
+        Json(openai_error(message, "server_error", None)),
     )
         .into_response()
+}
+
+/// The only failure text a client of this surface is given.
+const PUBLIC_FAILURE_MESSAGE: &str = "Request execution failed: an internal server error occurred.";
+
+/// Log a failed hosted run server-side and return the message a client may
+/// see.
+///
+/// An [`Error`] from a run carries whatever the failing layer put in it: a
+/// provider's raw HTTP body, a tool's own error text, a deserialization
+/// message naming internal types, a filesystem path from a message store.
+/// None of that is part of this surface's wire contract, and all of it used
+/// to be copied verbatim into the SSE `error` event and the 500 body — which
+/// reach an unauthenticated caller whenever the router is served without
+/// [`crate::AgentHost::with_bearer_token`] (upstream #9460).
+///
+/// So the caller gets [`PUBLIC_FAILURE_MESSAGE`] and the detail goes to the
+/// log, correlated by the stream's response id where there is one. The
+/// compact error type is always logged; the error's full text only when
+/// `ENABLE_SENSITIVE_DATA` is set, which is the same gate
+/// [`agent_framework_core::observability`] puts on message content, since an
+/// error message can quote the prompt that caused it.
+///
+/// This covers run failures only. The hosting layer's *own* validation
+/// messages ("Pending interrupts require a resume entry…", the host and
+/// bearer guards' replies) are part of the contract and are returned
+/// unchanged.
+fn log_run_failure(phase: &str, response_id: Option<&str>, err: &Error) -> &'static str {
+    let kind = error_type(err);
+    let response_id = response_id.unwrap_or("-");
+    if ObservabilityConfig::from_env().enable_sensitive_data {
+        tracing::error!(
+            phase,
+            response_id,
+            error_type = %kind,
+            error = %err,
+            "hosted run failed"
+        );
+    } else {
+        tracing::error!(phase, response_id, error_type = %kind, "hosted run failed");
+    }
+    PUBLIC_FAILURE_MESSAGE
 }
 
 /// DevUI's fallback usage estimate (~4 characters per token) for runs that

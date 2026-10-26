@@ -186,8 +186,12 @@ impl AgentHost {
         self
     }
 
-    /// Reject (403) requests whose `Host` header isn't one of `hosts`
-    /// (anti-DNS-rebinding; ports are ignored). Opt-in: unset by default, so
+    /// Apply the local-access guard: reject (403) requests whose `Host`
+    /// header isn't one of `hosts` (anti-DNS-rebinding; ports are ignored),
+    /// and reject a cross-site browser request on a state-changing method,
+    /// which the allowlist alone does not — a page on any origin can have the
+    /// browser `POST` to `localhost`, and the browser sends `Host:
+    /// localhost`. Opt-in: unset by default, so
     /// [`AgentHost::into_router`] is unaffected unless this is called. See
     /// [`crate::security::host_guard`].
     pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
@@ -291,10 +295,14 @@ impl AgentHost {
     }
 
     /// [`AgentHost::into_router`], but secure by default: if
-    /// [`AgentHost::with_allowed_hosts`] was never called, the anti-DNS-
-    /// rebinding `Host` guard is still applied with the default loopback
-    /// allowlist (`localhost`, `127.0.0.1`, `[::1]`, any port). Bearer auth
-    /// stays opt-in — call [`AgentHost::with_bearer_token`] to require it.
+    /// [`AgentHost::with_allowed_hosts`] was never called, the local-access
+    /// guard is still applied with the default loopback allowlist
+    /// (`localhost`, `127.0.0.1`, `[::1]`, any port). That guard is the
+    /// anti-DNS-rebinding `Host` check *and* a rejection of cross-site
+    /// browser requests on state-changing methods — see
+    /// [`crate::security::host_guard`], which explains why the allowlist
+    /// alone does not keep a hostile page out. Bearer auth stays opt-in —
+    /// call [`AgentHost::with_bearer_token`] to require it.
     ///
     /// This does not change [`AgentHost::into_router`] itself; use this method
     /// when you want a safer default entry point (e.g. for `serve`-style

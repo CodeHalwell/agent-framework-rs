@@ -1010,6 +1010,11 @@ pub mod metrics {
     const TOKEN_TYPE_OUTPUT: &str = "output";
     const FUNCTION_NAME: &str = "agent_framework.function.name";
 
+    /// The `gen_ai.tool.type` of a tool this histogram times: the
+    /// function-invocation loop only times local function tools (a hosted
+    /// tool runs inside the provider and is never invoked here).
+    const TOOL_TYPE_FUNCTION: &str = "function";
+
     struct Metrics {
         token_usage: Histogram<u64>,
         operation_duration: Histogram<f64>,
@@ -1149,7 +1154,22 @@ pub mod metrics {
         error_type: Option<&str>,
     ) {
         let m = instruments();
-        let mut attrs = vec![KeyValue::new(FUNCTION_NAME, tool_name.to_string())];
+        // The dimension set is listed explicitly, and matches upstream's
+        // (#9592): the GenAI operation, tool name and tool type, plus the
+        // framework's own `agent_framework.function.name` measurement tag.
+        //
+        // Upstream reached this set by *removing* span attributes it had been
+        // copying wholesale onto the histogram, which put a tool's arguments
+        // and result — and so prompt content — into metric dimensions. This
+        // port has always built the list by hand and never carried those, so
+        // only the three missing dimensions are added here; the cross-language
+        // contract is the point of naming them.
+        let mut attrs = vec![
+            KeyValue::new(attr::OPERATION, op::EXECUTE_TOOL),
+            KeyValue::new(attr::TOOL_NAME, tool_name.to_string()),
+            KeyValue::new(attr::TOOL_TYPE, TOOL_TYPE_FUNCTION),
+            KeyValue::new(FUNCTION_NAME, tool_name.to_string()),
+        ];
         if let Some(err) = error_type {
             attrs.push(KeyValue::new(attr::ERROR_TYPE, err.to_string()));
         }
