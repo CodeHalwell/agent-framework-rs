@@ -421,3 +421,54 @@ async fn agent_history_sessions_survive_a_restart() {
         "prior user + assistant + new input"
     );
 }
+
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn hosted_conversation_turns_save_their_sessions() {
+    use agent_framework_foundry_hosting::{HistorySource, ResponsesHostServer};
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let (storage, _) = double().await;
+        let echo = Echo::default();
+        let router = ResponsesHostServer::agent(agent(echo.clone()))
+            .with_history_source(history)
+            .with_config(FoundryHostConfig {
+                is_hosted: true,
+                session_id: "sandbox".into(),
+                ..FoundryHostConfig::local()
+            })
+            .with_session_store_provider(Arc::new(FoundrySessionStoreProvider::new(storage, None)))
+            .into_router();
+        let mut ids = Vec::new();
+        for input in ["one", "two"] {
+            let mut request = post(
+                "/responses",
+                json!({"input": input, "conversation": "conv_h"}),
+            );
+            request
+                .headers_mut()
+                .insert("x-agent-user-id", "alice".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-agent-foundry-call-id", "call-1".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-agent-foundry-call-id", "call-1".parse().unwrap());
+            let (status, reply) = json(&router, request).await;
+            assert_eq!(status, StatusCode::OK, "{history:?}: {reply}");
+            ids.push(reply["id"].clone());
+        }
+        // The first turn's own session record continues it.
+        let mut request = post(
+            "/responses",
+            json!({"input": "three", "previous_response_id": ids[0]}),
+        );
+        request
+            .headers_mut()
+            .insert("x-agent-user-id", "alice".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-agent-foundry-call-id", "call-1".parse().unwrap());
+        let (status, reply) = json(&router, request).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {reply}");
+    }
+}

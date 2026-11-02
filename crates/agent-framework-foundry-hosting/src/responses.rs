@@ -857,6 +857,10 @@ struct Prepared {
     /// The agent, when resolved before the turn runs (see
     /// [`snapshot_inherited_session`]).
     agent: Option<Arc<dyn SupportsAgentRun>>,
+    /// The host-session handle the turn snapshotted its inherited session
+    /// through, kept for the run: a store tracks the ETags of the records it
+    /// wrote, so the run must replace the snapshot through the same one.
+    sessions: Option<Arc<HostSessions>>,
 }
 
 /// Replies resuming a paused workflow.
@@ -1044,6 +1048,7 @@ async fn create(
         session_out: Arc::default(),
         terminal: Arc::new(inner.terminal(&response_id)),
         agent: None,
+        sessions: None,
         input_items: input_items_of(&create.input, &response_id),
         model: create
             .model
@@ -1642,7 +1647,10 @@ async fn execute(
     let sessions = if host_history {
         None
     } else {
-        Some(server.host_sessions(&request.context)?)
+        Some(match &prepared.sessions {
+            Some(sessions) => sessions.clone(),
+            None => Arc::new(server.host_sessions(&request.context)?),
+        })
     };
     let (mut session, local_history) = match &sessions {
         // The transcript is replayed; only the state bag carries over.
@@ -1866,7 +1874,7 @@ async fn snapshot_inherited_session(
         Target::AgentFactory(factory) => factory().await?,
         Target::Workflow { .. } => return Ok(()),
     };
-    let sessions = server.host_sessions(&prepared.request.context)?;
+    let sessions = Arc::new(server.host_sessions(&prepared.request.context)?);
     sessions
         .copy_or_fresh(
             agent.as_ref(),
@@ -1875,6 +1883,7 @@ async fn snapshot_inherited_session(
         )
         .await?;
     prepared.agent = Some(agent);
+    prepared.sessions = Some(sessions);
     Ok(())
 }
 

@@ -51,6 +51,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   (`fail_interrupted_responses`, with upstream's recovery error);
   `ResponseStore::response_ids` lists stored responses (implemented by the
   in-memory and file stores).
+- Foundry hosting: with `session-store` and a hosted
+  `FoundrySessionStoreProvider`, stored conversation turns under
+  `HistorySource::Agent`/`Service` no longer fail with a storage conflict
+  when saving their session: the turn keeps one request-scoped store from
+  snapshotting its inherited session through the run.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
