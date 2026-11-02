@@ -59,6 +59,13 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - Foundry hosting (`websocket`): `/invocations_ws` reads client frames on
   a separate task, so a handler that isn't reading no longer blocks its own
   output, keepalive pings or the close frame.
+- Foundry hosting: a cancel that arrives after a background turn has stored
+  its final response still closes the turn's replay on that response's final
+  event and schedules its eviction, so replay streams no longer hang.
+- Foundry hosting: `DELETE /responses/{id}` also deletes the agent session
+  the response saved under `HistorySource::Agent`/`Service`, keeping the
+  conversation's own; session saves share the response's cancel/delete lock,
+  so a late write cannot recreate a deleted snapshot.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

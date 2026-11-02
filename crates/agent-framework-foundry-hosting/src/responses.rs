@@ -640,6 +640,45 @@ fn end_replay(inner: &Arc<Inner>, id: &str, replay: &Arc<Replay>) {
     });
 }
 
+/// Close the replay of a background turn that was aborted before closing
+/// it: record `response`'s terminal event (unless the turn already did),
+/// end the replay's streams, and schedule its eviction. A no-op once the
+/// replay is closed.
+fn close_aborted_replay(inner: &Arc<Inner>, id: &str, response: &Value) {
+    let Some(replay) = inner.replays.lock().unwrap().get(id).cloned() else {
+        return;
+    };
+    if replay.done.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let kind = match response["status"].as_str() {
+        Some("cancelled") => "response.cancelled",
+        Some("failed") => "response.failed",
+        Some("incomplete") => "response.incomplete",
+        _ => "response.completed",
+    };
+    let (sequence, recorded) = {
+        let events = replay.events.lock().unwrap();
+        let recorded = events.last().is_some_and(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "response.completed"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+            )
+        });
+        (events.len(), recorded)
+    };
+    if !recorded {
+        replay.push(
+            kind,
+            &json!({"type": kind, "sequence_number": sequence, "response": response}),
+        );
+    }
+    end_replay(inner, id, &replay);
+}
+
 struct Inner {
     server: ResponsesHostServer,
     running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
@@ -1708,8 +1747,14 @@ async fn execute(
     }
     if !host_history && prepared.store {
         // Part of persistence: a session that cannot be saved fails the
-        // turn rather than leaving its continuation unresumable.
-        if let Some(sessions) = &sessions {
+        // turn rather than leaving its continuation unresumable. Under the
+        // response's terminal lock, so a cancel or delete either waits for
+        // these writes or has stopped them: a deleted response's snapshot
+        // is never recreated, and a cancelled one keeps its inherited one.
+        let terminal = prepared.terminal.clone();
+        let state = terminal.state.lock().await;
+        let stopped = state.finalized || terminal.stopping();
+        if let (Some(sessions), false) = (&sessions, stopped) {
             sessions
                 .save(
                     agent.as_ref(),
@@ -1729,6 +1774,7 @@ async fn execute(
                     .await?;
             }
         }
+        drop(state);
     }
     Ok((response, None))
 }
@@ -1947,6 +1993,21 @@ impl HostSessions {
                 },
             };
             sessions.insert(to.to_string(), snapshot);
+            Ok(())
+        }
+    }
+
+    async fn delete(&self, agent: &dyn SupportsAgentRun, key: &str) -> Result<()> {
+        #[cfg(feature = "session-store")]
+        {
+            let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
+            let agent = Namespaced::new(agent, &self.1);
+            self.0.delete_session(&agent, &key).await
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            let _ = agent;
+            self.0.lock().unwrap().remove(key);
             Ok(())
         }
     }
@@ -2425,7 +2486,11 @@ async fn get_response(
     sse(&inner.server.config, rx, None)
 }
 
-async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
+async fn delete_response(
+    State(inner): State<Arc<Inner>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let handle = inner.running.lock().unwrap().remove(&id);
     let was_running = handle.is_some();
     let terminal = inner.terminal(&id);
@@ -2445,6 +2510,18 @@ async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>
     // stop: wait for it, then finalize so one that has not yet started
     // writes nothing. The response stays deleted.
     let mut state = terminal.state.lock().await;
+    let exists = match inner.server.store.get(&id).await {
+        Ok(stored) => stored.is_some(),
+        Err(e) => return server_error(e.to_string()),
+    };
+    // Its session snapshot goes with it (the conversation keeps its own).
+    if exists || was_running {
+        let context = FoundryRequestContext::from_headers(&headers, None);
+        if let Err(e) = delete_response_session(&inner.server, &context, &id).await {
+            tracing::error!(error = %e, "failed to delete a response's session");
+            return server_error("The response's session could not be deleted.".to_string());
+        }
+    }
     let deleted = inner.server.store.delete(&id).await;
     if was_running || matches!(deleted, Ok(true)) {
         state.finalized = true;
@@ -2454,6 +2531,28 @@ async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>
         Ok(false) => not_found(&id),
         Err(e) => server_error(e.to_string()),
     }
+}
+
+/// Delete the agent session a stored turn saved under `id`'s response key
+/// (`HistorySource::Agent` / `Service`).
+async fn delete_response_session(
+    server: &ResponsesHostServer,
+    context: &FoundryRequestContext,
+    id: &str,
+) -> std::result::Result<(), TurnError> {
+    if server.history == HistorySource::AgentServer {
+        return Ok(());
+    }
+    let agent = match &server.target {
+        Target::Agent(agent) => agent.clone(),
+        Target::AgentFactory(factory) => factory().await?,
+        Target::Workflow { .. } => return Ok(()),
+    };
+    server
+        .host_sessions(context)?
+        .delete(agent.as_ref(), &response_session_key(id))
+        .await?;
+    Ok(())
 }
 
 async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
@@ -2490,6 +2589,9 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
                 Some("queued" | "in_progress")
             );
         if !unfinished {
+            // The turn committed before the abort landed, so it never closed
+            // its replay: close it on the committed outcome.
+            close_aborted_replay(&inner, &id, &stored.response);
             if stored.response["status"] == json!("cancelled") {
                 return Json(stored.response).into_response();
             }
@@ -2498,21 +2600,7 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
         stored.response["status"] = json!("cancelled");
         // The aborted task never closes its replay: record the cancellation,
         // end the replay's streams, and schedule its eviction.
-        let replay = inner.replays.lock().unwrap().get(&id).cloned();
-        if let Some(replay) = replay {
-            if !replay.done.load(std::sync::atomic::Ordering::SeqCst) {
-                let sequence = replay.events.lock().unwrap().len();
-                replay.push(
-                    "response.cancelled",
-                    &json!({
-                        "type": "response.cancelled",
-                        "sequence_number": sequence,
-                        "response": stored.response,
-                    }),
-                );
-                end_replay(&inner, &id, &replay);
-            }
-        }
+        close_aborted_replay(&inner, &id, &stored.response);
         if let Err(e) = inner.server.store.put(&id, stored.clone()).await {
             return server_error(e.to_string());
         }
@@ -2595,6 +2683,182 @@ mod tests {
 
         fn id(&self) -> &str {
             "hang"
+        }
+    }
+
+    async fn raw_call(
+        router: &Router,
+        method: &str,
+        path: String,
+        body: Option<Value>,
+    ) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Holds the first conversation write until released: the response
+    /// record is already committed then.
+    #[derive(Default)]
+    struct GatedConversation {
+        inner: InMemoryResponseStore,
+        tripped: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ResponseStore for GatedConversation {
+        async fn get(&self, id: &str) -> Result<Option<StoredResponse>> {
+            self.inner.get(id).await
+        }
+        async fn put(&self, id: &str, response: StoredResponse) -> Result<()> {
+            self.inner.put(id, response).await
+        }
+        async fn delete(&self, id: &str) -> Result<bool> {
+            self.inner.delete(id).await
+        }
+        async fn conversation(&self, id: &str) -> Result<Option<Vec<Message>>> {
+            self.inner.conversation(id).await
+        }
+        async fn set_conversation(&self, id: &str, transcript: Vec<Message>) -> Result<()> {
+            if !self.tripped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.set_conversation(id, transcript).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_cancel_still_closes_and_evicts_the_replay() {
+        let store = Arc::new(GatedConversation::default());
+        let (router, inner) = ResponsesHostServer::agent(Arc::new(Hang))
+            .with_response_store(store.clone())
+            .routes(HostOptions::default());
+        let (_, queued) = raw_call(
+            &router,
+            "POST",
+            "/responses".into(),
+            Some(json!({"input": "hi", "background": true, "conversation": "c_late"})),
+        )
+        .await;
+        let id = serde_json::from_str::<Value>(&queued).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The turn has committed its completed response and is finishing
+        // its writes when the cancel arrives.
+        tokio::time::timeout(Duration::from_secs(5), store.entered.notified())
+            .await
+            .unwrap();
+        let cancel = tokio::spawn({
+            let router = router.clone();
+            let path = format!("/responses/{id}/cancel");
+            async move { raw_call(&router, "POST", path, Some(json!({}))).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.release.notify_one();
+        let (status, _) = cancel.await.unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "already finished"
+        );
+        let stored = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.response["status"], "completed",
+            "the committed status stays"
+        );
+        // Replay streams end, on the committed terminal event.
+        let (_, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            raw_call(&router, "GET", format!("/responses/{id}?stream=true"), None),
+        )
+        .await
+        .expect("the replay ends");
+        let last = body
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|l| l.strip_prefix("event: ")))
+            .last()
+            .map(str::to_string);
+        assert_eq!(last.as_deref(), Some("response.completed"), "{body}");
+        // And the buffer is evicted after the replay TTL.
+        tokio::time::pause();
+        tokio::time::advance(REPLAY_TTL + Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!inner.replays.lock().unwrap().contains_key(&id));
+    }
+
+    /// Whether the host keeps a session under `key`.
+    async fn has_session(inner: &Arc<Inner>, key: &str) -> bool {
+        #[cfg(feature = "session-store")]
+        {
+            let store = inner
+                .server
+                .sessions
+                .session_store(&inner.server.config, &FoundryRequestContext::default())
+                .unwrap();
+            let agent = Namespaced::new(&Hang, &inner.server.config.agent_name);
+            let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key).unwrap();
+            store.get_session(&agent, &key).await.unwrap().is_some()
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            inner.server.sessions.lock().unwrap().contains_key(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_response_deletes_its_session_snapshot() {
+        for history in [HistorySource::Agent, HistorySource::Service] {
+            let (router, inner) = ResponsesHostServer::agent(Arc::new(Hang))
+                .with_history_source(history)
+                .routes(HostOptions::default());
+            let mut ids = Vec::new();
+            for body in [
+                json!({"input": "hi"}),
+                json!({"input": "hi", "conversation": "c_del"}),
+            ] {
+                let (status, reply) =
+                    raw_call(&router, "POST", "/responses".into(), Some(body)).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{reply}");
+                let reply: Value = serde_json::from_str(&reply).unwrap();
+                ids.push(reply["id"].as_str().unwrap().to_string());
+            }
+            for id in &ids {
+                assert!(
+                    has_session(&inner, &response_session_key(id)).await,
+                    "{history:?}"
+                );
+            }
+            for id in &ids {
+                let (status, _) =
+                    raw_call(&router, "DELETE", format!("/responses/{id}"), None).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                assert!(
+                    !has_session(&inner, &response_session_key(id)).await,
+                    "{history:?}: the response's snapshot is deleted"
+                );
+            }
+            assert!(
+                has_session(&inner, &conversation_session_key("c_del")).await,
+                "{history:?}: the conversation keeps its session"
+            );
         }
     }
 
