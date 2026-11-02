@@ -14,7 +14,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 154 / 225 / 20 / 63 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 59 / 14 / 4 / 0 / 0 | 2 | 4 |
-| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 5 / 0 / 8 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 7 / 8 / 0 / 2 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.GitHub.Copilot` | 1 / 5 / 0 / 0 / 0 | 0 / 1 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
@@ -128,14 +128,8 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Compaction::SlidingWindowCompactionStrategy properties::MinimumPreservedTurns` | partial | adapted | window counts messages, not user turns. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy constructors::TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | Truncation::new takes a max message count; there are no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy properties::MinimumPreservedGroups` | partial | adapted | max_messages caps retained messages rather than guaranteeing a minimum number of preserved groups. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)` | unmapped | mapped | FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)` | unmapped | mapped | No operation to delete stored memories for a scope. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::EnableSensitiveTelemetryData` | unmapped | unmapped | FoundryMemoryProvider emits no sensitive-data telemetry toggle. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::MaxMemories` | unmapped | mapped | No limit on the number of memories requested or injected per search. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::Redactor` | unmapped | unmapped | No redactor hook for memory content. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::SearchInputMessageFilter` | unmapped | adapted | Search input is fixed to the run's user/assistant text; no filter can be supplied. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::StorageInputRequestMessageFilter` | unmapped | adapted | No filter over the request messages written to the memory store. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::StorageInputResponseMessageFilter` | unmapped | adapted | No filter over the response messages written to the memory store. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent constructors::GitHubCopilotAgent(CopilotClient, SessionConfig?, bool, string?, string?, string?, JsonSerializerOptions?, ILoggerFactory?)` | partial | adapted | No Copilot SDK client or SessionConfig; build an Agent over GitHubCopilotChatClient instead. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent constructors::GitHubCopilotAgent(CopilotClient, bool, string?, string?, string?, IList<AIFunctionDeclaration>?, string?, JsonSerializerOptions?, ILoggerFactory?)` | partial | adapted | Instructions and tools go on AgentBuilder over GitHubCopilotChatClient; Copilot SDK/CLI session features are absent. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent methods::CreateSessionAsync(string)` | partial | adapted | A service session id can be stored, but the chat-completions client is stateless so no Copilot session is resumed. |

@@ -21,6 +21,9 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- `FoundryMemoryProvider`: `with_max_memories`, search and storage message
+  filters, `ensure_stored_memories_deleted` and
+  `ensure_memory_store_created`.
 - Smaller parity options: `AgentResponse::to_updates`, `Agent::chat_client`,
   `memory::with_message_source` / `message_source_type`,
   `SkillsProvider::with_filter`, `with_instructions_prompt`,

@@ -4583,14 +4583,18 @@
         },
         "methods": {
           "EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::ensure_memory_store_created"
+            ],
+            "status": "mapped",
+            "note": "GETs the store and creates it on 404; returns whether it was created."
           },
           "EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No operation to delete stored memories for a scope."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::ensure_stored_memories_deleted"
+            ],
+            "status": "mapped",
+            "note": "Deletes the session scope with :delete_scope and drops its cached state."
           }
         }
       },
@@ -4618,9 +4622,11 @@
             "note": "FoundryMemoryProvider emits no sensitive-data telemetry toggle."
           },
           "MaxMemories": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No limit on the number of memories requested or injected per search."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_max_memories"
+            ],
+            "status": "mapped",
+            "note": "Sent as options.max_memories on every search."
           },
           "Redactor": {
             "rust": [],
@@ -4628,9 +4634,11 @@
             "note": "No redactor hook for memory content."
           },
           "SearchInputMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Search input is fixed to the run's user/assistant text; no filter can be supplied."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_search_input_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the run input."
           },
           "StateKey": {
             "rust": [
@@ -4640,14 +4648,18 @@
             "note": "State lives on the provider keyed by scope rather than in a session state bag, so no state key is needed."
           },
           "StorageInputRequestMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No filter over the request messages written to the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_storage_request_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the request messages."
           },
           "StorageInputResponseMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No filter over the response messages written to the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_storage_response_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the response messages."
           },
           "UpdateDelay": {
             "rust": [

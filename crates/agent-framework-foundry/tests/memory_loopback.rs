@@ -656,3 +656,76 @@ async fn a_scope_with_a_request_in_flight_is_not_evicted() {
         "the third request is alice's contextual search, not a repeat static fetch"
     );
 }
+
+fn plain(url: &str) -> FoundryMemoryProvider {
+    FoundryMemoryProvider::new(url, "store", Arc::new(StaticTokenCredential::new("tok")))
+}
+
+#[tokio::test]
+async fn max_memories_and_filters_shape_the_requests() {
+    let (url, seen) = server(vec![
+        (200, search_body("s0", &[])),
+        (200, search_body("s1", &[])),
+        (200, "{\"update_id\": \"u1\"}".into()),
+    ]);
+    let provider = plain(&url)
+        .with_scope("user-1")
+        .with_update_delay(0)
+        .with_max_memories(3)
+        .with_search_input_filter(|m| m.iter().filter(|m| m.text() != "skip").cloned().collect())
+        .with_storage_response_filter(|_| Vec::new());
+    let mut ctx = SessionContext::new(vec![Message::user("keep"), Message::user("skip")]);
+    provider.before_run(&mut ctx).await.unwrap();
+    provider
+        .after_run(
+            &[Message::user("stored")],
+            &[Message::assistant("not stored")],
+            None,
+        )
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[1].body["options"]["max_memories"], 3);
+    let searched: Vec<&str> = seen[1].body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(searched, ["keep"]);
+    let stored = seen[2].body["items"].as_array().unwrap();
+    assert_eq!(stored.len(), 1, "the response was filtered out");
+}
+
+#[tokio::test]
+async fn stored_memories_can_be_deleted_and_the_store_created() {
+    let (url, seen) = server(vec![
+        (200, "{}".into()),
+        (404, "{}".into()),
+        (200, "{\"name\": \"store\"}".into()),
+        (200, "{}".into()),
+    ]);
+    let provider = plain(&url);
+    let session = agent_framework_core::session::AgentSession::new();
+    provider
+        .ensure_stored_memories_deleted(&session)
+        .await
+        .unwrap();
+    assert!(provider
+        .ensure_memory_store_created("gpt-4o", "text-embedding-3-small", Some("notes"))
+        .await
+        .unwrap());
+    assert!(!provider
+        .ensure_memory_store_created("gpt-4o", "text-embedding-3-small", None)
+        .await
+        .unwrap());
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen[0]
+        .start_line
+        .contains("/memory_stores/store:delete_scope"));
+    assert_eq!(seen[0].body["scope"], session.session_id());
+    assert!(seen[1].start_line.starts_with("GET /memory_stores/store?"));
+    assert!(seen[2].start_line.starts_with("POST /memory_stores?"));
+    assert_eq!(seen[2].body["definition"]["chat_model"], "gpt-4o");
+    assert_eq!(seen[2].body["description"], "notes");
+}
