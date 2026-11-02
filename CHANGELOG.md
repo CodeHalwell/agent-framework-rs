@@ -172,6 +172,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `HandoffBuilder` and `MagenticBuilder` gain `with_checkpointing`, as
   upstream's `checkpoint_storage`, so orchestrations can checkpoint (and a
   hosted orchestration can pause and resume).
+- Foundry hosting (`voice`, review fix): once the client is gone and the
+  outbound channel is drained, the connection loop stops polling it instead
+  of spinning while a callback is still running.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

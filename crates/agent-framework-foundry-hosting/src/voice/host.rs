@@ -357,6 +357,10 @@ async fn connection(
         ticker
     });
     let mut client_open = true;
+    // Set once the outbound channel is closed and drained: `recv` would
+    // then return `None` at once on every iteration, spinning the loop for
+    // as long as a callback keeps running.
+    let mut outgoing_open = true;
     // Once the client is gone, the outbound channel closes: a later send
     // fails at once, and queued ones are answered with an error.
     fn client_gone(client_open: &mut bool, out_rx: &mut mpsc::Receiver<Outgoing>) {
@@ -370,8 +374,11 @@ async fn connection(
         tokio::select! {
             outcome = &mut dispatcher => break outcome,
             _ = &mut gone_rx, if client_open => client_gone(&mut client_open, &mut out_rx),
-            outgoing = out_rx.recv() => {
-                let Some(Outgoing { frame, ack }) = outgoing else { continue };
+            outgoing = out_rx.recv(), if outgoing_open => {
+                let Some(Outgoing { frame, ack }) = outgoing else {
+                    outgoing_open = false;
+                    continue;
+                };
                 let result = if session.is_terminal() {
                     Err(VoiceError::Terminating)
                 } else if !client_open {
