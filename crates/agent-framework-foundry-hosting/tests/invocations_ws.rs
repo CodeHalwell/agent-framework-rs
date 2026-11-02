@@ -147,3 +147,53 @@ fn the_ping_interval_comes_from_the_environment() {
     assert!(InvocationsWs::ping_interval_from(|_| Some("-1".into())).is_err());
     assert!(InvocationsWs::ping_interval_from(|_| Some("x".into())).is_err());
 }
+
+/// Sends many frames without ever reading.
+async fn chatty(session: WsSession) -> agent_framework_core::error::Result<()> {
+    for i in 0..500 {
+        session
+            .send(Message::Text(format!("out {i}").into()))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_handler_that_does_not_read_cannot_stall_its_output() {
+    let ws = InvocationsWs::new(chatty).ping_interval(Duration::from_millis(20));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, ws.into_router()).await.unwrap() });
+    let client = connect(&format!("ws://{addr}/invocations_ws")).await;
+    let (mut sink, mut stream) = client.split();
+    // The client floods input the handler never reads...
+    let flood = tokio::spawn(async move {
+        for i in 0..2000 {
+            if sink
+                .send(tungstenite::Message::text(format!("in {i}")))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    // ...while reading everything the handler sends, then the close.
+    let received = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut texts = 0;
+        while let Some(Ok(message)) = stream.next().await {
+            match message {
+                tungstenite::Message::Text(_) => texts += 1,
+                tungstenite::Message::Close(frame) => {
+                    return (texts, frame.map(|f| u16::from(f.code)))
+                }
+                _ => {}
+            }
+        }
+        (texts, None)
+    })
+    .await
+    .expect("no deadlock: the output drains while input is backed up");
+    assert_eq!(received, (500, Some(1000)));
+    flood.abort();
+}

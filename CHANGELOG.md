@@ -56,6 +56,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `HistorySource::Agent`/`Service` no longer fail with a storage conflict
   when saving their session: the turn keeps one request-scoped store from
   snapshotting its inherited session through the run.
+- Foundry hosting (`websocket`): `/invocations_ws` reads client frames on
+  a separate task, so a handler that isn't reading no longer blocks its own
+  output, keepalive pings or the close frame.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

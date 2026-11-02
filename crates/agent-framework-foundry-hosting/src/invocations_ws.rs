@@ -176,7 +176,32 @@ async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: Foun
         context,
     };
     let mut handler = tokio::spawn((server.handler)(session));
-    let mut in_tx = Some(in_tx);
+    // The reader delivers the client's frames on its own task: when the
+    // handler is not reading and its inbound queue is full, only the reader
+    // waits (backpressure reaches the client), while the loop below keeps
+    // sending the handler's output, keepalive pings and the close.
+    let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let mut in_tx = Some(in_tx);
+        while let Some(frame) = stream.next().await {
+            match frame {
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                Ok(message) => {
+                    // A handler that dropped its session no longer reads:
+                    // keep reading (discarding) to notice the close.
+                    if let Some(tx) = &in_tx {
+                        if tx.send(message).await.is_err() {
+                            in_tx = None;
+                        }
+                    }
+                }
+            }
+        }
+        // The handler's `recv` now yields `None`.
+        drop(in_tx);
+        let _ = closed_tx.send(());
+    });
     let mut ping = server.ping_interval.map(|interval| {
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -187,24 +212,11 @@ async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: Foun
     let outcome = loop {
         tokio::select! {
             outcome = &mut handler => break outcome,
-            frame = stream.next(), if client_open => match frame {
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    // The handler's `recv` now yields `None`.
-                    client_open = false;
-                    in_tx = None;
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                Some(Ok(message)) => {
-                    if let Some(tx) = &in_tx {
-                        let _ = tx.send(message).await;
-                    }
-                }
-            },
+            _ = &mut closed_rx, if client_open => client_open = false,
             message = out_rx.recv(), if outgoing_open => match message {
                 Some(message) => {
                     if sink.send(message).await.is_err() {
                         client_open = false;
-                        in_tx = None;
                     }
                 }
                 None => outgoing_open = false,
@@ -212,12 +224,11 @@ async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: Foun
             _ = async { ping.as_mut().expect("guarded").tick().await }, if ping.is_some() && client_open => {
                 if sink.send(Message::Ping(Default::default())).await.is_err() {
                     client_open = false;
-                    in_tx = None;
                 }
             }
         }
     };
-    drop(in_tx);
+    reader.abort();
     // Frames the handler sent before returning go out before the close.
     while let Ok(message) = out_rx.try_recv() {
         if sink.send(message).await.is_err() {
