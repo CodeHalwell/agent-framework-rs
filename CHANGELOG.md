@@ -118,6 +118,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   host: new `FunctionResultContent::additional_properties`,
   `MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`, `Tool::invoke_with_properties` and
   `McpClient::call_tool_raw`.
+- Core (review fix): polling a background operation with its continuation
+  token no longer counts as a model iteration — the operation was charged
+  once when submitted — so a slow provider cannot spend `max_iterations` on
+  polls before its tool calls run.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

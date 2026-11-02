@@ -1433,8 +1433,19 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 }
             }
 
-            while budget.iterations < self.config.max_iterations {
-                budget.iterations += 1;
+            loop {
+                // A model operation is charged one iteration when it is
+                // submitted. Retrieving a background operation with its
+                // continuation token is not a new one, so polls are free:
+                // otherwise a slow provider could spend the limit on polls
+                // alone, and the failsafe could not disable tools on an
+                // operation that was already submitted with them.
+                if options.continuation_token.is_none() {
+                    if budget.iterations >= self.config.max_iterations {
+                        break;
+                    }
+                    budget.iterations += 1;
+                }
                 options.tools = live_tools.snapshot();
                 let tools = executable_tools(&options);
                 // Checked before the approval replay below, not only after

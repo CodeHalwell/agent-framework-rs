@@ -517,8 +517,12 @@ fn ask_tool(call_id: &str, name: &str) -> ChatResponse {
 async fn the_iteration_limit_carries_across_background_continuations() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let runs = Arc::new(AtomicUsize::new(0));
-    // Request 1 uses both iterations (one tool call, then a pending poll).
-    // The continuation must go straight to the tools-disabled failsafe.
+    // Request 1 uses both iterations: the model asks for c1 (run), then the
+    // tool-result submission is still running. Polling it is free and yields
+    // that second iteration's call c2, which runs as it would without
+    // background mode; the limit is then spent, so c3 must not run (before
+    // the budget carried iterations, the continuation got two fresh ones and
+    // ran c3 too).
     let script = Script::replies(vec![
         ask_tool("c1", "lookup"),
         pending("op-10", None),
@@ -555,7 +559,7 @@ async fn the_iteration_limit_carries_across_background_continuations() {
         .unwrap();
     assert_eq!(
         runs.load(Ordering::SeqCst),
-        1,
+        2,
         "a continuation must not get fresh iterations"
     );
 }
@@ -611,4 +615,48 @@ async fn provider_tools_are_available_to_a_continuation() {
         requests[0].0.is_empty(),
         "no provider context is sent with a continuation"
     );
+}
+
+#[tokio::test]
+async fn polls_of_a_running_operation_do_not_spend_iterations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runs = Arc::new(AtomicUsize::new(0));
+    // The submission counts once; the two polls that find it still running
+    // or finished must not, so the finished operation's tool call still runs.
+    let script = Script::replies(vec![
+        pending("op-12", None),
+        pending("op-12", None),
+        ask_tool("c1", "lookup"),
+        ChatResponse::from_text("done"),
+    ]);
+    let agent = Agent::builder(script.clone())
+        .tool(counting_tool("lookup", runs.clone()))
+        .function_invocation_config(FunctionInvocationConfig {
+            max_iterations: 2,
+            ..Default::default()
+        })
+        .build();
+    let mut session = agent.create_session();
+    let mut response = agent
+        .run_with_options(
+            vec![Message::user("go")],
+            Some(&mut session),
+            AgentRunOptions::new().with_background(true),
+        )
+        .await
+        .unwrap();
+    while let Some(token) = response.continuation_token.clone() {
+        response = agent
+            .run_with_options(
+                Vec::new(),
+                Some(&mut session),
+                AgentRunOptions::new()
+                    .with_background(true)
+                    .with_continuation_token(token),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the tool call ran");
+    assert_eq!(response.text(), "done");
 }
