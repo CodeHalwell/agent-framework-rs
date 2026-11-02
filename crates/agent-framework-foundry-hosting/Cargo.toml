@@ -45,6 +45,8 @@ experimental-computer-use = ["agent-framework-core/experimental-computer-use"]
 # OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
 # and `configure_observability` exports to Application Insights or OTLP from
 # the host configuration (upstream agentserver tracing).
+# `invocations_ws`: the agentserver's `/invocations_ws` WebSocket route.
+websocket = ["axum/ws"]
 otel = [
     "agent-framework-core/azure-monitor",
     "dep:opentelemetry",
@@ -53,6 +55,7 @@ otel = [
 ]
 
 [dev-dependencies]
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
 tokio = { workspace = true }

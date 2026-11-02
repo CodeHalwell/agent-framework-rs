@@ -35,6 +35,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting: `/invocations_ws` WebSocket invocations (feature
+  `websocket`): the host runs the handler with a session and the request
+  context, closes with 1000 or 1011, logs the close, and sends keepalive
+  pings when `WS_KEEPALIVE_INTERVAL` is set.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

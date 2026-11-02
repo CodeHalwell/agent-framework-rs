@@ -80,6 +80,9 @@ pub mod host;
 #[cfg(feature = "session-store")]
 #[cfg_attr(docsrs, doc(cfg(feature = "session-store")))]
 pub mod invocations;
+#[cfg(feature = "websocket")]
+#[cfg_attr(docsrs, doc(cfg(feature = "websocket")))]
+pub mod invocations_ws;
 mod output;
 pub mod responses;
 pub mod scope;
