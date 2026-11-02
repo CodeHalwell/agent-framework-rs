@@ -660,3 +660,42 @@ async fn polls_of_a_running_operation_do_not_spend_iterations() {
     assert_eq!(runs.load(Ordering::SeqCst), 1, "the tool call ran");
     assert_eq!(response.text(), "done");
 }
+
+#[tokio::test]
+async fn completed_tool_interactions_are_recorded_while_the_operation_runs() {
+    // The loop runs a tool, then the tool-result submission is still
+    // running: the call and its result are already final and must reach
+    // local history, while the pending operation's partial text must not.
+    let history = InMemoryHistoryProvider::new();
+    let script = Script::replies(vec![
+        ask_tool("c1", "lookup"),
+        pending("op-13", Some("partial")),
+    ]);
+    let agent = Agent::builder(script.clone()).tool(lookup()).build();
+    let mut session = session_with(&history);
+    let response = agent
+        .run_with_options(
+            vec![Message::user("go")],
+            Some(&mut session),
+            AgentRunOptions::new().with_background(true),
+        )
+        .await
+        .unwrap();
+    assert!(response.continuation_token.is_some());
+    let recorded = history.list_messages();
+    let has_call = recorded.iter().any(|m| {
+        m.contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionCall(fc) if fc.call_id == "c1"))
+    });
+    let has_result = recorded.iter().any(|m| {
+        m.contents
+            .iter()
+            .any(|c| matches!(c, Content::FunctionResult(fr) if fr.call_id == "c1"))
+    });
+    assert!(has_call && has_result, "{recorded:?}");
+    assert!(
+        !recorded.iter().any(|m| m.text().contains("partial")),
+        "the pending output is not recorded yet"
+    );
+}

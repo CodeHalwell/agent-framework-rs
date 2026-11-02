@@ -163,15 +163,48 @@ fn is_background_run(options: &ChatOptions) -> bool {
 
 /// The messages a run's completion hooks record as the response. While a
 /// background operation is still running ([`AgentResponse::continuation_token`]
-/// is set) the reply is incomplete, so nothing is recorded for it yet: the
-/// run that finally completes the operation records the whole reply. The
-/// run's input is recorded either way, by the run that sent it.
-fn persistable_response(messages: &[Message], continuation_pending: bool) -> &[Message] {
-    if continuation_pending {
-        &[]
-    } else {
-        messages
+/// is set) its own reply is incomplete, so it is not recorded yet: the run
+/// that finally completes the operation records it. Tool interactions the
+/// run already completed before the operation went pending (a function call
+/// together with its result) are final, though, and the next run will not
+/// see them again, so those are recorded now. The run's input is recorded
+/// either way, by the run that sent it.
+fn persistable_response(messages: &[Message], continuation_pending: bool) -> Vec<Message> {
+    if !continuation_pending {
+        return messages.to_vec();
     }
+    let contents = || messages.iter().flat_map(|m| m.contents.iter());
+    let answered: std::collections::HashSet<&str> = contents()
+        .filter_map(crate::types::Content::as_function_result)
+        .map(|r| r.call_id.as_str())
+        .collect();
+    let called: std::collections::HashSet<&str> = contents()
+        .filter_map(crate::types::Content::as_function_call)
+        .map(|c| c.call_id.as_str())
+        .collect();
+    messages
+        .iter()
+        .filter_map(|message| {
+            let completed: Vec<crate::types::Content> = message
+                .contents
+                .iter()
+                .filter(|content| match content {
+                    crate::types::Content::FunctionCall(call) => {
+                        answered.contains(call.call_id.as_str())
+                    }
+                    crate::types::Content::FunctionResult(result) => {
+                        called.contains(result.call_id.as_str())
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            (!completed.is_empty()).then(|| Message {
+                contents: completed,
+                ..message.clone()
+            })
+        })
+        .collect()
 }
 
 /// Map a completed run into buffered agent updates — one update per message,
@@ -616,7 +649,7 @@ impl Agent {
             let reply =
                 persistable_response(&response.messages, response.continuation_token.is_some());
             for cp in self.finish_providers(&session, service_history, per_call.as_ref()) {
-                cp.after_run_in_session(&session, &input, reply, None)
+                cp.after_run_in_session(&session, &input, &reply, None)
                     .await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
@@ -1316,8 +1349,9 @@ fn async_stream_forward(
                                 .into_iter()
                                 .filter(|p| !(service_history && p.is_history_provider()))
                             {
-                                if let Err(e) =
-                                    cp.after_run_in_session(&session, &input, reply, None).await
+                                if let Err(e) = cp
+                                    .after_run_in_session(&session, &input, &reply, None)
+                                    .await
                                 {
                                     return Some((Err(e), (inner, collected, true, None)));
                                 }
@@ -1391,7 +1425,7 @@ impl SupportsAgentRun for Agent {
         // records history, for any attached `HistoryProvider`).
         let reply = persistable_response(&response.messages, response.continuation_token.is_some());
         for cp in self.finish_providers(session, service_history, per_call.as_ref()) {
-            cp.after_run_in_session(session, &messages, reply, None)
+            cp.after_run_in_session(session, &messages, &reply, None)
                 .await?;
         }
 

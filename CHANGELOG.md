@@ -129,6 +129,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `int` field (`Filter::eq("year", 2020.0)`) binds as `BIGINT` when it
   fits, instead of being refused; out-of-range integral floats are still
   refused.
+- Core (review fix): when a background tool loop hands back a pending
+  operation, the tool interactions it already completed (each function call
+  with its result) are recorded in local history right away; only the
+  pending operation's own output waits for completion.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
