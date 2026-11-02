@@ -27,5 +27,10 @@ uuid = { workspace = true }
 # since this crate only needs plain key/list commands.
 redis = { version = "1", default-features = false, features = ["tokio-comp"] }
 
+[features]
+# `RedisVectorStore` (Redis Search vector collections). Experimental
+# upstream (VECTOR_STORES).
+experimental-vector-stores = ["agent-framework-core/experimental-vector-stores"]
+
 [dev-dependencies]
 tokio = { workspace = true }

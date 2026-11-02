@@ -21,6 +21,12 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- `agent-framework-redis`: `RedisVectorStore` / `RedisVectorCollection`
+  (port of upstream `agent_framework_redis._vector_store`), HASH or JSON
+  documents indexed by Redis Search, behind the crate's
+  `experimental-vector-stores` feature (turned on by the umbrella crate's
+  feature of the same name). Scores are native distances, reported with the
+  new `VectorSearchResult::SCORE_KIND_DISTANCE`.
 - **Harness complete** (`experimental-harness`): `FileAccessProvider`,
   `TodoFileStore`, `BackgroundAgentsProvider` with the
   `background_tasks_running` loop callbacks, `MemoryContextProvider` with

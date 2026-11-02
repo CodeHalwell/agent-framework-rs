@@ -30,6 +30,12 @@ impl LazyConnection {
         })
     }
 
+    /// The logical database the URL selects.
+    #[cfg(feature = "experimental-vector-stores")]
+    pub(crate) fn db(&self) -> i64 {
+        self.client.get_connection_info().redis_settings().db()
+    }
+
     /// Return a clone of the shared multiplexed connection, establishing it
     /// on first use.
     pub(crate) async fn get(&self) -> Result<MultiplexedConnection> {
