@@ -42,7 +42,8 @@
 //! experimental sit behind `experimental-*` features with no semver promise:
 //! `experimental-vector-stores`, `experimental-file-history`,
 //! `experimental-progressive-tools`, `experimental-agent-hooks` (the
-//! `agent_hooks` module of [`agent_framework_core`]), `experimental-harness` and
+//! `agent_hooks` module of [`agent_framework_core`]), `experimental-fides`
+//! (its `security` module), `experimental-harness` and
 //! `experimental-declarative-agents`.
 //! `experimental` turns them all on.
 //!

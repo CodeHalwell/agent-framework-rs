@@ -49,8 +49,9 @@ from the roadmap, not from this file.
   combined verdict and the record but are not persisted with the produced
   data or resurfaced as `source_labels`; upstream's framework layer does
   not do this either).
-- **Security (FIDES)**: marked experimental upstream; when ported it goes
-  behind an `experimental-*` feature (see `docs/feature-stages.md`).
+- **Security (FIDES), remainder** (`experimental-fides`): `SecureMCPToolProxy`
+  and server-provided IFC labels in MCP `_meta` (core cannot depend on
+  `agent-framework-mcp`; only the annotation mapping is ported).
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.

@@ -307,6 +307,7 @@ dependencies = [
  "agent-framework-azure",
  "agent-framework-core",
  "agent-framework-hosting",
+ "agent-framework-mcp",
  "async-trait",
  "axum",
  "base64 0.22.1",

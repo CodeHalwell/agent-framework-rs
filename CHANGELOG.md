@@ -35,6 +35,21 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- FIDES information-flow control (`experimental-fides`, upstream
+  `ExperimentalFeature.FIDES`): `agent_framework_core::security` with
+  integrity/confidentiality labels (`ContentLabel`, `combine_labels`,
+  `check_confidentiality_allowed`), `LabelTrackingFunctionMiddleware`
+  (tiered result labels, hiding untrusted results behind variable
+  references, `[var_<id>]` expansion, context-label tracking, standing
+  guidance), `PolicyEnforcementFunctionMiddleware` (untrusted-context,
+  untrusted-argument, confidentiality and principal checks with an audit
+  log; block, warn, inline approval handler, or session-bound pending
+  approvals), the `quarantined_llm` and `inspect_variable` tools,
+  `SecureAgentConfig`, and MCP annotation mapping. Tool declarations are
+  registered by name (`ToolSecurityRegistry`); `SecureMCPToolProxy` is not
+  ported. The umbrella `experimental` feature now also enables
+  `experimental-fides` and the `sql-server`, `mongodb` and
+  `azure-documentdb` stores.
 - `agent-framework-claude` (umbrella feature `claude`, in `full`): the
   Claude Code CLI as an agent (`ClaudeAgent`), ported from upstream's
   `agent_framework_claude`. With no Rust Claude Agent SDK, it drives the
