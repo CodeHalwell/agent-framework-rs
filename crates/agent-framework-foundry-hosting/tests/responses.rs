@@ -1487,6 +1487,9 @@ impl SupportsAgentRun for HangingCounter {
         if messages.last().map(|m| m.text()) == Some("hang".to_string()) {
             std::future::pending::<()>().await;
         }
+        if messages.last().map(|m| m.text()) == Some("fail".to_string()) {
+            return Err(agent_framework_core::error::Error::Other("boom".into()));
+        }
         Counter.run(messages, session).await
     }
 
@@ -2072,4 +2075,79 @@ async fn a_delete_during_persistence_stays_deleted() {
     )
     .await;
     assert_eq!(next["output_text"], "1 messages, last: next");
+}
+
+/// Runs `request` in the background and returns its record once failed.
+async fn failed_turn(router: &axum::Router, mut request: serde_json::Value) -> serde_json::Value {
+    request["background"] = json!(true);
+    let (_, queued) = json(router, post("/responses", request)).await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    for _ in 0..100 {
+        let (_, polled) = json(router, get(&format!("/responses/{id}"))).await;
+        if polled["status"] == "failed" {
+            return polled;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the turn did not fail");
+}
+
+#[tokio::test]
+async fn agent_kept_sessions_survive_cancelled_and_failed_predecessors() {
+    use agent_framework_foundry_hosting::HistorySource;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .into_router();
+        let text = |r: &serde_json::Value| {
+            r["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let continue_from = |id: &serde_json::Value, input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "previous_response_id": id}),
+            )
+        };
+        let (_, first) = json(&router, post("/responses", json!({"input": "a"}))).await;
+        assert_eq!(text(&first), "turn 1", "{history:?}");
+        // A continuation cancelled before the agent finished.
+        let (_, queued) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "hang", "background": true, "previous_response_id": first["id"]}),
+            ),
+        )
+        .await;
+        let cancelled = queued["id"].clone();
+        let (status, _) = json(
+            &router,
+            post(
+                &format!("/responses/{}/cancel", cancelled.as_str().unwrap()),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, next) = json(&router, continue_from(&cancelled, "c")).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(text(&next), "turn 2", "{history:?}: the inherited session");
+        // A failed run, continuing a cancelled one: both inherit.
+        let failed = failed_turn(
+            &router,
+            json!({"input": "fail", "previous_response_id": cancelled}),
+        )
+        .await;
+        let (status, next) = json(&router, continue_from(&failed["id"], "d")).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(text(&next), "turn 2", "{history:?}: the inherited session");
+        // A failed first turn inherits a fresh session.
+        let failed = failed_turn(&router, json!({"input": "fail"})).await;
+        let (status, next) = json(&router, continue_from(&failed["id"], "e")).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(text(&next), "turn 1");
+    }
 }

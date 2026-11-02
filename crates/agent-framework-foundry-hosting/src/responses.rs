@@ -520,7 +520,6 @@ impl ResponsesHostServer {
 
     /// The router: the Responses routes plus the shared host routes.
     pub fn into_router(self) -> Router {
-        let p = self.prefix.clone();
         let host = self
             .host
             .clone()
@@ -530,6 +529,13 @@ impl ResponsesHostServer {
                 self.config.agent_version.clone(),
                 self.config.session_id.clone(),
             );
+        let (router, _) = self.routes(host);
+        router
+    }
+
+    /// The router and its shared state.
+    fn routes(self, host: HostOptions) -> (Router, Arc<Inner>) {
+        let p = self.prefix.clone();
         let state = Arc::new(Inner {
             server: self,
             running: Mutex::new(HashMap::new()),
@@ -548,8 +554,8 @@ impl ResponsesHostServer {
                 &format!("{p}/responses/{{id}}/input_items"),
                 get(input_items),
             )
-            .with_state(state);
-        with_host_routes(router, host)
+            .with_state(state.clone());
+        (with_host_routes(router, host), state)
     }
 
     /// Serve on the configured port.
@@ -581,7 +587,8 @@ struct Inner {
     running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     replays: Mutex<HashMap<String, Arc<Replay>>>,
     conversations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per response: serializes its terminal writes with cancel / delete.
+    /// Per response with a live [`TerminalHandle`]: serializes its terminal
+    /// writes with cancel / delete.
     finals: Mutex<HashMap<String, Arc<Terminal>>>,
 }
 
@@ -613,19 +620,57 @@ impl Terminal {
     }
 }
 
+/// A holder of one response's [`Terminal`]: the turn (from before it can be
+/// cancelled until its persistence ends, shared by every clone of its
+/// [`Prepared`]) and each cancel or delete while it runs. Holders of one
+/// response share its entry in [`Inner::finals`]; the last to drop removes
+/// it, so the map holds only responses with a live holder and nothing is
+/// kept after the fact (a turn's later writes go through the entry it
+/// already holds).
+struct TerminalHandle {
+    inner: Arc<Inner>,
+    id: String,
+    terminal: Option<Arc<Terminal>>,
+}
+
+impl std::ops::Deref for TerminalHandle {
+    type Target = Terminal;
+
+    fn deref(&self) -> &Terminal {
+        self.terminal.as_ref().expect("taken only on drop")
+    }
+}
+
+impl Drop for TerminalHandle {
+    fn drop(&mut self) {
+        let mut terminals = self.inner.finals.lock().unwrap();
+        // Released under the map lock, so concurrent holders serialize and
+        // exactly the last one sees only the map's reference left.
+        drop(self.terminal.take());
+        if terminals
+            .get(&self.id)
+            .is_some_and(|t| Arc::strong_count(t) == 1)
+        {
+            terminals.remove(&self.id);
+        }
+    }
+}
+
 impl Inner {
-    /// `id`'s terminal coordination (see [`Terminal`]). Entries nobody
-    /// holds are dropped unless finalized or stopped, which must outlive the
-    /// writers that will consult them.
-    fn terminal(&self, id: &str) -> Arc<Terminal> {
-        let mut terminals = self.finals.lock().unwrap();
-        terminals.retain(|_, t| {
-            Arc::strong_count(t) > 1
-                || t.state
-                    .try_lock()
-                    .map_or(true, |s| s.finalized || s.stopped)
-        });
-        terminals.entry(id.to_string()).or_default().clone()
+    /// A holder of `id`'s terminal coordination (see [`TerminalHandle`]).
+    fn terminal(self: &Arc<Self>, id: &str) -> TerminalHandle {
+        let terminal = self
+            .finals
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .clone();
+        TerminalHandle {
+            inner: self.clone(),
+            id: id.to_string(),
+            terminal: Some(terminal),
+        }
     }
 
     /// The lock serializing one conversation's turns, from loading its
@@ -748,6 +793,9 @@ struct Prepared {
     session_state: Option<Value>,
     /// This turn's session state after the run, for persistence.
     session_out: Arc<Mutex<Option<Value>>>,
+    /// Held from before the turn can be cancelled or deleted until its
+    /// persistence ends.
+    terminal: Arc<TerminalHandle>,
 }
 
 /// Replies resuming a paused workflow.
@@ -933,6 +981,7 @@ async fn create(
         _conversation_turn: conversation_turn,
         session_state,
         session_out: Arc::default(),
+        terminal: Arc::new(inner.terminal(&response_id)),
         input_items: input_items_of(&create.input, &response_id),
         model: create
             .model
@@ -1174,7 +1223,7 @@ async fn run_turn(
             // Under the response's terminal lock: a cancel or delete either
             // waits for these writes or has already finalized the response,
             // in which case nothing is written.
-            let terminal = inner.terminal(&prepared.request.response_id);
+            let terminal = prepared.terminal.clone();
             let mut state = terminal.state.lock().await;
             if state.finalized || terminal.stopping() {
                 return ("cancelled".to_string(), response);
@@ -1532,7 +1581,8 @@ async fn execute(
             None => (agent.create_session(), None),
         },
         Some(sessions) => {
-            let (mut session, prior) = load_session(sessions, request, agent.as_ref()).await?;
+            let (mut session, prior) =
+                load_session(server, sessions, request, agent.as_ref()).await?;
             let history = attach_local_history(&mut session, prior);
             (session, history)
         }
@@ -1777,7 +1827,11 @@ impl HostSessions {
     }
 }
 
+/// How many cancelled or failed predecessors [`load_session`] looks through.
+const MAX_INHERITED_HOPS: usize = 64;
+
 async fn load_session(
+    server: &ResponsesHostServer,
     sessions: &HostSessions,
     request: &HostedResponseRequest,
     agent: &dyn SupportsAgentRun,
@@ -1797,11 +1851,57 @@ async fn load_session(
         &request.conversation_id,
     ) {
         (Some(loaded), _, _) => Ok(loaded),
-        (None, Some(previous), None) => Err(TurnError::Public(format!(
-            "Cannot find an existing agent session for previous_response_id={previous}."
-        ))),
+        (None, Some(previous), None) => inherited_session(server, sessions, previous, agent)
+            .await?
+            .ok_or_else(|| {
+                TurnError::Public(format!(
+                    "Cannot find an existing agent session for previous_response_id={previous}."
+                ))
+            }),
         _ => Ok((agent.create_session(), None)),
     }
+}
+
+/// The session a cancelled or failed response inherited, since only a
+/// completed turn saves one under its response (the counterpart of the
+/// `session_state` an `AgentServer` record keeps): its predecessor's, else
+/// its conversation's, else a new one. `None` when `previous` is not such a
+/// response (or the chain is too long or broken).
+async fn inherited_session(
+    server: &ResponsesHostServer,
+    sessions: &HostSessions,
+    previous: &str,
+    agent: &dyn SupportsAgentRun,
+) -> std::result::Result<Option<LoadedSession>, TurnError> {
+    let mut current = previous.to_string();
+    for _ in 0..MAX_INHERITED_HOPS {
+        let Some(stored) = server.store.get(&current).await? else {
+            return Ok(None);
+        };
+        let response = &stored.response;
+        if !matches!(response["status"].as_str(), Some("cancelled" | "failed")) {
+            return Ok(None);
+        }
+        if let Some(conversation) = response["conversation"]["id"].as_str() {
+            return Ok(Some(
+                match sessions
+                    .load(agent, &conversation_session_key(conversation))
+                    .await?
+                {
+                    Some(loaded) => loaded,
+                    None => (agent.create_session(), None),
+                },
+            ));
+        }
+        let Some(next) = response["previous_response_id"].as_str() else {
+            return Ok(Some((agent.create_session(), None)));
+        };
+        if let Some(loaded) = sessions.load(agent, &response_session_key(next)).await? {
+            return Ok(Some(loaded));
+        }
+        current = next.to_string();
+    }
+    Ok(None)
 }
 
 /// This turn's input as messages, with each `mcp_approval_response` item
@@ -2325,6 +2425,88 @@ mod tests {
         assert!(key.ends_with("00"));
         let next = ids::message_id(Some(&first));
         assert_eq!(ids::partition_key(&next).unwrap(), key);
+    }
+
+    /// Replies at once, except to `hang`, which never finishes.
+    struct Hang;
+
+    #[async_trait]
+    impl SupportsAgentRun for Hang {
+        async fn run(
+            &self,
+            messages: Vec<Message>,
+            _session: Option<&mut agent_framework_core::session::AgentSession>,
+        ) -> Result<AgentResponse> {
+            if messages.last().map(|m| m.text()).as_deref() == Some("hang") {
+                std::future::pending::<()>().await;
+            }
+            Ok(AgentResponse {
+                messages: vec![Message::assistant("done")],
+                ..Default::default()
+            })
+        }
+
+        fn id(&self) -> &str {
+            "hang"
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_coordination_is_reclaimed() {
+        use tower::ServiceExt;
+        let (router, inner) =
+            ResponsesHostServer::agent(Arc::new(Hang)).routes(HostOptions::default());
+        let call = |method: &str, path: String, body: Option<Value>| {
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    body.map(|b| b.to_string()).unwrap_or_default(),
+                ))
+                .unwrap();
+            let router = router.clone();
+            async move {
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+        for i in 0..20 {
+            let input = if i % 2 == 0 { "hang" } else { "hi" };
+            let (_, queued) = call(
+                "POST",
+                "/responses".into(),
+                Some(json!({"input": input, "background": true})),
+            )
+            .await;
+            let id = queued["id"].as_str().unwrap().to_string();
+            if i % 4 < 2 {
+                // Cancel a hanging turn, or (once it finished) fail to.
+                call("POST", format!("/responses/{id}/cancel"), Some(json!({}))).await;
+            }
+            let (status, _) = call("DELETE", format!("/responses/{id}"), None).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            // Deleting again, or an unknown id, keeps nothing either.
+            call("DELETE", format!("/responses/{id}"), None).await;
+            call("POST", format!("/responses/{id}/cancel"), Some(json!({}))).await;
+        }
+        let (_, done) = call("POST", "/responses".into(), Some(json!({"input": "hi"}))).await;
+        assert_eq!(done["status"], "completed");
+        // Aborted tasks drop their holders as the runtime reclaims them.
+        for _ in 0..100 {
+            if inner.finals.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(inner.finals.lock().unwrap().len(), 0, "no tombstones");
     }
 
     #[test]

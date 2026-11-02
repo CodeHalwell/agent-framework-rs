@@ -35,6 +35,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting: with `HistorySource::Agent`/`Service`, a cancelled or
+  failed response can be continued, inheriting its predecessor's session (or
+  its conversation's, or a fresh one). Cancel/delete coordination entries are
+  released once no turn, cancel or delete holds them, instead of being kept
+  per cancelled or deleted response.
 - Foundry hosting: paused hosted workflows accept `mcp_approval_response`
   replies to approval requests and, with `experimental-computer-use`,
   `computer_call_output` replies to computer calls. Review fix: a cancel or
