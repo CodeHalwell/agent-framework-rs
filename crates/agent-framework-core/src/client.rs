@@ -483,6 +483,45 @@ const BUDGET_EXHAUSTED_MESSAGE: &str =
 /// it.
 const BUDGET_STATE_KEY: &str = "__af_function_invocation_budget__";
 
+/// Session-state key holding the local calls of a declaration-only batch
+/// deferred until the caller answers every declaration-only call (upstream
+/// #9050): `{"calls": [FunctionCallContent], "host_call_ids": [String]}`.
+const DEFERRED_SIBLINGS_KEY: &str = "__af_function_invocation_deferred_siblings__";
+
+/// Whether `call` targets a declaration-only tool among `tools`: the caller
+/// answers it.
+fn is_caller_owned_call(tools: &[ToolDefinition], call: &FunctionCallContent) -> bool {
+    tools
+        .iter()
+        .any(|t| t.name == call.name && is_declaration_only(t))
+}
+
+/// A deferred batch whose declaration-only calls the conversation now
+/// answers: its local calls, ready to run. `None` when there is no batch or
+/// the caller has not answered every declaration-only call yet.
+fn ready_deferred_siblings(
+    session: Option<&AgentSession>,
+    conversation: &[Message],
+) -> Option<Vec<FunctionCallContent>> {
+    let batch = session?.state.get(DEFERRED_SIBLINGS_KEY)?;
+    let host_ids: Vec<String> = batch
+        .get("host_call_ids")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let answered: HashSet<&str> = conversation
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_result)
+        .map(|r| r.call_id.as_str())
+        .collect();
+    if !host_ids.iter().all(|id| answered.contains(id.as_str())) {
+        return None;
+    }
+    batch
+        .get("calls")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
 /// Milliseconds since the Unix epoch.
 fn epoch_millis() -> u64 {
     SystemTime::now()
@@ -1264,7 +1303,9 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // Checked against the request's *own* input: only a request
             // carrying approval responses is resuming the paused run whose
             // budget is parked on this session.
-            let resuming_approval = !collect_approval_responses(&conversation).is_empty();
+            let deferred = ready_deferred_siblings(session.as_ref(), &conversation);
+            let resuming_approval =
+                !collect_approval_responses(&conversation).is_empty() || deferred.is_some();
             let mut budget = InvocationBudget::resume_or_start(
                 &self.config,
                 session.as_ref(),
@@ -1274,6 +1315,78 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // whichever response is returned so the caller sees the cost of the
             // whole run and not just its final iteration.
             let mut aggregated_usage: Option<UsageDetails> = None;
+
+            // The caller has answered every declaration-only call of a
+            // deferred mixed batch: run its local calls now, once, against the
+            // current tool policy (a tool since removed answers as unknown; one
+            // that now requires approval pauses for it), and put their results
+            // beside the caller's before the model sees the turn.
+            if let Some(deferred) = deferred {
+                if let Some(s) = session.as_ref() {
+                    s.state.remove(DEFERRED_SIBLINGS_KEY);
+                }
+                let current = live_tools.snapshot();
+                let (gated, runnable): (Vec<_>, Vec<_>) = deferred.into_iter().partition(|c| {
+                    current
+                        .iter()
+                        .find(|t| t.name == c.name)
+                        .is_some_and(ToolDefinition::requires_approval)
+                });
+                let mut results = Vec::with_capacity(runnable.len());
+                for call in &runnable {
+                    let tool = current
+                        .iter()
+                        .find(|t| t.name == call.name && t.is_executable())
+                        .cloned();
+                    let outcome = execute_tool_call(
+                        tool,
+                        call,
+                        self.config.include_detailed_errors,
+                        self.config.terminate_on_unknown_calls,
+                        ToolCallEnv {
+                            function_middleware: &self.function_middleware,
+                            session: session.as_ref(),
+                            live_tools: Some(&live_tools),
+                            observability: &self.observability,
+                        },
+                    )
+                    .await
+                    .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
+                    budget.record(usize::from(outcome.executed));
+                    results.push(Content::FunctionResult(outcome.content));
+                }
+                if !results.is_empty() {
+                    let result_message = Message::with_contents(Role::tool(), results);
+                    // Right after the caller's answers, so every result
+                    // follows the calls it answers.
+                    let at = conversation
+                        .iter()
+                        .rposition(|m| m.contents.iter().any(|c| c.as_function_result().is_some()))
+                        .map_or(conversation.len(), |i| i + 1);
+                    conversation.insert(at, result_message.clone());
+                    carried.push(result_message);
+                }
+                if !gated.is_empty() {
+                    let mut gated = gated;
+                    let approvals: Vec<Content> = gated
+                        .iter_mut()
+                        .map(|c| {
+                            let id = c.ensure_occurrence_id().to_string();
+                            Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
+                                id,
+                                function_call: c.clone(),
+                            })
+                        })
+                        .collect();
+                    budget.park(session.as_ref());
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.push(Message::with_contents(Role::assistant(), approvals));
+                    return Ok(ChatResponse {
+                        messages: msgs,
+                        ..Default::default()
+                    });
+                }
+            }
 
             for _ in 0..self.config.max_iterations {
                 options.tools = live_tools.snapshot();
@@ -1551,8 +1664,12 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     // request, the response derived from it, and the replayed
                     // call all carry the same identity.
                     let mut identified_calls = calls.clone();
+                    // A declaration-only call in the batch is the caller's to
+                    // answer, not an approval: it comes back as the call
+                    // itself (upstream #9203), answered beside the approvals.
                     let approval_contents: Vec<Content> = identified_calls
                         .iter_mut()
+                        .filter(|c| !is_caller_owned_call(&options.tools, c))
                         .map(|c| {
                             let occurrence_id = c.ensure_occurrence_id().to_string();
                             Content::FunctionApprovalRequest(FunctionApprovalRequestContent {
@@ -1630,12 +1747,8 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 // replayed turn carried an unanswered call providers reject,
                 // and any answer the caller invented had bypassed function
                 // middleware.
-                let is_caller_owned = |c: &FunctionCallContent| {
-                    options
-                        .tools
-                        .iter()
-                        .any(|t| t.name == c.name && is_declaration_only(t))
-                };
+                let is_caller_owned =
+                    |c: &FunctionCallContent| is_caller_owned_call(&options.tools, c);
                 let has_declaration_only = calls.iter().any(&is_caller_owned);
                 let local_calls: Vec<FunctionCallContent> = if has_declaration_only {
                     calls
@@ -1646,6 +1759,36 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 } else {
                     calls.clone()
                 };
+
+                // With a session to hold them, the local siblings wait for
+                // the caller's answers (upstream #9050): the batch pauses as a
+                // whole, and they run once, on the request that answers every
+                // declaration-only call, so the turn the model sees next is
+                // complete. Without a session nothing could hold them, so they
+                // run now.
+                if has_declaration_only && !local_calls.is_empty() {
+                    if let Some(s) = session.as_ref() {
+                        let host_call_ids: Vec<&str> = calls
+                            .iter()
+                            .filter(|c| is_caller_owned(c))
+                            .map(|c| c.call_id.as_str())
+                            .collect();
+                        s.state.insert(
+                            DEFERRED_SIBLINGS_KEY,
+                            serde_json::json!({
+                                "calls": local_calls,
+                                "host_call_ids": host_call_ids,
+                            }),
+                        );
+                        budget.park(session.as_ref());
+                        let mut resp = response;
+                        let mut msgs = std::mem::take(&mut carried);
+                        msgs.append(&mut resp.messages);
+                        resp.messages = msgs;
+                        resp.usage_details = aggregated_usage;
+                        return Ok(resp);
+                    }
+                }
 
                 // Record the assistant message(s) that requested the calls.
                 carried.extend(response.messages.iter().cloned());

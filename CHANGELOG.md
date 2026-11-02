@@ -90,6 +90,14 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- **Behavior change:** mixed declaration-only batches follow upstream
+  #9050 and #9203. With a session, a declaration-only call's local siblings
+  no longer run on the same turn: the batch pauses, the siblings are held in
+  session state, and they run once, under the current tool policy, on the
+  request that answers every declaration-only call (a sibling whose tool now
+  requires approval pauses for it instead). Without a session they still run
+  on the same turn. In an approval batch, a declaration-only call is returned
+  for the caller to answer rather than turned into an approval request.
 - Message injection now also applies to streamed runs: messages queued on
   the session are streamed as their own updates and sent with the request,
   and a message queued mid-turn earns another call on the same stream

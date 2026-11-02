@@ -67,11 +67,6 @@ from the roadmap, not from this file.
   is most of what the exporter needs (see
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)). The Blob session
   store is ported (`agent-framework-azure`'s `session-store` feature).
-- **Function-invocation pauses with mixed batches**. A declaration-only
-  call's local siblings run on the same turn. Upstream instead holds them
-  until the caller answers whenever a session is present (#9050). An
-  approval batch also defers a declaration-only sibling as an approval,
-  where upstream pauses it as Host input (#9203).
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline and file-based skills (scripts and script

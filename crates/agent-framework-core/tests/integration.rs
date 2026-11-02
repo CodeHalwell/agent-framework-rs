@@ -4602,3 +4602,275 @@ async fn a_streamed_turn_the_service_keeps_is_not_recorded_locally() {
         history.list_messages()
     );
 }
+
+// -- Mixed declaration-only batches with a session (upstream #9050, #9203) --
+
+fn weather_tool(name: &str, runs: Arc<Mutex<usize>>) -> ToolDefinition {
+    FunctionTool::new(
+        name,
+        "",
+        json!({ "type": "object", "properties": {} }),
+        move |_args: Value| {
+            let runs = runs.clone();
+            async move {
+                *runs.lock().unwrap() += 1;
+                Ok(json!("sunny"))
+            }
+        },
+    )
+    .into_definition()
+}
+
+fn mixed_call_turn() -> Message {
+    Message::with_contents(
+        Role::assistant(),
+        vec![
+            Content::FunctionCall(FunctionCallContent::new("c1", "get_weather", None)),
+            Content::FunctionCall(FunctionCallContent::new("c2", "frontend_tool", None)),
+        ],
+    )
+}
+
+fn result_ids(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .filter_map(|c| match c {
+            Content::FunctionResult(r) => Some(r.call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn with_a_session_local_siblings_wait_for_the_callers_answers() {
+    let runs = Arc::new(Mutex::new(0usize));
+    let tools = vec![
+        weather_tool("get_weather", runs.clone()),
+        declaration_only_tool("frontend_tool"),
+    ];
+    let session = AgentSession::new();
+    let client = budgeted_client(
+        vec![
+            ChatResponse {
+                messages: vec![mixed_call_turn()],
+                ..Default::default()
+            },
+            ChatResponse::from_text("all done"),
+        ],
+        |_| {},
+    );
+
+    // First leg: the whole batch pauses; the local call does not run yet.
+    let first = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions {
+                tools: tools.clone(),
+                session: Some(session.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(*runs.lock().unwrap(), 0);
+    assert!(result_ids(&first.messages).is_empty());
+    assert_eq!(first.function_calls().len(), 2);
+
+    // Second leg: the caller answers its call; the sibling runs once, its
+    // result goes beside the caller's, and the model sees a complete turn.
+    let mut conversation = vec![Message::user("go"), mixed_call_turn()];
+    conversation.push(Message::with_contents(
+        Role::tool(),
+        vec![Content::FunctionResult(FunctionResultContent::new(
+            "c2",
+            Some(json!("picked")),
+        ))],
+    ));
+    let second = client
+        .get_response(
+            conversation,
+            ChatOptions {
+                tools: tools.clone(),
+                session: Some(session.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(*runs.lock().unwrap(), 1);
+    assert_eq!(second.text(), "all done");
+    assert_eq!(result_ids(&second.messages), ["c1"], "returned for history");
+    let seen = client.inner().seen.lock().unwrap().clone();
+    assert_eq!(result_ids(&seen[1]), ["c2", "c1"]);
+
+    // The batch is spent: replaying the same turn does not run it again.
+    let third = budgeted_client(vec![ChatResponse::from_text("again")], |_| {});
+    let mut replay = vec![Message::user("go"), mixed_call_turn()];
+    replay.push(Message::with_contents(
+        Role::tool(),
+        vec![
+            Content::FunctionResult(FunctionResultContent::new("c2", Some(json!("picked")))),
+            Content::FunctionResult(FunctionResultContent::new("c1", Some(json!("sunny")))),
+        ],
+    ));
+    third
+        .get_response(
+            replay,
+            ChatOptions {
+                tools,
+                session: Some(session),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(*runs.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_deferred_sibling_whose_tool_now_needs_approval_pauses_for_it() {
+    let runs = Arc::new(Mutex::new(0usize));
+    let session = AgentSession::new();
+    let first = budgeted_client(
+        vec![ChatResponse {
+            messages: vec![mixed_call_turn()],
+            ..Default::default()
+        }],
+        |_| {},
+    );
+    first
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions {
+                tools: vec![
+                    weather_tool("get_weather", runs.clone()),
+                    declaration_only_tool("frontend_tool"),
+                ],
+                session: Some(session.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let gated =
+        weather_tool("get_weather", runs.clone()).with_approval_mode(ApprovalMode::AlwaysRequire);
+    let second = budgeted_client(vec![], |_| {});
+    let out = second
+        .get_response(
+            vec![
+                Message::user("go"),
+                mixed_call_turn(),
+                Message::with_contents(
+                    Role::tool(),
+                    vec![Content::FunctionResult(FunctionResultContent::new(
+                        "c2",
+                        Some(json!("picked")),
+                    ))],
+                ),
+            ],
+            ChatOptions {
+                tools: vec![gated, declaration_only_tool("frontend_tool")],
+                session: Some(session),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(*runs.lock().unwrap(), 0, "not run without approval");
+    let approvals: Vec<_> = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .filter_map(|c| match c {
+            Content::FunctionApprovalRequest(r) => Some(r.function_call.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(approvals, ["c1"]);
+    assert!(
+        second.inner().seen.lock().unwrap().is_empty(),
+        "no model call"
+    );
+}
+
+#[tokio::test]
+async fn an_approval_batch_leaves_a_declaration_only_call_to_the_caller() {
+    let runs = Arc::new(Mutex::new(0usize));
+    let gated =
+        weather_tool("get_weather", runs.clone()).with_approval_mode(ApprovalMode::AlwaysRequire);
+    let client = budgeted_client(
+        vec![ChatResponse {
+            messages: vec![mixed_call_turn()],
+            ..Default::default()
+        }],
+        |_| {},
+    );
+    let out = client
+        .get_response(
+            vec![Message::user("go")],
+            ChatOptions {
+                tools: vec![gated, declaration_only_tool("frontend_tool")],
+                session: Some(AgentSession::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let approvals: Vec<_> = out
+        .messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .filter_map(|c| match c {
+            Content::FunctionApprovalRequest(r) => Some(r.function_call.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        approvals,
+        ["get_weather"],
+        "the caller's call is not an approval"
+    );
+    assert!(out
+        .function_calls()
+        .iter()
+        .any(|c| c.name == "frontend_tool"));
+    assert_eq!(*runs.lock().unwrap(), 0);
+
+    // Resume: approve the local call and answer the caller's call together.
+    let approval = out.user_input_requests()[0].create_response(true);
+    let mut conversation = vec![Message::user("go")];
+    conversation.extend(out.messages.clone());
+    conversation.push(Message::with_contents(
+        Role::tool(),
+        vec![Content::FunctionResult(FunctionResultContent::new(
+            "c2",
+            Some(json!("picked")),
+        ))],
+    ));
+    conversation.push(Message::with_contents(
+        Role::user(),
+        vec![Content::FunctionApprovalResponse(approval)],
+    ));
+    let gated =
+        weather_tool("get_weather", runs.clone()).with_approval_mode(ApprovalMode::AlwaysRequire);
+    let resume = budgeted_client(vec![ChatResponse::from_text("done")], |_| {});
+    let done = resume
+        .get_response(
+            conversation,
+            ChatOptions {
+                tools: vec![gated, declaration_only_tool("frontend_tool")],
+                session: Some(AgentSession::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.text(), "done");
+    assert_eq!(*runs.lock().unwrap(), 1);
+    let seen = resume.inner().seen.lock().unwrap().clone();
+    let mut answered = result_ids(&seen[0]);
+    answered.sort();
+    assert_eq!(answered, ["c1", "c2"], "the model sees both calls answered");
+}
