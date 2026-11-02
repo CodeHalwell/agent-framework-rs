@@ -403,6 +403,14 @@ impl FilterCompiler<'_> {
             }
             FilterOperator::IsNotNull => doc! { "$and": Self::present(name) },
             op @ (FilterOperator::Eq | FilterOperator::Ne) => {
+                // MongoDB's `$eq` / `$ne` on an array field also compare each
+                // element, so `[1, 2]` would match `[[1, 2], 3]`: refuse
+                // rather than silently diverge from whole-value equality.
+                if field.type_.as_deref() == Some("list") && !value.is_null() {
+                    return Err(config(
+                        "Azure DocumentDB cannot compare list fields as whole values; use contains, contains_any, or contains_all.",
+                    ));
+                }
                 let native = if *op == FilterOperator::Eq { "$eq" } else { "$ne" };
                 match filter_operand(field, &value, false)? {
                     Operand::Mismatch if *op == FilterOperator::Eq => Self::false_filter(),

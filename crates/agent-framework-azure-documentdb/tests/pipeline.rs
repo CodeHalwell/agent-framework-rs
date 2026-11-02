@@ -716,3 +716,16 @@ async fn live_round_trip() {
     assert_eq!(hits[0].record["id"], "b");
     docs.ensure_collection_deleted().await.unwrap();
 }
+
+#[tokio::test]
+async fn list_fields_refuse_whole_value_equality() {
+    let c = collection().await;
+    for op in [FilterOperator::Eq, FilterOperator::Ne] {
+        let e: FilterExpression = Filter::new("tags", op, Some(json!([1, 2]))).unwrap().into();
+        let err = c.filter_document(&e).unwrap_err().to_string();
+        assert!(err.contains("whole values"), "{err}");
+    }
+    // A null operand is still an is-null test.
+    let e: FilterExpression = Filter::eq("tags", Value::Null).unwrap().into();
+    assert!(c.filter_document(&e).is_ok());
+}
