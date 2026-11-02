@@ -35,6 +35,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Claude agent (review fix): control handlers the CLI started (tool calls,
+  approval and hook callbacks) are aborted when the run is dropped or
+  cancelled, and a `control_cancel_request` aborts the matching handler, so
+  no tool side effect starts or continues after cancellation.
 - MCP/Foundry hosting: Agent Skills `archive` (ZIP) entries are loaded in
   memory with upstream's safety limits and digest checks (`ArchiveOptions`,
   `load_skills_with`). `FoundryToolbox::skills_options` passes them through,

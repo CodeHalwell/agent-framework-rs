@@ -92,6 +92,18 @@ while True:
         import time
         while True:
             time.sleep(1)
+    if scenario in ("slow_tool", "cancel_tool"):
+        import time
+        out({"type": "control_request", "request_id": "slow1", "request": {
+            "subtype": "mcp_message", "server_name": "_agent_framework_tools",
+            "message": {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "slow", "arguments": {}}}}})
+        if scenario == "cancel_tool":
+            time.sleep(0.3)
+            out({"type": "control_cancel_request", "request_id": "slow1"})
+        record("pid", os.getpid())
+        while True:
+            time.sleep(1)
     if scenario == "crash":
         sys.stderr.write("fatal: no credentials\n"); sys.stderr.flush()
         sys.exit(3)
@@ -608,4 +620,77 @@ async fn dropping_the_stream_kills_a_silent_cli() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert!(gone, "the CLI is killed when its run is dropped");
+}
+
+/// An agent with a `slow` tool that records when it starts and when it
+/// finishes (after 800ms).
+fn slow_tool_agent(
+    fake: &Fake,
+    scenario: &str,
+) -> (ClaudeAgent, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let started = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let (s, f) = (started.clone(), finished.clone());
+    let slow = FunctionTool::new("slow", "Slow side effect", json!({}), move |_| {
+        let (s, f) = (s.clone(), f.clone());
+        async move {
+            s.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            f.fetch_add(1, Ordering::SeqCst);
+            Ok(json!("done"))
+        }
+    })
+    .into_definition();
+    let agent = ClaudeAgent::builder()
+        .tool(slow)
+        .options(fake.options(scenario))
+        .build()
+        .unwrap();
+    (agent, started, finished)
+}
+
+async fn wait_for(flag: &AtomicUsize) {
+    for _ in 0..200 {
+        if flag.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for the tool to start");
+}
+
+#[tokio::test]
+async fn dropping_the_stream_aborts_running_tool_calls() {
+    let fake = Fake::new();
+    let (agent, started, finished) = slow_tool_agent(&fake, "slow_tool");
+    let stream = agent
+        .run_stream(vec![Message::user("hi")], None, None)
+        .await
+        .unwrap();
+    wait_for(&started).await;
+    drop(stream);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        0,
+        "the tool call is aborted with its run"
+    );
+}
+
+#[tokio::test]
+async fn control_cancel_requests_abort_the_matching_tool_call() {
+    let fake = Fake::new();
+    let (agent, started, finished) = slow_tool_agent(&fake, "cancel_tool");
+    let stream = agent
+        .run_stream(vec![Message::user("hi")], None, None)
+        .await
+        .unwrap();
+    wait_for(&started).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        0,
+        "the CLI cancelled the request, so the tool call stops"
+    );
+    drop(stream);
 }

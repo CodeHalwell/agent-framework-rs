@@ -246,6 +246,21 @@ pub(crate) struct Handlers {
 
 type Pending = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
 type Writer = Arc<Mutex<Option<ChildStdin>>>;
+/// Control requests from the CLI still being answered, by request id.
+type Inflight = Arc<StdMutex<HashMap<String, tokio::task::AbortHandle>>>;
+
+/// Abort every control handler still running.
+fn abort_all(inflight: &Inflight) {
+    let handles: Vec<_> = inflight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .map(|(_, h)| h)
+        .collect();
+    for handle in handles {
+        handle.abort();
+    }
+}
 
 /// A running CLI process.
 pub(crate) struct Connection {
@@ -255,6 +270,16 @@ pub(crate) struct Connection {
     counter: AtomicU64,
     messages: mpsc::UnboundedReceiver<Value>,
     stderr: Arc<StdMutex<String>>,
+    /// Running control handlers (tool calls, approval and hook callbacks):
+    /// aborted when the connection goes away, so no tool side effect starts
+    /// or continues after its run is cancelled or dropped.
+    inflight: Inflight,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        abort_all(&self.inflight);
+    }
 }
 
 async fn write_line(writer: &Writer, value: &Value) -> Result<()> {
@@ -339,6 +364,8 @@ impl Connection {
         let reader_pending = pending.clone();
         let reader_writer = writer.clone();
         let handlers = Arc::new(handlers);
+        let inflight: Inflight = Arc::new(StdMutex::new(HashMap::new()));
+        let reader_inflight = inflight.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -382,12 +409,39 @@ impl Connection {
                     Some("control_request") => {
                         let writer = reader_writer.clone();
                         let handlers = handlers.clone();
-                        tokio::spawn(async move {
+                        let id = request_id_of(&message);
+                        let registry = reader_inflight.clone();
+                        // Registered under the lock before the task can
+                        // finish and remove itself.
+                        let mut map = reader_inflight.lock().unwrap_or_else(|p| p.into_inner());
+                        let task_id = id.clone();
+                        let task = tokio::spawn(async move {
                             let reply = answer_control_request(&handlers, &message).await;
+                            if let Some(id) = &task_id {
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .remove(id);
+                            }
                             let _ = write_line(&writer, &reply).await;
                         });
+                        if let Some(id) = id {
+                            if let Some(previous) = map.insert(id, task.abort_handle()) {
+                                previous.abort();
+                            }
+                        }
                     }
-                    Some("control_cancel_request") => {}
+                    Some("control_cancel_request") => {
+                        if let Some(id) = request_id_of(&message) {
+                            let handle = reader_inflight
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&id);
+                            if let Some(handle) = handle {
+                                handle.abort();
+                            }
+                        }
+                    }
                     _ => {
                         if tx.send(message).is_err() {
                             break;
@@ -395,6 +449,8 @@ impl Connection {
                     }
                 }
             }
+            // The CLI is gone: nothing can receive a handler's answer.
+            abort_all(&reader_inflight);
             // Fail anything still waiting for a control response.
             let waiting: Vec<_> = reader_pending
                 .lock()
@@ -414,6 +470,7 @@ impl Connection {
             counter: AtomicU64::new(0),
             messages,
             stderr,
+            inflight,
         })
     }
 
@@ -499,6 +556,15 @@ impl Connection {
         {
             let _ = self.child.kill().await;
         }
+    }
+}
+
+/// A control message's `request_id`, as a string.
+fn request_id_of(message: &Value) -> Option<String> {
+    match message.get("request_id")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
     }
 }
 
