@@ -164,6 +164,13 @@ pub struct FunctionInvokingChatClient<C: ChatClient> {
     /// function-middleware pipeline, driven here instead of by a
     /// `use_function_invocation` decorator).
     function_middleware: MiddlewarePipeline<FunctionInvocationContext>,
+    /// The live tool list of each session whose background operation is
+    /// pending, by session id: a continuation resumes the operation with the
+    /// tools it was actually submitted with (including any a tool or
+    /// middleware added or removed mid-run), whose executors cannot be
+    /// parked in the session's JSON state. Process-local; any other request
+    /// on the session drops the entry.
+    parked_tools: Arc<std::sync::Mutex<HashMap<String, Vec<ToolDefinition>>>>,
 }
 
 impl<C: ChatClient> FunctionInvokingChatClient<C> {
@@ -173,6 +180,7 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
             config: FunctionInvocationConfig::default(),
             function_middleware: MiddlewarePipeline::default(),
             observability: crate::observability::ObservabilityConfig::from_env(),
+            parked_tools: Arc::default(),
         }
     }
 
@@ -1282,6 +1290,26 @@ fn replace_approval_contents_with_results(
     }
 }
 
+impl<C: ChatClient> FunctionInvokingChatClient<C> {
+    /// Park `tools` for `session`'s pending background operation.
+    fn park_tools(&self, session: Option<&AgentSession>, tools: Vec<ToolDefinition>) {
+        if let Some(session) = session {
+            self.parked_tools
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(session.session_id().to_string(), tools);
+        }
+    }
+
+    /// Take (and drop) the tools parked for `session`.
+    fn take_parked_tools(&self, session: &AgentSession) -> Option<Vec<ToolDefinition>> {
+        self.parked_tools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session.session_id())
+    }
+}
+
 #[async_trait]
 impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
     async fn get_response(
@@ -1305,6 +1333,16 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // invoked tools via `FunctionInvocationContext::session`.
             let session = options.session.take();
             let observer = options.service_call_observer.take();
+            // A continuation resumes with the tools its operation was
+            // submitted with; any other request drops a stale entry.
+            if let Some(s) = session.as_ref() {
+                let parked = self.take_parked_tools(s);
+                if options.continuation_token.is_some() {
+                    if let Some(tools) = parked {
+                        options.tools = tools;
+                    }
+                }
+            }
 
             // Default tool choice to auto when tools are present and unset.
             if !options.tools.is_empty() && options.tool_choice.is_none() {
@@ -1597,6 +1635,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     // Parked like an approval pause, so the continuation
                     // resumes this run's call count and clock.
                     budget.park(session.as_ref());
+                    self.park_tools(session.as_ref(), live_tools.snapshot());
                     let mut pending = response;
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut pending.messages);
@@ -2009,6 +2048,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // this run's (spent) budget rather than start a fresh one.
             if final_resp.continuation_token.is_some() {
                 budget.park(session.as_ref());
+                self.park_tools(session.as_ref(), live_tools.snapshot());
             }
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);

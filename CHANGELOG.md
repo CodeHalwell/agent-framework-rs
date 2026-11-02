@@ -138,6 +138,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   the column to floating point (where `9007199254740992.0` matched
   `9007199254740993`); beyond the `BIGINT` range it equals nothing and is
   refused for ordered filters.
+- Core (review fix): with `experimental-progressive-tools`, the live tool
+  list (tools added or removed mid-run) is parked when a background
+  operation goes pending and restored for its continuation, so the resumed
+  operation can execute the tools it was submitted with. The parking is
+  process-local (executors cannot live in session JSON state).
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

@@ -699,3 +699,76 @@ async fn completed_tool_interactions_are_recorded_while_the_operation_runs() {
         "the pending output is not recorded yet"
     );
 }
+
+#[cfg(feature = "experimental-progressive-tools")]
+mod progressive {
+    use super::*;
+    use agent_framework_core::middleware::FunctionInvocationContext;
+    use agent_framework_core::tools::Tool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Adds `added` to the run's live tool list when called.
+    struct Unlock(ToolDefinition);
+
+    #[async_trait]
+    impl Tool for Unlock {
+        fn name(&self) -> &str {
+            "unlock"
+        }
+        fn description(&self) -> &str {
+            "adds a tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn invoke(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(json!("unlocked"))
+        }
+        async fn invoke_in_context(
+            &self,
+            _: serde_json::Value,
+            ctx: &FunctionInvocationContext,
+        ) -> Result<serde_json::Value> {
+            ctx.add_tools([self.0.clone()])?;
+            Ok(json!("unlocked"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_added_mid_run_survive_a_background_pause() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let secret = counting_tool("secret", runs.clone());
+        // `unlock` adds `secret`, then the next submission is still running;
+        // the finished operation calls `secret`, which must still run.
+        let script = Script::replies(vec![
+            ask_tool("c1", "unlock"),
+            pending("op-14", None),
+            ask_tool("c2", "secret"),
+            ChatResponse::from_text("done"),
+        ]);
+        let unlock = ToolDefinition::from_tool(Arc::new(Unlock(secret)));
+        let agent = Agent::builder(script.clone()).tool(unlock).build();
+        let mut session = agent.create_session();
+        let first = agent
+            .run_with_options(
+                vec![Message::user("go")],
+                Some(&mut session),
+                AgentRunOptions::new().with_background(true),
+            )
+            .await
+            .unwrap();
+        let token = first.continuation_token.clone().expect("still running");
+        let done = agent
+            .run_with_options(
+                Vec::new(),
+                Some(&mut session),
+                AgentRunOptions::new()
+                    .with_background(true)
+                    .with_continuation_token(token),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.text(), "done");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the added tool ran");
+    }
+}
