@@ -34,6 +34,8 @@ agui-client = ["hosting", "agent-framework-hosting/agui-client"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
+# Host agents and workflows as Azure AI Foundry hosted agents.
+foundry-hosting = ["dep:agent-framework-foundry-hosting"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 # The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it
@@ -93,6 +95,7 @@ experimental-evals = [
 experimental-session-store = [
     "agent-framework-core/experimental-session-store",
     "agent-framework-azure?/session-store",
+    "agent-framework-foundry-hosting?/session-store",
 ]
 experimental-declarative-agents = [
     "dep:agent-framework-declarative",
@@ -133,6 +136,7 @@ full = [
     "redis",
     "mem0",
     "foundry",
+    "foundry-hosting",
     "azure-ai-search",
     "cosmos",
     "copilotstudio",
@@ -159,6 +163,7 @@ agent-framework-hosting = { workspace = true, optional = true }
 agent-framework-redis = { workspace = true, optional = true }
 agent-framework-mem0 = { workspace = true, optional = true }
 agent-framework-foundry = { workspace = true, optional = true }
+agent-framework-foundry-hosting = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-qdrant = { workspace = true, optional = true }

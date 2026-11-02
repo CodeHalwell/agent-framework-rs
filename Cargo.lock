@@ -25,6 +25,7 @@ dependencies = [
  "agent-framework-declarative",
  "agent-framework-duckdb",
  "agent-framework-foundry",
+ "agent-framework-foundry-hosting",
  "agent-framework-foundry-local",
  "agent-framework-gemini",
  "agent-framework-github-copilot",

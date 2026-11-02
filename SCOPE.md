@@ -55,7 +55,15 @@ from the roadmap, not from this file.
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
-- **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
+- **Foundry hosting, remainder** (`agent-framework-foundry-hosting`): the
+  `service` and `agent` Responses history sources, provider-native
+  background polling, OAuth consent links, Responses output items beyond
+  text and client function calls (reasoning, MCP, search, image,
+  computer-use, annotations, usage events), stream replay, resuming a
+  workflow's `request_info` pause on a later turn, file-backed local
+  storage, and the agentserver's resilient task runtime, WebSocket/voice
+  invocations, OpenAPI/AsyncAPI routes and tracing. Tested in-process
+  only.
 - **Durable Task hosting** (`agent-framework-durabletask`, now published
   from its own repository). Blocked: it sits on the `durabletask` SDK, a
   deterministic-replay orchestration engine with durable entities and a

@@ -35,6 +35,17 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-foundry-hosting` (umbrella feature `foundry-hosting`, in
+  `full`): host agents and workflows as Azure AI Foundry hosted agents,
+  ported from upstream `foundry_hosting` and the agentserver container
+  protocol it builds on. `ResponsesHostServer` (sync, streamed and
+  background responses, `previous_response_id` / `conversation`
+  continuation, get/delete/cancel/input items), `InvocationsHostServer`
+  (feature `session-store`: durable per-session agent state, scoped per
+  platform user when hosted), `GET /readiness`, the snapshot lifecycle
+  routes, Foundry state-store clients with session (ETag-checked),
+  checkpoint and function-approval stores, and `FoundryToolbox`. Tested
+  in-process against storage and MCP doubles.
 - FIDES information-flow control (`experimental-fides`, upstream
   `ExperimentalFeature.FIDES`): `agent_framework_core::security` with
   integrity/confidentiality labels (`ContentLabel`, `combine_labels`,

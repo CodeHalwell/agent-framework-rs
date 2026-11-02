@@ -31,7 +31,7 @@ the order does not matter:
    `agent-framework-ollama` (need `openai`), `agent-framework-azure-documentdb` (needs `mongodb`)
 4. **Tier 3** — `agent-framework-anthropic` (needs `azure` + `bedrock`),
    `agent-framework-azure-ai-search`, `agent-framework-cosmos`,
-   `agent-framework-foundry` (need `azure`)
+   `agent-framework-foundry`, `agent-framework-foundry-hosting` (need `azure`)
 5. **Tier 4** — `agent-framework` (the umbrella crate)
 
 ```bash
@@ -44,7 +44,7 @@ done
 for c in azure azure-documentdb foundry-local github-copilot mistral ollama; do
   cargo publish -p agent-framework-$c
 done
-for c in anthropic azure-ai-search cosmos foundry; do
+for c in anthropic azure-ai-search cosmos foundry foundry-hosting; do
   cargo publish -p agent-framework-$c
 done
 cargo publish -p agent-framework

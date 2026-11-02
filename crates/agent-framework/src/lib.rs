@@ -26,6 +26,7 @@
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
+//! | `foundry-hosting` | [`agent_framework_foundry_hosting`] — host agents and workflows as Azure AI Foundry hosted agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
 //! | `qdrant` | [`agent_framework_qdrant`] — Qdrant vector store (experimental) | no |
 //! | `postgres` | [`agent_framework_postgres`] — PostgreSQL + pgvector vector store (experimental) | no |
@@ -134,29 +135,32 @@ pub use agent_framework_mem0 as mem0;
 /// `foundry` feature).
 #[cfg(feature = "foundry")]
 pub use agent_framework_foundry as foundry;
+/// Azure AI Foundry hosted agents (the `foundry-hosting` feature).
+#[cfg(feature = "foundry-hosting")]
+pub use agent_framework_foundry_hosting as foundry_hosting;
 
 /// Azure AI Search context provider and vector store (enable the
 /// `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
-/// The SQL Server vector store (the experimental `sql-server` feature).
-#[cfg(feature = "sql-server")]
-pub use agent_framework_sql_server as sql_server;
-/// The MongoDB Atlas vector store (the experimental `mongodb` feature).
-#[cfg(feature = "mongodb")]
-pub use agent_framework_mongodb as mongodb;
 /// The Azure DocumentDB (MongoDB vCore) vector store (the experimental `azure-documentdb` feature).
 #[cfg(feature = "azure-documentdb")]
 pub use agent_framework_azure_documentdb as azure_documentdb;
 /// The embedded DuckDB vector store (the experimental `duckdb` feature).
 #[cfg(feature = "duckdb")]
 pub use agent_framework_duckdb as duckdb;
+/// The MongoDB Atlas vector store (the experimental `mongodb` feature).
+#[cfg(feature = "mongodb")]
+pub use agent_framework_mongodb as mongodb;
 /// The PostgreSQL + pgvector vector store (the experimental `postgres` feature).
 #[cfg(feature = "postgres")]
 pub use agent_framework_postgres as postgres;
 /// The Qdrant vector store (the experimental `qdrant` feature).
 #[cfg(feature = "qdrant")]
 pub use agent_framework_qdrant as qdrant;
+/// The SQL Server vector store (the experimental `sql-server` feature).
+#[cfg(feature = "sql-server")]
+pub use agent_framework_sql_server as sql_server;
 
 /// Azure Cosmos DB NoSQL chat-message store, checkpoint storage, and
 /// vector store (enable the `cosmos` feature).

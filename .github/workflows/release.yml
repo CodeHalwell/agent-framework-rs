@@ -159,7 +159,7 @@ jobs:
           for c in azure azure-documentdb foundry-local github-copilot mistral ollama; do
             publish agent-framework-$c
           done
-          for c in anthropic azure-ai-search cosmos foundry; do
+          for c in anthropic azure-ai-search cosmos foundry foundry-hosting; do
             publish agent-framework-$c
           done
           publish agent-framework

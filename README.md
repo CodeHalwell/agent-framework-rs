@@ -108,6 +108,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-anthropic`](crates/agent-framework-anthropic) | Anthropic (Claude) Messages API client. |
 | [`agent-framework-azure`](crates/agent-framework-azure) | Azure OpenAI client + the Entra ID credential chain (CLI / client-secret / managed-identity / chained). |
 | [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`), client-side Prompt Agents (`FoundryAgent`), embeddings (`FoundryEmbeddingClient`) over either a Models inference endpoint or a project's OpenAI deployments, and managed memory (`FoundryMemoryProvider`). |
+| [`agent-framework-foundry-hosting`](crates/agent-framework-foundry-hosting) | Azure AI Foundry hosted agents: the Responses and Invocations container protocols, readiness, Foundry state-store-backed sessions, checkpoints and approvals, and toolboxes. |
 | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search: context provider (semantic + optional vector query) and vector store (index management, document CRUD, filtered vector and keyword-hybrid search). |
 | [`agent-framework-qdrant`](crates/agent-framework-qdrant) | Qdrant vector store over the REST API: named dense vectors, payload indexes, portable filters (experimental). |
 | [`agent-framework-postgres`](crates/agent-framework-postgres) | PostgreSQL + pgvector vector store: typed columns, HNSW / IVFFlat indexes, parameterized portable filters (experimental). |
@@ -211,6 +212,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `redis` | [`agent-framework-redis`](crates/agent-framework-redis) — Redis chat-message store & context provider | no |
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
 | `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, embeddings, and managed memory | no |
+| `foundry-hosting` | [`agent-framework-foundry-hosting`](crates/agent-framework-foundry-hosting) — Azure AI Foundry hosted agents (Responses and Invocations protocols, Foundry state storage) | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
 | `qdrant` | [`agent-framework-qdrant`](crates/agent-framework-qdrant) — Qdrant vector store (experimental) | no |
 | `postgres` | [`agent-framework-postgres`](crates/agent-framework-postgres) — PostgreSQL + pgvector vector store (experimental) | no |
