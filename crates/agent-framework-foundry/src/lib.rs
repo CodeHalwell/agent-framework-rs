@@ -91,11 +91,13 @@ pub(crate) fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest:
 }
 
 pub mod embeddings;
+pub mod hosted_agent;
 pub mod memory;
 mod tool_definition_wire;
 
 pub use client_headers::{FoundryClientHeaders, CLIENT_HEADER_PREFIX};
 pub use embeddings::FoundryEmbeddingClient;
+pub use hosted_agent::FoundryAgentChatClient;
 pub use memory::FoundryMemoryProvider;
 
 use std::sync::Arc;

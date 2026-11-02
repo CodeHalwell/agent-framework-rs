@@ -56,9 +56,6 @@ from the roadmap, not from this file.
   Evaluation is ported (`experimental-evals`); Foundry's cloud evaluator
   (`FoundryEvals`) is not.
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
-- **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
-  client-side and cannot yet bind to an agent hosted on the Foundry control
-  plane (`AIProjectClient.AsAIAgent`, `FoundryAgent(Uri, ...)`).
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.

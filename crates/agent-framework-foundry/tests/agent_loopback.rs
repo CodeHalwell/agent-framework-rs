@@ -20,7 +20,7 @@ use agent_framework_azure::StaticTokenCredential;
 use agent_framework_core::agent::{Agent, AgentRunOptions, SupportsAgentRun};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{ChatOptions, Content, Message};
-use agent_framework_foundry::{FoundryChatClient, FoundryClientHeaders};
+use agent_framework_foundry::{FoundryAgentChatClient, FoundryChatClient, FoundryClientHeaders};
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -590,4 +590,46 @@ async fn foundry_still_honors_an_explicitly_requested_include() {
         body_json["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
+}
+
+/// A server-hosted agent: the request names the agent and carries no model
+/// or tool declarations, while a local function tool still dispatches.
+#[tokio::test]
+async fn hosted_agent_requests_reference_the_agent() {
+    let server = FakeServer::start(false, OK_BODY);
+    let client = FoundryAgentChatClient::new(&server.addr, "support", Some("3".into()), "k");
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "lookup",
+        "Look up an order.",
+        serde_json::json!({"type": "object", "properties": {}}),
+        |_args| async { Ok(serde_json::json!("found")) },
+    )
+    .into_definition();
+    let agent = client.as_agent().tool(tool).build();
+    assert_eq!(SupportsAgentRun::name(&agent), Some("support"));
+    let reply = agent.run_once("where is it?").await.unwrap();
+    assert_eq!(reply.text(), "ok");
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(line.contains("/openai/v1/responses"), "{line}");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["agent_reference"],
+        serde_json::json!({"name": "support", "type": "agent_reference", "version": "3"})
+    );
+    for absent in ["model", "tools", "tool_choice", "parallel_tool_calls"] {
+        assert!(body.get(absent).is_none(), "{absent} in {body}");
+    }
+
+    let hosted = agent_framework_core::tools::hosted_web_search();
+    let err = client
+        .get_response(
+            vec![Message::user("x")],
+            ChatOptions {
+                tools: vec![hosted],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Only function tools"), "{err}");
 }

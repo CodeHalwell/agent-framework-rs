@@ -35,6 +35,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - **`agent-framework-postgres`**: the PostgreSQL + pgvector vector store
   (umbrella feature `postgres`, experimental). Its live tests run when
   `AF_POSTGRES_TEST_URL` is set.
+- `FoundryAgentChatClient` (in `agent-framework-foundry`): calls a Prompt or
+  Hosted Agent defined in a Foundry project by `agent_reference`, dropping
+  the model and tool declarations the service owns; `as_agent()` builds an
+  `Agent` whose local function tools dispatch the service agent's calls.
+  `AzureOpenAIResponsesClient::with_body_transform` is the hook it uses.
 - `ValkeyChatHistoryProvider` (in `agent-framework-redis`): port of .NET's
   Valkey history provider, resolving each session's conversation from its
   state bag rather than being pinned to one session.
