@@ -32,8 +32,8 @@ mod validation;
 mod viz;
 
 pub use checkpoint::{
-    get_checkpoint_summary, CheckpointStorage, FileCheckpointStorage, InMemoryCheckpointStorage,
-    WorkflowCheckpoint, WorkflowCheckpointSummary,
+    compare_checkpoints, get_checkpoint_summary, CheckpointStorage, FileCheckpointStorage,
+    InMemoryCheckpointStorage, WorkflowCheckpoint, WorkflowCheckpointSummary,
 };
 pub use context::{WorkflowContext, WorkflowMessage};
 pub use edge::{

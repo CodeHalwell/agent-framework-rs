@@ -31,6 +31,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-11-02-ca65085e-round-2`](2026-11-02-ca65085e-round-2.md) | Queued fixes + the Azure Rust SDK review (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e`](2026-11-02-ca65085e.md) | Post-`67ba500e` drift + Azure-ecosystem review (checked against `ca65085e`, 2026-11-01) |
 | [`2026-10-26-67ba500e`](2026-10-26-67ba500e.md) | Post-`02005995` drift + Azure-ecosystem review (checked against `67ba500e`, 2026-10-24) |
 | [`2026-10-21-02005995`](2026-10-21-02005995.md) | Post-`9d308951` drift + Go v0.2.0 skim (checked against `02005995`, 2026-10-21) |

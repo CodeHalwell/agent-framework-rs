@@ -1641,19 +1641,43 @@ fn parse_responses_event(
             let resp = value.get("response");
             let err_obj = resp
                 .and_then(|r| r.get("error"))
-                .or_else(|| value.get("error"));
-            let msg = err_obj
+                .filter(|e| !e.is_null())
+                .or_else(|| value.get("error").filter(|e| !e.is_null()))
+                // A flat `error` event carries `code` / `message` / `param`
+                // on the event itself rather than nested under an `error`
+                // key (upstream's `ResponseErrorEvent`). Without this
+                // fallback none of the three was found and every such event
+                // collapsed to the generic "response failed", discarding
+                // whatever the provider actually said. `response.failed`
+                // events are unaffected: they carry no top-level `message`,
+                // so they still fall through to that default.
+                .or(Some(value));
+            let message = err_obj
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
-                .unwrap_or("response failed")
-                .to_string();
+                .unwrap_or("response failed");
+            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
+            let param = err_obj.and_then(|e| e.get("param")).and_then(Value::as_str);
+            // Keep the provider's `code` and `param` in the surfaced error
+            // (upstream #9616). Only `message` used to survive, so a streamed
+            // `400` arrived as bare text like "Invalid value" with nothing
+            // naming the field that was wrong — the one detail that makes it
+            // actionable. Upstream carries them as attributes on its own
+            // exception type; `Error::service` carries a string, so they go
+            // in the message, formatted as upstream formats its own.
+            let mut detail = match code {
+                Some(code) => format!("{code}: {message}"),
+                None => message.to_string(),
+            };
+            if let Some(param) = param {
+                detail.push_str(&format!(" (parameter: {param})"));
+            }
             // Same classification as the non-streaming `response_failure_error`
             // so callers branching on content filters see one behavior for
             // streamed and non-streamed Responses.
-            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
             EventOutcome::Error(match code {
-                Some("content_filter") => Error::service_content_filter(msg),
-                _ => Error::service(msg),
+                Some("content_filter") => Error::service_content_filter(detail),
+                _ => Error::service(detail),
             })
         }
         "response.output_item.done" => {
@@ -2389,6 +2413,72 @@ mod tests {
             saw_error,
             "expected a response.failed event to surface an error"
         );
+    }
+
+    #[test]
+    fn a_streamed_error_keeps_the_provider_code_and_param() {
+        // Only `message` used to survive, so a streamed 400 arrived as bare
+        // text with nothing naming the offending field (upstream #9616).
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "error",
+                "code": "invalid_value",
+                "message": "Invalid value",
+                "param": "tools[0].name",
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        let text = err.to_string();
+        assert!(text.contains("invalid_value"), "missing code: {text}");
+        assert!(text.contains("Invalid value"), "missing message: {text}");
+        assert!(text.contains("tools[0].name"), "missing param: {text}");
+    }
+
+    #[test]
+    fn a_streamed_error_without_a_code_or_param_is_just_its_message() {
+        // The common shape must not grow "None:" noise.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({ "type": "error", "message": "plain failure" }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        let text = err.to_string();
+        assert!(text.contains("plain failure"), "{text}");
+        assert!(!text.contains("None"), "no placeholder noise: {text}");
+        assert!(
+            !text.contains("parameter:"),
+            "no empty param clause: {text}"
+        );
+    }
+
+    #[test]
+    fn a_content_filter_block_keeps_its_classification_and_its_code() {
+        // Enriching the message must not change how the error classifies.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "content_filter", "message": "blocked" } }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        assert!(matches!(err, Error::ServiceContentFilter { .. }));
+        let text = err.to_string();
+        assert!(text.contains("content_filter"), "{text}");
+        assert!(text.contains("blocked"), "{text}");
     }
 
     #[test]

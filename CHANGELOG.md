@@ -8,8 +8,56 @@ may break APIs).
 ## [Unreleased]
 
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
-in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md).
-Five changes, three of them defects that were live in this port.
+in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
+and a second round against the same baseline in
+[`docs/drift/2026-11-02-ca65085e-round-2.md`](docs/drift/2026-11-02-ca65085e-round-2.md).
+Eight changes, five of them defects that were live in this port. A review of
+the official Azure SDK for Rust crates is in
+[`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+### Fixed (round two)
+
+- `CheckpointStorage::list` could report a superseded checkpoint as the
+  newest one (upstream #9261). Sorting by `timestamp_millis` alone is not a
+  total order, and checkpoints are written one per superstep boundary, so two
+  routinely share a millisecond; the tie then fell to the backend's
+  enumeration order — `HashMap` order for `InMemoryCheckpointStorage`, which
+  Rust randomises per process. A caller reading the end of the list as "the
+  newest checkpoint" got an arbitrary one of the pair, differently on
+  different runs: with the fix reverted the new regression test fails 9 times
+  in 20. `list` now sorts with a new public `compare_checkpoints` over
+  `(timestamp_millis, iteration_count, checkpoint_id)` — `iteration_count`
+  being the superstep counter, which already encodes the supersession
+  upstream recovers by walking `previous_checkpoint_id`. Applied to the
+  in-memory, file and Cosmos stores, and now part of the trait's documented
+  contract.
+- Streamed Responses errors dropped the provider's `code` and `param`, and a
+  flat `error` event lost its message entirely (upstream #9616). The handler
+  read only `message`, and only from `response.error` or a top-level `error`
+  key — but a flat `error` event carries `code` / `message` / `param` on the
+  event itself, so every such event collapsed to a generic "response failed".
+  A streamed `400` arrived as bare text with nothing naming the offending
+  field. The event is now the last fallback for the error object, and `code`
+  and `param` are formatted into the message as upstream formats its own,
+  each clause omitted when absent. Content-filter classification is
+  unchanged. `agent-framework-azure` and Foundry reuse the same SSE parser,
+  so both get the fix.
+
+### Added (round two)
+
+- `otel-export`'s pipeline marks its telemetry with the
+  `microsoft.agent-framework="True"` resource attribute (upstream #9589),
+  shared by the tracer and meter providers. Azure's agent telemetry views —
+  Foundry's, and the Application Insights experiences built on them — key off
+  it to tell Agent Framework telemetry apart from an application's own, so a
+  pipeline without it exported telemetry those views did not recognise. The
+  value is the string `"True"`, matching upstream's default exactly. Two
+  `ObservabilityConfig` doc comments that claimed this crate builds no OTel
+  `Resource`, exporter or `MeterProvider` were corrected: they predate
+  `otel-export`, and a reader who believed them would wire their own
+  `Resource` and omit this attribute.
+
+The first round against this baseline follows.
 
 ### Fixed
 

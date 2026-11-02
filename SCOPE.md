@@ -71,7 +71,13 @@ from the roadmap, not from this file.
   to build on.
 - **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
   on the Agent Memory Toolkit), the dedicated Application Insights exporter,
-  and a session store backed by Azure storage. The last one is an
+  and a session store backed by Azure storage. Two of these are no longer
+  blocked on a dependency, only on the work (see
+  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)):
+  `azure_core_opentelemetry` is stable at 1.0.0, and with the
+  `microsoft.agent-framework` resource attribute `otel-export` now sets, it
+  is most of what the Application Insights exporter needs;
+  `azure_storage_blob` is stable at 1.1.0 for the session store. The last one is an
   implementation of the ported `session_store` abstraction, not new surface:
   upstream's `AzureBlobAgentSessionStore`
   (`Microsoft.Agents.AI.Hosting.AzureStorage`) saves, gets and deletes a
@@ -122,6 +128,15 @@ from the roadmap, not from this file.
   (declaring `SEPARATOR ""` / `CASESENSITIVE`) are breaking and need a
   migration for already-indexed data. Detailed in the 2026-11-02 pass; it is
   the next pass's first item.
+
+- **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
+  optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
+  `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
+  resource-token signing the official client now does. Not a defect — the
+  hand-rolled client works — but it is maintenance this port would stop
+  carrying. Needs a check that the crate's query surface covers the
+  `VectorDistance` queries `vector_store.rs` issues. See
+  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 - **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
   revision it was written against.

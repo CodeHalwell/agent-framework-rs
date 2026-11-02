@@ -78,10 +78,43 @@
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
+
+/// Resource attribute marking telemetry as produced by the Agent Framework
+/// (upstream #9589).
+///
+/// Azure's agent tooling — Foundry's telemetry views and the Application
+/// Insights experiences built on them — keys off this attribute to tell
+/// Agent Framework traces and metrics apart from an application's own. A
+/// pipeline without it exports telemetry those views do not recognise.
+///
+/// The value is the string `"True"`, not a boolean, matching upstream's
+/// `resource_attributes` default exactly: the two are distinct values on the
+/// wire and a consumer matching the string would not match a bool.
+const MICROSOFT_AGENT_FRAMEWORK_ATTR: &str = "microsoft.agent-framework";
+
+/// The value for [`MICROSOFT_AGENT_FRAMEWORK_ATTR`]. See its note on why this
+/// is the string `"True"` rather than a boolean.
+const MICROSOFT_AGENT_FRAMEWORK_VALUE: &str = "True";
+
+/// The OTel `Resource` shared by this pipeline's tracer and meter providers.
+///
+/// One resource for both signals, as upstream does: the marker attribute has
+/// to be on traces and metrics alike, or Azure's views recognise only half of
+/// what a run emits.
+fn build_resource(service_name: &str) -> Resource {
+    Resource::builder()
+        .with_service_name(service_name.to_string())
+        .with_attribute(KeyValue::new(
+            MICROSOFT_AGENT_FRAMEWORK_ATTR,
+            MICROSOFT_AGENT_FRAMEWORK_VALUE,
+        ))
+        .build()
+}
 
 use crate::error::{Error, Result};
 
@@ -232,9 +265,7 @@ impl OtelExport {
     /// which is [`OtelPipeline::install`]'s job, or the caller's via
     /// [`OtelPipeline::tracing_layer`].
     pub fn build(self) -> Result<OtelPipeline> {
-        let resource = Resource::builder()
-            .with_service_name(self.service_name.clone())
-            .build();
+        let resource = build_resource(&self.service_name);
 
         let tracer_provider = if self.traces {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -390,6 +421,35 @@ impl OtelPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_resource_marks_telemetry_as_agent_framework() {
+        // Azure's Foundry and Application Insights agent views key off this
+        // attribute to tell Agent Framework telemetry apart from the
+        // application's own (upstream #9589). Without it a pipeline exports
+        // telemetry those views do not recognise.
+        let resource = build_resource("svc");
+        let value = resource
+            .get(&opentelemetry::Key::from_static_str(
+                MICROSOFT_AGENT_FRAMEWORK_ATTR,
+            ))
+            .expect("the marker attribute must be on the resource");
+        assert_eq!(value.as_str(), MICROSOFT_AGENT_FRAMEWORK_VALUE);
+        // The string "True", not a boolean: a consumer matching the string
+        // would not match a bool on the wire.
+        assert_eq!(value.as_str(), "True");
+    }
+
+    #[test]
+    fn the_resource_still_carries_the_service_name() {
+        // The marker is additive — it must not displace the service name the
+        // caller configured.
+        let resource = build_resource("my-service");
+        let value = resource
+            .get(&opentelemetry::Key::from_static_str("service.name"))
+            .expect("service.name must survive");
+        assert_eq!(value.as_str(), "my-service");
+    }
 
     #[test]
     fn endpoint_defaults_and_overrides() {
