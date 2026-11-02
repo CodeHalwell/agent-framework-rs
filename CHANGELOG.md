@@ -21,6 +21,11 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Workflow telemetry: runs emit `workflow.build`, `workflow.run`,
+  `executor.process {id}`, `message.send` and `edge_group.process {type}`
+  spans (upstream's names and attributes) through `tracing`;
+  `WorkflowBuilder::with_telemetry(WorkflowTelemetryOptions)` turns kinds off
+  and opts into payload capture.
 - Compaction depth: the group model (`compaction::index`:
   `CompactionMessageIndex`, `CompactionMessageGroup`, `CompactionGroupKind`),
   `CompactionTriggers`, `PipelineCompactionStrategy`,

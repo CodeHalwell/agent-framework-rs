@@ -59,7 +59,9 @@ pub use orchestration::{
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 };
 pub use request_info::{PendingRequest, RequestInfoExecutor, RequestResponse};
-pub use runner::{Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream};
+pub use runner::{
+    Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream, WorkflowTelemetryOptions,
+};
 pub use shared_state::SharedState;
 pub use sub_workflow::WorkflowExecutor;
 pub use validation::{validate_workflow_graph, ValidationType, WorkflowValidationError};

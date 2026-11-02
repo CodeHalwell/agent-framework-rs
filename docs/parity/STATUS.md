@@ -20,11 +20,11 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 44 / 14 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 97 / 43 / 69 / 0 | 41 | 0 |
+| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 98 / 43 / 68 / 0 | 41 | 0 |
 | `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
 | `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
 | `Microsoft.Agents.AI.Workflows.InProc` | 5 / 3 / 0 / 0 / 0 | 1 / 2 / 5 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows.Observability` | 7 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 7 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Workflows.Observability` | 7 / 0 / 0 / 0 / 0 | 7 / 0 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Workflows.Reflection` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 3 | 0 |
 | `Microsoft.Agents.AI.Workflows.Specialized.Magentic` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 4 | 0 |
 | `Microsoft.AspNetCore.Builder` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 1 / 0 / 0 | 0 | 0 |
@@ -221,7 +221,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::OpenStreamingAsync(Workflow, string?, CancellationToken)` | partial | adapted | A streaming run cannot be opened without an initial input message, and session ids are not supported. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::ResumeStreamingAsync(Workflow, CheckpointInfo, CheckpointManager, CancellationToken)` | partial | adapted | Resume is non-streaming only; there is no run_stream variant that restores from a checkpoint. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution properties::Lockstep` | unmapped | mapped | There is no lockstep mode where supersteps advance only as the caller consumes events. |
-| `Microsoft.Agents.AI.Workflows::OpenTelemetryWorkflowBuilderExtensions methods::WithOpenTelemetry(WorkflowBuilder, Action<WorkflowTelemetryOptions>, ActivitySource)` | unmapped | adapted | Workflow runs emit no OpenTelemetry spans; WorkflowBuilder has no telemetry option. |
 | `Microsoft.Agents.AI.Workflows::OrchestrationBuilderBase<TBuilder> methods::WithDescription(string)` | partial | adapted | Only WorkflowBuilder has description; SequentialBuilder, ConcurrentBuilder and the other orchestration builders do not. |
 | `Microsoft.Agents.AI.Workflows::OutputTag methods::ToString()` | unmapped | mapped | There is no tag object to stringify; the event variant identifies the output kind. |
 | `Microsoft.Agents.AI.Workflows::OutputTag properties::Value` | unmapped | adapted | Output kinds are enum variants, so there is no tag string value. |
@@ -298,13 +297,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment methods::RunAsync<TInput>(Workflow, TInput, string, CancellationToken)` | partial | adapted | run(input) runs to the next halt; there is no session id parameter, and cancellation is by dropping the future. |
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment methods::RunStreamingAsync<TInput>(Workflow, TInput, string, CancellationToken)` | partial | adapted | run_stream(input) streams events; there is no session id parameter. |
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment properties::IsCheckpointingEnabled` | partial | mapped | Checkpointing is set on the builder; there is no accessor reporting whether it is enabled. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableEdgeGroupProcess` | unmapped | mapped | No edge-group spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableExecutorProcess` | unmapped | mapped | No executor-process spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableMessageSend` | unmapped | mapped | No message-send spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableWorkflowBuild` | unmapped | mapped | No workflow.build span exists to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableWorkflowRun` | unmapped | mapped | No workflow run/session spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::EnableSensitiveData` | unmapped | mapped | ObservabilityConfig::enable_sensitive_data covers chat/agent spans only; workflows emit no spans. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions` | unmapped | mapped | No workflow telemetry; the workflow runner emits no OpenTelemetry spans. |
 | `Microsoft.AspNetCore.Builder::A2AEndpointRouteBuilderExtensions methods::MapA2AHttpJson(IEndpointRouteBuilder, AIAgent, string)` | partial | adapted | A2ARouter serves JSON-RPC only; the HTTP+JSON transport binding is not implemented. |
 
 ## Not yet reviewed

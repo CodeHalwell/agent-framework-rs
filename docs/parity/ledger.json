@@ -6295,9 +6295,11 @@
       "OpenTelemetryWorkflowBuilderExtensions": {
         "methods": {
           "WithOpenTelemetry(WorkflowBuilder, Action<WorkflowTelemetryOptions>, ActivitySource)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Workflow runs emit no OpenTelemetry spans; WorkflowBuilder has no telemetry option."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowBuilder::with_telemetry"
+            ],
+            "status": "adapted",
+            "note": "Spans are emitted through tracing (on by default); with_telemetry turns kinds off. There is no ActivitySource argument."
           }
         }
       },
@@ -7520,40 +7522,54 @@
     "Microsoft.Agents.AI.Workflows.Observability": {
       "WorkflowTelemetryOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No workflow telemetry; the workflow runner emits no OpenTelemetry spans."
+          "rust": [
+            "agent_framework_core::workflow::runner::WorkflowTelemetryOptions"
+          ],
+          "status": "mapped",
+          "note": "Struct of span switches; spans go through tracing."
         },
         "properties": {
           "DisableEdgeGroupProcess": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No edge-group spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_edge_group_process"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableExecutorProcess": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No executor-process spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_executor_process"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableMessageSend": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-send spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_message_send"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableWorkflowBuild": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No workflow.build span exists to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_workflow_build"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableWorkflowRun": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No workflow run/session spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_workflow_run"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "EnableSensitiveData": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ObservabilityConfig::enable_sensitive_data covers chat/agent spans only; workflows emit no spans."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::enable_sensitive_data"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           }
         }
       }

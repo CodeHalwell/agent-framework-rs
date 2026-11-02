@@ -52,6 +52,7 @@ struct Inner {
 /// `WorkflowContext`.
 #[derive(Clone)]
 pub struct WorkflowContext {
+    telemetry: super::runner::WorkflowTelemetryOptions,
     executor_id: String,
     source_ids: Arc<Vec<String>>,
     shared: SharedState,
@@ -61,6 +62,7 @@ pub struct WorkflowContext {
 impl WorkflowContext {
     pub(crate) fn new(executor_id: String, source_ids: Vec<String>, shared: SharedState) -> Self {
         Self {
+            telemetry: Default::default(),
             executor_id,
             source_ids: Arc::new(source_ids),
             shared,
@@ -70,12 +72,40 @@ impl WorkflowContext {
 
     /// Send a message to all connected downstream executors.
     pub async fn send_message(&self, data: impl Into<Value>) -> Result<()> {
+        let data = data.into();
+        self.record_send(&data, None);
         self.inner.lock().unwrap().sent.push(WorkflowMessage {
-            data: data.into(),
+            data,
             source_id: self.executor_id.clone(),
             target_id: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn with_telemetry(
+        mut self,
+        telemetry: super::runner::WorkflowTelemetryOptions,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
+    /// A `message.send` span for an outgoing message.
+    fn record_send(&self, data: &Value, target: Option<&str>) {
+        if self.telemetry.disable_message_send {
+            return;
+        }
+        let span = tracing::info_span!(
+            "message.send",
+            otel.name = "message.send",
+            otel.kind = "producer",
+            message.source_id = %self.executor_id,
+            message.destination_executor_id = target.unwrap_or_default(),
+            message.content = tracing::field::Empty,
+        );
+        if self.telemetry.enable_sensitive_data {
+            span.record("message.content", data.to_string());
+        }
     }
 
     /// Send a message to a specific downstream executor.
@@ -84,10 +114,12 @@ impl WorkflowContext {
         target_id: impl Into<String>,
         data: impl Into<Value>,
     ) -> Result<()> {
+        let (target_id, data) = (target_id.into(), data.into());
+        self.record_send(&data, Some(&target_id));
         self.inner.lock().unwrap().sent.push(WorkflowMessage {
-            data: data.into(),
+            data,
             source_id: self.executor_id.clone(),
-            target_id: Some(target_id.into()),
+            target_id: Some(target_id),
         });
         Ok(())
     }
