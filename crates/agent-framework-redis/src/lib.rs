@@ -53,6 +53,7 @@
 pub mod chat_message_store;
 pub mod context_provider;
 mod internal;
+pub mod valkey;
 
 pub use chat_message_store::{
     RedisChatMessageStore, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
@@ -61,3 +62,4 @@ pub use context_provider::{
     RedisContextProvider, DEFAULT_CONTEXT_PROMPT,
     DEFAULT_KEY_PREFIX as DEFAULT_PROVIDER_KEY_PREFIX, DEFAULT_LIMIT,
 };
+pub use valkey::{ValkeyChatHistoryProvider, DEFAULT_VALKEY_KEY_PREFIX, DEFAULT_VALKEY_STATE_KEY};

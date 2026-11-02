@@ -43,8 +43,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use agent_framework_core::memory::{ContextProvider, SessionContext};
+use agent_framework_core::session::AgentSession;
 use agent_framework_core::types::Message;
-use agent_framework_redis::{RedisChatMessageStore, RedisContextProvider};
+use agent_framework_redis::{
+    RedisChatMessageStore, RedisContextProvider, ValkeyChatHistoryProvider,
+};
 use uuid::Uuid;
 
 /// Kills the spawned `redis-server` child (if any) when dropped.
@@ -818,4 +821,65 @@ async fn context_provider_redisearch_entries_are_not_visible_to_forced_scan_fall
         ctx.messages.is_empty(),
         "SCAN+MGET must not see a JSON.SET-backed entry (documented storage-encoding divergence)"
     );
+}
+
+#[tokio::test]
+async fn valkey_provider_resolves_the_conversation_per_session() {
+    let Some((url, _guard)) = test_server().await else {
+        return;
+    };
+    let provider = ValkeyChatHistoryProvider::new(&url)
+        .unwrap()
+        .with_key_prefix(format!("valkey-it-{}", Uuid::new_v4()))
+        .with_max_messages(3)
+        .unwrap()
+        .with_max_messages_to_retrieve(2)
+        .with_store_request_filter(|msgs| {
+            msgs.into_iter().filter(|m| m.text() != "secret").collect()
+        });
+    let (one, two) = (AgentSession::new(), AgentSession::new());
+    provider
+        .after_run_in_session(
+            &one,
+            &[Message::user("hi"), Message::user("secret")],
+            &[Message::assistant("hello")],
+            None,
+        )
+        .await
+        .unwrap();
+    provider
+        .after_run_in_session(
+            &one,
+            &[Message::user("again")],
+            &[Message::assistant("yes")],
+            None,
+        )
+        .await
+        .unwrap();
+    // Trimmed to 3 stored, 2 retrieved; the filtered request never stored.
+    assert_eq!(provider.message_count(&one).await.unwrap(), 3);
+    let mut ctx = SessionContext::new(vec![Message::user("now")]);
+    ctx.session = Some(one.clone());
+    provider.before_run(&mut ctx).await.unwrap();
+    let texts: Vec<String> = ctx.messages.iter().map(Message::text).collect();
+    assert_eq!(texts, ["again", "yes"]);
+    // The conversation id is recorded in the session state.
+    assert_eq!(
+        provider.conversation_id(&one).unwrap(),
+        one.session_id().to_string()
+    );
+    // Another session sees nothing; a failed run stores nothing.
+    assert!(provider.messages(&two).await.unwrap().is_empty());
+    let err = agent_framework_core::error::Error::Service("x".into());
+    provider
+        .after_run_in_session(&two, &[Message::user("q")], &[], Some(&err))
+        .await
+        .unwrap();
+    assert_eq!(provider.message_count(&two).await.unwrap(), 0);
+    provider.clear(&one).await.unwrap();
+    assert_eq!(provider.message_count(&one).await.unwrap(), 0);
+    assert!(ValkeyChatHistoryProvider::new(&url)
+        .unwrap()
+        .with_max_messages(0)
+        .is_err());
 }

@@ -90,8 +90,10 @@ from the roadmap, not from this file.
   `create_harness_agent` turns on); context providers seeing the agent
   (they see the session in `before_run` and, through
   `after_run_in_session`, after the run).
-- **Vector stores**: MongoDB, DuckDB, SQL Server, Azure
-  DocumentDB (blocked on the MongoDB wire protocol), Valkey.
+- **Vector stores**: MongoDB, DuckDB, SQL Server, Azure DocumentDB
+  (blocked on the MongoDB wire protocol), and Redis (upstream's
+  `agent_framework_redis._vector_store`, over RediSearch; the Redis crate
+  here has the history store, the context provider and Valkey history).
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
   optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
   `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and

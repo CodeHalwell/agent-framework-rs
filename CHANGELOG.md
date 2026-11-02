@@ -35,6 +35,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - **`agent-framework-postgres`**: the PostgreSQL + pgvector vector store
   (umbrella feature `postgres`, experimental). Its live tests run when
   `AF_POSTGRES_TEST_URL` is set.
+- `ValkeyChatHistoryProvider` (in `agent-framework-redis`): port of .NET's
+  Valkey history provider, resolving each session's conversation from its
+  state bag rather than being pinned to one session.
 - **Cloud streaming**: Anthropic on Foundry, Vertex and Bedrock now stream
   (Bedrock via a new AWS event-stream decoder), and the Bedrock Converse
   client streams through `converse-stream` instead of buffering.
