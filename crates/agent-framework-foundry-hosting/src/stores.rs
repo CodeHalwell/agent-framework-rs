@@ -153,6 +153,40 @@ pub trait FunctionApprovalStore: Send + Sync {
     async fn load_approval_request(&self, id: &str) -> Result<Content>;
 }
 
+/// A process-local [`FunctionApprovalStore`] (the Responses server's default
+/// when no [`FunctionApprovalStoreProvider`] is configured).
+#[derive(Debug, Default)]
+pub struct InMemoryFunctionApprovalStore {
+    requests: std::sync::Mutex<std::collections::HashMap<String, Content>>,
+}
+
+#[async_trait]
+impl FunctionApprovalStore for InMemoryFunctionApprovalStore {
+    async fn save_approval_request(&self, id: &str, request: &Content) -> Result<()> {
+        let mut requests = self.requests.lock().unwrap();
+        if requests.contains_key(id) {
+            return Err(agent_framework_core::error::Error::Other(format!(
+                "Approval request with ID '{id}' already exists."
+            )));
+        }
+        requests.insert(id.to_string(), request.clone());
+        Ok(())
+    }
+
+    async fn load_approval_request(&self, id: &str) -> Result<Content> {
+        self.requests
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                agent_framework_core::error::Error::Other(format!(
+                    "Approval request with ID '{id}' does not exist."
+                ))
+            })
+    }
+}
+
 /// Function-approval requests in a Foundry state store.
 pub struct FoundryFunctionApprovalStore {
     storage: FoundryStorage,

@@ -54,8 +54,8 @@ from the roadmap, not from this file.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
   code-interpreter, file/web-search and computer-use output items and
   container/file citations (no Rust content or annotation carries them);
-  saving approval requests for a later `mcp_approval_response`, and approval or
-  computer-call replies to paused workflows; durable (Foundry-stored) sessions
+  approval (`mcp_approval_response`) and computer-call replies to paused
+  workflows (agent approvals round-trip); durable (Foundry-stored) sessions
   for the `Agent`/`Service` history sources (kept in process); provider-native
   background polling; per-request toolbox tokens (needs a per-request header
   hook in `agent-framework-mcp`) and the toolbox skills provider (needs MCP

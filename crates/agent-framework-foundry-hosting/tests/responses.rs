@@ -1039,3 +1039,242 @@ async fn persistence_failures_fail_the_response() {
     }
     assert_eq!(last["status"], "failed", "{last}");
 }
+
+#[tokio::test]
+async fn an_unfinished_predecessor_cannot_be_continued() {
+    let agent_: Arc<dyn SupportsAgentRun> = Arc::new(Agent::builder(Hanging).name("h").build());
+    let router = ResponsesHostServer::agent(agent_).into_router();
+    let (_, queued) = json(
+        &router,
+        post("/responses", json!({"input": "first", "background": true})),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    let (status, body) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "next", "previous_response_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("still"));
+}
+
+#[tokio::test]
+async fn a_cancelled_predecessor_keeps_its_input() {
+    // The predecessor hangs; the continuation runs on a responsive agent
+    // sharing the store.
+    let store: Arc<dyn agent_framework_foundry_hosting::ResponseStore> =
+        Arc::new(agent_framework_foundry_hosting::InMemoryResponseStore::default());
+    let hanging: Arc<dyn SupportsAgentRun> = Arc::new(Agent::builder(Hanging).name("h").build());
+    let first = ResponsesHostServer::agent(hanging)
+        .with_response_store(store.clone())
+        .into_router();
+    let (_, queued) = json(
+        &first,
+        post("/responses", json!({"input": "first", "background": true})),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    json(&first, post(&format!("/responses/{id}/cancel"), json!({}))).await;
+    let second = ResponsesHostServer::agent(agent(Echo::default()))
+        .with_response_store(store)
+        .into_router();
+    let (status, body) = json(
+        &second,
+        post(
+            "/responses",
+            json!({"input": "next", "previous_response_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["output_text"], "2 messages, last: next");
+}
+
+/// Calls `danger` until it sees a result, then reports it.
+#[derive(Clone, Default)]
+struct WantsDanger;
+
+#[async_trait::async_trait]
+impl ChatClient for WantsDanger {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        use agent_framework_core::types::FunctionCallContent;
+        let result = messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .find_map(|c| match c {
+                Content::FunctionResult(r) => Some(r.result.clone().unwrap_or_default()),
+                _ => None,
+            });
+        let contents = match result {
+            Some(result) => vec![Content::text(format!("done: {result}"))],
+            None => vec![Content::FunctionCall(FunctionCallContent::new(
+                "c1",
+                "danger",
+                Some(agent_framework_core::types::FunctionArguments::Raw(
+                    "{}".into(),
+                )),
+            ))],
+        };
+        Ok(ChatResponse {
+            messages: vec![agent_framework_core::types::Message::with_contents(
+                Role::assistant(),
+                contents,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let response = self.get_response(messages, options).await?;
+        let updates: Vec<_> = response.messages[0]
+            .contents
+            .iter()
+            .cloned()
+            .map(|c| {
+                Ok(ChatResponseUpdate {
+                    contents: vec![c],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+#[tokio::test]
+async fn approval_requests_round_trip_through_mcp_approval_responses() {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = runs.clone();
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "danger",
+        "Needs approval",
+        json!({"type": "object"}),
+        move |_args: serde_json::Value| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!("ran"))
+            }
+        },
+    )
+    .into_definition()
+    .require_approval();
+    let agent: Arc<dyn SupportsAgentRun> = Arc::new(
+        Agent::builder(WantsDanger)
+            .name("careful")
+            .tool(tool)
+            .build(),
+    );
+    let router = ResponsesHostServer::agent(agent).into_router();
+
+    for approve in [true, false] {
+        let before = runs.load(std::sync::atomic::Ordering::SeqCst);
+        let (status, first) = json(&router, post("/responses", json!({"input": "do it"}))).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let request = first["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "mcp_approval_request")
+            .unwrap_or_else(|| panic!("an approval request: {first}"))
+            .clone();
+        assert_eq!(request["name"], "danger");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "not run yet"
+        );
+
+        let (status, second) = json(
+            &router,
+            post(
+                "/responses",
+                json!({
+                    "previous_response_id": first["id"],
+                    "input": [{
+                        "type": "mcp_approval_response",
+                        "approval_request_id": request["id"],
+                        "approve": approve,
+                    }],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let ran = runs.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert_eq!(ran, usize::from(approve), "approve={approve}: {second}");
+        assert!(second["output_text"]
+            .as_str()
+            .unwrap()
+            .starts_with("done: "));
+    }
+
+    let (status, body) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": [{"type": "mcp_approval_response", "approval_request_id": "mcpr_nope", "approve": true}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn a_configured_approval_store_holds_the_requests() {
+    use agent_framework_foundry_hosting::{
+        FoundryHostConfig, FoundryRequestContext, FunctionApprovalStore,
+        FunctionApprovalStoreProvider, InMemoryFunctionApprovalStore,
+    };
+    struct Provider(Arc<InMemoryFunctionApprovalStore>);
+    impl FunctionApprovalStoreProvider for Provider {
+        fn approval_store(
+            &self,
+            _: &FoundryHostConfig,
+            _: &FoundryRequestContext,
+        ) -> agent_framework_core::error::Result<Arc<dyn FunctionApprovalStore>> {
+            Ok(self.0.clone())
+        }
+    }
+    let shared = Arc::new(InMemoryFunctionApprovalStore::default());
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "danger",
+        "",
+        json!({"type": "object"}),
+        |_: serde_json::Value| async { Ok(json!("ran")) },
+    )
+    .into_definition()
+    .require_approval();
+    let agent: Arc<dyn SupportsAgentRun> =
+        Arc::new(Agent::builder(WantsDanger).name("c").tool(tool).build());
+    let router = ResponsesHostServer::agent(agent)
+        .with_function_approval_store(Arc::new(Provider(shared.clone())))
+        .into_router();
+    let (_, first) = json(&router, post("/responses", json!({"input": "do it"}))).await;
+    let id = first["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "mcp_approval_request")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let saved = shared.load_approval_request(&id).await.unwrap();
+    assert!(matches!(saved, Content::FunctionApprovalRequest(_)));
+}

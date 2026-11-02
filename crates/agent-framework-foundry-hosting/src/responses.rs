@@ -64,6 +64,9 @@ use crate::config::FoundryHostConfig;
 use crate::host::{with_host_routes, HostOptions};
 use crate::output::{OutputError, OutputTracker};
 use crate::scope::{ids, FoundryRequestContext};
+use crate::stores::{
+    FunctionApprovalStore, FunctionApprovalStoreProvider, InMemoryFunctionApprovalStore,
+};
 
 /// A turn's request, as the hosted agent or workflow sees it (upstream
 /// `HostedResponseRequest`).
@@ -231,6 +234,8 @@ pub struct ResponsesHostServer {
     checkpoints: Option<Arc<dyn CheckpointStorage>>,
     history: HistorySource,
     prepare_options: Option<OptionsHook>,
+    approval_provider: Option<Arc<dyn FunctionApprovalStoreProvider>>,
+    local_approvals: Arc<InMemoryFunctionApprovalStore>,
     sessions: Arc<Mutex<HashMap<String, Value>>>,
 }
 
@@ -255,6 +260,8 @@ impl ResponsesHostServer {
             checkpoints: None,
             history: HistorySource::default(),
             prepare_options: None,
+            approval_provider: None,
+            local_approvals: Arc::default(),
             sessions: Arc::default(),
         }
     }
@@ -337,6 +344,31 @@ impl ResponsesHostServer {
     ) -> Self {
         self.prepare_options = Some(Arc::new(hook));
         self
+    }
+
+    /// Where function-approval requests are kept between turns (e.g.
+    /// [`FoundryStorage`](crate::FoundryStorage)); without one they are kept
+    /// in process. A tool that requires approval surfaces as an
+    /// `mcp_approval_request`; a later turn's `mcp_approval_response`
+    /// (`approval_request_id`, `approve`) is resolved through this store into
+    /// the agent's function-approval response, so the call runs or is
+    /// rejected.
+    pub fn with_function_approval_store(
+        mut self,
+        provider: Arc<dyn FunctionApprovalStoreProvider>,
+    ) -> Self {
+        self.approval_provider = Some(provider);
+        self
+    }
+
+    fn approval_store(
+        &self,
+        context: &FoundryRequestContext,
+    ) -> Result<Arc<dyn FunctionApprovalStore>> {
+        match &self.approval_provider {
+            Some(provider) => provider.approval_store(&self.config, context),
+            None => Ok(self.local_approvals.clone()),
+        }
     }
 
     /// Where workflow checkpoints are kept: it is handed to the workflow
@@ -659,6 +691,15 @@ async fn create(
     let history = if let Some(previous) = &create.previous_response_id {
         match server.store.get(previous).await {
             Ok(Some(stored)) => {
+                // An unfinished predecessor has no transcript yet:
+                // continuing from it would silently drop its turn.
+                let status = stored.response["status"].as_str().unwrap_or_default();
+                if matches!(status, "queued" | "in_progress") {
+                    return bad_request(format!(
+                        "Previous response with id '{previous}' is still {status}; \
+                         wait for it to finish before continuing from it."
+                    ));
+                }
                 pause = stored.pause;
                 stored.transcript
             }
@@ -694,10 +735,11 @@ async fn create(
         _ => None,
     };
     let response_id = ids::response_id(create.previous_response_id.as_deref());
-    let messages = responses_to_run(&ResponsesRequest {
-        input: create.input.clone(),
-        ..Default::default()
-    });
+    let context = FoundryRequestContext::from_headers(&headers, None);
+    let messages = match turn_messages(server, &context, &create.input).await {
+        Ok(messages) => messages,
+        Err(e) => return bad_request(e),
+    };
     let prepared = Prepared {
         request: HostedResponseRequest {
             response_id: response_id.clone(),
@@ -706,7 +748,7 @@ async fn create(
             history,
             previous_response_id: create.previous_response_id.clone(),
             conversation_id: conversation,
-            context: FoundryRequestContext::from_headers(&headers, None),
+            context,
             checkpoint_storage: server.checkpoints.clone(),
         },
         resume,
@@ -793,7 +835,15 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
     let stored = StoredResponse {
         response: queued.clone(),
         input_items: prepared.input_items.clone(),
-        transcript: Vec::new(),
+        // A cancelled background response keeps this: its history and input
+        // (as upstream replays a finished predecessor's history and input).
+        transcript: prepared
+            .request
+            .history
+            .iter()
+            .chain(&prepared.request.messages)
+            .cloned()
+            .collect(),
         pause: None,
     };
     if let Err(e) = inner.server.store.put(&id, stored).await {
@@ -894,6 +944,7 @@ async fn run_turn(
     );
     let result = execute(server, prepared, events.as_deref_mut(), &mut tracker).await;
     let mut pause = None;
+    let mut approvals = Vec::new();
     let (status, response, transcript) = match result {
         Ok((agent_response, paused)) => {
             pause = paused;
@@ -901,6 +952,7 @@ async fn run_turn(
             if let Some(events) = events.as_deref_mut() {
                 events.emit_all(tracker.drain()).await;
             }
+            approvals = tracker.take_approvals();
             let response = final_response(prepared, tracker);
             let status = response["status"]
                 .as_str()
@@ -919,14 +971,20 @@ async fn run_turn(
                 TurnError::Run(_) => "The agent run failed.".to_string(),
             };
             response["error"] = json!({"code": "server_error", "message": message});
-            ("failed".to_string(), response, Vec::new())
+            let mut transcript = prepared.request.history.clone();
+            transcript.extend(prepared.request.messages.iter().cloned());
+            ("failed".to_string(), response, transcript)
         }
     };
     // Persist before the terminal event: a client that closes the stream
     // once it sees `response.completed` aborts this task, which must not
     // cancel the write it was told succeeded.
     let (status, response) = if prepared.store {
-        match persist(server, prepared, &status, &response, transcript, pause).await {
+        match persist(
+            server, prepared, &status, &response, transcript, pause, approvals,
+        )
+        .await
+        {
             Ok(()) => (status, response),
             Err(e) => {
                 // A turn whose outcome could not be stored did not succeed:
@@ -941,7 +999,13 @@ async fn run_turn(
                 let record = StoredResponse {
                     response: failed.clone(),
                     input_items: prepared.input_items.clone(),
-                    transcript: Vec::new(),
+                    transcript: prepared
+                        .request
+                        .history
+                        .iter()
+                        .chain(&prepared.request.messages)
+                        .cloned()
+                        .collect(),
                     pause: None,
                 };
                 if let Err(e) = server
@@ -977,7 +1041,14 @@ async fn persist(
     response: &Value,
     transcript: Vec<Message>,
     pause: Option<WorkflowPause>,
+    approvals: Vec<(String, Content)>,
 ) -> Result<()> {
+    if !approvals.is_empty() {
+        let store = server.approval_store(&prepared.request.context)?;
+        for (id, request) in &approvals {
+            store.save_approval_request(id, request).await?;
+        }
+    }
     let stored = StoredResponse {
         response: response.clone(),
         input_items: prepared.input_items.clone(),
@@ -1229,6 +1300,69 @@ fn load_session(
         ))),
         _ => Ok(agent.create_session()),
     }
+}
+
+/// This turn's input as messages, with each `mcp_approval_response` item
+/// resolved through the approval store into the original request's
+/// function-approval response (upstream `_item_to_message`).
+async fn turn_messages(
+    server: &ResponsesHostServer,
+    context: &FoundryRequestContext,
+    input: &Value,
+) -> std::result::Result<Vec<Message>, String> {
+    let items = match input {
+        Value::Array(items) => items.clone(),
+        other => {
+            return Ok(responses_to_run(&ResponsesRequest {
+                input: other.clone(),
+                ..Default::default()
+            }))
+        }
+    };
+    let mut messages = Vec::new();
+    let mut pending: Vec<Value> = Vec::new();
+    let flush = |pending: &mut Vec<Value>, messages: &mut Vec<Message>| {
+        if !pending.is_empty() {
+            messages.extend(responses_to_run(&ResponsesRequest {
+                input: Value::Array(std::mem::take(pending)),
+                ..Default::default()
+            }));
+        }
+    };
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("mcp_approval_response") {
+            pending.push(item);
+            continue;
+        }
+        flush(&mut pending, &mut messages);
+        let (Some(id), Some(approve)) = (
+            item.get("approval_request_id").and_then(Value::as_str),
+            item.get("approve").and_then(Value::as_bool),
+        ) else {
+            return Err(
+                "An mcp_approval_response requires an approval_request_id and a boolean approve."
+                    .into(),
+            );
+        };
+        let store = server.approval_store(context).map_err(|e| e.to_string())?;
+        let request = store
+            .load_approval_request(id)
+            .await
+            .map_err(|_| format!("Approval request with ID '{id}' does not exist."))?;
+        let Content::FunctionApprovalRequest(request) = request else {
+            return Err(format!(
+                "Approval request with ID '{id}' is not a function approval request."
+            ));
+        };
+        messages.push(Message::with_contents(
+            agent_framework_core::types::Role::user(),
+            vec![Content::FunctionApprovalResponse(
+                request.create_response(approve),
+            )],
+        ));
+    }
+    flush(&mut pending, &mut messages);
+    Ok(messages)
 }
 
 /// The newest checkpoint of `workflow_id` holding every pending request.

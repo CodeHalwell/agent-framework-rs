@@ -43,9 +43,11 @@
 //!   reasoning, function calls and results, MCP calls, image generation,
 //!   shell calls, approval and OAuth consent requests, and usage. Not
 //!   projected: code-interpreter, file/web-search and computer-use items
-//!   (no Rust content carries their wire shapes), container/file citations
-//!   (the Rust `Annotation` has no container or file index), and approval
-//!   requests are not saved for a later `mcp_approval_response`.
+//!   (no Rust content carries their wire shapes) and container/file
+//!   citations (the Rust `Annotation` has no container or file index).
+//!   Function-approval requests round-trip: each `mcp_approval_request` is
+//!   saved (to the configured `FunctionApprovalStoreProvider`, else in
+//!   process) and a later `mcp_approval_response` resumes the call.
 //! - **History.** `HistorySource::Agent` / `Service` keep the agent session
 //!   in process (not in the Foundry session store), so it does not survive
 //!   a restart. Provider-native background polling (`background_source =
@@ -103,6 +105,6 @@ pub use sessions::{
 pub use storage::{FoundryStateStore, FoundryStorage, FoundryStorageEndpoint, StorageError};
 pub use stores::{
     CheckpointStoreProvider, FoundryCheckpointStore, FoundryFunctionApprovalStore,
-    FunctionApprovalStore, FunctionApprovalStoreProvider,
+    FunctionApprovalStore, FunctionApprovalStoreProvider, InMemoryFunctionApprovalStore,
 };
 pub use toolbox::FoundryToolbox;

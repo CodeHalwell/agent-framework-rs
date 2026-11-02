@@ -69,6 +69,9 @@ pub(crate) struct OutputTracker {
     /// deltas) and are finalized when their result arrives or the response
     /// ends.
     open_calls: Vec<OpenCall>,
+    /// `(mcp_approval_request id, original approval request)` pairs, to be
+    /// saved so a later `mcp_approval_response` can be resolved.
+    approvals: Vec<(String, Content)>,
 }
 
 struct OpenCall {
@@ -102,6 +105,7 @@ impl OutputTracker {
             consent_origins,
             consents: HashSet::new(),
             open_calls: Vec::new(),
+            approvals: Vec::new(),
         }
     }
 
@@ -464,9 +468,11 @@ impl OutputTracker {
             }
             Content::FunctionApprovalRequest(request) => {
                 self.close();
+                let id = ids::new_id("mcpr", Some(&self.response_id));
+                self.approvals.push((id.clone(), content.clone()));
                 self.simple_item(json!({
                     "type": "mcp_approval_request",
-                    "id": ids::new_id("mcpr", Some(&self.response_id)),
+                    "id": id,
                     "server_label": "agent_framework",
                     "name": request.function_call.name,
                     "arguments": arguments_string(request.function_call.arguments.as_ref()),
@@ -696,6 +702,11 @@ impl OutputTracker {
     }
 
     /// Close everything and return `(output, usage, incomplete reason)`.
+    /// The approval requests emitted so far, with their wire ids.
+    pub(crate) fn take_approvals(&mut self) -> Vec<(String, Content)> {
+        std::mem::take(&mut self.approvals)
+    }
+
     fn finish_call(&mut self, call: OpenCall) {
         let id = self.items[call.index]["id"].clone();
         self.emit(
