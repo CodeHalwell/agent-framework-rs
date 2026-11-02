@@ -107,6 +107,15 @@ Microsoft's supported bridge from `azure_core` to OTel. Combined with the
 is what Azure's agent views key off, and the bridge is what carries
 `azure_core`'s own spans alongside this crate's.
 
+**Update:** the exporter half is now closed directly.
+`agent-framework-core`'s `azure-monitor` feature adds
+`OtelExport::with_azure_monitor` (and `azure_monitor_from_env`, reading
+`APPLICATIONINSIGHTS_CONNECTION_STRING`), which exports traces and metrics
+to Application Insights through the community
+`opentelemetry-application-insights` exporter (0.45, the release on
+`opentelemetry` 0.32). The `azure_core_opentelemetry` bridge for the Azure
+SDK's own client spans still waits on its move to `opentelemetry` 0.32.
+
 ### 3. Blob session store: `azure_storage_blob` is at 1.1.0, not 1.1
 
 `SCOPE.md` already names `azure_storage_blob` 1.1 for the

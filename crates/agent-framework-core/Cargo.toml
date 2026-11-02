@@ -35,6 +35,8 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry-application-insights = { workspace = true, optional = true }
+reqwest013 = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -89,6 +91,13 @@ otel-export = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
+]
+# Adds an Azure Monitor (Application Insights) destination to the
+# `otel-export` pipeline (`OtelExport::with_azure_monitor`).
+azure-monitor = [
+    "otel-export",
+    "dep:opentelemetry-application-insights",
+    "dep:reqwest013",
 ]
 
 [package.metadata.docs.rs]

@@ -94,6 +94,14 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "reqwest-rustls",
 ] }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
+# Azure Monitor / Application Insights exporter for the same pipeline
+# (agent-framework-core's `azure-monitor` feature). 0.45 is the release on
+# `opentelemetry` 0.32; 0.46 moved to 0.33.
+opentelemetry-application-insights = { version = "0.45", default-features = false, features = ["trace", "metrics"] }
+# The blocking reqwest client the Application Insights exporter sends with.
+# The same 0.13 `opentelemetry-otlp` already brings (with its TLS backend);
+# named here only so the exporter can be given a client.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking"] }
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "fmt"] }
 
 # Official Azure SDK for Rust (GA May 2026), behind agent-framework-azure's

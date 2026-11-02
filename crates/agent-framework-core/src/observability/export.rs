@@ -39,8 +39,13 @@
 //! collectors only and fails against any HTTPS endpoint — a failure that shows
 //! up at run time, not build time.
 //!
-//! Point it at an OpenTelemetry Collector, which is also the supported route
-//! to Azure Monitor — there is no official Microsoft OTel exporter for Rust.
+//! Point it at an OpenTelemetry Collector, or — with the `azure-monitor`
+//! feature — straight at Azure Monitor (Application Insights) with
+//! [`OtelExport::with_azure_monitor`], the counterpart of upstream's
+//! `configure_azure_monitor`. That destination uses the community
+//! `opentelemetry-application-insights` exporter (there is no official
+//! Microsoft OTel exporter for Rust) over the same blocking reqwest 0.13
+//! client and TLS backend.
 //!
 //! # Azure SDK client spans do not join this pipeline yet
 //!
@@ -196,6 +201,10 @@ fn signal_url(endpoint: &str, signal_path: &str) -> String {
 pub struct OtelExport {
     service_name: String,
     endpoint: String,
+    /// An Application Insights connection string: export there instead of
+    /// to the OTLP endpoint.
+    #[cfg(feature = "azure-monitor")]
+    azure_monitor: Option<String>,
     traces: bool,
     metrics: bool,
     metric_interval: Duration,
@@ -211,6 +220,8 @@ impl OtelExport {
             service_name: service_name.into(),
             endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string()),
+            #[cfg(feature = "azure-monitor")]
+            azure_monitor: None,
             traces: true,
             metrics: true,
             metric_interval: Duration::from_secs(60),
@@ -221,6 +232,33 @@ impl OtelExport {
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
         self
+    }
+
+    /// Export to Azure Monitor (Application Insights) with this connection
+    /// string instead of to an OTLP endpoint. The string is checked when the
+    /// pipeline is built.
+    #[cfg(feature = "azure-monitor")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "azure-monitor")))]
+    pub fn with_azure_monitor(mut self, connection_string: impl Into<String>) -> Self {
+        self.azure_monitor = Some(connection_string.into());
+        self
+    }
+
+    /// A pipeline exporting to Azure Monitor with the connection string in
+    /// `APPLICATIONINSIGHTS_CONNECTION_STRING`, the variable upstream and the
+    /// Azure Monitor distros read.
+    #[cfg(feature = "azure-monitor")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "azure-monitor")))]
+    pub fn azure_monitor_from_env(service_name: impl Into<String>) -> Result<Self> {
+        let connection_string = std::env::var(APPLICATIONINSIGHTS_CONNECTION_STRING_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Configuration(format!(
+                    "{APPLICATIONINSIGHTS_CONNECTION_STRING_ENV} is not set."
+                ))
+            })?;
+        Ok(Self::new(service_name).with_azure_monitor(connection_string))
     }
 
     /// Export spans. On by default.
@@ -267,35 +305,49 @@ impl OtelExport {
     pub fn build(self) -> Result<OtelPipeline> {
         let resource = build_resource(&self.service_name);
 
+        #[cfg(feature = "azure-monitor")]
+        let azure = self
+            .azure_monitor
+            .as_deref()
+            .map(azure_monitor_exporter)
+            .transpose()?;
+
         let tracer_provider = if self.traces {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_http()
-                .with_endpoint(signal_url(&self.endpoint, "/v1/traces"))
-                .build()
-                .map_err(|e| Error::other(format!("OTLP span exporter: {e}")))?;
-            Some(
-                SdkTracerProvider::builder()
-                    .with_resource(resource.clone())
-                    .with_batch_exporter(exporter)
-                    .build(),
-            )
+            let builder = SdkTracerProvider::builder().with_resource(resource.clone());
+            #[cfg(feature = "azure-monitor")]
+            let builder = match &azure {
+                Some(exporter) => builder.with_batch_exporter(exporter.clone()),
+                None => builder.with_batch_exporter(self.otlp_span_exporter()?),
+            };
+            #[cfg(not(feature = "azure-monitor"))]
+            let builder = builder.with_batch_exporter(self.otlp_span_exporter()?);
+            Some(builder.build())
         } else {
             None
         };
 
         let meter_provider = if self.metrics {
-            let exporter = opentelemetry_otlp::MetricExporter::builder()
-                .with_http()
-                .with_endpoint(signal_url(&self.endpoint, "/v1/metrics"))
-                .build()
-                .map_err(|e| Error::other(format!("OTLP metric exporter: {e}")))?;
-            let reader = PeriodicReader::builder(exporter)
-                .with_interval(self.metric_interval)
-                .build();
-            let provider = SdkMeterProvider::builder()
-                .with_resource(resource)
-                .with_reader(reader)
-                .build();
+            let builder = SdkMeterProvider::builder().with_resource(resource);
+            #[cfg(feature = "azure-monitor")]
+            let builder = match &azure {
+                Some(exporter) => builder.with_reader(
+                    PeriodicReader::builder(exporter.clone())
+                        .with_interval(self.metric_interval)
+                        .build(),
+                ),
+                None => builder.with_reader(
+                    PeriodicReader::builder(self.otlp_metric_exporter()?)
+                        .with_interval(self.metric_interval)
+                        .build(),
+                ),
+            };
+            #[cfg(not(feature = "azure-monitor"))]
+            let builder = builder.with_reader(
+                PeriodicReader::builder(self.otlp_metric_exporter()?)
+                    .with_interval(self.metric_interval)
+                    .build(),
+            );
+            let provider = builder.build();
             opentelemetry::global::set_meter_provider(provider.clone());
             Some(provider)
         } else {
@@ -307,6 +359,48 @@ impl OtelExport {
             meter_provider,
         })
     }
+}
+
+impl OtelExport {
+    fn otlp_span_exporter(&self) -> Result<opentelemetry_otlp::SpanExporter> {
+        opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(signal_url(&self.endpoint, "/v1/traces"))
+            .build()
+            .map_err(|e| Error::other(format!("OTLP span exporter: {e}")))
+    }
+
+    fn otlp_metric_exporter(&self) -> Result<opentelemetry_otlp::MetricExporter> {
+        opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(signal_url(&self.endpoint, "/v1/metrics"))
+            .build()
+            .map_err(|e| Error::other(format!("OTLP metric exporter: {e}")))
+    }
+}
+
+/// The environment variable holding an Application Insights connection
+/// string.
+#[cfg(feature = "azure-monitor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "azure-monitor")))]
+pub const APPLICATIONINSIGHTS_CONNECTION_STRING_ENV: &str = "APPLICATIONINSIGHTS_CONNECTION_STRING";
+
+/// The Application Insights exporter type this pipeline uses.
+#[cfg(feature = "azure-monitor")]
+type AzureMonitorExporter =
+    opentelemetry_application_insights::Exporter<reqwest013::blocking::Client>;
+
+#[cfg(feature = "azure-monitor")]
+fn azure_monitor_exporter(connection_string: &str) -> Result<AzureMonitorExporter> {
+    opentelemetry_application_insights::Exporter::new_from_connection_string(
+        connection_string,
+        reqwest013::blocking::Client::new(),
+    )
+    .map_err(|e| {
+        Error::Configuration(format!(
+            "invalid Application Insights connection string: {e}"
+        ))
+    })
 }
 
 /// A built export pipeline.
@@ -578,5 +672,100 @@ mod tests {
             .expect("trailing-slash endpoint builds");
         assert!(pipeline.tracer_provider.is_some());
         let _ = pipeline.shutdown();
+    }
+
+    #[cfg(feature = "azure-monitor")]
+    #[test]
+    fn a_malformed_connection_string_is_refused_at_build() {
+        let err = OtelExport::new("svc")
+            .with_azure_monitor("not a connection string")
+            .with_metrics(false)
+            .build()
+            .expect_err("refused");
+        assert!(err.to_string().contains("connection string"), "{err}");
+    }
+
+    #[cfg(feature = "azure-monitor")]
+    #[test]
+    fn a_valid_connection_string_builds_an_azure_monitor_pipeline() {
+        let pipeline = OtelExport::new("svc")
+            .with_azure_monitor(
+                "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://westeurope-5.in.applicationinsights.azure.com/",
+            )
+            .with_metrics(false)
+            .build()
+            .expect("builds");
+        assert!(pipeline.tracer_provider.is_some());
+    }
+
+    /// Spans reach the Application Insights ingestion endpoint the connection
+    /// string names, as `track` envelopes.
+    #[cfg(feature = "azure-monitor")]
+    #[test]
+    fn spans_export_to_the_ingestion_endpoint() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 8192];
+            // Read the head, then the body its Content-Length announces.
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length || n == 0 {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"itemsReceived":1,"itemsAccepted":1,"errors":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        // A connection string's endpoints are forced to https, so the
+        // exporter built from one is pointed at this plain-HTTP server with
+        // the (deprecated, but only) endpoint override.
+        #[allow(deprecated)]
+        let exporter = azure_monitor_exporter(
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;IngestionEndpoint=https://example.invalid/",
+        )
+        .unwrap()
+        .with_endpoint(&format!("http://127.0.0.1:{port}"))
+        .unwrap();
+        let provider = SdkTracerProvider::builder()
+            .with_resource(build_resource("svc"))
+            .with_batch_exporter(exporter)
+            .build();
+        {
+            use opentelemetry::trace::{Span as _, Tracer as _};
+            let mut span = provider.tracer(SCOPE_NAME).start("invoke_agent planner");
+            span.end();
+        }
+        provider.shutdown().expect("flushed");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /v2"), "{request}");
+        assert!(request.contains("/track"), "{request}");
     }
 }

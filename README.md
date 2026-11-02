@@ -214,7 +214,9 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
 | `tools` | [`agent-framework-tools`](crates/agent-framework-tools) — local and Docker shell tools (re-exported as `builtin_tools`) | no |
 | `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
-| `full` | all of the above except `otel-metrics` | no |
+| `otel-export` | a ready-made OTLP export pipeline for the spans and metrics (`observability::export`) | no |
+| `azure-monitor` | an Azure Monitor (Application Insights) destination for that pipeline (`OtelExport::with_azure_monitor`) | no |
+| `full` | all of the above except `otel-metrics`, `otel-export` and `azure-monitor` | no |
 
 APIs that upstream still marks experimental sit behind `experimental-*`
 features and carry no semver promise. `full` leaves them out, and

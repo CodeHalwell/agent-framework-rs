@@ -21,6 +21,11 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Azure Monitor export: `agent-framework-core`'s `azure-monitor` feature
+  (umbrella `azure-monitor`) adds `OtelExport::with_azure_monitor` and
+  `OtelExport::azure_monitor_from_env` (`APPLICATIONINSIGHTS_CONNECTION_STRING`),
+  sending the pipeline's traces and metrics to Application Insights, the
+  counterpart of upstream's `configure_azure_monitor`.
 - Message source attribution (upstream `_attribution`): context messages
   carry `additional_properties["_attribution"]` with their `source_id`
   (`ContextProvider::source_id`, defaulting to the provider's type name),

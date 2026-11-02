@@ -50,6 +50,9 @@ otel-metrics = ["agent-framework-core/otel-metrics"]
 # (`observability::export`). Implies `otel-metrics`; the only feature here that
 # pulls an OpenTelemetry *SDK*.
 otel-export = ["agent-framework-core/otel-export"]
+# An Azure Monitor (Application Insights) destination for that pipeline
+# (`OtelExport::with_azure_monitor`). Implies `otel-export`.
+azure-monitor = ["agent-framework-core/azure-monitor"]
 # Experimental surfaces (docs/feature-stages.md): APIs upstream still marks
 # experimental, with no semver promise. Not part of `full`; `experimental`
 # turns them all on.
