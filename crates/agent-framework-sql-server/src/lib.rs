@@ -417,6 +417,16 @@ fn numeric_operand(field: &VectorStoreField, n: &serde_json::Number) -> Result<P
         .filter(|f| f.is_finite())
         .ok_or_else(|| config_err("Numeric filter values must be finite."))?;
     if field.type_.as_deref() == Some("int") && f.fract() == 0.0 {
+        // An integral float (`2020.0`) compares numerically with the int
+        // column, as the portable filter contract requires (`1` matches
+        // `1.0`): bind it as `BIGINT` when it fits, refuse it when it
+        // does not. `i64::MAX as f64` rounds up to 2^63, so the upper bound
+        // is exclusive.
+        const MIN: f64 = i64::MIN as f64;
+        const MAX: f64 = i64::MAX as f64;
+        if (MIN..MAX).contains(&f) {
+            return Ok(Param::BigInt(f as i64));
+        }
         return Err(config_err(
             "Integer filter values must fit in the SQL Server bigint range.",
         ));
@@ -1389,5 +1399,42 @@ mod key_tests {
         assert_ne!(normalized_key(&lower, false), normalized_key(&upper, false));
         assert_eq!(normalized_key(&lower, true), normalized_key(&upper, true));
         assert_eq!(normalized_key(&json!(7), false), "7");
+    }
+}
+
+#[cfg(test)]
+mod operand_tests {
+    use super::{numeric_operand, Param};
+    use agent_framework_core::vectors::VectorStoreField;
+
+    fn number(v: f64) -> serde_json::Number {
+        serde_json::Number::from_f64(v).unwrap()
+    }
+
+    #[test]
+    fn integral_floats_bind_as_bigint_on_int_fields() {
+        let int = VectorStoreField::data("year").with_type("int");
+        assert_eq!(
+            numeric_operand(&int, &number(2020.0)).unwrap(),
+            Param::BigInt(2020)
+        );
+        assert_eq!(
+            numeric_operand(&int, &number(-5.0)).unwrap(),
+            Param::BigInt(-5)
+        );
+        // Fractional values still compare numerically.
+        assert_eq!(
+            numeric_operand(&int, &number(2020.5)).unwrap(),
+            Param::Float(2020.5)
+        );
+        // Out of the bigint range: refused on an int field.
+        assert!(numeric_operand(&int, &number(1e19)).is_err());
+        assert!(numeric_operand(&int, &number(9_223_372_036_854_775_808.0)).is_err());
+        // A float field takes it as a float.
+        let float = VectorStoreField::data("score").with_type("float");
+        assert_eq!(
+            numeric_operand(&float, &number(1e19)).unwrap(),
+            Param::Float(1e19)
+        );
     }
 }

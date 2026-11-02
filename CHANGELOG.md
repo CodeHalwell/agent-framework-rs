@@ -125,6 +125,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - Foundry hosting (`websocket`, review fix): when the client disconnects,
   the handler's outbound channel is closed, so an output-only handler's next
   `WsSession::send` fails and it can stop instead of streaming forever.
+- SQL Server vector store (review fix): an integral float operand on an
+  `int` field (`Filter::eq("year", 2020.0)`) binds as `BIGINT` when it
+  fits, instead of being refused; out-of-range integral floats are still
+  refused.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
