@@ -408,3 +408,25 @@ impl Tool for InspectVariable {
         Ok(Value::Object(result))
     }
 }
+
+/// Stamp `label` as the authoritative label of the result of the tool
+/// currently running under [`LabelTrackingFunctionMiddleware`](super::LabelTrackingFunctionMiddleware)
+/// (it is used as is, not combined with the tool's declared or inherited
+/// label). Returns `false` when no tracked invocation is running.
+///
+/// For trusted local code that knows its result's label exactly, such as an
+/// MCP proxy configured to trust a server's IFC labels
+/// (`agent_framework_mcp::security`). Never call it with a label taken from
+/// untrusted content without a local decision to trust that source.
+pub fn set_authoritative_result_label(label: ContentLabel) -> bool {
+    match current_invocation() {
+        Some(invocation) => {
+            *invocation
+                .authoritative
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(label);
+            true
+        }
+        None => false,
+    }
+}

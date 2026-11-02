@@ -193,6 +193,11 @@ pub struct ToolDescriptor {
     /// [`Self::requires_tasks`] reads it.
     #[serde(default)]
     pub execution: Option<Value>,
+    /// The tool's `annotations` (`ToolAnnotations` hints such as
+    /// `openWorldHint`), kept raw. Hints, not policy: with the `fides`
+    /// feature, [`crate::security`] maps them restriction-only.
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 
 impl ToolDescriptor {
@@ -399,6 +404,8 @@ pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
     pub is_error: bool,
     pub structured_content: Option<Value>,
+    /// The result's `_meta` (e.g. an IFC-aware server's `ifc` label).
+    pub meta: Option<Value>,
 }
 
 impl CallToolResult {
@@ -411,10 +418,12 @@ impl CallToolResult {
             .unwrap_or_default();
         let is_error = v.get("isError").and_then(Value::as_bool).unwrap_or(false);
         let structured_content = v.get("structuredContent").cloned();
+        let meta = v.get("_meta").filter(|m| !m.is_null()).cloned();
         Self {
             content,
             is_error,
             structured_content,
+            meta,
         }
     }
 

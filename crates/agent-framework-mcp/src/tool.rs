@@ -228,6 +228,15 @@ impl Tool for McpToolExecutor {
     }
 }
 
+/// What a tool executor is built from: the normalized local name, the
+/// server's descriptor (whose `name` is the remote name), and the client to
+/// call through.
+pub(crate) struct ExecutorParts<'a> {
+    pub(crate) local_name: String,
+    pub(crate) descriptor: &'a ToolDescriptor,
+    pub(crate) client: Arc<McpClient>,
+}
+
 /// Build one [`ToolDefinition`] per (filtered) tool descriptor, wired to call
 /// back through `client`.
 ///
@@ -240,6 +249,26 @@ fn build_tool_definitions(
     tools: &[ToolDescriptor],
     allowed_tools: Option<&HashSet<String>>,
     approval_mode: &McpApprovalMode,
+) -> Vec<ToolDefinition> {
+    build_tool_definitions_with(client, tools, allowed_tools, approval_mode, &|parts| {
+        Arc::new(McpToolExecutor {
+            local_name: parts.local_name,
+            description: parts.descriptor.description.clone().unwrap_or_default(),
+            parameters: parts.descriptor.input_schema.clone(),
+            remote_name: parts.descriptor.name.clone(),
+            client: parts.client,
+        })
+    })
+}
+
+/// [`build_tool_definitions`] with the executor built by `make` (the
+/// filtering, Tasks skip, collision dedup and approval policy are shared).
+pub(crate) fn build_tool_definitions_with(
+    client: Arc<McpClient>,
+    tools: &[ToolDescriptor],
+    allowed_tools: Option<&HashSet<String>>,
+    approval_mode: &McpApprovalMode,
+    make: &dyn Fn(ExecutorParts<'_>) -> Arc<dyn Tool>,
 ) -> Vec<ToolDefinition> {
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut definitions = Vec::new();
@@ -272,11 +301,9 @@ fn build_tool_definitions(
             );
             continue;
         }
-        let executor: Arc<dyn Tool> = Arc::new(McpToolExecutor {
+        let executor = make(ExecutorParts {
             local_name: local_name.clone(),
-            description: descriptor.description.clone().unwrap_or_default(),
-            parameters: descriptor.input_schema.clone(),
-            remote_name: descriptor.name.clone(),
+            descriptor,
             client: client.clone(),
         });
         let mut definition = ToolDefinition::from_tool(executor);
@@ -641,6 +668,28 @@ impl McpStdioTool {
     }
 }
 
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpStdioTool {
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
+    }
+}
+
 /// Resolved per agent run: lazily connects on first call (reusing
 /// [`Self::connect`]) and serves tools from [`McpClient::list_tools_cached`],
 /// which is invalidated automatically by a
@@ -913,6 +962,28 @@ impl McpStreamableHttpTool {
             client.close().await?;
         }
         Ok(())
+    }
+}
+
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpStreamableHttpTool {
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
     }
 }
 
@@ -1200,6 +1271,28 @@ impl McpWebsocketTool {
     }
 }
 
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpWebsocketTool {
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
+    }
+}
+
 /// Resolved per agent run: lazily connects on first call (reusing
 /// [`Self::connect`]) and serves tools from [`McpClient::list_tools_cached`],
 /// which is invalidated automatically by a
@@ -1245,6 +1338,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             output_schema: None,
             execution: None,
+            annotations: None,
         }
     }
 

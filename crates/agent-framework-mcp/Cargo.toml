@@ -32,5 +32,10 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "rustls-tls-webpki-roots",
 ] }
 
+[features]
+# FIDES for MCP tools (`security` module): annotation-derived labels and
+# server `_meta.ifc` result labels. Experimental upstream (FIDES).
+fides = ["agent-framework-core/experimental-fides"]
+
 [dev-dependencies]
 tokio = { workspace = true }

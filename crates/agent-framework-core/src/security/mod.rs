@@ -124,8 +124,8 @@ pub use scope::{
     DEFAULT_SESSION_STATE_KEY,
 };
 pub use tools::{
-    get_quarantine_client, get_security_tools, get_variable_store, set_quarantine_client,
-    set_variable_store, store_untrusted_content, SECURITY_TOOL_INSTRUCTIONS,
+    get_quarantine_client, get_security_tools, get_variable_store, set_authoritative_result_label,
+    set_quarantine_client, set_variable_store, store_untrusted_content, SECURITY_TOOL_INSTRUCTIONS,
 };
 pub use tracking::{
     rewritten_arguments, LabelTrackingFunctionMiddleware, ARGUMENT_LABEL_KEY, CONTEXT_LABEL_KEY,

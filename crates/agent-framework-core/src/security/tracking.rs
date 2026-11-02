@@ -788,9 +788,13 @@ impl LabelTrackingFunctionMiddleware {
             json!({"function_name": function_name, "timestamp": now}),
         );
         tracing::info!(tool = %function_name, "auto-hid an untrusted result behind a variable reference");
+        // The model sees only the label's levels: its metadata may carry
+        // strings derived from the hidden content, which must not reach the
+        // model while the context is trusted. The full label stays with the
+        // stored value.
         VariableReferenceContent::new(
             id,
-            label.clone(),
+            ContentLabel::new(label.integrity, label.confidentiality),
             Some(format!("Result from {function_name}")),
         )
         .to_value()
@@ -821,6 +825,10 @@ fn extract_label(
     if let Some(embedded) = value.get("security_label").filter(|l| l.is_object()) {
         match parse_content_label(embedded, "embedded", false) {
             Ok(embedded) => {
+                // A result's own label is an untrusted claim: only its
+                // levels count (they can only restrict). Its metadata is
+                // attacker-controlled and is dropped.
+                let embedded = ContentLabel::new(embedded.integrity, embedded.confidentiality);
                 let mut combined = combine_labels([fallback, &embedded]);
                 if combined.confidentiality == ConfidentialityLabel::UserIdentity
                     && fallback.confidentiality == ConfidentialityLabel::UserIdentity

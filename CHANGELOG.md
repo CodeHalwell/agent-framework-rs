@@ -35,6 +35,20 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-mcp` feature `fides` (`security` module), forwarded by
+  the umbrella's `experimental-fides`: `SecureMcpToolProxy` /
+  `secure_tool_definitions` declare every listed MCP tool in a
+  `ToolSecurityRegistry` from restriction-only `ToolAnnotations` hints
+  (`openWorldHint`, PUBLIC sink cap, local `annotation_override`s),
+  re-declared as the server's tool list changes, and stamp IFC labels a
+  server returns in `_meta.ifc` (combined with the local label, or
+  authoritative with `trust_server_ifc`). `ToolDescriptor` gains
+  `annotations` and `CallToolResult` gains `meta` (**breaking** for struct
+  literals); core gains `security::set_authoritative_result_label`.
+- FIDES security fix: a hidden result's model-visible variable reference
+  carries only the label's integrity and confidentiality, and a tool
+  result's embedded `security_label` contributes only its levels; its
+  attacker-controlled metadata never reaches the model or the result label.
 - `agent-framework-foundry-hosting` (umbrella feature `foundry-hosting`, in
   `full`): host agents and workflows as Azure AI Foundry hosted agents,
   ported from upstream `foundry_hosting` and the agentserver container
@@ -57,8 +71,7 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   log; block, warn, inline approval handler, or session-bound pending
   approvals), the `quarantined_llm` and `inspect_variable` tools,
   `SecureAgentConfig`, and MCP annotation mapping. Tool declarations are
-  registered by name (`ToolSecurityRegistry`); `SecureMCPToolProxy` is not
-  ported. The umbrella `experimental` feature now also enables
+  registered by name (`ToolSecurityRegistry`). The umbrella `experimental` feature now also enables
   `experimental-fides` and the `sql-server`, `mongodb` and
   `azure-documentdb` stores.
 - `agent-framework-claude` (umbrella feature `claude`, in `full`): the

@@ -134,6 +134,9 @@
 mod client;
 mod protocol;
 mod sampling;
+#[cfg(feature = "fides")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fides")))]
+pub mod security;
 mod tool;
 mod transport;
 
