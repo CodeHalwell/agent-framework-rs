@@ -1,0 +1,34 @@
+[package]
+name = "agent-framework-duckdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+description = "DuckDB vector store for agent-framework (experimental: VECTOR_STORES)"
+
+[dependencies]
+agent-framework-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+# Bundled: DuckDB is compiled from its amalgamation, so there is no system
+# library to install. `json` provides json_object, used to read rows back.
+duckdb = { version = "1.20000", features = ["bundled", "json"] }
+
+[features]
+# The whole crate is a vector store, experimental upstream (VECTOR_STORES):
+# without this feature it is empty.
+experimental-vector-stores = ["agent-framework-core/experimental-vector-stores"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

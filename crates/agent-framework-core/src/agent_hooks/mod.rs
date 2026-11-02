@@ -98,28 +98,26 @@
 //! [`InterceptionContextBuilder`], [`Verdict`], [`Interceptor`] and
 //! [`InterceptionRecord`] reimplement the subset the bundle needs: contexts
 //! validated against the §4 envelope and the §12.3 size and depth bounds,
-//! §5 verdict validation, `$target` transform paths (§5.2), the
-//! `sequential/first_deny` profile with `on_approval: "stop"` (§7.4),
-//! `enforce` and `evaluate_only` modes (§8), the §6.3 failure mapping, and
-//! payload-free records (§10.3).
+//! §5 verdict validation, `$target` transform paths (§5.2), all four
+//! composition profiles ([`Composition`]: `sequential/first_deny`,
+//! `sequential/run_all`, `parallel/strictest`, `parallel/unanimous`, §7),
+//! the approval seam ([`ApprovalResolver`], with an optional
+//! [`ApprovalRedactor`], §9), the `jcs-sha256` and custom identity providers
+//! ([`IdentityProvider`], §10), `enforce` and `evaluate_only` modes (§8), the
+//! §6.3 failure mapping, and payload-free records (§10.3).
 //!
 //! # Not ported
 //!
-//! - **Approval seam (§9).** There is no approval resolver: a liftable deny
-//!   (`Verdict::escalate`) is enforced as a plain deny, which the spec
-//!   allows.
-//! - **Composition profiles** other than `sequential/first_deny`
-//!   (`sequential/run_all`, `parallel/strictest`, `parallel/unanimous`).
 //! - **Result-label flow (§5.4).** Labels are unioned onto the combined
 //!   verdict and its record, but not persisted with the data the action
 //!   produced nor resurfaced as `extensions.*.source_labels` on later
 //!   points.
-//! - **Identity providers (§10).** No `jcs-sha256` (RFC 8785 + SHA-256) or
-//!   custom provider: records carry `null` identities and
-//!   `identity_provider: null`, i.e. they are identity-unbound.
-//! - **Cancellation.** Dropping a run's future emits no `agent_shutdown`
-//!   (there is no async drop); `ShutdownReason::Cancelled` is never sent by
-//!   the bundle.
+//! - **Cancellation without a runtime.** A run whose future is dropped
+//!   emits `agent_shutdown` (`cancelled`) from a spawned task, since there
+//!   is no async drop; with no Tokio runtime at drop time the trail stays
+//!   open.
+//! - **Declarations** (the SDK's declaration documents and registry): the
+//!   bundle is configured in code.
 //! - **Per-service-call history persistence** does not exist in the Rust
 //!   agent, so there is nothing to gate there; history is persisted once per
 //!   run, after `output`.
@@ -137,9 +135,17 @@
 //!   tool seam that invokes them.
 
 mod codecs;
+mod composition;
+mod identity;
 mod protocol;
 mod seams;
 
+pub use composition::{
+    approval_resolver_fn, ApprovalOutcome, ApprovalRedactor, ApprovalRequest, ApprovalResolution,
+    ApprovalResolver, Composition, CompositionProfile, FnApprovalResolver, OnApproval,
+    SynthesisPolicy,
+};
+pub use identity::{canonical_json, context_identity, IdentityFn, IdentityProvider, JCS_SHA256};
 pub use protocol::{
     host_error, interceptor_fn, CompositionRecord, Decision, EmitOutcome, EnforcementMode,
     FnInterceptor, InterceptionBlocked, InterceptionContext, InterceptionContextBuilder,

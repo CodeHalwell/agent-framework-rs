@@ -21,6 +21,38 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Agent hooks (`experimental-agent-hooks`), the rest of the control
+  contract: the `sequential/run_all`, `parallel/strictest` and
+  `parallel/unanimous` composition profiles (`Composition`,
+  `AgentHooksOptions::composition`), the approval seam
+  (`ApprovalResolver`, `approval_resolver_fn`, `ApprovalRedactor`; a
+  liftable deny is consulted, the echo rule enforced, and `on_approval`
+  stops or resumes the fold), the `jcs-sha256` identity provider (RFC 8785
+  + SHA-256 over the closed projection, now the default, as upstream) and
+  custom providers (`IdentityProvider`), and `agent_shutdown` with reason
+  `cancelled` when a run's future is dropped. **Breaking (experimental):**
+  `CompositionRecord` is now `Composition`, `InterceptionRecord::fold_truncated`
+  is `Option<bool>` (defined for the sequential profiles only), records
+  gain `resolved_by`, and records carry identities by default (use
+  `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-sql-server` (experimental, `VECTOR_STORES`; umbrella
+  feature `sql-server`): a SQL Server 2025 vector store ported from
+  upstream's `agent_framework_sql_server`, over `tiberius` (rustls). Native
+  `VECTOR(n)` columns with exact `VECTOR_DISTANCE` search (cosine,
+  Euclidean, dot), typed columns in an existing schema, scalar indexes,
+  parameterized two-valued portable filters, one transaction per
+  operation. Bytes fields and generated keys are not supported. Tested
+  offline (statement building); live tests need `AF_SQL_SERVER_TEST_URL`.
+
+- `agent-framework-duckdb` (experimental, `VECTOR_STORES`; umbrella feature
+  `duckdb`): an embedded DuckDB vector store ported from upstream's
+  `agent_framework_duckdb`. Typed columns, `FLOAT[n]`/`DOUBLE[n]` vectors,
+  cosine distance/similarity, dot product and Euclidean search, upserts
+  with `ON CONFLICT`, and parameterized portable filters (equality, `in`,
+  ordered, text). List containment and explicit data indexes are refused,
+  as upstream. DuckDB is bundled, so the crate builds without a system
+  library.
+
 - Typed workflow protocols: `workflow::protocol` (`ProtocolDescriptor`,
   `ProtocolBuilder`, `RequestPortInfo`), a defaulted
   `Executor::describe_protocol`, `FunctionExecutor::with_protocol`,

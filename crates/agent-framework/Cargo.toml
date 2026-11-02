@@ -39,6 +39,10 @@ cosmos = ["dep:agent-framework-cosmos"]
 qdrant = ["dep:agent-framework-qdrant", "experimental-vector-stores"]
 # The PostgreSQL + pgvector vector store (experimental, like `qdrant`).
 postgres = ["dep:agent-framework-postgres", "experimental-vector-stores"]
+# The SQL Server vector store (experimental).
+sql-server = ["dep:agent-framework-sql-server", "experimental-vector-stores"]
+# The embedded DuckDB vector store (experimental; bundles DuckDB, a C++ build).
+duckdb = ["dep:agent-framework-duckdb", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -63,6 +67,8 @@ experimental-vector-stores = [
     "agent-framework-redis?/experimental-vector-stores",
     "agent-framework-qdrant?/experimental-vector-stores",
     "agent-framework-postgres?/experimental-vector-stores",
+    "agent-framework-duckdb?/experimental-vector-stores",
+    "agent-framework-sql-server?/experimental-vector-stores",
 ]
 experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
@@ -141,6 +147,8 @@ agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-qdrant = { workspace = true, optional = true }
 agent-framework-postgres = { workspace = true, optional = true }
+agent-framework-duckdb = { workspace = true, optional = true }
+agent-framework-sql-server = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }
 agent-framework-purview = { workspace = true, optional = true }
 agent-framework-tools = { workspace = true, optional = true }

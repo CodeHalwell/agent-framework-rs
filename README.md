@@ -111,6 +111,8 @@ parity with the Python and .NET implementations.
 | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search: context provider (semantic + optional vector query) and vector store (index management, document CRUD, filtered vector and keyword-hybrid search). |
 | [`agent-framework-qdrant`](crates/agent-framework-qdrant) | Qdrant vector store over the REST API: named dense vectors, payload indexes, portable filters (experimental). |
 | [`agent-framework-postgres`](crates/agent-framework-postgres) | PostgreSQL + pgvector vector store: typed columns, HNSW / IVFFlat indexes, parameterized portable filters (experimental). |
+| [`agent-framework-sql-server`](crates/agent-framework-sql-server) | SQL Server vector store: native `VECTOR(n)` columns, exact `VECTOR_DISTANCE` search, parameterized portable filters (experimental). |
+| [`agent-framework-duckdb`](crates/agent-framework-duckdb) | Embedded DuckDB vector store: fixed-size array columns, cosine / dot / Euclidean search, parameterized portable filters (experimental). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
 | [`agent-framework-declarative`](crates/agent-framework-declarative) | Declarative YAML/JSON agents and workflows with provider/tool registries. |
@@ -209,6 +211,8 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
 | `qdrant` | [`agent-framework-qdrant`](crates/agent-framework-qdrant) — Qdrant vector store (experimental) | no |
 | `postgres` | [`agent-framework-postgres`](crates/agent-framework-postgres) — PostgreSQL + pgvector vector store (experimental) | no |
+| `sql-server` | [`agent-framework-sql-server`](crates/agent-framework-sql-server) — SQL Server vector store (experimental) | no |
+| `duckdb` | [`agent-framework-duckdb`](crates/agent-framework-duckdb) — embedded DuckDB vector store (experimental) | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |

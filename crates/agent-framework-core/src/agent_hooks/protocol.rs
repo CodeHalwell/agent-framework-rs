@@ -6,9 +6,9 @@
 //! `agent-hooks-sdk`, is published only as a `0.1.0-beta` pre-release, so
 //! rather than depend on it the subset the enforcement bundle needs is
 //! reimplemented here (see [`crate::agent_hooks`]), following the SDK's
-//! emitter: one `sequential/first_deny` composition profile with
-//! `on_approval: "stop"`, no approval resolver, and no identity provider (see
-//! the module docs of [`crate::agent_hooks`] for what is left out).
+//! emitter: the four composition profiles, the approval seam and the
+//! `jcs-sha256` / custom identity providers (see the module docs of
+//! [`crate::agent_hooks`] for what is left out).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::FutureExt;
+
+use super::composition::{
+    aggregate_strictest, Aggregate, ApprovalOutcome, ApprovalRedactor, ApprovalRequest,
+    ApprovalResolver, Composition, CompositionProfile, OnApproval, SynthesisPolicy,
+};
+use super::identity::IdentityProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -26,7 +32,7 @@ pub const SPEC_VERSION: &str = "agent-hooks/0.1";
 /// The spec-recommended per-interceptor timeout (§7): 5 seconds.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The composition profile this emitter implements (§7.2).
+/// The default composition profile (§7.2).
 pub const COMPOSITION_PROFILE: &str = "sequential/first_deny";
 
 /// Recommended bound on a context's serialized size (§12.3): 5 MiB.
@@ -60,6 +66,17 @@ pub mod host_error {
     pub const TRANSFORM_TARGET_FORBIDDEN: &str = "host_error:transform_target_forbidden";
     /// An `enforce`-mode emission with no interceptor registered.
     pub const NO_INTERCEPTOR: &str = "host_error:no_interceptor";
+    /// Two or more transforms against one snapshot under a parallel
+    /// profile (§7.5).
+    pub const TRANSFORM_CONFLICT: &str = "host_error:transform_conflict";
+    /// A non-unanimous outcome under `parallel/unanimous` (§7.5).
+    pub const COMPOSITION_DISAGREEMENT: &str = "host_error:composition_disagreement";
+    /// The approval resolver errored, panicked or timed out (§9).
+    pub const APPROVAL_RESOLVER_FAILED: &str = "host_error:approval_resolver_failed";
+    /// The resolver left the request unresolved (§9).
+    pub const APPROVAL_UNRESOLVED: &str = "host_error:approval_unresolved";
+    /// The resolution did not echo the request's `context_identity` (§9).
+    pub const APPROVAL_IDENTITY_MISMATCH: &str = "host_error:approval_identity_mismatch";
 }
 
 /// One of the eight interception points of the control contract (§3).
@@ -210,6 +227,18 @@ impl InterceptionContext {
     /// The whole context as a JSON object.
     pub fn as_json(&self) -> &Map<String, Value> {
         &self.json
+    }
+
+    /// Set a top-level field, for an [approval redactor](super::ApprovalRedactor)
+    /// minimizing what leaves through the seam. Interceptors receive copies,
+    /// so this cannot affect enforcement.
+    pub fn set(&mut self, field: impl Into<String>, value: Value) {
+        self.json.insert(field.into(), value);
+    }
+
+    /// Remove a top-level field (see [`Self::set`]).
+    pub fn remove(&mut self, field: &str) -> Option<Value> {
+        self.json.remove(field)
     }
 
     /// Replace `target` and its mirror field (§4.3: the target is a deep
@@ -477,9 +506,8 @@ pub struct Verdict {
     /// Warnings; permitted on any decision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Warning>,
-    /// Marks a deny as liftable by an approval seam. This host registers no
-    /// approval resolver, so a liftable deny is enforced as a plain deny
-    /// (which §9 allows).
+    /// Marks a deny as liftable through the approval seam (§9). Without a
+    /// resolver a liftable deny stands as a plain deny.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<Map<String, Value>>,
     /// The rewrite; present iff the decision is `transform`.
@@ -586,6 +614,12 @@ impl Verdict {
         self.decision != Decision::Deny
     }
 
+    /// Whether this is a liftable deny (a deny carrying an `approval`
+    /// block).
+    pub fn is_liftable(&self) -> bool {
+        self.decision == Decision::Deny && self.approval.is_some()
+    }
+
     /// Whether the reason is a host-synthesized `host_error:*` reason.
     pub fn is_host_error(&self) -> bool {
         self.reason
@@ -643,6 +677,13 @@ impl Verdict {
             reason: Some(reason.to_string()),
             message,
             ..Self::bare(Decision::Deny)
+        }
+    }
+
+    pub(crate) fn host_error_liftable(reason: &str, message: Option<String>) -> Self {
+        Self {
+            approval: Some(Map::new()),
+            ..Self::host_error(reason, message)
         }
     }
 
@@ -708,13 +749,7 @@ where
 }
 
 /// The composition block of a record (§10.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CompositionRecord {
-    /// Always `sequential/first_deny`.
-    pub profile: &'static str,
-    /// Always `stop` (the normative default).
-    pub on_approval: &'static str,
-}
+pub type CompositionRecord = Composition;
 
 /// A payload-free per-interceptor verdict summary (§10.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -733,9 +768,9 @@ pub struct VerdictSummary {
 
 /// The payload-free record of one emission (§10.3).
 ///
-/// This host declares no identity provider, so `input_identity`,
-/// `enforced_identity` and `identity_provider` are always `null` — the
-/// record self-describes as identity-unbound.
+/// The identities bind the record to the exact context before and after
+/// composition without copying it (§10); with the `Null` provider they are
+/// `null` and the record self-describes as identity-unbound.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InterceptionRecord {
     /// The interception point.
@@ -747,11 +782,11 @@ pub struct InterceptionRecord {
     /// record is serialized (§10.3).
     #[serde(serialize_with = "serialize_record_verdict")]
     pub verdict: Verdict,
-    /// Always `None` (no identity provider).
+    /// The provider's identity of the context before dispatch.
     pub input_identity: Option<String>,
-    /// Always `None` (no identity provider).
+    /// The provider's identity of the context after composition.
     pub enforced_identity: Option<String>,
-    /// Always `None` (no identity provider).
+    /// The identity provider's name (`None` when unbound).
     pub identity_provider: Option<String>,
     /// The session id (`""` when unknown).
     pub session_id: String,
@@ -766,8 +801,15 @@ pub struct InterceptionRecord {
     pub composition: CompositionRecord,
     /// Per-interceptor summaries, in registration order.
     pub verdicts: Vec<VerdictSummary>,
-    /// Whether registered interceptors were left uninvoked.
-    pub fold_truncated: bool,
+    /// Whether registered interceptors were left uninvoked; defined for the
+    /// sequential profiles only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fold_truncated: Option<bool>,
+    /// `"approval"` when a resolver's permit substituted for a verdict,
+    /// `"rejection"` when the seam was consulted and the deny stood; absent
+    /// when it was not consulted (§10.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<&'static str>,
     /// Number of interceptors registered.
     pub interceptors_registered: usize,
 }
@@ -854,17 +896,23 @@ pub type RecordSink = Arc<dyn Fn(&InterceptionRecord) + Send + Sync>;
 /// One registered interceptor and its optional, payload-free name.
 type Registration = (Option<String>, Arc<dyn Interceptor>);
 
-/// Dispatches contexts to interceptors and composes their verdicts
-/// (`sequential/first_deny`), producing a record per emission (§6–§10).
+/// Dispatches contexts to interceptors and composes their verdicts under
+/// the configured [`Composition`], consulting the approval seam for
+/// liftable denies and producing a record per emission (§6–§10).
 ///
 /// Fail-closed throughout: zero interceptors in `enforce` mode, an
 /// interceptor error, panic or timeout, an invalid verdict, an unappliable
-/// transform and an out-of-bounds context all become `host_error:*` denies.
+/// transform, an out-of-bounds context and an identity the provider cannot
+/// compute all become `host_error:*` denies.
 pub struct InterceptionEmitter {
     interceptors: Vec<Registration>,
     mode: EnforcementMode,
     timeout: Option<Duration>,
     record_sink: Option<RecordSink>,
+    composition: Composition,
+    identity: IdentityProvider,
+    resolver: Option<Arc<dyn ApprovalResolver>>,
+    redactor: Option<ApprovalRedactor>,
 }
 
 impl Default for InterceptionEmitter {
@@ -880,6 +928,10 @@ impl std::fmt::Debug for InterceptionEmitter {
             .field("mode", &self.mode)
             .field("timeout", &self.timeout)
             .field("record_sink", &self.record_sink.is_some())
+            .field("composition", &self.composition)
+            .field("identity", &self.identity)
+            .field("resolver", &self.resolver.is_some())
+            .field("redactor", &self.redactor.is_some())
             .finish()
     }
 }
@@ -889,7 +941,8 @@ struct Dispatch {
     combined: Verdict,
     decided_by: Option<usize>,
     verdicts: Vec<VerdictSummary>,
-    fold_truncated: bool,
+    fold_truncated: Option<bool>,
+    resolved_by: Option<&'static str>,
 }
 
 impl Dispatch {
@@ -898,20 +951,48 @@ impl Dispatch {
             combined: Verdict::host_error(reason, message),
             decided_by: None,
             verdicts: Vec::new(),
-            fold_truncated: false,
+            fold_truncated: None,
+            resolved_by: None,
+        }
+    }
+}
+
+/// The approval seam's answer for one liftable deny.
+enum Consultation {
+    /// Not consulted (not liftable, `evaluate_only`, `agent_shutdown`, or no
+    /// resolver): the deny stands.
+    NotConsulted,
+    /// Consulted: `permitted` resolutions substitute a permit; otherwise
+    /// `verdict` is the deny that stands.
+    Substituted {
+        verdict: Box<Verdict>,
+        permitted: bool,
+    },
+}
+
+impl Consultation {
+    fn failed(reason: &str, message: Option<&str>) -> Self {
+        Self::Substituted {
+            verdict: Box::new(Verdict::host_error(reason, message.map(str::to_string))),
+            permitted: false,
         }
     }
 }
 
 impl InterceptionEmitter {
-    /// An `enforce`-mode emitter with the default 5-second timeout and no
-    /// interceptors.
+    /// An `enforce`-mode emitter with the default 5-second timeout, the
+    /// default composition (`sequential/first_deny`, `on_approval: stop`),
+    /// the `jcs-sha256` identity provider and no interceptors.
     pub fn new() -> Self {
         Self {
             interceptors: Vec::new(),
             mode: EnforcementMode::Enforce,
             timeout: Some(DEFAULT_TIMEOUT),
             record_sink: None,
+            composition: Composition::default(),
+            identity: IdentityProvider::default(),
+            resolver: None,
+            redactor: None,
         }
     }
 
@@ -921,7 +1002,8 @@ impl InterceptionEmitter {
         self
     }
 
-    /// Builder: the per-interceptor timeout (`None` disables it).
+    /// Builder: the per-interceptor (and per-resolution) timeout (`None`
+    /// disables it).
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
@@ -931,6 +1013,30 @@ impl InterceptionEmitter {
     /// after each emission; a panicking sink is contained.
     pub fn with_record_sink(mut self, sink: RecordSink) -> Self {
         self.record_sink = Some(sink);
+        self
+    }
+
+    /// Builder: the composition profile and its knobs (§7).
+    pub fn with_composition(mut self, composition: Composition) -> Self {
+        self.composition = composition.normalized();
+        self
+    }
+
+    /// Builder: the identity provider (§10).
+    pub fn with_identity_provider(mut self, provider: IdentityProvider) -> Self {
+        self.identity = provider;
+        self
+    }
+
+    /// Builder: the approval resolver consulted for liftable denies (§9).
+    pub fn with_approval_resolver(mut self, resolver: Arc<dyn ApprovalResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Builder: minimize the context handed to the resolver (§9, §14).
+    pub fn with_approval_redactor(mut self, redactor: ApprovalRedactor) -> Self {
+        self.redactor = Some(redactor);
         self
     }
 
@@ -944,6 +1050,11 @@ impl InterceptionEmitter {
     /// The enforcement mode.
     pub fn mode(&self) -> EnforcementMode {
         self.mode
+    }
+
+    /// The composition in effect.
+    pub fn composition(&self) -> Composition {
+        self.composition
     }
 
     /// Run one emission; `Err` when the guarded action must not proceed.
@@ -969,9 +1080,23 @@ impl InterceptionEmitter {
     /// [`InterceptionEmitter::emit`].
     pub async fn emit_unchecked(&self, mut context: InterceptionContext) -> EmitOutcome {
         let original_target = context.target().clone();
+        let mut input_identity = None;
         let dispatch = match check_envelope(&context) {
             Err(message) => Dispatch::synthesized(host_error::CONTEXT_INVALID, Some(message)),
-            Ok(()) => self.dispatch(&mut context).await,
+            // §10.2: an identity the provider cannot compute fails the
+            // emission closed before any interceptor sees it.
+            Ok(()) => match self.identity.compute(&context) {
+                Err((reason, detail)) => Dispatch::synthesized(reason, Some(detail)),
+                Ok(identity) => {
+                    input_identity = identity;
+                    self.dispatch(&mut context).await
+                }
+            },
+        };
+        let enforced_identity = if input_identity.is_some() {
+            self.identity.compute(&context).ok().flatten()
+        } else {
+            None
         };
         let target = if self.mode == EnforcementMode::Enforce {
             context.target().clone()
@@ -982,9 +1107,9 @@ impl InterceptionEmitter {
             interception_point: context.point,
             mode: self.mode,
             verdict: dispatch.combined.project(),
-            input_identity: None,
-            enforced_identity: None,
-            identity_provider: None,
+            input_identity,
+            enforced_identity,
+            identity_provider: self.identity.name(),
             session_id: context.session_id().to_string(),
             sequence: context.sequence() as i64,
             timestamp: context
@@ -993,9 +1118,10 @@ impl InterceptionEmitter {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             decided_by: dispatch.decided_by,
-            composition: composition_record(),
+            composition: self.composition,
             verdicts: dispatch.verdicts,
             fold_truncated: dispatch.fold_truncated,
+            resolved_by: dispatch.resolved_by,
             interceptors_registered: self.interceptors.len(),
         };
         self.deliver(&record);
@@ -1024,14 +1150,15 @@ impl InterceptionEmitter {
             verdict: verdict.project(),
             input_identity: None,
             enforced_identity: None,
-            identity_provider: None,
+            identity_provider: self.identity.name(),
             session_id: session_id.to_string(),
             sequence: sequence.map(|s| s as i64).unwrap_or(-1),
             timestamp: Some(now_rfc3339()),
             decided_by: None,
-            composition: composition_record(),
+            composition: self.composition,
             verdicts: Vec::new(),
-            fold_truncated: false,
+            fold_truncated: None,
+            resolved_by: None,
             interceptors_registered: self.interceptors.len(),
         };
         self.deliver(&record);
@@ -1046,7 +1173,20 @@ impl InterceptionEmitter {
         }
     }
 
-    /// `sequential/first_deny` (§7.4), `on_approval: stop`, no resolver.
+    fn summaries(&self, verdicts: &[Verdict]) -> Vec<VerdictSummary> {
+        verdicts
+            .iter()
+            .zip(&self.interceptors)
+            .enumerate()
+            .map(|(index, (v, (name, _)))| VerdictSummary {
+                index,
+                decision: v.decision,
+                reason: v.reason.clone(),
+                name: name.clone(),
+            })
+            .collect()
+    }
+
     async fn dispatch(&self, context: &mut InterceptionContext) -> Dispatch {
         if self.interceptors.is_empty() {
             if self.mode == EnforcementMode::Enforce {
@@ -1056,54 +1196,112 @@ impl InterceptionEmitter {
                 combined: Verdict::allow(),
                 decided_by: None,
                 verdicts: Vec::new(),
-                fold_truncated: false,
+                fold_truncated: None,
+                resolved_by: None,
             };
         }
+        match self.composition.profile {
+            CompositionProfile::SequentialFirstDeny => self.dispatch_first_deny(context).await,
+            CompositionProfile::SequentialRunAll => self.dispatch_run_all(context).await,
+            CompositionProfile::ParallelStrictest | CompositionProfile::ParallelUnanimous => {
+                self.dispatch_parallel(context).await
+            }
+        }
+    }
+
+    /// Fold one transform into the context; an unappliable one becomes the
+    /// interceptor's synthesized deny.
+    fn fold_verdict(&self, context: &mut InterceptionContext, verdict: Verdict) -> Verdict {
+        match self.fold(context, &verdict) {
+            Ok(()) => verdict,
+            Err(reason) => Verdict::host_error(reason, None),
+        }
+    }
+
+    /// `sequential/first_deny` (§7.4): fold through; the first deny
+    /// short-circuits, unless the resolver approves it, in which case
+    /// `on_approval` stops the fold with the resolution or resumes it.
+    async fn dispatch_first_deny(&self, context: &mut InterceptionContext) -> Dispatch {
         let n = self.interceptors.len();
-        let mut summaries = Vec::with_capacity(n);
+        let on_approval = self.composition.on_approval.unwrap_or(OnApproval::Stop);
+        let mut per: Vec<Verdict> = Vec::with_capacity(n);
         let mut pool: Vec<Verdict> = Vec::with_capacity(n);
         let mut last_transform: Option<(usize, Verdict)> = None;
-        for (i, (name, interceptor)) in self.interceptors.iter().enumerate() {
-            let verdict = self.invoke(interceptor.as_ref(), context.clone()).await;
-            summaries.push(VerdictSummary {
-                index: i,
-                decision: verdict.decision,
-                reason: verdict.reason.clone(),
-                name: name.clone(),
-            });
-            let truncated = i + 1 < n;
+        let mut resolved_by = None;
+        for (i, (_, interceptor)) in self.interceptors.iter().enumerate() {
+            let truncated = Some(i + 1 < n);
+            let mut verdict = self.invoke(interceptor.as_ref(), context.clone()).await;
+            if verdict.decision == Decision::Transform {
+                // An unappliable transform is the interceptor's failure: the
+                // synthesized deny takes its slot (§6.3, §7.4).
+                verdict = self.fold_verdict(context, verdict);
+            }
+            per.push(verdict.clone());
             pool.push(verdict.clone());
             match verdict.decision {
-                // A deny (liftable or not: no resolver is registered, so a
-                // liftable deny stands, §9) short-circuits. A host-synthesized
-                // failure deny takes the failing interceptor's slot.
-                Decision::Deny => {
-                    return Dispatch {
-                        combined: with_unions(verdict, &pool),
-                        decided_by: Some(i),
-                        verdicts: summaries,
-                        fold_truncated: truncated,
-                    };
-                }
-                Decision::Transform => {
-                    if let Err(reason) = self.fold(context, &verdict) {
-                        // An unappliable transform is the interceptor's
-                        // failure: the synthesized deny takes its slot
-                        // (§6.3, §7.4) and decides the fold.
-                        let deny = Verdict::host_error(reason, None);
-                        let slot = &mut summaries[i];
-                        slot.decision = deny.decision;
-                        slot.reason = deny.reason.clone();
+                Decision::Allow => {}
+                Decision::Transform => last_transform = Some((i, verdict)),
+                Decision::Deny => match self.consult(context, &verdict).await {
+                    Consultation::NotConsulted => {
                         return Dispatch {
-                            combined: with_unions(deny, &pool),
+                            combined: with_unions(verdict, &pool),
                             decided_by: Some(i),
-                            verdicts: summaries,
+                            verdicts: self.summaries(&per),
                             fold_truncated: truncated,
+                            resolved_by,
                         };
                     }
-                    last_transform = Some((i, verdict));
-                }
-                Decision::Allow => {}
+                    Consultation::Substituted {
+                        verdict: resolution,
+                        permitted: false,
+                    } => {
+                        let synthesized = resolution.is_host_error();
+                        return Dispatch {
+                            combined: with_unions(*resolution, &pool),
+                            decided_by: if synthesized { None } else { Some(i) },
+                            verdicts: self.summaries(&per),
+                            fold_truncated: truncated,
+                            resolved_by: Some("rejection"),
+                        };
+                    }
+                    Consultation::Substituted {
+                        verdict: resolution,
+                        permitted: true,
+                    } => {
+                        resolved_by = Some("approval");
+                        let sub = if resolution.decision == Decision::Transform {
+                            self.fold_verdict(context, *resolution)
+                        } else {
+                            *resolution
+                        };
+                        if !sub.is_permit() {
+                            return Dispatch {
+                                combined: sub,
+                                decided_by: None,
+                                verdicts: self.summaries(&per),
+                                fold_truncated: truncated,
+                                resolved_by,
+                            };
+                        }
+                        pool.push(sub.clone());
+                        match on_approval {
+                            OnApproval::Stop => {
+                                return Dispatch {
+                                    combined: with_unions(sub, &pool),
+                                    decided_by: Some(i),
+                                    verdicts: self.summaries(&per),
+                                    fold_truncated: truncated,
+                                    resolved_by,
+                                };
+                            }
+                            OnApproval::Resume => {
+                                if sub.decision == Decision::Transform {
+                                    last_transform = Some((i, sub));
+                                }
+                            }
+                        }
+                    }
+                },
             }
         }
         let (decided_by, combined) = match last_transform {
@@ -1113,8 +1311,318 @@ impl InterceptionEmitter {
         Dispatch {
             combined: with_unions(combined, &pool),
             decided_by,
-            verdicts: summaries,
-            fold_truncated: false,
+            verdicts: self.summaries(&per),
+            fold_truncated: Some(false),
+            resolved_by,
+        }
+    }
+
+    /// `sequential/run_all` (§7.4): every interceptor runs and transforms
+    /// fold through; the most severe verdict wins. An unappliable transform
+    /// still short-circuits.
+    async fn dispatch_run_all(&self, context: &mut InterceptionContext) -> Dispatch {
+        let n = self.interceptors.len();
+        let mut all: Vec<Verdict> = Vec::with_capacity(n);
+        for (i, (_, interceptor)) in self.interceptors.iter().enumerate() {
+            let mut verdict = self.invoke(interceptor.as_ref(), context.clone()).await;
+            if verdict.decision == Decision::Transform {
+                verdict = self.fold_verdict(context, verdict);
+                if !verdict.is_permit() {
+                    all.push(verdict.clone());
+                    return Dispatch {
+                        combined: with_unions(verdict, &all),
+                        decided_by: Some(i),
+                        verdicts: self.summaries(&all),
+                        fold_truncated: Some(i + 1 < n),
+                        resolved_by: None,
+                    };
+                }
+            }
+            all.push(verdict);
+        }
+        let mut dispatch = self.aggregate(context, all, true).await;
+        dispatch.fold_truncated = Some(false);
+        dispatch
+    }
+
+    /// The parallel profiles (§7.5): every interceptor sees the same
+    /// snapshot, concurrently; nothing folds until aggregation.
+    async fn dispatch_parallel(&self, context: &mut InterceptionContext) -> Dispatch {
+        let snapshot = context.clone();
+        let all: Vec<Verdict> = futures::future::join_all(
+            self.interceptors
+                .iter()
+                .map(|(_, interceptor)| self.invoke(interceptor.as_ref(), snapshot.clone())),
+        )
+        .await;
+        if self.composition.profile == CompositionProfile::ParallelUnanimous {
+            let verdicts = self.summaries(&all);
+            if all.iter().all(|v| v.decision == Decision::Allow) {
+                return Dispatch {
+                    combined: with_unions(Verdict::allow(), &all),
+                    decided_by: None,
+                    verdicts,
+                    fold_truncated: None,
+                    resolved_by: None,
+                };
+            }
+            let mut resolved_by = None;
+            let combined = self
+                .synthesize(
+                    context,
+                    host_error::COMPOSITION_DISAGREEMENT,
+                    "non-unanimous outcome under parallel/unanimous".into(),
+                    self.composition
+                        .on_disagreement
+                        .unwrap_or(SynthesisPolicy::Deny),
+                    &all,
+                    &mut resolved_by,
+                )
+                .await;
+            return Dispatch {
+                combined,
+                decided_by: None,
+                verdicts,
+                fold_truncated: None,
+                resolved_by,
+            };
+        }
+        self.aggregate(context, all, false).await
+    }
+
+    /// Severity-max aggregation and winner handling, shared by `run_all`
+    /// (whose transforms are already folded) and `parallel/strictest`.
+    async fn aggregate(
+        &self,
+        context: &mut InterceptionContext,
+        all: Vec<Verdict>,
+        sequential: bool,
+    ) -> Dispatch {
+        let verdicts = self.summaries(&all);
+        let mut resolved_by = None;
+        match aggregate_strictest(&all, sequential) {
+            Aggregate::TransformConflict(indices) => {
+                let combined = self
+                    .synthesize(
+                        context,
+                        host_error::TRANSFORM_CONFLICT,
+                        format!("conflicting transforms from interceptors {indices:?}"),
+                        self.composition
+                            .on_transform_conflict
+                            .unwrap_or(SynthesisPolicy::Deny),
+                        &all,
+                        &mut resolved_by,
+                    )
+                    .await;
+                Dispatch {
+                    combined,
+                    decided_by: None,
+                    verdicts,
+                    fold_truncated: None,
+                    resolved_by,
+                }
+            }
+            Aggregate::Winner(i) => {
+                let winner = all[i].clone();
+                match winner.decision {
+                    Decision::Allow => Dispatch {
+                        combined: with_unions(Verdict::allow(), &all),
+                        decided_by: None,
+                        verdicts,
+                        fold_truncated: None,
+                        resolved_by,
+                    },
+                    Decision::Transform => {
+                        let winner = if sequential {
+                            winner
+                        } else {
+                            self.fold_verdict(context, winner)
+                        };
+                        if !winner.is_permit() {
+                            return Dispatch {
+                                combined: winner,
+                                decided_by: Some(i),
+                                verdicts,
+                                fold_truncated: None,
+                                resolved_by,
+                            };
+                        }
+                        Dispatch {
+                            combined: with_unions(winner, &all),
+                            decided_by: Some(i),
+                            verdicts,
+                            fold_truncated: None,
+                            resolved_by,
+                        }
+                    }
+                    // A liftable winner means no plain deny exists (it would
+                    // be more severe), so every deny is liftable (§7.4).
+                    Decision::Deny => {
+                        let (combined, decided_by) = match self.consult(context, &winner).await {
+                            Consultation::NotConsulted => (with_unions(winner, &all), Some(i)),
+                            Consultation::Substituted { verdict, permitted } => {
+                                let (combined, synthesized) = self.substitute(
+                                    context,
+                                    *verdict,
+                                    permitted,
+                                    &all,
+                                    &mut resolved_by,
+                                );
+                                (combined, if synthesized { None } else { Some(i) })
+                            }
+                        };
+                        Dispatch {
+                            combined,
+                            decided_by,
+                            verdicts,
+                            fold_truncated: None,
+                            resolved_by,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply a consultation's resolution: a permit folds (a transform) and
+    /// becomes the combined verdict; otherwise the resolution's deny stands.
+    /// Returns the combined verdict and whether it is host-synthesized.
+    fn substitute(
+        &self,
+        context: &mut InterceptionContext,
+        resolution: Verdict,
+        permitted: bool,
+        pool: &[Verdict],
+        resolved_by: &mut Option<&'static str>,
+    ) -> (Verdict, bool) {
+        if !permitted {
+            *resolved_by = Some("rejection");
+            let synthesized = resolution.is_host_error();
+            return (with_unions(resolution, pool), synthesized);
+        }
+        *resolved_by = Some("approval");
+        let sub = if resolution.decision == Decision::Transform {
+            self.fold_verdict(context, resolution)
+        } else {
+            resolution
+        };
+        if !sub.is_permit() {
+            return (sub, true);
+        }
+        let mut with_sub = pool.to_vec();
+        with_sub.push(sub.clone());
+        (with_unions(sub, &with_sub), false)
+    }
+
+    /// §7.5 synthesis: a plain deny, or a liftable one consulted through
+    /// the seam.
+    async fn synthesize(
+        &self,
+        context: &mut InterceptionContext,
+        reason: &str,
+        detail: String,
+        policy: SynthesisPolicy,
+        pool: &[Verdict],
+        resolved_by: &mut Option<&'static str>,
+    ) -> Verdict {
+        match policy {
+            SynthesisPolicy::Deny => with_unions(Verdict::host_error(reason, Some(detail)), pool),
+            SynthesisPolicy::Approval => {
+                let liftable = Verdict::host_error_liftable(reason, Some(detail));
+                match self.consult(context, &liftable).await {
+                    Consultation::NotConsulted => with_unions(liftable, pool),
+                    Consultation::Substituted { verdict, permitted } => {
+                        self.substitute(context, *verdict, permitted, pool, resolved_by)
+                            .0
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consult the approval seam for a liftable deny (§9): only in
+    /// `enforce` mode, never at `agent_shutdown`, and only with a resolver.
+    /// Enforces the echo rule and outcome/verdict agreement.
+    async fn consult(&self, context: &InterceptionContext, verdict: &Verdict) -> Consultation {
+        if !verdict.is_liftable()
+            || self.mode != EnforcementMode::Enforce
+            || context.point == InterceptionPoint::AgentShutdown
+        {
+            return Consultation::NotConsulted;
+        }
+        let Some(resolver) = &self.resolver else {
+            return Consultation::NotConsulted;
+        };
+        let presented = match &self.redactor {
+            Some(redact) => match std::panic::catch_unwind(AssertUnwindSafe(|| redact(context))) {
+                Ok(c) => c,
+                Err(_) => {
+                    return Consultation::failed(
+                        host_error::APPROVAL_RESOLVER_FAILED,
+                        Some("approval redactor panicked"),
+                    )
+                }
+            },
+            None => context.clone(),
+        };
+        // The identity binds the approval to what the approver saw.
+        let identity = match self.identity.compute(&presented) {
+            Ok(identity) => identity,
+            Err((reason, detail)) => return Consultation::failed(reason, Some(&detail)),
+        };
+        let request = ApprovalRequest {
+            context_identity: identity.clone(),
+            interception_point: context.point,
+            verdict: verdict.clone(),
+            context: presented,
+        };
+        let call = AssertUnwindSafe(resolver.resolve(request)).catch_unwind();
+        let result = match self.timeout {
+            Some(limit) => match tokio::time::timeout(limit, call).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Consultation::failed(
+                        host_error::APPROVAL_RESOLVER_FAILED,
+                        Some("resolver timed out"),
+                    )
+                }
+            },
+            None => call.await,
+        };
+        let resolution = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => {
+                return Consultation::failed(host_error::APPROVAL_RESOLVER_FAILED, Some("error"))
+            }
+            Err(_) => {
+                return Consultation::failed(host_error::APPROVAL_RESOLVER_FAILED, Some("panic"))
+            }
+        };
+        if resolution.context_identity != identity {
+            return Consultation::failed(host_error::APPROVAL_IDENTITY_MISMATCH, None);
+        }
+        if resolution.outcome == ApprovalOutcome::Unresolved {
+            return Consultation::failed(host_error::APPROVAL_UNRESOLVED, None);
+        }
+        let Some(substitute) = resolution.verdict else {
+            return Consultation::failed(host_error::APPROVAL_UNRESOLVED, None);
+        };
+        if let Err(why) = substitute.validate() {
+            return Consultation::failed(host_error::VERDICT_INVALID, Some(&why));
+        }
+        let permitted = match resolution.outcome {
+            ApprovalOutcome::Approve if substitute.is_permit() => true,
+            ApprovalOutcome::Reject if substitute.decision == Decision::Deny => false,
+            _ => {
+                return Consultation::failed(
+                    host_error::VERDICT_INVALID,
+                    Some("resolution outcome and verdict disagree"),
+                )
+            }
+        };
+        Consultation::Substituted {
+            verdict: Box::new(substitute),
+            permitted,
         }
     }
 
@@ -1172,13 +1680,6 @@ impl InterceptionEmitter {
                 Err(why) => Verdict::host_error(host_error::VERDICT_INVALID, Some(why)),
             },
         }
-    }
-}
-
-fn composition_record() -> CompositionRecord {
-    CompositionRecord {
-        profile: COMPOSITION_PROFILE,
-        on_approval: "stop",
     }
 }
 
@@ -1733,7 +2234,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(blocked.reason(), Some("needs_review"));
-        assert!(blocked.record.fold_truncated);
+        assert_eq!(blocked.record.fold_truncated, Some(true));
         assert!(blocked.verdict.result_labels.is_empty());
         assert_eq!(called.load(Ordering::SeqCst), 0);
     }
@@ -1791,7 +2292,14 @@ mod tests {
             assert_eq!(records.len(), 1);
             let wire = serde_json::to_string(&records[0]).unwrap();
             assert!(!wire.contains("secret text"), "{wire}");
-            assert!(wire.contains("\"identity_provider\":null"));
+            assert!(
+                wire.contains("\"identity_provider\":\"jcs-sha256\""),
+                "{wire}"
+            );
+            assert!(records[0]
+                .input_identity
+                .as_deref()
+                .is_some_and(|id| id.starts_with("sha256:") && id.len() == 71));
         }
     }
 
@@ -1825,7 +2333,7 @@ mod tests {
         assert_eq!(called.load(Ordering::SeqCst), 0);
         let record = &blocked.record;
         assert_eq!(record.decided_by, Some(1));
-        assert!(record.fold_truncated);
+        assert_eq!(record.fold_truncated, Some(true));
         assert_eq!(record.verdicts.len(), 2);
         let slot = &record.verdicts[1];
         assert_eq!(slot.index, 1);

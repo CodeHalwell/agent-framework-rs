@@ -28,6 +28,8 @@
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
 //! | `qdrant` | [`agent_framework_qdrant`] — Qdrant vector store (experimental) | no |
 //! | `postgres` | [`agent_framework_postgres`] — PostgreSQL + pgvector vector store (experimental) | no |
+//! | `sql-server` | [`agent_framework_sql_server`] — SQL Server vector store (experimental) | no |
+//! | `duckdb` | [`agent_framework_duckdb`] — DuckDB vector store, embedded (experimental) | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
@@ -130,6 +132,12 @@ pub use agent_framework_foundry as foundry;
 /// `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
+/// The SQL Server vector store (the experimental `sql-server` feature).
+#[cfg(feature = "sql-server")]
+pub use agent_framework_sql_server as sql_server;
+/// The embedded DuckDB vector store (the experimental `duckdb` feature).
+#[cfg(feature = "duckdb")]
+pub use agent_framework_duckdb as duckdb;
 /// The PostgreSQL + pgvector vector store (the experimental `postgres` feature).
 #[cfg(feature = "postgres")]
 pub use agent_framework_postgres as postgres;

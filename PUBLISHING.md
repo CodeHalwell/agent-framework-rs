@@ -22,7 +22,7 @@ the order does not matter:
 1. **Tier 0** — `agent-framework-core`
 2. **Tier 1** — `agent-framework-a2a`, `agent-framework-bedrock`,
    `agent-framework-copilotstudio`,
-   `agent-framework-declarative`, `agent-framework-gemini`,
+   `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-sql-server`, `agent-framework-gemini`,
    `agent-framework-hosting`, `agent-framework-mcp`, `agent-framework-mem0`,
    `agent-framework-openai`, `agent-framework-purview`,
    `agent-framework-postgres`, `agent-framework-qdrant`, `agent-framework-redis`, `agent-framework-tools`

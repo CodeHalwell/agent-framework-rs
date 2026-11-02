@@ -43,21 +43,24 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Agent hooks, remainder** (`experimental-agent-hooks` ships the
-  enforcement bundle): the approval seam (liftable denies are enforced as
-  plain denies), the `sequential/run_all` and parallel composition profiles,
-  the `jcs-sha256` and custom identity providers (records are
-  identity-unbound), an `agent_shutdown` on cancellation, and §5.4
-  result-label flow (labels reach the combined verdict and the record but
-  are not persisted with the produced data or resurfaced as
-  `source_labels`; upstream's framework layer does not do this either).
+- **Agent hooks, remainder** (`experimental-agent-hooks`): declaration
+  documents (the SDK's declaration loader and registry; the bundle is
+  configured in code), and §5.4 result-label flow (labels reach the
+  combined verdict and the record but are not persisted with the produced
+  data or resurfaced as `source_labels`; upstream's framework layer does
+  not do this either).
 - **Security (FIDES)**: marked experimental upstream; when ported it goes
   behind an `experimental-*` feature (see `docs/feature-stages.md`).
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
-- **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
+- **Durable Task hosting** (`agent-framework-durabletask`, now published
+  from its own repository). Blocked: it sits on the `durabletask` SDK, a
+  deterministic-replay orchestration engine with durable entities and a
+  gRPC sidecar protocol (about 18,000 lines on top of the package's own
+  20,000). There is no Rust Durable Task SDK to build on, and no sidecar or
+  scheduler emulator to verify a port against.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
 - **Azure**: the Cosmos DB memory provider (blocked on the Agent Memory
@@ -74,8 +77,10 @@ from the roadmap, not from this file.
   providers seeing the agent object (they see its
   identity, `SessionContext::agent`, and the session in `before_run`, and
   the session after the run, but not the agent itself).
-- **Vector stores**: MongoDB, DuckDB, SQL Server and Azure DocumentDB
-  (blocked on the MongoDB wire protocol). The Redis vector store is ported
+- **Vector stores**: MongoDB and Azure DocumentDB. DuckDB
+  (`agent-framework-duckdb`, embedded, tested in-process) and SQL Server
+  (`agent-framework-sql-server`, query building tested offline; no live
+  SQL Server 2025 in CI) are ported. The Redis vector store is ported
   (`agent-framework-redis`'s `experimental-vector-stores` feature); its
   live tests run only against a Redis with Search and JSON
   (`AF_REDIS_SEARCH_TEST_URL`), which this repository's CI does not start.
