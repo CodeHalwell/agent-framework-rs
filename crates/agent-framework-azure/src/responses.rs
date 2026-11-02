@@ -87,6 +87,7 @@ use std::sync::Arc;
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
 use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+use agent_framework_openai::responses::OpenAIContinuationToken;
 use futures::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
@@ -460,13 +461,28 @@ impl AzureOpenAIResponsesClient {
     }
 
     fn url(&self) -> String {
+        self.versioned(self.responses_root())
+    }
+
+    /// `GET {base}/responses/{id}` (with the api-version query): polls or
+    /// resumes a background response.
+    fn retrieve_url(&self, response_id: &str) -> String {
+        self.versioned(format!("{}/{response_id}", self.responses_root()))
+    }
+
+    /// `{base}/responses`, without the api-version query.
+    fn responses_root(&self) -> String {
         let base = match &self.inner.base_url {
             Some(explicit) => explicit.trim_end_matches('/').to_string(),
             None => format!("{}/openai/v1", self.inner.endpoint.trim_end_matches('/')),
         };
+        format!("{base}/responses")
+    }
+
+    fn versioned(&self, url: String) -> String {
         match &self.inner.api_version {
-            Some(v) => format!("{base}/responses?api-version={v}"),
-            None => format!("{base}/responses"),
+            Some(v) => format!("{url}?api-version={v}"),
+            None => url,
         }
     }
 
@@ -523,6 +539,9 @@ impl AzureOpenAIResponsesClient {
         }
         if let Some(store) = options.store {
             body.insert("store".into(), json!(store));
+        }
+        if let Some(background) = options.background {
+            body.insert("background".into(), json!(background));
         }
         if let Some(user) = &options.user {
             body.insert("user".into(), json!(user));
@@ -600,17 +619,40 @@ impl AzureOpenAIResponsesClient {
     }
 
     async fn post(&self, body: &Value, options: &ChatOptions) -> Result<reqwest::Response> {
+        let req = self.inner.http.post(self.url()).json(body);
+        self.send(req, options).await
+    }
+
+    /// Poll a background response (or, with `stream`, resume its event
+    /// stream after the token's `starting_after` position), as
+    /// `OpenAIChatClient` does.
+    async fn retrieve(
+        &self,
+        token: &OpenAIContinuationToken,
+        stream: bool,
+        options: &ChatOptions,
+    ) -> Result<reqwest::Response> {
+        let mut req = self.inner.http.get(self.retrieve_url(&token.response_id));
+        if stream {
+            req = req.query(&[("stream", "true")]);
+            if let Some(after) = token.sequence_number {
+                req = req.query(&[("starting_after", after)]);
+            }
+        }
+        self.send(req, options).await
+    }
+
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        options: &ChatOptions,
+    ) -> Result<reqwest::Response> {
         // Validated before the credential is fetched: a malformed header is
         // the caller's mistake and should be reported without first spending a
         // token request on it.
         let client_headers = client_headers(options)?;
         let (header_name, header_value) = self.auth_header().await?;
-        let mut req = self
-            .inner
-            .http
-            .post(self.url())
-            .header(header_name, header_value)
-            .json(body);
+        let mut req = req.header(header_name, header_value);
         for (name, value) in client_headers {
             req = req.header(name, value);
         }
@@ -644,8 +686,18 @@ impl ChatClient for AzureOpenAIResponsesClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let body = self.transformed_body(&messages, &options, false);
-        let resp = self.post(&body, &options).await?;
+        // A continuation token polls the background response it names; the
+        // messages are not sent, since that response already has its input.
+        let resp = match &options.continuation_token {
+            Some(token) => {
+                let token = OpenAIContinuationToken::from_token(token)?;
+                self.retrieve(&token, false, &options).await?
+            }
+            None => {
+                let body = self.transformed_body(&messages, &options, false);
+                self.post(&body, &options).await?
+            }
+        };
         let value: Value = resp
             .json()
             .await
@@ -668,8 +720,21 @@ impl ChatClient for AzureOpenAIResponsesClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
+        use agent_framework_openai::responses::parse_background_responses_sse_stream;
+        // A continuation token resumes the background response's event
+        // stream after the last event the caller saw.
+        if let Some(token) = &options.continuation_token {
+            let token = OpenAIContinuationToken::from_token(token)?;
+            let resp = self.retrieve(&token, true, &options).await?;
+            return Ok(
+                parse_background_responses_sse_stream(resp, options.store, Some(token)).boxed(),
+            );
+        }
         let body = self.transformed_body(&messages, &options, true);
         let resp = self.post(&body, &options).await?;
+        if options.background == Some(true) {
+            return Ok(parse_background_responses_sse_stream(resp, options.store, None).boxed());
+        }
         Ok(
             agent_framework_openai::responses::parse_responses_sse_stream(resp, options.store)
                 .boxed(),

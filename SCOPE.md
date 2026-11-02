@@ -57,12 +57,21 @@ from the roadmap, not from this file.
   container file citations announced in an MCP tool result's `_meta`; the
   agentserver's resilient task runtime, which runs on the Foundry Tasks
   service and can resume a workflow from its checkpoint (interrupted
-  background responses are failed at startup instead); voice invocations;
-  and host-side provider-native background polling (depends on the core
-  `background`/`continuation_token` contract). Span enrichment stamps agent
+  background responses are failed at startup instead, and provider
+  background polling does not resume after a restart); and voice
+  invocations. Span enrichment stamps agent
   identity at span start (the Rust SDK has no on-end mutation). A toolbox
   skill refresh rebuilds the `SkillsProvider`, so previously loaded skills
   are re-injected only once loaded again. Tested in-process only.
+- **Background responses, divergences**: the agent does not wrap the
+  provider token with the saved input and earlier updates (.NET's
+  `ChatClientAgentContinuationToken`), so after an interrupted stream the
+  resumed run records only the reply received after the cut. Requiring a
+  session for background runs and rejecting a token sent with new messages
+  follow .NET and Go (Python enforces neither). OpenAI tokens add
+  `sequence_number`/`starting_after` and `function_calls` (Python's carries
+  only `response_id` and replays the whole stream); no client cancel call
+  exists upstream, so none is offered.
 - **Computer use, remainder** (`experimental-computer-use`): Anthropic and
   Gemini skip the computer tool with a warning; upstream has no computer-use
   support for either provider. The workflow has no request-cancellation API,

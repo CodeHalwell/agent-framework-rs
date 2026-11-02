@@ -358,17 +358,16 @@ impl ChatClient for OpenAIChatClient {
         if let Some(token) = &options.continuation_token {
             let token = OpenAIContinuationToken::from_token(token)?;
             let resp = self.retrieve(&token, true).await?;
-            let resume = BackgroundStream {
-                response_id: Some(token.response_id),
-                sequence_number: token.sequence_number,
-            };
-            let call_ids = token.function_calls.into_iter().collect();
-            return Ok(sse_stream(resp, options.store, Some(resume), call_ids).boxed());
+            return Ok(
+                parse_background_responses_sse_stream(resp, options.store, Some(token)).boxed(),
+            );
         }
         let body = self.build_body(&messages, &options, true);
         let resp = self.post(&body).await?;
-        let background = (options.background == Some(true)).then(BackgroundStream::default);
-        Ok(sse_stream(resp, options.store, background, HashMap::new()).boxed())
+        if options.background == Some(true) {
+            return Ok(parse_background_responses_sse_stream(resp, options.store, None).boxed());
+        }
+        Ok(sse_stream(resp, options.store, None, HashMap::new()).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -1575,6 +1574,38 @@ pub fn parse_responses_sse_stream(
     store: Option<bool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     sse_stream(resp, store, None, HashMap::new())
+}
+
+/// [`parse_responses_sse_stream`] for a background response: every update
+/// carries an [`OpenAIContinuationToken`] while the response is still
+/// running. `resume` is the token a resumed stream continues from (`None`
+/// for a fresh `background: true` submission). `pub` so
+/// `agent-framework-azure`'s Responses client can reuse it.
+pub fn parse_background_responses_sse_stream(
+    resp: reqwest::Response,
+    store: Option<bool>,
+    resume: Option<OpenAIContinuationToken>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
+    match resume {
+        Some(token) => {
+            let state = BackgroundStream {
+                response_id: Some(token.response_id),
+                sequence_number: token.sequence_number,
+            };
+            sse_stream(
+                resp,
+                store,
+                Some(state),
+                token.function_calls.into_iter().collect(),
+            )
+        }
+        None => sse_stream(
+            resp,
+            store,
+            Some(BackgroundStream::default()),
+            HashMap::new(),
+        ),
+    }
 }
 
 /// Where a background response's stream stands, so every update can carry

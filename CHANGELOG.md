@@ -91,6 +91,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   with the continuation token until it completes, as upstream's
   `background_source="provider"` (requires `HistorySource::Service`;
   `with_background_poll_interval` defaults to 2s).
+- Azure OpenAI Responses: background responses, as the OpenAI client —
+  `background: true` is sent, a continuation token polls
+  `GET {base}/responses/{id}` (with the api-version) or resumes the stream
+  with `starting_after`, and background stream updates carry tokens
+  (`parse_background_responses_sse_stream` is shared from
+  `agent-framework-openai`).
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
