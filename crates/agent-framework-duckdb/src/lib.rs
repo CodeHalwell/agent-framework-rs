@@ -302,8 +302,13 @@ impl FilterCompiler<'_> {
             return Ok(format!("{column} IS NULL"));
         }
         let param = match (field.type_.as_deref(), value) {
-            (Some("int") | Some("float"), Value::Number(n)) => {
-                numeric_operand(n, "Numeric filter operands must be finite.")?
+            (Some(kind @ ("int" | "float")), Value::Number(n)) => {
+                match numeric_operand(n, kind == "int", "Numeric filter operands must be finite.")?
+                {
+                    Some(param) => param,
+                    // Beyond BIGINT: no stored integer equals it.
+                    None => return Ok("FALSE".to_string()),
+                }
             }
             _ => match value_param(field, value) {
                 Ok(p) => p,
@@ -403,9 +408,17 @@ impl FilterCompiler<'_> {
                                     .into(),
                             ))
                         }
-                        (Some("int" | "float"), Value::Number(n)) => {
-                            numeric_operand(n, "Ordered filter numbers must be finite.")?
-                        }
+                        (Some(kind @ ("int" | "float")), Value::Number(n)) => numeric_operand(
+                            n,
+                            kind == "int",
+                            "Ordered filter numbers must be finite.",
+                        )?
+                        .ok_or_else(|| {
+                            Error::Configuration(
+                                "Integer filter values must fit in the DuckDB BIGINT range."
+                                    .into(),
+                            )
+                        })?,
                         _ => value_param(field, operand)?,
                     };
                     self.params.push(param);
@@ -879,15 +892,31 @@ fn normalized_key(value: &Value, uuid: bool) -> String {
 
 /// A numeric filter operand, bound exactly: integers as `BIGINT` (a double
 /// would round values beyond 2^53 onto a neighbouring key), other numbers as
-/// finite `DOUBLE`.
-fn numeric_operand(n: &serde_json::Number, not_finite: &str) -> Result<Db> {
+/// finite `DOUBLE`. On an `int` column an integral float (`2020.0`) binds as
+/// `BIGINT` too: bound as a `DOUBLE`, DuckDB would promote the column to
+/// floating point and round distinct stored integers onto the operand.
+/// `Ok(None)` is an integral float outside the `BIGINT` range on an `int`
+/// column, which no stored value can equal.
+fn numeric_operand(
+    n: &serde_json::Number,
+    int_column: bool,
+    not_finite: &str,
+) -> Result<Option<Db>> {
     if let Some(i) = n.as_i64() {
-        return Ok(Db::BigInt(i));
+        return Ok(Some(Db::BigInt(i)));
     }
-    n.as_f64()
+    let f = n
+        .as_f64()
         .filter(|f| f.is_finite())
-        .map(Db::Double)
-        .ok_or_else(|| Error::Configuration(not_finite.into()))
+        .ok_or_else(|| Error::Configuration(not_finite.into()))?;
+    if int_column && f.fract() == 0.0 {
+        // `i64::MAX as f64` rounds up to 2^63, so the upper bound is
+        // exclusive.
+        const MIN: f64 = i64::MIN as f64;
+        const MAX: f64 = i64::MAX as f64;
+        return Ok((MIN..MAX).contains(&f).then_some(Db::BigInt(f as i64)));
+    }
+    Ok(Some(Db::Double(f)))
 }
 
 fn table_exists(connection: &duckdb::Connection, name: &str) -> Result<bool> {

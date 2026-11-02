@@ -133,6 +133,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   operation, the tool interactions it already completed (each function call
   with its result) are recorded in local history right away; only the
   pending operation's own output waits for completion.
+- DuckDB vector store (review fix): an integral float operand on an `int`
+  column binds as `BIGINT`, so DuckDB compares exactly instead of promoting
+  the column to floating point (where `9007199254740992.0` matched
+  `9007199254740993`); beyond the `BIGINT` range it equals nothing and is
+  refused for ordered filters.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

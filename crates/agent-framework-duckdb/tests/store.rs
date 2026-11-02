@@ -316,3 +316,54 @@ async fn integer_filters_beyond_2_53_are_exact() {
         .unwrap();
     assert_eq!(ids(hits), [2]);
 }
+
+#[tokio::test]
+async fn integral_float_filters_on_int_columns_compare_exactly() {
+    let store = DuckDbStore::in_memory().unwrap();
+    let definition = VectorStoreCollectionDefinition::new(vec![
+        VectorStoreField::key("id").with_type("int"),
+        VectorStoreField::data("big").with_type("int"),
+        VectorStoreField::vector("embedding", 2),
+    ])
+    .unwrap();
+    let docs = store.get_collection("af_float_ops", definition).unwrap();
+    docs.ensure_collection_exists().await.unwrap();
+    docs.upsert(vec![
+        json!({"id": 1, "big": 9_007_199_254_740_992_i64, "embedding": [1.0, 0.0]}),
+        json!({"id": 2, "big": 9_007_199_254_740_993_i64, "embedding": [0.0, 1.0]}),
+        json!({"id": 3, "big": 2020, "embedding": [1.0, 1.0]}),
+    ])
+    .await
+    .unwrap();
+    let ids = |hits: Vec<agent_framework_core::vectors::VectorSearchResult>| {
+        let mut ids: Vec<i64> = hits
+            .iter()
+            .map(|h| h.record["id"].as_i64().unwrap())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let docs = &docs;
+    let search = |filter: Filter| async move {
+        docs.search(
+            vec![1.0, 0.0],
+            &VectorSearchOptions::new(5).with_filter(filter),
+        )
+        .await
+    };
+    // 2^53 as a float names exactly 2^53, not its neighbour 2^53 + 1.
+    let eq = Filter::eq("big", 9_007_199_254_740_992.0_f64).unwrap();
+    assert_eq!(ids(search(eq).await.unwrap()), [1]);
+    let member = Filter::any_of("big", vec![json!(9_007_199_254_740_992.0_f64)]).unwrap();
+    assert_eq!(ids(search(member).await.unwrap()), [1]);
+    let gte = Filter::gte("big", 9_007_199_254_740_993.0_f64).unwrap();
+    // 2^53 + 1 is not representable: the float rounds to 2^53.
+    assert_eq!(ids(search(gte).await.unwrap()), [1, 2]);
+    let small = Filter::eq("big", 2020.0_f64).unwrap();
+    assert_eq!(ids(search(small).await.unwrap()), [3]);
+    // An integral float beyond BIGINT equals nothing, and is refused for
+    // ordered comparisons.
+    let huge = Filter::eq("big", 1e19_f64).unwrap();
+    assert!(ids(search(huge).await.unwrap()).is_empty());
+    assert!(search(Filter::gt("big", 1e19_f64).unwrap()).await.is_err());
+}
