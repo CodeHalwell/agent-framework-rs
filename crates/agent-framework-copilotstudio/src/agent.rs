@@ -238,6 +238,9 @@ impl SupportsAgentRun for CopilotStudioAgent {
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 }
 
 #[cfg(test)]

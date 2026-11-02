@@ -296,6 +296,11 @@ pub trait SupportsAgentRun: Send + Sync {
         None
     }
 
+    /// The optional human-readable description.
+    fn description(&self) -> Option<&str> {
+        None
+    }
+
     /// The display name: `name` if set, else `id`.
     fn display_name(&self) -> String {
         self.name()
@@ -1063,6 +1068,9 @@ impl SupportsAgentRun for Agent {
     }
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     fn create_session(&self) -> AgentSession {

@@ -298,6 +298,9 @@ impl SupportsAgentRun for A2AAgent {
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 }
 
 /// Map one A2A `message/stream` event to zero or more agent updates, threading

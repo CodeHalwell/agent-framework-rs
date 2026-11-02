@@ -244,7 +244,7 @@ async fn bedrock_streams_the_aws_event_stream() {
 #[tokio::test]
 async fn a_bedrock_stream_exception_ends_the_stream_with_its_error() {
     let mut body = bedrock_frames(&events(&["partial"], "end_turn")).1;
-    body.truncate(0);
+    body.clear();
     body.extend(encode_message(
         &[
             (":message-type", "exception"),

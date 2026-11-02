@@ -626,15 +626,14 @@ pub fn parse_stream_event(
                     protected_data: Some(sig.to_string()),
                     ..Default::default()
                 }
-            } else if let Some(redacted) = reasoning.get("redactedContent") {
+            } else {
+                let redacted = reasoning.get("redactedContent")?;
                 TextReasoningContent {
                     raw_representation: Some(
                         json!({ "reasoningContent": { "redactedContent": redacted } }),
                     ),
                     ..Default::default()
                 }
-            } else {
-                return None;
             };
             Some(update(vec![Content::TextReasoning(fragment)]))
         }

@@ -426,6 +426,9 @@ impl SupportsAgentRun for WorkflowAgent {
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
 
     fn create_session(&self) -> AgentSession {
         // Eagerly attach a fresh `InMemoryHistoryProvider`, rather than

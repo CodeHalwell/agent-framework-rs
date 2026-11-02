@@ -15,12 +15,10 @@
 //! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
 //! | `_file_access.py` (the tool half): `FileAccessProvider` | [`FileAccessProvider`] |
 //! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
+//! | `_background_agents.py`: `BackgroundAgentsProvider`, `BackgroundTaskInfo`, `BackgroundTaskStatus`; `_loop.py`: `background_tasks_running`, `background_tasks_running_message` | [`BackgroundAgentsProvider`], [`BackgroundTaskInfo`], [`BackgroundTaskStatus`], [`background_tasks_running`], [`background_tasks_running_message`] |
 //!
 //! # Not ported here
 //!
-//! - **Background agents** (`_background_agents.py`) have no Rust
-//!   counterpart, so the loop's `background_tasks_running` /
-//!   `background_tasks_running_message` helpers are not ported either.
 //! - **Memory**: `_memory.py` and the full `create_harness_agent`
 //!   assembly are out of scope for now.
 //!
@@ -53,6 +51,7 @@
 //! See each submodule's documentation for the divergences specific to it.
 
 pub mod agent_loop;
+pub mod background_agents;
 pub mod file_access;
 pub mod file_memory;
 pub mod file_store;
@@ -66,6 +65,12 @@ pub use agent_loop::{
     LoopDecision, TodosRemaining, TodosRemainingMessage, VerdictParser, CRITERIA_PLACEHOLDER,
     DEFAULT_JUDGE_INSTRUCTIONS, DEFAULT_JUDGE_MAX_ITERATIONS, DEFAULT_MAX_ITERATIONS,
     DEFAULT_NEXT_MESSAGE, JUDGE_VERDICT_DONE, JUDGE_VERDICT_MORE,
+};
+pub use background_agents::{
+    background_tasks_running, background_tasks_running_message, BackgroundAgentsProvider,
+    BackgroundAgentsProviderBuilder, BackgroundTaskInfo, BackgroundTaskStatus,
+    BackgroundTasksRunning, BackgroundTasksRunningMessage, DEFAULT_BACKGROUND_AGENTS_INSTRUCTIONS,
+    DEFAULT_BACKGROUND_AGENTS_SOURCE_ID, DEFAULT_BACKGROUND_AGENTS_WAIT_TIMEOUT,
 };
 pub use file_access::{
     FileAccessProvider, DEFAULT_FILE_ACCESS_INSTRUCTIONS, DEFAULT_FILE_ACCESS_SOURCE_ID,
