@@ -25,6 +25,8 @@ tokio-stream = { workspace = true }
 pin-project-lite = { workspace = true }
 # Optional: search patterns for the harness file store (`experimental-harness`).
 regex = { workspace = true, optional = true }
+# Optional: SKILL.md frontmatter for file-based skills (`file-skills`).
+serde_yaml = { version = "0.9", optional = true }
 # Optional: GenAI metrics behind the `otel-metrics` feature. API crate only —
 # no SDK/exporter is pulled in; see `observability` module docs.
 opentelemetry = { workspace = true, optional = true }
@@ -65,6 +67,10 @@ experimental-harness = ["dep:regex"]
 # EVALS: the `evaluation` module (evaluate_agent / evaluate_workflow, local
 # checks, evaluator results).
 experimental-evals = []
+# File-based skills: `skills_files` (SKILL.md discovery) and
+# `SkillsProvider::from_paths`. Stable upstream; optional here only to keep
+# the YAML parser out of a default build.
+file-skills = ["dep:serde_yaml"]
 # SESSION_STORE: the `session_store` module (`AgentSessionStore`, the
 # in-memory and file stores) and `ContextProvider::snapshot_history`.
 experimental-session-store = []

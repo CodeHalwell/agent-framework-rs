@@ -54,6 +54,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   the model input, injects the rendered document (or uploads it through a
   `FileSearchBackend`), resumes slow analyses on later turns, and offers
   `list_documents`.
+- File-based skills (`file-skills` feature, in `full`): `FileSkillsSource`
+  discovers `SKILL.md` packages per the Agent Skills spec (validated
+  frontmatter, resources by extension and depth, links refused);
+  `SkillsProvider::from_paths`; the harness builder's `skills_paths`.
 - Message injection: `session::enqueue_messages` / `pending_messages`
   queue messages for a run's next model call, including from a tool
   mid-run; a queue left at the end of a turn earns another call. Built into

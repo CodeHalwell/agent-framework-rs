@@ -98,6 +98,9 @@ pub mod session;
 pub mod session_store;
 pub mod settings;
 pub mod skills;
+#[cfg(feature = "file-skills")]
+#[cfg_attr(docsrs, doc(cfg(feature = "file-skills")))]
+pub mod skills_files;
 pub mod storage_keys;
 pub mod streaming;
 pub mod text_search;

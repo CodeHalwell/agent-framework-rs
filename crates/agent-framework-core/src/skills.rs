@@ -19,11 +19,13 @@
 //! for the lifetime of the provider, so the model does not have to re-load it
 //! each turn.
 //!
-//! This is a deliberate **subset** of upstream: no MCP-backed skills (an
-//! `@experimental` upstream feature) and no `run_skill_script` /
-//! sandboxed script execution (upstream's third framework-generated tool) —
-//! both are out of scope here. Only `load_skill` and `read_skill_resource`
-//! are implemented.
+//! Skills are built in code here, or discovered from `SKILL.md` packages on
+//! disk with the `file-skills` feature (`skills_files`,
+//! `SkillsProvider::from_paths`). This is a **subset** of upstream: no
+//! MCP-backed skills, no class-based skills, no skill-source pipeline
+//! (filtering / caching / aggregating sources), and no `run_skill_script` /
+//! script runners. Only `load_skill` and `read_skill_resource` are
+//! implemented.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

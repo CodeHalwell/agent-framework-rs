@@ -49,8 +49,9 @@
 //!   [`web_search`](HarnessAgentBuilder::web_search) adds the hosted tool on
 //!   request and [`shell`](HarnessAgentBuilder::shell) takes the shell tool
 //!   and its environment provider ready-made.
-//! - **Skills** take a [`SkillsProvider`]; file-based skill discovery
-//!   (`skills_paths`) is not ported.
+//! - **Skills** take a [`SkillsProvider`], or `skills_paths` with the
+//!   `file-skills` feature; one provider holds them, where upstream
+//!   aggregates a code provider and a path provider.
 //! - `otel_provider_name` has no counterpart.
 
 use std::path::PathBuf;
@@ -310,6 +311,16 @@ impl HarnessAgentBuilder {
     pub fn skills_provider(mut self, provider: SkillsProvider) -> Self {
         self.skills_provider = Some(provider);
         self
+    }
+    /// Add the skills discovered from `SKILL.md` packages under `paths`
+    /// (upstream's `skills_paths`; needs the `file-skills` feature).
+    #[cfg(feature = "file-skills")]
+    pub fn skills_paths<P: AsRef<std::path::Path>>(
+        mut self,
+        paths: impl IntoIterator<Item = P>,
+    ) -> Result<Self> {
+        self.skills_provider = Some(SkillsProvider::from_paths(paths)?);
+        Ok(self)
     }
     /// Agents the harness agent may delegate background tasks to. Only
     /// supply agents you trust with what it may send them.

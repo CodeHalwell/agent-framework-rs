@@ -79,8 +79,8 @@ from the roadmap, not from this file.
   alters a value existing consumers read, so not made silently.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
-  skills beyond inline skills (scripts, file-based sources, source
-  pipelines); compaction's message-group model, triggers and summarization;
+  skills beyond inline and file-based skills (scripts and script
+  runners, class-based and MCP skills, source pipelines); compaction's message-group model, triggers and summarization;
   workflow telemetry, run cancellation and graph reflection; message source
   attribution; message injection while streaming (it is ported for
   non-streaming calls); history persisted after every model
