@@ -236,7 +236,13 @@ pub struct ResponsesHostServer {
     prepare_options: Option<OptionsHook>,
     approval_provider: Option<Arc<dyn FunctionApprovalStoreProvider>>,
     local_approvals: Arc<InMemoryFunctionApprovalStore>,
-    sessions: Arc<Mutex<HashMap<String, Value>>>,
+    /// The agent sessions of the `Agent` / `Service` history sources: in a
+    /// session store (with history, so they survive a restart) when the
+    /// `session-store` feature is on, else kept live in process.
+    #[cfg(feature = "session-store")]
+    sessions: Arc<dyn crate::sessions::SessionStoreProvider>,
+    #[cfg(not(feature = "session-store"))]
+    sessions: Arc<Mutex<HashMap<String, agent_framework_core::session::AgentSession>>>,
 }
 
 impl std::fmt::Debug for ResponsesHostServer {
@@ -262,6 +268,9 @@ impl ResponsesHostServer {
             prepare_options: None,
             approval_provider: None,
             local_approvals: Arc::default(),
+            #[cfg(feature = "session-store")]
+            sessions: Arc::new(crate::sessions::InMemorySessionStoreProvider::default()),
+            #[cfg(not(feature = "session-store"))]
             sessions: Arc::default(),
         }
     }
@@ -359,6 +368,35 @@ impl ResponsesHostServer {
     ) -> Self {
         self.approval_provider = Some(provider);
         self
+    }
+
+    /// Where the agent sessions of the `Agent` and `Service` history sources
+    /// are kept (feature `session-store`): e.g. a
+    /// [`FoundrySessionStoreProvider`](crate::sessions::FoundrySessionStoreProvider),
+    /// so `previous_response_id` and `conversation` continuations, history
+    /// included, survive a restart. The default is a process-local store.
+    #[cfg(feature = "session-store")]
+    pub fn with_session_store_provider(
+        mut self,
+        provider: Arc<dyn crate::sessions::SessionStoreProvider>,
+    ) -> Self {
+        self.sessions = provider;
+        self
+    }
+
+    /// The session handle one turn loads from and saves to.
+    fn host_sessions(&self, context: &FoundryRequestContext) -> Result<HostSessions> {
+        #[cfg(feature = "session-store")]
+        {
+            Ok(HostSessions(
+                self.sessions.session_store(&self.config, context)?,
+            ))
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            let _ = context;
+            Ok(HostSessions(self.sessions.clone()))
+        }
     }
 
     fn approval_store(
@@ -859,6 +897,10 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
         .insert(id.clone(), replay.clone());
     let task_inner = inner.clone();
     let task_id = id.clone();
+    // Registered under the lock the task's own cleanup takes, so a turn that
+    // finishes instantly cannot remove its entry before it is inserted (which
+    // would leave a finished task registered as running).
+    let mut running = inner.running.lock().unwrap();
     let task = tokio::spawn(async move {
         let mut events = Events::new(tx);
         events.replay = Some(replay.clone());
@@ -868,11 +910,8 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
         task_inner.running.lock().unwrap().remove(&task_id);
         end_replay(&task_inner, &task_id, &replay);
     });
-    inner
-        .running
-        .lock()
-        .unwrap()
-        .insert(id, task.abort_handle());
+    running.insert(id, task.abort_handle());
+    drop(running);
     if stream {
         // The run continues if the client disconnects.
         sse(&inner.server.config, rx, None)
@@ -1226,10 +1265,14 @@ async fn execute(
         options = hook(request, options)?;
     }
     let options = AgentRunOptions::new().with_chat_options(options);
-    let mut session = if host_history {
-        agent.create_session()
+    let sessions = if host_history {
+        None
     } else {
-        load_session(server, request, agent.as_ref())?
+        Some(server.host_sessions(&request.context)?)
+    };
+    let mut session = match &sessions {
+        None => agent.create_session(),
+        Some(sessions) => load_session(sessions, request, agent.as_ref()).await?,
     };
     let response = match events {
         None => {
@@ -1262,11 +1305,25 @@ async fn execute(
         }
     };
     if !host_history && prepared.store {
-        let state = session.to_dict();
-        let mut sessions = server.sessions.lock().unwrap();
-        sessions.insert(format!("response:{}", request.response_id), state.clone());
-        if let Some(conversation) = &request.conversation_id {
-            sessions.insert(format!("conversation:{conversation}"), state);
+        // Part of persistence: a session that cannot be saved fails the
+        // turn rather than leaving its continuation unresumable.
+        if let Some(sessions) = &sessions {
+            sessions
+                .save(
+                    agent.as_ref(),
+                    &response_session_key(&request.response_id),
+                    &session,
+                )
+                .await?;
+            if let Some(conversation) = &request.conversation_id {
+                sessions
+                    .save(
+                        agent.as_ref(),
+                        &conversation_session_key(conversation),
+                        &session,
+                    )
+                    .await?;
+            }
         }
     }
     Ok((response, None))
@@ -1274,27 +1331,81 @@ async fn execute(
 
 /// The agent session to continue: the conversation's, else the previous
 /// response's, else a new one.
-fn load_session(
-    server: &ResponsesHostServer,
+fn response_session_key(response_id: &str) -> String {
+    format!("response-{response_id}")
+}
+
+fn conversation_session_key(conversation_id: &str) -> String {
+    format!("conversation-{conversation_id}")
+}
+
+/// One turn's view of the host-kept agent sessions.
+#[cfg(feature = "session-store")]
+struct HostSessions(Arc<dyn agent_framework_core::session_store::AgentSessionStore>);
+#[cfg(not(feature = "session-store"))]
+struct HostSessions(Arc<Mutex<HashMap<String, agent_framework_core::session::AgentSession>>>);
+
+impl HostSessions {
+    async fn load(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        key: &str,
+    ) -> Result<Option<agent_framework_core::session::AgentSession>> {
+        #[cfg(feature = "session-store")]
+        {
+            let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
+            self.0.get_session(agent, &key).await
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            let _ = agent;
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+    }
+
+    async fn save(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        key: &str,
+        session: &agent_framework_core::session::AgentSession,
+    ) -> Result<()> {
+        #[cfg(feature = "session-store")]
+        {
+            let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
+            self.0.save_session(agent, &key, session).await
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            let _ = agent;
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), session.clone());
+            Ok(())
+        }
+    }
+}
+
+async fn load_session(
+    sessions: &HostSessions,
     request: &HostedResponseRequest,
     agent: &dyn SupportsAgentRun,
 ) -> std::result::Result<agent_framework_core::session::AgentSession, TurnError> {
     let key = match (&request.conversation_id, &request.previous_response_id) {
-        (Some(conversation), _) => Some(format!("conversation:{conversation}")),
-        (None, Some(previous)) => Some(format!("response:{previous}")),
+        (Some(conversation), _) => Some(conversation_session_key(conversation)),
+        (None, Some(previous)) => Some(response_session_key(previous)),
         _ => None,
     };
-    let stored = key
-        .as_ref()
-        .and_then(|k| server.sessions.lock().unwrap().get(k).cloned());
+    let stored = match &key {
+        Some(key) => sessions.load(agent, key).await?,
+        None => None,
+    };
     match (
         stored,
         &request.previous_response_id,
         &request.conversation_id,
     ) {
-        (Some(state), _, _) => Ok(agent_framework_core::session::AgentSession::from_dict(
-            &state,
-        )?),
+        (Some(session), _, _) => Ok(session),
         (None, Some(previous), None) => Err(TurnError::Public(format!(
             "Cannot find an existing agent session for previous_response_id={previous}."
         ))),
@@ -1619,6 +1730,24 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
     let mut stored = stored;
     if let Some(handle) = handle {
         handle.abort();
+        // The turn may have finished (and persisted its terminal status)
+        // between the read above and the abort: only an unfinished response
+        // becomes cancelled.
+        stored = match inner.server.store.get(&id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return not_found(&id),
+            Err(e) => return server_error(e.to_string()),
+        };
+        let unfinished = matches!(
+            stored.response["status"].as_str(),
+            Some("queued" | "in_progress")
+        );
+        if !unfinished {
+            if stored.response["status"] == json!("cancelled") {
+                return Json(stored.response).into_response();
+            }
+            return bad_request("Cannot cancel a response that has already finished.");
+        }
         stored.response["status"] = json!("cancelled");
         // The aborted task never closes its replay: record the cancellation,
         // end the replay's streams, and schedule its eviction.

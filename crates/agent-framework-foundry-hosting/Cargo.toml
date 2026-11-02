@@ -37,6 +37,8 @@ tracing-opentelemetry = { workspace = true, optional = true }
 # `InvocationsHostServer` and the agent-session stores, over core's
 # `AgentSessionStore` (experimental upstream: SESSION_STORE).
 session-store = ["agent-framework-core/experimental-session-store"]
+# `FoundryToolbox::skills_provider`: Agent Skills a toolbox serves over MCP.
+skills = ["agent-framework-mcp/skills"]
 # OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
 # and `configure_observability` exports to Application Insights or OTLP from
 # the host configuration (upstream agentserver tracing).

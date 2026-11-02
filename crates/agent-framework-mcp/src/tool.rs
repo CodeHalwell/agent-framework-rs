@@ -740,6 +740,7 @@ pub struct McpStreamableHttpTool {
     description: Option<String>,
     url: String,
     headers: Vec<(String, String)>,
+    header_provider: Option<crate::transport::HeaderProvider>,
     timeout: Option<Duration>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
@@ -759,6 +760,7 @@ impl McpStreamableHttpTool {
             description: None,
             url: url.into(),
             headers: Vec::new(),
+            header_provider: None,
             timeout: None,
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
@@ -786,6 +788,14 @@ impl McpStreamableHttpTool {
     /// Set a per-request timeout.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Headers computed for every request (e.g. a bearer token fetched from
+    /// a credential each time, so a long-lived tool never sends an expired
+    /// one). They replace same-named [`Self::headers`].
+    pub fn header_provider(mut self, provider: crate::transport::HeaderProvider) -> Self {
+        self.header_provider = Some(provider);
         self
     }
 
@@ -866,8 +876,11 @@ impl McpStreamableHttpTool {
         self.session
             .get_or_try_init(|| async {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
-                let transport =
+                let mut transport =
                     McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout)?;
+                if let Some(provider) = &self.header_provider {
+                    transport = transport.with_header_provider(provider.clone());
+                }
                 let mut client =
                     McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
@@ -967,7 +980,15 @@ impl McpStreamableHttpTool {
 
 /// Crate-internal access for wrappers (the `fides` proxy).
 impl McpStreamableHttpTool {
-    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    /// The Agent Skills this server serves (SEP-2640; feature `skills`): see
+    /// [`crate::skills::load_skills`]. Connects first.
+    #[cfg(feature = "skills")]
+    pub async fn skills(&self) -> Result<Vec<agent_framework_core::skills::Skill>> {
+        let client = self.connected_client().await?;
+        crate::skills::load_skills(&client).await
+    }
+
+    #[cfg_attr(not(any(feature = "fides", feature = "skills")), allow(dead_code))]
     pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
         self.connect().await?;
         Ok(self

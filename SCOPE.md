@@ -52,16 +52,18 @@ from the roadmap, not from this file.
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
-  code-interpreter, file/web-search and computer-use output items and
-  container/file citations (no Rust content or annotation carries them);
-  approval (`mcp_approval_response`) and computer-call replies to paused
-  workflows (agent approvals round-trip); durable (Foundry-stored) sessions
-  for the `Agent`/`Service` history sources (kept in process); provider-native
-  background polling; per-request toolbox tokens (needs a per-request header
-  hook in `agent-framework-mcp`) and the toolbox skills provider (needs MCP
-  skills in core); and the agentserver's crash-recoverable task runtime,
-  WebSocket/voice invocations, and OpenTelemetry distro beyond trace-context
-  propagation and exporter selection. Tested in-process only.
+  computer-use output items and replies (core has no computer-use content:
+  upstream's experimental `COMPUTER_USE` feature is not ported); container
+  file citations announced in an MCP tool result's `_meta`; approval
+  (`mcp_approval_response`) and computer-call replies to paused workflows
+  (agent approvals round-trip); toolbox archive skills and skill-cache
+  refresh; provider-native background polling; and the agentserver's
+  crash-recoverable task runtime, WebSocket/voice invocations, and
+  OpenTelemetry distro beyond trace-context propagation and exporter
+  selection. Tested in-process only.
+- **Computer use** (`COMPUTER_USE`, experimental upstream): computer-tool
+  content types and their tool-loop, compaction, session, workflow and
+  OpenAI provider support.
 - **Durable Task hosting** (`agent-framework-durabletask`, now published
   from its own repository). Blocked: it sits on the `durabletask` SDK, a
   deterministic-replay orchestration engine with durable entities and a

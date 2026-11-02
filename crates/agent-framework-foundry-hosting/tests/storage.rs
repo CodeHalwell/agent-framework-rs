@@ -376,3 +376,48 @@ async fn a_stale_session_write_is_refused() {
     b.delete_session(agent.as_ref(), &key).await.unwrap();
     assert!(a.get_session(agent.as_ref(), &key).await.unwrap().is_none());
 }
+
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn agent_history_sessions_survive_a_restart() {
+    use agent_framework_foundry_hosting::{
+        HistorySource, InMemoryResponseStore, ResponsesHostServer,
+    };
+    let (storage, _) = double().await;
+    let responses: Arc<InMemoryResponseStore> = Arc::default();
+    let echo = common::Echo::default();
+    let build = || {
+        ResponsesHostServer::agent(common::agent(echo.clone()))
+            .with_history_source(HistorySource::Agent)
+            .with_response_store(responses.clone())
+            .with_session_store_provider(Arc::new(
+                agent_framework_foundry_hosting::sessions::FoundrySessionStoreProvider::new(
+                    storage.clone(),
+                    None,
+                ),
+            ))
+            .into_router()
+    };
+    let host = build();
+    let (status, first) =
+        common::json(&host, common::post("/responses", json!({"input": "one"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    // A fresh host (a restart) continues from the stored agent session.
+    drop(host);
+    let restarted = build();
+    let (status, second) = common::json(
+        &restarted,
+        common::post(
+            "/responses",
+            json!({"input": "two", "previous_response_id": first["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = echo.seen.lock().unwrap();
+    assert_eq!(
+        seen.last().unwrap().len(),
+        3,
+        "prior user + assistant + new input"
+    );
+}

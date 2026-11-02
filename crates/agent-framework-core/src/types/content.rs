@@ -128,6 +128,11 @@ pub struct Annotation {
     /// the text (upstream #9436).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotated_regions_coordinate_space: Option<RegionCoordinateSpace>,
+    /// Provider-specific extras (upstream `additional_properties`), e.g. a
+    /// code-interpreter citation's `container_id` or a file citation's
+    /// `index`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty", default)]
+    pub additional_properties: serde_json::Map<String, Value>,
 }
 
 impl Annotation {

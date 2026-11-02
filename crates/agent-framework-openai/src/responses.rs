@@ -1278,14 +1278,18 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
 }
 
 /// Parse the `annotations` on an `output_text` part into [`Annotation`]s
-/// (`_create_response_content:667-724`). The core annotation type has no free
-/// `additional_properties`, so upstream's `index`/`container_id` extras are
-/// dropped.
+/// (`_create_response_content:667-724`), keeping upstream's `index` and
+/// `container_id` extras in `additional_properties`.
 fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
     let arr = part.get("annotations").and_then(Value::as_array)?;
     let mut out = Vec::new();
     for ann in arr {
         let str_field = |k: &str| ann.get(k).and_then(Value::as_str).map(String::from);
+        let extras = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|k| ann.get(*k).map(|v| (k.to_string(), v.clone())))
+                .collect::<serde_json::Map<String, Value>>()
+        };
         let regions = || {
             Some(vec![TextSpanRegion {
                 start_index: ann.get("start_index").and_then(Value::as_i64),
@@ -1295,11 +1299,13 @@ fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
         match ann.get("type").and_then(Value::as_str) {
             Some("file_path") => out.push(Annotation {
                 file_id: str_field("file_id"),
+                additional_properties: extras(&["index"]),
                 ..Default::default()
             }),
             Some("file_citation") => out.push(Annotation {
                 url: str_field("filename"),
                 file_id: str_field("file_id"),
+                additional_properties: extras(&["index"]),
                 ..Default::default()
             }),
             Some("url_citation") => out.push(Annotation {
@@ -1312,6 +1318,7 @@ fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
                 file_id: str_field("file_id"),
                 url: str_field("filename"),
                 annotated_regions: regions(),
+                additional_properties: extras(&["container_id"]),
                 ..Default::default()
             }),
             _ => {}

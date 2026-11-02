@@ -546,6 +546,31 @@ impl PromptMessage {
     }
 }
 
+/// One item of a `resources/read` result: text or base64 `blob` contents.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceContents {
+    /// The resource's URI.
+    pub uri: String,
+    /// Its MIME type, if declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Text contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Base64 binary contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// The result of a `resources/read` request.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ReadResourceResult {
+    /// The resource's contents (a resource may have several parts).
+    #[serde(default)]
+    pub contents: Vec<ResourceContents>,
+}
+
 /// The result of a `prompts/get` request.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -36,6 +36,8 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
 # FIDES for MCP tools (`security` module): annotation-derived labels and
 # server `_meta.ifc` result labels. Experimental upstream (FIDES).
 fides = ["agent-framework-core/experimental-fides"]
+# Agent Skills served over MCP (SEP-2640, `skills` module).
+skills = ["agent-framework-core/file-skills"]
 
 [dev-dependencies]
 tokio = { workspace = true }

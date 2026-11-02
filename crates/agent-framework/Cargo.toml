@@ -38,6 +38,9 @@ foundry = ["dep:agent-framework-foundry"]
 foundry-hosting = ["dep:agent-framework-foundry-hosting"]
 # OpenTelemetry parenting and exporter setup for Foundry hosted agents.
 foundry-hosting-otel = ["foundry-hosting", "agent-framework-foundry-hosting/otel"]
+# Agent Skills served by a Foundry toolbox / any MCP server (SEP-2640).
+foundry-hosting-skills = ["foundry-hosting", "agent-framework-foundry-hosting/skills"]
+mcp-skills = ["mcp", "agent-framework-mcp/skills"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 # The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it

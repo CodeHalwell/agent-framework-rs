@@ -534,6 +534,14 @@ impl McpClient {
             .map_err(|e| Error::service(format!("invalid MCP prompts/get response: {e}")))
     }
 
+    /// Read the resource at `uri` (`resources/read`).
+    pub async fn read_resource(&self, uri: &str) -> Result<crate::protocol::ReadResourceResult> {
+        self.require_initialized().await?;
+        let raw = self.rpc("resources/read", json!({ "uri": uri })).await?;
+        serde_json::from_value(raw)
+            .map_err(|e| Error::service(format!("invalid MCP resources/read response: {e}")))
+    }
+
     /// Whether the server declared the `prompts` capability during
     /// [`Self::initialize`]. `false` before `initialize` has completed.
     pub async fn supports_prompts(&self) -> bool {

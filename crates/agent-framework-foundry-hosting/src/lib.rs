@@ -39,18 +39,21 @@
 //!
 //! # Divergences
 //!
-//! - **Responses output** covers text (with URL citations), refusals,
-//!   reasoning, function calls and results, MCP calls, image generation,
-//!   shell calls, approval and OAuth consent requests, and usage. Not
-//!   projected: code-interpreter, file/web-search and computer-use items
-//!   (no Rust content carries their wire shapes) and container/file
-//!   citations (the Rust `Annotation` has no container or file index).
+//! - **Responses output** covers text (with URL, file, file-path and
+//!   container-file citations), refusals, reasoning, function calls and
+//!   results, MCP calls, image generation, shell calls, approval and OAuth
+//!   consent requests, and usage, which is what upstream projects. Not
+//!   projected: computer-use items (core has no computer-use content; that
+//!   is upstream's experimental `COMPUTER_USE` feature), and container-file
+//!   citations an MCP tool result announces in its `_meta` for later text.
 //!   Function-approval requests round-trip: each `mcp_approval_request` is
 //!   saved (to the configured `FunctionApprovalStoreProvider`, else in
 //!   process) and a later `mcp_approval_response` resumes the call.
-//! - **History.** `HistorySource::Agent` / `Service` keep the agent session
-//!   in process (not in the Foundry session store), so it does not survive
-//!   a restart. Provider-native background polling (`background_source =
+//! - **History.** With the `session-store` feature, the agent sessions of
+//!   `HistorySource::Agent` / `Service` (history included) go through a
+//!   session store (`with_session_store_provider`, e.g. Foundry storage),
+//!   so continuations survive a restart; without it they are kept live in
+//!   process. Provider-native background polling (`background_source =
 //!   "provider"`) is not ported.
 //! - **Workflow pauses** answer only `function_call_output` replies;
 //!   approval (`mcp_approval_response`) and computer-call replies to a
@@ -59,9 +62,10 @@
 //!   type).
 //! - **Local storage** defaults to in memory; [`FileResponseStore`] gives
 //!   the agentserver's file-backed store (not partitioned by user).
-//! - **Toolbox** tokens are fetched when the tool is built (the MCP crate
-//!   has no per-request header hook), and the toolbox skills provider needs
-//!   MCP skills, which core does not have.
+//! - **Toolbox** tokens are fetched from the credential for every MCP
+//!   request. Its skills provider (feature `skills`) discovers `skill-md`
+//!   skills once, at build; archive skills and cache refresh are not
+//!   ported (see `agent_framework_mcp::skills`).
 //! - Not ported from the agentserver: the resilient (crash-recoverable)
 //!   task runtime, WebSocket/voice invocations, and its OpenTelemetry
 //!   distro beyond trace-context propagation and exporter selection (the

@@ -35,6 +35,24 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting and MCP: `FoundryToolbox` fetches its bearer token for
+  every request through a new per-request header hook
+  (`McpStreamableHttpTool::header_provider`, `HeaderProvider`); with the
+  `session-store` feature the `Agent`/`Service` history sources keep their
+  agent sessions (history included) in a session store
+  (`ResponsesHostServer::with_session_store_provider`) so continuations
+  survive a restart, and without it the `Agent` source no longer drops local
+  history between turns; Agent Skills served over MCP (SEP-2640:
+  `agent-framework-mcp` feature `skills`, `McpClient::read_resource`,
+  `skills::load_skills`, and `FoundryToolbox::skills_provider` behind
+  foundry-hosting's `skills` feature; umbrella `mcp-skills` /
+  `foundry-hosting-skills`); container-file, file and file-path citations in
+  Responses output (core `Annotation` gains `additional_properties`,
+  **breaking** for struct literals without `..Default::default()`; the
+  OpenAI Responses client now keeps `index` and `container_id`). Review
+  fixes: cancelling a background response that already finished no longer
+  overwrites it with `cancelled`; Foundry approval round trip; unfinished
+  predecessors are refused.
 - `agent-framework-foundry-hosting`: rich Responses output (reasoning,
   refusals, function calls and outputs streamed in order, MCP calls, image
   generation, shell calls, approval and OAuth consent requests, URL

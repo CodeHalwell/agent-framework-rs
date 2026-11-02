@@ -833,29 +833,73 @@ fn image_generation_result(outputs: &Value) -> Option<String> {
     None
 }
 
-/// Framework citations as Responses output-text annotations. Source-
-/// coordinate regions are not output spans; only URL citations with text
-/// spans map (the Rust `Annotation` carries no container or file index).
+/// Framework citations as Responses output-text annotations (upstream
+/// `_annotations_to_output_text`): container-file citations (a
+/// `container_id` extra), URL citations, file citations and file paths (an
+/// `index` extra). Source-coordinate regions describe the cited source, not
+/// the generated text, so they are not emitted as spans.
 fn annotations_to_output_text(annotations: Option<&[Annotation]>) -> Vec<Value> {
     let mut out = Vec::new();
     for annotation in annotations.unwrap_or_default() {
-        let (Some(url), None) = (&annotation.url, &annotation.file_id) else {
-            continue;
+        let regions: Vec<(i64, i64)> = if annotation.annotated_regions_coordinate_space
+            == Some(agent_framework_core::types::RegionCoordinateSpace::Source)
+        {
+            Vec::new()
+        } else {
+            annotation
+                .annotated_regions
+                .iter()
+                .flatten()
+                .filter_map(|r| Some((r.start_index?, r.end_index?)))
+                .collect()
         };
-        if url.is_empty() || annotation.annotated_regions_coordinate_space.is_some() {
-            continue;
-        }
-        for region in annotation.annotated_regions.iter().flatten() {
-            let (Some(start), Some(end)) = (region.start_index, region.end_index) else {
-                continue;
-            };
-            out.push(json!({
-                "type": "url_citation",
-                "url": url,
-                "title": annotation.title.clone().unwrap_or_default(),
-                "start_index": start,
-                "end_index": end,
-            }));
+        let extras = &annotation.additional_properties;
+        let container_id = extras
+            .get("container_id")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty());
+        let index = extras
+            .get("index")
+            .and_then(Value::as_i64)
+            .filter(|i| *i >= 0);
+        let file_id = annotation.file_id.as_deref().filter(|f| !f.is_empty());
+        let url = annotation.url.as_deref().filter(|u| !u.is_empty());
+        match (container_id, file_id, url, index) {
+            (Some(container_id), Some(file_id), _, _) => {
+                for (start, end) in &regions {
+                    out.push(json!({
+                        "type": "container_file_citation",
+                        "container_id": container_id,
+                        "file_id": file_id,
+                        "filename": url.unwrap_or_default(),
+                        "start_index": start,
+                        "end_index": end,
+                    }));
+                }
+            }
+            (None, None, Some(url), _) => {
+                for (start, end) in &regions {
+                    out.push(json!({
+                        "type": "url_citation",
+                        "url": url,
+                        "title": annotation.title.clone().unwrap_or_default(),
+                        "start_index": start,
+                        "end_index": end,
+                    }));
+                }
+            }
+            (None, Some(file_id), Some(filename), Some(index)) => out.push(json!({
+                "type": "file_citation",
+                "file_id": file_id,
+                "filename": filename,
+                "index": index,
+            })),
+            (None, Some(file_id), None, Some(index)) => out.push(json!({
+                "type": "file_path",
+                "file_id": file_id,
+                "index": index,
+            })),
+            _ => {}
         }
     }
     out
@@ -965,6 +1009,56 @@ mod tests {
         assert_eq!(
             items[0]["content"][0]["annotations"][0],
             json!({"type": "url_citation", "url": "https://example.com", "title": "Ex", "start_index": 4, "end_index": 10})
+        );
+    }
+
+    #[test]
+    fn container_and_file_citations_become_their_annotations() {
+        let region = || {
+            Some(vec![TextSpanRegion {
+                start_index: Some(0),
+                end_index: Some(5),
+            }])
+        };
+        let extras = |pairs: &[(&str, Value)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<serde_json::Map<String, Value>>()
+        };
+        let mut text = TextContent::new("plot.png");
+        text.annotations = Some(vec![
+            Annotation {
+                file_id: Some("cfile_1".into()),
+                url: Some("plot.png".into()),
+                annotated_regions: region(),
+                additional_properties: extras(&[("container_id", json!("cntr_1"))]),
+                ..Default::default()
+            },
+            Annotation {
+                file_id: Some("file_2".into()),
+                url: Some("doc.pdf".into()),
+                additional_properties: extras(&[("index", json!(3))]),
+                ..Default::default()
+            },
+            Annotation {
+                file_id: Some("file_3".into()),
+                additional_properties: extras(&[("index", json!(1))]),
+                ..Default::default()
+            },
+        ]);
+        let mut t = OutputTracker::new("caresp_x", None);
+        t.handle(&Content::Text(text), None, false).unwrap();
+        t.close();
+        let (items, _, _) = t.finish();
+        assert_eq!(
+            items[0]["content"][0]["annotations"],
+            json!([
+                {"type": "container_file_citation", "container_id": "cntr_1", "file_id": "cfile_1",
+                 "filename": "plot.png", "start_index": 0, "end_index": 5},
+                {"type": "file_citation", "file_id": "file_2", "filename": "doc.pdf", "index": 3},
+                {"type": "file_path", "file_id": "file_3", "index": 1},
+            ])
         );
     }
 

@@ -3,7 +3,9 @@
 //!
 //! The endpoint is `url`, else `TOOLBOX_ENDPOINT`, else
 //! `{FOUNDRY_PROJECT_ENDPOINT}/toolboxes/{TOOLBOX_NAME}/mcp?api-version=v1`.
-//! Every request carries a bearer token for the Foundry data plane, the
+//! Every request carries a bearer token for the Foundry data plane (fetched
+//! from the credential for each request, so a long-lived tool never sends an
+//! expired token; credentials cache and refresh their own tokens), the
 //! `Foundry-Features` header (`Toolboxes=V1Preview` merged with
 //! `FOUNDRY_AGENT_TOOLSET_FEATURES`) and, inside a hosted request, the
 //! platform call id.
@@ -146,9 +148,8 @@ impl FoundryToolbox {
         self
     }
 
-    /// The MCP tool, with the token fetched now. Tokens expire, so build a
-    /// toolbox per request (or per agent instance from an agent factory)
-    /// rather than once per process.
+    /// The MCP tool. The bearer token is fetched from the credential for
+    /// every MCP request, so the tool may be built once and reused.
     pub async fn build(&self) -> Result<McpStreamableHttpTool> {
         self.build_with(|name| std::env::var(name).ok()).await
     }
@@ -167,23 +168,58 @@ impl FoundryToolbox {
             .clone()
             .or_else(|| lookup("TOOLBOX_NAME").filter(|n| !n.is_empty()))
             .unwrap_or_else(|| toolbox_name_from_endpoint(&endpoint));
-        let token = self
-            .credential
-            .get_token_for_scope(&self.token_scope)
-            .await?;
-        let mut headers = vec![
-            ("Authorization".to_string(), format!("Bearer {token}")),
-            (
-                "Foundry-Features".to_string(),
-                features_header(lookup(TOOLSET_FEATURES_ENV).as_deref()),
-            ),
-        ];
+        let credential = self.credential.clone();
+        let scope = self.token_scope.clone();
+        let token_provider: agent_framework_mcp::HeaderProvider = Arc::new(move || {
+            let credential = credential.clone();
+            let scope = scope.clone();
+            Box::pin(async move {
+                let token = credential.get_token_for_scope(&scope).await?;
+                Ok(vec![(
+                    "Authorization".to_string(),
+                    format!("Bearer {token}"),
+                )])
+            })
+        });
+        let mut headers = vec![(
+            "Foundry-Features".to_string(),
+            features_header(lookup(TOOLSET_FEATURES_ENV).as_deref()),
+        )];
         if let Some(call_id) = self.context.as_ref().and_then(|c| c.call_id.clone()) {
             headers.push((headers::FOUNDRY_CALL_ID.to_string(), call_id));
         }
         Ok(McpStreamableHttpTool::new(name, endpoint)
             .headers(headers)
+            .header_provider(token_provider)
             .timeout(self.timeout))
+    }
+}
+
+impl FoundryToolbox {
+    /// A [`SkillsProvider`](agent_framework_core::skills::SkillsProvider)
+    /// over the Agent Skills this toolbox serves over MCP (feature `skills`;
+    /// upstream `as_skills_provider`): discovery reads `skill://index.json`
+    /// on the toolbox's MCP session (see [`agent_framework_mcp::skills`]).
+    /// The skills are discovered now; build a new provider to pick up
+    /// changes.
+    #[cfg(feature = "skills")]
+    pub async fn skills_provider(&self) -> Result<agent_framework_core::skills::SkillsProvider> {
+        let tool = self.build().await?;
+        Ok(agent_framework_core::skills::SkillsProvider::new(
+            tool.skills().await?,
+        ))
+    }
+
+    /// [`Self::skills_provider`] reading configuration from `lookup`.
+    #[cfg(feature = "skills")]
+    pub async fn skills_provider_with(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<agent_framework_core::skills::SkillsProvider> {
+        let tool = self.build_with(lookup).await?;
+        Ok(agent_framework_core::skills::SkillsProvider::new(
+            tool.skills().await?,
+        ))
     }
 }
 

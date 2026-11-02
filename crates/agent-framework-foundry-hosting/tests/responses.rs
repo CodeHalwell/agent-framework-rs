@@ -1278,3 +1278,59 @@ async fn a_configured_approval_store_holds_the_requests() {
     let saved = shared.load_approval_request(&id).await.unwrap();
     assert!(matches!(saved, Content::FunctionApprovalRequest(_)));
 }
+
+#[tokio::test]
+async fn the_agent_history_source_keeps_the_agents_history() {
+    use agent_framework_foundry_hosting::HistorySource;
+    let echo = Echo::default();
+    let router = ResponsesHostServer::agent(agent(echo.clone()))
+        .with_history_source(HistorySource::Agent)
+        .into_router();
+    let (status, first) = json(&router, post("/responses", json!({"input": "one"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "two", "previous_response_id": first["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = echo.seen.lock().unwrap();
+    assert_eq!(
+        seen.last().unwrap().len(),
+        3,
+        "prior user + assistant + new input"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_finished_background_turn_keeps_it_completed() {
+    let router = ResponsesHostServer::agent(agent(Echo::default())).into_router();
+    for _ in 0..50 {
+        let (_, queued) = json(
+            &router,
+            post("/responses", json!({"input": "bg", "background": true})),
+        )
+        .await;
+        let id = queued["id"].as_str().unwrap().to_string();
+        let mut done = false;
+        for _ in 0..200 {
+            let (_, polled) = json(&router, get(&format!("/responses/{id}"))).await;
+            if polled["status"] == "completed" {
+                done = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(done);
+        let (status, _) = json(&router, post(&format!("/responses/{id}/cancel"), json!({}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, after) = json(&router, get(&format!("/responses/{id}"))).await;
+        assert_eq!(
+            after["status"], "completed",
+            "a finished turn stays completed"
+        );
+    }
+}
