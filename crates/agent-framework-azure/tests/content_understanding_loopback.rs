@@ -17,10 +17,13 @@ use serde_json::{json, Value};
 
 /// Serves analyze → Operation-Location → results. The operation reports
 /// `Running` until `ready_after` polls have been made.
-fn serve(ready_after: usize) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+/// Each request's line and API key.
+type Log = Arc<Mutex<Vec<(String, String)>>>;
+
+fn serve(ready_after: usize) -> (String, Log) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let log: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let log: Log = Arc::default();
     let (seen, me) = (log.clone(), base.clone());
     let polls = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
