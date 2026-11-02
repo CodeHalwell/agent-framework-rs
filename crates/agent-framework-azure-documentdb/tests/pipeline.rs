@@ -750,3 +750,31 @@ async fn list_membership_does_not_use_an_element_sensitive_null_guard() {
         );
     }
 }
+
+#[tokio::test]
+async fn list_null_tests_look_at_the_whole_field() {
+    // `[null, "x"]` is a non-null list: element-sensitive `$eq: null` /
+    // `$ne: null` must not be used for list fields.
+    let c = collection().await;
+    let is_null = doc! { "$and": [ { "tags": { "$exists": true } }, { "tags": { "$not": { "$type": "array" } } } ] };
+    let is_not_null = doc! { "tags": { "$type": "array" } };
+    let cases: Vec<(FilterExpression, Document)> = vec![
+        (Filter::is_null("tags").unwrap().into(), is_null.clone()),
+        (
+            Filter::new("tags", FilterOperator::IsNotNull, None)
+                .unwrap()
+                .into(),
+            is_not_null.clone(),
+        ),
+        (Filter::eq("tags", Value::Null).unwrap().into(), is_null),
+        (
+            Filter::new("tags", FilterOperator::Ne, Some(Value::Null))
+                .unwrap()
+                .into(),
+            is_not_null,
+        ),
+    ];
+    for (e, expected) in cases {
+        assert_eq!(c.filter_document(&e).unwrap(), expected);
+    }
+}

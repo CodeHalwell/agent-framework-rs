@@ -396,8 +396,18 @@ impl FilterCompiler<'_> {
             }
         };
         let value = filter.value.clone().unwrap_or(Value::Null);
+        // MongoDB's scalar null comparisons also inspect array elements, so
+        // `[null, "x"]` would count as null. A list field is null exactly when
+        // it is present and not an array, and non-null when it is an array.
+        let is_list = field.type_.as_deref() == Some("list");
+        let list_is_null = || doc! { "$and": [ { name: { "$exists": true } }, { name: { "$not": { "$type": "array" } } } ] };
+        let list_is_not_null = || doc! { name: { "$type": "array" } };
         Ok(match &filter.operator {
             FilterOperator::Exists => doc! { name: { "$exists": true } },
+            FilterOperator::IsNull if is_list => list_is_null(),
+            FilterOperator::IsNotNull if is_list => list_is_not_null(),
+            FilterOperator::Eq if is_list && value.is_null() => list_is_null(),
+            FilterOperator::Ne if is_list && value.is_null() => list_is_not_null(),
             FilterOperator::IsNull => {
                 doc! { "$and": [ { name: { "$exists": true } }, { name: { "$eq": Bson::Null } } ] }
             }
