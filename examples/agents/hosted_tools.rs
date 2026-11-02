@@ -51,6 +51,9 @@ fn describe(tool: &ToolDefinition) -> String {
         ToolKind::HostedMcp { url, allowed_tools } => format!(
             "HostedMcp           -- the *service* connects to {url}, allowed={allowed_tools:?}"
         ),
+        ToolKind::HostedComputer => {
+            "HostedComputer      -- provider-side computer use (caller executes actions)".into()
+        }
     }
 }
 
