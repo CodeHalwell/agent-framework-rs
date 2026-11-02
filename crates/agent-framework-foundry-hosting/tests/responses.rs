@@ -1473,3 +1473,59 @@ async fn factory_agents_with_fresh_ids_resume_their_sessions() {
         "prior user + assistant + new input"
     );
 }
+
+/// Counts turns in session state; never answers the input "hang".
+struct HangingCounter;
+
+#[async_trait::async_trait]
+impl SupportsAgentRun for HangingCounter {
+    async fn run(
+        &self,
+        messages: Vec<agent_framework_core::prelude::Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::AgentResponse> {
+        if messages.last().map(|m| m.text()) == Some("hang".to_string()) {
+            std::future::pending::<()>().await;
+        }
+        Counter.run(messages, session).await
+    }
+
+    fn id(&self) -> &str {
+        "hanging-counter"
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_continuation_keeps_its_inherited_session_state() {
+    let router = ResponsesHostServer::agent(Arc::new(HangingCounter)).into_router();
+    let text = |r: &serde_json::Value| {
+        r["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (_, first) = json(&router, post("/responses", json!({"input": "a"}))).await;
+    assert_eq!(text(&first), "turn 1");
+    let (_, queued) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "hang", "background": true, "previous_response_id": first["id"]}),
+        ),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    let (status, _) = json(&router, post(&format!("/responses/{id}/cancel"), json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    // Continuing from the cancelled record replays the inherited history with
+    // the session state that history carried.
+    let (_, next) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "c", "previous_response_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(text(&next), "turn 2", "{next}");
+}

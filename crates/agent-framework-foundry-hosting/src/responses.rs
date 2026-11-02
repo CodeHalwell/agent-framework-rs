@@ -922,7 +922,10 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
             .cloned()
             .collect(),
         pause: None,
-        session_state: None,
+        // The inherited session state travels with the inherited transcript:
+        // a cancelled record must not replay history without the security
+        // state (FIDES labels, hidden variables) that history carried.
+        session_state: prepared.session_state.clone(),
     };
     if let Err(e) = inner.server.store.put(&id, stored).await {
         return server_error(e.to_string());
@@ -1086,7 +1089,7 @@ async fn run_turn(
                         .cloned()
                         .collect(),
                     pause: None,
-                    session_state: None,
+                    session_state: prepared.session_state.clone(),
                 };
                 if let Err(e) = server
                     .store
