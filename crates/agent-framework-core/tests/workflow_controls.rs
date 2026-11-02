@@ -184,12 +184,7 @@ impl ChatClient for Named {
     }
 }
 
-fn agent(
-    name: &str,
-) -> (
-    Arc<dyn SupportsAgentRun>,
-    Arc<Mutex<Vec<Vec<(String, String)>>>>,
-) {
+fn agent(name: &str) -> (Arc<dyn SupportsAgentRun>, Seen) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let client = Named {
         name: name.into(),
