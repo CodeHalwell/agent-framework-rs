@@ -111,8 +111,8 @@ pub use host::{
 #[cfg(feature = "session-store")]
 pub use invocations::{InvocationRequest, InvocationRun, InvocationsHostServer, WorkflowTurn};
 pub use responses::{
-    HistorySource, HostedResponseRequest, InMemoryResponseStore, OptionsHook, ResponseStore,
-    ResponsesHostServer, StoredResponse, WorkflowPause,
+    BackgroundSource, HistorySource, HostedResponseRequest, InMemoryResponseStore, OptionsHook,
+    ResponseStore, ResponsesHostServer, StoredResponse, WorkflowPause,
 };
 pub use scope::{FoundryRequestContext, FoundryRequestScope};
 #[cfg(feature = "session-store")]

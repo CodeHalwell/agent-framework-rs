@@ -124,6 +124,26 @@ pub enum HistorySource {
     Service,
 }
 
+/// Who runs a `background: true` response (upstream `background_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundSource {
+    /// The host runs the turn in its own background task; the agent's
+    /// provider is called as for any other turn.
+    #[default]
+    AgentServer,
+    /// The host also asks the agent's provider for a background response
+    /// (`ChatOptions::background`) and polls it with the continuation token
+    /// the provider returns until it finishes, emitting its output as it is
+    /// recorded. Requires [`HistorySource::Service`] and a provider that
+    /// supports background responses (such as the OpenAI Responses client);
+    /// agents only. Local tools must be idempotent: a poll that completes a
+    /// tool call runs it in the host.
+    Provider,
+}
+
+/// Upstream's provider background polling interval.
+const DEFAULT_BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Rewrites the caller's model options before an agent runs (upstream
 /// `prepare_options`).
 pub type OptionsHook =
@@ -321,6 +341,8 @@ pub struct ResponsesHostServer {
     consent_origins: Option<Vec<String>>,
     checkpoints: Option<Arc<dyn CheckpointStorage>>,
     history: HistorySource,
+    background_source: BackgroundSource,
+    background_poll_interval: Duration,
     prepare_options: Option<OptionsHook>,
     approval_provider: Option<Arc<dyn FunctionApprovalStoreProvider>>,
     local_approvals: Arc<InMemoryFunctionApprovalStore>,
@@ -353,6 +375,8 @@ impl ResponsesHostServer {
             consent_origins: None,
             checkpoints: None,
             history: HistorySource::default(),
+            background_source: BackgroundSource::default(),
+            background_poll_interval: DEFAULT_BACKGROUND_POLL_INTERVAL,
             prepare_options: None,
             approval_provider: None,
             local_approvals: Arc::default(),
@@ -427,6 +451,22 @@ impl ResponsesHostServer {
     /// turn.
     pub fn with_history_source(mut self, source: HistorySource) -> Self {
         self.history = source;
+        self
+    }
+
+    /// Who runs a `background: true` response (default
+    /// [`BackgroundSource::AgentServer`]). [`BackgroundSource::Provider`]
+    /// needs [`HistorySource::Service`]; a background request made under any
+    /// other history source fails.
+    pub fn with_background_source(mut self, source: BackgroundSource) -> Self {
+        self.background_source = source;
+        self
+    }
+
+    /// How long to wait between polls of a provider background response
+    /// (default two seconds, as upstream).
+    pub fn with_background_poll_interval(mut self, interval: Duration) -> Self {
+        self.background_poll_interval = interval;
         self
     }
 
@@ -1707,7 +1747,26 @@ async fn execute(
             (session, history)
         }
     };
+    let provider_background =
+        server.background_source == BackgroundSource::Provider && prepared.create.background;
     let response = match events {
+        _ if provider_background => {
+            if server.history != HistorySource::Service {
+                return Err(TurnError::Public(
+                    "BackgroundSource::Provider requires HistorySource::Service.".into(),
+                ));
+            }
+            run_provider_background(
+                server,
+                agent.as_ref(),
+                &mut session,
+                messages,
+                options,
+                events,
+                tracker,
+            )
+            .await?
+        }
         None => {
             let response = agent
                 .run_with_options(messages, Some(&mut session), options)
@@ -1777,6 +1836,84 @@ async fn execute(
         drop(state);
     }
     Ok((response, None))
+}
+
+/// Run a turn as a provider background response (upstream
+/// `_run_provider_background`): submit with `background`, then poll with the
+/// continuation token the provider returns until it returns none. Each
+/// response's finished output is recorded (and streamed) as it arrives; an
+/// unfinished one contributes only the completed tool calls and results a
+/// tool loop put ahead of it, since polling repeats the rest.
+async fn run_provider_background(
+    server: &ResponsesHostServer,
+    agent: &dyn SupportsAgentRun,
+    session: &mut agent_framework_core::session::AgentSession,
+    messages: Vec<Message>,
+    options: AgentRunOptions,
+    mut events: Option<&mut Events>,
+    tracker: &mut OutputTracker,
+) -> std::result::Result<AgentResponse, TurnError> {
+    let submit = options.clone().with_background(true);
+    let mut current = agent
+        .run_with_options(messages, Some(&mut *session), submit)
+        .await?;
+    let mut recorded: Vec<Message> = Vec::new();
+    let mut round = 0usize;
+    loop {
+        if let Some(id) = current.conversation_id.as_deref() {
+            session.try_adopt_service_session_id(id);
+        }
+        let token = current.continuation_token.take();
+        let mut output = current;
+        if token.is_some() {
+            output.messages = completed_prefix(std::mem::take(&mut output.messages));
+            output.finish_reason = None;
+        }
+        // Distinct ids per response, so the tracker does not fold one
+        // poll's messages into another's.
+        for (i, message) in output.messages.iter_mut().enumerate() {
+            if message.message_id.is_none() {
+                message.message_id = Some(format!("bg{round}-{i}"));
+            }
+        }
+        if !output.messages.is_empty() || output.usage_details.is_some() {
+            tracker.handle_response(&output)?;
+            if let Some(events) = events.as_deref_mut() {
+                events.emit_all(tracker.drain()).await;
+            }
+            recorded.extend(output.messages.iter().cloned());
+        }
+        let Some(token) = token else {
+            output.messages = recorded;
+            return Ok(output);
+        };
+        round += 1;
+        tokio::time::sleep(server.background_poll_interval).await;
+        let poll = options
+            .clone()
+            .with_background(true)
+            .with_continuation_token(token);
+        current = agent
+            .run_with_options(Vec::new(), Some(&mut *session), poll)
+            .await?;
+    }
+}
+
+/// The messages of an unfinished response that a tool loop completed ahead
+/// of it: everything up to and including its last function result.
+fn completed_prefix(mut messages: Vec<Message>) -> Vec<Message> {
+    for index in (0..messages.len()).rev() {
+        let last_result = messages[index]
+            .contents
+            .iter()
+            .rposition(|c| matches!(c, Content::FunctionResult(_)));
+        if let Some(offset) = last_result {
+            messages.truncate(index + 1);
+            messages[index].contents.truncate(offset + 1);
+            return messages;
+        }
+    }
+    Vec::new()
 }
 
 /// The agent session to continue: the conversation's, else the previous

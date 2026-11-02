@@ -86,6 +86,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `function_calls` (output index → call id), so argument fragments after the
   cut reach their call, and a function call the resumed stream never saw
   announced is taken whole from its `response.output_item.done`.
+- Foundry hosting: `ResponsesHostServer::with_background_source(BackgroundSource::Provider)`
+  hands a `background: true` response to the agent's provider and polls it
+  with the continuation token until it completes, as upstream's
+  `background_source="provider"` (requires `HistorySource::Service`;
+  `with_background_poll_interval` defaults to 2s).
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
