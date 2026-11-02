@@ -306,7 +306,7 @@ impl FilterCompiler<'_> {
                 match numeric_operand(n, kind == "int", "Numeric filter operands must be finite.")?
                 {
                     Some(param) => param,
-                    // Beyond BIGINT: no stored integer equals it.
+                    // Not exactly representable in the column: nothing equals it.
                     None => return Ok("FALSE".to_string()),
                 }
             }
@@ -415,7 +415,8 @@ impl FilterCompiler<'_> {
                         )?
                         .ok_or_else(|| {
                             Error::Configuration(
-                                "Integer filter values must fit in the DuckDB BIGINT range."
+                                "Ordered filter numbers must be exactly representable in the \
+                                 column's type (BIGINT for int fields, DOUBLE for float fields)."
                                     .into(),
                             )
                         })?,
@@ -895,15 +896,35 @@ fn normalized_key(value: &Value, uuid: bool) -> String {
 /// finite `DOUBLE`. On an `int` column an integral float (`2020.0`) binds as
 /// `BIGINT` too: bound as a `DOUBLE`, DuckDB would promote the column to
 /// floating point and round distinct stored integers onto the operand.
-/// `Ok(None)` is an integral float outside the `BIGINT` range on an `int`
-/// column, which no stored value can equal.
+/// Conversely, on a `float` column an integer operand binds as a `DOUBLE`
+/// only when a double holds it exactly: DuckDB would otherwise round it onto
+/// a neighbouring stored value.
+///
+/// `Ok(None)` is an operand the column cannot hold exactly (an integral
+/// float beyond `BIGINT` on an `int` column, an integer beyond 2^53 a double
+/// cannot represent on a `float` column): no stored value equals it, and no
+/// ordered comparison with it can be made exactly.
 fn numeric_operand(
     n: &serde_json::Number,
     int_column: bool,
     not_finite: &str,
 ) -> Result<Option<Db>> {
     if let Some(i) = n.as_i64() {
-        return Ok(Some(Db::BigInt(i)));
+        if int_column {
+            return Ok(Some(Db::BigInt(i)));
+        }
+        let f = i as f64;
+        // Exact iff the round trip gives the integer back (2^63 itself
+        // saturates on the way back, so it is excluded too).
+        let exact = f < i64::MAX as f64 && f as i64 == i;
+        return Ok(exact.then_some(Db::Double(f)));
+    }
+    if !int_column && n.as_u64().is_some() {
+        // Beyond i64: a double can hold it only if it round-trips.
+        let u = n.as_u64().unwrap_or_default();
+        let f = u as f64;
+        let exact = f < u64::MAX as f64 && f as u64 == u;
+        return Ok(exact.then_some(Db::Double(f)));
     }
     let f = n
         .as_f64()

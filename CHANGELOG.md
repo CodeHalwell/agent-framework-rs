@@ -143,6 +143,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   operation goes pending and restored for its continuation, so the resumed
   operation can execute the tools it was submitted with. The parking is
   process-local (executors cannot live in session JSON state).
+- DuckDB vector store (review fix): an integer operand on a `float` column
+  binds as `DOUBLE` only when a double holds it exactly; beyond that
+  (above 2^53) it equals nothing and is refused for ordered filters, instead
+  of rounding onto a neighbouring stored value.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

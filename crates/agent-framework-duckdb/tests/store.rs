@@ -367,3 +367,62 @@ async fn integral_float_filters_on_int_columns_compare_exactly() {
     assert!(ids(search(huge).await.unwrap()).is_empty());
     assert!(search(Filter::gt("big", 1e19_f64).unwrap()).await.is_err());
 }
+
+#[tokio::test]
+async fn integer_filters_on_float_columns_compare_exactly() {
+    let store = DuckDbStore::in_memory().unwrap();
+    let definition = VectorStoreCollectionDefinition::new(vec![
+        VectorStoreField::key("id").with_type("int"),
+        VectorStoreField::data("score").with_type("float"),
+        VectorStoreField::vector("embedding", 2),
+    ])
+    .unwrap();
+    let docs = store.get_collection("af_int_on_float", definition).unwrap();
+    docs.ensure_collection_exists().await.unwrap();
+    docs.upsert(vec![
+        json!({"id": 1, "score": 9_007_199_254_740_992.0_f64, "embedding": [1.0, 0.0]}),
+        json!({"id": 2, "score": 2.0, "embedding": [0.0, 1.0]}),
+    ])
+    .await
+    .unwrap();
+    let docs = &docs;
+    let search = |filter: Filter| async move {
+        docs.search(
+            vec![1.0, 0.0],
+            &VectorSearchOptions::new(5).with_filter(filter),
+        )
+        .await
+    };
+    let ids = |hits: Vec<agent_framework_core::vectors::VectorSearchResult>| {
+        let mut ids: Vec<i64> = hits
+            .iter()
+            .map(|h| h.record["id"].as_i64().unwrap())
+            .collect();
+        ids.sort();
+        ids
+    };
+    // 2^53 + 1 is not a double, so no stored float equals it.
+    let eq = Filter::eq("score", 9_007_199_254_740_993_i64).unwrap();
+    assert!(ids(search(eq).await.unwrap()).is_empty());
+    let member = Filter::any_of("score", vec![json!(9_007_199_254_740_993_i64)]).unwrap();
+    assert!(ids(search(member).await.unwrap()).is_empty());
+    // A representable integer still compares numerically.
+    assert_eq!(
+        ids(search(Filter::eq("score", 2).unwrap()).await.unwrap()),
+        [2]
+    );
+    assert_eq!(
+        ids(
+            search(Filter::eq("score", 9_007_199_254_740_992_i64).unwrap())
+                .await
+                .unwrap()
+        ),
+        [1]
+    );
+    // An ordered comparison it cannot make exactly is refused.
+    assert!(
+        search(Filter::gt("score", 9_007_199_254_740_993_i64).unwrap())
+            .await
+            .is_err()
+    );
+}
