@@ -1115,9 +1115,12 @@ impl SqlServerCollection {
     }
 }
 
-/// A key compared as text, so UUIDs match whatever their case.
-fn normalized_key(value: &Value) -> String {
+/// A key compared as text. UUID-typed keys are canonicalized so they match
+/// whatever their case or hyphenation; string keys (binary collation) are
+/// compared exactly, so distinct UUID-shaped strings stay distinct.
+fn normalized_key(value: &Value, uuid: bool) -> String {
     match value {
+        Value::String(s) if !uuid => s.clone(),
         Value::String(s) => uuid::Uuid::parse_str(s)
             .map(|u| u.hyphenated().to_string())
             .unwrap_or_else(|_| s.clone()),
@@ -1184,18 +1187,19 @@ impl VectorCollection for SqlServerCollection {
         )?;
         let results = self.client.run(statements).await?;
         let key_name = self.definition.key_field().name.clone();
+        let uuid_keys = self.definition.key_field().type_.as_deref() == Some("UUID");
         let mut found = std::collections::HashMap::new();
         for row in results.into_iter().flatten() {
             let (record, _) = self.record(&fields, row, include_vectors)?;
             let id = record
                 .get(&key_name)
-                .map(normalized_key)
+                .map(|k| normalized_key(k, uuid_keys))
                 .unwrap_or_default();
             found.insert(id, record);
         }
         Ok(keys
             .iter()
-            .map(|k| found.get(&normalized_key(k)).cloned())
+            .map(|k| found.get(&normalized_key(k, uuid_keys)).cloned())
             .collect())
     }
 
@@ -1370,5 +1374,20 @@ impl VectorStore for SqlServerStore {
                     .ok_or_else(|| Error::service("SQL Server returned a non-string table name."))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::normalized_key;
+    use serde_json::json;
+
+    #[test]
+    fn only_uuid_keys_are_canonicalized() {
+        let lower = json!("a1b2c3d4-0000-0000-0000-000000000001");
+        let upper = json!("A1B2C3D4-0000-0000-0000-000000000001");
+        assert_ne!(normalized_key(&lower, false), normalized_key(&upper, false));
+        assert_eq!(normalized_key(&lower, true), normalized_key(&upper, true));
+        assert_eq!(normalized_key(&json!(7), false), "7");
     }
 }
