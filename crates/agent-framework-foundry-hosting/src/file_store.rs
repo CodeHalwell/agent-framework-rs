@@ -174,6 +174,34 @@ impl ResponseStore for FileResponseStore {
             .await
     }
 
+    async fn response_ids(&self) -> Result<Vec<String>> {
+        let mut entries = match tokio::fs::read_dir(self.dir.join("responses")).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io(e)),
+        };
+        // Files are named by digest: the id is read from each record.
+        let mut ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(io)? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match self.read(&path).await {
+                Ok(Some(value)) => {
+                    if let Some(id) = value["response"]["id"].as_str() {
+                        ids.push(id.to_string());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping an unreadable response record")
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     async fn delete(&self, id: &str) -> Result<bool> {
         let _guard = self.lock.lock().await;
         match tokio::fs::remove_file(self.path("responses", id)).await {

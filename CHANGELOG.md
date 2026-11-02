@@ -44,6 +44,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   installed by `configure_observability`, stamps the agentserver's Foundry
   identity and baggage ids on every span; request spans join the caller's
   W3C baggage.
+- Foundry hosting: `ResponsesHostServer::serve` first fails background
+  responses a previous process left `queued`/`in_progress`
+  (`fail_interrupted_responses`, with upstream's recovery error);
+  `ResponseStore::response_ids` lists stored responses (implemented by the
+  in-memory and file stores).
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

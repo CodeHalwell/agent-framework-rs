@@ -2218,3 +2218,66 @@ async fn a_conversation_turns_continuation_keeps_the_session_it_inherited() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_restart_fails_interrupted_background_responses() {
+    use agent_framework_foundry_hosting::{FileResponseStore, ResponseStore, StoredResponse};
+    let dir = std::env::temp_dir().join(format!("af-sweep-{}", uuid_like()));
+    let store = Arc::new(FileResponseStore::new(&dir));
+    let record = |id: &str, status: &str, background: bool| StoredResponse {
+        response: json!({"id": id, "object": "response", "status": status, "background": background, "output": []}),
+        input_items: Vec::new(),
+        transcript: Vec::new(),
+        pause: None,
+        session_state: None,
+    };
+    for (id, status, background) in [
+        ("caresp_queued", "queued", true),
+        ("caresp_running", "in_progress", true),
+        ("caresp_done", "completed", true),
+        ("caresp_cancelled", "cancelled", true),
+        ("caresp_foreground", "in_progress", false),
+    ] {
+        store.put(id, record(id, status, background)).await.unwrap();
+    }
+    let mut ids = store.response_ids().await.unwrap();
+    ids.sort();
+    assert_eq!(
+        ids,
+        [
+            "caresp_cancelled",
+            "caresp_done",
+            "caresp_foreground",
+            "caresp_queued",
+            "caresp_running"
+        ]
+    );
+
+    // A new host over the same store sweeps before serving.
+    let server =
+        ResponsesHostServer::agent(agent(Echo::default())).with_response_store(store.clone());
+    assert_eq!(server.fail_interrupted_responses().await.unwrap(), 2);
+    for id in ["caresp_queued", "caresp_running"] {
+        let stored = store.get(id).await.unwrap().unwrap();
+        assert_eq!(stored.response["status"], "failed", "{id}");
+        assert_eq!(
+            stored.response["error"]["message"],
+            "A non-resumable agent cannot be replayed after a process crash."
+        );
+    }
+    for (id, status) in [
+        ("caresp_done", "completed"),
+        ("caresp_cancelled", "cancelled"),
+        ("caresp_foreground", "in_progress"),
+    ] {
+        assert_eq!(
+            store.get(id).await.unwrap().unwrap().response["status"],
+            status
+        );
+    }
+    // Idempotent; a process-local store has nothing to sweep.
+    assert_eq!(server.fail_interrupted_responses().await.unwrap(), 0);
+    let fresh = ResponsesHostServer::agent(agent(Echo::default()));
+    assert_eq!(fresh.fail_interrupted_responses().await.unwrap(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

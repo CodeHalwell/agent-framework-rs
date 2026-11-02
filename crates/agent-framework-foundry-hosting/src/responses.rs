@@ -186,6 +186,12 @@ pub trait ResponseStore: Send + Sync {
     async fn set_conversation_state(&self, _id: &str, _state: Value) -> Result<()> {
         Ok(())
     }
+    /// The ids of every stored response, for the startup sweep
+    /// ([`ResponsesHostServer::fail_interrupted_responses`]). The default
+    /// lists none, which suits a store that does not outlive the process.
+    async fn response_ids(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Replace a conversation's transcript and session state together (the
     /// state is cleared when `state` is `None`). The host writes a turn's
     /// conversation through this one call, so a store should apply it
@@ -222,6 +228,9 @@ pub struct InMemoryResponseStore {
 impl ResponseStore for InMemoryResponseStore {
     async fn get(&self, id: &str) -> Result<Option<StoredResponse>> {
         Ok(self.responses.lock().unwrap().get(id).cloned())
+    }
+    async fn response_ids(&self) -> Result<Vec<String>> {
+        Ok(self.responses.lock().unwrap().keys().cloned().collect())
     }
     async fn put(&self, id: &str, response: StoredResponse) -> Result<()> {
         self.responses
@@ -559,9 +568,58 @@ impl ResponsesHostServer {
     }
 
     /// Serve on the configured port.
+    /// Serve on the configured port, after
+    /// [`Self::fail_interrupted_responses`].
     pub async fn serve(self) -> Result<()> {
         let config = self.config.clone();
+        let swept = self.fail_interrupted_responses().await?;
+        if swept > 0 {
+            tracing::warn!(
+                count = swept,
+                "failed background responses interrupted by a restart"
+            );
+        }
         crate::host::serve(self.into_router(), &config).await
+    }
+
+    /// The startup sweep: a background response the store still holds as
+    /// `queued` or `in_progress` was interrupted by the previous process
+    /// ending, and nothing will finish it, so it is marked `failed` with
+    /// upstream's recovery error (its pollers stop waiting, and continuing
+    /// from it inherits its predecessor's state as for any failed turn).
+    /// Returns how many were failed. [`Self::serve`] runs it first; call it
+    /// before serving a router from [`Self::into_router`] yourself.
+    ///
+    /// Divergence: upstream's resilient task runtime can instead resume a
+    /// workflow from its checkpoint; the Rust host does not (see the crate
+    /// docs).
+    pub async fn fail_interrupted_responses(&self) -> Result<usize> {
+        let message = match self.target {
+            Target::Workflow { .. } => {
+                "Recovery mode is only supported when resilient_background=True."
+            }
+            _ => "A non-resumable agent cannot be replayed after a process crash.",
+        };
+        let mut failed = 0;
+        for id in self.store.response_ids().await? {
+            let Some(mut stored) = self.store.get(&id).await? else {
+                continue;
+            };
+            let interrupted = stored.response["background"] == json!(true)
+                && matches!(
+                    stored.response["status"].as_str(),
+                    Some("queued" | "in_progress")
+                );
+            if !interrupted {
+                continue;
+            }
+            stored.response["status"] = json!("failed");
+            stored.response["error"] = json!({"code": "server_error", "message": message});
+            stored.pause = None;
+            self.store.put(&id, stored).await?;
+            failed += 1;
+        }
+        Ok(failed)
     }
 }
 

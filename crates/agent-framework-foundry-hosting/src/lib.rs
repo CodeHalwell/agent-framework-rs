@@ -67,10 +67,18 @@
 //!   unpacked in memory; `skills_provider` discovers once, and
 //!   `ToolboxSkillsProvider` discovers lazily, caches, and refreshes (see
 //!   `agent_framework_mcp::skills` and [`toolbox::ToolboxSkillsProvider`]).
-//! - Not ported from the agentserver: the resilient (crash-recoverable)
-//!   task runtime, WebSocket/voice invocations, and its OpenTelemetry
-//!   distro beyond trace-context propagation and exporter selection (the
-//!   `otel` feature).
+//! - **Restarts**: background responses a previous process left `queued`
+//!   or `in_progress` are failed by
+//!   [`ResponsesHostServer::fail_interrupted_responses`] (run by `serve`),
+//!   with upstream's recovery error. Not ported: the agentserver's resilient
+//!   task runtime (built on the Foundry Tasks service), which can resume a
+//!   workflow from its checkpoint, and provider-native background polling.
+//! - **WebSocket invocations** (feature `websocket`): [`invocations_ws`]
+//!   serves `/invocations_ws`.
+//! - **Telemetry** (feature `otel`): caller trace context and W3C baggage,
+//!   exporter selection, and Foundry span enrichment
+//!   ([`FoundryEnrichmentSpanProcessor`]); the agentserver's OTel distro is
+//!   otherwise not ported.
 
 #[cfg(feature = "experimental-computer-use")]
 mod computer;
