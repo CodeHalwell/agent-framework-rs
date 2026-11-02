@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
             WorkflowEvent::AgentRun {
                 executor_id,
                 response,
+                ..
             } => {
                 let r: AgentResponse = serde_json::from_value(response.clone()).unwrap_or_default();
                 println!(

@@ -30,7 +30,7 @@ use crate::session::AgentSession;
 use crate::tools::{FunctionTool, ToolDefinition};
 use crate::types::{
     AgentResponse, AgentResponseUpdate, Content, FunctionApprovalRequestContent, FunctionArguments,
-    FunctionCallContent, Message, Role,
+    FunctionCallContent, Message, Role, UsageDetails,
 };
 use crate::workflow::{Workflow, WorkflowEvent};
 
@@ -158,16 +158,48 @@ impl WorkflowAgent {
         .into_definition()
     }
 
-    /// Map the workflow's outputs into response messages.
-    fn outputs_to_messages(&self, outputs: Vec<Value>) -> Vec<Message> {
+    /// Map the workflow's outputs into response messages, together with the
+    /// usage merged from any [`AgentResponse`] among them.
+    ///
+    /// Three shapes are recognised, tried in this order:
+    ///
+    /// 1. an [`AgentResponse`] — a child agent's own response. Its
+    ///    caller-facing messages are taken and its `usage_details` merged in.
+    ///    The tokens were billed whether or not any of its messages survive
+    ///    the filter, so usage merges even when all of them are dropped.
+    /// 2. a `Vec<Message>` (a JSON array) or a single [`Message`].
+    /// 3. anything else — a string, or any other JSON value, which becomes
+    ///    the text of one assistant message.
+    ///
+    /// The order is unambiguous: `AgentResponse::messages` has no serde
+    /// default, so only an object carrying a `messages` array parses as one,
+    /// and a bare `Message` has no such field.
+    ///
+    /// Only caller-facing messages survive shapes 1 and 2 — see
+    /// [`is_caller_facing`]. Shape 3 is synthesised as an assistant message
+    /// and so is always caller-facing.
+    fn outputs_to_messages(&self, outputs: Vec<Value>) -> (Vec<Message>, Option<UsageDetails>) {
         let mut messages = Vec::new();
+        let mut usage: Option<UsageDetails> = None;
         for out in outputs {
+            if let Ok(response) = serde_json::from_value::<AgentResponse>(out.clone()) {
+                messages.extend(response.messages.into_iter().filter(is_caller_facing));
+                if let Some(details) = response.usage_details {
+                    match &mut usage {
+                        Some(total) => total.add_assign(&details),
+                        None => usage = Some(details),
+                    }
+                }
+                continue;
+            }
             if let Ok(msgs) = serde_json::from_value::<Vec<Message>>(out.clone()) {
-                messages.extend(msgs);
+                messages.extend(msgs.into_iter().filter(is_caller_facing));
                 continue;
             }
             if let Ok(msg) = serde_json::from_value::<Message>(out.clone()) {
-                messages.push(msg);
+                if is_caller_facing(&msg) {
+                    messages.push(msg);
+                }
                 continue;
             }
             match out {
@@ -175,8 +207,43 @@ impl WorkflowAgent {
                 other => messages.push(Message::assistant(other.to_string())),
             }
         }
-        messages
+        (messages, usage)
     }
+}
+
+/// Whether a workflow output message is one the workflow-as-agent's caller
+/// should see.
+///
+/// Non-assistant messages are dropped: a system prompt and a tool result are
+/// internal workflow artifacts, and a user message would be re-emitted — a
+/// `GroupChat` orchestrator yields the whole conversation, the caller's own
+/// turn included.
+///
+/// An assistant message carrying a function-call envelope is dropped whole,
+/// reasoning included: its `tool`-role result was already excluded by the
+/// role rule, and a call without its result is an invalid transcript for the
+/// providers that validate call/result pairing on replay.
+///
+/// Two notes on how this differs from upstream's `_caller_facing_messages`:
+///
+/// - upstream also exempts a call flagged `informational_only` (a hosted
+///   call recorded for transcript fidelity, which never gets a local
+///   result). There is no such flag here: a provider-hosted MCP call is its
+///   own [`Content::McpServerToolCall`] variant rather than a
+///   [`Content::FunctionCall`], so it is already not an envelope and needs
+///   no exemption.
+/// - the pending-request messages that [`request_message`] builds also carry
+///   a [`Content::FunctionCall`], but they are appended by `run` *after*
+///   this filter has run over the workflow's outputs, so surfacing an
+///   outstanding request is unaffected.
+fn is_caller_facing(message: &Message) -> bool {
+    message.role == Role::assistant()
+        && !message.contents.iter().any(|content| {
+            matches!(
+                content,
+                Content::FunctionCall(_) | Content::FunctionApprovalResponse(_)
+            )
+        })
 }
 
 /// Convert a pending request into a user-input (function-approval) message.
@@ -264,8 +331,11 @@ fn forward_and_persist(
                 None => {
                     if let Some((session, input)) = finish.take() {
                         let response = AgentResponse::from_updates(collected.clone());
-                        for cp in session.context_providers {
-                            if let Err(e) = cp.after_run(&input, &response.messages, None).await {
+                        for cp in session.context_providers.clone() {
+                            if let Err(e) = cp
+                                .after_run_in_session(&session, &input, &response.messages, None)
+                                .await
+                            {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
                         }
@@ -297,7 +367,7 @@ impl SupportsAgentRun for WorkflowAgent {
         let input = serde_json::to_value(&messages).unwrap_or_else(|_| Value::Array(Vec::new()));
         let run = self.workflow.run(input).await?;
 
-        let mut response_messages = self.outputs_to_messages(run.outputs());
+        let (mut response_messages, usage_details) = self.outputs_to_messages(run.outputs());
 
         // Surface any outstanding requests as user-input requests.
         for pending in run.pending_requests() {
@@ -317,11 +387,16 @@ impl SupportsAgentRun for WorkflowAgent {
         // the workflow's own input — this is a write-back, not a
         // read-and-write.
         for cp in session.context_providers.clone() {
-            cp.after_run(&messages, &response_messages, None).await?;
+            cp.after_run_in_session(session, &messages, &response_messages, None)
+                .await?;
         }
 
         Ok(AgentResponse {
             messages: response_messages,
+            // The tokens a child agent's `AgentResponse` output reported were
+            // spent by this run; without carrying them up, a workflow-as-agent
+            // reported no usage at all.
+            usage_details,
             ..Default::default()
         })
     }
@@ -354,6 +429,9 @@ impl SupportsAgentRun for WorkflowAgent {
 
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     fn create_session(&self) -> AgentSession {

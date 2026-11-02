@@ -1,0 +1,27 @@
+[package]
+name = "agent-framework-qdrant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+description = "Qdrant vector store for agent-framework (experimental: VECTOR_STORES)"
+
+[dependencies]
+agent-framework-core = { workspace = true, features = ["experimental-vector-stores"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -242,7 +242,14 @@ struct Inner {
     /// `include` on the caller's behalf. True here, as on OpenAI; Foundry
     /// turns it off (see [`Self::without_implicit_encrypted_reasoning`]).
     implicit_encrypted_reasoning: bool,
+    /// Rewrites each request body after it is built; see
+    /// [`AzureOpenAIResponsesClient::with_body_transform`].
+    body_transform: Option<BodyTransform>,
 }
+
+/// Rewrites a Responses request body after it is built, given the run's
+/// options. See [`AzureOpenAIResponsesClient::with_body_transform`].
+pub type BodyTransform = Arc<dyn Fn(&mut Map<String, Value>, &ChatOptions) + Send + Sync>;
 
 impl Clone for AzureOpenAIResponsesClient {
     fn clone(&self) -> Self {
@@ -287,6 +294,7 @@ impl AzureOpenAIResponsesClient {
                 api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::ApiKey(api_key.into()),
                 implicit_encrypted_reasoning: true,
+                body_transform: None,
             }),
         }
     }
@@ -307,6 +315,7 @@ impl AzureOpenAIResponsesClient {
                 api_version: Some(DEFAULT_API_VERSION.to_string()),
                 auth: Auth::Credential(credential),
                 implicit_encrypted_reasoning: true,
+                body_transform: None,
             }),
         }
     }
@@ -397,6 +406,17 @@ impl AzureOpenAIResponsesClient {
         self
     }
 
+    /// Rewrite every request body after it is built — the hook a client
+    /// built on this one (Foundry's agent client) uses to add or strip
+    /// fields the shared builder knows nothing about.
+    pub fn with_body_transform(
+        mut self,
+        transform: impl Fn(&mut Map<String, Value>, &ChatOptions) + Send + Sync + 'static,
+    ) -> Self {
+        Arc::make_mut(&mut self.inner).body_transform = Some(Arc::new(transform));
+        self
+    }
+
     /// Replace the HTTP client requests go through.
     ///
     /// The default is [`azure_http_client`](crate::azure_http_client) for this
@@ -448,6 +468,14 @@ impl AzureOpenAIResponsesClient {
             Some(v) => format!("{base}/responses?api-version={v}"),
             None => format!("{base}/responses"),
         }
+    }
+
+    fn transformed_body(&self, messages: &[Message], options: &ChatOptions, stream: bool) -> Value {
+        let mut body = self.build_body(messages, options, stream);
+        if let (Some(transform), Value::Object(map)) = (&self.inner.body_transform, &mut body) {
+            transform(map, options);
+        }
+        body
     }
 
     /// Build the Responses API request body, reusing conversion from
@@ -586,10 +614,12 @@ impl AzureOpenAIResponsesClient {
         for (name, value) in client_headers {
             req = req.header(name, value);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());
@@ -614,7 +644,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&messages, &options, false);
+        let body = self.transformed_body(&messages, &options, false);
         let resp = self.post(&body, &options).await?;
         let value: Value = resp
             .json()
@@ -638,7 +668,7 @@ impl ChatClient for AzureOpenAIResponsesClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let body = self.build_body(&messages, &options, true);
+        let body = self.transformed_body(&messages, &options, true);
         let resp = self.post(&body, &options).await?;
         Ok(
             agent_framework_openai::responses::parse_responses_sse_stream(resp, options.store)

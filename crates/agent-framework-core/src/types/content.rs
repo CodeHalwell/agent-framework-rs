@@ -114,6 +114,45 @@ pub struct Annotation {
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotated_regions: Option<Vec<TextSpanRegion>>,
+    /// What [`Self::annotated_regions`] index into. `None` keeps the
+    /// original meaning — character offsets into the annotated
+    /// [`TextContent::text`] — so annotations serialized before this field
+    /// existed read the same.
+    ///
+    /// A provider that reports *where in the cited source* a quote came from
+    /// sets [`RegionCoordinateSpace::Source`]: Anthropic's document
+    /// citations carry character offsets into the document, page numbers or
+    /// content-block indices, none of which are positions in the generated
+    /// text. Without the marker a consumer that highlights the answer from
+    /// `annotated_regions` highlights the wrong span, or one past the end of
+    /// the text (upstream #9436).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub annotated_regions_coordinate_space: Option<RegionCoordinateSpace>,
+}
+
+impl Annotation {
+    /// The regions that are spans of the annotated text itself — empty when
+    /// they locate the quote in the cited source instead (see
+    /// [`Self::annotated_regions_coordinate_space`]). Use this, not
+    /// `annotated_regions`, to highlight or link generated text.
+    pub fn content_regions(&self) -> &[TextSpanRegion] {
+        match self.annotated_regions_coordinate_space {
+            Some(RegionCoordinateSpace::Source) => &[],
+            _ => self.annotated_regions.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
+/// What an [`Annotation`]'s `annotated_regions` index into. Upstream's
+/// `annotated_regions_coordinate_space`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegionCoordinateSpace {
+    /// Positions in the annotated text content.
+    Content,
+    /// Positions in the cited source — characters, pages or blocks of the
+    /// document or search result the quote came from.
+    Source,
 }
 
 /// Plain text content.
@@ -879,6 +918,19 @@ impl Content {
         }
     }
 
+    /// The text of a [`Content::Text`] item only — the answer, not the
+    /// model's reasoning. [`Self::as_text`] also returns
+    /// [`Content::TextReasoning`] text; this is what the `text()` accessors
+    /// use, as upstream's `Message.text` joins only `type == "text"`
+    /// contents. Folding reasoning in leaked a reasoning model's thinking
+    /// into the answer, and broke structured output, which parses `text()`.
+    pub fn as_plain_text(&self) -> Option<&str> {
+        match self {
+            Content::Text(t) => Some(&t.text),
+            _ => None,
+        }
+    }
+
     /// The function call carried by this item, if any.
     pub fn as_function_call(&self) -> Option<&FunctionCallContent> {
         match self {
@@ -1237,6 +1289,37 @@ mod tests {
         assert_eq!(sum.cache_creation_input_token_count, Some(6));
         assert_eq!(sum.cache_read_input_token_count, Some(8));
         assert_eq!(sum.reasoning_output_token_count, Some(10));
+    }
+
+    #[test]
+    fn annotation_regions_default_to_content_coordinates() {
+        // An annotation with no marker — every one serialized before it
+        // existed, and every provider that reports answer offsets — keeps
+        // meaning "spans of this text".
+        let legacy: Annotation = serde_json::from_value(serde_json::json!({
+            "type": "citation",
+            "annotated_regions": [{ "start_index": 0, "end_index": 4 }]
+        }))
+        .unwrap();
+        assert_eq!(legacy.annotated_regions_coordinate_space, None);
+        assert_eq!(legacy.content_regions().len(), 1);
+    }
+
+    #[test]
+    fn source_coordinate_regions_round_trip_and_are_not_content_spans() {
+        let ann = Annotation {
+            annotated_regions: Some(vec![TextSpanRegion {
+                start_index: Some(500),
+                end_index: Some(900),
+            }]),
+            annotated_regions_coordinate_space: Some(RegionCoordinateSpace::Source),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&ann).unwrap();
+        assert_eq!(v["annotated_regions_coordinate_space"], "source");
+        let back: Annotation = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ann);
+        assert!(back.content_regions().is_empty());
     }
 
     #[test]

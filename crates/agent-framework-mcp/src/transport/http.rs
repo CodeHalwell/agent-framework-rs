@@ -125,6 +125,10 @@ impl McpStreamableHttpTransport {
             // and nothing else, so an MCP server's `X-Api-Key` — or the
             // session id — would be handed to whatever host it redirected to.
             http: reqwest::Client::builder()
+                .user_agent(agent_framework_core::user_agent::user_agent(
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION"),
+                ))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| Error::Configuration(format!("MCP HTTP client: {e}")))?,
@@ -210,10 +214,12 @@ impl McpStreamableHttpTransport {
             if let Some(timeout) = self.timeout {
                 req = req.timeout(timeout);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| Error::service(format!("MCP HTTP request failed: {e}")))?;
+            let resp = req.send().await.map_err(|e| {
+                Error::service(format!(
+                    "MCP HTTP request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
             if !resp.status().is_redirection() {
                 return Ok(resp);
             }

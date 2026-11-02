@@ -109,6 +109,8 @@ parity with the Python and .NET implementations.
 | [`agent-framework-azure`](crates/agent-framework-azure) | Azure OpenAI client + the Entra ID credential chain (CLI / client-secret / managed-identity / chained). |
 | [`agent-framework-foundry`](crates/agent-framework-foundry) | Azure AI Foundry Responses API chat client (`FoundryChatClient`), client-side Prompt Agents (`FoundryAgent`), embeddings (`FoundryEmbeddingClient`) over either a Models inference endpoint or a project's OpenAI deployments, and managed memory (`FoundryMemoryProvider`). |
 | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) | Azure AI Search: context provider (semantic + optional vector query) and vector store (index management, document CRUD, filtered vector and keyword-hybrid search). |
+| [`agent-framework-qdrant`](crates/agent-framework-qdrant) | Qdrant vector store over the REST API: named dense vectors, payload indexes, portable filters (experimental). |
+| [`agent-framework-postgres`](crates/agent-framework-postgres) | PostgreSQL + pgvector vector store: typed columns, HNSW / IVFFlat indexes, parameterized portable filters (experimental). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
 | [`agent-framework-declarative`](crates/agent-framework-declarative) | Declarative YAML/JSON agents and workflows with provider/tool registries. |
@@ -205,12 +207,16 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `mem0` | [`agent-framework-mem0`](crates/agent-framework-mem0) — Mem0 long-term memory provider | no |
 | `foundry` | [`agent-framework-foundry`](crates/agent-framework-foundry) — Azure AI Foundry Responses API chat client, Prompt Agents, embeddings, and managed memory | no |
 | `azure-ai-search` | [`agent-framework-azure-ai-search`](crates/agent-framework-azure-ai-search) — Azure AI Search memory | no |
+| `qdrant` | [`agent-framework-qdrant`](crates/agent-framework-qdrant) — Qdrant vector store (experimental) | no |
+| `postgres` | [`agent-framework-postgres`](crates/agent-framework-postgres) — PostgreSQL + pgvector vector store (experimental) | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
 | `tools` | [`agent-framework-tools`](crates/agent-framework-tools) — local and Docker shell tools (re-exported as `builtin_tools`) | no |
 | `otel-metrics` | GenAI metrics (token-usage / operation-duration / function-invocation histograms) via the `opentelemetry` API crate | no |
-| `full` | all of the above except `otel-metrics` | no |
+| `otel-export` | a ready-made OTLP export pipeline for the spans and metrics (`observability::export`) | no |
+| `azure-monitor` | an Azure Monitor (Application Insights) destination for that pipeline (`OtelExport::with_azure_monitor`) | no |
+| `full` | all of the above except `otel-metrics`, `otel-export` and `azure-monitor` | no |
 
 APIs that upstream still marks experimental sit behind `experimental-*`
 features and carry no semver promise. `full` leaves them out, and
@@ -223,9 +229,10 @@ features and carry no semver promise. `full` leaves them out, and
 | `experimental-file-history` | `FileHistoryProvider` |
 | `experimental-progressive-tools` | `LiveToolList`, and adding or removing tools mid-run from `FunctionInvocationContext` |
 | `experimental-agent-hooks` | `agent_framework_core::agent_hooks`: AGENT-HOOKS-0.1 interception (allow / deny / transform verdicts at the agent, model-call and tool-call seams), enforced fail-closed |
-| `experimental-harness` | `agent_framework_core::harness`: the agent loop (`LoopAgent`, `Judge`, `todos_remaining`), `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`, the file store and `FileMemoryProvider` |
+| `experimental-harness` | `agent_framework_core::harness`: the agent loop (`LoopAgent`, `Judge`, `todos_remaining`), `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`, the file store, `FileAccessProvider`, `FileMemoryProvider`, `BackgroundAgentsProvider`, `MemoryContextProvider` and `create_harness_agent` |
+| `experimental-evals` | `agent_framework_core::evaluation`: `evaluate_agent`, `evaluate_workflow`, `LocalEvaluator` with keyword / tool-call / function checks, and CI assertions on the results |
 | `experimental-declarative-agents` | [`agent-framework-declarative`](crates/agent-framework-declarative): YAML/JSON agents and workflows |
-| `experimental` | all six |
+| `experimental` | all of them |
 
 ```toml
 # Every stable integration (no experimental APIs):

@@ -236,6 +236,12 @@ where
     }
 }
 
+/// An auto-approval rule approving every call (upstream
+/// `ToolApprovalAgent.AllToolsAutoApprovalRule`). Use only for trusted tools.
+pub fn all_tools_auto_approval_rule(_call: &FunctionCallContent) -> bool {
+    true
+}
+
 /// Wraps an agent with standing tool approvals, auto-approval rules and
 /// one-at-a-time approval prompts. See the [module docs](self).
 #[derive(Clone)]

@@ -34,6 +34,15 @@ pub trait Executor: Send + Sync {
     ///
     /// The default implementation ignores the state. Only executors that
     /// snapshot state need to implement this.
+    /// Reset per-run state before a fresh run (upstream `IResettableExecutor`):
+    /// an executor instance is shared by every run of its workflow, so one
+    /// that keeps per-run state clears it here. Called on every executor at
+    /// the start of a run (not on a resume from a checkpoint). The default
+    /// does nothing.
+    async fn reset(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn restore_state(&self, _state: Value) -> Result<()> {
         Ok(())
     }

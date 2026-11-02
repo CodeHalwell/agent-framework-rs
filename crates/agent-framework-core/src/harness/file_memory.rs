@@ -39,10 +39,10 @@
 //!   stays injective rather than collision-resistant. Folder names for such
 //!   scopes therefore differ from upstream's.
 //! - **Write lock.** Mutating tools hold a lock for their whole
-//!   read-modify-write and index rebuild. Upstream Python shares that lock
-//!   per store and folder across every provider in the process; here it
-//!   belongs to the provider (as in .NET), which is enough while this is the
-//!   only provider writing through a store.
+//!   read-modify-write and index rebuild. As upstream Python, the lock is
+//!   per store instance and folder, shared with every other provider in the
+//!   process (including [`FileAccessProvider`](super::FileAccessProvider));
+//!   the folder is lowercased but not NFC-folded.
 
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ use crate::types::Message;
 
 use super::file_store::{
     apply_replace, apply_replace_lines, compile_glob, is_windows_reserved_segment,
-    normalize_relative_path, AgentFileStore, FileLineEdit,
+    normalize_relative_path, store_write_lock, AgentFileStore, FileLineEdit,
 };
 
 /// The default `source_id` of a [`FileMemoryProvider`].
@@ -126,9 +126,6 @@ struct Inner {
     scope: Option<String>,
     /// `None` until replaced: the default then depends on the scope.
     instructions: Option<String>,
-    /// Shared by every provider derived from one with a builder method,
-    /// since they write to the same store.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FileMemoryProvider {
@@ -149,20 +146,18 @@ impl FileMemoryProvider {
                 source_id: DEFAULT_FILE_MEMORY_SOURCE_ID.to_string(),
                 scope: None,
                 instructions: None,
-                write_lock: Arc::new(tokio::sync::Mutex::new(())),
             }),
         }
     }
 
     /// A provider with this one's configuration changed by `f`, so calling a
-    /// builder method on a clone is fine. It shares this one's write lock.
+    /// builder method on a clone is fine.
     fn update(self, f: impl FnOnce(&mut Inner)) -> Self {
         let mut inner = Inner {
             store: self.inner.store.clone(),
             source_id: self.inner.source_id.clone(),
             scope: self.inner.scope.clone(),
             instructions: self.inner.instructions.clone(),
-            write_lock: self.inner.write_lock.clone(),
         };
         f(&mut inner);
         Self {
@@ -292,7 +287,8 @@ impl FileMemoryProvider {
                         )));
                     }
                     let described = args.description.as_deref().is_some_and(|d| !d.trim().is_empty());
-                    let _guard = inner.write_lock.lock().await;
+                    let lock = store_write_lock(&inner.store, &folder);
+                    let _guard = lock.lock().await;
                     let outcome = async {
                         inner.store.write(&combine(&folder, &normalized), &args.content).await?;
                         let desc_path = combine(&folder, &desc_name);
@@ -370,7 +366,8 @@ impl FileMemoryProvider {
                         Ok(path) => path,
                         Err(message) => return Ok(text(message)),
                     };
-                    let _guard = inner.write_lock.lock().await;
+                    let lock = store_write_lock(&inner.store, &folder);
+                    let _guard = lock.lock().await;
                     let outcome = async {
                         let deleted = inner.store.delete(&path).await?;
                         inner.store.delete(&description_file_name(&path)).await?;
@@ -501,7 +498,8 @@ impl FileMemoryProvider {
                         Ok(path) => path,
                         Err(message) => return Ok(text(message)),
                     };
-                    let _guard = inner.write_lock.lock().await;
+                    let lock = store_write_lock(&inner.store, &folder);
+                    let _guard = lock.lock().await;
                     let outcome = async {
                         let Some(content) = inner.store.read(&path).await? else {
                             return Ok(None);
@@ -547,7 +545,8 @@ impl FileMemoryProvider {
                         Ok(path) => path,
                         Err(message) => return Ok(text(message)),
                     };
-                    let _guard = inner.write_lock.lock().await;
+                    let lock = store_write_lock(&inner.store, &folder);
+                    let _guard = lock.lock().await;
                     let outcome = async {
                         let Some(content) = inner.store.read(&path).await? else {
                             return Ok(false);
@@ -716,14 +715,15 @@ mod tests {
     }
 
     #[test]
-    fn derived_providers_share_one_write_lock() {
+    fn providers_on_one_store_share_a_folder_lock() {
         // They write to the same store, so their writes must not interleave.
-        let store = Arc::new(super::super::file_store::InMemoryAgentFileStore::new());
-        let base = FileMemoryProvider::new(store).with_scope("user-1");
-        let derived = base.clone().with_instructions("Use memory.");
-        assert!(Arc::ptr_eq(
-            &base.inner.write_lock,
-            &derived.inner.write_lock
-        ));
+        let store: Arc<dyn AgentFileStore> =
+            Arc::new(super::super::file_store::InMemoryAgentFileStore::new());
+        let a = store_write_lock(&store, "Folder");
+        let b = store_write_lock(&store, "folder");
+        assert!(Arc::ptr_eq(&a, &b));
+        let other: Arc<dyn AgentFileStore> =
+            Arc::new(super::super::file_store::InMemoryAgentFileStore::new());
+        assert!(!Arc::ptr_eq(&a, &store_write_lock(&other, "folder")));
     }
 }

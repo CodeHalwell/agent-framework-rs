@@ -32,8 +32,8 @@ mod validation;
 mod viz;
 
 pub use checkpoint::{
-    get_checkpoint_summary, CheckpointStorage, FileCheckpointStorage, InMemoryCheckpointStorage,
-    WorkflowCheckpoint, WorkflowCheckpointSummary,
+    compare_checkpoints, get_checkpoint_summary, CheckpointStorage, FileCheckpointStorage,
+    InMemoryCheckpointStorage, WorkflowCheckpoint, WorkflowCheckpointSummary,
 };
 pub use context::{WorkflowContext, WorkflowMessage};
 pub use edge::{
@@ -44,13 +44,14 @@ pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
 pub use orchestration::{
     handoff_tool_name, handoff_tool_spec, AgentApprovalExecutor, AgentExecutor, ApprovalRequest,
-    ConcurrentBuilder, GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
-    HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode, HandoffUserInputRequest,
-    MagenticBuilder, MagenticContext, MagenticManager, MagenticPlanReviewDecision,
-    MagenticPlanReviewRequest, MagenticProgressLedger, MagenticProgressLedgerItem,
-    MagenticStallInterventionDecision, MagenticStallInterventionRequest, MagenticTaskLedger,
-    ManagerSelectionResponse, RoundRobinManager, SequentialBuilder, StandardMagenticManager,
-    WorkflowAgent, WorkflowAgentExt, DEFAULT_GROUP_CHAT_MAX_ITERATIONS,
+    AutonomousMode, ConcurrentAggregator, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,
+    GroupChatManager, GroupChatState, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
+    HandoffUserInputRequest, MagenticBuilder, MagenticContext, MagenticManager,
+    MagenticPlanReviewDecision, MagenticPlanReviewRequest, MagenticProgressLedger,
+    MagenticProgressLedgerItem, MagenticStallInterventionDecision,
+    MagenticStallInterventionRequest, MagenticTaskLedger, ManagerSelectionResponse,
+    RoundRobinManager, SequentialBuilder, StandardMagenticManager, WorkflowAgent, WorkflowAgentExt,
+    DEFAULT_AUTONOMOUS_PROMPT, DEFAULT_AUTONOMOUS_TURN_LIMIT, DEFAULT_GROUP_CHAT_MAX_ITERATIONS,
     DEFAULT_MANAGER_INSTRUCTIONS, DEFAULT_MANAGER_STRUCTURED_OUTPUT_PROMPT, MAGENTIC_MANAGER_NAME,
     ORCHESTRATOR_FINAL_ANSWER_PROMPT, ORCHESTRATOR_PROGRESS_LEDGER_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_FACTS_PROMPT, ORCHESTRATOR_TASK_LEDGER_FACTS_UPDATE_PROMPT,
@@ -58,7 +59,9 @@ pub use orchestration::{
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 };
 pub use request_info::{PendingRequest, RequestInfoExecutor, RequestResponse};
-pub use runner::{Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream};
+pub use runner::{
+    Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream, WorkflowTelemetryOptions,
+};
 pub use shared_state::SharedState;
 pub use sub_workflow::WorkflowExecutor;
 pub use validation::{validate_workflow_graph, ValidationType, WorkflowValidationError};

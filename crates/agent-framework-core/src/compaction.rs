@@ -12,17 +12,17 @@
 //! `ContextWindow`) plus a `CompactionProvider(ContextProvider)` that wires a
 //! strategy into the client's `get_response` loop.
 //!
-//! This module intentionally delivers a smaller, dependency-free surface:
-//! the [`Tokenizer`] and [`CompactionStrategy`] abstractions upstream
-//! defines, plus four concrete, non-LLM strategies that mirror upstream's
-//! `Truncation`, `SlidingWindow`, `ContextWindow`/`TokenBudget`, and
-//! `ToolResult` (renamed [`SelectiveToolResult`] here to avoid confusion with
-//! `Content::FunctionResult`... "tool result" is the plain-English name).
-//! Compaction here works by *returning a reduced list* rather than annotating
-//! messages in place — simpler, and sufficient for the strategies included.
-//! Wiring a strategy into the client's `get_response` loop (upstream's
-//! `CompactionProvider`) is intentionally out of scope for this change; see
-//! `UPSTREAM_DRIFT.md` §9.
+//! This module delivers that surface in two layers. The message-list
+//! layer: the [`Tokenizer`] and [`CompactionStrategy`] abstractions and the
+//! non-LLM strategies [`Truncation`], [`SlidingWindow`], [`TokenBudget`],
+//! [`SelectiveToolResult`] / [`ToolResultCompactionStrategy`] and
+//! [`ContextWindowCompactionStrategy`], which return a reduced list rather
+//! than annotating messages in place. The group layer (`index`): the
+//! [`CompactionMessageIndex`] group model, [`CompactionTriggers`],
+//! [`PipelineCompactionStrategy`], [`TriggeredCompactionStrategy`] and the
+//! LLM-backed [`SummarizationCompactionStrategy`], over the asynchronous
+//! [`AsyncCompactionStrategy`] every synchronous strategy also implements.
+//! [`CompactionProvider`] runs either kind before each run.
 //!
 //! Compaction never errors on content: given any message list it returns a
 //! (possibly unchanged) retained subset that satisfies the strategy's
@@ -31,6 +31,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+
+pub mod index;
+pub use index::{
+    AsyncCompactionStrategy, CompactionGroupKind, CompactionMessageGroup, CompactionMessageIndex,
+    CompactionTrigger, CompactionTriggers, PipelineCompactionStrategy,
+    SummarizationCompactionStrategy, TriggeredCompactionStrategy, COMPACTION_SUMMARY_KEY,
+    DEFAULT_SUMMARIZATION_PROMPT, DEFAULT_SUMMARY_INPUT_TOKEN_BUDGET,
+};
 
 use crate::error::Result;
 use crate::memory::{ContextProvider, SessionContext};
@@ -419,6 +427,232 @@ impl CompactionStrategy for SelectiveToolResult {
             }
         }
         out
+    }
+}
+
+/// Formats the stand-in for a compacted tool result: called with the name of
+/// the tool that produced it (when its call is in the conversation) and the
+/// result.
+pub type ToolResultFormatter =
+    Arc<dyn Fn(Option<&str>, &crate::types::FunctionResultContent) -> String + Send + Sync>;
+
+/// [`SelectiveToolResult`] with a custom stand-in (upstream
+/// `ToolResultCompactionStrategy`'s `ToolCallFormatter`): all but the last
+/// `keep_last` tool results have their payload replaced by what the
+/// formatter returns, keeping each exchange paired.
+#[derive(Clone)]
+pub struct ToolResultCompactionStrategy {
+    keep_last: usize,
+    formatter: ToolResultFormatter,
+}
+
+impl std::fmt::Debug for ToolResultCompactionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolResultCompactionStrategy")
+            .field("keep_last", &self.keep_last)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolResultCompactionStrategy {
+    /// Keep the last `keep_last` results verbatim; replace the rest with
+    /// `[Tool results: <tool>]` (upstream's default label).
+    pub fn new(keep_last: usize) -> Self {
+        Self {
+            keep_last,
+            formatter: Arc::new(|tool, _| format!("[Tool results: {}]", tool.unwrap_or("tool"))),
+        }
+    }
+
+    /// Format the stand-in with `formatter`.
+    pub fn with_formatter(
+        mut self,
+        formatter: impl Fn(Option<&str>, &crate::types::FunctionResultContent) -> String
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.formatter = Arc::new(formatter);
+        self
+    }
+}
+
+impl CompactionStrategy for ToolResultCompactionStrategy {
+    fn compact(&self, messages: &[Message], _tokenizer: &dyn Tokenizer) -> Vec<Message> {
+        let names: std::collections::HashMap<&str, &str> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::FunctionCall(fc) => Some((fc.call_id.as_str(), fc.name.as_str())),
+                _ => None,
+            })
+            .collect();
+        let tool_result_count = messages.iter().filter(|m| has_tool_result(m)).count();
+        let mut strip_budget = tool_result_count.saturating_sub(self.keep_last);
+        let mut out = Vec::with_capacity(messages.len());
+        for message in messages {
+            if has_tool_result(message) && strip_budget > 0 {
+                strip_budget -= 1;
+                let mut compacted = message.clone();
+                for content in &mut compacted.contents {
+                    if let Content::FunctionResult(fr) = content {
+                        let text = (self.formatter)(names.get(fr.call_id.as_str()).copied(), fr);
+                        fr.result = Some(serde_json::Value::String(text.clone()));
+                        // As in `SelectiveToolResult`: converters render the
+                        // exception instead of the result.
+                        if fr.exception.is_some() {
+                            fr.exception = Some(text);
+                        }
+                    }
+                }
+                out.push(compacted);
+            } else {
+                out.push(message.clone());
+            }
+        }
+        out
+    }
+}
+
+/// Token-budget compaction from a model's context window (upstream
+/// `ContextWindowCompactionStrategy`): the input budget is the window less
+/// the output reservation; once the conversation passes
+/// `tool_eviction_threshold` of it, older tool results are collapsed (the
+/// last `keep_last_tool_call_groups` kept), and if it then still passes
+/// `truncation_threshold`, the oldest messages are dropped down to the
+/// eviction level.
+#[derive(Debug, Clone)]
+pub struct ContextWindowCompactionStrategy {
+    max_context_window_tokens: usize,
+    max_output_tokens: usize,
+    tool_eviction_threshold: f64,
+    truncation_threshold: f64,
+    keep_last_tool_call_groups: usize,
+    preserve_first_user: bool,
+}
+
+impl ContextWindowCompactionStrategy {
+    /// Upstream's default eviction threshold.
+    pub const DEFAULT_TOOL_EVICTION_THRESHOLD: f64 = 0.5;
+    /// Upstream's default truncation threshold.
+    pub const DEFAULT_TRUNCATION_THRESHOLD: f64 = 0.8;
+
+    /// A strategy for a `max_context_window_tokens` window reserving
+    /// `max_output_tokens` for the reply.
+    pub fn new(
+        max_context_window_tokens: usize,
+        max_output_tokens: usize,
+    ) -> crate::error::Result<Self> {
+        if max_context_window_tokens == 0 {
+            return Err(crate::error::Error::Configuration(
+                "max_context_window_tokens must be positive.".into(),
+            ));
+        }
+        if max_output_tokens >= max_context_window_tokens {
+            return Err(crate::error::Error::Configuration(
+                "max_output_tokens must be >= 0 and < max_context_window_tokens.".into(),
+            ));
+        }
+        Ok(Self {
+            max_context_window_tokens,
+            max_output_tokens,
+            tool_eviction_threshold: Self::DEFAULT_TOOL_EVICTION_THRESHOLD,
+            truncation_threshold: Self::DEFAULT_TRUNCATION_THRESHOLD,
+            keep_last_tool_call_groups: 4,
+            preserve_first_user: false,
+        })
+    }
+
+    fn check(eviction: f64, truncation: f64) -> crate::error::Result<()> {
+        let in_range = |t: f64| t > 0.0 && t <= 1.0;
+        if !in_range(eviction) {
+            return Err(crate::error::Error::Configuration(
+                "tool_eviction_threshold must be in (0.0, 1.0].".into(),
+            ));
+        }
+        if !in_range(truncation) {
+            return Err(crate::error::Error::Configuration(
+                "truncation_threshold must be in (0.0, 1.0].".into(),
+            ));
+        }
+        if truncation < eviction {
+            return Err(crate::error::Error::Configuration(
+                "truncation_threshold must be >= tool_eviction_threshold.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fraction of the input budget at which tool results are evicted.
+    pub fn with_tool_eviction_threshold(mut self, threshold: f64) -> crate::error::Result<Self> {
+        Self::check(threshold, self.truncation_threshold)?;
+        self.tool_eviction_threshold = threshold;
+        Ok(self)
+    }
+
+    /// The fraction of the input budget at which messages are truncated.
+    pub fn with_truncation_threshold(mut self, threshold: f64) -> crate::error::Result<Self> {
+        Self::check(self.tool_eviction_threshold, threshold)?;
+        self.truncation_threshold = threshold;
+        Ok(self)
+    }
+
+    /// How many recent tool results eviction keeps (default 4).
+    pub fn with_keep_last_tool_call_groups(mut self, keep: usize) -> Self {
+        self.keep_last_tool_call_groups = keep;
+        self
+    }
+
+    /// Keep the earliest user message through truncation.
+    pub fn preserve_first_user(mut self) -> Self {
+        self.preserve_first_user = true;
+        self
+    }
+
+    /// The model's context window.
+    pub fn max_context_window_tokens(&self) -> usize {
+        self.max_context_window_tokens
+    }
+
+    /// The output reservation.
+    pub fn max_output_tokens(&self) -> usize {
+        self.max_output_tokens
+    }
+
+    /// The input budget: the window less the output reservation.
+    pub fn input_budget_tokens(&self) -> usize {
+        self.max_context_window_tokens - self.max_output_tokens
+    }
+
+    /// The eviction threshold.
+    pub fn tool_eviction_threshold(&self) -> f64 {
+        self.tool_eviction_threshold
+    }
+
+    /// The truncation threshold.
+    pub fn truncation_threshold(&self) -> f64 {
+        self.truncation_threshold
+    }
+}
+
+impl CompactionStrategy for ContextWindowCompactionStrategy {
+    fn compact(&self, messages: &[Message], tokenizer: &dyn Tokenizer) -> Vec<Message> {
+        let budget = self.input_budget_tokens() as f64;
+        let eviction_tokens = (budget * self.tool_eviction_threshold) as usize;
+        let truncation_tokens = (budget * self.truncation_threshold) as usize;
+        let total =
+            |m: &[Message]| -> usize { m.iter().map(|m| count_message_tokens(tokenizer, m)).sum() };
+        let mut current = messages.to_vec();
+        if total(&current) > eviction_tokens {
+            current = ToolResultCompactionStrategy::new(self.keep_last_tool_call_groups)
+                .compact(&current, tokenizer);
+        }
+        if total(&current) > truncation_tokens {
+            let mut truncation = TokenBudget::new(eviction_tokens);
+            truncation.preserve_first_user = self.preserve_first_user;
+            current = truncation.compact(&current, tokenizer);
+        }
+        current
     }
 }
 
@@ -1011,7 +1245,7 @@ fn without_settled_approvals(messages: &[Message]) -> Vec<Message> {
 /// so compaction always sees the full, history-prepended message list for the
 /// run.
 pub struct CompactionProvider {
-    strategy: Arc<dyn CompactionStrategy>,
+    strategy: Arc<dyn AsyncCompactionStrategy>,
     tokenizer: Box<dyn Tokenizer>,
 }
 
@@ -1032,6 +1266,16 @@ impl CompactionProvider {
             tokenizer: Box::new(tokenizer),
         }
     }
+
+    /// A compaction provider running an [`AsyncCompactionStrategy`] — a
+    /// [`SummarizationCompactionStrategy`], a [`PipelineCompactionStrategy`]
+    /// or a [`TriggeredCompactionStrategy`] — with the default tokenizer.
+    pub fn with_async_strategy(strategy: impl AsyncCompactionStrategy + 'static) -> Self {
+        Self {
+            strategy: Arc::new(strategy),
+            tokenizer: Box::new(ApproxTokenizer),
+        }
+    }
 }
 
 #[async_trait]
@@ -1042,7 +1286,10 @@ impl ContextProvider for CompactionProvider {
         // Settlement is decided on the uncompacted history (see
         // `without_settled_approvals`); the run's input is not ours to edit.
         crate::client::drop_settled_approval_responses(&mut ctx.messages);
-        let retained = self.strategy.compact(&ctx.messages, &*self.tokenizer);
+        let retained = self
+            .strategy
+            .compact_async(&ctx.messages, &*self.tokenizer)
+            .await;
         // Pair against the run's input as well as history. `prepare_request`
         // appends `input_messages` *after* every provider has run, so a
         // declaration-only (frontend) tool call sitting in history is routinely
@@ -2952,5 +3199,61 @@ mod tests {
             .after_run(&[Message::new(Role::user(), "hi")], &[], None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn tool_result_compaction_formats_its_stand_in() {
+        let messages = vec![
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::FunctionCall(
+                    crate::types::FunctionCallContent::new("c1", "search", None),
+                )],
+            ),
+            Message::with_contents(
+                Role::tool(),
+                vec![Content::FunctionResult(
+                    crate::types::FunctionResultContent::new("c1", Some(serde_json::json!("big"))),
+                )],
+            ),
+        ];
+        let out = ToolResultCompactionStrategy::new(0).compact(&messages, &ApproxTokenizer);
+        let Content::FunctionResult(fr) = &out[2].contents[0] else {
+            panic!("kept as a result")
+        };
+        assert_eq!(fr.result, Some(serde_json::json!("[Tool results: search]")));
+        let custom = ToolResultCompactionStrategy::new(0)
+            .with_formatter(|tool, r| format!("{}:{}", tool.unwrap_or("?"), r.call_id))
+            .compact(&messages, &ApproxTokenizer);
+        let Content::FunctionResult(fr) = &custom[2].contents[0] else {
+            panic!()
+        };
+        assert_eq!(fr.result, Some(serde_json::json!("search:c1")));
+    }
+
+    #[test]
+    fn context_window_compaction_evicts_then_truncates() {
+        assert!(ContextWindowCompactionStrategy::new(100, 100).is_err());
+        assert!(ContextWindowCompactionStrategy::new(100, 10)
+            .unwrap()
+            .with_truncation_threshold(0.1)
+            .is_err());
+        let strategy = ContextWindowCompactionStrategy::new(120, 20).unwrap();
+        assert_eq!(strategy.input_budget_tokens(), 100);
+        // Small conversations pass through.
+        let small = vec![Message::user("hi")];
+        assert_eq!(strategy.compact(&small, &ApproxTokenizer).len(), 1);
+        // Forty ~10-token messages (~400 tokens) are cut to the eviction level.
+        let big: Vec<Message> = (0..40)
+            .map(|i| Message::user(format!("message number {i:02} with padding")))
+            .collect();
+        let out = strategy.compact(&big, &ApproxTokenizer);
+        let tokens: usize = out
+            .iter()
+            .map(|m| count_message_tokens(&ApproxTokenizer, m))
+            .sum();
+        assert!(tokens <= 50, "{tokens}");
+        assert_eq!(out.last().unwrap().text(), big.last().unwrap().text());
     }
 }

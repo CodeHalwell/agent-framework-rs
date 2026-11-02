@@ -11,6 +11,11 @@ categories.workspace = true
 readme.workspace = true
 description = "Azure AI Foundry (Responses API) chat client and Prompt Agents for agent-framework-rs"
 
+[features]
+# EVALS (experimental upstream): `evals::FoundryEvals`, the Foundry cloud
+# evaluator for agent_framework_core::evaluation.
+evals = ["agent-framework-core/experimental-evals"]
+
 [dependencies]
 agent-framework-core = { workspace = true }
 agent-framework-azure = { workspace = true }
@@ -27,3 +32,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }
+
+[[test]]
+name = "evals_loopback"
+required-features = ["evals"]

@@ -17,9 +17,9 @@
 
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
-    ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, Message, Role, TextReasoningContent, ToolMode,
-    UsageDetails,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
+    FunctionArguments, FunctionCallContent, FunctionResultContent, Message, Role,
+    TextReasoningContent, ToolMode, UsageContent, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -552,6 +552,109 @@ fn reasoning_to_block(tr: &TextReasoningContent) -> Option<Value> {
             "reasoningText": { "text": tr.text, "signature": signature }
         }
     }))
+}
+
+/// Per-stream state for [`parse_stream_event`]: which tool call each content
+/// block index belongs to, since `toolUse` input deltas carry only the index.
+#[derive(Debug, Default)]
+pub struct ConverseStreamState {
+    tool_ids: std::collections::HashMap<i64, String>,
+}
+
+/// Map one `ConverseStream` event to an update, or `None` when it carries
+/// nothing for the caller (`contentBlockStop`, an empty start, metrics).
+///
+/// The events are `messageStart`, `contentBlockStart` (a `toolUse` start
+/// names the call), `contentBlockDelta` (`text`, `toolUse.input` fragments,
+/// or `reasoningContent` text, signature or redacted content),
+/// `contentBlockStop`, `messageStop` (`stopReason`) and `metadata` (`usage`).
+/// Streamed reasoning follows the same fragment shape the Anthropic client
+/// uses: text fragments, then the signature as an empty-text fragment that
+/// coalesces onto them, so the aggregated reasoning replays through
+/// [`reasoning_to_block`] exactly as a non-streamed one does.
+pub fn parse_stream_event(
+    event_type: &str,
+    payload: &Value,
+    state: &mut ConverseStreamState,
+) -> Option<ChatResponseUpdate> {
+    let update = |contents: Vec<Content>| ChatResponseUpdate {
+        contents,
+        role: Some(Role::assistant()),
+        ..Default::default()
+    };
+    let index = payload
+        .get("contentBlockIndex")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    match event_type {
+        "messageStart" => Some(update(Vec::new())),
+        "contentBlockStart" => {
+            let tool = payload.get("start")?.get("toolUse")?;
+            let call_id = tool
+                .get("toolUseId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+            state.tool_ids.insert(index, call_id.to_string());
+            Some(update(vec![Content::FunctionCall(
+                FunctionCallContent::new(call_id, name, None),
+            )]))
+        }
+        "contentBlockDelta" => {
+            let delta = payload.get("delta")?;
+            if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                return Some(update(vec![Content::text(text)]));
+            }
+            if let Some(input) = delta.get("toolUse").and_then(|t| t.get("input")) {
+                let call_id = state.tool_ids.get(&index).cloned().unwrap_or_default();
+                let partial = input
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| input.to_string());
+                return Some(update(vec![Content::FunctionCall(
+                    FunctionCallContent::new(call_id, "", Some(FunctionArguments::Raw(partial))),
+                )]));
+            }
+            let reasoning = delta.get("reasoningContent")?;
+            let fragment = if let Some(text) = reasoning.get("text").and_then(Value::as_str) {
+                TextReasoningContent {
+                    text: text.to_string(),
+                    ..Default::default()
+                }
+            } else if let Some(sig) = reasoning.get("signature").and_then(Value::as_str) {
+                TextReasoningContent {
+                    protected_data: Some(sig.to_string()),
+                    ..Default::default()
+                }
+            } else {
+                let redacted = reasoning.get("redactedContent")?;
+                TextReasoningContent {
+                    raw_representation: Some(
+                        json!({ "reasoningContent": { "redactedContent": redacted } }),
+                    ),
+                    ..Default::default()
+                }
+            };
+            Some(update(vec![Content::TextReasoning(fragment)]))
+        }
+        "messageStop" => {
+            let reason = payload.get("stopReason").and_then(Value::as_str)?;
+            Some(ChatResponseUpdate {
+                finish_reason: Some(map_stop_reason(reason)),
+                ..Default::default()
+            })
+        }
+        "metadata" => {
+            let usage = payload.get("usage")?;
+            Some(ChatResponseUpdate {
+                contents: vec![Content::Usage(UsageContent {
+                    details: parse_usage(usage),
+                })],
+                ..Default::default()
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Map a Converse `stopReason` to a [`FinishReason`].

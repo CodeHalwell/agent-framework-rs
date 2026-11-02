@@ -39,7 +39,7 @@ use super::events::WorkflowEvent;
 use super::executor::Executor;
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
-use crate::types::{AgentResponse, AgentResponseUpdate, Message};
+use crate::types::{AgentResponse, AgentResponseUpdate, Message, Role};
 
 mod approval;
 mod concurrent;
@@ -50,15 +50,16 @@ mod sequential;
 mod workflow_agent;
 
 pub use approval::{AgentApprovalExecutor, ApprovalRequest};
-pub use concurrent::ConcurrentBuilder;
+pub use concurrent::{ConcurrentAggregator, ConcurrentBuilder};
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
     ManagerSelectionResponse, RoundRobinManager, DEFAULT_GROUP_CHAT_MAX_ITERATIONS,
     DEFAULT_MANAGER_INSTRUCTIONS, DEFAULT_MANAGER_STRUCTURED_OUTPUT_PROMPT,
 };
 pub use handoff::{
-    handoff_tool_name, handoff_tool_spec, HandoffBuilder, HandoffEdgeBuilder,
-    HandoffInteractionMode, HandoffUserInputRequest,
+    handoff_tool_name, handoff_tool_spec, AutonomousMode, HandoffBuilder, HandoffEdgeBuilder,
+    HandoffInteractionMode, HandoffUserInputRequest, DEFAULT_AUTONOMOUS_PROMPT,
+    DEFAULT_AUTONOMOUS_TURN_LIMIT,
 };
 pub use magentic::{
     MagenticBuilder, MagenticContext, MagenticManager, MagenticPlanReviewDecision,
@@ -233,6 +234,30 @@ pub(crate) fn ensure_author(mut message: Message, name: &str) -> Message {
     message
 }
 
+/// The synthetic user turn [`invocation_messages`] appends. Upstream's text.
+pub(crate) const CONTINUATION_TURN: &str = "please continue.";
+
+/// The messages to actually run an agent over: `conversation`, plus a
+/// synthetic [`CONTINUATION_TURN`] user message when
+/// `ensure_trailing_user_turn` is set and the conversation ends on an
+/// assistant turn (upstream #8779).
+///
+/// Chaining agents hands each one a conversation ending on the previous
+/// agent's reply, and some chat-completions providers answer a prompt that
+/// ends on `assistant` with empty text. The continuation goes on this
+/// invocation-only copy, never on the conversation itself, so it is not
+/// forwarded downstream, yielded as output or seen by any other participant.
+pub(crate) fn invocation_messages(
+    conversation: &[Message],
+    ensure_trailing_user_turn: bool,
+) -> Vec<Message> {
+    let mut messages = conversation.to_vec();
+    if ensure_trailing_user_turn && messages.last().is_some_and(|m| m.role == Role::assistant()) {
+        messages.push(Message::user(CONTINUATION_TURN));
+    }
+    messages
+}
+
 /// Run an agent over a conversation and surface its activity on the event
 /// stream incrementally: an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate)
 /// per streamed [`AgentResponseUpdate`] as it arrives, then a final
@@ -250,6 +275,7 @@ pub(crate) async fn run_agent_and_emit(
     author: &str,
     ctx: &WorkflowContext,
 ) -> Result<AgentResponse> {
+    let input = serde_json::to_value(&conversation).unwrap_or(Value::Null);
     let mut stream = agent.run_stream(conversation, None, None).await?;
     let mut updates: Vec<AgentResponseUpdate> = Vec::new();
     while let Some(item) = stream.next().await {
@@ -276,6 +302,7 @@ pub(crate) async fn run_agent_and_emit(
         ctx.add_event(WorkflowEvent::AgentRun {
             executor_id: executor_id.to_string(),
             response: resp_value,
+            input,
         });
     }
     Ok(response)
@@ -295,6 +322,12 @@ pub struct AgentExecutor {
     /// source — see [`SequentialBuilder::output_from`](super::SequentialBuilder::output_from)
     /// and [`ConcurrentBuilder::output_from`](super::ConcurrentBuilder::output_from).
     also_send: bool,
+    /// See [`Self::with_trailing_user_turn`].
+    ensure_trailing_user_turn: bool,
+    /// See [`Self::with_chain_only_responses`].
+    chain_only_responses: bool,
+    /// See [`Self::with_reassign_other_agents_as_users`].
+    reassign_other_agents_as_users: bool,
 }
 
 impl AgentExecutor {
@@ -305,7 +338,37 @@ impl AgentExecutor {
             agent,
             emit_output: false,
             also_send: false,
+            ensure_trailing_user_turn: false,
+            chain_only_responses: false,
+            reassign_other_agents_as_users: false,
         }
+    }
+
+    /// Send downstream only this agent's response, not the whole
+    /// conversation (upstream `WithChainOnlyAgentResponses`). Its workflow
+    /// output, when it yields one, is still the whole conversation.
+    pub fn with_chain_only_responses(mut self, chain_only: bool) -> Self {
+        self.chain_only_responses = chain_only;
+        self
+    }
+
+    /// Present other agents' assistant messages to this agent as user
+    /// messages (upstream `AIAgentHostOptions.ReassignOtherAgentsAsUsers`), so
+    /// it answers them rather than treating them as its own earlier turns.
+    /// Messages keep their author name.
+    pub fn with_reassign_other_agents_as_users(mut self, reassign: bool) -> Self {
+        self.reassign_other_agents_as_users = reassign;
+        self
+    }
+
+    /// When set, a conversation ending on an assistant message is run with a
+    /// synthetic user continuation turn appended, for providers that answer
+    /// such a prompt with empty text. The turn is invocation-only: it is
+    /// never added to the conversation passed on. Off by default. See
+    /// [`SequentialBuilder::ensure_trailing_user_turn`](super::SequentialBuilder::ensure_trailing_user_turn).
+    pub fn with_trailing_user_turn(mut self, ensure: bool) -> Self {
+        self.ensure_trailing_user_turn = ensure;
+        self
     }
 
     /// When set, the executor yields the running conversation as a workflow
@@ -338,17 +401,37 @@ impl Executor for AgentExecutor {
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         let mut conversation = parse_conversation(&message)?;
+        let mut invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
+        if self.reassign_other_agents_as_users {
+            let own = self.agent.name().map(str::to_string);
+            for m in &mut invocation {
+                let from_other = m.role == crate::types::Role::assistant()
+                    && m.author_name.is_some()
+                    && m.author_name != own;
+                if from_other {
+                    m.role = crate::types::Role::user();
+                }
+            }
+        }
         let response =
-            run_agent_and_emit(&self.agent, conversation.clone(), &self.id, &self.id, &ctx).await?;
+            run_agent_and_emit(&self.agent, invocation, &self.id, &self.id, &ctx).await?;
 
-        conversation.extend(response.messages);
-        let payload = serde_json::to_value(&conversation)
-            .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))?;
+        let reply = response.messages;
+        conversation.extend(reply.iter().cloned());
+        let to_value = |messages: &Vec<Message>| {
+            serde_json::to_value(messages)
+                .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))
+        };
+        let payload = to_value(&conversation)?;
         if self.emit_output {
             ctx.yield_output(payload.clone()).await?;
         }
         if !self.emit_output || self.also_send {
-            ctx.send_message(payload).await?;
+            if self.chain_only_responses {
+                ctx.send_message(to_value(&reply)?).await?;
+            } else {
+                ctx.send_message(payload).await?;
+            }
         }
         Ok(())
     }

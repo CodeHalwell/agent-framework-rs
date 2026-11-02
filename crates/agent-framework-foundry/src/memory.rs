@@ -180,6 +180,11 @@ impl State {
     /// the map simply runs over capacity until one frees up, which is the
     /// right trade: the bound exists to stop unbounded growth, not to be
     /// honoured at the cost of correctness.
+    /// Drop a scope's cached state (its profile and cursors).
+    fn forget(&mut self, scope: &str) {
+        self.scopes.remove(scope);
+    }
+
     fn touch(&mut self, scope: &str, capacity: usize) -> Arc<Mutex<ScopeState>> {
         self.tick += 1;
         let tick = self.tick;
@@ -235,7 +240,14 @@ pub struct FoundryMemoryProvider {
     max_cached_scopes: usize,
     /// Latch so the "no scope" warning is logged once rather than per run.
     warned_no_scope: AtomicBool,
+    max_memories: Option<usize>,
+    search_input_filter: Option<MessageFilter>,
+    storage_request_filter: Option<MessageFilter>,
+    storage_response_filter: Option<MessageFilter>,
 }
+
+/// Filters messages before they are searched with or stored.
+pub type MessageFilter = Arc<dyn Fn(&[Message]) -> Vec<Message> + Send + Sync>;
 
 impl std::fmt::Debug for FoundryMemoryProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -271,7 +283,149 @@ impl FoundryMemoryProvider {
             state: Mutex::new(State::default()),
             max_cached_scopes: DEFAULT_MAX_CACHED_SCOPES,
             warned_no_scope: AtomicBool::new(false),
+            max_memories: None,
+            search_input_filter: None,
+            storage_request_filter: None,
+            storage_response_filter: None,
         }
+    }
+
+    /// Ask for at most `max` memories per search (upstream `MaxMemories`).
+    pub fn with_max_memories(mut self, max: usize) -> Self {
+        self.max_memories = Some(max.max(1));
+        self
+    }
+
+    /// Choose which of the run's input messages the search uses (upstream
+    /// `SearchInputMessageFilter`).
+    pub fn with_search_input_filter(
+        mut self,
+        filter: impl Fn(&[Message]) -> Vec<Message> + Send + Sync + 'static,
+    ) -> Self {
+        self.search_input_filter = Some(Arc::new(filter));
+        self
+    }
+
+    /// Choose which request messages are stored (upstream
+    /// `StorageInputRequestMessageFilter`).
+    pub fn with_storage_request_filter(
+        mut self,
+        filter: impl Fn(&[Message]) -> Vec<Message> + Send + Sync + 'static,
+    ) -> Self {
+        self.storage_request_filter = Some(Arc::new(filter));
+        self
+    }
+
+    /// Choose which response messages are stored (upstream
+    /// `StorageInputResponseMessageFilter`).
+    pub fn with_storage_response_filter(
+        mut self,
+        filter: impl Fn(&[Message]) -> Vec<Message> + Send + Sync + 'static,
+    ) -> Self {
+        self.storage_response_filter = Some(Arc::new(filter));
+        self
+    }
+
+    /// Delete every memory stored under `session`'s scope (upstream
+    /// `EnsureStoredMemoriesDeletedAsync`): the configured scope, else the
+    /// session id. A store without that scope is not an error.
+    pub async fn ensure_stored_memories_deleted(
+        &self,
+        session: &agent_framework_core::session::AgentSession,
+    ) -> Result<()> {
+        let scope = self
+            .resolve_scope(Some(session.session_id()))
+            .expect("a session id is always present");
+        let (status, text) = self
+            .send(
+                reqwest::Method::POST,
+                self.url("delete_scope"),
+                Some(json!({ "scope": scope })),
+            )
+            .await?;
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            self.state.lock().await.forget(&scope);
+            return Ok(());
+        }
+        Err(Error::service(format!(
+            "Foundry memory API error {status}: {text}"
+        )))
+    }
+
+    /// Create the memory store if it does not exist yet (upstream
+    /// `EnsureMemoryStoreCreatedAsync`), using `chat_model` and
+    /// `embedding_model` deployments. Returns whether it was created.
+    pub async fn ensure_memory_store_created(
+        &self,
+        chat_model: &str,
+        embedding_model: &str,
+        description: Option<&str>,
+    ) -> Result<bool> {
+        let store_url = format!(
+            "{}/memory_stores/{}?api-version={}",
+            self.endpoint, self.memory_store_name, self.api_version
+        );
+        let (status, text) = self.send(reqwest::Method::GET, store_url, None).await?;
+        if status.is_success() {
+            return Ok(false);
+        }
+        if status != reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::service(format!(
+                "Foundry memory API error {status}: {text}"
+            )));
+        }
+        let mut body = json!({
+            "name": self.memory_store_name,
+            "definition": {
+                "kind": "default",
+                "chat_model": chat_model,
+                "embedding_model": embedding_model,
+            },
+        });
+        if let Some(d) = description {
+            body["description"] = json!(d);
+        }
+        let create_url = format!(
+            "{}/memory_stores?api-version={}",
+            self.endpoint, self.api_version
+        );
+        let (status, text) = self
+            .send(reqwest::Method::POST, create_url, Some(body))
+            .await?;
+        if status.is_success() {
+            Ok(true)
+        } else if status == reqwest::StatusCode::CONFLICT {
+            // Created concurrently.
+            Ok(false)
+        } else {
+            Err(Error::service(format!(
+                "Foundry memory API error {status}: {text}"
+            )))
+        }
+    }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let token = self
+            .credential
+            .get_token_for_scope(&self.token_scope)
+            .await?;
+        let mut request = self.http.request(method, url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let resp = request.send().await.map_err(|e| {
+            Error::service(format!(
+                "Foundry memory request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
+        let status = resp.status();
+        Ok((status, resp.text().await.unwrap_or_default()))
     }
 
     /// Pin the memory scope — the namespace that isolates one user's or one
@@ -359,7 +513,12 @@ impl FoundryMemoryProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("Foundry memory request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "Foundry memory request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -390,6 +549,9 @@ impl FoundryMemoryProvider {
         }
         if let Some(id) = previous_search_id {
             body.insert("previous_search_id".into(), json!(id));
+        }
+        if let Some(max) = self.max_memories {
+            body.insert("options".into(), json!({ "max_memories": max }));
         }
         let value = self.post("search_memories", &Value::Object(body)).await?;
         Ok(SearchResult {
@@ -504,7 +666,11 @@ impl ContextProvider for FoundryMemoryProvider {
         // (Upstream returns outright here, losing the profile; that made the
         // empty-input path disagree with the search-failed path below, which
         // does inject it.)
-        let items = message_items(&ctx.input_messages);
+        let search_input = match &self.search_input_filter {
+            Some(f) => f(&ctx.input_messages),
+            None => ctx.input_messages.clone(),
+        };
+        let items = message_items(&search_input);
         if !items.is_empty() {
             match self
                 .search(&scope, Some(items), entry.previous_search_id.as_deref())
@@ -565,8 +731,14 @@ impl ContextProvider for FoundryMemoryProvider {
             (scope, slot)
         };
 
-        let mut all: Vec<Message> = request_messages.to_vec();
-        all.extend_from_slice(response_messages);
+        let mut all: Vec<Message> = match &self.storage_request_filter {
+            Some(f) => f(request_messages),
+            None => request_messages.to_vec(),
+        };
+        match &self.storage_response_filter {
+            Some(f) => all.extend(f(response_messages)),
+            None => all.extend_from_slice(response_messages),
+        }
         let items = message_items(&all);
         if items.is_empty() {
             return Ok(());

@@ -49,14 +49,13 @@
 //! # }
 //! ```
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, Content, Message, Role, UsageContent,
-};
-use futures::stream::{self, StreamExt};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+use futures::stream::StreamExt;
 use serde_json::Value;
 
 use crate::convert;
@@ -174,7 +173,7 @@ impl AnthropicVertexClient {
         let region = region.into();
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 project_id: project_id.into(),
                 endpoint: format!("https://{region}-aiplatform.googleapis.com"),
                 region,
@@ -204,6 +203,14 @@ impl AnthropicVertexClient {
             .or_else(|_| std::env::var("ANTHROPIC_VERTEX_REGION"))
             .unwrap_or_else(|_| DEFAULT_REGION.to_string());
         Ok(Self::new(project_id, region, model, token_provider))
+    }
+
+    /// Send requests to `endpoint` (`scheme://host[:port]`) instead of the
+    /// region's public `{region}-aiplatform.googleapis.com` — a Private
+    /// Service Connect endpoint, or a proxy. The request path is unchanged.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.inner).endpoint = endpoint.into().trim_end_matches('/').to_string();
+        self
     }
 
     /// Override the default `max_tokens` sent when `ChatOptions::max_tokens`
@@ -250,17 +257,22 @@ impl AnthropicVertexClient {
         )
     }
 
-    async fn send(&self, model: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn send(&self, model: &str, body: &Value, streaming: bool) -> Result<reqwest::Response> {
         let token = self.inner.token_provider.access_token()?;
         let resp = self
             .inner
             .http
-            .post(self.url(model, false))
+            .post(self.url(model, streaming))
             .bearer_auth(token)
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -273,6 +285,30 @@ impl AnthropicVertexClient {
     }
 }
 
+impl AnthropicVertexClient {
+    /// Send one request to `streamRawPredict` for `conversation`, which
+    /// streams the Messages API's SSE framing, and parse it. `paused` is set
+    /// if it ends on `pause_turn`.
+    async fn open_stream(
+        &self,
+        conversation: &[Message],
+        options: &ChatOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<ChatStream> {
+        let model = self.effective_model(options);
+        let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
+        let body = convert::build_cloud_request(
+            conversation,
+            options,
+            max_tokens,
+            true,
+            ANTHROPIC_VERTEX_VERSION,
+        );
+        let resp = self.send(&model, &body, true).await?;
+        Ok(crate::parse_sse_stream(resp, paused).boxed())
+    }
+}
+
 #[async_trait::async_trait]
 impl ChatClient for AnthropicVertexClient {
     async fn get_response(
@@ -282,62 +318,46 @@ impl ChatClient for AnthropicVertexClient {
     ) -> Result<ChatResponse> {
         let model = self.effective_model(&options);
         let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
-        let body = convert::build_cloud_request(
-            &messages,
-            &options,
-            max_tokens,
-            false,
-            ANTHROPIC_VERTEX_VERSION,
-        );
-        let resp = self.send(&model, &body).await?;
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        Ok(convert::parse_response(&value))
+        let options = &options;
+        let model = &model;
+        // Continues the turn while the API pauses it — see
+        // `continue_paused_turns`.
+        crate::continue_paused_turns(messages, |conversation| async move {
+            let body = convert::build_cloud_request(
+                &conversation,
+                options,
+                max_tokens,
+                false,
+                ANTHROPIC_VERTEX_VERSION,
+            );
+            let resp = self.send(model, &body, false).await?;
+            resp.json::<Value>()
+                .await
+                .map_err(|e| Error::service(format!("invalid response json: {e}")))
+        })
+        .await
     }
 
-    /// Get a streaming response.
-    ///
-    /// Vertex AI's `streamRawPredict` route does stream Anthropic's usual SSE
-    /// framing, but wiring up a second SSE consumer here (duplicating
-    /// [`crate::AnthropicClient`]'s `parse_sse_stream`) plus a
-    /// synchronous-token-provider-vs-long-lived-stream story is deferred as a
-    /// documented extension point for a first cut of this transport. This
-    /// method calls the non-streaming `rawPredict` route (the same request
-    /// [`ChatClient::get_response`] sends) and adapts the complete
-    /// [`ChatResponse`] into a single [`ChatResponseUpdate`] — the same
-    /// tactic [`crate::bedrock::AnthropicBedrockClient::get_streaming_response`]
-    /// and [`agent_framework_bedrock::BedrockChatClient::get_streaming_response`]
-    /// use. Callers driving this client through
-    /// [`ChatResponse::from_updates`](agent_framework_core::types::ChatResponse::from_updates)
-    /// still get a correct aggregated result; they just don't see partial
-    /// text arrive incrementally.
+    /// Streams the Messages API's SSE response as it arrives, continuing the
+    /// turn while the API pauses it (`continue_paused_stream`), like
+    /// [`crate::AnthropicClient`]. This used to send the non-streaming request
+    /// and replay the finished response as a single update, so a caller saw
+    /// nothing until the whole answer was ready.
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let response = self.get_response(messages, options).await?;
-
-        let mut contents: Vec<Content> = response
-            .messages
-            .iter()
-            .flat_map(|m| m.contents.iter().cloned())
-            .collect();
-        if let Some(usage) = response.usage_details.clone() {
-            contents.push(Content::Usage(UsageContent { details: usage }));
-        }
-
-        let update = ChatResponseUpdate {
-            contents,
-            role: Some(Role::assistant()),
-            response_id: response.response_id.clone(),
-            model: response.model.clone(),
-            finish_reason: response.finish_reason.clone(),
-            ..Default::default()
-        };
-        Ok(stream::once(async move { Ok(update) }).boxed())
+        let paused = Arc::new(AtomicBool::new(false));
+        let first = self
+            .open_stream(&messages, &options, paused.clone())
+            .await?;
+        let (client, opts) = (self.clone(), options);
+        let open: crate::StreamOpener = Arc::new(move |conversation, paused| {
+            let (client, opts) = (client.clone(), opts.clone());
+            Box::pin(async move { client.open_stream(&conversation, &opts, paused).await })
+        });
+        Ok(crate::continue_paused_stream(open, messages, first, paused).boxed())
     }
 
     fn model(&self) -> Option<&str> {

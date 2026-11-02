@@ -20,7 +20,7 @@ use agent_framework_azure::StaticTokenCredential;
 use agent_framework_core::agent::{Agent, AgentRunOptions, SupportsAgentRun};
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{ChatOptions, Content, Message};
-use agent_framework_foundry::{FoundryChatClient, FoundryClientHeaders};
+use agent_framework_foundry::{FoundryAgentChatClient, FoundryChatClient, FoundryClientHeaders};
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -95,6 +95,12 @@ struct FakeServer {
 
 impl FakeServer {
     fn start(event_stream: bool, body: &'static str) -> Self {
+        Self::start_with_delay(event_stream, body, Duration::ZERO)
+    }
+
+    /// Like [`FakeServer::start`], but waits `delay` after reading a request
+    /// before answering it — a stand-in for a slow or hung endpoint.
+    fn start_with_delay(event_stream: bool, body: &'static str, delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
         listener.set_nonblocking(true).expect("set nonblocking");
         let addr = format!("http://{}", listener.local_addr().unwrap());
@@ -110,6 +116,9 @@ impl FakeServer {
                         stream.set_nonblocking(false).expect("blocking");
                         let req = read_http_request(&mut stream);
                         requests_bg.lock().unwrap().push(req);
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
                         write_response(&mut stream, event_stream, body);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -165,6 +174,83 @@ async fn api_key_client_requests_carry_the_foundry_user_agent() {
     c.get_response(vec![Message::user("hi")], ChatOptions::default())
         .await
         .unwrap();
+    let (_line, headers, _body) = server.requests().remove(0);
+    let headers = headers.to_ascii_lowercase();
+    assert!(
+        headers.contains("(agent-framework-foundry)"),
+        "headers: {headers}"
+    );
+}
+
+/// How long the slow-endpoint tests make the server wait, and how long the
+/// client is given. The gap is wide enough that a loaded CI machine cannot
+/// flip the outcome either way.
+const SLOW_SERVER_DELAY: Duration = Duration::from_millis(600);
+const SHORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// `with_timeout` bounds a request that would otherwise hang (upstream
+/// #9699). `reqwest` applies no timeout of its own, so without this a hung
+/// Foundry endpoint stalls the run forever and there was no way to say
+/// otherwise.
+#[tokio::test]
+async fn a_request_that_outlives_the_timeout_fails_instead_of_hanging() {
+    let server = FakeServer::start_with_delay(false, OK_BODY, SLOW_SERVER_DELAY);
+    let c = client(&server.addr).with_timeout(SHORT_CLIENT_TIMEOUT);
+
+    let started = std::time::Instant::now();
+    let err = c
+        .get_response(vec![Message::user("hi")], ChatOptions::default())
+        .await
+        .expect_err("the request must not outlive its timeout");
+    let elapsed = started.elapsed();
+
+    // The bound has to end the request before the server would have
+    // answered...
+    assert!(
+        elapsed < SLOW_SERVER_DELAY,
+        "gave up after {elapsed:?}, which is not sooner than the server's \
+         {SLOW_SERVER_DELAY:?} delay — the timeout did not bound the request \
+         (error: {err})"
+    );
+    // ...and the error has to say it was a timeout. `reqwest`'s own Display
+    // is only "error sending request for url (...)", identical for a timeout
+    // and a refused connection; the cause is in its source chain, which the
+    // provider crates now include (`agent_framework_core::error::error_chain`).
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("timed out") || text.contains("timeout"),
+        "the error should name the timeout: {err}"
+    );
+}
+
+/// The guard for the test above: the same slow server answers fine when no
+/// timeout is set, so it is the bound that ends the request and not the
+/// fake server simply being broken.
+#[tokio::test]
+async fn the_same_slow_response_still_succeeds_with_no_timeout_set() {
+    let server = FakeServer::start_with_delay(false, OK_BODY, SLOW_SERVER_DELAY);
+    let c = client(&server.addr);
+
+    let response = c
+        .get_response(vec![Message::user("hi")], ChatOptions::default())
+        .await
+        .expect("no timeout set, so a slow answer is still an answer");
+    assert_eq!(response.text(), "ok");
+}
+
+/// `with_timeout` rebuilds the underlying HTTP client, which is also what
+/// carries this crate's `User-Agent`. Rebuilding it without the header would
+/// re-attribute Foundry traffic to `agent-framework-azure` — the very thing
+/// `http_client()` exists to prevent — so a timed client is checked for it
+/// too.
+#[tokio::test]
+async fn a_timed_client_still_sends_the_foundry_user_agent() {
+    let server = FakeServer::start(false, OK_BODY);
+    let c = client(&server.addr).with_timeout(Duration::from_secs(30));
+    c.get_response(vec![Message::user("hi")], ChatOptions::default())
+        .await
+        .unwrap();
+
     let (_line, headers, _body) = server.requests().remove(0);
     let headers = headers.to_ascii_lowercase();
     assert!(
@@ -504,4 +590,46 @@ async fn foundry_still_honors_an_explicitly_requested_include() {
         body_json["include"],
         serde_json::json!(["reasoning.encrypted_content"])
     );
+}
+
+/// A server-hosted agent: the request names the agent and carries no model
+/// or tool declarations, while a local function tool still dispatches.
+#[tokio::test]
+async fn hosted_agent_requests_reference_the_agent() {
+    let server = FakeServer::start(false, OK_BODY);
+    let client = FoundryAgentChatClient::new(&server.addr, "support", Some("3".into()), "k");
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "lookup",
+        "Look up an order.",
+        serde_json::json!({"type": "object", "properties": {}}),
+        |_args| async { Ok(serde_json::json!("found")) },
+    )
+    .into_definition();
+    let agent = client.as_agent().tool(tool).build();
+    assert_eq!(SupportsAgentRun::name(&agent), Some("support"));
+    let reply = agent.run_once("where is it?").await.unwrap();
+    assert_eq!(reply.text(), "ok");
+    let (line, _headers, body) = server.requests().remove(0);
+    assert!(line.contains("/openai/v1/responses"), "{line}");
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["agent_reference"],
+        serde_json::json!({"name": "support", "type": "agent_reference", "version": "3"})
+    );
+    for absent in ["model", "tools", "tool_choice", "parallel_tool_calls"] {
+        assert!(body.get(absent).is_none(), "{absent} in {body}");
+    }
+
+    let hosted = agent_framework_core::tools::hosted_web_search();
+    let err = client
+        .get_response(
+            vec![Message::user("x")],
+            ChatOptions {
+                tools: vec![hosted],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Only function tools"), "{err}");
 }

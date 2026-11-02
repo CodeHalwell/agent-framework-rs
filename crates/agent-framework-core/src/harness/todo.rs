@@ -15,8 +15,6 @@
 //!   rather than upstream's per-session lock map. Tool calls of different
 //!   sessions on the same provider therefore also take turns; the critical
 //!   section is a state read and write, so the cost is negligible.
-//! - `TodoFileStore` is not ported. Implement [`TodoStore`] for another
-//!   backing store.
 //! - The tools return their JSON result as a JSON value rather than a JSON
 //!   string; the model sees the same text.
 
@@ -308,6 +306,17 @@ struct TodoInner {
     instructions: String,
     store: Arc<dyn TodoStore>,
     mutation_lock: tokio::sync::Mutex<()>,
+    list_message: TodoListMessage,
+}
+
+/// Renders the current todo list into the message a run sees.
+pub type TodoListMessageBuilder = Arc<dyn Fn(&[TodoItem]) -> String + Send + Sync>;
+
+/// How the current list reaches each run.
+#[derive(Clone, Default)]
+struct TodoListMessage {
+    suppress: bool,
+    builder: Option<TodoListMessageBuilder>,
 }
 
 /// Gives an agent a session-scoped todo list.
@@ -352,40 +361,79 @@ impl TodoProvider {
     }
 
     fn build(source_id: String, instructions: String, store: Arc<dyn TodoStore>) -> Self {
+        Self::build_with(source_id, instructions, store, TodoListMessage::default())
+    }
+
+    fn build_with(
+        source_id: String,
+        instructions: String,
+        store: Arc<dyn TodoStore>,
+        list_message: TodoListMessage,
+    ) -> Self {
         Self {
             inner: Arc::new(TodoInner {
                 source_id,
                 instructions,
                 store,
                 mutation_lock: tokio::sync::Mutex::new(()),
+                list_message,
             }),
         }
     }
 
+    fn with_list_message(self, f: impl FnOnce(&mut TodoListMessage)) -> Self {
+        let mut list_message = self.inner.list_message.clone();
+        f(&mut list_message);
+        Self::build_with(
+            self.inner.source_id.clone(),
+            self.inner.instructions.clone(),
+            self.inner.store.clone(),
+            list_message,
+        )
+    }
+
+    /// Builder: do not add the current list to each run (upstream
+    /// `SuppressTodoListMessage`); the model reads it with its tools instead.
+    pub fn with_suppressed_todo_list_message(self, suppress: bool) -> Self {
+        self.with_list_message(|m| m.suppress = suppress)
+    }
+
+    /// Builder: render the current list with `builder` (upstream
+    /// `TodoListMessageBuilder`) instead of the default Markdown list.
+    pub fn with_todo_list_message_builder(
+        self,
+        builder: impl Fn(&[TodoItem]) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.with_list_message(|m| m.builder = Some(Arc::new(builder)))
+    }
+
     /// Builder: use `source_id` as the state key (default `"todo"`).
     pub fn with_source_id(self, source_id: impl Into<String>) -> Self {
-        Self::build(
+        Self::build_with(
             source_id.into(),
             self.inner.instructions.clone(),
             self.inner.store.clone(),
+            self.inner.list_message.clone(),
         )
     }
 
     /// Builder: replace the default instructions.
     pub fn with_instructions(self, instructions: impl Into<String>) -> Self {
-        Self::build(
+        Self::build_with(
             self.inner.source_id.clone(),
             instructions.into(),
             self.inner.store.clone(),
+            self.inner.list_message.clone(),
         )
     }
 
     /// Builder: persist todos through `store` instead of the session state.
     pub fn with_store(self, store: Arc<dyn TodoStore>) -> Self {
-        Self::build(
+        Self::build_with(
             self.inner.source_id.clone(),
             self.inner.instructions.clone(),
             store,
+            self.inner.list_message.clone(),
         )
     }
 
@@ -640,9 +688,195 @@ impl ContextProvider for TodoProvider {
         })?;
         ctx.add_instructions(self.inner.instructions.clone());
         ctx.tools.extend(self.tools(&session));
-        let items = self.items(&session).await?;
-        ctx.messages.push(Message::user(render_todo_list(&items)));
+        let message = &self.inner.list_message;
+        if !message.suppress {
+            let items = self.items(&session).await?;
+            let text = match &message.builder {
+                Some(build) => build(&items),
+                None => render_todo_list(&items),
+            };
+            ctx.messages.push(Message::user(text));
+        }
         Ok(())
+    }
+}
+
+/// A [`TodoStore`] keeping each session's todos in one JSON file per source
+/// id, as `{"items": [...], "next_id": n}`.
+///
+/// Port of upstream `TodoFileStore`. The file for a session lives at
+/// `{base}/{session}/{stem}.{source}{ext}`, or with
+/// [`with_owner_state_key`](Self::with_owner_state_key) at
+/// `{base}/{owner_prefix}{owner}/{kind}/{session}/...`, the owner read from
+/// that key of the session's state bag. Every segment is derived with
+/// [`storage_key_segment`](crate::storage_keys::storage_key_segment), so two
+/// different values never share a directory. Writes go to a temporary file
+/// that is then renamed over the target, so a reader never sees a half
+/// written file.
+///
+/// The base directory must not be writable by untrusted users, who could
+/// replace the files behind this store's back.
+#[derive(Debug, Clone)]
+pub struct TodoFileStore {
+    base_path: std::path::PathBuf,
+    kind: String,
+    owner_prefix: String,
+    owner_state_key: Option<String>,
+    state_filename: String,
+}
+
+const TODO_SEGMENT_PREFIX: &str = "~todo-";
+
+impl TodoFileStore {
+    /// A store rooted at `base_path`.
+    pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            base_path: base_path.into(),
+            kind: "todos".into(),
+            owner_prefix: String::new(),
+            owner_state_key: None,
+            state_filename: "todos.json".into(),
+        }
+    }
+
+    /// The bucket name under each owner directory (default `todos`).
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = kind.into();
+        self
+    }
+
+    /// A prefix for the owner directory's name.
+    pub fn with_owner_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.owner_prefix = prefix.into();
+        self
+    }
+
+    /// Group sessions under the owner id held in this session-state key.
+    /// Loading or saving fails for a session without it.
+    pub fn with_owner_state_key(mut self, key: impl Into<String>) -> Self {
+        self.owner_state_key = Some(key.into());
+        self
+    }
+
+    /// The state file name (default `todos.json`); the source id is inserted
+    /// before its extension.
+    pub fn with_state_filename(mut self, name: impl Into<String>) -> Self {
+        self.state_filename = name.into();
+        self
+    }
+
+    /// The file holding `session`'s todos for `source_id`.
+    pub fn state_path(
+        &self,
+        session: &AgentSession,
+        source_id: &str,
+    ) -> Result<std::path::PathBuf> {
+        let segment = |v: &str| crate::storage_keys::storage_key_segment(v, TODO_SEGMENT_PREFIX);
+        let mut dir = self.base_path.clone();
+        if let Some(key) = &self.owner_state_key {
+            let owner = session.state.get(key).filter(|v| !v.is_null()).ok_or_else(|| {
+                Error::Configuration(format!(
+                    "TodoFileStore requires session.state[{key:?}] to be set for file-backed storage."
+                ))
+            })?;
+            let owner = match owner {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            dir.push(format!("{}{}", self.owner_prefix, segment(&owner)));
+            dir.push(&self.kind);
+        }
+        let session_id = session.session_id();
+        if session_id.contains('/') || session_id.contains('\\') {
+            return Err(Error::Configuration(format!(
+                "TodoFileStore session_id must not contain path separators: {session_id:?}"
+            )));
+        }
+        dir.push(segment(session_id));
+        let source = segment(source_id);
+        let file = match self.state_filename.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{stem}.{source}.{ext}"),
+            _ => format!("{}.{source}.json", self.state_filename),
+        };
+        Ok(dir.join(file))
+    }
+}
+
+#[async_trait]
+impl TodoStore for TodoFileStore {
+    async fn load_state(
+        &self,
+        session: &AgentSession,
+        source_id: &str,
+    ) -> Result<(Vec<TodoItem>, u64)> {
+        let path = self.state_path(session, source_id)?;
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 1)),
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "Could not read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let shown = path.display();
+        let payload: Value = serde_json::from_str(&text).map_err(|e| {
+            Error::Serialization(format!("Todo file {shown} is not valid JSON: {e}"))
+        })?;
+        let Value::Object(payload) = payload else {
+            return Err(Error::Serialization(format!(
+                "Todo file {shown} must contain a JSON object."
+            )));
+        };
+        let items = match payload.get("items") {
+            None => Vec::new(),
+            Some(Value::Array(raw)) => raw
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    if !item.is_object() {
+                        return Err(Error::Serialization(format!(
+                            "Todo item at index {index} in todo file {shown} must be a mapping; got {}.",
+                            json_type_name(item)
+                        )));
+                    }
+                    TodoItem::from_value(item)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(Error::Serialization(format!(
+                    "Todo file {shown} has a non-list 'items' field."
+                )))
+            }
+        };
+        let next_id = match payload.get("next_id") {
+            None => 1,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                Error::Serialization(format!(
+                    "Todo file {shown} has a non-integer 'next_id' field."
+                ))
+            })?,
+        };
+        let next_id = safe_next_id(&items, next_id)?;
+        Ok((items, next_id))
+    }
+
+    async fn save_state(
+        &self,
+        session: &AgentSession,
+        items: &[TodoItem],
+        next_id: u64,
+        source_id: &str,
+    ) -> Result<()> {
+        let path = self.state_path(session, source_id)?;
+        let payload = json!({
+            "items": items.iter().map(TodoItem::to_value).collect::<Vec<_>>(),
+            "next_id": safe_next_id(items, next_id)?,
+        })
+        .to_string()
+            + "\n";
+        super::atomic_write_text(&path, &payload).await
     }
 }
 
@@ -910,5 +1144,81 @@ mod tests {
         // A session is required.
         let mut ctx = SessionContext::new(vec![]);
         assert!(provider.before_run(&mut ctx).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod file_store_tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("af-todo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn round_trips_per_session_and_source() {
+        let base = temp_dir();
+        let store = TodoFileStore::new(&base);
+        let session = AgentSession::new();
+        assert_eq!(
+            store.load_state(&session, "todo").await.unwrap(),
+            (vec![], 1)
+        );
+        let items = vec![TodoItem::new(3, "write the port", None)];
+        store.save_state(&session, &items, 1, "todo").await.unwrap();
+        let (loaded, next_id) = store.load_state(&session, "todo").await.unwrap();
+        assert_eq!(loaded, items);
+        assert_eq!(next_id, 4, "next_id is clamped past the highest id");
+        assert_eq!(store.load_state(&session, "other").await.unwrap().0, vec![]);
+        let path = store.state_path(&session, "todo").unwrap();
+        assert_eq!(
+            path,
+            base.join(session.session_id()).join("todos.todo.json")
+        );
+        // No temporary files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_directories_come_from_session_state() {
+        let base = temp_dir();
+        let store = TodoFileStore::new(&base)
+            .with_owner_state_key("user")
+            .with_owner_prefix("u-")
+            .with_state_filename("plan");
+        let session = AgentSession::new();
+        assert!(store.load_state(&session, "todo").await.is_err());
+        session.state.insert("user", json!("alice/../bob"));
+        let path = store.state_path(&session, "todo").unwrap();
+        let rel = path.strip_prefix(&base).unwrap();
+        let parts: Vec<_> = rel
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(parts.len(), 4, "{parts:?}");
+        assert!(parts[0].starts_with("u-~todo-"), "{parts:?}");
+        assert_eq!(parts[1], "todos");
+        assert_eq!(parts[3], "plan.todo.json");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_files_are_reported() {
+        let base = temp_dir();
+        let store = TodoFileStore::new(&base);
+        let session = AgentSession::new();
+        let path = store.state_path(&session, "todo").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"items": {}}"#).unwrap();
+        let err = store.load_state(&session, "todo").await.unwrap_err();
+        assert!(err.to_string().contains("non-list 'items'"), "{err}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

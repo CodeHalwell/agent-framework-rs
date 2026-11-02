@@ -363,11 +363,25 @@ impl ChatResponse {
         // Only a *conflict* splits: an update with no author, or one landing
         // on a message that has none yet, still continues the message, which
         // is what lets the first update of a run name its message.
+        //
+        // An update whose id no message carries yet names the last message
+        // when that message has no id (and the role and author fit), as
+        // upstream's `_process_update` does: a stream's opening update
+        // (`response.created`, a reasoning item) carries no id, and the first
+        // text update names the message it began.
         let idx = match &update.message_id {
             Some(mid) => self
                 .messages
                 .iter()
-                .position(|m| m.message_id.as_deref() == Some(mid.as_str())),
+                .position(|m| m.message_id.as_deref() == Some(mid.as_str()))
+                .or_else(|| {
+                    self.messages.last().and_then(|last| {
+                        (last.message_id.is_none()
+                            && last.role == role
+                            && authors_compatible(last, update.author_name.as_deref()))
+                        .then(|| self.messages.len() - 1)
+                    })
+                }),
             None => self
                 .messages
                 .iter()
@@ -662,7 +676,7 @@ impl ChatResponseUpdate {
         }
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 
@@ -714,6 +728,17 @@ pub struct AgentResponse {
 }
 
 impl AgentResponse {
+    /// The response as the stream of updates that would aggregate back into
+    /// it (upstream `ToAgentResponseUpdates`): one update per message with a
+    /// distinct id, ids on every update, and usage and finish reason on the
+    /// last.
+    pub fn to_updates(&self) -> Vec<AgentResponseUpdate> {
+        crate::agent::response_to_updates(self.clone())
+            .into_iter()
+            .filter_map(|u| u.ok())
+            .collect()
+    }
+
     /// The concatenated text of all messages (no separator), matching Python.
     ///
     /// Empty when the run's final assistant turn is a refusal — see
@@ -857,7 +882,7 @@ impl AgentResponseUpdate {
         }
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 

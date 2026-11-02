@@ -135,7 +135,7 @@ impl Message {
         }
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -284,6 +284,32 @@ mod prepare_messages_tests {
 
 #[cfg(test)]
 mod refusal_tests {
+    #[test]
+    fn text_is_the_answer_without_the_models_reasoning() {
+        // Upstream's `Message.text` joins only `type == "text"` contents.
+        // Including reasoning leaked a thinking model's chain of thought into
+        // the answer — and into structured output, which parses `text()`.
+        let msg = Message::with_contents(
+            Role::assistant(),
+            vec![
+                Content::TextReasoning(crate::types::TextReasoningContent {
+                    text: "let me think".into(),
+                    ..Default::default()
+                }),
+                Content::text("{\"answer\": 42}"),
+            ],
+        );
+        assert_eq!(msg.text(), "{\"answer\": 42}");
+        let response = crate::types::ChatResponse {
+            messages: vec![msg],
+            ..Default::default()
+        };
+        assert_eq!(
+            response.parse_json::<serde_json::Value>().unwrap()["answer"],
+            42
+        );
+    }
+
     use super::*;
     use crate::types::content::TextContent;
 

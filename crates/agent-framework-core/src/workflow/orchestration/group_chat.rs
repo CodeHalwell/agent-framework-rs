@@ -687,7 +687,15 @@ impl GroupChatBuilder {
             participants,
             descriptions,
             manager_name,
-            max_rounds: Some(self.max_rounds.unwrap_or(DEFAULT_GROUP_CHAT_MAX_ITERATIONS)),
+            // A cap below 1 is coerced up to 1: the limit is checked before a
+            // round runs, so an uncoerced 0 would halt the conversation with
+            // only the "round limit" notice and no participant ever speaking.
+            // Mirrors upstream's base group-chat orchestrator.
+            max_rounds: Some(
+                self.max_rounds
+                    .unwrap_or(DEFAULT_GROUP_CHAT_MAX_ITERATIONS)
+                    .max(1),
+            ),
             termination: self.termination,
         };
 

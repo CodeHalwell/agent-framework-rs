@@ -28,8 +28,6 @@ use crate::auth::TokenProvider;
 use crate::models::{ProcessContentRequest, ProcessContentResponse};
 use crate::settings::PurviewSettings;
 
-const PURVIEW_USER_AGENT: &str = concat!("agent-framework-rs-purview/", env!("CARGO_PKG_VERSION"));
-
 /// `Prefer: evaluateInline` — sent on **every** `processContent` request this
 /// crate makes.
 ///
@@ -76,7 +74,7 @@ pub struct PurviewClient {
 impl PurviewClient {
     pub fn new(token_provider: impl TokenProvider + 'static, settings: &PurviewSettings) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             token_provider: Arc::new(token_provider),
             graph_base_uri: settings.graph_base_uri.trim_end_matches('/').to_string(),
             ignore_payment_required: settings.ignore_payment_required,
@@ -107,7 +105,7 @@ impl PurviewClient {
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/json")
-            .header(USER_AGENT, PURVIEW_USER_AGENT)
+            .header(USER_AGENT, crate::user_agent())
             // See PREFER_EVALUATE_INLINE: this crate's verdict is only useful
             // if it comes back on this response, so it always asks for inline
             // evaluation.

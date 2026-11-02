@@ -18,10 +18,6 @@ use crate::auth::TokenProvider;
 use crate::settings::CopilotStudioConnectionSettings;
 
 const EVENT_STREAM_ACCEPT: &str = "text/event-stream";
-const D2E_USER_AGENT: &str = concat!(
-    "agent-framework-rs-copilotstudio/",
-    env!("CARGO_PKG_VERSION")
-);
 
 /// A Microsoft Copilot Studio agent, reached via the Direct-to-Engine (D2E)
 /// API. Wraps a [`CopilotStudioConnectionSettings`] + [`TokenProvider`] so a
@@ -57,7 +53,7 @@ impl CopilotStudioAgent {
             description: None,
             connection: Arc::new(connection),
             token_provider: Arc::new(token_provider),
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
         }
     }
 
@@ -118,7 +114,7 @@ impl CopilotStudioAgent {
             .header(AUTHORIZATION, auth)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, EVENT_STREAM_ACCEPT)
-            .header(USER_AGENT, D2E_USER_AGENT)
+            .header(USER_AGENT, crate::user_agent())
             .json(&body)
             .send()
             .await
@@ -241,6 +237,9 @@ impl SupportsAgentRun for CopilotStudioAgent {
 
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 }
 

@@ -70,9 +70,11 @@
       "AIProjectClientExtensions": {
         "methods": {
           "AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
+            "rust": [
+              "agent_framework_foundry::hosted_agent::FoundryAgentChatClient::as_agent"
+            ],
+            "status": "adapted",
+            "note": "FoundryAgentChatClient binds to a server-hosted Prompt or Hosted Agent by agent_reference; as_agent() builds the Agent, local function tools dispatching its calls."
           },
           "AsAIAgent(AIProjectClient, string, string, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
@@ -106,10 +108,10 @@
           },
           "Description": {
             "rust": [
-              "agent_framework_core::agent::Agent::description"
+              "agent_framework_core::agent::SupportsAgentRun::description"
             ],
-            "status": "partial",
-            "note": "Description exists on Agent only; the SupportsAgentRun trait has no description accessor."
+            "status": "mapped",
+            "note": "Property becomes a trait accessor (defaulted to None), overridden by Agent and the provider agents."
           },
           "Id": {
             "rust": [
@@ -433,7 +435,7 @@
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "after_run receives no agent reference."
+            "note": "after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent)."
           },
           "InvokeException": {
             "rust": [
@@ -457,9 +459,11 @@
             "note": "Response messages arrive as the second after_run argument; empty on failure."
           },
           "Session": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "after_run receives no session, so a provider cannot read the session or its state bag after a run."
+            "rust": [
+              "agent_framework_core::memory::ContextProvider::after_run_in_session"
+            ],
+            "status": "adapted",
+            "note": "after_run_in_session receives the run's session (its default forwards to after_run)."
           }
         }
       },
@@ -481,9 +485,12 @@
             "note": "The SessionContext itself carries the contributed instructions, messages and tools."
           },
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "Session": {
             "rust": [
@@ -609,122 +616,164 @@
       },
       "AgentFileSkill": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only."
+          "rust": [
+            "agent_framework_core::skills::Skill",
+            "agent_framework_core::skills_files::FileSkillsSource::load"
+          ],
+          "status": "adapted",
+          "note": "File-based skills load into Skill values carrying their directory, resources and file scripts; there is no separate type."
         },
         "properties": {
           "Path": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only."
+            "rust": [
+              "agent_framework_core::skills::Skill::path"
+            ],
+            "status": "mapped",
+            "note": "The absolute skill directory, set for file-based skills."
           }
         }
       },
       "AgentFileSkillFilterContext": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter",
+            "agent_framework_core::skills_files::FileSkillsSource::with_script_filter"
+          ],
+          "status": "adapted",
+          "note": "Resource and script filters are closures called with (skill name, relative path); there is no context type."
         },
         "properties": {
           "RelativeFilePath": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "The resource filter is a closure called with (skill name, relative path); there is no context type, and scripts are not ported."
           },
           "SkillName": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "The resource filter is a closure called with (skill name, relative path); there is no context type, and scripts are not ported."
           }
         }
       },
       "AgentFileSkillScript": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScript",
+            "agent_framework_core::skills::SkillScriptSource"
+          ],
+          "status": "adapted",
+          "note": "A file script is a SkillScript with a File source, run by the provider's SkillScriptRunner."
         },
         "properties": {
           "FullPath": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::full_path"
+            ],
+            "status": "mapped",
+            "note": "The script's absolute path."
           },
           "ParametersSchema": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::parameters_schema"
+            ],
+            "status": "mapped",
+            "note": "File scripts advertise an array of strings, as upstream."
           }
         },
         "methods": {
           "RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "run_skill_script delegates a file script to the provider's runner after rechecking the file."
           }
         }
       },
       "AgentFileSkillScriptRunner": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScriptRunner",
+            "agent_framework_core::skills::SkillsProvider::with_script_runner"
+          ],
+          "status": "adapted",
+          "note": "A closure (skill, script, args) -> future; the application supplies it, there is no default runner."
         }
       },
       "AgentFileSkillsSource": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource"
+          ],
+          "status": "adapted",
+          "note": "Behind the file-skills feature; options are builder methods."
         },
         "constructors": {
           "AgentFileSkillsSource(string, AgentFileSkillScriptRunner, AgentFileSkillsSourceOptions, ILoggerFactory)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::new"
+            ],
+            "status": "adapted",
+            "note": "FileSkillsSource::new takes the paths; options are builder methods; no script runner (scripts are not ported)."
           }
         },
         "methods": {
           "GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::load"
+            ],
+            "status": "adapted",
+            "note": "load() discovers synchronously and reads resources eagerly; it takes no context."
           }
         }
       },
       "AgentFileSkillsSourceOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource"
+          ],
+          "status": "adapted",
+          "note": "The options are builder methods on FileSkillsSource."
         },
         "properties": {
           "AllowedResourceExtensions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_extensions"
+            ],
+            "status": "adapted",
+            "note": "Builder method on the source."
           },
           "AllowedScriptExtensions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_script_extensions"
+            ],
+            "status": "adapted",
+            "note": "Builder method; .py by default, as upstream."
           },
           "ResourceFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "Builder method taking a (skill name, relative path) closure."
           },
           "ScriptFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_script_filter"
+            ],
+            "status": "adapted",
+            "note": "Builder method taking a (skill name, relative path) closure."
           },
           "SearchDepth": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_search_depth"
+            ],
+            "status": "adapted",
+            "note": "Builder method; errors below 1."
           }
         }
       },
@@ -842,11 +891,10 @@
         "properties": {
           "Frontmatter": {
             "rust": [
-              "agent_framework_core::skills::Skill::name",
-              "agent_framework_core::skills::Skill::description"
+              "agent_framework_core::skills::Skill"
             ],
-            "status": "partial",
-            "note": "Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing."
+            "status": "adapted",
+            "note": "Frontmatter fields live on Skill (license, compatibility, allowed_tools, metadata); file skills fill them from SKILL.md."
           }
         },
         "methods": {
@@ -865,9 +913,12 @@
             "note": "with_resource takes name and string content but no resource description."
           },
           "AddScript(string, Delegate, string, JsonSerializerOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::with_script",
+              "agent_framework_core::skills::SkillScript::inline"
+            ],
+            "status": "adapted",
+            "note": "with_script(SkillScript::inline(name, closure)); the closure takes the model's args as JSON."
           },
           "GetContentAsync(CancellationToken)": {
             "rust": [
@@ -884,9 +935,11 @@
             "note": "Resources are looked up by name in the resources HashMap."
           },
           "GetScriptAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::script"
+            ],
+            "status": "adapted",
+            "note": "Synchronous, case-insensitive lookup."
           }
         }
       },
@@ -1008,70 +1061,98 @@
       },
       "AgentRequestMessageSourceAttribution": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+          "rust": [
+            "agent_framework_core::memory::ATTRIBUTION_KEY",
+            "agent_framework_core::memory::attribute_message"
+          ],
+          "status": "adapted",
+          "note": "Attribution is a JSON object under additional_properties[\"_attribution\"] (source_id, source_type, origin_session_ids), as upstream Python."
         },
         "constructors": {
           "AgentRequestMessageSourceAttribution(AgentRequestMessageSourceType, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::attribute_message"
+            ],
+            "status": "adapted",
+            "note": "attribute_message writes it."
           }
         },
         "properties": {
           "SourceId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_id"
+            ],
+            "status": "adapted",
+            "note": "Read with message_source_id."
           },
           "SourceType": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "Read with message_source_type."
           }
         },
         "fields": {
           "AdditionalPropertiesKey": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::ATTRIBUTION_KEY"
+            ],
+            "status": "mapped",
+            "note": "The additional_properties key."
           }
         }
       },
       "AgentRequestMessageSourceType": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+          "rust": [
+            "agent_framework_core::memory::message_source_type"
+          ],
+          "status": "adapted",
+          "note": "The source type is a string: the provider's type name for context messages (as upstream Python), or any caller-chosen value such as \"External\"."
         },
         "constructors": {
           "AgentRequestMessageSourceType(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           }
         },
         "properties": {
           "AIContextProvider": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "ChatHistory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "External": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "Value": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           }
         }
       },
@@ -1153,9 +1234,11 @@
         },
         "methods": {
           "ToAgentResponseUpdates()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The response-to-updates conversion is crate-private (agent::response_to_updates), not public API."
+            "rust": [
+              "agent_framework_core::types::response::AgentResponse::to_updates"
+            ],
+            "status": "mapped",
+            "note": "Public method."
           }
         }
       },
@@ -1450,11 +1533,10 @@
         "properties": {
           "Frontmatter": {
             "rust": [
-              "agent_framework_core::skills::Skill::name",
-              "agent_framework_core::skills::Skill::description"
+              "agent_framework_core::skills::Skill"
             ],
-            "status": "partial",
-            "note": "Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing."
+            "status": "adapted",
+            "note": "Frontmatter fields live on Skill (license, compatibility, allowed_tools, metadata); file skills fill them from SKILL.md."
           }
         },
         "methods": {
@@ -1473,39 +1555,47 @@
             "note": "Resources are looked up by name in the resources HashMap."
           },
           "GetScriptAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::script"
+            ],
+            "status": "adapted",
+            "note": "Synchronous, case-insensitive lookup."
           }
         }
       },
       "AgentSkillFrontmatter": {
         "mapping": {
           "rust": [
+            "agent_framework_core::skills_files::SkillFrontmatter",
             "agent_framework_core::skills::Skill"
           ],
-          "status": "partial",
-          "note": "Frontmatter is flattened into Skill name/description fields; there is no separate type and no name validation."
+          "status": "adapted",
+          "note": "SkillFrontmatter (file-skills feature) is parsed and validated from SKILL.md; its fields are copied onto Skill."
         },
         "constructors": {
           "AgentSkillFrontmatter(string, string, string)": {
             "rust": [
-              "agent_framework_core::skills::Skill::new"
+              "agent_framework_core::skills::Skill::new",
+              "agent_framework_core::skills_files::validate_skill_name"
             ],
-            "status": "partial",
-            "note": "Skill::new takes name and description; compatibility and spec validation of the name are missing."
+            "status": "adapted",
+            "note": "Skill::new takes name and description; validate_skill_name applies the specification's name rules."
           }
         },
         "properties": {
           "AllowedTools": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no AllowedTools field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::allowed_tools"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Compatibility": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no Compatibility field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::compatibility"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Description": {
             "rust": [
@@ -1515,14 +1605,18 @@
             "note": "Skill::description field."
           },
           "License": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no License field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::license"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Metadata": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no Metadata field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::metadata"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Name": {
             "rust": [
@@ -1567,32 +1661,42 @@
       },
       "AgentSkillScript": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScript"
+          ],
+          "status": "adapted",
+          "note": "A struct with an Inline or File source rather than an abstract class."
         },
         "properties": {
           "Description": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::description"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "Name": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::name"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "ParametersSchema": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::parameters_schema"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           }
         },
         "methods": {
           "RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider"
+            ],
+            "status": "adapted",
+            "note": "Scripts run through the provider's run_skill_script tool: inline in-process, file scripts via the runner."
           }
         }
       },
@@ -1636,24 +1740,34 @@
             "note": "No source caching layer exists because skills are a fixed in-memory list."
           },
           "UseFileScriptRunner(AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "Builder method on the provider."
           },
           "UseFileSkill(string, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::from_paths",
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "from_paths discovers the skills; options come from FileSkillsSource and the runner from with_script_runner."
           },
           "UseFileSkills(IEnumerable<string>, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::from_paths",
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "from_paths discovers the skills; options come from FileSkillsSource and the runner from with_script_runner."
           },
           "UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No skill filter predicate; callers must filter the Vec<Skill> before SkillsProvider::new."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_filter"
+            ],
+            "status": "partial",
+            "note": "A predicate over skills; it takes no source context."
           },
           "UseLoggerFactory(ILoggerFactory)": {
             "rust": [
@@ -1663,14 +1777,18 @@
             "note": "Rust logs through the global tracing subscriber, so no logger is passed in."
           },
           "UseOptions(Action<AgentSkillsProviderOptions>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SkillsProvider has no options type to configure."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider"
+            ],
+            "status": "adapted",
+            "note": "Options are builder methods on SkillsProvider."
           },
           "UsePromptTemplate(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_instructions_prompt"
+            ],
+            "status": "mapped",
+            "note": "Builder method; {skills} is replaced by the list."
           },
           "UseSkill(AgentSkill)": {
             "rust": [
@@ -1707,25 +1825,33 @@
       },
       "AgentSkillsProviderOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "SkillsProvider has no options type; prompt, approvals and error detail are fixed."
+          "rust": [
+            "agent_framework_core::skills::SkillsProvider"
+          ],
+          "status": "adapted",
+          "note": "Options are builder methods on SkillsProvider."
         },
         "properties": {
           "DisableLoadSkillApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_load_skill_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; off by default here (upstream requires approval by default)."
           },
           "DisableReadSkillResourceApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_read_skill_resource_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; off by default here (upstream requires approval by default)."
           },
           "DisableRunSkillScriptApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; approval required by default, as upstream."
           },
           "IncludeDetailedErrors": {
             "rust": [],
@@ -1733,9 +1859,11 @@
             "note": "No option controls error detail; unknown skills/resources always return a fixed message."
           },
           "SkillsInstructionPrompt": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_instructions_prompt"
+            ],
+            "status": "adapted",
+            "note": "Builder method."
           }
         }
       },
@@ -1813,33 +1941,43 @@
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluator(BackgroundTaskCompletionLoopEvaluatorOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluator: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running"
+            ],
+            "status": "adapted",
+            "note": "background_tasks_running(&provider) is the LoopAgent condition; it takes the provider instead of finding it on the agent."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::BackgroundTasksRunning"
+            ],
+            "status": "adapted",
+            "note": "LoopCallback<LoopDecision> on BackgroundTasksRunning."
           }
         },
         "constants": {
           "DefaultFeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultFeedbackMessageTemplate: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           },
           "IncompleteTaskCountPlaceholder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "IncompleteTaskCountPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           },
           "IncompleteTasksPlaceholder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "IncompleteTasksPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           }
         }
       },
@@ -1851,16 +1989,20 @@
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluatorOptions()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluatorOptions: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "No options type; a custom next-message LoopCallback replaces the template."
           }
         },
         "properties": {
           "FeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "No options type; a custom next-message LoopCallback replaces the template."
           }
         }
       },
@@ -1902,14 +2044,18 @@
         },
         "properties": {
           "AIContextProviders": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Agent has no accessor for its configured context providers."
+            "rust": [
+              "agent_framework_core::agent::Agent::context_providers"
+            ],
+            "status": "mapped",
+            "note": "Accessor for the agent's configured providers."
           },
           "ChatClient": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Agent has no accessor for its underlying ChatClient."
+            "rust": [
+              "agent_framework_core::agent::Agent::chat_client"
+            ],
+            "status": "adapted",
+            "note": "Returns the client wrapped in the function-invocation layer."
           },
           "ChatHistoryProvider": {
             "rust": [],
@@ -2047,9 +2193,11 @@
             "note": "Builder method."
           },
           "EnableMessageInjection": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No mid-run message injection."
+            "rust": [
+              "agent_framework_core::session::enqueue_messages"
+            ],
+            "status": "adapted",
+            "note": "Message injection is always available: messages queued on the session join the next model call (streaming and not)."
           },
           "Id": {
             "rust": [
@@ -2066,9 +2214,11 @@
             "note": "Builder method."
           },
           "RequirePerServiceCallChatHistoryPersistence": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "History is persisted once per run in after_run, never per service call inside the tool loop."
+            "rust": [
+              "agent_framework_core::agent::AgentBuilder::require_per_service_call_history_persistence"
+            ],
+            "status": "mapped",
+            "note": "Builder option."
           },
           "ThrowOnChatHistoryProviderConflict": {
             "rust": [],
@@ -2159,7 +2309,7 @@
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "after_run receives no agent reference."
+            "note": "after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent)."
           },
           "InvokeException": {
             "rust": [
@@ -2183,18 +2333,23 @@
             "note": "Response messages arrive as the second after_run argument; empty on failure."
           },
           "Session": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "after_run receives no session, so a provider cannot read the session or its state bag after a run."
+            "rust": [
+              "agent_framework_core::memory::ContextProvider::after_run_in_session"
+            ],
+            "status": "adapted",
+            "note": "after_run_in_session receives the run's session (its default forwards to after_run)."
           }
         }
       },
       "ChatHistoryProvider.InvokingContext": {
         "properties": {
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "RequestMessages": {
             "rust": [
@@ -2217,19 +2372,25 @@
       "ChatMessageExtensions": {
         "methods": {
           "GetAgentRequestMessageSourceId(ChatMessage)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_id"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           },
           "GetAgentRequestMessageSourceType(ChatMessage)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           },
           "WithAgentRequestMessageSource(ChatMessage, AgentRequestMessageSourceType, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           }
         }
       },
@@ -3031,9 +3192,12 @@
       "MessageAIContextProvider.InvokingContext": {
         "properties": {
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "RequestMessages": {
             "rust": [
@@ -3055,20 +3219,27 @@
       },
       "MessageInjectingChatClient": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+          "rust": [
+            "agent_framework_core::client::FunctionInvokingChatClient",
+            "agent_framework_core::session::enqueue_messages"
+          ],
+          "status": "adapted",
+          "note": "Injection is built into FunctionInvokingChatClient rather than a separate client."
         },
         "methods": {
           "EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+            "rust": [
+              "agent_framework_core::session::enqueue_messages"
+            ],
+            "status": "adapted",
+            "note": "A free function over the session; injection is built into the function-invocation loop (non-streaming) rather than a separate chat client."
           },
           "GetPendingMessagesAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+            "rust": [
+              "agent_framework_core::session::pending_messages"
+            ],
+            "status": "adapted",
+            "note": "A free function returning a snapshot of the queue."
           }
         }
       },
@@ -3295,14 +3466,18 @@
             "note": "Replaces the todo instructions."
           },
           "SuppressTodoListMessage": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The current-list message is always injected; there is no option to suppress it."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::with_suppressed_todo_list_message"
+            ],
+            "status": "mapped",
+            "note": "Builder method."
           },
           "TodoListMessageBuilder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The current-list message has a fixed format; there is no custom builder."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::with_todo_list_message_builder"
+            ],
+            "status": "mapped",
+            "note": "Builder method taking a closure over the items."
           }
         }
       },
@@ -3325,9 +3500,11 @@
         },
         "properties": {
           "AllToolsAutoApprovalRule": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No predefined approve-everything rule; the closure |_: &FunctionCallContent| true serves."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::all_tools_auto_approval_rule"
+            ],
+            "status": "mapped",
+            "note": "Free function usable as a rule."
           }
         },
         "constants": {
@@ -3733,197 +3910,270 @@
     "Microsoft.Agents.AI.Compaction": {
       "CompactionGroupKind": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionGroupKind"
+          ],
+          "status": "mapped",
+          "note": "Enum of group kinds."
         },
         "constants": {
           "AssistantText": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::AssistantText"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "Summary": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::Summary"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "System": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::System"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "ToolCall": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::ToolCall"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "User": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::User"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           }
         }
       },
       "CompactionMessageGroup": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionMessageGroup"
+          ],
+          "status": "mapped",
+          "note": "Struct of an atomic group."
         },
         "properties": {
           "ByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::byte_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "ExcludeReason": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::exclude_reason"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "IsExcluded": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::is_excluded"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "Kind": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::kind"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "MessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::message_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "Messages": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::messages"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "TokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::token_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "TurnIndex": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::turn_index"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           }
         }
       },
       "CompactionMessageIndex": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionMessageIndex"
+          ],
+          "status": "mapped",
+          "note": "Groups a conversation; strategies decide on groups."
         },
         "constructors": {
           "CompactionMessageIndex(IList<CompactionMessageGroup>, Tokenizer)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::new",
+              "agent_framework_core::compaction::index::CompactionMessageIndex::counted"
+            ],
+            "status": "adapted",
+            "note": "Built from messages (grouping them) with a tokenizer, rather than from prepared groups."
           }
         },
         "properties": {
           "Groups": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::groups"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_byte_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedNonSystemGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_non_system_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedTokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_token_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedTurnCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_turn_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "RawMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::raw_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "Tokenizer": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::tokenizer"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_byte_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalTokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_token_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalTurnCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_turn_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           }
         },
         "methods": {
           "AddGroup(CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::add_group"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetAllMessages()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_all_messages"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetIncludedMessages()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_included_messages"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetTurnGroups(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_turn_groups"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "InsertGroup(int, CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::insert_group"
+            ],
+            "status": "mapped",
+            "note": "Method."
           }
         }
       },
@@ -3952,144 +4202,196 @@
       "CompactionStrategy": {
         "mapping": {
           "rust": [
-            "agent_framework_core::compaction::CompactionStrategy"
+            "agent_framework_core::compaction::CompactionStrategy",
+            "agent_framework_core::compaction::index::AsyncCompactionStrategy"
           ],
-          "status": "partial",
-          "note": "CompactionStrategy is a message-list-in/out trait; it has no trigger/target-trigger gating like the .NET base class."
+          "status": "adapted",
+          "note": "A message-list trait, plus its async form for strategies that call out; trigger gating is TriggeredCompactionStrategy."
         },
         "methods": {
           "CompactAsync(CompactionMessageIndex, ILogger, CancellationToken)": {
             "rust": [
+              "agent_framework_core::compaction::index::AsyncCompactionStrategy::compact_async",
               "agent_framework_core::compaction::CompactionStrategy::compact"
             ],
             "status": "adapted",
-            "note": "CompactionStrategy::compact takes &[Message] and a Tokenizer instead of a CompactionMessageIndex and returns the retained list."
+            "note": "Takes and returns messages; strategies build a CompactionMessageIndex when they need groups."
           }
         }
       },
       "CompactionTrigger": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionTrigger"
+          ],
+          "status": "adapted",
+          "note": "An Arc<dyn Fn(&CompactionMessageIndex) -> bool>."
         }
       },
       "CompactionTriggers": {
         "methods": {
           "All(CompactionTrigger[])": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::all"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "Any(CompactionTrigger[])": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::any"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "GroupsExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::groups_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "HasToolCalls()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::has_tool_calls"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "MessagesExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::messages_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TokensBelow(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::tokens_below"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TokensExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::tokens_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TurnsExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::turns_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           }
         },
         "fields": {
           "Always": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::always"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "Never": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::never"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionTriggers"
+          ],
+          "status": "mapped",
+          "note": "Factory of triggers."
         }
       },
       "ContextWindowCompactionStrategy": {
         "constructors": {
           "ContextWindowCompactionStrategy(int, int, double, double)": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::new"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::new",
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::with_tool_eviction_threshold",
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::with_truncation_threshold"
             ],
-            "status": "partial",
-            "note": "TokenBudget enforces one token budget; there is no output-token reservation or staged tool-eviction/truncation thresholds."
+            "status": "adapted",
+            "note": "Window and output sizes in new; thresholds by builder methods, validated as upstream."
           }
         },
         "properties": {
           "InputBudgetTokens": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::max_tokens"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::input_budget_tokens"
             ],
-            "status": "adapted",
-            "note": "The caller passes the input budget directly as TokenBudget::max_tokens instead of deriving it from window minus output tokens."
+            "status": "mapped",
+            "note": "Accessor."
           },
           "MaxContextWindowTokens": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::max_tokens"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::max_context_window_tokens"
             ],
-            "status": "partial",
-            "note": "Only a single token budget exists; the full context-window size is not modelled separately from the input budget."
+            "status": "mapped",
+            "note": "Accessor."
           },
           "MaxOutputTokens": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "TokenBudget has no output-token reservation; callers subtract it themselves before choosing max_tokens."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::max_output_tokens"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           },
           "ToolEvictionThreshold": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No staged tool-result eviction threshold; SelectiveToolResult must be applied as a separate strategy."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::tool_eviction_threshold"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           },
           "TruncationThreshold": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No staged truncation threshold; TokenBudget trims immediately to its budget."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::truncation_threshold"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::ContextWindowCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "Two-phase: tool-result eviction, then truncation."
         }
       },
       "PipelineCompactionStrategy": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+          "rust": [
+            "agent_framework_core::compaction::index::PipelineCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "Runs async (or sync) strategies in order."
         },
         "constructors": {
           "PipelineCompactionStrategy(IEnumerable<CompactionStrategy>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+            "rust": [
+              "agent_framework_core::compaction::index::PipelineCompactionStrategy::new"
+            ],
+            "status": "mapped",
+            "note": "Constructor."
           }
         },
         "properties": {
           "Strategies": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+            "rust": [
+              "agent_framework_core::compaction::index::PipelineCompactionStrategy::strategies"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           }
         }
       },
@@ -4097,10 +4399,11 @@
         "constructors": {
           "SlidingWindowCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
-              "agent_framework_core::compaction::SlidingWindow::new"
+              "agent_framework_core::compaction::SlidingWindow::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
             ],
             "status": "partial",
-            "note": "SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers."
+            "note": "SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
@@ -4116,63 +4419,90 @@
       "SummarizationCompactionStrategy": {
         "constructors": {
           "SummarizationCompactionStrategy(IChatClient, CompactionTrigger, int, string, CompactionTrigger)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
+            ],
+            "status": "adapted",
+            "note": "Triggers follow upstream Python (target_count + threshold); wrap in TriggeredCompactionStrategy for a custom trigger."
           }
         },
         "properties": {
           "ChatClient": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::new"
+            ],
+            "status": "adapted",
+            "note": "Given to new."
           },
           "MinimumPreservedGroups": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::with_target_count"
+            ],
+            "status": "adapted",
+            "note": "Preservation is by message count over whole groups, as upstream Python."
           },
           "SummarizationPrompt": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::with_prompt",
+              "agent_framework_core::compaction::index::DEFAULT_SUMMARIZATION_PROMPT"
+            ],
+            "status": "mapped",
+            "note": "Builder method and default."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::index::SummarizationCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "LLM summarization of the oldest groups, as upstream SummarizationStrategy."
         }
       },
       "ToolResultCompactionStrategy": {
         "constructors": {
           "ToolResultCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
-              "agent_framework_core::compaction::SelectiveToolResult::new"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
             ],
-            "status": "partial",
-            "note": "SelectiveToolResult replaces older tool results with a fixed marker; no trigger gating or configurable formatter."
+            "status": "adapted",
+            "note": "keep_last in new; triggers by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
           "MinimumPreservedGroups": {
             "rust": [
-              "agent_framework_core::compaction::SelectiveToolResult::keep_last"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new"
             ],
             "status": "adapted",
-            "note": "keep_last is the number of most recent tool results left intact."
+            "note": "keep_last results stay verbatim."
           },
           "ToolCallFormatter": {
             "rust": [
-              "agent_framework_core::compaction::OMITTED_TOOL_RESULT"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::with_formatter",
+              "agent_framework_core::compaction::ToolResultFormatter"
             ],
-            "status": "partial",
-            "note": "The replacement text is the fixed OMITTED_TOOL_RESULT constant; a custom formatter cannot be supplied."
+            "status": "mapped",
+            "note": "Custom formatter closure."
           }
         },
         "methods": {
           "DefaultToolCallFormatter(CompactionMessageGroup)": {
             "rust": [
-              "agent_framework_core::compaction::OMITTED_TOOL_RESULT"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new"
             ],
-            "status": "partial",
-            "note": "Rust substitutes a fixed marker rather than formatting a summary of the compacted tool calls."
+            "status": "adapted",
+            "note": "The default formatter writes \"[Tool results: <tool>]\", as upstream."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::ToolResultCompactionStrategy",
+            "agent_framework_core::compaction::SelectiveToolResult"
+          ],
+          "status": "adapted",
+          "note": "Replaces older tool results' payloads, keeping exchanges paired."
         }
       },
       "TruncationCompactionStrategy": {
@@ -4186,11 +4516,12 @@
         "constructors": {
           "TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy",
               "agent_framework_core::compaction::Truncation::new",
               "agent_framework_core::compaction::Truncation::preserve_first_user"
             ],
             "status": "partial",
-            "note": "Truncation::new takes a max message count; there are no trigger/target triggers."
+            "note": "Truncation::new takes a max message count; there are no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
@@ -4215,9 +4546,11 @@
         },
         "constructors": {
           "FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
+            "rust": [
+              "agent_framework_foundry::hosted_agent::FoundryAgentChatClient::with_token_credential"
+            ],
+            "status": "adapted",
+            "note": "A server-hosted agent is reached through FoundryAgentChatClient (endpoint, agent name/version, credential) and its as_agent()."
           },
           "FoundryAgent(Uri, AuthenticationTokenProvider, string, string, AIProjectClientOptions?, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
@@ -4250,14 +4583,18 @@
         },
         "methods": {
           "EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::ensure_memory_store_created"
+            ],
+            "status": "mapped",
+            "note": "GETs the store and creates it on 404; returns whether it was created."
           },
           "EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No operation to delete stored memories for a scope."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::ensure_stored_memories_deleted"
+            ],
+            "status": "mapped",
+            "note": "Deletes the session scope with :delete_scope and drops its cached state."
           }
         }
       },
@@ -4285,9 +4622,11 @@
             "note": "FoundryMemoryProvider emits no sensitive-data telemetry toggle."
           },
           "MaxMemories": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No limit on the number of memories requested or injected per search."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_max_memories"
+            ],
+            "status": "mapped",
+            "note": "Sent as options.max_memories on every search."
           },
           "Redactor": {
             "rust": [],
@@ -4295,9 +4634,11 @@
             "note": "No redactor hook for memory content."
           },
           "SearchInputMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Search input is fixed to the run's user/assistant text; no filter can be supplied."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_search_input_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the run input."
           },
           "StateKey": {
             "rust": [
@@ -4307,14 +4648,18 @@
             "note": "State lives on the provider keyed by scope rather than in a session state bag, so no state key is needed."
           },
           "StorageInputRequestMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No filter over the request messages written to the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_storage_request_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the request messages."
           },
           "StorageInputResponseMessageFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No filter over the response messages written to the memory store."
+            "rust": [
+              "agent_framework_foundry::memory::FoundryMemoryProvider::with_storage_response_filter"
+            ],
+            "status": "adapted",
+            "note": "A closure over the response messages."
           },
           "UpdateDelay": {
             "rust": [
@@ -4973,9 +5318,11 @@
             "note": "AgentExecutor does not intercept agent approval/user-input requests; AgentApprovalExecutor is a separate post-response approval loop."
           },
           "ReassignOtherAgentsAsUsers": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AgentExecutor passes the conversation unchanged; other agents' assistant messages are not rewritten as user messages."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::AgentExecutor::with_reassign_other_agents_as_users"
+            ],
+            "status": "mapped",
+            "note": "Option on AgentExecutor."
           }
         }
       },
@@ -5226,9 +5573,11 @@
             "note": "Builds the dispatcher, participant executors and aggregator into a Workflow."
           },
           "WithAggregator(Func<IList<List<ChatMessage>>, List<ChatMessage>>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ConcurrentBuilder uses a fixed internal aggregator; there is no hook to supply a custom aggregation function."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::concurrent::ConcurrentBuilder::with_aggregator"
+            ],
+            "status": "mapped",
+            "note": "Closure over the participants' conversations."
           }
         }
       },
@@ -5428,9 +5777,11 @@
             "note": "The Executor trait requires Send + Sync, so every instance is assumed safe to share across concurrent runs."
           },
           "SupportsResetting": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Executors have no reset hook between runs; only snapshot_state/restore_state for checkpoints."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Every executor can reset; the default does nothing."
           }
         }
       },
@@ -5574,9 +5925,11 @@
             "note": "Executor requires Send + Sync, so shared instances are assumed safe under concurrent runs."
           },
           "SupportsResetting": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No reset capability exists for shared executor instances between runs."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Every executor can reset; the default does nothing."
           }
         }
       },
@@ -5816,15 +6169,19 @@
       },
       "IResettableExecutor": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No reset trait; executors are reused across runs without a reset hook."
+          "rust": [
+            "agent_framework_core::workflow::executor::Executor::reset"
+          ],
+          "status": "adapted",
+          "note": "A defaulted trait method rather than a separate interface; the runner calls it on every executor before a fresh run."
         },
         "methods": {
           "ResetAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No reset method exists on Executor."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Defaulted async trait method."
           }
         }
       },
@@ -5885,9 +6242,11 @@
             "note": "No key-listing method; SharedState::export returns the whole map, and scopes do not exist."
           },
           "RequestHaltAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WorkflowContext has no way for an executor to request the run halt at the end of the superstep."
+            "rust": [
+              "agent_framework_core::workflow::context::WorkflowContext::request_halt"
+            ],
+            "status": "mapped",
+            "note": "The run stops once the superstep completes; messages the superstep sent are dropped."
           },
           "SendMessageAsync(object, string, CancellationToken)": {
             "rust": [
@@ -6029,9 +6388,11 @@
       "OpenTelemetryWorkflowBuilderExtensions": {
         "methods": {
           "WithOpenTelemetry(WorkflowBuilder, Action<WorkflowTelemetryOptions>, ActivitySource)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Workflow runs emit no OpenTelemetry spans; WorkflowBuilder has no telemetry option."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowBuilder::with_telemetry"
+            ],
+            "status": "adapted",
+            "note": "Spans are emitted through tracing (on by default); with_telemetry turns kinds off. There is no ActivitySource argument."
           }
         }
       },
@@ -6364,9 +6725,11 @@
             "note": "events() returns every event the run has emitted."
           },
           "SessionId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WorkflowRun has no session id; only the workflow-level Workflow::id exists."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRun::session_id"
+            ],
+            "status": "mapped",
+            "note": "A fresh id per run."
           }
         },
         "methods": {
@@ -6515,9 +6878,12 @@
             "note": "build() validates participants and returns the sequential Workflow."
           },
           "WithChainOnlyAgentResponses(bool)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Each stage always receives the full running conversation; there is no option to chain only agent responses."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::sequential::SequentialBuilder::with_chain_only_agent_responses",
+              "agent_framework_core::workflow::orchestration::AgentExecutor::with_chain_only_responses"
+            ],
+            "status": "mapped",
+            "note": "Builder option; each participant receives only the previous response."
           }
         }
       },
@@ -6553,16 +6919,20 @@
         },
         "properties": {
           "SessionId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Streaming runs carry no session id."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRunStream::session_id"
+            ],
+            "status": "mapped",
+            "note": "A fresh id per run."
           }
         },
         "methods": {
           "CancelRunAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No cancel operation; dropping the stream detaches the spawned run task rather than stopping it, and WorkflowRunState::Cancelled is never set."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRunStream::cancel"
+            ],
+            "status": "mapped",
+            "note": "Aborts the run task; into_run reports the cancellation."
           },
           "DisposeAsync()": {
             "rust": [
@@ -6617,22 +6987,28 @@
       },
       "SubworkflowWarningEvent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Workflows emit no warning events; warnings go to tracing only."
+          "rust": [
+            "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+          ],
+          "status": "mapped",
+          "note": "Forwarded by WorkflowExecutor from a nested workflow's warnings."
         },
         "constructors": {
           "SubworkflowWarningEvent(string, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No warning event to construct."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+            ],
+            "status": "mapped",
+            "note": "Variant constructor."
           }
         },
         "properties": {
           "SubWorkflowId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No subworkflow warning event, so no subworkflow id field."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+            ],
+            "status": "mapped",
+            "note": "The sub_workflow_id field."
           }
         }
       },
@@ -7030,15 +7406,20 @@
       },
       "WorkflowWarningEvent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No workflow warning event; warnings are logged via tracing."
+          "rust": [
+            "agent_framework_core::workflow::events::WorkflowEvent::Warning",
+            "agent_framework_core::workflow::context::WorkflowContext::add_warning"
+          ],
+          "status": "mapped",
+          "note": "Event variant, emitted with WorkflowContext::add_warning."
         },
         "constructors": {
           "WorkflowWarningEvent(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No warning event to construct."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::Warning"
+            ],
+            "status": "mapped",
+            "note": "Variant constructor."
           }
         }
       }
@@ -7254,40 +7635,54 @@
     "Microsoft.Agents.AI.Workflows.Observability": {
       "WorkflowTelemetryOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No workflow telemetry; the workflow runner emits no OpenTelemetry spans."
+          "rust": [
+            "agent_framework_core::workflow::runner::WorkflowTelemetryOptions"
+          ],
+          "status": "mapped",
+          "note": "Struct of span switches; spans go through tracing."
         },
         "properties": {
           "DisableEdgeGroupProcess": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No edge-group spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_edge_group_process"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableExecutorProcess": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No executor-process spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_executor_process"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableMessageSend": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-send spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_message_send"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableWorkflowBuild": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No workflow.build span exists to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_workflow_build"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "DisableWorkflowRun": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No workflow run/session spans exist to disable."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::disable_workflow_run"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "EnableSensitiveData": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ObservabilityConfig::enable_sensitive_data covers chat/agent spans only; workflows emit no spans."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowTelemetryOptions::enable_sensitive_data"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           }
         }
       }

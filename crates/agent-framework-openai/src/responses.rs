@@ -29,7 +29,8 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
+    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, CodeInterpreterToolCallContent,
+    CodeInterpreterToolResultContent, Content, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
     McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
     ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
@@ -74,7 +75,7 @@ impl OpenAIChatClient {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 api_key: api_key.into(),
                 base_url: DEFAULT_BASE_URL.to_string(),
                 model: model.into(),
@@ -204,10 +205,12 @@ impl OpenAIChatClient {
         if let Some(org) = &self.inner.organization {
             req = req.header("OpenAI-Organization", org);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());
@@ -836,6 +839,70 @@ fn user_location_to_responses(location: &Value) -> Value {
     Value::Object(loc)
 }
 
+/// The contents of a `code_interpreter_call` output item: a
+/// [`Content::CodeInterpreterToolCall`] carrying the submitted code, and a
+/// [`Content::CodeInterpreterToolResult`] carrying its `logs` (as text) and
+/// `image` outputs (as URIs), as upstream's
+/// `from_code_interpreter_tool_call` / `_tool_result`.
+///
+/// These used to be flattened into ordinary [`Content::Text`] — the run's
+/// console output, or its source when there was none — so the tool's
+/// output read as part of the model's answer, in `text()` and in anything
+/// built from it. Used for both a full response and the streamed
+/// `response.output_item.done`, which is the only event that carries
+/// `outputs` during streaming (upstream #9744).
+fn code_interpreter_contents(item: &Value) -> Vec<Content> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let mut outputs = Vec::new();
+    for output in item
+        .get("outputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match output.get("type").and_then(Value::as_str) {
+            Some("logs") => {
+                if let Some(logs) = output.get("logs").and_then(Value::as_str) {
+                    outputs.push(Content::Text(TextContent::new(logs)));
+                }
+            }
+            Some("image") => {
+                if let Some(url) = output.get("url").and_then(Value::as_str) {
+                    outputs.push(Content::Uri(UriContent {
+                        uri: url.to_string(),
+                        media_type: "image".to_string(),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut contents = Vec::new();
+    if let Some(code) = item
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
+        contents.push(Content::CodeInterpreterToolCall(
+            CodeInterpreterToolCallContent {
+                call_id: call_id.clone(),
+                inputs: Some(vec![Content::Text(TextContent::new(code))]),
+            },
+        ));
+    }
+    contents.push(Content::CodeInterpreterToolResult(
+        CodeInterpreterToolResultContent {
+            call_id,
+            outputs: Some(outputs),
+        },
+    ));
+    contents
+}
+
 /// Build the Responses MCP `require_approval` value. A `parameters.approval_mode`
 /// override — either the string `"always_require"`/`"never_require"` or an
 /// object `{"always": [...], "never": [...]}` — takes precedence over the
@@ -956,16 +1023,36 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
         ..Default::default()
     };
 
-    let mut contents: Vec<Content> = Vec::new();
+    // One assistant message per `message` output item, carrying that item's
+    // id (upstream #9768). Other items (reasoning, tool calls) join the
+    // message being built; a message item with a new id starts the next one,
+    // and the first message item names a message that has no id yet.
+    let mut messages: Vec<Message> = Vec::new();
     if let Some(items) = value.get("output").and_then(Value::as_array) {
         for item in items {
-            parse_output_item(item, &mut contents);
+            let item_id = (item.get("type").and_then(Value::as_str) == Some("message"))
+                .then(|| item.get("id").and_then(Value::as_str))
+                .flatten()
+                .filter(|id| !id.is_empty());
+            let starts_new = match (messages.last(), item_id) {
+                (None, _) => true,
+                (Some(last), Some(id)) => last.message_id.as_deref().is_some_and(|m| m != id),
+                _ => false,
+            };
+            if starts_new {
+                messages.push(Message::with_contents(Role::assistant(), Vec::new()));
+            }
+            let current = messages.last_mut().expect("pushed above");
+            if let Some(id) = item_id {
+                current.message_id = Some(id.to_string());
+            }
+            parse_output_item(item, &mut current.contents);
         }
     }
-
-    let mut message = Message::with_contents(Role::assistant(), contents);
-    message.message_id = response.response_id.clone();
-    response.messages.push(message);
+    if messages.is_empty() {
+        messages.push(Message::with_contents(Role::assistant(), Vec::new()));
+    }
+    response.messages = messages;
 
     response.finish_reason = finish_reason_from_response(value);
 
@@ -1127,37 +1214,9 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                 }
             }
         }
-        // Code-interpreter runs surface `logs` as text and `image` outputs as
-        // URIs; a bare `code` (no outputs) is a text fallback
-        // (`_create_response_content:748-764`).
-        Some("code_interpreter_call") => {
-            let outputs = item
-                .get("outputs")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty());
-            if let Some(outputs) = outputs {
-                for output in outputs {
-                    match output.get("type").and_then(Value::as_str) {
-                        Some("logs") => {
-                            if let Some(logs) = output.get("logs").and_then(Value::as_str) {
-                                contents.push(Content::Text(TextContent::new(logs)));
-                            }
-                        }
-                        Some("image") => {
-                            if let Some(url) = output.get("url").and_then(Value::as_str) {
-                                contents.push(Content::Uri(UriContent {
-                                    uri: url.to_string(),
-                                    media_type: "image".to_string(),
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if let Some(code) = item.get("code").and_then(Value::as_str) {
-                contents.push(Content::Text(TextContent::new(code)));
-            }
-        }
+        // A code-interpreter run is a hosted tool call and its result, not
+        // assistant text (see `code_interpreter_contents`).
+        Some("code_interpreter_call") => contents.extend(code_interpreter_contents(item)),
         // A generated image is returned as base64; default to image/png unless
         // the result is a data URI that states its own type
         // (`_create_response_content:788-811`).
@@ -1449,6 +1508,16 @@ fn reasoning_update(text: &str) -> EventOutcome {
     })
 }
 
+/// The output item a streamed text or refusal delta belongs to, so the
+/// aggregated response keeps one message per `message` item (upstream #9768).
+fn stream_item_id(value: &Value) -> Option<String> {
+    value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse one Responses API SSE event (already-decoded JSON `data:` payload).
 fn parse_responses_event(
     value: &Value,
@@ -1485,6 +1554,7 @@ fn parse_responses_event(
             EventOutcome::Update(ChatResponseUpdate {
                 contents: vec![Content::Text(TextContent::new(text))],
                 role: Some(Role::assistant()),
+                message_id: stream_item_id(value),
                 ..Default::default()
             })
         }
@@ -1503,6 +1573,7 @@ fn parse_responses_event(
             EventOutcome::Update(ChatResponseUpdate {
                 contents: vec![Content::Text(TextContent::refusal(text))],
                 role: Some(Role::assistant()),
+                message_id: stream_item_id(value),
                 ..Default::default()
             })
         }
@@ -1641,22 +1712,62 @@ fn parse_responses_event(
             let resp = value.get("response");
             let err_obj = resp
                 .and_then(|r| r.get("error"))
-                .or_else(|| value.get("error"));
-            let msg = err_obj
+                .filter(|e| !e.is_null())
+                .or_else(|| value.get("error").filter(|e| !e.is_null()))
+                // A flat `error` event carries `code` / `message` / `param`
+                // on the event itself rather than nested under an `error`
+                // key (upstream's `ResponseErrorEvent`). Without this
+                // fallback none of the three was found and every such event
+                // collapsed to the generic "response failed", discarding
+                // whatever the provider actually said. `response.failed`
+                // events are unaffected: they carry no top-level `message`,
+                // so they still fall through to that default.
+                .or(Some(value));
+            let message = err_obj
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
-                .unwrap_or("response failed")
-                .to_string();
+                .unwrap_or("response failed");
+            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
+            let param = err_obj.and_then(|e| e.get("param")).and_then(Value::as_str);
+            // Keep the provider's `code` and `param` in the surfaced error
+            // (upstream #9616). Only `message` used to survive, so a streamed
+            // `400` arrived as bare text like "Invalid value" with nothing
+            // naming the field that was wrong — the one detail that makes it
+            // actionable. Upstream carries them as attributes on its own
+            // exception type; `Error::service` carries a string, so they go
+            // in the message, formatted as upstream formats its own.
+            let mut detail = match code {
+                Some(code) => format!("{code}: {message}"),
+                None => message.to_string(),
+            };
+            if let Some(param) = param {
+                detail.push_str(&format!(" (parameter: {param})"));
+            }
             // Same classification as the non-streaming `response_failure_error`
             // so callers branching on content filters see one behavior for
             // streamed and non-streamed Responses.
-            let code = err_obj.and_then(|e| e.get("code")).and_then(Value::as_str);
             EventOutcome::Error(match code {
-                Some("content_filter") => Error::service_content_filter(msg),
-                _ => Error::service(msg),
+                Some("content_filter") => Error::service_content_filter(detail),
+                _ => Error::service(detail),
             })
         }
         "response.output_item.done" => {
+            // A finished code-interpreter run: the done item is the only
+            // place its `outputs` arrive while streaming, and its `code` is
+            // final. Emitted whole, once. (Upstream also streams the code
+            // live from `code_interpreter_call_code.delta` with a merge mode
+            // this port's content model has no counterpart for, so the code
+            // arrives here instead of in fragments.)
+            if let Some(item) = value
+                .get("item")
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("code_interpreter_call"))
+            {
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents: code_interpreter_contents(item),
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
             let Some(item) = value
                 .get("item")
                 .filter(|i| i.get("type").and_then(Value::as_str) == Some("mcp_call"))
@@ -2039,6 +2150,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_keeps_one_message_per_message_item() {
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": "rs_1", "summary": [{ "type": "summary_text", "text": "think" }] },
+                { "type": "message", "id": "msg_1", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "Checking the refund policy." }
+                ]},
+                { "type": "message", "id": "msg_2", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "The refund requires approval." }
+                ]},
+                { "type": "function_call", "call_id": "c1", "name": "approve", "arguments": "{}" }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let ids: Vec<_> = resp
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_deref())
+            .collect();
+        assert_eq!(ids, [Some("msg_1"), Some("msg_2")]);
+        assert_eq!(resp.messages[0].text(), "Checking the refund policy.");
+        assert!(matches!(
+            resp.messages[0].contents[0],
+            Content::TextReasoning(_)
+        ));
+        assert_eq!(resp.messages[1].text(), "The refund requires approval.");
+        assert!(matches!(
+            resp.messages[1].contents[1],
+            Content::FunctionCall(_)
+        ));
+        assert_eq!(resp.response_id.as_deref(), Some("resp_1"));
+    }
+
+    #[test]
+    fn parse_response_without_message_items_has_one_unnamed_message() {
+        let value = json!({"id": "resp_1", "output": [
+            { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" }
+        ]});
+        let resp = parse_response(&value, None);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].message_id, None);
+    }
+
+    #[test]
     fn parse_response_store_false_omits_conversation_id() {
         let value = json!({
             "id": "resp_123",
@@ -2283,6 +2440,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_keeps_one_message_per_output_item() {
+        let mut events = vec![(
+            "response.created",
+            json!({ "type": "response.created", "response": { "id": "resp_1" } }),
+        )];
+        for (i, text) in [
+            "Checking the refund policy.",
+            "The refund requires approval.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            events.push((
+                "response.output_text.delta",
+                json!({ "type": "response.output_text.delta", "item_id": format!("msg_{i}"), "delta": text }),
+            ));
+        }
+        let resp = ChatResponse::from_updates(collect_updates(sse_body(&events)).await);
+        let texts: Vec<_> = resp.messages.iter().map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Checking the refund policy.",
+                "The refund requires approval."
+            ]
+        );
+        assert_eq!(resp.messages[0].message_id.as_deref(), Some("msg_0"));
+        assert_eq!(resp.messages[1].message_id.as_deref(), Some("msg_1"));
+    }
+
+    #[tokio::test]
     async fn stream_text_only_accumulates() {
         let text = sse_body(&[
             (
@@ -2389,6 +2577,72 @@ mod tests {
             saw_error,
             "expected a response.failed event to surface an error"
         );
+    }
+
+    #[test]
+    fn a_streamed_error_keeps_the_provider_code_and_param() {
+        // Only `message` used to survive, so a streamed 400 arrived as bare
+        // text with nothing naming the offending field (upstream #9616).
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "error",
+                "code": "invalid_value",
+                "message": "Invalid value",
+                "param": "tools[0].name",
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        let text = err.to_string();
+        assert!(text.contains("invalid_value"), "missing code: {text}");
+        assert!(text.contains("Invalid value"), "missing message: {text}");
+        assert!(text.contains("tools[0].name"), "missing param: {text}");
+    }
+
+    #[test]
+    fn a_streamed_error_without_a_code_or_param_is_just_its_message() {
+        // The common shape must not grow "None:" noise.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({ "type": "error", "message": "plain failure" }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        let text = err.to_string();
+        assert!(text.contains("plain failure"), "{text}");
+        assert!(!text.contains("None"), "no placeholder noise: {text}");
+        assert!(
+            !text.contains("parameter:"),
+            "no empty param clause: {text}"
+        );
+    }
+
+    #[test]
+    fn a_content_filter_block_keeps_its_classification_and_its_code() {
+        // Enriching the message must not change how the error classifies.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "content_filter", "message": "blocked" } }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Error(err) = outcome else {
+            panic!("expected an error outcome");
+        };
+        assert!(matches!(err, Error::ServiceContentFilter { .. }));
+        let text = err.to_string();
+        assert!(text.contains("content_filter"), "{text}");
+        assert!(text.contains("blocked"), "{text}");
     }
 
     #[test]
@@ -2706,26 +2960,77 @@ mod tests {
     }
 
     #[test]
-    fn code_interpreter_outputs_become_text_and_uri() {
+    fn a_code_interpreter_run_is_a_hosted_call_and_result_not_answer_text() {
+        // Its console output and source used to be flattened into ordinary
+        // text, so they read as part of the model's answer.
         let contents = parse_item(json!({
             "type": "code_interpreter_call",
+            "id": "ci_1",
+            "code": "print('hello stdout')",
             "outputs": [
                 { "type": "logs", "logs": "hello stdout" },
                 { "type": "image", "url": "https://ex.com/plot.png" },
             ],
         }));
-        assert!(matches!(&contents[0], Content::Text(t) if t.text == "hello stdout"));
         assert!(
-            matches!(&contents[1], Content::Uri(u) if u.uri == "https://ex.com/plot.png" && u.media_type == "image")
+            contents.iter().all(|c| !matches!(c, Content::Text(_))),
+            "{contents:?}"
+        );
+        let Content::CodeInterpreterToolCall(call) = &contents[0] else {
+            panic!("expected the call first: {contents:?}");
+        };
+        assert_eq!(call.call_id.as_deref(), Some("ci_1"));
+        assert!(
+            matches!(&call.inputs.as_ref().unwrap()[0], Content::Text(t) if t.text == "print('hello stdout')")
+        );
+        let Content::CodeInterpreterToolResult(result) = &contents[1] else {
+            panic!("expected the result second: {contents:?}");
+        };
+        let outputs = result.outputs.as_ref().unwrap();
+        assert!(matches!(&outputs[0], Content::Text(t) if t.text == "hello stdout"));
+        assert!(
+            matches!(&outputs[1], Content::Uri(u) if u.uri == "https://ex.com/plot.png" && u.media_type == "image")
         );
     }
 
     #[test]
-    fn code_interpreter_without_outputs_falls_back_to_code() {
+    fn a_code_interpreter_run_with_no_outputs_still_reports_its_result() {
         let contents = parse_item(json!({
-            "type": "code_interpreter_call", "code": "print(1)",
+            "type": "code_interpreter_call", "call_id": "ci_2", "code": "x = 1",
         }));
-        assert!(matches!(&contents[0], Content::Text(t) if t.text == "print(1)"));
+        assert_eq!(contents.len(), 2);
+        assert!(
+            matches!(&contents[1], Content::CodeInterpreterToolResult(r) if r.outputs.as_deref() == Some(&[][..]))
+        );
+    }
+
+    #[test]
+    fn a_streamed_code_interpreter_run_is_captured_from_output_item_done() {
+        // The done item is the only streaming event that carries `outputs`
+        // (upstream #9744); before this they were never seen while streaming.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "code_interpreter_call", "id": "ci_3", "code": "1+1",
+                    "outputs": [{ "type": "logs", "logs": "2" }]
+                }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Update(update) = outcome else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::CodeInterpreterToolCall(_)
+        ));
+        let Content::CodeInterpreterToolResult(r) = &update.contents[1] else {
+            panic!("{:?}", update.contents);
+        };
+        assert!(matches!(&r.outputs.as_ref().unwrap()[0], Content::Text(t) if t.text == "2"));
     }
 
     #[test]

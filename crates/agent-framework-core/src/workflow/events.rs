@@ -54,6 +54,11 @@ pub enum WorkflowEvent {
     AgentRun {
         executor_id: String,
         response: Value,
+        /// The conversation the agent was run over (a JSON array of
+        /// messages), as upstream's `AgentExecutorResponse.full_conversation`
+        /// carries it. `null` from producers that do not record it.
+        #[serde(default)]
+        input: Value,
     },
     /// A workflow-level output was yielded (`WorkflowOutputEvent`).
     ///
@@ -90,6 +95,14 @@ pub enum WorkflowEvent {
     },
     /// The run failed terminally (`WorkflowFailedEvent`).
     Failed { error: String },
+    /// A non-fatal problem an executor reported (`WorkflowWarningEvent`).
+    Warning { message: String },
+    /// A warning from a nested workflow, forwarded by its
+    /// [`WorkflowExecutor`](super::WorkflowExecutor) (`SubworkflowWarningEvent`).
+    SubworkflowWarning {
+        sub_workflow_id: String,
+        message: String,
+    },
 }
 
 impl WorkflowEvent {

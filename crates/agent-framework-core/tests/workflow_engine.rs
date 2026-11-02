@@ -382,6 +382,8 @@ fn tag(event: &WorkflowEvent) -> String {
         WorkflowEvent::Custom(_) => "Custom".into(),
         WorkflowEvent::RequestInfo { .. } => "RequestInfo".into(),
         WorkflowEvent::Failed { .. } => "Failed".into(),
+        WorkflowEvent::Warning { .. } => "Warning".into(),
+        WorkflowEvent::SubworkflowWarning { .. } => "SubworkflowWarning".into(),
     }
 }
 

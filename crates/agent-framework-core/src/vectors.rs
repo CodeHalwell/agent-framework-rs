@@ -636,8 +636,8 @@ pub struct VectorSearchResult {
     ///
     /// `None` means the score is in the collection's declared distance
     /// function, as [`InMemoryVectorStore`] returns. The values this workspace
-    /// emits are [`Self::SCORE_KIND_RELEVANCE`] and
-    /// [`Self::SCORE_KIND_RRF`], both higher-is-closer.
+    /// emits are [`Self::SCORE_KIND_RELEVANCE`] and [`Self::SCORE_KIND_RRF`],
+    /// both higher-is-closer, and [`Self::SCORE_KIND_DISTANCE`], lower-is-closer.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub score_kind: Option<String>,
 }
@@ -649,6 +649,10 @@ impl VectorSearchResult {
     /// A reciprocal-rank-fusion score from a hybrid query: higher is a better
     /// match, and it is a rank combination rather than any distance.
     pub const SCORE_KIND_RRF: &'static str = "rrf";
+    /// A native distance: lower is a better match, whatever the declared
+    /// distance function's name says (Redis reports cosine and inner-product
+    /// searches this way).
+    pub const SCORE_KIND_DISTANCE: &'static str = "distance";
 
     /// Whether a higher [`Self::score`] means a closer match, given the
     /// collection's declared distance function.
@@ -660,6 +664,7 @@ impl VectorSearchResult {
     pub fn higher_is_closer(&self, distance: Option<&DistanceFunction>) -> Option<bool> {
         match self.score_kind.as_deref() {
             Some(Self::SCORE_KIND_RELEVANCE) | Some(Self::SCORE_KIND_RRF) => Some(true),
+            Some(Self::SCORE_KIND_DISTANCE) => Some(false),
             Some(_) => None,
             None => distance.and_then(DistanceFunction::higher_is_closer),
         }

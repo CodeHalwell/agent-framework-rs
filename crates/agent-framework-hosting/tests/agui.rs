@@ -278,7 +278,18 @@ async fn agent_failure_emits_run_error() {
     let events = parse_sse_json(&text);
     assert_eq!(event_types(&events), vec!["RUN_STARTED", "RUN_ERROR"]);
     assert_eq!(events[0]["threadId"], "t");
-    assert!(events[1]["message"].as_str().unwrap().contains("kaboom"));
+    // The run's own error text stays on the server (upstream #9460, which
+    // this port first applied to DevUI): a provider's raw HTTP body, a
+    // tool's error text or a filesystem path must not reach the client.
+    let message = events[1]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("kaboom"),
+        "internal error text leaked: {message}"
+    );
+    assert!(
+        !message.is_empty(),
+        "the client is still told the run failed"
+    );
     // No RUN_FINISHED after a RUN_ERROR.
     assert!(!event_types(&events).contains(&"RUN_FINISHED".to_string()));
 }

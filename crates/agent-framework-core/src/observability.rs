@@ -857,8 +857,12 @@ impl<C: ChatClient> ChatClient for ObservableChatClient<C> {
 /// separate "enable" switch — attach a subscriber (optionally bridged to
 /// OTel; see the [module docs](self)) to turn observability on.
 ///
-/// This crate does **not** build an OTel `Resource`, exporter, or
-/// `MeterProvider` — see the [module docs](self) for wiring those yourself.
+/// This config does **not** build an OTel `Resource`, exporter, or
+/// `MeterProvider`. Enable the `otel-export` feature and use
+/// [`export::OtelExport`] to get all three wired up — including the
+/// `microsoft.agent-framework` resource attribute Azure's agent telemetry
+/// views key off. See the [module docs](self) for wiring them yourself
+/// instead.
 #[derive(Debug, Clone, Default)]
 pub struct ObservabilityConfig {
     /// Whether message / system-instructions / tool-definition / tool-call
@@ -925,9 +929,12 @@ impl ObservabilityConfig {
 
     /// The `OTEL_SERVICE_NAME` passthrough, defaulting to `"agent_framework"`
     /// (mirrors Python's `_create_resource`, `observability.py:336-344`).
-    /// This crate does not build a `Resource` from it — it's exposed so an
+    /// This config does not build a `Resource` from it — it's exposed so an
     /// app wiring its own OTel `Resource` (see the [module docs](self)) can
-    /// stay consistent with whatever this reads. Reads the environment fresh
+    /// stay consistent with whatever this reads. An app that does wire its
+    /// own should also set the `microsoft.agent-framework` attribute that
+    /// `otel-export`'s pipeline sets, or Azure's agent telemetry views will
+    /// not recognise what it exports. Reads the environment fresh
     /// on every call rather than caching it at [`from_env`](Self::from_env)
     /// time.
     pub fn otel_service_name(&self) -> String {

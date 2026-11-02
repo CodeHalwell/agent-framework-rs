@@ -1662,7 +1662,17 @@ impl MagenticBuilder {
                 .max_stall_count
                 .unwrap_or_else(|| manager.max_stall_count()),
             max_reset_count: self.max_reset_count.or_else(|| manager.max_reset_count()),
-            max_round_count: self.max_round_count.or_else(|| manager.max_round_count()),
+            // A round cap below 1 is coerced up to 1, matching the base
+            // group-chat contract (see `GroupChatBuilder::build`). The limit
+            // is checked *before* a round is counted, so an uncoerced 0 would
+            // end the run before any coordination round could execute —
+            // yielding only the "Stopped due to round limit" placeholder. The
+            // cap can also arrive from a custom `MagenticManager`, so it is
+            // coerced here rather than in the builder's setter.
+            max_round_count: self
+                .max_round_count
+                .or_else(|| manager.max_round_count())
+                .map(|m| m.max(1)),
             manager,
             participants,
             descriptions,

@@ -7,6 +7,338 @@ may break APIs).
 
 ## [Unreleased]
 
+Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
+in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
+and three further rounds against the same baseline in
+[`round-2`](docs/drift/2026-11-02-ca65085e-round-2.md),
+[`round-3`](docs/drift/2026-11-02-ca65085e-round-3.md) and
+[`round-4`](docs/drift/2026-11-02-ca65085e-round-4.md).
+Round four takes the two security items earlier rounds had left for a
+decision, and clears the rest of the queue. A review of the official Azure
+SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+### Added (parity push)
+
+Closing items from `SCOPE.md`'s "Not yet ported" list:
+
+- `FoundryMemoryProvider`: `with_max_memories`, search and storage message
+  filters, `ensure_stored_memories_deleted` and
+  `ensure_memory_store_created`.
+- Smaller parity options: `AgentResponse::to_updates`, `Agent::chat_client`,
+  `memory::with_message_source` / `message_source_type`,
+  `SkillsProvider::with_filter`, `with_instructions_prompt`,
+  `with_load_skill_approval` and `with_read_skill_resource_approval`,
+  `TodoProvider::with_suppressed_todo_list_message` and
+  `with_todo_list_message_builder`, and
+  `harness::all_tools_auto_approval_rule`.
+- Workflow run controls: `WorkflowContext::request_halt` (stop after the
+  superstep), `WorkflowRunStream::cancel`, per-run `session_id` on
+  `WorkflowRun` and `WorkflowRunStream`, a defaulted `Executor::reset`
+  called before each fresh run, `WorkflowContext::add_warning` with the new
+  `WorkflowEvent::Warning` / `SubworkflowWarning` variants (forwarded from
+  nested workflows), `SequentialBuilder::with_chain_only_agent_responses`,
+  `ConcurrentBuilder::with_aggregator` and
+  `AgentExecutor::with_reassign_other_agents_as_users`.
+- Workflow telemetry: runs emit `workflow.build`, `workflow.run`,
+  `executor.process {id}`, `message.send` and `edge_group.process {type}`
+  spans (upstream's names and attributes) through `tracing`;
+  `WorkflowBuilder::with_telemetry(WorkflowTelemetryOptions)` turns kinds off
+  and opts into payload capture.
+- Compaction depth: the group model (`compaction::index`:
+  `CompactionMessageIndex`, `CompactionMessageGroup`, `CompactionGroupKind`),
+  `CompactionTriggers`, `PipelineCompactionStrategy`,
+  `TriggeredCompactionStrategy`, the LLM-backed
+  `SummarizationCompactionStrategy` over the new `AsyncCompactionStrategy`
+  (`CompactionProvider::with_async_strategy`,
+  `AgentBuilder::with_async_compaction`), `ToolResultCompactionStrategy`
+  with a custom formatter, and the two-phase
+  `ContextWindowCompactionStrategy`.
+- Skill scripts: `SkillScript` (inline closures run in-process, or files
+  discovered in a skill's directory, `.py` by default) and the
+  `run_skill_script` tool, which requires approval by default
+  (`SkillsProvider::with_script_approval`). File scripts run through the
+  application's `SkillsProvider::with_script_runner`; there is no default
+  runner. `Skill` gains `scripts`, `path` and the frontmatter fields
+  (`license`, `compatibility`, `allowed_tools`, `metadata`);
+  `FileSkillsSource` gains `with_script_extensions` and `with_script_filter`.
+  `Agent::context_providers` exposes the configured providers.
+- Azure Monitor export: `agent-framework-core`'s `azure-monitor` feature
+  (umbrella `azure-monitor`) adds `OtelExport::with_azure_monitor` and
+  `OtelExport::azure_monitor_from_env` (`APPLICATIONINSIGHTS_CONNECTION_STRING`),
+  sending the pipeline's traces and metrics to Application Insights, the
+  counterpart of upstream's `configure_azure_monitor`.
+- Message source attribution (upstream `_attribution`): context messages
+  carry `additional_properties["_attribution"]` with their `source_id`
+  (`ContextProvider::source_id`, defaulting to the provider's type name),
+  `source_type` and any `origin_session_ids`. `SessionContext` gains
+  `extend_messages`, `extend_messages_from` and `get_messages`; the agent
+  attributes whatever a provider adds.
+- `SessionContext::agent` (`AgentInfo`: id, name, description): context
+  providers see the agent they run for in `before_run`, as upstream's
+  `agent` argument.
+- `AgentBuilder::require_per_service_call_history_persistence` (upstream's
+  option of the same name): with a local history provider, each model call
+  of the tool loop records what it added, so a run that fails midway keeps
+  its completed turns. `create_harness_agent` turns it on, as upstream.
+- `agent-framework-redis`: `RedisVectorStore` / `RedisVectorCollection`
+  (port of upstream `agent_framework_redis._vector_store`), HASH or JSON
+  documents indexed by Redis Search, behind the crate's
+  `experimental-vector-stores` feature (turned on by the umbrella crate's
+  feature of the same name). Scores are native distances, reported with the
+  new `VectorSearchResult::SCORE_KIND_DISTANCE`.
+- **Harness complete** (`experimental-harness`): `FileAccessProvider`,
+  `TodoFileStore`, `BackgroundAgentsProvider` with the
+  `background_tasks_running` loop callbacks, `MemoryContextProvider` with
+  `MemoryStore` / `MemoryFileStore`, and `create_harness_agent`
+  (`HarnessAgent`). File-access and file-memory edits now share one lock
+  per store and folder, as upstream.
+- **Evaluation** (`experimental-evals`): `evaluate_agent`,
+  `evaluate_workflow`, `LocalEvaluator`, the keyword / tool-call /
+  function checks and `EvalResults` CI assertions; `FoundryEvals` (Foundry's
+  built-in and generated rubric evaluators over the Evals API) behind
+  `agent-framework-foundry`'s `evals` feature.
+- **`agent-framework-qdrant`**: the Qdrant vector store (umbrella feature
+  `qdrant`, experimental).
+- **`agent-framework-postgres`**: the PostgreSQL + pgvector vector store
+  (umbrella feature `postgres`, experimental). Its live tests run when
+  `AF_POSTGRES_TEST_URL` is set.
+- `FoundryAgentChatClient` (in `agent-framework-foundry`): calls a Prompt or
+  Hosted Agent defined in a Foundry project by `agent_reference`, dropping
+  the model and tool declarations the service owns; `as_agent()` builds an
+  `Agent` whose local function tools dispatch the service agent's calls.
+  `AzureOpenAIResponsesClient::with_body_transform` is the hook it uses.
+- `ValkeyChatHistoryProvider` (in `agent-framework-redis`): port of .NET's
+  Valkey history provider, resolving each session's conversation from its
+  state bag rather than being pinned to one session.
+- **Cloud streaming**: Anthropic on Foundry, Vertex and Bedrock now stream
+  (Bedrock via a new AWS event-stream decoder), and the Bedrock Converse
+  client streams through `converse-stream` instead of buffering.
+- `ContentUnderstandingContextProvider` (`agent-framework-azure`, feature
+  `content-understanding`; umbrella `azure-content-understanding`): analyzes
+  supported attachments with Azure Content Understanding, strips them from
+  the model input, injects the rendered document (or uploads it through a
+  `FileSearchBackend`), resumes slow analyses on later turns, and offers
+  `list_documents`.
+- File-based skills (`file-skills` feature, in `full`): `FileSkillsSource`
+  discovers `SKILL.md` packages per the Agent Skills spec (validated
+  frontmatter, resources by extension and depth, links refused);
+  `SkillsProvider::from_paths`; the harness builder's `skills_paths`.
+- Message injection: `session::enqueue_messages` / `pending_messages`
+  queue messages for a run's next model call, including from a tool
+  mid-run; a queue left at the end of a turn earns another call. Built into
+  the function-invocation loop for non-streaming calls.
+- Context providers can rewrite `SessionContext::input_messages`; the model
+  receives the rewritten input, as upstream allows.
+- `ContextProvider::after_run_in_session`: the completion hook with the
+  run's session. It defaults to `after_run`, and agents now call it.
+- `SupportsAgentRun::description()` (defaulted), reported by `Agent`,
+  `WorkflowAgent`, `A2AAgent` and `CopilotStudioAgent`; `Agent::tools()`.
+
+### Changed (parity push)
+
+- **Breaking:** `WorkflowEvent` gains `Warning` and `SubworkflowWarning`
+  variants; exhaustive matches need arms for them.
+- **Behavior change:** mixed declaration-only batches follow upstream
+  #9050 and #9203. With a session, a declaration-only call's local siblings
+  no longer run on the same turn: the batch pauses, the siblings are held in
+  session state, and they run once, under the current tool policy, on the
+  request that answers every declaration-only call (a sibling whose tool now
+  requires approval pauses for it instead). Without a session they still run
+  on the same turn. In an approval batch, a declaration-only call is returned
+  for the caller to answer rather than turned into an approval request.
+- Message injection now also applies to streamed runs: messages queued on
+  the session are streamed as their own updates and sent with the request,
+  and a message queued mid-turn earns another call on the same stream
+  (upstream `_stream_injected_messages`). To make that follow-up call from
+  inside the stream, `FunctionInvokingChatClient` holds its inner client in
+  an `Arc`, and its `ChatClient` impl requires `C: 'static`.
+- **Behavior change:** the Responses parsers (OpenAI, Azure OpenAI,
+  Foundry) return one assistant message per `message` output item, with the
+  item's id as `message_id`, instead of a single message whose id was the
+  response id (upstream #9768). Streamed text and refusal deltas carry their
+  `item_id`, and `ChatResponse::from_updates` names an id-less trailing
+  message with the first id it sees, so streamed and non-streamed responses
+  agree. `response_id` is unchanged; read it instead of
+  `messages[0].message_id`.
+- **Breaking:** `WorkflowEvent::AgentRun` gains an `input` field (the
+  conversation the agent ran over), which evaluation needs. Patterns that
+  name every field need a `..`.
+- `Message::text()` and the update text accessors join only plain text, as
+  upstream does, so model reasoning no longer leaks into the answer text.
+
+### Security (round four)
+
+- `agent-framework-redis` no longer returns one scope's memories under
+  another's. The `FT.SEARCH` path's scope `TAG` query over-matched — a value
+  containing a comma is indexed as several tags, and matching is
+  case-insensitive — so `user_id = "smith"` received `"smith,john"`'s
+  memories. Every hit is now re-checked against the exact scope, and the
+  query requires each comma-separated part, which also lets a provider whose
+  own id contains a comma find its memories at all. No schema change or data
+  migration (upstream's #9461 needed both).
+- AG-UI `RUN_ERROR` events no longer carry a failed run's internal error
+  text to the client; it is logged against the run id instead, as DevUI's
+  were in round one.
+
+### Fixed (round four)
+
+- Transport errors now say what went wrong. A `reqwest` failure's own
+  message reads the same for a timeout, a refused connection and a DNS
+  failure; every provider crate now includes the error's cause chain, via a
+  new `agent_framework_core::error::error_chain`.
+- An MCP tool configured with a zero request timeout is refused at
+  `connect` instead of failing every call (upstream #9314).
+- MCP tools that require the Tasks extension, which this client does not
+  implement, are no longer offered to the model (upstream #9746).
+
+### Added (round four)
+
+- Every HTTP-backed crate sends the framework `User-Agent`
+  (`agent-framework-rust/<version> (<crate>)`). The format moves to
+  `agent_framework_core::user_agent`; the provider crates that sent none,
+  and the two that sent a one-off format (Copilot Studio, Purview), now use
+  it.
+- `Annotation::annotated_regions_coordinate_space` and
+  `Annotation::content_regions()`: Anthropic document citations locate the
+  quote in the *source*, and are now marked so, so they are not mistaken
+  for spans of the answer (upstream #9436).
+- `SequentialBuilder::ensure_trailing_user_turn` (upstream #8779), and
+  `with_trailing_user_turn` on `AgentExecutor` / `AgentApprovalExecutor`.
+- `HandoffBuilder::with_autonomous_mode(AutonomousMode)`: per-agent
+  autonomous continuation with per-agent prompts and turn limits, as
+  upstream's `with_autonomous_mode`.
+
+### Fixed (round three)
+
+- Every follow-up question after an Anthropic server-side web search was
+  refused (upstream #9718). The search's `server_tool_use` and
+  `web_search_tool_result` blocks replayed as a client `tool_use` and a
+  `tool_result` inside the assistant turn, which the Messages API rejects. A
+  `srvtoolu_` call now replays as `server_tool_use` and its result as the
+  typed block it arrived as, `content` verbatim (including the
+  `encrypted_content` the API validates). A server tool this client cannot
+  replay faithfully is omitted with its result, keeping the request valid.
+  Covers `web_search` and `web_fetch`, as upstream does.
+- A turn the API paused (`stop_reason: "pause_turn"`, during a long server
+  tool) was returned to the caller as finished — often a search call with no
+  answer. All four Anthropic clients (direct, Foundry, Bedrock, Vertex) now
+  continue the turn, up to 10 times and only while the paused content
+  replays faithfully, merging the turns into one response with summed usage.
+  Streaming continues too, forwarding every update as it arrives.
+
+### Fixed (round two)
+
+- `CheckpointStorage::list` could report a superseded checkpoint as the
+  newest one (upstream #9261). Sorting by `timestamp_millis` alone is not a
+  total order, and checkpoints are written one per superstep boundary, so two
+  routinely share a millisecond; the tie then fell to the backend's
+  enumeration order — `HashMap` order for `InMemoryCheckpointStorage`, which
+  Rust randomises per process. A caller reading the end of the list as "the
+  newest checkpoint" got an arbitrary one of the pair, differently on
+  different runs: with the fix reverted the new regression test fails 9 times
+  in 20. `list` now sorts with a new public `compare_checkpoints` over
+  `(timestamp_millis, iteration_count, checkpoint_id)` — `iteration_count`
+  being the superstep counter, which already encodes the supersession
+  upstream recovers by walking `previous_checkpoint_id`. Applied to the
+  in-memory, file and Cosmos stores, and now part of the trait's documented
+  contract.
+- Streamed Responses errors dropped the provider's `code` and `param`, and a
+  flat `error` event lost its message entirely (upstream #9616). The handler
+  read only `message`, and only from `response.error` or a top-level `error`
+  key — but a flat `error` event carries `code` / `message` / `param` on the
+  event itself, so every such event collapsed to a generic "response failed".
+  A streamed `400` arrived as bare text with nothing naming the offending
+  field. The event is now the last fallback for the error object, and `code`
+  and `param` are formatted into the message as upstream formats its own,
+  each clause omitted when absent. Content-filter classification is
+  unchanged. `agent-framework-azure` and Foundry reuse the same SSE parser,
+  so both get the fix.
+
+### Added (round two)
+
+- `otel-export`'s pipeline marks its telemetry with the
+  `microsoft.agent-framework="True"` resource attribute (upstream #9589),
+  shared by the tracer and meter providers. Azure's agent telemetry views —
+  Foundry's, and the Application Insights experiences built on them — key off
+  it to tell Agent Framework telemetry apart from an application's own, so a
+  pipeline without it exported telemetry those views did not recognise. The
+  value is the string `"True"`, matching upstream's default exactly. Two
+  `ObservabilityConfig` doc comments that claimed this crate builds no OTel
+  `Resource`, exporter or `MeterProvider` were corrected: they predate
+  `otel-export`, and a reader who believed them would wire their own
+  `Resource` and omit this attribute.
+
+The first round against this baseline follows.
+
+### Fixed
+
+- Gemini reports which model served a run (upstream #9736).
+  `ChatResponse::model` and every streamed update came back `None` whenever
+  Gemini omitted `modelVersion` from the body, so a per-request
+  `ChatOptions::model` override was invisible on the response. Both the
+  non-streaming and streaming parsers now fall back to the model the request
+  was sent to, and prefer a `modelVersion` when the body carries one. On the
+  streaming path the fallback is applied after the "carries nothing new"
+  test, so a keep-alive chunk is still skipped rather than becoming an update
+  carrying only a model label. (Upstream fixed only its non-streaming path;
+  here neither path had a fallback.)
+- A round cap below 1 is coerced up to 1 in both Magentic and group chat
+  (upstream #9502). Both check the limit before counting the round, so a cap
+  of `0` ended the run on the loop's first pass: no ledger requested, no
+  participant spoken, and only the "round limit" placeholder returned.
+  Magentic coerces in `MagenticBuilder::build` rather than in the setter,
+  because the cap can also come from a custom `MagenticManager`.
+- A workflow exposed as an agent no longer loses its token counts
+  (upstream #9720). An `AgentResponse` output was not a recognised shape: it
+  fell through to the catch-all arm, arrived as one assistant message of raw
+  JSON, and its `usage_details` were dropped — and `AgentResponse` was built
+  with `..Default::default()` besides, so a workflow-as-agent reported no
+  usage from any run. Its caller-facing messages are now taken and its usage
+  merged and reported, including when every message of the response was
+  filtered out.
+- A workflow exposed as an agent no longer returns internal messages to its
+  caller (upstream #8729). System prompts and tool results are workflow
+  artifacts, and user messages get re-emitted — a group-chat orchestrator
+  yields the whole conversation, the caller's own turn included. Only
+  assistant messages survive, and an assistant message carrying a
+  function-call envelope is dropped whole, since a call without its result is
+  an invalid transcript for providers that validate call/result pairing on
+  replay. Pending request-info messages are appended after the filter and are
+  unaffected.
+
+### Added
+
+- `FoundryChatClient::with_timeout` bounds a single request, body included
+  (upstream #9699). `reqwest` applies no timeout by default, so a hung
+  Foundry endpoint stalled a run indefinitely with no way to say otherwise.
+  Backed by a new `agent_framework_azure::azure_http_client_with_timeout`
+  that shares a builder with `azure_http_client`, so a timed client keeps the
+  framework `User-Agent` and the whole Azure crate family can reach it. The
+  bound spans the response body, so on `get_streaming_response` it caps the
+  stream's lifetime rather than the time to first token.
+- `McpApprovalMode::PerTool` carries a `never_require` list and a `default`
+  (upstream #9828), resolved in upstream's order: always, never, `default`,
+  then no approval. `per_tool_except` expresses the policy this enables —
+  gate every tool except a known-safe set, so a tool the server adds later is
+  approved rather than let through. `with_default` and `with_never_require`
+  compose onto a `per_tool` policy and are no-ops on the whole-server
+  variants. `per_tool`'s own behaviour is unchanged. Upstream's
+  single-string name normalisation and its no-`default` warning do not apply
+  — see the pass notes.
+
+### Security
+
+- Recorded, not fixed: `agent-framework-redis`'s context provider can
+  retrieve one scope's memory under another's. Its scope `TAG` fields are
+  indexed with RediSearch's defaults (separator `,`, case-insensitive) and
+  the value is written unescaped, so `user_id = "smith,john"` is indexed as
+  two tags and matches a provider scoped to `user_id = "smith"`. Upstream's
+  fix (#9461) hashes scope values into opaque tokens and is `[BREAKING]`
+  with a migration; so is the smaller schema fix. See `SCOPE.md` and the
+  pass notes.
+
+---
+
 Upstream drift from the window ending at `67ba500e` (2026-10-24), recorded
 in [`docs/drift/2026-10-26-67ba500e.md`](docs/drift/2026-10-26-67ba500e.md).
 Five changes, three of them defects that were live in this port. One

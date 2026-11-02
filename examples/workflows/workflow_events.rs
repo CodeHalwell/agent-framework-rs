@@ -66,6 +66,11 @@ fn render(event: &WorkflowEvent) -> String {
             ..
         } => format!("RequestInfo({request_id}) from {source_executor_id}"),
         WorkflowEvent::Failed { error } => format!("Failed: {error}"),
+        WorkflowEvent::Warning { message } => format!("Warning: {message}"),
+        WorkflowEvent::SubworkflowWarning {
+            sub_workflow_id,
+            message,
+        } => format!("SubworkflowWarning({sub_workflow_id}): {message}"),
     }
 }
 

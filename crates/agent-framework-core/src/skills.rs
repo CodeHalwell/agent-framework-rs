@@ -19,11 +19,21 @@
 //! for the lifetime of the provider, so the model does not have to re-load it
 //! each turn.
 //!
-//! This is a deliberate **subset** of upstream: no MCP-backed skills (an
-//! `@experimental` upstream feature) and no `run_skill_script` /
-//! sandboxed script execution (upstream's third framework-generated tool) —
-//! both are out of scope here. Only `load_skill` and `read_skill_resource`
-//! are implemented.
+//! Skills are built in code here, or discovered from `SKILL.md` packages on
+//! disk with the `file-skills` feature (`skills_files`,
+//! `SkillsProvider::from_paths`).
+//!
+//! A skill may also carry [`SkillScript`]s: inline scripts (a closure run
+//! in-process) or file scripts (a file in the skill's directory, run by the
+//! provider's [`SkillScriptRunner`], which the application supplies — there
+//! is no default). When any skill has a script the provider adds a third
+//! tool, `run_skill_script`, which **requires approval by default** because
+//! it runs code; [`SkillsProvider::with_script_approval`] opts out for
+//! trusted skills.
+//!
+//! This is still a subset of upstream: no MCP-backed skills, no class-based
+//! skills, and no skill-source pipeline (filtering / caching / aggregating
+//! sources).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -31,9 +41,146 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::memory::{ContextProvider, SessionContext};
-use crate::tools::FunctionTool;
+use crate::tools::{BoxFuture, FunctionTool};
+
+/// An inline script's body: called with the model's `args`.
+pub type InlineScriptFn = Arc<dyn Fn(Option<Value>) -> BoxFuture<Result<Value>> + Send + Sync>;
+
+/// Runs file-based skill scripts: called with the owning skill, the script
+/// and the model's `args` (for file scripts, an array of CLI argument
+/// strings). The application decides how — a subprocess, a sandbox, a
+/// hosted code interpreter.
+pub type SkillScriptRunner =
+    Arc<dyn Fn(Skill, SkillScript, Option<Value>) -> BoxFuture<Result<Value>> + Send + Sync>;
+
+/// Where a [`SkillScript`]'s code lives.
+#[derive(Clone)]
+pub enum SkillScriptSource {
+    /// Code-defined: run in-process.
+    Inline(InlineScriptFn),
+    /// A file in the skill's directory, run by the provider's
+    /// [`SkillScriptRunner`].
+    File {
+        /// The script's absolute path.
+        full_path: std::path::PathBuf,
+    },
+}
+
+/// An executable script attached to a [`Skill`], run through the
+/// `run_skill_script` tool.
+#[derive(Clone)]
+pub struct SkillScript {
+    /// The name the model runs it by (for file scripts, the path relative to
+    /// the skill, e.g. `scripts/process.py`). Matched case-insensitively.
+    pub name: String,
+    /// A short summary, if any.
+    pub description: Option<String>,
+    /// JSON Schema for `args`, advertised to the model, if any. File scripts
+    /// take an array of strings.
+    pub parameters_schema: Option<Value>,
+    /// The script's code.
+    pub source: SkillScriptSource,
+}
+
+impl std::fmt::Debug for SkillScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SkillScript");
+        d.field("name", &self.name)
+            .field("description", &self.description);
+        if let SkillScriptSource::File { full_path } = &self.source {
+            d.field("full_path", full_path);
+        }
+        d.finish_non_exhaustive()
+    }
+}
+
+impl SkillScript {
+    /// An inline script running `f` with the model's `args`.
+    pub fn inline<F, Fut>(name: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(Option<Value>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+    {
+        Self {
+            name: name.into(),
+            description: None,
+            parameters_schema: None,
+            source: SkillScriptSource::Inline(Arc::new(move |args| Box::pin(f(args)))),
+        }
+    }
+
+    /// A file script at `full_path`, run by the provider's runner.
+    pub fn file(name: impl Into<String>, full_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            parameters_schema: Some(
+                serde_json::json!({"type": "array", "items": {"type": "string"}}),
+            ),
+            source: SkillScriptSource::File {
+                full_path: full_path.into(),
+            },
+        }
+    }
+
+    /// Builder: a short summary.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Builder: the JSON Schema of `args`.
+    pub fn with_parameters_schema(mut self, schema: Value) -> Self {
+        self.parameters_schema = Some(schema);
+        self
+    }
+
+    /// The file script's path, if it is one.
+    pub fn full_path(&self) -> Option<&std::path::Path> {
+        match &self.source {
+            SkillScriptSource::File { full_path } => Some(full_path),
+            SkillScriptSource::Inline(_) => None,
+        }
+    }
+}
+
+fn xml_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The `<available_scripts>` block listing `scripts` (upstream
+/// `_build_available_scripts_block`): `<available_scripts />` when there are
+/// none, so the model does not invent names.
+pub fn available_scripts_block(scripts: &[SkillScript]) -> String {
+    if scripts.is_empty() {
+        return "<available_scripts />".into();
+    }
+    let lines: Vec<String> = scripts
+        .iter()
+        .map(|script| {
+            let mut attrs = format!("name=\"{}\"", xml_attr(&script.name));
+            if let Some(d) = &script.description {
+                attrs.push_str(&format!(" description=\"{}\"", xml_attr(d)));
+            }
+            match &script.parameters_schema {
+                Some(schema) => format!(
+                    "  <script {attrs}>\n    <parameters_schema>{}</parameters_schema>\n  </script>",
+                    xml_attr(&schema.to_string())
+                ),
+                None => format!("  <script {attrs} />"),
+            }
+        })
+        .collect();
+    format!(
+        "<available_scripts>\n{}\n</available_scripts>",
+        lines.join("\n")
+    )
+}
 
 /// A named, progressive-disclosure capability package.
 ///
@@ -53,6 +200,18 @@ pub struct Skill {
     pub description: String,
     pub instructions: String,
     pub resources: HashMap<String, String>,
+    /// Scripts the model can run with `run_skill_script`.
+    pub scripts: Vec<SkillScript>,
+    /// The directory a file-based skill was loaded from.
+    pub path: Option<std::path::PathBuf>,
+    /// A license name or reference (frontmatter `license`).
+    pub license: Option<String>,
+    /// Compatibility notes (frontmatter `compatibility`).
+    pub compatibility: Option<String>,
+    /// Space-delimited pre-approved tool names (frontmatter `allowed-tools`).
+    pub allowed_tools: Option<String>,
+    /// Free-form string metadata (frontmatter `metadata`).
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Skill {
@@ -63,7 +222,29 @@ impl Skill {
             description: description.into(),
             instructions: String::new(),
             resources: HashMap::new(),
+            scripts: Vec::new(),
+            path: None,
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            metadata: Default::default(),
         }
+    }
+
+    /// Builder: attach a script (replacing one with the same name,
+    /// case-insensitively).
+    pub fn with_script(mut self, script: SkillScript) -> Self {
+        self.scripts
+            .retain(|s| !s.name.eq_ignore_ascii_case(&script.name));
+        self.scripts.push(script);
+        self
+    }
+
+    /// The script named `name`, matched case-insensitively.
+    pub fn script(&self, name: &str) -> Option<&SkillScript> {
+        self.scripts
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
     }
 
     /// Builder: set the skill's full instructions (revealed on `load_skill`).
@@ -92,6 +273,11 @@ impl Skill {
 pub struct SkillsProvider {
     skills: Arc<HashMap<String, Skill>>,
     loaded: Arc<Mutex<HashSet<String>>>,
+    script_runner: Option<SkillScriptRunner>,
+    script_approval: bool,
+    load_approval: bool,
+    resource_approval: bool,
+    instructions_prompt: Option<String>,
 }
 
 impl SkillsProvider {
@@ -102,7 +288,70 @@ impl SkillsProvider {
         Self {
             skills: Arc::new(skills),
             loaded: Arc::new(Mutex::new(HashSet::new())),
+            script_runner: None,
+            script_approval: true,
+            load_approval: false,
+            resource_approval: false,
+            instructions_prompt: None,
         }
+    }
+
+    /// Keep only the skills `filter` accepts (upstream `UseFilter`).
+    pub fn with_filter(mut self, filter: impl Fn(&Skill) -> bool) -> Self {
+        let kept: HashMap<String, Skill> = self
+            .skills
+            .iter()
+            .filter(|(_, s)| filter(s))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.skills = Arc::new(kept);
+        self
+    }
+
+    /// Replace the catalog's introduction (upstream `SkillsInstructionPrompt`
+    /// / `UsePromptTemplate`). `{skills}` in the template is replaced by the
+    /// skill list; without it the list follows the template.
+    pub fn with_instructions_prompt(mut self, template: impl Into<String>) -> Self {
+        self.instructions_prompt = Some(template.into());
+        self
+    }
+
+    /// Whether `load_skill` requires approval (off by default here; upstream
+    /// requires it unless `DisableLoadSkillApproval`).
+    pub fn with_load_skill_approval(mut self, required: bool) -> Self {
+        self.load_approval = required;
+        self
+    }
+
+    /// Whether `read_skill_resource` requires approval (off by default
+    /// here; upstream requires it unless `DisableReadSkillResourceApproval`).
+    pub fn with_read_skill_resource_approval(mut self, required: bool) -> Self {
+        self.resource_approval = required;
+        self
+    }
+
+    /// Run file-based scripts with `runner`. Without one, running a file
+    /// script answers with an error; inline scripts need none.
+    pub fn with_script_runner<F, Fut>(mut self, runner: F) -> Self
+    where
+        F: Fn(Skill, SkillScript, Option<Value>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.script_runner = Some(Arc::new(move |skill, script, args| {
+            Box::pin(runner(skill, script, args))
+        }));
+        self
+    }
+
+    /// Whether `run_skill_script` requires approval (the default, as
+    /// upstream). Turn it off only for trusted skills.
+    pub fn with_script_approval(mut self, required: bool) -> Self {
+        self.script_approval = required;
+        self
+    }
+
+    fn has_scripts(&self) -> bool {
+        self.skills.values().any(|s| !s.scripts.is_empty())
     }
 
     /// The short catalog injected into every run's instructions: one bullet
@@ -112,16 +361,40 @@ impl SkillsProvider {
         let mut names: Vec<&String> = self.skills.keys().collect();
         names.sort();
 
-        let mut lines = vec![
-            "Available skills (progressive disclosure — each skill below is only \
+        let intro = "Available skills (progressive disclosure — each skill below is only \
              summarized; call the `load_skill` tool with a skill's name to reveal \
              its full instructions, and `read_skill_resource` to read one of its \
-             named resources):"
-                .to_string(),
-        ];
-        for name in names {
-            let skill = &self.skills[name];
-            lines.push(format!("- {}: {}", skill.name, skill.description));
+             named resources):";
+        let list: Vec<String> = names
+            .into_iter()
+            .map(|name| {
+                let skill = &self.skills[name];
+                format!("- {}: {}", skill.name, skill.description)
+            })
+            .collect();
+        let mut lines = match &self.instructions_prompt {
+            Some(template) if template.contains("{skills}") => {
+                vec![template.replace("{skills}", &list.join("\n"))]
+            }
+            Some(template) => {
+                let mut l = vec![template.clone()];
+                l.extend(list);
+                l
+            }
+            None => {
+                let mut l = vec![intro.to_string()];
+                l.extend(list);
+                l
+            }
+        };
+        if self.has_scripts() {
+            lines.push(
+                "Use `run_skill_script` to run a script a loaded skill lists, using the name \
+                 exactly as listed. Pass named script arguments inside `args` as a JSON object; \
+                 for file-based scripts that take CLI-style arguments, pass `args` as an array \
+                 of strings."
+                    .to_string(),
+            );
         }
         lines.join("\n")
     }
@@ -179,7 +452,17 @@ impl SkillsProvider {
                     let response = match skills.get(&skill_name) {
                         Some(skill) => {
                             loaded.lock().unwrap().insert(skill_name);
-                            skill.instructions.clone()
+                            if skill.scripts.is_empty()
+                                || skill.instructions.contains("<available_scripts")
+                            {
+                                skill.instructions.clone()
+                            } else {
+                                format!(
+                                    "{}\n\n{}",
+                                    skill.instructions,
+                                    available_scripts_block(&skill.scripts)
+                                )
+                            }
                         }
                         None => format!("No skill named '{skill_name}' is available."),
                     };
@@ -240,10 +523,92 @@ impl SkillsProvider {
         )
     }
 
-    // Note: upstream also generates a third tool, `run_skill_script`, backed
-    // by sandboxed script execution. That — like MCP-backed skills — is out
-    // of scope for this subset; only `load_skill` and `read_skill_resource`
-    // are provided.
+    /// The `run_skill_script(skill_name, script_name, args?)` tool. Unknown
+    /// names answer with an error message the model can read; a script's
+    /// own failure is an error of the call, handled by the function loop.
+    fn run_skill_script_tool(&self) -> FunctionTool {
+        let skills = Arc::clone(&self.skills);
+        let runner = self.script_runner.clone();
+        let tool = FunctionTool::new(
+            "run_skill_script",
+            "Runs a script associated with a skill.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "The name of the skill."},
+                    "script_name": {"type": "string", "description": "The name of the script, exactly as listed."},
+                    "args": {
+                        "description": "Arguments for the script: a JSON object of named arguments, or an array of strings for file-based scripts.",
+                        "anyOf": [
+                            {"type": "object"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ]
+                    }
+                },
+                "required": ["skill_name", "script_name"],
+                "additionalProperties": false
+            }),
+            move |args: Value| {
+                let skills = Arc::clone(&skills);
+                let runner = runner.clone();
+                async move {
+                    let text = |k: &str| {
+                        args.get(k)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string()
+                    };
+                    let (skill_name, script_name) = (text("skill_name"), text("script_name"));
+                    if skill_name.is_empty() {
+                        return Ok(Value::String("Error: Skill name cannot be empty.".into()));
+                    }
+                    if script_name.is_empty() {
+                        return Ok(Value::String("Error: Script name cannot be empty.".into()));
+                    }
+                    let Some(skill) = skills.get(&skill_name) else {
+                        return Ok(Value::String(format!(
+                            "Error: Skill '{skill_name}' not found."
+                        )));
+                    };
+                    let Some(script) = skill.script(&script_name) else {
+                        return Ok(Value::String(format!(
+                            "Error: Script '{script_name}' not found in skill '{skill_name}'."
+                        )));
+                    };
+                    let script_args = args.get("args").cloned().filter(|a| !a.is_null());
+                    match &script.source {
+                        SkillScriptSource::Inline(f) => f(script_args).await,
+                        SkillScriptSource::File { full_path } => {
+                            let Some(runner) = runner else {
+                                return Err(Error::Configuration(format!(
+                                    "Script '{}' requires a runner. Provide a script runner for file-based scripts.",
+                                    script.name
+                                )));
+                            };
+                            // Recheck the file: it may have been replaced by a
+                            // link since discovery.
+                            let linked = std::fs::symlink_metadata(full_path)
+                                .map(|m| !m.is_file())
+                                .unwrap_or(true);
+                            if linked {
+                                return Err(Error::Configuration(format!(
+                                    "Script '{}' is no longer a regular file.",
+                                    script.name
+                                )));
+                            }
+                            runner(skill.clone(), script.clone(), script_args).await
+                        }
+                    }
+                }
+            },
+        );
+        if self.script_approval {
+            tool.with_approval_mode(crate::tools::ApprovalMode::AlwaysRequire)
+        } else {
+            tool
+        }
+    }
 }
 
 #[async_trait]
@@ -254,9 +619,21 @@ impl ContextProvider for SkillsProvider {
             ctx.add_instructions(instructions);
         }
 
-        ctx.tools.push(self.load_skill_tool().into_definition());
+        let gate = |tool: FunctionTool, required: bool| {
+            if required {
+                tool.with_approval_mode(crate::tools::ApprovalMode::AlwaysRequire)
+            } else {
+                tool
+            }
+        };
         ctx.tools
-            .push(self.read_skill_resource_tool().into_definition());
+            .push(gate(self.load_skill_tool(), self.load_approval).into_definition());
+        ctx.tools
+            .push(gate(self.read_skill_resource_tool(), self.resource_approval).into_definition());
+        if self.has_scripts() {
+            ctx.tools
+                .push(self.run_skill_script_tool().into_definition());
+        }
 
         Ok(())
     }

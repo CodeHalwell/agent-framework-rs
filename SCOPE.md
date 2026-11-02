@@ -43,11 +43,6 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Harness, remainder**: the file access tools (`FileAccessProvider`),
-  memory, background agents (and the loop's `background_tasks_running`
-  condition), `TodoFileStore` and the `create_harness_agent` assembly. The
-  agent loop, todo, tool approval, agent mode, the file store and file
-  memory are ported behind `experimental-harness`.
 - **Agent hooks, remainder** (`experimental-agent-hooks` ships the
   enforcement bundle): the approval seam (liftable denies are enforced as
   plain denies), the `sequential/run_all` and parallel composition profiles,
@@ -56,64 +51,48 @@ from the roadmap, not from this file.
   result-label flow (labels reach the combined verdict and the record but
   are not persisted with the produced data or resurfaced as
   `source_labels`; upstream's framework layer does not do this either).
-- **Evaluation** and **security (FIDES)**: both marked experimental
-  upstream; when ported they go behind `experimental-*` features (see
-  `docs/feature-stages.md`).
+- **Security (FIDES)**: marked experimental upstream; when ported it goes
+  behind an `experimental-*` feature (see `docs/feature-stages.md`).
+  Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
+  `agent-framework-foundry`'s `evals` feature); upstream's
+  `evaluate_foundry_target` is not.
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
-- **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
-  client-side and cannot yet bind to an agent hosted on the Foundry control
-  plane (`AIProjectClient.AsAIAgent`, `FoundryAgent(Uri, ...)`).
-- **Cloud-transport streaming for Anthropic on Bedrock and Vertex**: the
-  streaming methods buffer one non-streaming request into a single update.
-  The AWS event-stream and `:streamRawPredict` framings are not implemented.
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
-- **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
-  on the Agent Memory Toolkit), the dedicated Application Insights exporter,
-  and a session store backed by Azure storage. The last one is an
-  implementation of the ported `session_store` abstraction, not new surface:
-  upstream's `AzureBlobAgentSessionStore`
-  (`Microsoft.Agents.AI.Hosting.AzureStorage`) saves, gets and deletes a
-  serialized session as a blob, which `agent-framework-azure`'s Entra
-  credential chain and `azure_http_client` already have what is needed to
-  reach — or `azure_storage_blob` 1.1, which shares the `azure_core` 1.x
-  line the optional `entra-sdk` feature already pulls.
-- **A framework `User-Agent` outside the Azure crates**. The Azure-facing
-  crates send `agent-framework-rust/<version> (<component>)` via
-  `agent_framework_azure::azure_http_client`; the other provider clients, and
-  `agent-framework-purview` and `agent-framework-foundry-local`, still build
-  bare `reqwest` clients. A framework-wide header needs the helper somewhere
-  every crate can reach, and `agent-framework-core` carries no `reqwest`
-  dependency by design.
-- **Function-invocation pauses with mixed batches**. A declaration-only
-  call's local siblings run on the same turn. Upstream instead holds them
-  until the caller answers whenever a session is present (#9050). An
-  approval batch also defers a declaration-only sibling as an approval,
-  where upstream pauses it as Host input (#9203).
-- **Streamed code-interpreter content**. The OpenAI Responses client
-  produces no `CodeInterpreterToolCallContent`, so there is nothing to
-  stream or merge.
-- **Per-agent handoff autonomous turn limits**. Upstream's
-  `with_autonomous_mode(agents=[...], turn_limits={...})` is per participant.
-  Here there is one `HandoffBuilder::max_iterations` cap plus a global
-  `HandoffInteractionMode`, whose `Autonomous` variant already expresses
-  upstream's zero-continuation case.
+- **Azure**: the Cosmos DB memory provider (blocked on the Agent Memory
+  Toolkit). The Application Insights exporter is ported
+  (`agent-framework-core`'s `azure-monitor` feature); the
+  `azure_core_opentelemetry` bridge for the Azure SDK's own client spans
+  waits on that crate moving to `opentelemetry` 0.32 (see
+  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)). The Blob session
+  store is ported (`agent-framework-azure`'s `session-store` feature).
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
-  skills beyond inline skills (scripts, file-based sources, source
-  pipelines); compaction's message-group model, triggers and summarization;
-  workflow telemetry, run cancellation and graph reflection; message source
-  attribution and message injection; context providers seeing the agent and
-  session.
-- **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
-  DocumentDB (blocked on the MongoDB wire protocol), Valkey.
-- **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
-  revision it was written against.
-- **`SequentialBuilder::ensure_trailing_user_turn`** (upstream #8779): an
-  opt-in that appends a synthetic user continuation message when the
-  conversation handed to the next participant ends on an assistant turn,
-  for providers that answer an assistant-ending prompt with empty text.
+  skills beyond inline and file-based skills with scripts (class-based and
+  MCP skills, source pipelines); compaction's in-place annotation model (groups here are computed per pass rather than stamped on messages, and summaries are not linked back to the messages they replace);
+  workflow graph reflection of request ports and typed protocol descriptors; context
+  providers seeing the agent object (they see its
+  identity, `SessionContext::agent`, and the session in `before_run`, and
+  the session after the run, but not the agent itself).
+- **Vector stores**: MongoDB, DuckDB, SQL Server and Azure DocumentDB
+  (blocked on the MongoDB wire protocol). The Redis vector store is ported
+  (`agent-framework-redis`'s `experimental-vector-stores` feature); its
+  live tests run only against a Redis with Search and JSON
+  (`AF_REDIS_SEARCH_TEST_URL`), which this repository's CI does not start.
+- **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
+  optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
+  `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
+  resource-token signing the official client now does. Not a defect — the
+  hand-rolled client works — but it is maintenance this port would stop
+  carrying. Needs a check that the crate's query surface covers the
+  `VectorDistance` queries `vector_store.rs` issues. See
+  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+- **MCP 2.x protocol negotiation** (upstream #9236): the `2026-07-28`
+  protocol era upstream's `auto` mode negotiates. This client requests
+  `2025-06-18` and accepts servers that answer with `2025-11-25` or older;
+  the new era's wire changes are not ported.
 - **Workflow pause/restore bookkeeping** (upstream #9291, #9289):
   preserving concurrent steps across a pause, and restored sub-workflow
   sibling requests. Both land on upstream's `WorkflowExecutor`; this

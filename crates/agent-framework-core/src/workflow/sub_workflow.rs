@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::context::WorkflowContext;
+use super::events::WorkflowEvent;
 use super::executor::Executor;
 use super::request_info::RequestResponse;
 use super::runner::{Workflow, WorkflowRun};
@@ -31,6 +32,7 @@ use crate::error::Result;
 struct ChildExecution {
     run: WorkflowRun,
     forwarded_outputs: usize,
+    forwarded_events: usize,
 }
 
 #[derive(Default)]
@@ -85,6 +87,25 @@ impl WorkflowExecutor {
         mut child: ChildExecution,
         ctx: &WorkflowContext,
     ) -> Result<()> {
+        // Forward the child's new warnings, attributed to it.
+        let warnings: Vec<String> = child
+            .run
+            .events()
+            .iter()
+            .skip(child.forwarded_events)
+            .filter_map(|e| match e {
+                WorkflowEvent::Warning { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        child.forwarded_events = child.run.events().len();
+        for message in warnings {
+            ctx.add_event(WorkflowEvent::SubworkflowWarning {
+                sub_workflow_id: self.child.id().to_string(),
+                message,
+            });
+        }
+
         // Forward only outputs produced since the last time we processed.
         let all_outputs = child.run.outputs();
         let new_outputs: Vec<Value> = all_outputs
@@ -174,6 +195,7 @@ impl Executor for WorkflowExecutor {
             ChildExecution {
                 run: child_run,
                 forwarded_outputs: 0,
+                forwarded_events: 0,
             },
             &ctx,
         )

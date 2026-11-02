@@ -32,10 +32,14 @@ impl Executor for DispatchExecutor {
     }
 }
 
-/// The default aggregator: collects each participant's final conversation and
-/// yields the union of the initial prompt plus each agent's last reply.
+/// Combines the participants' conversations into the workflow's output.
+pub type ConcurrentAggregator = Arc<dyn Fn(Vec<Vec<Message>>) -> Vec<Message> + Send + Sync>;
+
+/// The aggregator: collects each participant's final conversation and, by
+/// default, yields the initial prompt plus each agent's last reply.
 struct AggregateExecutor {
     id: String,
+    custom: Option<ConcurrentAggregator>,
 }
 
 #[async_trait]
@@ -49,6 +53,16 @@ impl Executor for AggregateExecutor {
             Value::Array(items) => items,
             _ => return Err(Error::Workflow("aggregator expected an array".into())),
         };
+        if let Some(custom) = &self.custom {
+            let parsed = conversations
+                .iter()
+                .map(parse_conversation)
+                .collect::<Result<Vec<_>>>()?;
+            let payload = serde_json::to_value(custom(parsed))
+                .map_err(|e| Error::Workflow(format!("serialize error: {e}")))?;
+            ctx.yield_output(payload).await?;
+            return Ok(());
+        }
         let mut merged: Vec<Message> = Vec::new();
         let mut seeded = false;
         for conv_value in conversations {
@@ -80,9 +94,21 @@ pub struct ConcurrentBuilder {
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
     request_info: bool,
+    aggregator: Option<ConcurrentAggregator>,
 }
 
 impl ConcurrentBuilder {
+    /// Combine the participants' conversations (in participant order) with
+    /// `aggregator` instead of the default prompt-plus-last-replies merge
+    /// (upstream `WithAggregator`).
+    pub fn with_aggregator(
+        mut self,
+        aggregator: impl Fn(Vec<Vec<Message>>) -> Vec<Message> + Send + Sync + 'static,
+    ) -> Self {
+        self.aggregator = Some(Arc::new(aggregator));
+        self
+    }
+
     /// Create an empty builder.
     pub fn new() -> Self {
         Self::default()
@@ -201,6 +227,7 @@ impl ConcurrentBuilder {
             }))
             .add_executor(Arc::new(AggregateExecutor {
                 id: "aggregate".into(),
+                custom: self.aggregator.clone(),
             }))
             .set_start("dispatch");
 

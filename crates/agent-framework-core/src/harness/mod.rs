@@ -1,7 +1,8 @@
 //! The experimental agent harness: an agent loop, a todo list, standing tool
-//! approvals, operating modes and file-based memory.
+//! approvals, operating modes, file access, file-based and durable memory,
+//! background agents, and [`create_harness_agent`] to assemble them.
 //!
-//! Rust port of six pieces of upstream's `agent_framework._harness` package
+//! Rust port of upstream's `agent_framework._harness` package
 //! (Python `ExperimentalFeature.HARNESS`, .NET `Microsoft.Agents.AI.Harness`
 //! `[Experimental]`). Everything here sits behind the `experimental-harness`
 //! cargo feature and carries no semver promise; see `docs/feature-stages.md`.
@@ -9,23 +10,15 @@
 //! | Upstream (Python) | Here |
 //! |---|---|
 //! | `_loop.py`: `AgentLoopMiddleware`, `JudgeVerdict`, `todos_remaining`, `todos_remaining_message` | [`LoopAgent`], [`Judge`], [`JudgeVerdict`], [`todos_remaining`], [`todos_remaining_message`] |
-//! | `_todo.py`: `TodoProvider`, `TodoStore`, `TodoSessionStore`, `TodoItem`, … | [`TodoProvider`], [`TodoStore`], [`TodoSessionStore`], [`TodoItem`], … |
+//! | `_todo.py`: `TodoProvider`, `TodoStore`, `TodoSessionStore`, `TodoFileStore`, `TodoItem`, … | [`TodoProvider`], [`TodoStore`], [`TodoSessionStore`], [`TodoFileStore`], [`TodoItem`], … |
 //! | `_tool_approval.py`: `ToolApprovalMiddleware`, `ToolApprovalRule`, `ToolApprovalState`, `create_always_approve_*` | [`ToolApprovalAgent`], [`ToolApprovalRule`], [`ToolApprovalState`], [`ToolApprovalAgent::always_approve_tool_response`], … |
 //! | `_mode.py`: `AgentModeProvider`, `get_agent_mode`, `set_agent_mode` | [`AgentModeProvider`], [`get_agent_mode`], [`set_agent_mode`] |
 //! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
+//! | `_file_access.py` (the tool half): `FileAccessProvider` | [`FileAccessProvider`] |
 //! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
-//!
-//! # Not ported here
-//!
-//! - **Background agents** (`_background_agents.py`) have no Rust
-//!   counterpart, so the loop's `background_tasks_running` /
-//!   `background_tasks_running_message` helpers are not ported either.
-//! - **File access and memory**: `FileAccessProvider` (the tool half of
-//!   `_file_access.py`), `_memory.py` and the full `create_harness_agent`
-//!   assembly are out of scope for now. The file store they would build on
-//!   is here.
-//! - `TodoFileStore` is not ported: [`TodoStore`] is a public trait, so a
-//!   file-backed store can be supplied by the application.
+//! | `_agent.py`: `create_harness_agent` | [`create_harness_agent`], [`HarnessAgent`] |
+//! | `_memory.py`: `MemoryContextProvider`, `MemoryStore`, `MemoryFileStore`, `MemoryTopicRecord`, `MemoryIndexEntry` | [`MemoryContextProvider`], [`MemoryStore`], [`MemoryFileStore`], [`MemoryTopicRecord`], [`MemoryIndexEntry`] |
+//! | `_background_agents.py`: `BackgroundAgentsProvider`, `BackgroundTaskInfo`, `BackgroundTaskStatus`; `_loop.py`: `background_tasks_running`, `background_tasks_running_message` | [`BackgroundAgentsProvider`], [`BackgroundTaskInfo`], [`BackgroundTaskStatus`], [`background_tasks_running`], [`background_tasks_running_message`] |
 //!
 //! # Divergences from upstream
 //!
@@ -56,8 +49,12 @@
 //! See each submodule's documentation for the divergences specific to it.
 
 pub mod agent_loop;
+pub mod background_agents;
+pub mod file_access;
 pub mod file_memory;
 pub mod file_store;
+pub mod harness_agent;
+pub mod memory;
 pub mod mode;
 pub mod todo;
 pub mod tool_approval;
@@ -69,15 +66,43 @@ pub use agent_loop::{
     DEFAULT_JUDGE_INSTRUCTIONS, DEFAULT_JUDGE_MAX_ITERATIONS, DEFAULT_MAX_ITERATIONS,
     DEFAULT_NEXT_MESSAGE, JUDGE_VERDICT_DONE, JUDGE_VERDICT_MORE,
 };
+pub use background_agents::{
+    background_tasks_running, background_tasks_running_message, BackgroundAgentsProvider,
+    BackgroundAgentsProviderBuilder, BackgroundTaskInfo, BackgroundTaskStatus,
+    BackgroundTasksRunning, BackgroundTasksRunningMessage, DEFAULT_BACKGROUND_AGENTS_INSTRUCTIONS,
+    DEFAULT_BACKGROUND_AGENTS_SOURCE_ID, DEFAULT_BACKGROUND_AGENTS_WAIT_TIMEOUT,
+};
+pub use file_access::{
+    FileAccessProvider, DEFAULT_FILE_ACCESS_INSTRUCTIONS, DEFAULT_FILE_ACCESS_SOURCE_ID,
+    FILE_ACCESS_DELETE_TOOL_NAME, FILE_ACCESS_GREP_TOOL_NAME, FILE_ACCESS_LS_TOOL_NAME,
+    FILE_ACCESS_READ_LINES_TOOL_NAME, FILE_ACCESS_READ_ONLY_TOOL_NAMES, FILE_ACCESS_READ_TOOL_NAME,
+    FILE_ACCESS_REPLACE_LINES_TOOL_NAME, FILE_ACCESS_REPLACE_TOOL_NAME,
+    FILE_ACCESS_WRITE_TOOL_NAME, FILE_ACCESS_WRITE_TOOL_NAMES,
+};
 pub use file_memory::{
     FileMemoryProvider, DEFAULT_FILE_MEMORY_INSTRUCTIONS, DEFAULT_FILE_MEMORY_SOURCE_ID,
     SCOPED_FILE_MEMORY_INSTRUCTIONS,
 };
 pub use file_store::{
     apply_replace, apply_replace_lines, compile_search_regex, matches_glob,
-    normalize_relative_path, scan_content, split_lines, AgentFileStore, FileLineEdit,
+    normalize_relative_path, scan_content, slice_lines, split_lines, AgentFileStore, FileLineEdit,
     FileSearchMatch, FileSearchResult, FileStoreEntry, FileStoreEntryType,
     FileSystemAgentFileStore, InMemoryAgentFileStore, MAX_SEARCH_PATTERN_LENGTH, SEARCH_TIMEOUT,
+};
+pub use harness_agent::{
+    create_harness_agent, HarnessAgent, HarnessAgentBuilder, DEFAULT_HARNESS_INSTRUCTIONS,
+};
+pub use memory::{
+    format_memory_timestamp, parse_memory_timestamp, slugify_topic, HistoryMessageFilter,
+    MemoryContextProvider, MemoryContextProviderBuilder, MemoryFileStore, MemoryIndexEntry,
+    MemoryMaintenanceState, MemoryStore, MemoryTopicRecord, TranscriptSearchResult,
+    DEFAULT_MEMORY_CONSOLIDATION_INTERVAL, DEFAULT_MEMORY_CONSOLIDATION_MIN_SESSIONS,
+    DEFAULT_MEMORY_CONSOLIDATION_PROMPT, DEFAULT_MEMORY_CONTEXT_PROMPT,
+    DEFAULT_MEMORY_EXTRACTION_PROMPT, DEFAULT_MEMORY_INDEX_FILE_NAME, DEFAULT_MEMORY_INDEX_HEADER,
+    DEFAULT_MEMORY_INDEX_LINE_LENGTH, DEFAULT_MEMORY_INDEX_LINE_LIMIT,
+    DEFAULT_MEMORY_MAX_EXTRACTIONS, DEFAULT_MEMORY_NO_TOPICS_TEXT, DEFAULT_MEMORY_SELECTION_LIMIT,
+    DEFAULT_MEMORY_SOURCE_ID, DEFAULT_MEMORY_STATE_FILE_NAME, DEFAULT_MEMORY_TOPICS_DIRECTORY_NAME,
+    DEFAULT_MEMORY_TRANSCRIPTS_DIRECTORY_NAME,
 };
 pub use mode::{
     get_agent_mode, set_agent_mode, AgentModeProvider, AgentModeProviderBuilder,
@@ -85,12 +110,13 @@ pub use mode::{
     EXECUTE_MODE_INSTRUCTIONS, PLAN_MODE_INSTRUCTIONS,
 };
 pub use todo::{
-    TodoCompleteInput, TodoInput, TodoItem, TodoProvider, TodoSessionStore, TodoStore,
-    DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
+    TodoCompleteInput, TodoFileStore, TodoInput, TodoItem, TodoListMessageBuilder, TodoProvider,
+    TodoSessionStore, TodoStore, DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
 };
 pub use tool_approval::{
-    ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope, ToolApprovalState,
-    ToolAutoApprovalRule, DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS, DEFAULT_TOOL_APPROVAL_SOURCE_ID,
+    all_tools_auto_approval_rule, ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope,
+    ToolApprovalState, ToolAutoApprovalRule, DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS,
+    DEFAULT_TOOL_APPROVAL_SOURCE_ID,
 };
 
 use std::future::Future;
@@ -121,6 +147,35 @@ pub(crate) fn read_state_object(
             json_type_name(&other)
         ))),
     }
+}
+
+/// Write `text` to `path` atomically: into an exclusively created sibling
+/// temporary file (so an existing file or symlink cannot redirect the
+/// write), then renamed over `path`. Creates the parent directories.
+pub(crate) async fn atomic_write_text(path: &std::path::Path, text: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let io = |e: std::io::Error| Error::Other(format!("Could not write {}: {e}", path.display()));
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no parent directory", path.display())))?;
+    tokio::fs::create_dir_all(dir).await.map_err(io)?;
+    let tmp = dir.join(format!(".maf-state-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await?;
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(io(e));
+    }
+    Ok(())
 }
 
 /// The JSON type name of `value`, for error messages.

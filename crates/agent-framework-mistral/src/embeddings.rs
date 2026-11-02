@@ -60,7 +60,7 @@ impl MistralEmbeddingClient {
     pub fn new(api_key: impl Into<String>, model: Option<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 api_key: api_key.into(),
                 base_url: DEFAULT_BASE_URL.to_string(),
                 model: model.unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string()),
@@ -122,7 +122,12 @@ impl EmbeddingClient for MistralEmbeddingClient {
             .json(&Value::Object(body))
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

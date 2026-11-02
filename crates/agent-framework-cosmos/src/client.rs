@@ -383,10 +383,12 @@ impl CosmosRestClient {
                 .body(serde_json::to_vec(b)?);
         }
 
-        builder
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("Cosmos DB request failed: {e}")))
+        builder.send().await.map_err(|e| {
+            Error::service(format!(
+                "Cosmos DB request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })
     }
 
     /// `POST /dbs` with `{"id": database_id}`. Tolerates `409 Conflict`

@@ -27,12 +27,25 @@ tokio-stream = { workspace = true }
 uuid = { workspace = true }
 azure_core = { workspace = true, optional = true }
 azure_identity = { workspace = true, optional = true }
+# SHA-256 for the Blob session store's blob names (upstream's scheme).
+sha2 = { version = "0.10", optional = true }
+# Content Understanding: decoding data-URI attachments.
+base64 = { workspace = true, optional = true }
 
 [features]
 # Entra ID credentials from the official Azure SDK for Rust, adapted onto this
 # crate's `TokenCredential` (see the `entra_sdk` module). Purely additive: the
 # hand-rolled credential chain stays the default and is unaffected when off.
 entra-sdk = ["dep:azure_core", "dep:azure_identity"]
+# `AzureBlobAgentSessionStore`: core's experimental session store, persisted
+# as blobs in an Azure Storage container. Upstream marks the surface
+# experimental too.
+session-store = ["agent-framework-core/experimental-session-store", "dep:sha2"]
+# `ContentUnderstandingContextProvider`: analyze attachments with Azure
+# Content Understanding.
+content-understanding = ["dep:base64"]
 
 [dev-dependencies]
 tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

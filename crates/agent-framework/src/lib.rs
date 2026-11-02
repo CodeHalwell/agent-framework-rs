@@ -26,6 +26,8 @@
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
+//! | `qdrant` | [`agent_framework_qdrant`] — Qdrant vector store (experimental) | no |
+//! | `postgres` | [`agent_framework_postgres`] — PostgreSQL + pgvector vector store (experimental) | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
@@ -128,6 +130,12 @@ pub use agent_framework_foundry as foundry;
 /// `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
+/// The PostgreSQL + pgvector vector store (the experimental `postgres` feature).
+#[cfg(feature = "postgres")]
+pub use agent_framework_postgres as postgres;
+/// The Qdrant vector store (the experimental `qdrant` feature).
+#[cfg(feature = "qdrant")]
+pub use agent_framework_qdrant as qdrant;
 
 /// Azure Cosmos DB NoSQL chat-message store, checkpoint storage, and
 /// vector store (enable the `cosmos` feature).

@@ -10,21 +10,21 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 |---|---|---|---|---|
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
-| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 132 / 164 / 24 / 142 / 0 | 41 | 22 |
+| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 2 / 0 / 0 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 154 / 225 / 20 / 63 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
-| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 59 / 14 / 4 / 0 / 0 | 2 | 4 |
+| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 7 / 8 / 0 / 2 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.GitHub.Copilot` | 1 / 5 / 0 / 0 / 0 | 0 / 1 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 44 / 14 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 97 / 43 / 69 / 0 | 41 | 0 |
+| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 69 / 102 / 43 / 52 / 0 | 41 | 0 |
 | `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
 | `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
 | `Microsoft.Agents.AI.Workflows.InProc` | 5 / 3 / 0 / 0 / 0 | 1 / 2 / 5 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows.Observability` | 7 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 7 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Workflows.Observability` | 7 / 0 / 0 / 0 / 0 | 7 / 0 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Workflows.Reflection` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 3 | 0 |
 | `Microsoft.Agents.AI.Workflows.Specialized.Magentic` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 4 | 0 |
 | `Microsoft.AspNetCore.Builder` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 1 / 0 / 0 | 0 | 0 |
@@ -38,58 +38,20 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 | Declaration | Rust | Go | Note |
 |---|---|---|---|
-| `Azure.AI.Projects::AIProjectClientExtensions methods::AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService<TService>(object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent properties::CurrentRunContext` | partial | adapted | Middleware gets AgentContext and tools get the session, but there is no ambient run context carrying agent, session and options. |
-| `Microsoft.Agents.AI::AIAgent properties::Description` | partial | mapped | Description exists on Agent only; the SupportsAgentRun trait has no description accessor. |
 | `Microsoft.Agents.AI::AIAgentBuilder constructors::AIAgentBuilder(AIAgent)` | partial | adapted | The builder starts from a ChatClient; an existing SupportsAgentRun (e.g. A2AAgent) cannot be wrapped with middleware. |
 | `Microsoft.Agents.AI::AIAgentExtensions methods::AsBuilder(AIAgent)` | partial | adapted | Middleware is added before build; a built agent cannot be turned back into a builder and re-wrapped. |
 | `Microsoft.Agents.AI::AIAgentMetadata constructors::AIAgentMetadata(string)` | unmapped | adapted | Neither agents nor ChatClient expose a provider name; it appears only as a span attribute. |
 | `Microsoft.Agents.AI::AIAgentMetadata properties::ProviderName` | unmapped | mapped | Neither agents nor ChatClient expose a provider name; it appears only as a span attribute. |
 | `Microsoft.Agents.AI::AIAgentMetadata` | unmapped | adapted | Neither agents nor ChatClient expose a provider name; it appears only as a span attribute. |
-| `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run receives no agent reference. |
-| `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Session` | unmapped | adapted | after_run receives no session, so a provider cannot read the session or its state bag after a run. |
-| `Microsoft.Agents.AI::AIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
+| `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent). |
 | `Microsoft.Agents.AI::AIJudgeLoopEvaluator constants::GapAnalysisPlaceholder` | unmapped | intentional | Judge feedback is not templated; judge_feedback_message inserts the judge's reasoning directly. |
-| `Microsoft.Agents.AI::AgentFileSkill properties::Path` | unmapped | unmapped | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkill` | unmapped | adapted | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillFilterContext properties::RelativeFilePath` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillFilterContext properties::SkillName` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillFilterContext` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillScript methods::RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillScript properties::FullPath` | unmapped | unmapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillScript properties::ParametersSchema` | unmapped | mapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillScript` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillScriptRunner` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillsSource constructors::AgentFileSkillsSource(string, AgentFileSkillScriptRunner, AgentFileSkillsSourceOptions, ILoggerFactory)` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSource methods::GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSource` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::AllowedResourceExtensions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::AllowedScriptExtensions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ResourceFilter` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ScriptFilter` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::SearchDepth` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(AgentSkillFrontmatter, string, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name/description/instructions; there is no frontmatter type and no argument marshaler. |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(string, string, string, string, string, string, AdditionalPropertiesDictionary, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name, description and instructions; license, compatibility, allowedTools and metadata have no field. |
 | `Microsoft.Agents.AI::AgentInlineSkill methods::AddResource(string, Delegate, string, JsonSerializerOptions)` | partial | adapted | with_resource stores static string content only; there is no delegate-computed resource. |
 | `Microsoft.Agents.AI::AgentInlineSkill methods::AddResource(string, object, string)` | partial | adapted | with_resource takes name and string content but no resource description. |
-| `Microsoft.Agents.AI::AgentInlineSkill methods::AddScript(string, Delegate, string, JsonSerializerOptions)` | unmapped | partial | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentInlineSkill methods::GetScriptAsync(string, CancellationToken)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentInlineSkill properties::Frontmatter` | partial | mapped | Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution constructors::AgentRequestMessageSourceAttribution(AgentRequestMessageSourceType, string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution fields::AdditionalPropertiesKey` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution properties::SourceId` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution properties::SourceType` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType constructors::AgentRequestMessageSourceType(string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::AIContextProvider` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::ChatHistory` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::External` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::Value` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentResponse methods::ToAgentResponseUpdates()` | unmapped | mapped | The response-to-updates conversion is crate-private (agent::response_to_updates), not public API. |
 | `Microsoft.Agents.AI::AgentResponse properties::AgentId` | unmapped | mapped | AgentResponse carries no agent id. |
 | `Microsoft.Agents.AI::AgentResponse properties::RawRepresentation` | unmapped | mapped | AgentResponse keeps no raw provider payload (only AgentResponseUpdate does). |
 | `Microsoft.Agents.AI::AgentResponse<T> properties::IsWrappedInObject` | unmapped | unmapped | Non-object schemas are not wrapped in an object envelope, so there is no unwrap flag. |
@@ -100,70 +62,31 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentRunContext` | partial | adapted | AgentContext carries messages and metadata through agent middleware but not the agent, session or run options. |
 | `Microsoft.Agents.AI::AgentRunOptions properties::AllowBackgroundResponses` | unmapped | adapted | No way to request a background run; responses only carry a continuation token through. |
 | `Microsoft.Agents.AI::AgentRunOptions properties::ContinuationToken` | unmapped | adapted | A continuation token cannot be passed back to resume or poll a background run. |
-| `Microsoft.Agents.AI::AgentSkill methods::GetScriptAsync(string, CancellationToken)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkill properties::Frontmatter` | partial | mapped | Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter constructors::AgentSkillFrontmatter(string, string, string)` | partial | adapted | Skill::new takes name and description; compatibility and spec validation of the name are missing. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter properties::AllowedTools` | unmapped | mapped | Skill has no AllowedTools field; only name, description, instructions and resources exist. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter properties::Compatibility` | unmapped | adapted | Skill has no Compatibility field; only name, description, instructions and resources exist. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter properties::License` | unmapped | mapped | Skill has no License field; only name, description, instructions and resources exist. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter properties::Metadata` | unmapped | mapped | Skill has no Metadata field; only name, description, instructions and resources exist. |
-| `Microsoft.Agents.AI::AgentSkillFrontmatter` | partial | mapped | Frontmatter is flattened into Skill name/description fields; there is no separate type and no name validation. |
 | `Microsoft.Agents.AI::AgentSkillResource properties::Description` | unmapped | mapped | Skill resources are plain name-to-string entries with no description. |
 | `Microsoft.Agents.AI::AgentSkillResource` | partial | adapted | Resources are a name-to-string HashMap on Skill; there is no resource type, description or computed content. |
-| `Microsoft.Agents.AI::AgentSkillScript methods::RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)` | unmapped | partial | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillScript properties::Description` | unmapped | mapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillScript properties::Name` | unmapped | mapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillScript properties::ParametersSchema` | unmapped | mapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillScript` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
 | `Microsoft.Agents.AI::AgentSkillsProvider constructors::AgentSkillsProvider(AgentSkillsSource, AgentSkillsProviderOptions, ILoggerFactory, bool)` | partial | adapted | SkillsProvider::new takes a Vec<Skill>; there is no source, options or caching parameter. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::DisableCaching()` | unmapped | mapped | No source caching layer exists because skills are a fixed in-memory list. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseCachingOptions(Action<CachingAgentSkillsSourceOptions>)` | unmapped | unmapped | No source caching layer exists because skills are a fixed in-memory list. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFileScriptRunner(AgentFileSkillScriptRunner)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFileSkill(string, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFileSkills(IEnumerable<string>, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)` | unmapped | partial | No skill filter predicate; callers must filter the Vec<Skill> before SkillsProvider::new. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseOptions(Action<AgentSkillsProviderOptions>)` | unmapped | adapted | SkillsProvider has no options type to configure. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UsePromptTemplate(string)` | unmapped | mapped | The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden. |
+| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)` | partial | partial | A predicate over skills; it takes no source context. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseSource(AgentSkillsSource)` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseSource(Func<ILoggerFactory, AgentSkillsSource>)` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableLoadSkillApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableReadSkillResourceApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableRunSkillScriptApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
 | `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::IncludeDetailedErrors` | unmapped | mapped | No option controls error detail; unknown skills/resources always return a fixed message. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::SkillsInstructionPrompt` | unmapped | mapped | The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions` | unmapped | mapped | SkillsProvider has no options type; prompt, approvals and error detail are fixed. |
 | `Microsoft.Agents.AI::AgentSkillsSource methods::GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsSource` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsSourceContext properties::Agent` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. No per-run agent context is passed to skill lookup. |
 | `Microsoft.Agents.AI::AgentSkillsSourceContext properties::Session` | unmapped | unmapped | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AggregatingAgentSkillsSource` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AlwaysApproveToolApprovalResponseContent properties::InnerResponse` | unmapped | mapped | There is no wrapper, so the returned FunctionApprovalResponseContent is the response itself. |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::DefaultFeedbackMessageTemplate` | unmapped | intentional | DefaultFeedbackMessageTemplate: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::IncompleteTaskCountPlaceholder` | unmapped | intentional | IncompleteTaskCountPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::IncompleteTasksPlaceholder` | unmapped | intentional | IncompleteTasksPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constructors::BackgroundTaskCompletionLoopEvaluator(BackgroundTaskCompletionLoopEvaluatorOptions)` | unmapped | intentional | BackgroundTaskCompletionLoopEvaluator: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator methods::EvaluateAsync(LoopContext, CancellationToken)` | unmapped | intentional | EvaluateAsync: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator` | unmapped | intentional | No background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions constructors::BackgroundTaskCompletionLoopEvaluatorOptions()` | unmapped | intentional | BackgroundTaskCompletionLoopEvaluatorOptions: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions properties::FeedbackMessageTemplate` | unmapped | intentional | FeedbackMessageTemplate: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions` | unmapped | intentional | No options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::CachingAgentSkillsSource` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::ChatClientAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup hook; Agent exposes no accessor for its chat client or metadata. |
-| `Microsoft.Agents.AI::ChatClientAgent properties::AIContextProviders` | unmapped | unmapped | Agent has no accessor for its configured context providers. |
-| `Microsoft.Agents.AI::ChatClientAgent properties::ChatClient` | unmapped | unmapped | Agent has no accessor for its underlying ChatClient. |
 | `Microsoft.Agents.AI::ChatClientAgent properties::ChatHistoryProvider` | unmapped | unmapped | Agent has no accessor for a configured history provider. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::ClearOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
-| `Microsoft.Agents.AI::ChatClientAgentOptions properties::EnableMessageInjection` | unmapped | adapted | No mid-run message injection. |
-| `Microsoft.Agents.AI::ChatClientAgentOptions properties::RequirePerServiceCallChatHistoryPersistence` | unmapped | mapped | History is persisted once per run in after_run, never per service call inside the tool loop. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::ThrowOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::WarnOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
 | `Microsoft.Agents.AI::ChatClientAgentRunOptions properties::ChatClientFactory` | unmapped | unmapped | No per-run hook to wrap or replace the chat client. |
-| `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run receives no agent reference. |
-| `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Session` | unmapped | adapted | after_run receives no session, so a provider cannot read the session or its state bag after a run. |
-| `Microsoft.Agents.AI::ChatHistoryProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceId(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceType(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::WithAgentRequestMessageSource(ChatMessage, AgentRequestMessageSourceType, string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
+| `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent). |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator constructors::CompletionMarkerLoopEvaluator(string, CompletionMarkerLoopEvaluatorOptions)` | unmapped | adapted | CompletionMarkerLoopEvaluator: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator methods::EvaluateAsync(LoopContext, CancellationToken)` | unmapped | mapped | EvaluateAsync: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator` | unmapped | mapped | No built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
@@ -189,15 +112,8 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::LoopContext properties::AdditionalProperties` | unmapped | mapped | No property bag on the loop context; callbacks can keep state in the session or their own captures. |
 | `Microsoft.Agents.AI::LoopContext properties::Agent` | unmapped | adapted | The context carries no agent; helpers that need a provider take it explicitly. |
 | `Microsoft.Agents.AI::LoopContext properties::RunOptions` | unmapped | adapted | The run options are not exposed to loop callbacks. |
-| `Microsoft.Agents.AI::MessageAIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient methods::EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient methods::GetPendingMessagesAsync(AgentSession, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient` | unmapped | adapted | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::ProviderSessionState<TState>` | partial | adapted | before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session). |
 | `Microsoft.Agents.AI::TodoCompletionLoopEvaluator constants::RemainingTodosPlaceholder` | unmapped | intentional | The todo reminder is not templated; todos_remaining_message lists the open items directly. |
-| `Microsoft.Agents.AI::TodoProviderOptions properties::SuppressTodoListMessage` | unmapped | mapped | The current-list message is always injected; there is no option to suppress it. |
-| `Microsoft.Agents.AI::TodoProviderOptions properties::TodoListMessageBuilder` | unmapped | mapped | The current-list message has a fixed format; there is no custom builder. |
-| `Microsoft.Agents.AI::ToolApprovalAgent properties::AllToolsAutoApprovalRule` | unmapped | mapped | No predefined approve-everything rule; the closure \|_: &FunctionCallContent\| true serves. |
 | `Microsoft.Agents.AI::ToolApprovalAgentOptions properties::JsonSerializerOptions` | unmapped | adapted | Rule arguments and state are serialized with serde; there are no serializer options. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext constructors::ToolAutoApprovalRuleContext(FunctionCallContent, AIAgent, AgentSession, IReadOnlyCollection<ChatMessage>, AgentRunOptions)` | unmapped | adapted | No rule context type; rules receive the function call directly. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext properties::Agent` | unmapped | mapped | Auto-approval rules do not receive the agent. |
@@ -208,82 +124,12 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.A2A::A2AAgent methods::CreateSessionAsync(string, string)` | partial | adapted | A2AAgent keeps contextId/taskId as private JSON in service_session_id; there is no typed way to seed a session with a given context and task id. |
 | `Microsoft.Agents.AI.A2A::A2AAgentSession properties::ContextId` | partial | mapped | contextId is persisted inside the JSON in service_session_id but has no typed public accessor. |
 | `Microsoft.Agents.AI.A2A::A2AAgentSession properties::TaskId` | partial | mapped | taskId is persisted inside the JSON in service_session_id but has no typed public accessor. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind constants::AssistantText` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind constants::Summary` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind constants::System` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind constants::ToolCall` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind constants::User` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionGroupKind` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::ByteCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::ExcludeReason` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::IsExcluded` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::Kind` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::MessageCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::Messages` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::TokenCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup properties::TurnIndex` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageGroup` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex constructors::CompactionMessageIndex(IList<CompactionMessageGroup>, Tokenizer)` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex methods::AddGroup(CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex methods::GetAllMessages()` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex methods::GetIncludedMessages()` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex methods::GetTurnGroups(int)` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex methods::InsertGroup(int, CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::Groups` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedByteCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedGroupCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedMessageCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedNonSystemGroupCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedTokenCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::IncludedTurnCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::RawMessageCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::Tokenizer` | unmapped | adapted | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::TotalByteCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::TotalGroupCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::TotalMessageCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::TotalTokenCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex properties::TotalTurnCount` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionMessageIndex` | unmapped | mapped | Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>. |
-| `Microsoft.Agents.AI.Compaction::CompactionStrategy` | partial | adapted | CompactionStrategy is a message-list-in/out trait; it has no trigger/target-trigger gating like the .NET base class. |
-| `Microsoft.Agents.AI.Compaction::CompactionTrigger` | unmapped | adapted | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers fields::Always` | unmapped | adapted | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers fields::Never` | unmapped | adapted | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::All(CompactionTrigger[])` | unmapped | adapted | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::Any(CompactionTrigger[])` | unmapped | adapted | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::GroupsExceed(int)` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::HasToolCalls()` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::MessagesExceed(int)` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::TokensBelow(int)` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::TokensExceed(int)` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::CompactionTriggers methods::TurnsExceed(int)` | unmapped | mapped | No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally. |
-| `Microsoft.Agents.AI.Compaction::ContextWindowCompactionStrategy constructors::ContextWindowCompactionStrategy(int, int, double, double)` | partial | adapted | TokenBudget enforces one token budget; there is no output-token reservation or staged tool-eviction/truncation thresholds. |
-| `Microsoft.Agents.AI.Compaction::ContextWindowCompactionStrategy properties::MaxContextWindowTokens` | partial | mapped | Only a single token budget exists; the full context-window size is not modelled separately from the input budget. |
-| `Microsoft.Agents.AI.Compaction::ContextWindowCompactionStrategy properties::MaxOutputTokens` | unmapped | mapped | TokenBudget has no output-token reservation; callers subtract it themselves before choosing max_tokens. |
-| `Microsoft.Agents.AI.Compaction::ContextWindowCompactionStrategy properties::ToolEvictionThreshold` | unmapped | adapted | No staged tool-result eviction threshold; SelectiveToolResult must be applied as a separate strategy. |
-| `Microsoft.Agents.AI.Compaction::ContextWindowCompactionStrategy properties::TruncationThreshold` | unmapped | adapted | No staged truncation threshold; TokenBudget trims immediately to its budget. |
-| `Microsoft.Agents.AI.Compaction::PipelineCompactionStrategy constructors::PipelineCompactionStrategy(IEnumerable<CompactionStrategy>)` | unmapped | adapted | No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy. |
-| `Microsoft.Agents.AI.Compaction::PipelineCompactionStrategy properties::Strategies` | unmapped | adapted | No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy. |
-| `Microsoft.Agents.AI.Compaction::PipelineCompactionStrategy` | unmapped | mapped | No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy. |
-| `Microsoft.Agents.AI.Compaction::SlidingWindowCompactionStrategy constructors::SlidingWindowCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers. |
+| `Microsoft.Agents.AI.Compaction::SlidingWindowCompactionStrategy constructors::SlidingWindowCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy. |
 | `Microsoft.Agents.AI.Compaction::SlidingWindowCompactionStrategy properties::MinimumPreservedTurns` | partial | adapted | window counts messages, not user turns. |
-| `Microsoft.Agents.AI.Compaction::SummarizationCompactionStrategy constructors::SummarizationCompactionStrategy(IChatClient, CompactionTrigger, int, string, CompactionTrigger)` | unmapped | adapted | No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy). |
-| `Microsoft.Agents.AI.Compaction::SummarizationCompactionStrategy properties::ChatClient` | unmapped | adapted | No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy). |
-| `Microsoft.Agents.AI.Compaction::SummarizationCompactionStrategy properties::MinimumPreservedGroups` | unmapped | adapted | No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy). |
-| `Microsoft.Agents.AI.Compaction::SummarizationCompactionStrategy properties::SummarizationPrompt` | unmapped | adapted | No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy). |
-| `Microsoft.Agents.AI.Compaction::ToolResultCompactionStrategy constructors::ToolResultCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | SelectiveToolResult replaces older tool results with a fixed marker; no trigger gating or configurable formatter. |
-| `Microsoft.Agents.AI.Compaction::ToolResultCompactionStrategy methods::DefaultToolCallFormatter(CompactionMessageGroup)` | partial | mapped | Rust substitutes a fixed marker rather than formatting a summary of the compacted tool calls. |
-| `Microsoft.Agents.AI.Compaction::ToolResultCompactionStrategy properties::ToolCallFormatter` | partial | mapped | The replacement text is the fixed OMITTED_TOOL_RESULT constant; a custom formatter cannot be supplied. |
-| `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy constructors::TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | Truncation::new takes a max message count; there are no trigger/target triggers. |
+| `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy constructors::TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | Truncation::new takes a max message count; there are no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy properties::MinimumPreservedGroups` | partial | adapted | max_messages caps retained messages rather than guaranteeing a minimum number of preserved groups. |
-| `Microsoft.Agents.AI.Foundry::FoundryAgent constructors::FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)` | unmapped | mapped | FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)` | unmapped | mapped | No operation to delete stored memories for a scope. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::EnableSensitiveTelemetryData` | unmapped | unmapped | FoundryMemoryProvider emits no sensitive-data telemetry toggle. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::MaxMemories` | unmapped | mapped | No limit on the number of memories requested or injected per search. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::Redactor` | unmapped | unmapped | No redactor hook for memory content. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::SearchInputMessageFilter` | unmapped | adapted | Search input is fixed to the run's user/assistant text; no filter can be supplied. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::StorageInputRequestMessageFilter` | unmapped | adapted | No filter over the request messages written to the memory store. |
-| `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::StorageInputResponseMessageFilter` | unmapped | adapted | No filter over the response messages written to the memory store. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent constructors::GitHubCopilotAgent(CopilotClient, SessionConfig?, bool, string?, string?, string?, JsonSerializerOptions?, ILoggerFactory?)` | partial | adapted | No Copilot SDK client or SessionConfig; build an Agent over GitHubCopilotChatClient instead. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent constructors::GitHubCopilotAgent(CopilotClient, bool, string?, string?, string?, IList<AIFunctionDeclaration>?, string?, JsonSerializerOptions?, ILoggerFactory?)` | partial | adapted | Instructions and tools go on AgentBuilder over GitHubCopilotChatClient; Copilot SDK/CLI session features are absent. |
 | `Microsoft.Agents.AI.GitHub.Copilot::GitHubCopilotAgent methods::CreateSessionAsync(string)` | partial | adapted | A service session id can be stored, but the chat-completions client is stateless so no Copilot session is resumed. |
@@ -298,7 +144,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::ForwardIncomingMessages` | partial | mapped | AgentExecutor always sends the incoming conversation plus the reply downstream; forwarding only the reply is not configurable. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::InterceptUnterminatedFunctionCalls` | unmapped | mapped | AgentExecutor has no option to route unresolved function calls as workflow messages or external requests. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::InterceptUserInputRequests` | unmapped | mapped | AgentExecutor does not intercept agent approval/user-input requests; AgentApprovalExecutor is a separate post-response approval loop. |
-| `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::ReassignOtherAgentsAsUsers` | unmapped | mapped | AgentExecutor passes the conversation unchanged; other agents' assistant messages are not rewritten as user messages. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildConcurrent(IEnumerable<AIAgent>, Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | partial | adapted | ConcurrentBuilder builds the fan-out/fan-in, but its aggregator is fixed (prompt plus each last reply); no custom aggregator. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildConcurrent(string, IEnumerable<AIAgent>, Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | partial | adapted | ConcurrentBuilder::name sets the workflow name, but a custom aggregator function cannot be supplied. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildSequential(bool, IEnumerable<AIAgent>)` | partial | adapted | SequentialBuilder always forwards the full accumulated conversation; there is no chain-only-agent-responses mode. |
@@ -307,7 +152,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::Checkpoints` | partial | adapted | WorkflowRun does not expose its checkpoints; callers query the CheckpointStorage by workflow id instead. |
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::IsCheckpointingEnabled` | partial | adapted | Checkpointing is enabled on WorkflowBuilder::with_checkpointing, but neither Workflow nor WorkflowRun reports whether it is on. |
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::LastCheckpoint` | partial | adapted | WorkflowRun has no last-checkpoint accessor; the latest must be found by listing the storage. |
-| `Microsoft.Agents.AI.Workflows::ConcurrentWorkflowBuilder methods::WithAggregator(Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | unmapped | adapted | ConcurrentBuilder uses a fixed internal aggregator; there is no hook to supply a custom aggregation function. |
 | `Microsoft.Agents.AI.Workflows::EdgeData properties::Label` | partial | adapted | Labels exist only on switch Case edges; plain, fan-out and fan-in edges carry no label. |
 | `Microsoft.Agents.AI.Workflows::EdgeId` | unmapped | adapted | Edges have no public identity type; they are not individually addressable. |
 | `Microsoft.Agents.AI.Workflows::Executor methods::DescribeProtocol()` | unmapped | mapped | There is no protocol descriptor; message routing is by edges only, without type checks. |
@@ -319,28 +163,22 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::FactoryAsync` | unmapped | adapted | No per-run executor factory; every run shares the registered Arc<dyn Executor> instance. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::IsPlaceholder` | unmapped | adapted | Placeholder bindings resolved later do not exist; executors must be supplied when added. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::RawValue` | unmapped | adapted | No raw source value is retained alongside the registered executor. |
-| `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::SupportsResetting` | unmapped | adapted | Executors have no reset hook between runs; only snapshot_state/restore_state for checkpoints. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBindingExtensions methods::BindAsExecutor(AIAgent, bool)` | partial | adapted | AgentExecutor::new wraps the agent, but update-event emission is always on and cannot be toggled. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBindingExtensions methods::BindExecutor<TExecutor>(Func<string, string, ValueTask<TExecutor>>, string)` | unmapped | adapted | No lazily invoked per-session executor factory; executors are constructed before being added. |
 | `Microsoft.Agents.AI.Workflows::ExecutorCompletedEvent` | partial | mapped | WorkflowEvent::ExecutorCompleted carries only executor_id, not the handler result payload. |
-| `Microsoft.Agents.AI.Workflows::ExecutorInstanceBinding properties::SupportsResetting` | unmapped | adapted | No reset capability exists for shared executor instances between runs. |
 | `Microsoft.Agents.AI.Workflows::ExecutorInvokedEvent` | partial | mapped | WorkflowEvent::ExecutorInvoked carries only executor_id, not the incoming message payload. |
 | `Microsoft.Agents.AI.Workflows::ExternalRequest properties::PortInfo` | partial | mapped | There are no typed request ports; only the emitting and reply-to executor ids are recorded. |
 | `Microsoft.Agents.AI.Workflows::ExternalResponse properties::PortInfo` | partial | mapped | No request port metadata; the response carries original_request instead. |
 | `Microsoft.Agents.AI.Workflows::FunctionExecutor<TInput, TOutput>` | partial | adapted | FunctionExecutor wraps an async closure over serde_json::Value; there is no typed output that is auto-sent. |
-| `Microsoft.Agents.AI.Workflows::IResettableExecutor methods::ResetAsync()` | unmapped | adapted | No reset method exists on Executor. |
-| `Microsoft.Agents.AI.Workflows::IResettableExecutor` | unmapped | adapted | No reset trait; executors are reused across runs without a reset hook. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::QueueClearScopeAsync(string, CancellationToken)` | partial | adapted | SharedState::clear wipes the single run-wide namespace; there are no named or executor-local scopes. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::QueueStateUpdateAsync<T>(string, T, string, CancellationToken)` | partial | adapted | SharedState::set stages an update committed at the superstep boundary, but the scope parameter has no counterpart. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadOrInitStateAsync<T>(string, Func<T>, string, CancellationToken)` | partial | adapted | SharedState::update can initialise a missing key from a closure, but state has no scopes. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadStateAsync<T>(string, string, CancellationToken)` | partial | adapted | SharedState::get reads a Value by key; there is no scope parameter and no typed read. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadStateKeysAsync(string, CancellationToken)` | partial | adapted | No key-listing method; SharedState::export returns the whole map, and scopes do not exist. |
-| `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::RequestHaltAsync()` | unmapped | adapted | WorkflowContext has no way for an executor to request the run halt at the end of the superstep. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::OpenStreamingAsync(Workflow, CheckpointManager, string?, CancellationToken)` | partial | adapted | run_stream always requires an initial input; opening a run with no input and a session id is not supported. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::OpenStreamingAsync(Workflow, string?, CancellationToken)` | partial | adapted | A streaming run cannot be opened without an initial input message, and session ids are not supported. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::ResumeStreamingAsync(Workflow, CheckpointInfo, CheckpointManager, CancellationToken)` | partial | adapted | Resume is non-streaming only; there is no run_stream variant that restores from a checkpoint. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution properties::Lockstep` | unmapped | mapped | There is no lockstep mode where supersteps advance only as the caller consumes events. |
-| `Microsoft.Agents.AI.Workflows::OpenTelemetryWorkflowBuilderExtensions methods::WithOpenTelemetry(WorkflowBuilder, Action<WorkflowTelemetryOptions>, ActivitySource)` | unmapped | adapted | Workflow runs emit no OpenTelemetry spans; WorkflowBuilder has no telemetry option. |
 | `Microsoft.Agents.AI.Workflows::OrchestrationBuilderBase<TBuilder> methods::WithDescription(string)` | partial | adapted | Only WorkflowBuilder has description; SequentialBuilder, ConcurrentBuilder and the other orchestration builders do not. |
 | `Microsoft.Agents.AI.Workflows::OutputTag methods::ToString()` | unmapped | mapped | There is no tag object to stringify; the event variant identifies the output kind. |
 | `Microsoft.Agents.AI.Workflows::OutputTag properties::Value` | unmapped | adapted | Output kinds are enum variants, so there is no tag string value. |
@@ -359,7 +197,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::RequestPort properties::Response` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no response type on a request node. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEventCount` | partial | mapped | events() returns all events; there is no bookmark, so the count of new events since last read is not tracked. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEvents` | partial | mapped | events() returns the full slice each time; no cursor advances to yield only newly arrived events. |
-| `Microsoft.Agents.AI.Workflows::Run properties::SessionId` | unmapped | mapped | WorkflowRun has no session id; only the workflow-level Workflow::id exists. |
 | `Microsoft.Agents.AI.Workflows::RunStatus constants::Ended` | partial | mapped | Failed and Cancelled are terminal, but a normally finished run reports Idle; there is no distinct Ended state. |
 | `Microsoft.Agents.AI.Workflows::RunStatus constants::NotStarted` | unmapped | mapped | No pre-start state; Workflow::run and run_stream start immediately and first report Started. |
 | `Microsoft.Agents.AI.Workflows::ScopeId methods::Equals(object?)` | unmapped | partial | No scope identity type to compare. |
@@ -369,17 +206,11 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::ScopeKey methods::Equals(object?)` | unmapped | partial | No scope/key type; keys are plain Strings compared by value. |
 | `Microsoft.Agents.AI.Workflows::ScopeKey properties::ScopeId` | unmapped | adapted | No scope component on SharedState keys. |
 | `Microsoft.Agents.AI.Workflows::ScopeKey` | unmapped | adapted | No scope/key pair; SharedState is addressed by a plain String key. |
-| `Microsoft.Agents.AI.Workflows::SequentialWorkflowBuilder methods::WithChainOnlyAgentResponses(bool)` | unmapped | mapped | Each stage always receives the full running conversation; there is no option to chain only agent responses. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions properties::ScopeName` | unmapped | partial | No state scopes; executor state is not stored under a named shared scope. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions properties::StateKey` | unmapped | partial | No configurable state key; executor state is checkpointed by executor id. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions` | partial | adapted | Executors persist state via snapshot_state/restore_state into checkpoints; no options type binding state to a key and scope. |
-| `Microsoft.Agents.AI.Workflows::StreamingRun methods::CancelRunAsync()` | unmapped | mapped | No cancel operation; dropping the stream detaches the spawned run task rather than stopping it, and WorkflowRunState::Cancelled is never set. |
 | `Microsoft.Agents.AI.Workflows::StreamingRun methods::GetStatusAsync(CancellationToken)` | partial | mapped | Status arrives as WorkflowEvent::Status on the stream or via into_run().state(); no query on the live stream. |
 | `Microsoft.Agents.AI.Workflows::StreamingRun methods::SendResponseAsync(ExternalResponse)` | partial | mapped | Responses go to WorkflowRun::send_response after into_run(); events after the response are not streamed. |
-| `Microsoft.Agents.AI.Workflows::StreamingRun properties::SessionId` | unmapped | mapped | Streaming runs carry no session id. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent constructors::SubworkflowWarningEvent(string, string)` | unmapped | adapted | No warning event to construct. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent properties::SubWorkflowId` | unmapped | mapped | No subworkflow warning event, so no subworkflow id field. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent` | unmapped | adapted | Workflows emit no warning events; warnings go to tracing only. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletedEvent properties::CompletionInfo` | unmapped | mapped | SuperStepCompleted carries only the step number, no completion diagnostics. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletionInfo properties::ActivatedExecutors` | unmapped | adapted | Activated executors per superstep are not reported; ExecutorInvoked events are the closest signal. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletionInfo properties::Checkpoint` | unmapped | mapped | Superstep checkpoints are saved but not reported on the completion event. |
@@ -403,8 +234,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::WorkflowBuilder methods::Build(bool)` | partial | partial | build() always validates graph connectivity; there is no switch to skip the orphan-executor check. |
 | `Microsoft.Agents.AI.Workflows::WorkflowHostingExtensions methods::AsAIAgent(Workflow, string, string, string, IWorkflowExecutionEnvironment, bool, bool)` | partial | adapted | as_agent(name) plus with_id/with_description; no execution-environment, exception-detail or include-outputs options. |
 | `Microsoft.Agents.AI.Workflows::WorkflowSessionCheckpointRecovery` | unmapped | unmapped | No recovery of workflow-agent sessions from checkpoints; WorkflowAgent sessions are not checkpoint-backed. |
-| `Microsoft.Agents.AI.Workflows::WorkflowWarningEvent constructors::WorkflowWarningEvent(string)` | unmapped | mapped | No warning event to construct. |
-| `Microsoft.Agents.AI.Workflows::WorkflowWarningEvent` | unmapped | mapped | No workflow warning event; warnings are logged via tracing. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::EdgeInfo` | partial | adapted | EdgeGroup (Single/FanOut/FanIn) describes edges, but Workflow does not expose its edge groups publicly. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::ICheckpointStore<TStoreObject> methods::CreateCheckpointAsync(string, TStoreObject, CheckpointInfo)` | partial | mapped | save() persists a checkpoint and returns its id; checkpoints do not record a parent link. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::ICheckpointStore<TStoreObject> methods::RetrieveIndexAsync(string, CheckpointInfo)` | partial | mapped | list() filters by workflow id, not session, and cannot filter by parent checkpoint. |
@@ -417,13 +246,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment methods::RunAsync<TInput>(Workflow, TInput, string, CancellationToken)` | partial | adapted | run(input) runs to the next halt; there is no session id parameter, and cancellation is by dropping the future. |
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment methods::RunStreamingAsync<TInput>(Workflow, TInput, string, CancellationToken)` | partial | adapted | run_stream(input) streams events; there is no session id parameter. |
 | `Microsoft.Agents.AI.Workflows.InProc::InProcessExecutionEnvironment properties::IsCheckpointingEnabled` | partial | mapped | Checkpointing is set on the builder; there is no accessor reporting whether it is enabled. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableEdgeGroupProcess` | unmapped | mapped | No edge-group spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableExecutorProcess` | unmapped | mapped | No executor-process spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableMessageSend` | unmapped | mapped | No message-send spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableWorkflowBuild` | unmapped | mapped | No workflow.build span exists to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::DisableWorkflowRun` | unmapped | mapped | No workflow run/session spans exist to disable. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions properties::EnableSensitiveData` | unmapped | mapped | ObservabilityConfig::enable_sensitive_data covers chat/agent spans only; workflows emit no spans. |
-| `Microsoft.Agents.AI.Workflows.Observability::WorkflowTelemetryOptions` | unmapped | mapped | No workflow telemetry; the workflow runner emits no OpenTelemetry spans. |
 | `Microsoft.AspNetCore.Builder::A2AEndpointRouteBuilderExtensions methods::MapA2AHttpJson(IEndpointRouteBuilder, AIAgent, string)` | partial | adapted | A2ARouter serves JSON-RPC only; the HTTP+JSON transport binding is not implemented. |
 
 ## Not yet reviewed

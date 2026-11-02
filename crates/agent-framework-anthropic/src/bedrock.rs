@@ -32,16 +32,15 @@
 //! # }
 //! ```
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_framework_bedrock::sigv4::{self, SigV4Params};
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, Message, Role, UsageContent,
-};
-use futures::stream::{self, StreamExt};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+use futures::stream::StreamExt;
 use serde_json::Value;
 
 use crate::convert;
@@ -129,8 +128,11 @@ pub struct AnthropicBedrockClient {
 struct Inner {
     http: reqwest::Client,
     region: String,
-    /// The `bedrock-runtime` host derived from `region`.
+    /// The `bedrock-runtime` host derived from `region`, or the host of an
+    /// endpoint set with `with_endpoint`. It is also the signed `host`.
     host: String,
+    /// `https`, unless `with_endpoint` named another scheme.
+    scheme: String,
     model: String,
     access_key_id: String,
     secret_access_key: String,
@@ -162,8 +164,9 @@ impl AnthropicBedrockClient {
         let region = region.into();
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 host: bedrock_host(&region),
+                scheme: "https".to_string(),
                 region,
                 model: model.into(),
                 access_key_id: access_key_id.into(),
@@ -203,6 +206,30 @@ impl AnthropicBedrockClient {
         self
     }
 
+    /// Send requests to `endpoint` (`scheme://host[:port]`) instead of the
+    /// region's public `bedrock-runtime` host — a VPC interface endpoint, a
+    /// FIPS endpoint, or a proxy. Requests are still signed for the client's
+    /// region, with this host as the signed `host`.
+    ///
+    /// # Errors
+    /// [`Error::Configuration`] when `endpoint` is not `http(s)://host`.
+    pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
+        let (scheme, rest) = endpoint
+            .split_once("://")
+            .filter(|(scheme, _)| *scheme == "https" || *scheme == "http")
+            .ok_or_else(|| Error::Configuration(format!("invalid Bedrock endpoint: {endpoint}")))?;
+        let host = rest.trim_end_matches('/');
+        if host.is_empty() || host.contains('/') {
+            return Err(Error::Configuration(format!(
+                "invalid Bedrock endpoint: {endpoint}"
+            )));
+        }
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.scheme = scheme.to_string();
+        inner.host = host.to_string();
+        Ok(self)
+    }
+
     /// Override the region (and derive a new signing host from it).
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         let region = region.into();
@@ -236,11 +263,16 @@ impl AnthropicBedrockClient {
             .unwrap_or_else(|| self.inner.model.clone())
     }
 
-    /// Sign and POST a request body to `/model/{model}/invoke`, returning the
-    /// raw response on a success status.
-    async fn send(&self, model: &str, body: &Value) -> Result<reqwest::Response> {
-        let path = invoke_path(model);
-        let url = format!("https://{}{path}", self.inner.host);
+    /// Sign and POST a request body to `/model/{model}/invoke` (or, when
+    /// `streaming`, `/model/{model}/invoke-with-response-stream`), returning
+    /// the raw response on a success status.
+    async fn send(&self, model: &str, body: &Value, streaming: bool) -> Result<reqwest::Response> {
+        let path = if streaming {
+            format!("{}-with-response-stream", invoke_path(model))
+        } else {
+            invoke_path(model)
+        };
+        let url = format!("{}://{}{path}", self.inner.scheme, self.inner.host);
         let payload = serde_json::to_vec(body).map_err(|e| {
             Error::Serialization(format!("failed to serialize Bedrock invoke request: {e}"))
         })?;
@@ -278,10 +310,12 @@ impl AnthropicBedrockClient {
             request = request.header(name, value);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -295,6 +329,63 @@ impl AnthropicBedrockClient {
     }
 }
 
+impl AnthropicBedrockClient {
+    /// Send one `InvokeModelWithResponseStream` request for `conversation`
+    /// and turn its event stream into updates. `paused` is set if it ends on
+    /// `pause_turn`.
+    async fn open_stream(
+        &self,
+        conversation: &[Message],
+        options: &ChatOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<ChatStream> {
+        let model = self.effective_model(options);
+        let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
+        // No `stream` key: on Bedrock the route, not the body, selects
+        // streaming.
+        let body = convert::build_cloud_request(
+            conversation,
+            options,
+            max_tokens,
+            false,
+            ANTHROPIC_BEDROCK_VERSION,
+        );
+        let resp = self.send(&model, &body, true).await?;
+        let events = agent_framework_bedrock::eventstream::decode_body(resp)
+            .filter_map(|msg| async move { invoke_stream_event(msg).transpose() })
+            .boxed();
+        Ok(crate::parse_event_value_stream(events, paused).boxed())
+    }
+}
+
+/// The Messages API event inside one `InvokeModelWithResponseStream`
+/// message: a `chunk` event's payload is `{"bytes": "<base64 JSON>"}`. An
+/// `exception` or `error` message becomes the stream's error; other event
+/// types carry nothing.
+fn invoke_stream_event(
+    msg: Result<agent_framework_bedrock::eventstream::EventMessage>,
+) -> Result<Option<Value>> {
+    use base64::Engine as _;
+    let msg = msg?;
+    if let Some(err) = msg.as_error() {
+        return Err(err);
+    }
+    if msg.event_type() != Some("chunk") {
+        return Ok(None);
+    }
+    let payload: Value = serde_json::from_slice(&msg.payload)
+        .map_err(|e| Error::service(format!("invalid Bedrock chunk: {e}")))?;
+    let Some(b64) = payload.get("bytes").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| Error::service(format!("invalid Bedrock chunk encoding: {e}")))?;
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|e| Error::service(format!("invalid Bedrock chunk event: {e}")))
+}
+
 #[async_trait::async_trait]
 impl ChatClient for AnthropicBedrockClient {
     async fn get_response(
@@ -304,63 +395,48 @@ impl ChatClient for AnthropicBedrockClient {
     ) -> Result<ChatResponse> {
         let model = self.effective_model(&options);
         let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
-        let body = convert::build_cloud_request(
-            &messages,
-            &options,
-            max_tokens,
-            false,
-            ANTHROPIC_BEDROCK_VERSION,
-        );
-        let resp = self.send(&model, &body).await?;
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        Ok(convert::parse_response(&value))
+        let options = &options;
+        let model = &model;
+        // Continues the turn while the API pauses it — see
+        // `continue_paused_turns`.
+        crate::continue_paused_turns(messages, |conversation| async move {
+            let body = convert::build_cloud_request(
+                &conversation,
+                options,
+                max_tokens,
+                false,
+                ANTHROPIC_BEDROCK_VERSION,
+            );
+            let resp = self.send(model, &body, false).await?;
+            resp.json::<Value>()
+                .await
+                .map_err(|e| Error::service(format!("invalid response json: {e}")))
+        })
+        .await
     }
 
-    /// Get a streaming response.
-    ///
-    /// Bedrock's `invoke-with-response-stream` counterpart uses AWS's binary
-    /// event-stream framing (length-prefixed, CRC-checked frames), not
-    /// line-delimited SSE — parsing it needs a dedicated binary frame
-    /// decoder, which is a documented extension point rather than
-    /// implemented here (the same tactic
-    /// [`agent_framework_bedrock::BedrockChatClient::get_streaming_response`]
-    /// takes for the Converse API). This method calls the non-streaming
-    /// `invoke` endpoint (the same request [`ChatClient::get_response`]
-    /// sends) and adapts the complete [`ChatResponse`] into a single
-    /// [`ChatResponseUpdate`]. Callers driving this client through
-    /// [`ChatResponse::from_updates`](agent_framework_core::types::ChatResponse::from_updates)
-    /// still get a correct aggregated result; they just don't see partial
-    /// text arrive incrementally.
+    /// Streams `InvokeModelWithResponseStream` as it arrives — the AWS
+    /// event-stream framing decoded by
+    /// [`agent_framework_bedrock::eventstream`], each `chunk` carrying one
+    /// base64-encoded Messages API event — continuing the turn while the API
+    /// pauses it, like [`crate::AnthropicClient`]. This used to send the
+    /// non-streaming `invoke` and replay the finished response as a single
+    /// update, so a caller saw nothing until the whole answer was ready.
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let response = self.get_response(messages, options).await?;
-
-        let mut contents: Vec<_> = response
-            .messages
-            .iter()
-            .flat_map(|m| m.contents.iter().cloned())
-            .collect();
-        if let Some(usage) = response.usage_details.clone() {
-            contents.push(agent_framework_core::types::Content::Usage(UsageContent {
-                details: usage,
-            }));
-        }
-
-        let update = ChatResponseUpdate {
-            contents,
-            role: Some(Role::assistant()),
-            response_id: response.response_id.clone(),
-            model: response.model.clone(),
-            finish_reason: response.finish_reason.clone(),
-            ..Default::default()
-        };
-        Ok(stream::once(async move { Ok(update) }).boxed())
+        let paused = Arc::new(AtomicBool::new(false));
+        let first = self
+            .open_stream(&messages, &options, paused.clone())
+            .await?;
+        let (client, opts) = (self.clone(), options);
+        let open: crate::StreamOpener = Arc::new(move |conversation, paused| {
+            let (client, opts) = (client.clone(), opts.clone());
+            Box::pin(async move { client.open_stream(&conversation, &opts, paused).await })
+        });
+        Ok(crate::continue_paused_stream(open, messages, first, paused).boxed())
     }
 
     fn model(&self) -> Option<&str> {

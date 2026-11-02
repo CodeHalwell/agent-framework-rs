@@ -193,6 +193,34 @@ pub fn get_checkpoint_summary(checkpoint: &WorkflowCheckpoint) -> WorkflowCheckp
     }
 }
 
+/// Order two checkpoints as [`CheckpointStorage::list`] returns them:
+/// oldest first, by `(timestamp_millis, iteration_count, checkpoint_id)`.
+///
+/// Sorting on `timestamp_millis` alone is not a total order, and that matters.
+/// Checkpoints are written one per superstep boundary, so two of them can
+/// share a millisecond, and then the tie is broken by whatever order the
+/// backend happened to enumerate: `HashMap` iteration order for
+/// [`InMemoryCheckpointStorage`] (which varies between runs of the same
+/// program), directory order for [`FileCheckpointStorage`], and the server's
+/// row order for a remote store. A caller that reads the end of the list as
+/// "the newest checkpoint" could therefore resume from a *superseded* one,
+/// and do it intermittently.
+///
+/// `iteration_count` is what settles it: within one workflow run it is the
+/// superstep counter, so the higher of two checkpoints sharing a timestamp is
+/// the later one. That is the same supersession upstream recovers by walking
+/// `previous_checkpoint_id` (#9261); this port has no such lineage field and
+/// does not need one, because the superstep counter already encodes it.
+/// `checkpoint_id` is the final key so that checkpoints from *different* runs
+/// landing on the same timestamp and superstep still come back in a stable
+/// order rather than an arbitrary one.
+pub fn compare_checkpoints(a: &WorkflowCheckpoint, b: &WorkflowCheckpoint) -> std::cmp::Ordering {
+    a.timestamp_millis
+        .cmp(&b.timestamp_millis)
+        .then_with(|| a.iteration_count.cmp(&b.iteration_count))
+        .then_with(|| a.checkpoint_id.cmp(&b.checkpoint_id))
+}
+
 /// Storage backend for workflow checkpoints.
 ///
 /// Rust analogue of Python's `CheckpointStorage` protocol.
@@ -205,6 +233,13 @@ pub trait CheckpointStorage: Send + Sync {
     async fn load(&self, checkpoint_id: &str) -> Result<Option<WorkflowCheckpoint>>;
 
     /// List checkpoints, optionally filtered by workflow id.
+    ///
+    /// Implementations return them oldest first, in
+    /// [`compare_checkpoints`] order — a total order, so the last element is
+    /// always *the* newest checkpoint and never an arbitrary pick among
+    /// several sharing a millisecond. An implementation outside this crate
+    /// should sort with that comparator rather than by `timestamp_millis`
+    /// alone.
     async fn list(&self, workflow_id: Option<&str>) -> Result<Vec<WorkflowCheckpoint>>;
 
     /// Delete a checkpoint by id, returning whether it existed.
@@ -248,7 +283,7 @@ impl CheckpointStorage for InMemoryCheckpointStorage {
             .filter(|cp| workflow_id.is_none_or(|w| cp.workflow_id == w))
             .cloned()
             .collect();
-        out.sort_by_key(|a| a.timestamp_millis);
+        out.sort_by(compare_checkpoints);
         Ok(out)
     }
 
@@ -370,7 +405,7 @@ impl CheckpointStorage for FileCheckpointStorage {
                 }
             }
         }
-        out.sort_by_key(|a| a.timestamp_millis);
+        out.sort_by(compare_checkpoints);
         Ok(out)
     }
 
@@ -393,6 +428,109 @@ mod tests {
             std::env::temp_dir().join(format!("afr-checkpoint-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Build a checkpoint with an explicit id, timestamp and superstep, so a
+    /// timestamp tie can be set up deliberately.
+    fn cp_at(id: &str, timestamp_millis: u64, iteration_count: usize) -> WorkflowCheckpoint {
+        WorkflowCheckpoint {
+            checkpoint_id: id.to_string(),
+            workflow_id: "wf".to_string(),
+            workflow_name: None,
+            timestamp_millis,
+            iteration_count,
+            messages: Vec::new(),
+            executor_states: HashMap::new(),
+            shared_state: HashMap::new(),
+            pending_requests: Vec::new(),
+            fanin_state: HashMap::new(),
+            metadata: HashMap::new(),
+            graph_signature: String::new(),
+            version: default_version(),
+        }
+    }
+
+    #[test]
+    fn checkpoints_sharing_a_timestamp_order_by_superstep() {
+        // Checkpoints are written one per superstep boundary, so two can land
+        // in the same millisecond. The later superstep supersedes the earlier
+        // one and has to sort after it, however the backend enumerated them.
+        let earlier = cp_at("a", 1_000, 3);
+        let later = cp_at("b", 1_000, 4);
+        assert_eq!(
+            compare_checkpoints(&earlier, &later),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_checkpoints(&later, &earlier),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn a_newer_timestamp_wins_over_a_higher_superstep() {
+        // Timestamp is still the primary key: a later checkpoint from a
+        // shorter run must not be ordered before one from a longer earlier run.
+        let older_longer_run = cp_at("a", 1_000, 9);
+        let newer_shorter_run = cp_at("b", 2_000, 1);
+        assert_eq!(
+            compare_checkpoints(&older_longer_run, &newer_shorter_run),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn a_full_tie_is_broken_deterministically_by_id() {
+        // Different runs can collide on both timestamp and superstep. The
+        // order between them is arbitrary but must not vary between calls.
+        let a = cp_at("aaa", 1_000, 2);
+        let b = cp_at("bbb", 1_000, 2);
+        assert_eq!(compare_checkpoints(&a, &b), std::cmp::Ordering::Less);
+        assert_eq!(compare_checkpoints(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    #[tokio::test]
+    async fn in_memory_list_puts_the_newest_checkpoint_last_despite_a_timestamp_tie() {
+        // The real defect: `InMemoryCheckpointStorage` is backed by a
+        // `HashMap`, whose iteration order varies between runs of the same
+        // program. Sorting on `timestamp_millis` alone left the tie to that
+        // order, so a caller reading the end of the list as "the newest
+        // checkpoint" could resume from the superseded one — intermittently.
+        //
+        // Saved newest-first so a stable sort on timestamp alone would leave
+        // the superseded checkpoint last for at least some hash orders.
+        let storage = InMemoryCheckpointStorage::new();
+        for (id, iteration) in [("z-newest", 7usize), ("a-superseded", 6)] {
+            storage.save(cp_at(id, 5_000, iteration)).await.unwrap();
+        }
+
+        let listed = storage.list(Some("wf")).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed.last().unwrap().checkpoint_id,
+            "z-newest",
+            "the highest superstep must be last: {:?}",
+            listed
+                .iter()
+                .map(|c| (&c.checkpoint_id, c.iteration_count))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn file_list_puts_the_newest_checkpoint_last_despite_a_timestamp_tie() {
+        // Same contract for the file store, where the tie would otherwise
+        // fall to directory enumeration order.
+        let dir = tmp_dir();
+        let storage = FileCheckpointStorage::new(&dir).unwrap();
+        for (id, iteration) in [("z-newest", 2usize), ("a-superseded", 1)] {
+            storage.save(cp_at(id, 5_000, iteration)).await.unwrap();
+        }
+
+        let listed = storage.list(Some("wf")).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.last().unwrap().checkpoint_id, "z-newest");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -808,6 +808,7 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
         WorkflowEvent::AgentRun {
             executor_id,
             response,
+            ..
         } => json!({
             "event_type": "AgentRunEvent",
             "executor_id": executor_id,
@@ -817,6 +818,17 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
         WorkflowEvent::Failed { error } => {
             json!({ "event_type": "WorkflowFailedEvent", "message": error })
         }
+        WorkflowEvent::Warning { message } => {
+            json!({ "event_type": "WorkflowWarningEvent", "message": message })
+        }
+        WorkflowEvent::SubworkflowWarning {
+            sub_workflow_id,
+            message,
+        } => json!({
+            "event_type": "SubworkflowWarningEvent",
+            "sub_workflow_id": sub_workflow_id,
+            "message": message,
+        }),
         // Handled by the caller; included for completeness.
         WorkflowEvent::ExecutorInvoked { executor_id } => {
             json!({ "event_type": "ExecutorInvokedEvent", "executor_id": executor_id })
@@ -894,7 +906,10 @@ const PUBLIC_FAILURE_MESSAGE: &str = "Request execution failed: an internal serv
 /// messages ("Pending interrupts require a resume entry…", the host and
 /// bearer guards' replies) are part of the contract and are returned
 /// unchanged.
-fn log_run_failure(phase: &str, response_id: Option<&str>, err: &Error) -> &'static str {
+///
+/// Shared with the AG-UI surface ([`crate::agui`]), whose `RUN_ERROR`
+/// events had the same disclosure; there `response_id` is the run id.
+pub(crate) fn log_run_failure(phase: &str, response_id: Option<&str>, err: &Error) -> &'static str {
     let kind = error_type(err);
     let response_id = response_id.unwrap_or("-");
     if ObservabilityConfig::from_env().enable_sensitive_data {

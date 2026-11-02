@@ -15,8 +15,11 @@ use agent_framework_core::types::{Content, DataContent, Message, Role, UriConten
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Protocol versions this client understands well enough to proceed if a
-/// server negotiates down to one of them.
-pub const COMPATIBLE_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// server answers with one of them. `2025-11-25` (the revision upstream's
+/// MCP 2.x client speaks in its legacy mode) keeps the `initialize`,
+/// `tools/*` and `prompts/*` shapes this client uses.
+pub const COMPATIBLE_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// A monotonically increasing JSON-RPC request id generator, starting at 1.
 #[derive(Debug, Default)]
@@ -181,6 +184,28 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
     #[serde(default)]
     pub output_schema: Option<Value>,
+    /// The tool's `execution` hints, notably `taskSupport`
+    /// (`"forbidden"` / `"optional"` / `"required"`). Kept raw: only
+    /// [`Self::requires_tasks`] reads it.
+    #[serde(default)]
+    pub execution: Option<Value>,
+}
+
+impl ToolDescriptor {
+    /// Whether the server says this tool can only be called through the MCP
+    /// Tasks extension (`execution.taskSupport == "required"`).
+    ///
+    /// This client does not implement Tasks, so such a tool cannot be called
+    /// successfully: a plain `tools/call` is refused by the server. A tool
+    /// whose Tasks support is `"optional"` is an ordinary tool as far as this
+    /// client is concerned (upstream #9746).
+    pub fn requires_tasks(&self) -> bool {
+        self.execution
+            .as_ref()
+            .and_then(|e| e.get("taskSupport"))
+            .and_then(Value::as_str)
+            == Some("required")
+    }
 }
 
 fn empty_object_schema() -> Value {

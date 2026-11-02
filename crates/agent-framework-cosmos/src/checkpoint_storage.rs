@@ -255,7 +255,11 @@ impl CheckpointStorage for CosmosCheckpointStorage {
             .iter()
             .map(parse_checkpoint_document)
             .collect::<Result<_>>()?;
-        out.sort_by_key(|cp| cp.timestamp_millis);
+        // Same total order the core stores use, so a caller reading the end
+        // of the list as "the newest checkpoint" cannot land on a superseded
+        // one when two share a millisecond — here the tie would otherwise
+        // fall to Cosmos's row order. See `compare_checkpoints`.
+        out.sort_by(agent_framework_core::workflow::compare_checkpoints);
         Ok(out)
     }
 

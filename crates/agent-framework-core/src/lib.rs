@@ -82,6 +82,9 @@ pub mod agent_hooks;
 pub mod client;
 pub mod compaction;
 pub mod error;
+#[cfg(feature = "experimental-evals")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-evals")))]
+pub mod evaluation;
 #[cfg(feature = "experimental-harness")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-harness")))]
 pub mod harness;
@@ -95,11 +98,15 @@ pub mod session;
 pub mod session_store;
 pub mod settings;
 pub mod skills;
+#[cfg(feature = "file-skills")]
+#[cfg_attr(docsrs, doc(cfg(feature = "file-skills")))]
+pub mod skills_files;
 pub mod storage_keys;
 pub mod streaming;
 pub mod text_search;
 pub mod tools;
 pub mod types;
+pub mod user_agent;
 #[cfg(feature = "experimental-vector-stores")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
 pub mod vectors;
@@ -148,8 +155,8 @@ pub mod prelude {
         ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
-        CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,
-        GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
+        AutonomousMode, CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage,
+        GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
         HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
         MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
         MagenticStallInterventionDecision, MagenticStallInterventionRequest, RequestInfoExecutor,

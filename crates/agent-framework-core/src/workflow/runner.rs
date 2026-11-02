@@ -169,6 +169,8 @@ pub(crate) struct WorkflowShared {
     /// restriction" — see [`WorkflowRun::classify_yield`] for the full
     /// precedence rule.
     pub output_executors: HashSet<String>,
+    /// Which spans runs emit.
+    pub telemetry: WorkflowTelemetryOptions,
     /// Executor ids whose yields are non-terminal
     /// [`Intermediate`](WorkflowEvent::Intermediate) events (see
     /// [`WorkflowBuilder::intermediate_output_from`]).
@@ -186,6 +188,30 @@ pub struct WorkflowBuilder {
     checkpoint_storage: Option<Arc<dyn CheckpointStorage>>,
     output_executors: Vec<String>,
     intermediate_executors: Vec<String>,
+    telemetry: WorkflowTelemetryOptions,
+}
+
+/// Which workflow spans are emitted (upstream `WorkflowTelemetryOptions`).
+///
+/// A run emits `workflow.build`, `workflow.run`, `executor.process {id}`,
+/// `message.send` and `edge_group.process {type}` spans through `tracing`,
+/// inert until a subscriber (such as the `otel-export` pipeline) is
+/// installed. Each kind can be turned off; message payloads are recorded only
+/// with `enable_sensitive_data`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkflowTelemetryOptions {
+    /// Skip the `workflow.build` span.
+    pub disable_workflow_build: bool,
+    /// Skip the `workflow.run` span.
+    pub disable_workflow_run: bool,
+    /// Skip the `executor.process` spans.
+    pub disable_executor_process: bool,
+    /// Skip the `edge_group.process` spans.
+    pub disable_edge_group_process: bool,
+    /// Skip the `message.send` spans.
+    pub disable_message_send: bool,
+    /// Record message payloads on `message.send` and `executor.process`.
+    pub enable_sensitive_data: bool,
 }
 
 impl std::default::Default for WorkflowBuilder {
@@ -200,6 +226,7 @@ impl std::default::Default for WorkflowBuilder {
             checkpoint_storage: None,
             output_executors: Vec::new(),
             intermediate_executors: Vec::new(),
+            telemetry: WorkflowTelemetryOptions::default(),
         }
     }
 }
@@ -519,8 +546,43 @@ impl WorkflowBuilder {
         self
     }
 
+    /// Configure which workflow spans are emitted (upstream
+    /// `WithOpenTelemetry`). All are on by default.
+    pub fn with_telemetry(mut self, options: WorkflowTelemetryOptions) -> Self {
+        self.telemetry = options;
+        self
+    }
+
     /// Validate and build the workflow.
     pub fn build(self) -> Result<Workflow> {
+        let span = (!self.telemetry.disable_workflow_build).then(|| {
+            tracing::info_span!(
+                "workflow.build",
+                otel.name = "workflow.build",
+                workflow_builder.name = self.name.as_deref().unwrap_or_default(),
+                workflow_builder.description = self.description.as_deref().unwrap_or_default(),
+                workflow.id = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            )
+        });
+        let built = self.build_inner();
+        if let Some(span) = &span {
+            match &built {
+                Ok(workflow) => {
+                    span.record("workflow.id", workflow.id());
+                }
+                Err(e) => {
+                    span.record("error.type", "WorkflowError");
+                    span.record("otel.status_code", "ERROR");
+                    tracing::debug!(parent: span, error = %e, "workflow build failed");
+                }
+            }
+        }
+        built
+    }
+
+    fn build_inner(self) -> Result<Workflow> {
         let start = self
             .start
             .ok_or_else(|| Error::Workflow("no start executor set".into()))?;
@@ -551,6 +613,7 @@ impl WorkflowBuilder {
                 graph_signature,
                 output_executors: self.output_executors.into_iter().collect(),
                 intermediate_executors: self.intermediate_executors.into_iter().collect(),
+                telemetry: self.telemetry,
             }),
         })
     }
@@ -605,8 +668,11 @@ impl Workflow {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = self.shared.clone();
         let input = input.into();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let run_session_id = session_id.clone();
         let handle = tokio::spawn(async move {
             let mut run = WorkflowRun::new(shared, Some(tx));
+            run.session_id = run_session_id;
             let result = run.start(input).await;
             // Drop the streaming sender so the receiver observes end-of-stream;
             // otherwise the sender lives on inside the returned run and the
@@ -618,6 +684,7 @@ impl Workflow {
         WorkflowRunStream {
             rx,
             handle: Some(handle),
+            session_id,
         }
     }
 
@@ -760,9 +827,17 @@ pub struct WorkflowRun {
     events: Vec<WorkflowEvent>,
     state: WorkflowRunState,
     event_tx: Option<UnboundedSender<WorkflowEvent>>,
+    halt: Arc<std::sync::atomic::AtomicBool>,
+    session_id: String,
 }
 
 impl WorkflowRun {
+    /// This run's id (upstream `Run.SessionId`), distinct for every run of
+    /// the workflow.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn new(shared: Arc<WorkflowShared>, event_tx: Option<UnboundedSender<WorkflowEvent>>) -> Self {
         Self {
             shared,
@@ -774,6 +849,8 @@ impl WorkflowRun {
             events: Vec::new(),
             state: WorkflowRunState::Started,
             event_tx,
+            halt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -821,6 +898,9 @@ impl WorkflowRun {
     }
 
     async fn start(&mut self, input: Value) -> Result<()> {
+        for executor in self.shared.executors.values() {
+            executor.reset().await?;
+        }
         self.emit(WorkflowEvent::Started);
         self.state = WorkflowRunState::InProgress;
         self.emit(WorkflowEvent::Status(WorkflowRunState::InProgress));
@@ -872,7 +952,27 @@ impl WorkflowRun {
     /// Drive the superstep loop, emitting the terminal status on success or a
     /// `Failed` status on error.
     async fn drive(&mut self) -> Result<()> {
-        match self.run_loop().await {
+        use tracing::Instrument;
+        let telemetry = self.shared.telemetry;
+        let span = if telemetry.disable_workflow_run {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                "workflow.run",
+                otel.name = "workflow.run",
+                workflow.id = %self.shared.id,
+                workflow.name = self.shared.name.as_deref().unwrap_or_default(),
+                workflow.description = self.shared.description.as_deref().unwrap_or_default(),
+                error.type = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            )
+        };
+        let result = self.run_loop().instrument(span.clone()).await;
+        if result.is_err() {
+            span.record("error.type", "WorkflowError");
+            span.record("otel.status_code", "ERROR");
+        }
+        match result {
             Ok(()) => Ok(()),
             Err(e) => {
                 // A failed superstep never reaches `commit()`, but its staged
@@ -1013,8 +1113,11 @@ impl WorkflowRun {
             // yields `results` in exactly the planned order the apply loop below
             // relies on for determinism.
             let shared_state = self.shared_state.clone();
+            let telemetry = self.shared.telemetry;
+            let halt = self.halt.clone();
             let group_results = futures::future::join_all(groups.into_iter().map(|group| {
                 let shared_state = shared_state.clone();
+                let halt = halt.clone();
                 async move {
                     let mut out = Vec::with_capacity(group.len());
                     for inv in group {
@@ -1024,6 +1127,8 @@ impl WorkflowRun {
                                 inv.data,
                                 inv.source_ids,
                                 shared_state.clone(),
+                                telemetry,
+                                halt.clone(),
                             )
                             .await,
                         );
@@ -1115,6 +1220,11 @@ impl WorkflowRun {
             self.emit(WorkflowEvent::SuperStepCompleted(step));
             self.queue = next;
             self.iteration += 1;
+            if self.halt.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // An executor asked the run to stop: what this superstep sent
+                // is not delivered.
+                self.queue.clear();
+            }
             self.maybe_checkpoint(step).await;
         }
 
@@ -1144,12 +1254,42 @@ impl WorkflowRun {
         data: Value,
         source_ids: Vec<String>,
         shared_state: SharedState,
+        telemetry: WorkflowTelemetryOptions,
+        halt: Arc<std::sync::atomic::AtomicBool>,
     ) -> (String, Result<DrainedEffects>) {
+        use tracing::Instrument;
         let id = executor.id().to_string();
-        let ctx = WorkflowContext::new(id.clone(), source_ids, shared_state);
-        let result = match executor.execute(data, ctx.clone()).await {
+        let span = if telemetry.disable_executor_process {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!(
+                "executor.process",
+                otel.name = %format!("executor.process {id}"),
+                executor.id = %id,
+                message.type = json_type_name(&data),
+                message.source_id = %source_ids.join(","),
+                message.content = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            )
+        };
+        if telemetry.enable_sensitive_data {
+            span.record("message.content", data.to_string());
+        }
+        let ctx = WorkflowContext::new(id.clone(), source_ids, shared_state)
+            .with_telemetry(telemetry)
+            .with_halt(halt);
+        let result = match executor
+            .execute(data, ctx.clone())
+            .instrument(span.clone())
+            .await
+        {
             Ok(()) => Ok(ctx.take()),
-            Err(e) => Err(e),
+            Err(e) => {
+                span.record("error.type", "ExecutorError");
+                span.record("otel.status_code", "ERROR");
+                Err(e)
+            }
         };
         (id, result)
     }
@@ -1265,7 +1405,51 @@ impl WorkflowRun {
             return Ok(vec![t.clone()]);
         }
         let mut targets = Vec::new();
+        let telemetry = self.shared.telemetry;
         for group in &self.shared.edge_groups {
+            let span = (!telemetry.disable_edge_group_process
+                && group.sources().contains(&msg.source_id))
+            .then(|| {
+                let kind = match group {
+                    EdgeGroup::Single { .. } => "SingleEdgeGroup",
+                    EdgeGroup::FanOut { .. } => "FanOutEdgeGroup",
+                    EdgeGroup::FanIn { .. } => "FanInEdgeGroup",
+                };
+                tracing::info_span!(
+                    "edge_group.process",
+                    otel.name = %format!("edge_group.process {kind}"),
+                    edge_group.type = kind,
+                    message.source_id = %msg.source_id,
+                    edge_group.delivered = tracing::field::Empty,
+                    edge_group.delivery_status = tracing::field::Empty,
+                )
+            });
+            let before = targets.len();
+            self.route_group(group, msg, &mut targets).await?;
+            if let Some(span) = span {
+                let delivered = targets.len() > before;
+                span.record("edge_group.delivered", delivered);
+                span.record(
+                    "edge_group.delivery_status",
+                    if delivered {
+                        "delivered"
+                    } else {
+                        "dropped condition evaluated to false"
+                    },
+                );
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Add the targets `group` routes `msg` to.
+    async fn route_group(
+        &self,
+        group: &EdgeGroup,
+        msg: &WorkflowMessage,
+        targets: &mut Vec<String>,
+    ) -> Result<()> {
+        {
             match group {
                 EdgeGroup::Single {
                     source,
@@ -1335,7 +1519,7 @@ impl WorkflowRun {
                 _ => {}
             }
         }
-        Ok(targets)
+        Ok(())
     }
 
     /// If `target` is the sink of a fan-in group, return its source ids.
@@ -1392,9 +1576,25 @@ impl WorkflowRun {
 pub struct WorkflowRunStream {
     rx: UnboundedReceiver<WorkflowEvent>,
     handle: Option<tokio::task::JoinHandle<Result<WorkflowRun>>>,
+    session_id: String,
 }
 
 impl WorkflowRunStream {
+    /// The run's id (see [`WorkflowRun::session_id`]).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Stop the run (upstream `CancelRunAsync`): its task is aborted at its
+    /// next await point, the stream ends, and [`into_run`](Self::into_run)
+    /// then reports the cancellation as an error. Work an executor already
+    /// started outside the runtime (a request in flight) is not undone.
+    pub fn cancel(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
     /// Await the driving task and return the final run state.
     ///
     /// Drains any remaining buffered events first so the run completes.
@@ -1414,6 +1614,18 @@ impl futures::Stream for WorkflowRunStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+/// The JSON type of a message payload, for span attributes.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

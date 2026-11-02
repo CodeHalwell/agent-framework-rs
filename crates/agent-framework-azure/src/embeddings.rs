@@ -194,7 +194,12 @@ impl EmbeddingClient for AzureOpenAIEmbeddingClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());

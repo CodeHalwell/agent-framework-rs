@@ -56,6 +56,7 @@ pub use foundry::AnthropicFoundryClient;
 pub use vertex::{AnthropicVertexClient, StaticVertexToken, VertexTokenProvider};
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
@@ -63,10 +64,24 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
-    Message, Role, TextContent, TextReasoningContent, UsageContent,
+    McpServerToolCallContent, Message, Role, TextContent, TextReasoningContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::Value;
+
+/// This crate's HTTP client, sending the framework `User-Agent`
+/// ([`agent_framework_core::user_agent::user_agent`]) so providers can
+/// attribute the traffic. A static ASCII token cannot fail to become a
+/// header; the fallback only keeps this infallible.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(agent_framework_core::user_agent::user_agent(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -210,7 +225,7 @@ impl AnthropicClient {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 api_key: api_key.into(),
                 base_url: DEFAULT_BASE_URL.to_string(),
                 model: model.into(),
@@ -305,11 +320,12 @@ impl AnthropicClient {
     async fn post(&self, body: &Value, betas: &[String]) -> Result<reqwest::Response> {
         let url = format!("{}/v1/messages", self.inner.base_url.trim_end_matches('/'));
         let request = new_message_request(&self.inner.http, &url, &self.inner.api_key, betas);
-        let resp = request
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = request.json(body).send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
@@ -325,38 +341,69 @@ impl AnthropicClient {
     }
 }
 
+impl AnthropicClient {
+    /// Send one streaming request for `conversation` and parse its SSE body.
+    /// `paused` is set if the stream ends on `stop_reason: "pause_turn"`.
+    async fn open_stream(
+        &self,
+        conversation: &[Message],
+        options: &ChatOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<ChatStream> {
+        let (body, betas) = self.build_body(conversation, options, true);
+        let resp = self.post(&body, &betas).await?;
+        Ok(parse_sse_stream(resp, paused).boxed())
+    }
+}
+
 #[async_trait::async_trait]
 impl ChatClient for AnthropicClient {
+    /// Continues the turn while the API pauses it — see
+    /// [`continue_paused_turns`].
     async fn get_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let (body, betas) = self.build_body(&messages, &options, false);
-        let resp = self.post(&body, &betas).await?;
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        if let Some(err) = value.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown Anthropic error")
-                .to_string();
-            return Err(Error::service(msg));
-        }
-        Ok(convert::parse_response(&value))
+        let options = &options;
+        continue_paused_turns(messages, |conversation| async move {
+            let (body, betas) = self.build_body(&conversation, options, false);
+            let resp = self.post(&body, &betas).await?;
+            let value: Value = resp
+                .json()
+                .await
+                .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
+            if let Some(err) = value.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown Anthropic error")
+                    .to_string();
+                return Err(Error::service(msg));
+            }
+            Ok(value)
+        })
+        .await
     }
 
+    /// Continues the turn while the API pauses it, as
+    /// [`get_response`](Self::get_response) does — see
+    /// [`continue_paused_stream`].
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let (body, betas) = self.build_body(&messages, &options, true);
-        let resp = self.post(&body, &betas).await?;
-        Ok(parse_sse_stream(resp).boxed())
+        let paused = Arc::new(AtomicBool::new(false));
+        let first = self
+            .open_stream(&messages, &options, paused.clone())
+            .await?;
+        let (client, opts) = (self.clone(), options);
+        let open: StreamOpener = Arc::new(move |conversation, paused| {
+            let (client, opts) = (client.clone(), opts.clone());
+            Box::pin(async move { client.open_stream(&conversation, &opts, paused).await })
+        });
+        Ok(continue_paused_stream(open, messages, first, paused).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -368,13 +415,139 @@ impl ChatClient for AnthropicClient {
     }
 }
 
+/// How many times one turn is continued after `pause_turn` before the paused
+/// response is returned as it stands. Upstream's limit (#9718).
+const MAX_PAUSE_TURN_CONTINUATIONS: usize = 10;
+
+/// Drive one non-streaming request, continuing the turn while the API pauses
+/// it. Shared by every client in this crate — the direct API, Foundry,
+/// Bedrock and Vertex — since each differs only in how it sends a request,
+/// which `send` supplies: given the conversation so far, it returns the raw
+/// Messages API response body, or the error the transport produced.
+///
+/// A long-running *server* tool (web search, web fetch) can make the API stop
+/// with `stop_reason: "pause_turn"` before the assistant has finished. The
+/// paused assistant content is to be sent back as the trailing assistant
+/// turn, so the model picks up where it stopped. Before upstream #9718 that
+/// reason was mapped straight to `stop`, so the caller received the
+/// half-finished turn — often a search call with no answer after it — as a
+/// completed response.
+///
+/// The turn is continued at most [`MAX_PAUSE_TURN_CONTINUATIONS`] times, and
+/// only while the paused content can be replayed faithfully (see
+/// [`convert::is_pause_turn_replayable`]); otherwise the paused response is
+/// returned as it is. Every turn's content is merged into one assistant
+/// message and their usage summed (see [`convert::merge_pause_turn`]), since
+/// to the caller they are one turn.
+pub(crate) async fn continue_paused_turns<F, Fut>(
+    messages: Vec<Message>,
+    mut send: F,
+) -> Result<ChatResponse>
+where
+    F: FnMut(Vec<Message>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let mut conversation = messages;
+    let mut merged: Option<ChatResponse> = None;
+    for continuation in 0..=MAX_PAUSE_TURN_CONTINUATIONS {
+        let value = send(conversation.clone()).await?;
+        let turn = convert::parse_response(&value);
+        let paused = value.get("stop_reason").and_then(Value::as_str) == Some("pause_turn");
+        let can_continue = paused
+            && continuation < MAX_PAUSE_TURN_CONTINUATIONS
+            && turn.messages.iter().all(convert::is_pause_turn_replayable);
+        if can_continue {
+            conversation.extend(turn.messages.iter().cloned());
+        }
+        merged = Some(match merged {
+            None => turn,
+            Some(acc) => convert::merge_pause_turn(acc, turn),
+        });
+        if !can_continue {
+            break;
+        }
+    }
+    Ok(merged.expect("the loop runs at least once"))
+}
+
 type ByteStream =
     std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>;
 
 /// Turn an Anthropic Messages API SSE HTTP response into a stream of
 /// [`ChatResponseUpdate`]s.
-fn parse_sse_stream(
+/// Handle one decoded Messages API stream event, whatever transport carried
+/// it: an `error` event ends the stream, a `message_delta` stopping on
+/// `pause_turn` sets `paused` (which `map_stop_reason` folds into `stop` for
+/// the caller), and everything else goes to [`parse_stream_event`].
+fn handle_stream_value(
+    value: &Value,
+    tool_use_ids: &mut HashMap<i64, StreamBlock>,
+    usage: &mut convert::StreamUsageAccumulator,
+    paused: &AtomicBool,
+) -> Result<Option<ChatResponseUpdate>> {
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        let msg = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Anthropic stream error")
+            .to_string();
+        return Err(Error::service(msg));
+    }
+    if value.get("type").and_then(Value::as_str) == Some("message_delta")
+        && value
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(Value::as_str)
+            == Some("pause_turn")
+    {
+        paused.store(true, Ordering::SeqCst);
+    }
+    Ok(parse_stream_event(value, tool_use_ids, usage))
+}
+
+/// Turn a stream of already-decoded Messages API events into updates — for a
+/// transport that is not SSE, such as Bedrock's binary event stream, where
+/// each event arrives inside its own frame. Same handling as
+/// [`parse_sse_stream`] via [`handle_stream_value`].
+pub(crate) fn parse_event_value_stream<S>(
+    values: S,
+    paused: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send
+where
+    S: futures::Stream<Item = Result<Value>> + Send + Unpin + 'static,
+{
+    futures::stream::unfold(
+        (
+            values,
+            HashMap::<i64, StreamBlock>::new(),
+            convert::StreamUsageAccumulator::default(),
+            paused,
+            false,
+        ),
+        |(mut values, mut ids, mut usage, paused, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match values.next().await? {
+                    Ok(value) => match handle_stream_value(&value, &mut ids, &mut usage, &paused) {
+                        Ok(Some(update)) => {
+                            return Some((Ok(update), (values, ids, usage, paused, false)))
+                        }
+                        Ok(None) => continue,
+                        Err(e) => return Some((Err(e), (values, ids, usage, paused, true))),
+                    },
+                    Err(e) => return Some((Err(e), (values, ids, usage, paused, true))),
+                }
+            }
+        },
+    )
+}
+
+pub(crate) fn parse_sse_stream(
     resp: reqwest::Response,
+    paused: Arc<AtomicBool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     futures::stream::unfold(
@@ -386,6 +559,7 @@ fn parse_sse_stream(
             tool_use_ids: HashMap::new(),
             usage: convert::StreamUsageAccumulator::default(),
             done: false,
+            paused,
         },
         |mut state| async move {
             loop {
@@ -417,22 +591,18 @@ fn parse_sse_stream(
                             let Ok(value) = serde_json::from_str::<Value>(data) else {
                                 continue;
                             };
-                            if value.get("type").and_then(Value::as_str) == Some("error") {
-                                let msg = value
-                                    .get("error")
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown Anthropic stream error")
-                                    .to_string();
-                                state.done = true;
-                                return Some((Err(Error::service(msg)), state));
-                            }
-                            if let Some(update) = parse_stream_event(
+                            match handle_stream_value(
                                 &value,
                                 &mut state.tool_use_ids,
                                 &mut state.usage,
+                                &state.paused,
                             ) {
-                                state.queued.push_back(update);
+                                Ok(Some(update)) => state.queued.push_back(update),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    state.done = true;
+                                    return Some((Err(e), state));
+                                }
                             }
                         }
                     }
@@ -453,20 +623,122 @@ struct SseState {
     buffer: String,
     utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
-    /// `content_block` index -> `tool_use` call id, so `input_json_delta`
+    /// `content_block` index -> what that block is, so `input_json_delta`
     /// fragments (which carry only the index) resolve to the right call.
-    tool_use_ids: HashMap<i64, String>,
+    tool_use_ids: HashMap<i64, StreamBlock>,
     /// Turns Anthropic's cumulative usage snapshots into per-update increments.
     usage: convert::StreamUsageAccumulator,
     done: bool,
+    /// Set when the message ends on `stop_reason: "pause_turn"`.
+    paused: Arc<AtomicBool>,
+}
+
+/// Stream a turn, continuing it while the API pauses it — the streaming
+/// counterpart of [`continue_paused_turns`], with the same limit and the
+/// same replayability rule.
+///
+/// Every update is forwarded as it arrives, so the caller sees the paused
+/// turn's content and then the continuation's, in order, as one stream. When
+/// a stream ends paused, its updates are rebuilt into the assistant message
+/// (via [`ChatResponse::from_updates`]), appended to the conversation, and a
+/// new request is opened from there. An error opening a continuation is
+/// yielded as the stream's last item rather than swallowed.
+/// Opens one streaming request for a conversation, setting the flag it is
+/// given if that stream ends on `pause_turn`. Each client in this crate
+/// supplies its own, so [`continue_paused_stream`] serves every transport.
+pub(crate) type StreamOpener = Arc<
+    dyn Fn(Vec<Message>, Arc<AtomicBool>) -> futures::future::BoxFuture<'static, Result<ChatStream>>
+        + Send
+        + Sync,
+>;
+
+pub(crate) fn continue_paused_stream(
+    open: StreamOpener,
+    messages: Vec<Message>,
+    first: ChatStream,
+    paused: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
+    struct PausedStreamState {
+        open: StreamOpener,
+        conversation: Vec<Message>,
+        inner: ChatStream,
+        collected: Vec<ChatResponseUpdate>,
+        paused: Arc<AtomicBool>,
+        continuation: usize,
+        done: bool,
+    }
+    futures::stream::unfold(
+        PausedStreamState {
+            open,
+            conversation: messages,
+            inner: first,
+            collected: Vec::new(),
+            paused,
+            continuation: 0,
+            done: false,
+        },
+        |mut st| async move {
+            loop {
+                if st.done {
+                    return None;
+                }
+                match st.inner.next().await {
+                    Some(Ok(update)) => {
+                        st.collected.push(update.clone());
+                        return Some((Ok(update), st));
+                    }
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(e), st));
+                    }
+                    None => {
+                        let was_paused = st.paused.swap(false, Ordering::SeqCst);
+                        if !was_paused || st.continuation >= MAX_PAUSE_TURN_CONTINUATIONS {
+                            return None;
+                        }
+                        let turn = ChatResponse::from_updates(std::mem::take(&mut st.collected));
+                        if !turn.messages.iter().all(convert::is_pause_turn_replayable) {
+                            return None;
+                        }
+                        st.conversation.extend(turn.messages);
+                        st.continuation += 1;
+                        match (st.open)(st.conversation.clone(), st.paused.clone()).await {
+                            Ok(next) => st.inner = next,
+                            Err(e) => {
+                                st.done = true;
+                                return Some((Err(e), st));
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// Parse one decoded SSE event into an update, or `None` for event types that
 /// carry no content of their own (`content_block_stop`, `message_stop`,
 /// `ping`, ...).
+/// What a streamed content block at a given index is, for the deltas that
+/// carry only the index.
+enum StreamBlock {
+    /// A client or server tool call: its `input_json_delta` fragments are
+    /// emitted as `FunctionCall` argument fragments under this call id.
+    Tool(String),
+    /// An MCP-connector call, buffered until `content_block_stop` and then
+    /// emitted whole as one `McpServerToolCall` — that content type has no
+    /// fragment merging, and replaying it needs the complete input.
+    Mcp {
+        id: String,
+        name: String,
+        server_name: Option<String>,
+        input: String,
+    },
+}
+
 fn parse_stream_event(
     value: &Value,
-    tool_use_ids: &mut HashMap<i64, String>,
+    tool_use_ids: &mut HashMap<i64, StreamBlock>,
     usage_acc: &mut convert::StreamUsageAccumulator,
 ) -> Option<ChatResponseUpdate> {
     match value.get("type").and_then(Value::as_str)? {
@@ -499,7 +771,21 @@ fn parse_stream_event(
             let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
             let block = value.get("content_block")?;
             match block.get("type").and_then(Value::as_str)? {
-                "tool_use" | "mcp_tool_use" | "server_tool_use" => {
+                "mcp_tool_use" => {
+                    let str_field =
+                        |k: &str| block.get(k).and_then(Value::as_str).map(str::to_string);
+                    tool_use_ids.insert(
+                        index,
+                        StreamBlock::Mcp {
+                            id: str_field("id").unwrap_or_default(),
+                            name: str_field("name").unwrap_or_default(),
+                            server_name: str_field("server_name"),
+                            input: String::new(),
+                        },
+                    );
+                    None
+                }
+                "tool_use" | "server_tool_use" => {
                     let id = block
                         .get("id")
                         .and_then(Value::as_str)
@@ -510,7 +796,7 @@ fn parse_stream_event(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    tool_use_ids.insert(index, id.clone());
+                    tool_use_ids.insert(index, StreamBlock::Tool(id.clone()));
                     Some(ChatResponseUpdate {
                         contents: vec![Content::FunctionCall(FunctionCallContent::new(
                             id, name, None,
@@ -584,16 +870,28 @@ fn parse_stream_event(
                     ..Default::default()
                 }),
                 "input_json_delta" => {
-                    let call_id = tool_use_ids.get(&index).cloned().unwrap_or_default();
                     let partial = delta
                         .get("partial_json")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    Content::FunctionCall(FunctionCallContent::new(
-                        call_id,
-                        "",
-                        Some(FunctionArguments::Raw(partial.to_string())),
-                    ))
+                    match tool_use_ids.get_mut(&index) {
+                        Some(StreamBlock::Mcp { input, .. }) => {
+                            input.push_str(partial);
+                            return None;
+                        }
+                        Some(StreamBlock::Tool(call_id)) => {
+                            Content::FunctionCall(FunctionCallContent::new(
+                                call_id.clone(),
+                                "",
+                                Some(FunctionArguments::Raw(partial.to_string())),
+                            ))
+                        }
+                        None => Content::FunctionCall(FunctionCallContent::new(
+                            String::new(),
+                            "",
+                            Some(FunctionArguments::Raw(partial.to_string())),
+                        )),
+                    }
                 }
                 _ => return None,
             };
@@ -623,8 +921,43 @@ fn parse_stream_event(
                 ..Default::default()
             })
         }
-        // `content_block_stop`, `message_stop`, `ping`, and anything else
-        // carry no content of their own.
+        // A buffered MCP-connector call is complete at its block's stop.
+        "content_block_stop" => {
+            let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
+            match tool_use_ids.remove(&index) {
+                Some(StreamBlock::Mcp {
+                    id,
+                    name,
+                    server_name,
+                    input,
+                }) => {
+                    let arguments = if input.trim().is_empty() {
+                        FunctionArguments::Object(HashMap::new())
+                    } else {
+                        FunctionArguments::Raw(input)
+                    };
+                    Some(ChatResponseUpdate {
+                        contents: vec![Content::McpServerToolCall(McpServerToolCallContent {
+                            call_id: id,
+                            tool_name: name,
+                            server_name,
+                            arguments: Some(arguments),
+                            approval_request_id: None,
+                        })],
+                        role: Some(Role::assistant()),
+                        ..Default::default()
+                    })
+                }
+                Some(tool) => {
+                    // Keep the mapping: a late delta still resolves.
+                    tool_use_ids.insert(index, tool);
+                    None
+                }
+                None => None,
+            }
+        }
+        // `message_stop`, `ping`, and anything else carry no content of
+        // their own.
         _ => None,
     }
 }
@@ -649,6 +982,7 @@ mod tests {
             tool_use_ids: HashMap::new(),
             usage: convert::StreamUsageAccumulator::default(),
             done: false,
+            paused: Arc::new(AtomicBool::new(false)),
         };
         let mut updates = Vec::new();
         if let Some(Ok(bytes)) = state.byte_stream.next().await {
@@ -1052,17 +1386,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_mcp_tool_use_via_content_block_start() {
-        let text = sse_frame(
+    async fn stream_mcp_tool_use_is_buffered_and_emitted_whole_at_block_stop() {
+        // The input streams in fragments after an empty start; the hosted-MCP
+        // content type has no fragment merging, so the call is emitted once,
+        // complete, when its block stops — and is not a local function call.
+        let mut text = sse_frame(
             "content_block_start",
             &serde_json::json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "mcp_tool_use", "id": "mcptoolu_1", "name": "search_docs", "server_name": "docs", "input": {} } }),
         );
+        for partial in ["{\"q\": \"ru", "st\"}"] {
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": partial } }),
+            ));
+        }
+        text.push_str(&sse_frame(
+            "content_block_stop",
+            &serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+        ));
         let updates = collect_updates(text).await;
         let resp = ChatResponse::from_updates(updates);
-        let calls = resp.function_calls();
-        assert_eq!(calls.len(), 1);
+        assert!(
+            resp.function_calls().is_empty(),
+            "not a local function call"
+        );
+        let calls: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .filter_map(|c| match c {
+                Content::McpServerToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{:?}", resp.messages);
         assert_eq!(calls[0].call_id, "mcptoolu_1");
-        assert_eq!(calls[0].name, "search_docs");
+        assert_eq!(calls[0].server_name.as_deref(), Some("docs"));
+        let args = match calls[0].arguments.as_ref().unwrap() {
+            FunctionArguments::Raw(raw) => serde_json::from_str::<Value>(raw).unwrap(),
+            FunctionArguments::Object(m) => serde_json::to_value(m).unwrap(),
+        };
+        assert_eq!(args, serde_json::json!({ "q": "rust" }));
     }
 
     #[tokio::test]
@@ -1118,6 +1482,7 @@ mod tests {
             tool_use_ids: HashMap::new(),
             usage: convert::StreamUsageAccumulator::default(),
             done: false,
+            paused: Arc::new(AtomicBool::new(false)),
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
         let decoded = state.utf8.push(&bytes);

@@ -22,6 +22,8 @@ foundry-local = ["dep:agent-framework-foundry-local"]
 bedrock = ["dep:agent-framework-bedrock"]
 github-copilot = ["dep:agent-framework-github-copilot"]
 azure = ["dep:agent-framework-azure"]
+# Azure Content Understanding attachment analysis (`ContentUnderstandingContextProvider`).
+azure-content-understanding = ["azure", "agent-framework-azure/content-understanding"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
 hosting = ["dep:agent-framework-hosting"]
@@ -32,6 +34,11 @@ mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
+# The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it
+# implies `experimental-vector-stores` and is not part of `full`.
+qdrant = ["dep:agent-framework-qdrant", "experimental-vector-stores"]
+# The PostgreSQL + pgvector vector store (experimental, like `qdrant`).
+postgres = ["dep:agent-framework-postgres", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -43,6 +50,9 @@ otel-metrics = ["agent-framework-core/otel-metrics"]
 # (`observability::export`). Implies `otel-metrics`; the only feature here that
 # pulls an OpenTelemetry *SDK*.
 otel-export = ["agent-framework-core/otel-export"]
+# An Azure Monitor (Application Insights) destination for that pipeline
+# (`OtelExport::with_azure_monitor`). Implies `otel-export`.
+azure-monitor = ["agent-framework-core/azure-monitor"]
 # Experimental surfaces (docs/feature-stages.md): APIs upstream still marks
 # experimental, with no semver promise. Not part of `full`; `experimental`
 # turns them all on.
@@ -50,12 +60,22 @@ experimental-vector-stores = [
     "agent-framework-core/experimental-vector-stores",
     "agent-framework-cosmos?/experimental-vector-stores",
     "agent-framework-azure-ai-search?/experimental-vector-stores",
+    "agent-framework-redis?/experimental-vector-stores",
 ]
 experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
 experimental-agent-hooks = ["agent-framework-core/experimental-agent-hooks"]
+# File-based skills: SKILL.md discovery (`SkillsProvider::from_paths`).
+file-skills = ["agent-framework-core/file-skills"]
 experimental-harness = ["agent-framework-core/experimental-harness"]
-experimental-session-store = ["agent-framework-core/experimental-session-store"]
+experimental-evals = [
+    "agent-framework-core/experimental-evals",
+    "agent-framework-foundry?/evals",
+]
+experimental-session-store = [
+    "agent-framework-core/experimental-session-store",
+    "agent-framework-azure?/session-store",
+]
 experimental-declarative-agents = [
     "dep:agent-framework-declarative",
     "agent-framework-declarative/experimental-declarative-agents",
@@ -66,10 +86,14 @@ experimental = [
     "experimental-progressive-tools",
     "experimental-agent-hooks",
     "experimental-harness",
+    "experimental-evals",
     "experimental-session-store",
     "experimental-declarative-agents",
+    "qdrant",
+    "postgres",
 ]
 full = [
+    "file-skills",
     "openai",
     "anthropic",
     "ollama",
@@ -113,6 +137,8 @@ agent-framework-mem0 = { workspace = true, optional = true }
 agent-framework-foundry = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
+agent-framework-qdrant = { workspace = true, optional = true }
+agent-framework-postgres = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }
 agent-framework-purview = { workspace = true, optional = true }
 agent-framework-tools = { workspace = true, optional = true }

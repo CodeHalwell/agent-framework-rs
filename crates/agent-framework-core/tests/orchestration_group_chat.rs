@@ -74,6 +74,31 @@ fn conversation(run: &WorkflowRun) -> Vec<Message> {
     serde_json::from_value(output).expect("output is a conversation")
 }
 
+/// A round cap below 1 is coerced up to 1, so at least one participant
+/// speaks. Upstream's base group-chat orchestrator applies the same coercion
+/// (`max(1, max_rounds)`); without it the limit — checked before a round runs
+/// — halts the conversation immediately and the caller gets only the
+/// "round limit" notice with nothing said.
+#[tokio::test]
+async fn a_round_cap_below_one_is_coerced_to_one() {
+    let a = agent("A", vec!["a-speaks"]);
+
+    let workflow = GroupChatBuilder::new()
+        .participant("A", a)
+        .round_robin()
+        .max_rounds(0)
+        .build()
+        .unwrap();
+
+    let run = workflow.run("kick off").await.unwrap();
+    let conv = conversation(&run);
+    let texts: Vec<String> = conv.iter().map(Message::text).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("a-speaks")),
+        "one round must run, so the single participant speaks: {texts:?}"
+    );
+}
+
 #[tokio::test]
 async fn round_robin_visits_participants_in_order() {
     let a = agent("A", vec!["a-speaks"]);

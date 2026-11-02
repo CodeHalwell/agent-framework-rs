@@ -66,12 +66,19 @@
 //! # }
 //! ```
 
+#[cfg(feature = "session-store")]
+pub mod blob_session_store;
+#[cfg(feature = "content-understanding")]
+#[cfg_attr(docsrs, doc(cfg(feature = "content-understanding")))]
+pub mod content_understanding;
 mod credential;
 mod credentials;
 pub mod embeddings;
 #[cfg(feature = "entra-sdk")]
 pub mod entra_sdk;
 pub mod responses;
+#[cfg(feature = "session-store")]
+pub use blob_session_store::{AzureBlobAgentSessionStore, BlobAuth, STORAGE_SCOPE};
 
 pub use credential::{StaticTokenCredential, TokenCredential};
 pub use credentials::{
@@ -117,7 +124,7 @@ pub const DEFAULT_EMBEDDING_API_VERSION: &str = "2024-10-21";
 /// supportability, so a request that sends none is traffic the platform — and
 /// anyone reading a support case — cannot attribute. Upstream identifies
 /// itself the same way, per package (#9223).
-pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
+pub const USER_AGENT_PRODUCT: &str = agent_framework_core::user_agent::USER_AGENT_PRODUCT;
 
 /// The `User-Agent` value for an Azure call made by `component` at `version`.
 ///
@@ -125,8 +132,12 @@ pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
 /// `CARGO_PKG_VERSION`, so a request names both the framework and the
 /// connector inside it: `agent-framework-rust/0.11.0
 /// (agent-framework-azure-cosmos)`.
+///
+/// The format is [`agent_framework_core::user_agent::user_agent`]'s, which
+/// every other crate in the workspace sends too; this name is kept for the
+/// Azure crates that already call it.
 pub fn azure_user_agent(component: &str, version: &str) -> String {
-    format!("{USER_AGENT_PRODUCT}/{version} ({component})")
+    agent_framework_core::user_agent::user_agent(component, version)
 }
 
 /// A [`reqwest::Client`] whose requests carry [`azure_user_agent`].
@@ -136,10 +147,43 @@ pub fn azure_user_agent(component: &str, version: &str) -> String {
 /// format lives in one place. A static ASCII token cannot fail to become a
 /// header, so the fallback exists only to keep the signature infallible.
 pub fn azure_http_client(component: &str, version: &str) -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(azure_user_agent(component, version))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    build_azure_http_client(component, version, None)
+}
+
+/// [`azure_http_client`] with a total per-request timeout.
+///
+/// `reqwest` applies no timeout by default, so a hung Azure endpoint
+/// otherwise stalls a run indefinitely. The bound covers the whole request,
+/// response body included — for a streaming call that is the lifetime of the
+/// stream, so a caller that streams long answers wants a generous value or
+/// none at all.
+///
+/// For reference, the OpenAI SDK upstream's Python clients build on defaults
+/// to a 5s connect and 600s total timeout; this sets only the total.
+pub fn azure_http_client_with_timeout(
+    component: &str,
+    version: &str,
+    timeout: std::time::Duration,
+) -> reqwest::Client {
+    build_azure_http_client(component, version, Some(timeout))
+}
+
+/// Shared builder behind [`azure_http_client`] and
+/// [`azure_http_client_with_timeout`].
+///
+/// The fallback drops the timeout along with the `User-Agent`, but it is only
+/// reached when `reqwest` cannot initialise its TLS backend at all, in which
+/// case no request will succeed anyway.
+fn build_azure_http_client(
+    component: &str,
+    version: &str,
+    timeout: Option<std::time::Duration>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().user_agent(azure_user_agent(component, version));
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// This crate's own [`azure_http_client`].
@@ -362,7 +406,12 @@ impl AzureOpenAIClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
