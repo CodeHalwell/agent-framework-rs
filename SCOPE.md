@@ -43,11 +43,10 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Harness, remainder**: memory (`MemoryContextProvider`) and the
-  `create_harness_agent` assembly. The agent loop, todo (with
-  `TodoFileStore`), tool approval, agent mode, the file store, file access,
-  file memory and background agents are ported behind
-  `experimental-harness`.
+- **Harness, remainder**: the `create_harness_agent` assembly. The agent
+  loop, todo (with `TodoFileStore`), tool approval, agent mode, the file
+  store, file access, file memory, background agents and memory
+  (`MemoryContextProvider`) are ported behind `experimental-harness`.
 - **Agent hooks, remainder** (`experimental-agent-hooks` ships the
   enforcement bundle): the approval seam (liftable denies are enforced as
   plain denies), the `sequential/run_all` and parallel composition profiles,
@@ -88,8 +87,9 @@ from the roadmap, not from this file.
   skills beyond inline skills (scripts, file-based sources, source
   pipelines); compaction's message-group model, triggers and summarization;
   workflow telemetry, run cancellation and graph reflection; message source
-  attribution and message injection; context providers seeing the agent and
-  session.
+  attribution and message injection; context providers seeing the agent
+  (they see the session in `before_run` and, through
+  `after_run_in_session`, after the run).
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an

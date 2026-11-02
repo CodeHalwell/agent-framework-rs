@@ -15,12 +15,12 @@
 //! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
 //! | `_file_access.py` (the tool half): `FileAccessProvider` | [`FileAccessProvider`] |
 //! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
+//! | `_memory.py`: `MemoryContextProvider`, `MemoryStore`, `MemoryFileStore`, `MemoryTopicRecord`, `MemoryIndexEntry` | [`MemoryContextProvider`], [`MemoryStore`], [`MemoryFileStore`], [`MemoryTopicRecord`], [`MemoryIndexEntry`] |
 //! | `_background_agents.py`: `BackgroundAgentsProvider`, `BackgroundTaskInfo`, `BackgroundTaskStatus`; `_loop.py`: `background_tasks_running`, `background_tasks_running_message` | [`BackgroundAgentsProvider`], [`BackgroundTaskInfo`], [`BackgroundTaskStatus`], [`background_tasks_running`], [`background_tasks_running_message`] |
 //!
 //! # Not ported here
 //!
-//! - **Memory**: `_memory.py` and the full `create_harness_agent`
-//!   assembly are out of scope for now.
+//! - The full `create_harness_agent` assembly is out of scope for now.
 //!
 //! # Divergences from upstream
 //!
@@ -55,6 +55,7 @@ pub mod background_agents;
 pub mod file_access;
 pub mod file_memory;
 pub mod file_store;
+pub mod memory;
 pub mod mode;
 pub mod todo;
 pub mod tool_approval;
@@ -88,6 +89,18 @@ pub use file_store::{
     normalize_relative_path, scan_content, slice_lines, split_lines, AgentFileStore, FileLineEdit,
     FileSearchMatch, FileSearchResult, FileStoreEntry, FileStoreEntryType,
     FileSystemAgentFileStore, InMemoryAgentFileStore, MAX_SEARCH_PATTERN_LENGTH, SEARCH_TIMEOUT,
+};
+pub use memory::{
+    format_memory_timestamp, parse_memory_timestamp, slugify_topic, HistoryMessageFilter,
+    MemoryContextProvider, MemoryContextProviderBuilder, MemoryFileStore, MemoryIndexEntry,
+    MemoryMaintenanceState, MemoryStore, MemoryTopicRecord, TranscriptSearchResult,
+    DEFAULT_MEMORY_CONSOLIDATION_INTERVAL, DEFAULT_MEMORY_CONSOLIDATION_MIN_SESSIONS,
+    DEFAULT_MEMORY_CONSOLIDATION_PROMPT, DEFAULT_MEMORY_CONTEXT_PROMPT,
+    DEFAULT_MEMORY_EXTRACTION_PROMPT, DEFAULT_MEMORY_INDEX_FILE_NAME, DEFAULT_MEMORY_INDEX_HEADER,
+    DEFAULT_MEMORY_INDEX_LINE_LENGTH, DEFAULT_MEMORY_INDEX_LINE_LIMIT,
+    DEFAULT_MEMORY_MAX_EXTRACTIONS, DEFAULT_MEMORY_NO_TOPICS_TEXT, DEFAULT_MEMORY_SELECTION_LIMIT,
+    DEFAULT_MEMORY_SOURCE_ID, DEFAULT_MEMORY_STATE_FILE_NAME, DEFAULT_MEMORY_TOPICS_DIRECTORY_NAME,
+    DEFAULT_MEMORY_TRANSCRIPTS_DIRECTORY_NAME,
 };
 pub use mode::{
     get_agent_mode, set_agent_mode, AgentModeProvider, AgentModeProviderBuilder,
@@ -131,6 +144,35 @@ pub(crate) fn read_state_object(
             json_type_name(&other)
         ))),
     }
+}
+
+/// Write `text` to `path` atomically: into an exclusively created sibling
+/// temporary file (so an existing file or symlink cannot redirect the
+/// write), then renamed over `path`. Creates the parent directories.
+pub(crate) async fn atomic_write_text(path: &std::path::Path, text: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let io = |e: std::io::Error| Error::Other(format!("Could not write {}: {e}", path.display()));
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no parent directory", path.display())))?;
+    tokio::fs::create_dir_all(dir).await.map_err(io)?;
+    let tmp = dir.join(format!(".maf-state-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await?;
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(io(e));
+    }
+    Ok(())
 }
 
 /// The JSON type name of `value`, for error messages.

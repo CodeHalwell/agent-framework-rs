@@ -949,7 +949,7 @@ impl FreshContext {
         for provider in &self.providers {
             if provider.is_history_provider() {
                 provider
-                    .after_run(last_input, &last_response.messages, None)
+                    .after_run_in_session(session, last_input, &last_response.messages, None)
                     .await?;
             }
         }

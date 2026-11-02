@@ -79,6 +79,24 @@ pub trait ContextProvider: Send + Sync {
         Ok(())
     }
 
+    /// The completion hook with the run's session, which is what agents
+    /// call. Mirrors the `session` argument of upstream's `after_run`.
+    ///
+    /// The default forwards to [`after_run`](Self::after_run), so a provider
+    /// that does not need the session implements only that; one that does
+    /// (to find per-session or per-owner storage, say) overrides this.
+    async fn after_run_in_session(
+        &self,
+        session: &crate::session::AgentSession,
+        request_messages: &[Message],
+        response_messages: &[Message],
+        error: Option<&Error>,
+    ) -> Result<()> {
+        let _ = session;
+        self.after_run(request_messages, response_messages, error)
+            .await
+    }
+
     /// Whether this provider manages conversation history (a
     /// [`HistoryProvider`](crate::history::HistoryProvider)). [`Agent`](crate::agent::Agent)
     /// and [`WorkflowAgent`](crate::workflow::WorkflowAgent) use this to

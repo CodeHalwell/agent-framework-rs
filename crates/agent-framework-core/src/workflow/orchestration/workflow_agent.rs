@@ -331,8 +331,11 @@ fn forward_and_persist(
                 None => {
                     if let Some((session, input)) = finish.take() {
                         let response = AgentResponse::from_updates(collected.clone());
-                        for cp in session.context_providers {
-                            if let Err(e) = cp.after_run(&input, &response.messages, None).await {
+                        for cp in session.context_providers.clone() {
+                            if let Err(e) = cp
+                                .after_run_in_session(&session, &input, &response.messages, None)
+                                .await
+                            {
                                 return Some((Err(e), (inner, collected, true, None)));
                             }
                         }
@@ -384,7 +387,8 @@ impl SupportsAgentRun for WorkflowAgent {
         // the workflow's own input — this is a write-back, not a
         // read-and-write.
         for cp in session.context_providers.clone() {
-            cp.after_run(&messages, &response_messages, None).await?;
+            cp.after_run_in_session(session, &messages, &response_messages, None)
+                .await?;
         }
 
         Ok(AgentResponse {

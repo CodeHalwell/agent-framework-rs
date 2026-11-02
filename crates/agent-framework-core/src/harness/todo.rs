@@ -819,33 +819,7 @@ impl TodoStore for TodoFileStore {
         })
         .to_string()
             + "\n";
-        let io =
-            |e: std::io::Error| Error::Other(format!("Could not write {}: {e}", path.display()));
-        let dir = path.parent().expect("a state path has a parent");
-        tokio::fs::create_dir_all(dir).await.map_err(io)?;
-        let tmp = dir.join(format!(".maf-state-{}.tmp", uuid::Uuid::new_v4().simple()));
-        // Exclusive creation, so an existing file or symbolic link at the
-        // temporary name cannot redirect the write.
-        let written = async {
-            use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .await?;
-            file.write_all(payload.as_bytes()).await?;
-            file.flush().await
-        }
-        .await;
-        if let Err(e) = written {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(io(e));
-        }
-        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(io(e));
-        }
-        Ok(())
+        super::atomic_write_text(&path, &payload).await
     }
 }
 
