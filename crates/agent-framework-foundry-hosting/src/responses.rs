@@ -136,8 +136,13 @@ pub type OptionsHook =
 pub struct WorkflowPause {
     /// The checkpoint holding the pending requests.
     pub checkpoint_id: String,
-    /// `(wire call id, workflow request id)` pairs, in request order.
+    /// `(wire id, workflow request id)` pairs, in request order. The wire id
+    /// is the `call_id` a `function_call_output` / `computer_call_output`
+    /// answers, or the `approval_request_id` of an `mcp_approval_response`.
     pub requests: Vec<(String, String)>,
+    /// The pending requests' data, in the same order (to build typed replies:
+    /// approval responses, computer results).
+    pub request_data: Vec<Value>,
 }
 
 /// A stored response.
@@ -530,6 +535,7 @@ impl ResponsesHostServer {
             running: Mutex::new(HashMap::new()),
             replays: Mutex::new(HashMap::new()),
             conversations: Mutex::new(HashMap::new()),
+            finals: Mutex::new(HashMap::new()),
         });
         let router = Router::new()
             .route(&format!("{p}/responses"), post(create))
@@ -575,9 +581,53 @@ struct Inner {
     running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
     replays: Mutex<HashMap<String, Arc<Replay>>>,
     conversations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per response: serializes its terminal writes with cancel / delete.
+    finals: Mutex<HashMap<String, Arc<Terminal>>>,
+}
+
+/// One response's terminal-write coordination. A turn's persistence runs in
+/// its own task (so a disconnect cannot cut it short), which also means it
+/// outlives a cancel or delete aborting the turn. Both take `state`, so their
+/// writes never interleave, and a cancel or delete first raises `stop`, which
+/// the persistence checks before each write: whatever it has not yet
+/// written, it skips. A cancel or delete therefore wins unless the turn's
+/// writes all committed first.
+#[derive(Default)]
+struct Terminal {
+    stop: std::sync::atomic::AtomicBool,
+    state: tokio::sync::Mutex<TerminalState>,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    /// Cancelled or deleted: a persistence that starts later writes nothing.
+    finalized: bool,
+    /// A persistence stopped part-way: its response record may read as
+    /// finished, but the turn did not commit, so it is still cancellable.
+    stopped: bool,
+}
+
+impl Terminal {
+    fn stopping(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Inner {
+    /// `id`'s terminal coordination (see [`Terminal`]). Entries nobody
+    /// holds are dropped unless finalized or stopped, which must outlive the
+    /// writers that will consult them.
+    fn terminal(&self, id: &str) -> Arc<Terminal> {
+        let mut terminals = self.finals.lock().unwrap();
+        terminals.retain(|_, t| {
+            Arc::strong_count(t) > 1
+                || t.state
+                    .try_lock()
+                    .map_or(true, |s| s.finalized || s.stopped)
+        });
+        terminals.entry(id.to_string()).or_default().clone()
+    }
+
     /// The lock serializing one conversation's turns, from loading its
     /// transcript through persisting the new one, so concurrent turns
     /// cannot drop each other.
@@ -859,9 +909,14 @@ async fn create(
     };
     let response_id = ids::response_id(create.previous_response_id.as_deref());
     let context = FoundryRequestContext::from_headers(&headers, None);
-    let messages = match turn_messages(server, &context, &create.input).await {
-        Ok(messages) => messages,
-        Err(e) => return bad_request(e),
+    // A workflow resume's input is its replies, consumed above.
+    let messages = if resume.is_some() {
+        Vec::new()
+    } else {
+        match turn_messages(server, &context, &create.input).await {
+            Ok(messages) => messages,
+            Err(e) => return bad_request(e),
+        }
     };
     let prepared = Prepared {
         request: HostedResponseRequest {
@@ -1112,64 +1167,84 @@ async fn run_turn(
     let (status, response) = if prepared.store {
         // Spawned so a disconnect (which drops this task) cannot cut the
         // writes short and leave the conversation half-updated.
-        let persisted = {
-            let inner = inner.clone();
-            let prepared = prepared.clone();
-            let (status, response) = (status.clone(), response.clone());
-            tokio::spawn(async move {
-                persist(
-                    &inner.server,
-                    &prepared,
-                    &status,
-                    &response,
-                    transcript,
-                    pause,
-                    approvals,
-                )
-                .await
-            })
-            .await
-            .unwrap_or_else(|e| {
-                Err(agent_framework_core::error::Error::Other(format!(
-                    "persisting the response failed: {e}"
-                )))
-            })
-        };
-        match persisted {
-            Ok(()) => (status, response),
-            Err(e) => {
-                // A turn whose outcome could not be stored did not succeed:
-                // report it as failed, and record that (best effort) so a
-                // background response is not left in progress.
-                tracing::error!(error = %e, "failed to persist a hosted response");
-                let mut failed = prepared.skeleton("failed");
-                failed["error"] = json!({
-                    "code": "server_error",
-                    "message": "The response could not be stored.",
-                });
-                let record = StoredResponse {
-                    response: failed.clone(),
-                    input_items: prepared.input_items.clone(),
-                    transcript: prepared
-                        .request
-                        .history
-                        .iter()
-                        .chain(&prepared.request.messages)
-                        .cloned()
-                        .collect(),
-                    pause: None,
-                    session_state: prepared.session_state.clone(),
-                };
-                if let Err(e) = server
-                    .store
-                    .put(&prepared.request.response_id, record)
-                    .await
-                {
-                    tracing::error!(error = %e, "failed to record a persistence failure");
-                }
-                ("failed".to_string(), failed)
+        let mut join_failed = prepared.skeleton("failed");
+        let inner = inner.clone();
+        let prepared = prepared.clone();
+        tokio::spawn(async move {
+            // Under the response's terminal lock: a cancel or delete either
+            // waits for these writes or has already finalized the response,
+            // in which case nothing is written.
+            let terminal = inner.terminal(&prepared.request.response_id);
+            let mut state = terminal.state.lock().await;
+            if state.finalized || terminal.stopping() {
+                return ("cancelled".to_string(), response);
             }
-        }
+            match persist(
+                &inner.server,
+                &prepared,
+                &status,
+                &response,
+                transcript,
+                pause,
+                approvals,
+                &terminal,
+            )
+            .await
+            {
+                Ok(true) => (status, response),
+                Ok(false) => {
+                    state.stopped = true;
+                    ("cancelled".to_string(), response)
+                }
+                Err(_) if terminal.stopping() => {
+                    state.stopped = true;
+                    ("cancelled".to_string(), response)
+                }
+                Err(e) => {
+                    // A turn whose outcome could not be stored did not
+                    // succeed: report it as failed, and record that (best
+                    // effort) so a background response is not left in
+                    // progress.
+                    tracing::error!(error = %e, "failed to persist a hosted response");
+                    let mut failed = prepared.skeleton("failed");
+                    failed["error"] = json!({
+                        "code": "server_error",
+                        "message": "The response could not be stored.",
+                    });
+                    let record = StoredResponse {
+                        response: failed.clone(),
+                        input_items: prepared.input_items.clone(),
+                        transcript: prepared
+                            .request
+                            .history
+                            .iter()
+                            .chain(&prepared.request.messages)
+                            .cloned()
+                            .collect(),
+                        pause: None,
+                        session_state: prepared.session_state.clone(),
+                    };
+                    if let Err(e) = inner
+                        .server
+                        .store
+                        .put(&prepared.request.response_id, record)
+                        .await
+                    {
+                        tracing::error!(error = %e, "failed to record a persistence failure");
+                    }
+                    ("failed".to_string(), failed)
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "the persistence task failed");
+            join_failed["error"] = json!({
+                "code": "server_error",
+                "message": "The response could not be stored.",
+            });
+            ("failed".to_string(), join_failed)
+        })
     } else {
         (status, response)
     };
@@ -1185,7 +1260,9 @@ async fn run_turn(
 }
 
 /// Store the response, then (unless it failed) its conversation's
-/// transcript.
+/// transcript. Stops (returning `false`) before any write once `terminal`
+/// is told to stop.
+#[allow(clippy::too_many_arguments)] // one turn's outcome, consumed once
 async fn persist(
     server: &ResponsesHostServer,
     prepared: &Prepared,
@@ -1194,7 +1271,8 @@ async fn persist(
     transcript: Vec<Message>,
     pause: Option<WorkflowPause>,
     approvals: Vec<(String, Content)>,
-) -> Result<()> {
+    terminal: &Terminal,
+) -> Result<bool> {
     if !approvals.is_empty() {
         let store = server.approval_store(&prepared.request.context)?;
         for (id, request) in &approvals {
@@ -1217,11 +1295,19 @@ async fn persist(
         pause,
         session_state: session_state.clone(),
     };
+    if terminal.stopping() {
+        return Ok(false);
+    }
     server
         .store
         .put(&prepared.request.response_id, stored)
         .await?;
     if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
+        // A cancel or delete that arrived during the response write keeps
+        // the conversation as it was.
+        if terminal.stopping() {
+            return Ok(false);
+        }
         // Transcript and state move together. The previous pair is read
         // first (under the conversation's turn lock) so a failed update can
         // put it back rather than leave a new transcript with an old state.
@@ -1246,7 +1332,7 @@ async fn persist(
             return Err(e);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Why a turn failed: a run error (its text stays private) or a projection
@@ -1361,18 +1447,42 @@ async fn execute(
                             )
                         })?;
                     let mut requests = Vec::new();
+                    let mut request_data = Vec::new();
                     for request in &pending {
-                        let wire_id = ids::new_id("call", Some(&prepared.request.response_id));
-                        tracker.handle(
-                            &request_info_call(&wire_id, &request.request_data),
-                            None,
-                            false,
-                        )?;
+                        let wire_id =
+                            match serde_json::from_value::<Content>(request.request_data.clone()) {
+                                // An approval surfaces as `mcp_approval_request`;
+                                // its reply is an `mcp_approval_response`.
+                                Ok(approval @ Content::FunctionApprovalRequest(_)) => {
+                                    tracker.handle(&approval, None, false)?;
+                                    tracker.last_approval_id().ok_or_else(|| {
+                                        TurnError::Public(
+                                            "The approval request was not projected.".into(),
+                                        )
+                                    })?
+                                }
+                                other => {
+                                    let wire_id =
+                                        ids::new_id("call", Some(&prepared.request.response_id));
+                                    tracker.handle(
+                                        &request_info_call(
+                                            &wire_id,
+                                            &request.request_data,
+                                            other.ok(),
+                                        ),
+                                        None,
+                                        false,
+                                    )?;
+                                    wire_id
+                                }
+                            };
                         requests.push((wire_id, request.request_id.clone()));
+                        request_data.push(request.request_data.clone());
                     }
                     Some(WorkflowPause {
                         checkpoint_id: checkpoint,
                         requests,
+                        request_data,
                     })
                 }
                 (None, false) => {
@@ -1783,14 +1893,23 @@ async fn pause_checkpoint(
         .map(|cp| cp.checkpoint_id))
 }
 
-/// A pending request as the function call a client answers (upstream
-/// `request_info`): a framework function call keeps its name and arguments
-/// under the wire id; anything else is `request_info({request_id, request})`.
-fn request_info_call(wire_id: &str, data: &Value) -> Content {
+/// A pending request as the call a client answers (upstream `_project`): a
+/// framework function call keeps its name and arguments under the wire id, a
+/// computer call keeps its actions under the wire id; anything else is
+/// `request_info({request_id, request})`.
+fn request_info_call(wire_id: &str, data: &Value, content: Option<Content>) -> Content {
     use agent_framework_core::types::{FunctionArguments, FunctionCallContent};
-    if let Ok(Content::FunctionCall(mut call)) = serde_json::from_value::<Content>(data.clone()) {
-        call.call_id = wire_id.to_string();
-        return Content::FunctionCall(call);
+    match content {
+        Some(Content::FunctionCall(mut call)) => {
+            call.call_id = wire_id.to_string();
+            return Content::FunctionCall(call);
+        }
+        #[cfg(feature = "experimental-computer-use")]
+        Some(Content::ComputerToolCall(mut call)) => {
+            call.call_id = wire_id.to_string();
+            return Content::ComputerToolCall(call);
+        }
+        _ => {}
     }
     let mut arguments = HashMap::new();
     arguments.insert("request_id".to_string(), json!(wire_id));
@@ -1802,10 +1921,13 @@ fn request_info_call(wire_id: &str, data: &Value) -> Content {
     ))
 }
 
-/// Map the turn's `function_call_output` items onto the paused workflow's
-/// requests. The whole pending batch must be answered, exactly once, and
-/// not mixed with new input. Outputs that parse as JSON are passed as
-/// JSON; otherwise as the string.
+/// Map the turn's replies onto the paused workflow's requests (upstream
+/// `_load_replies`): `function_call_output` answers a call, an
+/// `mcp_approval_response` answers an approval with the original request's
+/// function-approval response, and a `computer_call_output` answers a
+/// computer call with its typed result. The whole pending batch must be
+/// answered, exactly once, and not mixed with new input. Function outputs
+/// that parse as JSON are passed as JSON; otherwise as the string.
 fn workflow_replies(
     pause: &WorkflowPause,
     input: &Value,
@@ -1818,27 +1940,68 @@ fn workflow_replies(
     if items.is_empty() {
         return Err("Workflow replies require an exact pending stored checkpoint.".into());
     }
+    let pending = |wire: &str| {
+        pause.requests.iter().position(|(w, _)| w == wire).map(|i| {
+            let data = pause.request_data.get(i).cloned().unwrap_or(Value::Null);
+            (
+                pause.requests[i].1.clone(),
+                serde_json::from_value::<Content>(data).ok(),
+            )
+        })
+    };
     let mut replies = HashMap::new();
     for item in items {
-        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
-            return Err("Pending workflow replies cannot be mixed with new input.".into());
-        }
-        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
-            return Err("A workflow reply requires its pending call ID.".into());
-        };
-        let Some((_, request_id)) = pause.requests.iter().find(|(wire, _)| wire == call_id) else {
-            return Err(
-                "A reply must match its wire ID in the exact pending workflow checkpoint.".into(),
-            );
-        };
-        let output = match item.get("output") {
-            Some(Value::String(text)) => {
-                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
+        let (request_id, reply) = match item.get("type").and_then(Value::as_str) {
+            Some("mcp_approval_response") => {
+                let (Some(wire), Some(approve)) = (
+                    item.get("approval_request_id").and_then(Value::as_str),
+                    item.get("approve").and_then(Value::as_bool),
+                ) else {
+                    return Err(
+                        "An approval reply requires its exact ID and a boolean decision.".into(),
+                    );
+                };
+                let Some((request_id, Some(Content::FunctionApprovalRequest(request)))) =
+                    pending(wire)
+                else {
+                    return Err(
+                        "The approval is unavailable in this exact pending checkpoint.".into(),
+                    );
+                };
+                let response = Content::FunctionApprovalResponse(request.create_response(approve));
+                (
+                    request_id,
+                    serde_json::to_value(response).map_err(|e| e.to_string())?,
+                )
             }
-            Some(other) => other.clone(),
-            None => Value::Null,
+            Some(kind @ ("function_call_output" | "computer_call_output")) => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    return Err("A workflow reply requires its pending call ID.".into());
+                };
+                let Some((request_id, content)) = pending(call_id) else {
+                    return Err(
+                        "A reply must match its wire ID in the exact pending workflow checkpoint."
+                            .into(),
+                    );
+                };
+                if matches!(content, Some(Content::FunctionApprovalRequest(_))) {
+                    return Err("An approval cannot be replaced by a function result.".into());
+                }
+                if kind == "computer_call_output" {
+                    (request_id, computer_reply(&item, content)?)
+                } else {
+                    let output = match item.get("output") {
+                        Some(Value::String(text)) => serde_json::from_str(text)
+                            .unwrap_or_else(|_| Value::String(text.clone())),
+                        Some(other) => other.clone(),
+                        None => Value::Null,
+                    };
+                    (request_id, output)
+                }
+            }
+            _ => return Err("Pending workflow replies cannot be mixed with new input.".into()),
         };
-        if replies.insert(request_id.clone(), output).is_some() {
+        if replies.insert(request_id, reply).is_some() {
             return Err("Duplicate workflow replies are not allowed.".into());
         }
     }
@@ -1846,6 +2009,34 @@ fn workflow_replies(
         return Err("Answer exactly the complete pending workflow request batch.".into());
     }
     Ok(replies)
+}
+
+/// A `computer_call_output` answering a paused workflow's computer call: the
+/// typed result, correlated with the original call.
+#[cfg(feature = "experimental-computer-use")]
+fn computer_reply(item: &Value, pending: Option<Content>) -> std::result::Result<Value, String> {
+    let Some(Content::ComputerToolCall(call)) = pending else {
+        return Err("The computer reply has no matching pending computer request.".into());
+    };
+    let message = crate::computer::item_to_message(item)?.ok_or_else(|| {
+        "A computer reply requires a typed screenshot and safety acknowledgement.".to_string()
+    })?;
+    let [Content::ComputerToolResult(mut result)] = <[Content; 1]>::try_from(message.contents)
+        .map_err(|_| {
+            "A computer reply requires a typed screenshot and safety acknowledgement.".to_string()
+        })?
+    else {
+        return Err(
+            "A computer reply requires a typed screenshot and safety acknowledgement.".into(),
+        );
+    };
+    result.call_id = call.call_id;
+    serde_json::to_value(Content::ComputerToolResult(result)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "experimental-computer-use"))]
+fn computer_reply(_: &Value, _: Option<Content>) -> std::result::Result<Value, String> {
+    Err("Computer replies need the `experimental-computer-use` feature.".into())
 }
 
 /// A workflow's outputs as an agent response: agent responses and messages
@@ -1988,7 +2179,13 @@ async fn get_response(
 }
 
 async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
-    if let Some(handle) = inner.running.lock().unwrap().remove(&id) {
+    let handle = inner.running.lock().unwrap().remove(&id);
+    let was_running = handle.is_some();
+    let terminal = inner.terminal(&id);
+    if let Some(handle) = handle {
+        terminal
+            .stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         handle.abort();
     }
     // A deleted response is not replayable: end any open replay streams
@@ -1997,7 +2194,15 @@ async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>
     if let Some(replay) = replay {
         replay.finish();
     }
-    match inner.server.store.delete(&id).await {
+    // An in-flight persistence (it outlives the abort) has been told to
+    // stop: wait for it, then finalize so one that has not yet started
+    // writes nothing. The response stays deleted.
+    let mut state = terminal.state.lock().await;
+    let deleted = inner.server.store.delete(&id).await;
+    if was_running || matches!(deleted, Ok(true)) {
+        state.finalized = true;
+    }
+    match deleted {
         Ok(true) => Json(json!({"id": id, "object": "response", "deleted": true})).into_response(),
         Ok(false) => not_found(&id),
         Err(e) => server_error(e.to_string()),
@@ -2016,19 +2221,27 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
     let handle = inner.running.lock().unwrap().remove(&id);
     let mut stored = stored;
     if let Some(handle) = handle {
+        // The aborted turn's persistence outlives the abort: tell it to stop,
+        // then wait for it under the response's terminal lock (or finalize
+        // first, so it writes nothing). The turn may have committed its
+        // terminal status meanwhile: only an unfinished response (or one
+        // whose persistence stopped part-way) becomes cancelled.
+        let terminal = inner.terminal(&id);
+        terminal
+            .stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         handle.abort();
-        // The turn may have finished (and persisted its terminal status)
-        // between the read above and the abort: only an unfinished response
-        // becomes cancelled.
+        let mut state = terminal.state.lock().await;
         stored = match inner.server.store.get(&id).await {
             Ok(Some(current)) => current,
             Ok(None) => return not_found(&id),
             Err(e) => return server_error(e.to_string()),
         };
-        let unfinished = matches!(
-            stored.response["status"].as_str(),
-            Some("queued" | "in_progress")
-        );
+        let unfinished = state.stopped
+            || matches!(
+                stored.response["status"].as_str(),
+                Some("queued" | "in_progress")
+            );
         if !unfinished {
             if stored.response["status"] == json!("cancelled") {
                 return Json(stored.response).into_response();
@@ -2056,6 +2269,8 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
         if let Err(e) = inner.server.store.put(&id, stored.clone()).await {
             return server_error(e.to_string());
         }
+        state.finalized = true;
+        state.stopped = false;
     } else if stored.response["status"] != json!("cancelled") {
         return bad_request("Cannot cancel a response that has already finished.");
     }

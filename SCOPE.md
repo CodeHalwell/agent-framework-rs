@@ -54,14 +54,12 @@ from the roadmap, not from this file.
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
-  container
-  file citations announced in an MCP tool result's `_meta`; approval
-  (`mcp_approval_response`) and computer-call replies to paused hosted workflows
-  (agent approvals round-trip); toolbox archive skills and skill-cache
-  refresh; provider-native background polling; and the agentserver's
-  crash-recoverable task runtime, WebSocket/voice invocations, and
-  OpenTelemetry distro beyond trace-context propagation and exporter
-  selection. Tested in-process only.
+  container file citations announced in an MCP tool result's `_meta`;
+  toolbox archive (ZIP) skills and skill-cache refresh; provider-native
+  background polling; and the agentserver's crash-recoverable task runtime,
+  WebSocket/voice invocations, and OpenTelemetry distro beyond trace-context
+  propagation and exporter selection (Foundry span enrichment). Tested
+  in-process only.
 - **Computer use, remainder** (`experimental-computer-use`): Anthropic and
   Gemini skip the computer tool with a warning; upstream has no computer-use
   support for either provider. The workflow has no request-cancellation API,

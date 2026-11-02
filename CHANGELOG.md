@@ -35,6 +35,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting: paused hosted workflows accept `mcp_approval_response`
+  replies to approval requests and, with `experimental-computer-use`,
+  `computer_call_output` replies to computer calls. Review fix: a cancel or
+  delete racing a background turn's persistence now wins deterministically
+  (per-response serialization), so a late write can no longer overwrite
+  `cancelled`, recreate a deleted response, or update the conversation.
 - Workflows (`experimental-computer-use`): a pending computer call can be
   cancelled by replying `{"call_id": …, "cancelled": true}` (alone or in an
   array) or `{"cancelled": true}` to cancel all; cancelled calls become

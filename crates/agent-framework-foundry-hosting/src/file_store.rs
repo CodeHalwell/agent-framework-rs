@@ -130,6 +130,7 @@ fn to_json(stored: &StoredResponse) -> Value {
         "pause": stored.pause.as_ref().map(|p| json!({
             "checkpoint_id": p.checkpoint_id,
             "requests": p.requests,
+            "request_data": p.request_data,
         })),
         "session_state": stored.session_state,
     })
@@ -143,6 +144,7 @@ fn from_json(value: Value) -> Result<StoredResponse> {
         p => Some(WorkflowPause {
             checkpoint_id: p["checkpoint_id"].as_str().unwrap_or_default().to_string(),
             requests: serde_json::from_value(p["requests"].clone())?,
+            request_data: p["request_data"].as_array().cloned().unwrap_or_default(),
         }),
     };
     Ok(StoredResponse {

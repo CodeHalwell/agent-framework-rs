@@ -726,6 +726,11 @@ impl OutputTracker {
 
     /// Close everything and return `(output, usage, incomplete reason)`.
     /// The approval requests emitted so far, with their wire ids.
+    /// The id of the most recent `mcp_approval_request` emitted.
+    pub(crate) fn last_approval_id(&self) -> Option<String> {
+        self.approvals.last().map(|(id, _)| id.clone())
+    }
+
     pub(crate) fn take_approvals(&mut self) -> Vec<(String, Content)> {
         std::mem::take(&mut self.approvals)
     }

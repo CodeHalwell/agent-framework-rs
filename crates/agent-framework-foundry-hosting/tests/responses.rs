@@ -1755,3 +1755,321 @@ async fn a_failed_continuation_keeps_the_inherited_session_state() {
         "the failed record kept turn 1's state with its inherited transcript"
     );
 }
+
+/// A workflow that pauses with `request` and yields `answer(reply)` when
+/// resumed.
+fn pausing_workflow(
+    request: serde_json::Value,
+    answer: fn(&serde_json::Value) -> String,
+) -> ResponsesHostServer {
+    use agent_framework_core::workflow::{
+        CheckpointStorage, InMemoryCheckpointStorage, RequestInfoExecutor, RequestResponse,
+    };
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    ResponsesHostServer::workflow(move |req| {
+        let request = request.clone();
+        let asker = FunctionExecutor::new("asker", move |msg, ctx| {
+            let request = request.clone();
+            async move {
+                if let Some(reply) = RequestResponse::from_message(&msg) {
+                    ctx.yield_output(json!(answer(&reply.data))).await?;
+                } else {
+                    ctx.send_message(request).await?;
+                }
+                Ok(())
+            }
+        });
+        let mut builder = WorkflowBuilder::new()
+            .add_executor(Arc::new(asker))
+            .add_executor(Arc::new(RequestInfoExecutor::new("ask")))
+            .set_start("asker")
+            .add_edge("asker", "ask");
+        if let Some(storage) = req.checkpoint_storage.clone() {
+            builder = builder.with_checkpointing(storage);
+        }
+        builder.build()
+    })
+    .with_checkpoint_store(storage)
+}
+
+#[tokio::test]
+async fn a_paused_workflow_approval_is_answered_with_an_mcp_approval_response() {
+    use agent_framework_core::types::{
+        FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent,
+    };
+    let request = serde_json::to_value(Content::FunctionApprovalRequest(
+        FunctionApprovalRequestContent {
+            id: "appr_1".into(),
+            function_call: FunctionCallContent::new(
+                "fc_1",
+                "delete_file",
+                Some(FunctionArguments::Object(
+                    [("path".to_string(), json!("/tmp/x"))]
+                        .into_iter()
+                        .collect(),
+                )),
+            ),
+        },
+    ))
+    .unwrap();
+    let router = pausing_workflow(request, |reply| {
+        format!(
+            "approved={} for {}",
+            reply["approved"], reply["function_call"]["name"]
+        )
+    })
+    .into_router();
+    let (status, first) = json(&router, post("/responses", json!({"input": "go"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let item = &first["output"][0];
+    assert_eq!(item["type"], "mcp_approval_request", "{first}");
+    assert_eq!(item["name"], "delete_file");
+    let approval_id = item["id"].as_str().unwrap().to_string();
+    let id = first["id"].as_str().unwrap().to_string();
+
+    // A function result cannot stand in for an approval, nor an unknown id.
+    for bad in [
+        json!([{"type": "function_call_output", "call_id": approval_id, "output": "yes"}]),
+        json!([{"type": "mcp_approval_response", "approval_request_id": "mcpr_nope", "approve": true}]),
+        json!([{"type": "mcp_approval_response", "approval_request_id": approval_id}]),
+    ] {
+        let (status, body) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": bad, "previous_response_id": id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    for (approve, expected) in [
+        (true, "approved=true for \"delete_file\""),
+        (false, "approved=false for \"delete_file\""),
+    ] {
+        let (status, second) = json(
+            &router,
+            post(
+                "/responses",
+                json!({
+                    "previous_response_id": id,
+                    "input": [{"type": "mcp_approval_response", "approval_request_id": approval_id, "approve": approve}],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["output_text"], expected);
+    }
+}
+
+#[cfg(feature = "experimental-computer-use")]
+#[tokio::test]
+async fn a_paused_workflow_computer_call_is_answered_with_a_computer_call_output() {
+    use agent_framework_core::types::ComputerToolCallContent;
+    let request = serde_json::to_value(Content::ComputerToolCall(ComputerToolCallContent {
+        id: "cu_1".into(),
+        call_id: "orig_call".into(),
+        actions: vec![json!({"type": "click", "x": 1, "y": 2})],
+        status: Some("completed".into()),
+        pending_safety_checks: None,
+        user_input_request: true,
+        additional_properties: Default::default(),
+    }))
+    .unwrap();
+    let router = pausing_workflow(request, |reply| {
+        format!(
+            "{} {}",
+            reply["type"].as_str().unwrap_or("?"),
+            reply["call_id"]
+        )
+    })
+    .into_router();
+    let (status, first) = json(&router, post("/responses", json!({"input": "go"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let item = &first["output"][0];
+    assert_eq!(item["type"], "computer_call", "{first}");
+    let wire = item["call_id"].as_str().unwrap().to_string();
+    assert_ne!(
+        wire, "orig_call",
+        "the pending call is addressed by its wire id"
+    );
+    let (status, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({
+                "previous_response_id": first["id"],
+                "input": [{
+                    "type": "computer_call_output",
+                    "call_id": wire,
+                    "output": {"type": "computer_screenshot", "image_url": "https://x/after.png"},
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["output_text"], "computer_tool_result \"orig_call\"");
+}
+
+/// Holds the first write of a completed response until released, to land a
+/// cancel or delete in the middle of a turn's persistence.
+#[derive(Default)]
+struct GatedStore {
+    inner: agent_framework_foundry_hosting::InMemoryResponseStore,
+    tripped: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for GatedStore {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.inner.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        if response.response["status"] == "completed"
+            && !self.tripped.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.inner.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
+    {
+        self.inner.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<agent_framework_core::types::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.set_conversation(id, transcript).await
+    }
+    async fn conversation_state(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<serde_json::Value>> {
+        self.inner.conversation_state(id).await
+    }
+    async fn set_conversation_state(
+        &self,
+        id: &str,
+        state: serde_json::Value,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.set_conversation_state(id, state).await
+    }
+}
+
+/// Starts a background turn in conversation `conv_g` and returns once its
+/// persistence is blocked writing the completed response.
+async fn background_turn_mid_persist() -> (axum::Router, Arc<GatedStore>, String) {
+    let store = Arc::new(GatedStore::default());
+    let router = ResponsesHostServer::agent(agent(Echo::default()))
+        .with_response_store(store.clone())
+        .into_router();
+    let (status, queued) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "bg", "background": true, "conversation": "conv_g"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{queued}");
+    let id = queued["id"].as_str().unwrap().to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.notified())
+        .await
+        .expect("the turn reaches its persistence");
+    (router, store, id)
+}
+
+/// Runs `request` while the persistence is held, then releases it and lets
+/// any still-running write finish.
+async fn during_persist(
+    router: &axum::Router,
+    store: &GatedStore,
+    request: axum::http::Request<axum::body::Body>,
+) -> (StatusCode, serde_json::Value) {
+    let pending = tokio::spawn({
+        let router = router.clone();
+        async move { json(&router, request).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    store.release.notify_one();
+    let result = pending.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    result
+}
+
+#[tokio::test]
+async fn a_cancel_during_persistence_stays_cancelled() {
+    let (router, store, id) = background_turn_mid_persist().await;
+    let (status, cancelled) = during_persist(
+        &router,
+        &store,
+        post(&format!("/responses/{id}/cancel"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["status"], "cancelled");
+    let (_, polled) = json(&router, get(&format!("/responses/{id}"))).await;
+    assert_eq!(polled["status"], "cancelled", "the late write did not win");
+    // The cancelled turn never reached the conversation.
+    let (_, next) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "next", "conversation": "conv_g"}),
+        ),
+    )
+    .await;
+    assert_eq!(next["output_text"], "1 messages, last: next");
+}
+
+#[tokio::test]
+async fn a_delete_during_persistence_stays_deleted() {
+    let (router, store, id) = background_turn_mid_persist().await;
+    let (status, deleted) = during_persist(
+        &router,
+        &store,
+        axum::http::Request::delete(format!("/responses/{id}"))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["deleted"], true);
+    let (status, _) = json(&router, get(&format!("/responses/{id}"))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the late write did not recreate it"
+    );
+    let (_, next) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "next", "conversation": "conv_g"}),
+        ),
+    )
+    .await;
+    assert_eq!(next["output_text"], "1 messages, last: next");
+}
