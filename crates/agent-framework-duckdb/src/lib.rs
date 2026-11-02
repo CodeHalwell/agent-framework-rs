@@ -804,18 +804,19 @@ impl VectorCollection for DuckDbCollection {
                     .map_err(map_err)
             })
             .await?;
+        let uuid_keys = key_field.type_.as_deref() == Some("UUID");
         let mut found = std::collections::HashMap::new();
         for row in rows {
             let record = self.parse_record(&row)?;
             let id = record
                 .get(&key_field.name)
-                .map(normalized_key)
+                .map(|k| normalized_key(k, uuid_keys))
                 .unwrap_or_default();
             found.insert(id, record);
         }
         Ok(keys
             .iter()
-            .map(|k| found.get(&normalized_key(k)).cloned())
+            .map(|k| found.get(&normalized_key(k, uuid_keys)).cloned())
             .collect())
     }
 
@@ -867,10 +868,12 @@ impl VectorCollection for DuckDbCollection {
     }
 }
 
-/// A key compared as text, so `"A1B2…"` and `"a1b2…"` UUIDs and `1` vs
-/// `"1"` land on one entry only when they are the same stored key.
-fn normalized_key(value: &Value) -> String {
+/// A key compared as text. UUID-typed keys are canonicalized (DuckDB stores
+/// them hyphenated and lowercase, so `"A1B2…"` finds `"a1b2…"`); string keys
+/// are compared exactly, so distinct UUID-shaped strings stay distinct.
+fn normalized_key(value: &Value, uuid: bool) -> String {
     match value {
+        Value::String(s) if !uuid => s.clone(),
         Value::String(s) => uuid::Uuid::parse_str(s)
             .map(|u| u.hyphenated().to_string())
             .unwrap_or_else(|_| s.clone()),

@@ -219,8 +219,18 @@ impl ClaudeAgent {
         let agent = self.clone();
         let prompt = format_prompt(messages);
         tokio::spawn(async move {
-            if let Err(e) = agent.drive(prompt, resume, options, &tx).await {
-                let _ = tx.send(Err(e));
+            // The run lives as long as its receiver: when the caller drops the
+            // stream (or the run future), the drive future is dropped, which
+            // drops the connection and kills the CLI, even while it is silent
+            // or executing a tool.
+            let closed = tx.clone();
+            tokio::select! {
+                result = agent.drive(prompt, resume, options, &tx) => {
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+                () = closed.closed() => {}
             }
         });
         rx

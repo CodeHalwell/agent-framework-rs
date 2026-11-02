@@ -253,3 +253,30 @@ fn explicit_data_indexes_are_refused() {
     .unwrap();
     assert!(store.collection("af_idx", definition).is_err());
 }
+
+#[tokio::test]
+async fn uuid_shaped_string_keys_stay_distinct() {
+    let store = DuckDbStore::in_memory().unwrap();
+    let definition = VectorStoreCollectionDefinition::new(vec![
+        VectorStoreField::key("id").with_type("str"),
+        VectorStoreField::data("n").with_type("int"),
+        VectorStoreField::vector("embedding", 2),
+    ])
+    .unwrap();
+    let docs = store.get_collection("af_str_keys", definition).unwrap();
+    docs.ensure_collection_exists().await.unwrap();
+    let lower = "a1b2c3d4-0000-0000-0000-000000000001";
+    let upper = "A1B2C3D4-0000-0000-0000-000000000001";
+    docs.upsert(vec![
+        json!({"id": lower, "n": 1, "embedding": [1.0, 0.0]}),
+        json!({"id": upper, "n": 2, "embedding": [0.0, 1.0]}),
+    ])
+    .await
+    .unwrap();
+    let got = docs
+        .get(vec![json!(lower), json!(upper)], false)
+        .await
+        .unwrap();
+    assert_eq!(got[0].as_ref().unwrap()["n"], 1);
+    assert_eq!(got[1].as_ref().unwrap()["n"], 2);
+}

@@ -87,6 +87,11 @@ while True:
         continue
     record("user", msg)
     out({"type": "system", "subtype": "init", "session_id": "sess-1"})
+    if scenario == "hang":
+        record("pid", os.getpid())
+        import time
+        while True:
+            time.sleep(1)
     if scenario == "crash":
         sys.stderr.write("fatal: no credentials\n"); sys.stderr.flush()
         sys.exit(3)
@@ -566,4 +571,41 @@ async fn live_cli_round_trip() {
         .unwrap();
     assert!(response.text().to_lowercase().contains("pong"));
     assert!(response.conversation_id.is_some());
+}
+
+#[tokio::test]
+async fn dropping_the_stream_kills_a_silent_cli() {
+    let fake = Fake::new();
+    let agent = ClaudeAgent::new(fake.options("hang")).unwrap();
+    let stream = agent
+        .run_stream(vec![Message::user("hi")], None, None)
+        .await
+        .unwrap();
+    let mut pid = None;
+    for _ in 0..200 {
+        if let Some(p) = fake.entries("pid").first() {
+            pid = p.as_u64();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let pid = pid.expect("the fake CLI started").to_string();
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(alive());
+    drop(stream);
+    let mut gone = false;
+    for _ in 0..200 {
+        if !alive() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(gone, "the CLI is killed when its run is dropped");
 }
