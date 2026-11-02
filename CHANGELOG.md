@@ -39,6 +39,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `websocket`): the host runs the handler with a session and the request
   context, closes with 1000 or 1011, logs the close, and sends keepalive
   pings when `WS_KEEPALIVE_INTERVAL` is set.
+- Core: `OtelExport::with_span_processor` adds span processors to the export
+  pipeline. Foundry hosting (`otel`): `FoundryEnrichmentSpanProcessor`,
+  installed by `configure_observability`, stamps the agentserver's Foundry
+  identity and baggage ids on every span; request spans join the caller's
+  W3C baggage.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

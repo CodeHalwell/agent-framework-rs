@@ -379,18 +379,115 @@ fn request_span(request: &Request, request_id: &str, options: &HostOptions) -> t
                 self.0.keys().map(|k| k.as_str()).collect()
             }
         }
+        // The caller's trace, and its W3C baggage (which carries the ids
+        // [`FoundryEnrichmentSpanProcessor`] stamps).
         let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
             .extract(&Headers(request.headers()));
+        let parent = opentelemetry_sdk::propagation::BaggagePropagator::new()
+            .extract_with_context(&parent, &Headers(request.headers()));
         let _ = span.set_parent(parent);
     }
     span
+}
+
+/// Adds Foundry identity attributes to every span (the agentserver's
+/// `_FoundryEnrichmentSpanProcessor`; feature `otel`):
+///
+/// - `microsoft.foundry` = `True`, `microsoft.foundry.project.id`, and the
+///   agent identity (`gen_ai.agent.name` / `version` / `id`) from the host
+///   configuration;
+/// - `microsoft.session.id` from the `azure.ai.agentserver.session_id`
+///   baggage entry, else the configured session id;
+/// - `gen_ai.conversation.id` and
+///   `azure.ai.agentserver.invocations.invocation_id` from the
+///   `azure.ai.agentserver.conversation_id` / `invocation_id` baggage entries
+///   (request spans join the caller's W3C baggage).
+///
+/// [`configure_observability`] installs it. Divergence: the agent identity
+/// is stamped when a span starts (upstream stamps it as the span ends, so a
+/// framework cannot overwrite it); a span that sets its own
+/// `gen_ai.agent.*` afterwards keeps its value.
+#[cfg(feature = "otel")]
+#[derive(Debug, Clone, Default)]
+pub struct FoundryEnrichmentSpanProcessor {
+    agent_name: String,
+    agent_version: String,
+    agent_id: String,
+    project_id: String,
+    session_id: String,
+}
+
+#[cfg(feature = "otel")]
+impl FoundryEnrichmentSpanProcessor {
+    /// Baggage key of the session id.
+    pub const SESSION_BAGGAGE: &'static str = "azure.ai.agentserver.session_id";
+    /// Baggage key of the conversation id.
+    pub const CONVERSATION_BAGGAGE: &'static str = "azure.ai.agentserver.conversation_id";
+    /// Baggage key of the invocation id.
+    pub const INVOCATION_BAGGAGE: &'static str = "azure.ai.agentserver.invocation_id";
+
+    /// The identity of the agent `config` describes.
+    pub fn from_config(config: &FoundryHostConfig) -> Self {
+        Self {
+            agent_name: config.agent_name.clone(),
+            agent_version: config.agent_version.clone(),
+            agent_id: config.agent_id.clone(),
+            project_id: config.project_id.clone(),
+            session_id: config.session_id.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+impl opentelemetry_sdk::trace::SpanProcessor for FoundryEnrichmentSpanProcessor {
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &opentelemetry::Context) {
+        use opentelemetry::baggage::BaggageExt as _;
+        use opentelemetry::trace::Span as _;
+        use opentelemetry::KeyValue;
+        let mut set = |key: &'static str, value: &str| {
+            if !value.is_empty() {
+                span.set_attribute(KeyValue::new(key, value.to_string()));
+            }
+        };
+        set("microsoft.foundry", "True");
+        set("microsoft.foundry.project.id", &self.project_id);
+        set("gen_ai.agent.name", &self.agent_name);
+        set("gen_ai.agent.version", &self.agent_version);
+        set("gen_ai.agent.id", &self.agent_id);
+        let baggage = cx.baggage();
+        let entry = |key: &str| baggage.get(key).map(|v| v.as_str().to_string());
+        let session = entry(Self::SESSION_BAGGAGE).unwrap_or_else(|| self.session_id.clone());
+        set("microsoft.session.id", &session);
+        set(
+            "gen_ai.conversation.id",
+            &entry(Self::CONVERSATION_BAGGAGE).unwrap_or_default(),
+        );
+        set(
+            "azure.ai.agentserver.invocations.invocation_id",
+            &entry(Self::INVOCATION_BAGGAGE).unwrap_or_default(),
+        );
+    }
+
+    fn on_end(&self, _span: opentelemetry_sdk::trace::SpanData) {}
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
 }
 
 /// Export telemetry as the agentserver does: to Application Insights when
 /// `APPLICATIONINSIGHTS_CONNECTION_STRING` is configured, else to the OTLP
 /// endpoint when one is, else nowhere (`Ok(None)`). The pipeline is
 /// installed as the global `tracing` subscriber; keep it alive and shut it
-/// down on exit.
+/// down on exit. Every span carries the Foundry identity attributes
+/// ([`FoundryEnrichmentSpanProcessor`]).
 #[cfg(feature = "otel")]
 pub fn configure_observability(
     config: &FoundryHostConfig,
@@ -408,7 +505,9 @@ pub fn configure_observability(
     } else {
         return Ok(None);
     };
-    let pipeline = export.build()?;
+    let pipeline = export
+        .with_span_processor(FoundryEnrichmentSpanProcessor::from_config(config))
+        .build()?;
     pipeline.install()?;
     Ok(Some(pipeline))
 }

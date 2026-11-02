@@ -96,7 +96,7 @@ pub mod toolbox;
 pub use config::FoundryHostConfig;
 pub use file_store::FileResponseStore;
 #[cfg(feature = "otel")]
-pub use host::configure_observability;
+pub use host::{configure_observability, FoundryEnrichmentSpanProcessor};
 pub use host::{
     parse_traceparent, serve, with_host_routes, AfterRestoreHook, AgentSessionContext, HostOptions,
 };
