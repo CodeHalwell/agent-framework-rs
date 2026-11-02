@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, ContinuationToken, Message,
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, ContinuationToken, FunctionArguments,
+    Message,
 };
 use agent_framework_openai::responses::{OpenAIChatClient, OpenAIContinuationToken};
 use futures::StreamExt;
@@ -221,8 +222,8 @@ async fn an_interrupted_background_stream_resumes_after_its_last_event() {
     assert_eq!(
         OpenAIContinuationToken::from_token(&token).unwrap(),
         OpenAIContinuationToken {
-            response_id: "resp_s".into(),
             sequence_number: Some(2),
+            ..OpenAIContinuationToken::new("resp_s")
         }
     );
     let partial = ChatResponse::from_updates(first);
@@ -285,8 +286,9 @@ async fn an_ordinary_stream_carries_no_continuation_token() {
 #[test]
 fn a_token_is_read_back_from_json_or_a_bare_response_id() {
     let token = OpenAIContinuationToken {
-        response_id: "resp_1".into(),
         sequence_number: Some(7),
+        function_calls: [(1, "call_1".to_string())].into(),
+        ..OpenAIContinuationToken::new("resp_1")
     };
     assert_eq!(
         OpenAIContinuationToken::from_token(&token.to_token()).unwrap(),
@@ -298,4 +300,119 @@ fn a_token_is_read_back_from_json_or_a_bare_response_id() {
     );
     assert!(OpenAIContinuationToken::from_token(&ContinuationToken::new("{\"x\":1}")).is_err());
     assert!(OpenAIContinuationToken::from_token(&ContinuationToken::new("  ")).is_err());
+}
+
+fn function_call_item(arguments: &str) -> Value {
+    json!({ "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "lookup", "arguments": arguments })
+}
+
+/// The arguments of the one function call in `response`, joined.
+fn call_arguments(response: &ChatResponse) -> (usize, String, String) {
+    let calls: Vec<_> = response
+        .messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(|c| match c {
+            Content::FunctionCall(fc) => Some(fc),
+            _ => None,
+        })
+        .collect();
+    let raw = match calls.first().and_then(|c| c.arguments.as_ref()) {
+        Some(FunctionArguments::Raw(raw)) => raw.clone(),
+        Some(other) => serde_json::to_string(other).unwrap(),
+        None => String::new(),
+    };
+    (
+        calls.len(),
+        calls.first().map(|c| c.name.clone()).unwrap_or_default(),
+        raw,
+    )
+}
+
+fn call_stream_tail() -> Vec<Value> {
+    vec![
+        json!({ "type": "response.function_call_arguments.delta", "sequence_number": 4,
+                "item_id": "fc_1", "output_index": 0, "delta": "\"paris\"}" }),
+        json!({ "type": "response.function_call_arguments.done", "sequence_number": 5,
+                "item_id": "fc_1", "output_index": 0,
+                "arguments": "{\"city\":\"paris\"}" }),
+        json!({ "type": "response.output_item.done", "sequence_number": 6,
+                "output_index": 0, "item": function_call_item("{\"city\":\"paris\"}") }),
+        json!({ "type": "response.completed", "sequence_number": 7,
+                "response": { "id": "resp_f", "status": "completed",
+                              "output": [function_call_item("{\"city\":\"paris\"}")] } }),
+    ]
+}
+
+#[tokio::test]
+async fn a_function_call_interrupted_mid_arguments_resumes_with_all_of_them() {
+    let (base_url, seen) = scripted_server(vec![
+        // Cut after the call was announced and part of its arguments sent.
+        sse_reply(&[
+            json!({ "type": "response.created", "sequence_number": 0,
+                    "response": { "id": "resp_f", "status": "queued" } }),
+            json!({ "type": "response.output_item.added", "sequence_number": 1,
+                    "output_index": 0, "item": function_call_item("") }),
+            json!({ "type": "response.function_call_arguments.delta", "sequence_number": 2,
+                    "item_id": "fc_1", "output_index": 0, "delta": "{\"city\":" }),
+        ]),
+        sse_reply(&call_stream_tail()),
+    ]);
+    let client = client(base_url);
+    let first = collect(
+        client
+            .get_streaming_response(
+                vec![Message::user("weather?")],
+                ChatOptions::new().with_background(true),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let token = first.last().unwrap().continuation_token.clone().unwrap();
+    let rest = collect(
+        client
+            .get_streaming_response(
+                Vec::new(),
+                ChatOptions::new().with_continuation_token(token),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(request_line(&seen.lock().unwrap()[1]).contains("starting_after=2"));
+
+    // The caller holding both connections' updates has the whole call, once.
+    let combined = ChatResponse::from_updates(first.into_iter().chain(rest).collect());
+    assert_eq!(
+        call_arguments(&combined),
+        (1, "lookup".into(), "{\"city\":\"paris\"}".into())
+    );
+}
+
+#[tokio::test]
+async fn a_function_call_never_announced_to_a_resumed_stream_comes_from_its_done_item() {
+    // Resumed after the announcement with no record of it (a token carrying
+    // only the response id and position): the done item supplies the call.
+    let (base_url, _seen) = scripted_server(vec![sse_reply(&call_stream_tail())]);
+    let token = OpenAIContinuationToken {
+        sequence_number: Some(3),
+        ..OpenAIContinuationToken::new("resp_f")
+    };
+    let rest = collect(
+        client(base_url)
+            .get_streaming_response(
+                Vec::new(),
+                ChatOptions::new().with_continuation_token(token.to_token()),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let response = ChatResponse::from_updates(rest);
+    assert_eq!(
+        call_arguments(&response),
+        (1, "lookup".into(), "{\"city\":\"paris\"}".into())
+    );
 }

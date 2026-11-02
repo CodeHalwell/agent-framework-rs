@@ -21,7 +21,7 @@
 //! # }
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
@@ -62,6 +62,13 @@ pub struct OpenAIContinuationToken {
     /// token came from a stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence_number: Option<u64>,
+    /// The function calls the stream announced before this position, as
+    /// `output_index` → `call_id`. A resumed stream starts after the
+    /// `response.output_item.added` event that announced a call, so without
+    /// these its later `response.function_call_arguments.delta` fragments
+    /// could not be routed to the call they belong to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub function_calls: BTreeMap<i64, String>,
 }
 
 impl OpenAIContinuationToken {
@@ -70,6 +77,7 @@ impl OpenAIContinuationToken {
         Self {
             response_id: response_id.into(),
             sequence_number: None,
+            function_calls: BTreeMap::new(),
         }
     }
 
@@ -354,12 +362,13 @@ impl ChatClient for OpenAIChatClient {
                 response_id: Some(token.response_id),
                 sequence_number: token.sequence_number,
             };
-            return Ok(sse_stream(resp, options.store, Some(resume)).boxed());
+            let call_ids = token.function_calls.into_iter().collect();
+            return Ok(sse_stream(resp, options.store, Some(resume), call_ids).boxed());
         }
         let body = self.build_body(&messages, &options, true);
         let resp = self.post(&body).await?;
         let background = (options.background == Some(true)).then(BackgroundStream::default);
-        Ok(sse_stream(resp, options.store, background).boxed())
+        Ok(sse_stream(resp, options.store, background, HashMap::new()).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -1565,7 +1574,7 @@ pub fn parse_responses_sse_stream(
     resp: reqwest::Response,
     store: Option<bool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
-    sse_stream(resp, store, None)
+    sse_stream(resp, store, None, HashMap::new())
 }
 
 /// Where a background response's stream stands, so every update can carry
@@ -1598,7 +1607,13 @@ impl BackgroundStream {
     /// terminal event ends it (no token), anything else leaves it running,
     /// resumable from this event on. Mirrors upstream's streaming
     /// `operation_state` / `continuation_token` handling.
-    fn stamp(&self, event: &Value, update: &mut ChatResponseUpdate, store: Option<bool>) {
+    fn stamp(
+        &self,
+        event: &Value,
+        update: &mut ChatResponseUpdate,
+        store: Option<bool>,
+        call_ids: &HashMap<i64, String>,
+    ) {
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
         let status = event
             .get("response")
@@ -1628,6 +1643,10 @@ impl BackgroundStream {
             OpenAIContinuationToken {
                 response_id: response_id.clone(),
                 sequence_number: self.sequence_number,
+                function_calls: call_ids
+                    .iter()
+                    .map(|(index, id)| (*index, id.clone()))
+                    .collect(),
             }
             .to_token(),
         );
@@ -1638,11 +1657,13 @@ impl BackgroundStream {
 }
 
 /// [`parse_responses_sse_stream`], stamping continuation tokens on the
-/// updates of a background response (`background` is `Some`).
+/// updates of a background response (`background` is `Some`). `call_ids`
+/// are the function calls a resumed stream's earlier events announced.
 fn sse_stream(
     resp: reqwest::Response,
     store: Option<bool>,
     background: Option<BackgroundStream>,
+    call_ids: HashMap<i64, String>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     futures::stream::unfold(
@@ -1651,7 +1672,7 @@ fn sse_stream(
             buffer: String::new(),
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
-            call_ids: HashMap::new(),
+            call_ids,
             done: false,
             store,
             background,
@@ -1687,7 +1708,7 @@ fn sse_stream(
                             match parse_responses_event(&value, &mut state.call_ids, state.store) {
                                 EventOutcome::Update(mut update) => {
                                     if let Some(bg) = &state.background {
-                                        bg.stamp(&value, &mut update, state.store);
+                                        bg.stamp(&value, &mut update, state.store, &state.call_ids);
                                     }
                                     state.queued.push_back(update)
                                 }
@@ -2025,6 +2046,41 @@ fn parse_responses_event(
                 parse_output_item(item, &mut contents);
                 return EventOutcome::Update(ChatResponseUpdate {
                     contents,
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
+            // A function call this stream never announced — a resumed
+            // stream that started after its `output_item.added` and had no
+            // routing for it — arrives whole here: the done item carries
+            // the call id, name and complete arguments, as .NET builds its
+            // calls. A call that was announced streamed its arguments
+            // already, so it is not repeated.
+            if let Some(item) = value
+                .get("item")
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if call_ids.contains_key(&output_index) {
+                    return EventOutcome::None;
+                }
+                let field = |name: &str| {
+                    item.get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let call_id = field("call_id");
+                call_ids.insert(output_index, call_id.clone());
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                        call_id,
+                        field("name"),
+                        Some(FunctionArguments::Raw(field("arguments"))),
+                    ))],
                     role: Some(Role::assistant()),
                     ..Default::default()
                 });

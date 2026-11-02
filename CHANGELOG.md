@@ -81,6 +81,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   that says it needs `store=true` (it was previously resolved from the
   approval store), and the 400 for an unknown approval id says that approval
   requests from `store=false` responses are not kept.
+- OpenAI Responses: resuming an interrupted background stream no longer
+  truncates function-call arguments. `OpenAIContinuationToken` gains
+  `function_calls` (output index → call id), so argument fragments after the
+  cut reach their call, and a function call the resumed stream never saw
+  announced is taken whole from its `response.output_item.done`.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
