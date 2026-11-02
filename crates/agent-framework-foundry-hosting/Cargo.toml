@@ -53,6 +53,8 @@ otel = [
 ]
 
 [dev-dependencies]
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

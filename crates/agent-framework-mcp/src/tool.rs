@@ -988,6 +988,17 @@ impl McpStreamableHttpTool {
         crate::skills::load_skills(&client).await
     }
 
+    /// [`Self::skills`] unpacking `archive` entries with `options` (see
+    /// [`crate::skills::load_skills_with`]).
+    #[cfg(feature = "skills")]
+    pub async fn skills_with(
+        &self,
+        options: &crate::skills::ArchiveOptions,
+    ) -> Result<Vec<agent_framework_core::skills::Skill>> {
+        let client = self.connected_client().await?;
+        crate::skills::load_skills_with(&client, options).await
+    }
+
     #[cfg_attr(not(any(feature = "fides", feature = "skills")), allow(dead_code))]
     pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
         self.connect().await?;

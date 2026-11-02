@@ -84,11 +84,16 @@ fn server() -> McpStdioTool {
     McpStdioTool::new("ifc", "python3").args([path.to_string_lossy().to_string()])
 }
 
-fn uuid_like() -> u128 {
-    std::time::SystemTime::now()
+/// A per-call unique suffix, so parallel tests never share (and truncate)
+/// one another's server script.
+fn uuid_like() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_nanos()
+        .as_nanos();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}_{n}")
 }
 
 fn definition<'a>(defs: &'a [ToolDefinition], name: &str) -> &'a ToolDefinition {

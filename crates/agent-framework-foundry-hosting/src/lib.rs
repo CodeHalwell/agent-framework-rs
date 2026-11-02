@@ -63,9 +63,10 @@
 //! - **Local storage** defaults to in memory; [`FileResponseStore`] gives
 //!   the agentserver's file-backed store (not partitioned by user).
 //! - **Toolbox** tokens are fetched from the credential for every MCP
-//!   request. Its skills provider (feature `skills`) discovers `skill-md`
-//!   skills once, at build; archive skills and cache refresh are not
-//!   ported (see `agent_framework_mcp::skills`).
+//!   request. Its skills (feature `skills`) include `archive` (ZIP) skills,
+//!   unpacked in memory; `skills_provider` discovers once, and
+//!   `ToolboxSkillsProvider` discovers lazily, caches, and refreshes (see
+//!   `agent_framework_mcp::skills` and [`toolbox::ToolboxSkillsProvider`]).
 //! - Not ported from the agentserver: the resilient (crash-recoverable)
 //!   task runtime, WebSocket/voice invocations, and its OpenTelemetry
 //!   distro beyond trace-context propagation and exporter selection (the
@@ -114,3 +115,5 @@ pub use stores::{
     FunctionApprovalStore, FunctionApprovalStoreProvider, InMemoryFunctionApprovalStore,
 };
 pub use toolbox::FoundryToolbox;
+#[cfg(feature = "skills")]
+pub use toolbox::{ToolboxSkillsOptions, ToolboxSkillsProvider};

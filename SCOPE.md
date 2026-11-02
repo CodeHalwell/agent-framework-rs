@@ -55,10 +55,14 @@ from the roadmap, not from this file.
   `evaluate_foundry_target` is not.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
   container file citations announced in an MCP tool result's `_meta`;
-  toolbox archive (ZIP) skills and skill-cache refresh; provider-native
-  background polling; and the agentserver's crash-recoverable task runtime,
-  WebSocket/voice invocations, and OpenTelemetry distro beyond trace-context
-  propagation and exporter selection (Foundry span enrichment). Tested
+  provider-native background polling (needs a core
+  `background`/`continuation_token` contract and OpenAI Responses background
+  submit/poll); the agentserver's crash-recoverable task runtime (it runs on
+  the Foundry Tasks service; a startup sweep failing interrupted background
+  responses is the feasible local subset); WebSocket/voice invocations; and
+  Foundry span enrichment (needs a span-processor hook on core's
+  `OtelExport`). A toolbox skill refresh rebuilds the `SkillsProvider`, so
+  previously loaded skills are re-injected only once loaded again. Tested
   in-process only.
 - **Computer use, remainder** (`experimental-computer-use`): Anthropic and
   Gemini skip the computer tool with a warning; upstream has no computer-use

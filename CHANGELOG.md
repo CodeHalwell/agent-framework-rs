@@ -35,6 +35,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- MCP/Foundry hosting: Agent Skills `archive` (ZIP) entries are loaded in
+  memory with upstream's safety limits and digest checks (`ArchiveOptions`,
+  `load_skills_with`). `FoundryToolbox::skills_options` passes them through,
+  and `ToolboxSkillsProvider` discovers lazily, caches, refreshes on an
+  interval (or every run), and keeps its previous skills when a refresh fails.
 - Foundry hosting: with `HistorySource::Agent`/`Service`, each stored
   conversation turn records the session it inherited before it runs, so
   continuing from a cancelled or failed conversation turn with

@@ -31,13 +31,21 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "handshake",
     "rustls-tls-webpki-roots",
 ] }
+# The `skills` feature: `archive` skill entries (in-memory ZIP extraction,
+# deflate only, and SHA-256 digest checks).
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"], optional = true }
+base64 = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+flate2 = { version = "1", optional = true }
 
 [features]
 # FIDES for MCP tools (`security` module): annotation-derived labels and
 # server `_meta.ifc` result labels. Experimental upstream (FIDES).
 fides = ["agent-framework-core/experimental-fides"]
 # Agent Skills served over MCP (SEP-2640, `skills` module).
-skills = ["agent-framework-core/file-skills"]
+skills = ["agent-framework-core/file-skills", "dep:zip", "dep:base64", "dep:sha2", "dep:flate2"]
 
 [dev-dependencies]
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
 tokio = { workspace = true }

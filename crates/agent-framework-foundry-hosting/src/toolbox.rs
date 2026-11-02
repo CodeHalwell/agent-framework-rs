@@ -92,6 +92,8 @@ pub struct FoundryToolbox {
     token_scope: String,
     timeout: Duration,
     context: Option<FoundryRequestContext>,
+    #[cfg(feature = "skills")]
+    skills: ToolboxSkillsOptions,
 }
 
 impl std::fmt::Debug for FoundryToolbox {
@@ -114,6 +116,8 @@ impl FoundryToolbox {
             token_scope: DEFAULT_TOOLBOX_SCOPE.into(),
             timeout: DEFAULT_TIMEOUT,
             context: None,
+            #[cfg(feature = "skills")]
+            skills: ToolboxSkillsOptions::default(),
         }
     }
 
@@ -195,31 +199,180 @@ impl FoundryToolbox {
     }
 }
 
+/// How a toolbox's skills are discovered and cached (feature `skills`;
+/// upstream `as_skills_provider`'s keyword arguments).
+#[cfg(feature = "skills")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolboxSkillsOptions {
+    /// How `archive` entries are unpacked (upstream `archive_*`).
+    pub archive: agent_framework_mcp::skills::ArchiveOptions,
+    /// [`ToolboxSkillsProvider`] re-discovers on every run (upstream
+    /// `disable_caching`).
+    pub disable_caching: bool,
+    /// How long [`ToolboxSkillsProvider`]'s discovery stays fresh; `None`
+    /// keeps it for the provider's life (upstream `cache_refresh_interval`).
+    pub refresh_interval: Option<Duration>,
+}
+
+#[cfg(feature = "skills")]
 impl FoundryToolbox {
+    /// Skill discovery and caching options (default: upstream's).
+    pub fn skills_options(mut self, options: ToolboxSkillsOptions) -> Self {
+        self.skills = options;
+        self
+    }
+
     /// A [`SkillsProvider`](agent_framework_core::skills::SkillsProvider)
-    /// over the Agent Skills this toolbox serves over MCP (feature `skills`;
-    /// upstream `as_skills_provider`): discovery reads `skill://index.json`
-    /// on the toolbox's MCP session (see [`agent_framework_mcp::skills`]).
-    /// The skills are discovered now; build a new provider to pick up
-    /// changes.
-    #[cfg(feature = "skills")]
+    /// over the Agent Skills this toolbox serves over MCP (upstream
+    /// `as_skills_provider`): discovery reads `skill://index.json` on the
+    /// toolbox's MCP session (see [`agent_framework_mcp::skills`]), with
+    /// [`ToolboxSkillsOptions::archive`]. The skills are discovered now and
+    /// kept; [`Self::refreshing_skills_provider`] re-discovers.
     pub async fn skills_provider(&self) -> Result<agent_framework_core::skills::SkillsProvider> {
-        let tool = self.build().await?;
-        Ok(agent_framework_core::skills::SkillsProvider::new(
-            tool.skills().await?,
-        ))
+        self.skills_provider_with(|name| std::env::var(name).ok())
+            .await
     }
 
     /// [`Self::skills_provider`] reading configuration from `lookup`.
-    #[cfg(feature = "skills")]
     pub async fn skills_provider_with(
         &self,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<agent_framework_core::skills::SkillsProvider> {
         let tool = self.build_with(lookup).await?;
         Ok(agent_framework_core::skills::SkillsProvider::new(
-            tool.skills().await?,
+            tool.skills_with(&self.skills.archive).await?,
         ))
+    }
+
+    /// A [`ToolboxSkillsProvider`]: discovery on first run, then cached as
+    /// [`ToolboxSkillsOptions`] direct.
+    pub async fn refreshing_skills_provider(&self) -> Result<ToolboxSkillsProvider> {
+        self.refreshing_skills_provider_with(|name| std::env::var(name).ok())
+            .await
+    }
+
+    /// [`Self::refreshing_skills_provider`] reading configuration from
+    /// `lookup`.
+    pub async fn refreshing_skills_provider_with(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<ToolboxSkillsProvider> {
+        Ok(ToolboxSkillsProvider {
+            tool: self.build_with(lookup).await?,
+            options: self.skills.clone(),
+            configure: None,
+            cache: tokio::sync::Mutex::new(None),
+        })
+    }
+}
+
+/// Customizes each [`SkillsProvider`](agent_framework_core::skills::SkillsProvider)
+/// a [`ToolboxSkillsProvider`] builds.
+#[cfg(feature = "skills")]
+type ConfigureSkills = Arc<
+    dyn Fn(
+            agent_framework_core::skills::SkillsProvider,
+        ) -> agent_framework_core::skills::SkillsProvider
+        + Send
+        + Sync,
+>;
+
+/// A context provider over a toolbox's skills that discovers them lazily
+/// and caches them (upstream `as_skills_provider` with its caching source):
+///
+/// - The first run discovers; a failure fails that run, and the next retries.
+/// - Then the discovery is reused until
+///   [`ToolboxSkillsOptions::refresh_interval`] passes (never, by default),
+///   when the next run re-discovers. A failed refresh keeps the previous
+///   skills (logged) and retries on the next run.
+/// - With [`ToolboxSkillsOptions::disable_caching`] every run discovers.
+///
+/// Concurrent runs share one discovery. Divergence: each discovery builds a
+/// new [`SkillsProvider`](agent_framework_core::skills::SkillsProvider), so
+/// skills loaded before a refresh are announced again only once loaded again
+/// (their earlier `load_skill` results stay in the conversation). A
+/// toolbox's platform-header identity is fixed when it is built, so there is
+/// no per-identity cache to replace.
+#[cfg(feature = "skills")]
+pub struct ToolboxSkillsProvider {
+    tool: McpStreamableHttpTool,
+    options: ToolboxSkillsOptions,
+    configure: Option<ConfigureSkills>,
+    cache: tokio::sync::Mutex<
+        Option<(
+            tokio::time::Instant,
+            agent_framework_core::skills::SkillsProvider,
+        )>,
+    >,
+}
+
+#[cfg(feature = "skills")]
+impl std::fmt::Debug for ToolboxSkillsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolboxSkillsProvider")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "skills")]
+impl ToolboxSkillsProvider {
+    /// Customize each discovered provider (approvals, filters, the
+    /// instructions prompt): upstream's `disable_*_approval`,
+    /// `instruction_template`.
+    pub fn configure(
+        mut self,
+        configure: impl Fn(
+                agent_framework_core::skills::SkillsProvider,
+            ) -> agent_framework_core::skills::SkillsProvider
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.configure = Some(Arc::new(configure));
+        self
+    }
+
+    /// The current skills provider, discovering as the options direct.
+    pub async fn current(&self) -> Result<agent_framework_core::skills::SkillsProvider> {
+        let mut cache = self.cache.lock().await;
+        let fresh = match (&*cache, self.options.refresh_interval) {
+            _ if self.options.disable_caching => None,
+            (Some((_, provider)), None) => Some(provider),
+            (Some((at, provider)), Some(interval)) if at.elapsed() < interval => Some(provider),
+            _ => None,
+        };
+        if let Some(provider) = fresh {
+            return Ok(provider.clone());
+        }
+        match self.tool.skills_with(&self.options.archive).await {
+            Ok(skills) => {
+                let mut provider = agent_framework_core::skills::SkillsProvider::new(skills);
+                if let Some(configure) = &self.configure {
+                    provider = configure(provider);
+                }
+                *cache = Some((tokio::time::Instant::now(), provider.clone()));
+                Ok(provider)
+            }
+            Err(e) => match &*cache {
+                Some((_, previous)) if !self.options.disable_caching => {
+                    tracing::warn!(error = %e, "toolbox skill refresh failed; keeping the previous skills");
+                    Ok(previous.clone())
+                }
+                _ => Err(e),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "skills")]
+#[async_trait::async_trait]
+impl agent_framework_core::memory::ContextProvider for ToolboxSkillsProvider {
+    async fn before_run(
+        &self,
+        ctx: &mut agent_framework_core::memory::SessionContext,
+    ) -> Result<()> {
+        self.current().await?.before_run(ctx).await
     }
 }
 
