@@ -17,7 +17,7 @@ pub use content::{
     McpServerToolResultContent, OauthConsentRequestContent, RegionCoordinateSpace,
     ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
     TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
-    FUNCTION_INVOCATION_ERROR_MARKER,
+    FUNCTION_INVOCATION_ERROR_MARKER, MCP_TOOL_RESULT_HOST_PAYLOAD_KEY,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};

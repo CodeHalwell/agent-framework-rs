@@ -783,6 +783,7 @@ async fn execute_tool_call(
                     call_id: call.call_id.clone(),
                     result: None,
                     exception: Some(format!("tool '{}' not found", call.name)),
+                    additional_properties: Default::default(),
                 },
             })
         }
@@ -804,6 +805,7 @@ async fn execute_tool_call(
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
+                            additional_properties: Default::default(),
                         },
                     });
                 }
@@ -827,7 +829,9 @@ async fn execute_tool_call(
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
-                        let result = exec.invoke_in_context(ctx.arguments.clone(), &ctx).await;
+                        let result = exec
+                            .invoke_with_properties(ctx.arguments.clone(), &ctx)
+                            .await;
                         if let Err(e) = &result {
                             crate::observability::record_error(
                                 &tracing::Span::current(),
@@ -849,10 +853,12 @@ async fn execute_tool_call(
                             .map(crate::observability::error_type)
                             .as_deref(),
                     );
-                    if let Ok(value) = &outcome {
+                    if let Ok((value, _)) = &outcome {
                         crate::observability::record_tool_result(&span, value, &obs_config);
                     }
-                    ctx.result = Some(outcome?);
+                    let (value, properties) = outcome?;
+                    ctx.result = Some(value);
+                    ctx.result_properties = properties;
                     Ok(ctx)
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
@@ -874,6 +880,7 @@ async fn execute_tool_call(
                         call_id: call.call_id.clone(),
                         result: Some(ctx.result.unwrap_or(Value::Null)),
                         exception: None,
+                        additional_properties: ctx.result_properties,
                     },
                 }),
                 // The one error the loop does not absorb: middleware that
@@ -893,6 +900,7 @@ async fn execute_tool_call(
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
+                            additional_properties: Default::default(),
                         },
                     })
                 }
@@ -1250,6 +1258,7 @@ fn replace_approval_contents_with_results(
                             call_id: call_id.clone(),
                             result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                             exception: None,
+                            additional_properties: Default::default(),
                         });
                         answered = true;
                     }
@@ -1465,6 +1474,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                                 call_id: resp.function_call.call_id.clone(),
                                 result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                                 exception: None,
+                                additional_properties: Default::default(),
                             }));
                             continue;
                         }
@@ -2554,6 +2564,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("first".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
         approved.insert(
@@ -2562,6 +2573,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("second".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
 
@@ -2602,6 +2614,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("legacy".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
         let mut messages = vec![Message::with_contents(
@@ -2670,6 +2683,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
             Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
@@ -2783,6 +2797,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
         ];
@@ -2815,6 +2830,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
             approval_request("c1"),

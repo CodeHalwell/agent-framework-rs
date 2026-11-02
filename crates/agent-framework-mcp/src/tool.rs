@@ -226,7 +226,45 @@ impl Tool for McpToolExecutor {
             .call_tool_value(&self.remote_name, arguments)
             .await
     }
+
+    /// The model-visible result, plus the full `tools/call` result for the
+    /// host under
+    /// [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`](agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY)
+    /// (upstream's MCP Host payload), omitted when it encodes to more than
+    /// [`MAX_HOST_PAYLOAD_SIZE_BYTES`].
+    async fn invoke_with_properties(
+        &self,
+        arguments: Value,
+        _ctx: &agent_framework_core::middleware::FunctionInvocationContext,
+    ) -> Result<(Value, serde_json::Map<String, Value>)> {
+        let raw = self
+            .client
+            .call_tool_raw(&self.remote_name, arguments)
+            .await?;
+        let result = crate::protocol::CallToolResult::from_value(&raw);
+        if result.is_error {
+            return Err(agent_framework_core::error::Error::tool(
+                result.error_message(),
+            ));
+        }
+        let mut properties = serde_json::Map::new();
+        if raw.to_string().len() <= MAX_HOST_PAYLOAD_SIZE_BYTES {
+            properties.insert(
+                agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY.into(),
+                raw,
+            );
+        } else {
+            tracing::warn!(
+                "Omitting MCP Host payload because its encoded size exceeds {MAX_HOST_PAYLOAD_SIZE_BYTES} bytes."
+            );
+        }
+        Ok((result.to_value(), properties))
+    }
 }
+
+/// The largest MCP Host payload kept on a tool result (upstream's default
+/// `max_host_payload_size_bytes`, 1 MiB).
+pub const MAX_HOST_PAYLOAD_SIZE_BYTES: usize = 1024 * 1024;
 
 /// What a tool executor is built from: the normalized local name, the
 /// server's descriptor (whose `name` is the remote name), and the client to

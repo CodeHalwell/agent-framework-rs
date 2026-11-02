@@ -420,6 +420,13 @@ impl McpClient {
     /// `tools/call` — invoke a tool and return the raw result, including
     /// `is_error`, without converting an error result into an `Err`.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult> {
+        let raw = self.call_tool_raw(name, arguments).await?;
+        Ok(CallToolResult::from_value(&raw))
+    }
+
+    /// `tools/call`, returning the result exactly as the server sent it
+    /// (content blocks with their `_meta`, `structuredContent`, `_meta`).
+    pub async fn call_tool_raw(&self, name: &str, arguments: Value) -> Result<Value> {
         self.require_initialized().await?;
         let arguments = if arguments.is_null() {
             json!({})
@@ -427,8 +434,7 @@ impl McpClient {
             arguments
         };
         let params = json!({ "name": name, "arguments": arguments });
-        let raw = self.rpc("tools/call", params).await?;
-        Ok(CallToolResult::from_value(&raw))
+        self.rpc("tools/call", params).await
     }
 
     /// `tools/call`, mapped to a single JSON value suitable for handing back

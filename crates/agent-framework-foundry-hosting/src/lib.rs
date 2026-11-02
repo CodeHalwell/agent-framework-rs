@@ -44,8 +44,11 @@
 //!   results, MCP calls, image generation, shell calls, approval and OAuth
 //!   consent requests, and usage, which is what upstream projects. Not
 //!   projected: computer-use items (core has no computer-use content; that
-//!   is upstream's experimental `COMPUTER_USE` feature), and container-file
-//!   citations an MCP tool result announces in its `_meta` for later text.
+//!   is upstream's experimental `COMPUTER_USE` feature). Container files an
+//!   MCP tool result announces in its `_meta` (`container_file_citations`)
+//!   become `container_file_citation` annotations on later output text that
+//!   names them (they are not carried across a restart, which upstream does
+//!   only for its resilient runtime).
 //!   Function-approval requests round-trip: each `mcp_approval_request` is
 //!   saved (to the configured `FunctionApprovalStoreProvider`, else in
 //!   process) and a later `mcp_approval_response` resumes the call.

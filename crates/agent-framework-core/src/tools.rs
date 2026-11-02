@@ -58,6 +58,25 @@ pub trait Tool: Send + Sync {
     ) -> Result<Value> {
         self.invoke(arguments).await
     }
+
+    /// Execute the tool and return, with its result, host-side extras for
+    /// the result's
+    /// [`FunctionResultContent::additional_properties`](crate::types::FunctionResultContent::additional_properties)
+    /// (never shown to the model; e.g. an MCP tool's full result under
+    /// [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`](crate::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY)).
+    ///
+    /// The function-invocation loop calls **this** method; the default
+    /// delegates to [`Tool::invoke_in_context`] and attaches nothing.
+    async fn invoke_with_properties(
+        &self,
+        arguments: Value,
+        ctx: &crate::middleware::FunctionInvocationContext,
+    ) -> Result<(Value, serde_json::Map<String, Value>)> {
+        Ok((
+            self.invoke_in_context(arguments, ctx).await?,
+            serde_json::Map::new(),
+        ))
+    }
 }
 
 /// A dynamic source of tools, resolved fresh on every agent run instead of

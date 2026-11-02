@@ -1361,6 +1361,7 @@ mod tests {
                 call_id: "c1".into(),
                 result: None,
                 exception: Some("Traceback: ...a very long stack trace...".into()),
+                additional_properties: Default::default(),
             })],
         );
         let messages = vec![

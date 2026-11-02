@@ -511,6 +511,7 @@ impl HandoffCoordinator {
             call_id: call.call_id.clone(),
             result: Some(json!({ "handoff_to": target })),
             exception: None,
+            additional_properties: Default::default(),
         };
         let mut msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         msg.author_name = Some(call.name.clone());
@@ -524,6 +525,7 @@ impl HandoffCoordinator {
             call_id: call.call_id.clone(),
             result: None,
             exception: Some(format!("Error: unknown handoff target '{name}'.")),
+            additional_properties: Default::default(),
         };
         let mut msg = Message::with_contents(Role::tool(), vec![Content::FunctionResult(result)]);
         msg.author_name = Some(call.name.clone());

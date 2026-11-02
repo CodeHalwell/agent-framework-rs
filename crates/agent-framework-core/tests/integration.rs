@@ -726,6 +726,7 @@ async fn provider_resolved_tool_calls_are_not_executed_locally() {
                     call_id: "srv_1".into(),
                     result: Some(json!({"hits": 3})),
                     exception: None,
+                    additional_properties: Default::default(),
                 }),
                 Content::text("Found 3 results."),
             ],

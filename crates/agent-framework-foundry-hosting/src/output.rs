@@ -77,6 +77,112 @@ pub(crate) struct OutputTracker {
     /// `_outstanding_computer_calls`).
     #[cfg(feature = "experimental-computer-use")]
     computer_calls: HashSet<String>,
+    /// Container files announced by MCP tool results, by filename, in first
+    /// announced order, until output text names them (upstream
+    /// `_pending_container_file_citations`).
+    pending_container_files: Vec<ContainerFileCitation>,
+}
+
+/// A container file an MCP tool result announced (upstream
+/// `_ContainerFileCitation`).
+#[derive(Debug, Clone, PartialEq)]
+struct ContainerFileCitation {
+    container_id: String,
+    file_id: String,
+    filename: String,
+}
+
+/// The container files an MCP tool result announces in its `_meta` or its
+/// content blocks' `_meta` under `container_file_citations` (a citation, a
+/// list of them, or either JSON-encoded), each with `file_id`, `filename`
+/// and `container_id` (or the `_meta` block's own `container_id`); invalid
+/// entries are skipped (upstream
+/// `_container_file_citations_from_function_result`).
+fn container_file_citations(
+    result: &agent_framework_core::types::FunctionResultContent,
+) -> Vec<ContainerFileCitation> {
+    let Some(payload) = result
+        .additional_properties
+        .get(agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let mut blocks: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    if let Some(meta) = payload.get("_meta").and_then(Value::as_object) {
+        blocks.push(meta);
+    }
+    for item in payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(meta) = item.get("_meta").and_then(Value::as_object) {
+            blocks.push(meta);
+        }
+    }
+    let nonempty = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut citations = Vec::new();
+    for meta in blocks {
+        let mut raw = meta.get("container_file_citations").cloned();
+        if let Some(Value::String(encoded)) = &raw {
+            match serde_json::from_str::<Value>(encoded) {
+                Ok(decoded) => raw = Some(decoded),
+                Err(_) => continue,
+            }
+        }
+        let values = match raw {
+            Some(Value::Object(citation)) => vec![Value::Object(citation)],
+            Some(Value::Array(values)) => values,
+            _ => continue,
+        };
+        let fallback = meta.get("container_id");
+        for value in &values {
+            let Some(citation) = value.as_object() else {
+                continue;
+            };
+            // Upstream's `or`: a falsy container id falls back.
+            let falsy = |v: &Value| match v {
+                Value::Null => true,
+                Value::Bool(b) => !b,
+                Value::Number(n) => n.as_f64() == Some(0.0),
+                Value::String(s) => s.is_empty(),
+                Value::Array(a) => a.is_empty(),
+                Value::Object(o) => o.is_empty(),
+            };
+            let container = citation
+                .get("container_id")
+                .filter(|v| !falsy(v))
+                .or(fallback);
+            let (Some(container_id), Some(file_id), Some(filename)) = (
+                nonempty(container),
+                nonempty(citation.get("file_id")),
+                nonempty(citation.get("filename")),
+            ) else {
+                continue;
+            };
+            citations.push(ContainerFileCitation {
+                container_id,
+                file_id,
+                filename,
+            });
+        }
+    }
+    citations
+}
+
+/// Whether `text[start..end]` (char indices) is not embedded in another
+/// filename-like token (upstream `_has_container_filename_boundaries`).
+fn has_filename_boundaries(text: &[char], start: usize, end: usize) -> bool {
+    let token = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let before = start.checked_sub(1).map(|i| text[i]);
+    let after = text.get(end).copied();
+    !before.is_some_and(token) && !after.is_some_and(token)
 }
 
 struct OpenCall {
@@ -113,7 +219,89 @@ impl OutputTracker {
             approvals: Vec::new(),
             #[cfg(feature = "experimental-computer-use")]
             computer_calls: HashSet::new(),
+            pending_container_files: Vec::new(),
         }
+    }
+
+    /// Remember the container files `result` announces (a later announcement
+    /// of a filename replaces the earlier one).
+    fn note_container_files(
+        &mut self,
+        result: &agent_framework_core::types::FunctionResultContent,
+    ) {
+        for citation in container_file_citations(result) {
+            match self
+                .pending_container_files
+                .iter_mut()
+                .find(|c| c.filename == citation.filename)
+            {
+                Some(existing) => *existing = citation,
+                None => self.pending_container_files.push(citation),
+            }
+        }
+    }
+
+    /// `container_file_citation` annotations for the pending files `text`
+    /// names (upstream `_container_file_annotations_for_text`): every
+    /// occurrence with filename boundaries is a candidate; longer matches
+    /// win, then earlier ones, each file is cited once, citations never
+    /// overlap, and a cited file stops being pending. Indices count
+    /// characters.
+    fn container_file_annotations(&mut self, text: &str) -> Vec<Value> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, citation) in self.pending_container_files.iter().enumerate() {
+            let needle: Vec<char> = citation.filename.chars().collect();
+            if needle.is_empty() || needle.len() > chars.len() {
+                continue;
+            }
+            for start in 0..=chars.len() - needle.len() {
+                let end = start + needle.len();
+                if chars[start..end] == needle[..] && has_filename_boundaries(&chars, start, end) {
+                    candidates.push((start, end, i));
+                }
+            }
+        }
+        let files = &self.pending_container_files;
+        candidates.sort_by(|a, b| {
+            (b.1 - b.0)
+                .cmp(&(a.1 - a.0))
+                .then(a.0.cmp(&b.0))
+                .then(files[a.2].filename.cmp(&files[b.2].filename))
+        });
+        let mut selected: Vec<(usize, usize, usize)> = Vec::new();
+        for candidate in candidates {
+            let (start, end, i) = candidate;
+            if selected.iter().any(|s| s.2 == i)
+                || selected.iter().any(|s| start < s.1 && s.0 < end)
+            {
+                continue;
+            }
+            selected.push(candidate);
+        }
+        selected.sort_by_key(|s| s.0);
+        let annotations = selected
+            .iter()
+            .map(|&(start, end, i)| {
+                let c = &files[i];
+                json!({
+                    "type": "container_file_citation",
+                    "container_id": c.container_id,
+                    "file_id": c.file_id,
+                    "filename": c.filename,
+                    "start_index": start,
+                    "end_index": end,
+                })
+            })
+            .collect();
+        let cited: HashSet<usize> = selected.iter().map(|s| s.2).collect();
+        let mut index = 0;
+        self.pending_container_files.retain(|_| {
+            let keep = !cited.contains(&index);
+            index += 1;
+            keep
+        });
+        annotations
     }
 
     /// The events produced since the last call.
@@ -314,6 +502,7 @@ impl OutputTracker {
                     self.finish_call(call);
                 }
                 self.close();
+                self.note_container_files(result);
                 let output = match (&result.result, &result.exception) {
                     (Some(value), _) => json_text(value),
                     (None, Some(exception)) => format!("Error: {exception}"),
@@ -648,7 +837,12 @@ impl OutputTracker {
                 "response.output_text.done",
                 json!({"item_id": id, "output_index": index, "content_index": part, "text": text, "logprobs": []}),
             );
-            let annotations = std::mem::take(&mut self.annotations);
+            let mut annotations = std::mem::take(&mut self.annotations);
+            for annotation in self.container_file_annotations(&text) {
+                if !annotations.contains(&annotation) {
+                    annotations.push(annotation);
+                }
+            }
             for (i, annotation) in annotations.iter().enumerate() {
                 self.emit(
                     "response.output_text.annotation.added",
@@ -963,6 +1157,50 @@ pub(crate) fn is_allowed_consent_link(link: &str, allowed: Option<&[String]>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_file_citations_prefer_longer_earlier_matches_once() {
+        use agent_framework_core::types::{
+            FunctionResultContent, MCP_TOOL_RESULT_HOST_PAYLOAD_KEY,
+        };
+        let mut result = FunctionResultContent::new("c1", Some(json!("ok")));
+        result.additional_properties.insert(
+            MCP_TOOL_RESULT_HOST_PAYLOAD_KEY.into(),
+            json!({"_meta": {"container_id": "cntr", "container_file_citations": [
+                {"file_id": "f1", "filename": "report.csv"},
+                {"file_id": "f2", "filename": "final report.csv"},
+                {"file_id": "f3", "filename": "a.txt", "container_id": 0},
+                {"file_id": "f4", "filename": "later.txt"},
+                {"file_id": "", "filename": "nofile.txt"},
+            ]}}),
+        );
+        let mut tracker = OutputTracker::new("caresp_x", None);
+        tracker.note_container_files(&result);
+        let annotations =
+            tracker.container_file_annotations("final report.csv, report.csv and a.txt, a.txt");
+        let cited: Vec<(&str, u64, u64)> = annotations
+            .iter()
+            .map(|a| {
+                (
+                    a["file_id"].as_str().unwrap(),
+                    a["start_index"].as_u64().unwrap(),
+                    a["end_index"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        // The longer name wins the overlap; each file is cited once.
+        assert_eq!(cited, [("f2", 0, 16), ("f1", 18, 28), ("f3", 33, 38)]);
+        assert_eq!(
+            annotations[2]["container_id"], "cntr",
+            "a falsy id falls back"
+        );
+        // Cited files stop pending; the rest wait for later text.
+        assert!(tracker.container_file_annotations("report.csv").is_empty());
+        assert_eq!(
+            tracker.container_file_annotations("see later.txt")[0]["file_id"],
+            "f4"
+        );
+    }
     use agent_framework_core::types::{
         FunctionCallContent, FunctionResultContent, Message, Role, TextContent, TextSpanRegion,
     };

@@ -111,6 +111,13 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   the tools context providers inject (consulting non-history providers for
   their tools only, dropping their messages and instructions), so a resumed
   operation's call to such a tool runs.
+- Foundry hosting: container files an MCP tool result announces in its
+  `_meta` (`container_file_citations`) become `container_file_citation`
+  annotations on later output text that names them, as upstream. MCP tools
+  now keep their full `tools/call` result on the function result for the
+  host: new `FunctionResultContent::additional_properties`,
+  `MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`, `Tool::invoke_with_properties` and
+  `McpClient::call_tool_raw`.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

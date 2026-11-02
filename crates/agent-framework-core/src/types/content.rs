@@ -586,7 +586,20 @@ pub struct FunctionResultContent {
         serialize_with = "serialize_redacted_exception"
     )]
     pub exception: Option<String>,
+    /// Host-side extras the tool attached to its result (upstream
+    /// `additional_properties`), never shown to the model: e.g. an MCP
+    /// tool's full result under [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`], which
+    /// a host reads (for instance for the files a result announces). Tools
+    /// attach them through [`Tool::invoke_with_properties`](crate::tools::Tool::invoke_with_properties).
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub additional_properties: serde_json::Map<String, Value>,
 }
+
+/// The [`FunctionResultContent::additional_properties`] key under which an
+/// MCP tool keeps its full `tools/call` result (content blocks with their
+/// `_meta`, `structuredContent`, the result `_meta`) for the host (upstream
+/// `_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`).
+pub const MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: &str = "_mcp_tool_result_host_payload";
 
 impl FunctionResultContent {
     pub fn new(call_id: impl Into<String>, result: Option<Value>) -> Self {
@@ -594,6 +607,7 @@ impl FunctionResultContent {
             call_id: call_id.into(),
             result,
             exception: None,
+            additional_properties: serde_json::Map::new(),
         }
     }
 
