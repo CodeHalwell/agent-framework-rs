@@ -21,6 +21,15 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Compaction depth: the group model (`compaction::index`:
+  `CompactionMessageIndex`, `CompactionMessageGroup`, `CompactionGroupKind`),
+  `CompactionTriggers`, `PipelineCompactionStrategy`,
+  `TriggeredCompactionStrategy`, the LLM-backed
+  `SummarizationCompactionStrategy` over the new `AsyncCompactionStrategy`
+  (`CompactionProvider::with_async_strategy`,
+  `AgentBuilder::with_async_compaction`), `ToolResultCompactionStrategy`
+  with a custom formatter, and the two-phase
+  `ContextWindowCompactionStrategy`.
 - Skill scripts: `SkillScript` (inline closures run in-process, or files
   discovered in a skill's directory, `.py` by default) and the
   `run_skill_script` tool, which requires approval by default

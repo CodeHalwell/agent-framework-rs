@@ -1429,6 +1429,14 @@ impl AgentBuilder {
     pub fn with_compaction(self, strategy: impl CompactionStrategy + 'static) -> Self {
         self.context_provider(Arc::new(CompactionProvider::new(strategy)))
     }
+    /// Compact with an [`AsyncCompactionStrategy`](crate::compaction::AsyncCompactionStrategy)
+    /// — LLM summarization, a pipeline, or a triggered strategy.
+    pub fn with_async_compaction(
+        self,
+        strategy: impl crate::compaction::AsyncCompactionStrategy + 'static,
+    ) -> Self {
+        self.context_provider(Arc::new(CompactionProvider::with_async_strategy(strategy)))
+    }
     /// Add an agent middleware.
     pub fn middleware(mut self, mw: Arc<crate::middleware::AgentMiddleware>) -> Self {
         self.agent_middleware.push(mw);

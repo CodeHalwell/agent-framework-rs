@@ -3843,197 +3843,270 @@
     "Microsoft.Agents.AI.Compaction": {
       "CompactionGroupKind": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionGroupKind"
+          ],
+          "status": "mapped",
+          "note": "Enum of group kinds."
         },
         "constants": {
           "AssistantText": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::AssistantText"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "Summary": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::Summary"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "System": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::System"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "ToolCall": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::ToolCall"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           },
           "User": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionGroupKind::User"
+            ],
+            "status": "mapped",
+            "note": "Enum variant."
           }
         }
       },
       "CompactionMessageGroup": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionMessageGroup"
+          ],
+          "status": "mapped",
+          "note": "Struct of an atomic group."
         },
         "properties": {
           "ByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::byte_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "ExcludeReason": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::exclude_reason"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "IsExcluded": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::is_excluded"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "Kind": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::kind"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "MessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::message_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "Messages": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::messages"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "TokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::token_count"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           },
           "TurnIndex": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageGroup::turn_index"
+            ],
+            "status": "mapped",
+            "note": "Field (message_count is a method)."
           }
         }
       },
       "CompactionMessageIndex": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionMessageIndex"
+          ],
+          "status": "mapped",
+          "note": "Groups a conversation; strategies decide on groups."
         },
         "constructors": {
           "CompactionMessageIndex(IList<CompactionMessageGroup>, Tokenizer)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::new",
+              "agent_framework_core::compaction::index::CompactionMessageIndex::counted"
+            ],
+            "status": "adapted",
+            "note": "Built from messages (grouping them) with a tokenizer, rather than from prepared groups."
           }
         },
         "properties": {
           "Groups": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::groups"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_byte_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedNonSystemGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_non_system_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedTokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_token_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "IncludedTurnCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::included_turn_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "RawMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::raw_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "Tokenizer": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::tokenizer"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalByteCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_byte_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalGroupCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_group_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalMessageCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_message_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalTokenCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_token_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           },
           "TotalTurnCount": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::total_turn_count"
+            ],
+            "status": "mapped",
+            "note": "Accessor method."
           }
         },
         "methods": {
           "AddGroup(CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::add_group"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetAllMessages()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_all_messages"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetIncludedMessages()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_included_messages"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "GetTurnGroups(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::get_turn_groups"
+            ],
+            "status": "mapped",
+            "note": "Method."
           },
           "InsertGroup(int, CompactionGroupKind, IReadOnlyList<ChatMessage>, int?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust compaction has no message-group/index model; strategies take and return a plain Vec<Message>."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionMessageIndex::insert_group"
+            ],
+            "status": "mapped",
+            "note": "Method."
           }
         }
       },
@@ -4062,144 +4135,196 @@
       "CompactionStrategy": {
         "mapping": {
           "rust": [
-            "agent_framework_core::compaction::CompactionStrategy"
+            "agent_framework_core::compaction::CompactionStrategy",
+            "agent_framework_core::compaction::index::AsyncCompactionStrategy"
           ],
-          "status": "partial",
-          "note": "CompactionStrategy is a message-list-in/out trait; it has no trigger/target-trigger gating like the .NET base class."
+          "status": "adapted",
+          "note": "A message-list trait, plus its async form for strategies that call out; trigger gating is TriggeredCompactionStrategy."
         },
         "methods": {
           "CompactAsync(CompactionMessageIndex, ILogger, CancellationToken)": {
             "rust": [
+              "agent_framework_core::compaction::index::AsyncCompactionStrategy::compact_async",
               "agent_framework_core::compaction::CompactionStrategy::compact"
             ],
             "status": "adapted",
-            "note": "CompactionStrategy::compact takes &[Message] and a Tokenizer instead of a CompactionMessageIndex and returns the retained list."
+            "note": "Takes and returns messages; strategies build a CompactionMessageIndex when they need groups."
           }
         }
       },
       "CompactionTrigger": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionTrigger"
+          ],
+          "status": "adapted",
+          "note": "An Arc<dyn Fn(&CompactionMessageIndex) -> bool>."
         }
       },
       "CompactionTriggers": {
         "methods": {
           "All(CompactionTrigger[])": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::all"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "Any(CompactionTrigger[])": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::any"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "GroupsExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::groups_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "HasToolCalls()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::has_tool_calls"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "MessagesExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::messages_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TokensBelow(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::tokens_below"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TokensExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::tokens_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "TurnsExceed(int)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::turns_exceed"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           }
         },
         "fields": {
           "Always": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::always"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           },
           "Never": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No trigger abstraction in Rust; each strategy applies its own fixed limit unconditionally."
+            "rust": [
+              "agent_framework_core::compaction::index::CompactionTriggers::never"
+            ],
+            "status": "mapped",
+            "note": "Associated function returning a trigger."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::index::CompactionTriggers"
+          ],
+          "status": "mapped",
+          "note": "Factory of triggers."
         }
       },
       "ContextWindowCompactionStrategy": {
         "constructors": {
           "ContextWindowCompactionStrategy(int, int, double, double)": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::new"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::new",
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::with_tool_eviction_threshold",
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::with_truncation_threshold"
             ],
-            "status": "partial",
-            "note": "TokenBudget enforces one token budget; there is no output-token reservation or staged tool-eviction/truncation thresholds."
+            "status": "adapted",
+            "note": "Window and output sizes in new; thresholds by builder methods, validated as upstream."
           }
         },
         "properties": {
           "InputBudgetTokens": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::max_tokens"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::input_budget_tokens"
             ],
-            "status": "adapted",
-            "note": "The caller passes the input budget directly as TokenBudget::max_tokens instead of deriving it from window minus output tokens."
+            "status": "mapped",
+            "note": "Accessor."
           },
           "MaxContextWindowTokens": {
             "rust": [
-              "agent_framework_core::compaction::TokenBudget::max_tokens"
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::max_context_window_tokens"
             ],
-            "status": "partial",
-            "note": "Only a single token budget exists; the full context-window size is not modelled separately from the input budget."
+            "status": "mapped",
+            "note": "Accessor."
           },
           "MaxOutputTokens": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "TokenBudget has no output-token reservation; callers subtract it themselves before choosing max_tokens."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::max_output_tokens"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           },
           "ToolEvictionThreshold": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No staged tool-result eviction threshold; SelectiveToolResult must be applied as a separate strategy."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::tool_eviction_threshold"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           },
           "TruncationThreshold": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No staged truncation threshold; TokenBudget trims immediately to its budget."
+            "rust": [
+              "agent_framework_core::compaction::ContextWindowCompactionStrategy::truncation_threshold"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::ContextWindowCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "Two-phase: tool-result eviction, then truncation."
         }
       },
       "PipelineCompactionStrategy": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+          "rust": [
+            "agent_framework_core::compaction::index::PipelineCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "Runs async (or sync) strategies in order."
         },
         "constructors": {
           "PipelineCompactionStrategy(IEnumerable<CompactionStrategy>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+            "rust": [
+              "agent_framework_core::compaction::index::PipelineCompactionStrategy::new"
+            ],
+            "status": "mapped",
+            "note": "Constructor."
           }
         },
         "properties": {
           "Strategies": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No pipeline/composite strategy; AgentBuilder::with_compaction takes a single CompactionStrategy."
+            "rust": [
+              "agent_framework_core::compaction::index::PipelineCompactionStrategy::strategies"
+            ],
+            "status": "mapped",
+            "note": "Accessor."
           }
         }
       },
@@ -4207,10 +4332,11 @@
         "constructors": {
           "SlidingWindowCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
-              "agent_framework_core::compaction::SlidingWindow::new"
+              "agent_framework_core::compaction::SlidingWindow::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
             ],
             "status": "partial",
-            "note": "SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers."
+            "note": "SlidingWindow keeps the last N messages unconditionally; it is not turn-based and has no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
@@ -4226,63 +4352,90 @@
       "SummarizationCompactionStrategy": {
         "constructors": {
           "SummarizationCompactionStrategy(IChatClient, CompactionTrigger, int, string, CompactionTrigger)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
+            ],
+            "status": "adapted",
+            "note": "Triggers follow upstream Python (target_count + threshold); wrap in TriggeredCompactionStrategy for a custom trigger."
           }
         },
         "properties": {
           "ChatClient": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::new"
+            ],
+            "status": "adapted",
+            "note": "Given to new."
           },
           "MinimumPreservedGroups": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::with_target_count"
+            ],
+            "status": "adapted",
+            "note": "Preservation is by message count over whole groups, as upstream Python."
           },
           "SummarizationPrompt": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No LLM-backed summarization strategy in Rust compaction (module docs say this port has no summarizing strategy)."
+            "rust": [
+              "agent_framework_core::compaction::index::SummarizationCompactionStrategy::with_prompt",
+              "agent_framework_core::compaction::index::DEFAULT_SUMMARIZATION_PROMPT"
+            ],
+            "status": "mapped",
+            "note": "Builder method and default."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::index::SummarizationCompactionStrategy"
+          ],
+          "status": "mapped",
+          "note": "LLM summarization of the oldest groups, as upstream SummarizationStrategy."
         }
       },
       "ToolResultCompactionStrategy": {
         "constructors": {
           "ToolResultCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
-              "agent_framework_core::compaction::SelectiveToolResult::new"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new",
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy"
             ],
-            "status": "partial",
-            "note": "SelectiveToolResult replaces older tool results with a fixed marker; no trigger gating or configurable formatter."
+            "status": "adapted",
+            "note": "keep_last in new; triggers by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
           "MinimumPreservedGroups": {
             "rust": [
-              "agent_framework_core::compaction::SelectiveToolResult::keep_last"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new"
             ],
             "status": "adapted",
-            "note": "keep_last is the number of most recent tool results left intact."
+            "note": "keep_last results stay verbatim."
           },
           "ToolCallFormatter": {
             "rust": [
-              "agent_framework_core::compaction::OMITTED_TOOL_RESULT"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::with_formatter",
+              "agent_framework_core::compaction::ToolResultFormatter"
             ],
-            "status": "partial",
-            "note": "The replacement text is the fixed OMITTED_TOOL_RESULT constant; a custom formatter cannot be supplied."
+            "status": "mapped",
+            "note": "Custom formatter closure."
           }
         },
         "methods": {
           "DefaultToolCallFormatter(CompactionMessageGroup)": {
             "rust": [
-              "agent_framework_core::compaction::OMITTED_TOOL_RESULT"
+              "agent_framework_core::compaction::ToolResultCompactionStrategy::new"
             ],
-            "status": "partial",
-            "note": "Rust substitutes a fixed marker rather than formatting a summary of the compacted tool calls."
+            "status": "adapted",
+            "note": "The default formatter writes \"[Tool results: <tool>]\", as upstream."
           }
+        },
+        "mapping": {
+          "rust": [
+            "agent_framework_core::compaction::ToolResultCompactionStrategy",
+            "agent_framework_core::compaction::SelectiveToolResult"
+          ],
+          "status": "adapted",
+          "note": "Replaces older tool results' payloads, keeping exchanges paired."
         }
       },
       "TruncationCompactionStrategy": {
@@ -4296,11 +4449,12 @@
         "constructors": {
           "TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)": {
             "rust": [
+              "agent_framework_core::compaction::index::TriggeredCompactionStrategy",
               "agent_framework_core::compaction::Truncation::new",
               "agent_framework_core::compaction::Truncation::preserve_first_user"
             ],
             "status": "partial",
-            "note": "Truncation::new takes a max message count; there are no trigger/target triggers."
+            "note": "Truncation::new takes a max message count; there are no trigger/target triggers; trigger gating is available by wrapping in TriggeredCompactionStrategy."
           }
         },
         "properties": {
