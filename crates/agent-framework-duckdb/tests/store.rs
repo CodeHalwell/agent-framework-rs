@@ -280,3 +280,39 @@ async fn uuid_shaped_string_keys_stay_distinct() {
     assert_eq!(got[0].as_ref().unwrap()["n"], 1);
     assert_eq!(got[1].as_ref().unwrap()["n"], 2);
 }
+
+#[tokio::test]
+async fn integer_filters_beyond_2_53_are_exact() {
+    let store = DuckDbStore::in_memory().unwrap();
+    let definition = VectorStoreCollectionDefinition::new(vec![
+        VectorStoreField::key("id").with_type("int"),
+        VectorStoreField::data("big").with_type("int"),
+        VectorStoreField::vector("embedding", 2),
+    ])
+    .unwrap();
+    let docs = store.get_collection("af_big_ints", definition).unwrap();
+    docs.ensure_collection_exists().await.unwrap();
+    docs.upsert(vec![
+        json!({"id": 1, "big": 9_007_199_254_740_992_i64, "embedding": [1.0, 0.0]}),
+        json!({"id": 2, "big": 9_007_199_254_740_993_i64, "embedding": [0.0, 1.0]}),
+    ])
+    .await
+    .unwrap();
+    let ids = |hits: Vec<agent_framework_core::vectors::VectorSearchResult>| {
+        hits.iter()
+            .map(|h| h.record["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let eq = Filter::eq("big", 9_007_199_254_740_993_i64).unwrap();
+    let hits = docs
+        .search(vec![1.0, 0.0], &VectorSearchOptions::new(5).with_filter(eq))
+        .await
+        .unwrap();
+    assert_eq!(ids(hits), [2]);
+    let gt = Filter::gt("big", 9_007_199_254_740_992_i64).unwrap();
+    let hits = docs
+        .search(vec![1.0, 0.0], &VectorSearchOptions::new(5).with_filter(gt))
+        .await
+        .unwrap();
+    assert_eq!(ids(hits), [2]);
+}

@@ -303,9 +303,7 @@ impl FilterCompiler<'_> {
         }
         let param = match (field.type_.as_deref(), value) {
             (Some("int") | Some("float"), Value::Number(n)) => {
-                Db::Double(n.as_f64().filter(|f| f.is_finite()).ok_or_else(|| {
-                    Error::Configuration("Numeric filter operands must be finite.".into())
-                })?)
+                numeric_operand(n, "Numeric filter operands must be finite.")?
             }
             _ => match value_param(field, value) {
                 Ok(p) => p,
@@ -406,9 +404,7 @@ impl FilterCompiler<'_> {
                             ))
                         }
                         (Some("int" | "float"), Value::Number(n)) => {
-                            Db::Double(n.as_f64().filter(|f| f.is_finite()).ok_or_else(|| {
-                                Error::Configuration("Ordered filter numbers must be finite.".into())
-                            })?)
+                            numeric_operand(n, "Ordered filter numbers must be finite.")?
                         }
                         _ => value_param(field, operand)?,
                     };
@@ -879,6 +875,19 @@ fn normalized_key(value: &Value, uuid: bool) -> String {
             .unwrap_or_else(|_| s.clone()),
         other => other.to_string(),
     }
+}
+
+/// A numeric filter operand, bound exactly: integers as `BIGINT` (a double
+/// would round values beyond 2^53 onto a neighbouring key), other numbers as
+/// finite `DOUBLE`.
+fn numeric_operand(n: &serde_json::Number, not_finite: &str) -> Result<Db> {
+    if let Some(i) = n.as_i64() {
+        return Ok(Db::BigInt(i));
+    }
+    n.as_f64()
+        .filter(|f| f.is_finite())
+        .map(Db::Double)
+        .ok_or_else(|| Error::Configuration(not_finite.into()))
 }
 
 fn table_exists(connection: &duckdb::Connection, name: &str) -> Result<bool> {

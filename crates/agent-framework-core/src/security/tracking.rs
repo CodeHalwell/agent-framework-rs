@@ -661,7 +661,21 @@ impl Middleware<FunctionInvocationContext> for LabelTrackingFunctionMiddleware {
             authoritative: Mutex::new(None),
             inspect_error: Mutex::new(false),
         });
-        let mut ctx = CURRENT.scope(invocation.clone(), next.run(ctx)).await?;
+        let mut ctx = match CURRENT.scope(invocation.clone(), next.run(ctx)).await {
+            Ok(ctx) => ctx,
+            // A halt is the enforcement layer's own fail-closed signal.
+            Err(e) if e.is_middleware_failure() => return Err(e),
+            // A failure's text bypasses `label_result`: the loop turns it into
+            // a model-visible error. From a tool whose results are untrusted
+            // it may carry external content, so it is replaced by a
+            // content-free error rather than reaching the model unmediated.
+            Err(_) if !fallback.is_trusted() => {
+                return Err(Error::tool(format!(
+                    "tool '{function_name}' failed; details withheld (untrusted source)"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
         if ctx.metadata.contains_key(POLICY_TERMINATED_KEY) {
             return Ok(ctx);
         }
