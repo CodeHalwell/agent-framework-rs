@@ -398,7 +398,12 @@ impl ChatClient for AnthropicClient {
         let first = self
             .open_stream(&messages, &options, paused.clone())
             .await?;
-        Ok(continue_paused_stream(self.clone(), messages, options, first, paused).boxed())
+        let (client, opts) = (self.clone(), options);
+        let open: StreamOpener = Arc::new(move |conversation, paused| {
+            let (client, opts) = (client.clone(), opts.clone());
+            Box::pin(async move { client.open_stream(&conversation, &opts, paused).await })
+        });
+        Ok(continue_paused_stream(open, messages, first, paused).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -470,7 +475,77 @@ type ByteStream =
 
 /// Turn an Anthropic Messages API SSE HTTP response into a stream of
 /// [`ChatResponseUpdate`]s.
-fn parse_sse_stream(
+/// Handle one decoded Messages API stream event, whatever transport carried
+/// it: an `error` event ends the stream, a `message_delta` stopping on
+/// `pause_turn` sets `paused` (which `map_stop_reason` folds into `stop` for
+/// the caller), and everything else goes to [`parse_stream_event`].
+fn handle_stream_value(
+    value: &Value,
+    tool_use_ids: &mut HashMap<i64, StreamBlock>,
+    usage: &mut convert::StreamUsageAccumulator,
+    paused: &AtomicBool,
+) -> Result<Option<ChatResponseUpdate>> {
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        let msg = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Anthropic stream error")
+            .to_string();
+        return Err(Error::service(msg));
+    }
+    if value.get("type").and_then(Value::as_str) == Some("message_delta")
+        && value
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(Value::as_str)
+            == Some("pause_turn")
+    {
+        paused.store(true, Ordering::SeqCst);
+    }
+    Ok(parse_stream_event(value, tool_use_ids, usage))
+}
+
+/// Turn a stream of already-decoded Messages API events into updates — for a
+/// transport that is not SSE, such as Bedrock's binary event stream, where
+/// each event arrives inside its own frame. Same handling as
+/// [`parse_sse_stream`] via [`handle_stream_value`].
+pub(crate) fn parse_event_value_stream<S>(
+    values: S,
+    paused: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send
+where
+    S: futures::Stream<Item = Result<Value>> + Send + Unpin + 'static,
+{
+    futures::stream::unfold(
+        (
+            values,
+            HashMap::<i64, StreamBlock>::new(),
+            convert::StreamUsageAccumulator::default(),
+            paused,
+            false,
+        ),
+        |(mut values, mut ids, mut usage, paused, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match values.next().await? {
+                    Ok(value) => match handle_stream_value(&value, &mut ids, &mut usage, &paused) {
+                        Ok(Some(update)) => {
+                            return Some((Ok(update), (values, ids, usage, paused, false)))
+                        }
+                        Ok(None) => continue,
+                        Err(e) => return Some((Err(e), (values, ids, usage, paused, true))),
+                    },
+                    Err(e) => return Some((Err(e), (values, ids, usage, paused, true))),
+                }
+            }
+        },
+    )
+}
+
+pub(crate) fn parse_sse_stream(
     resp: reqwest::Response,
     paused: Arc<AtomicBool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
@@ -516,34 +591,18 @@ fn parse_sse_stream(
                             let Ok(value) = serde_json::from_str::<Value>(data) else {
                                 continue;
                             };
-                            if value.get("type").and_then(Value::as_str) == Some("error") {
-                                let msg = value
-                                    .get("error")
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("unknown Anthropic stream error")
-                                    .to_string();
-                                state.done = true;
-                                return Some((Err(Error::service(msg)), state));
-                            }
-                            // `map_stop_reason` folds `pause_turn` into
-                            // `stop`, so the raw reason is recorded here for
-                            // `continue_paused_stream` to act on.
-                            if value.get("type").and_then(Value::as_str) == Some("message_delta")
-                                && value
-                                    .get("delta")
-                                    .and_then(|d| d.get("stop_reason"))
-                                    .and_then(Value::as_str)
-                                    == Some("pause_turn")
-                            {
-                                state.paused.store(true, Ordering::SeqCst);
-                            }
-                            if let Some(update) = parse_stream_event(
+                            match handle_stream_value(
                                 &value,
                                 &mut state.tool_use_ids,
                                 &mut state.usage,
+                                &state.paused,
                             ) {
-                                state.queued.push_back(update);
+                                Ok(Some(update)) => state.queued.push_back(update),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    state.done = true;
+                                    return Some((Err(e), state));
+                                }
                             }
                         }
                     }
@@ -584,16 +643,23 @@ struct SseState {
 /// (via [`ChatResponse::from_updates`]), appended to the conversation, and a
 /// new request is opened from there. An error opening a continuation is
 /// yielded as the stream's last item rather than swallowed.
-fn continue_paused_stream(
-    client: AnthropicClient,
+/// Opens one streaming request for a conversation, setting the flag it is
+/// given if that stream ends on `pause_turn`. Each client in this crate
+/// supplies its own, so [`continue_paused_stream`] serves every transport.
+pub(crate) type StreamOpener = Arc<
+    dyn Fn(Vec<Message>, Arc<AtomicBool>) -> futures::future::BoxFuture<'static, Result<ChatStream>>
+        + Send
+        + Sync,
+>;
+
+pub(crate) fn continue_paused_stream(
+    open: StreamOpener,
     messages: Vec<Message>,
-    options: ChatOptions,
     first: ChatStream,
     paused: Arc<AtomicBool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     struct PausedStreamState {
-        client: AnthropicClient,
-        options: ChatOptions,
+        open: StreamOpener,
         conversation: Vec<Message>,
         inner: ChatStream,
         collected: Vec<ChatResponseUpdate>,
@@ -603,8 +669,7 @@ fn continue_paused_stream(
     }
     futures::stream::unfold(
         PausedStreamState {
-            client,
-            options,
+            open,
             conversation: messages,
             inner: first,
             collected: Vec::new(),
@@ -637,11 +702,7 @@ fn continue_paused_stream(
                         }
                         st.conversation.extend(turn.messages);
                         st.continuation += 1;
-                        match st
-                            .client
-                            .open_stream(&st.conversation, &st.options, st.paused.clone())
-                            .await
-                        {
+                        match (st.open)(st.conversation.clone(), st.paused.clone()).await {
                             Ok(next) => st.inner = next,
                             Err(e) => {
                                 st.done = true;

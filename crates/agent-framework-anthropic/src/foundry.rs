@@ -54,15 +54,14 @@
 //! # }
 //! ```
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use agent_framework_azure::TokenCredential;
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, Content, Message, Role, UsageContent,
-};
-use futures::stream::{self, StreamExt};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+use futures::stream::StreamExt;
 use serde_json::Value;
 
 use crate::convert;
@@ -245,6 +244,29 @@ impl AnthropicFoundryClient {
     }
 }
 
+impl AnthropicFoundryClient {
+    /// Send one streaming request for `conversation` (the Foundry Anthropic
+    /// endpoint streams the Messages API's SSE framing when the body sets
+    /// `stream`) and parse it. `paused` is set if it ends on `pause_turn`.
+    async fn open_stream(
+        &self,
+        conversation: &[Message],
+        options: &ChatOptions,
+        paused: Arc<AtomicBool>,
+    ) -> Result<ChatStream> {
+        let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
+        let body = convert::build_cloud_request(
+            conversation,
+            options,
+            max_tokens,
+            true,
+            &self.inner.anthropic_version,
+        );
+        let resp = self.send(&body).await?;
+        Ok(crate::parse_sse_stream(resp, paused).boxed())
+    }
+}
+
 #[async_trait::async_trait]
 impl ChatClient for AnthropicFoundryClient {
     async fn get_response(
@@ -277,44 +299,26 @@ impl ChatClient for AnthropicFoundryClient {
         .await
     }
 
-    /// Get a streaming response.
-    ///
-    /// Whether (and how) a given Foundry Anthropic deployment streams is one
-    /// more thing this crate can't assume stably across deployments (see the
-    /// [module docs](self)), so this calls the same non-streaming endpoint
-    /// [`ChatClient::get_response`] does and adapts the complete
-    /// [`ChatResponse`] into a single [`ChatResponseUpdate`] — the same
-    /// tactic [`crate::bedrock::AnthropicBedrockClient::get_streaming_response`]
-    /// and [`crate::vertex::AnthropicVertexClient::get_streaming_response`]
-    /// use. Callers driving this client through
-    /// [`ChatResponse::from_updates`](agent_framework_core::types::ChatResponse::from_updates)
-    /// still get a correct aggregated result; they just don't see partial
-    /// text arrive incrementally.
+    /// Streams the Messages API's SSE response as it arrives, continuing the
+    /// turn while the API pauses it (`continue_paused_stream`), like
+    /// [`crate::AnthropicClient`]. This used to send the non-streaming request
+    /// and replay the finished response as a single update, so a caller saw
+    /// nothing until the whole answer was ready.
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let response = self.get_response(messages, options).await?;
-
-        let mut contents: Vec<Content> = response
-            .messages
-            .iter()
-            .flat_map(|m| m.contents.iter().cloned())
-            .collect();
-        if let Some(usage) = response.usage_details.clone() {
-            contents.push(Content::Usage(UsageContent { details: usage }));
-        }
-
-        let update = ChatResponseUpdate {
-            contents,
-            role: Some(Role::assistant()),
-            response_id: response.response_id.clone(),
-            model: response.model.clone(),
-            finish_reason: response.finish_reason.clone(),
-            ..Default::default()
-        };
-        Ok(stream::once(async move { Ok(update) }).boxed())
+        let paused = Arc::new(AtomicBool::new(false));
+        let first = self
+            .open_stream(&messages, &options, paused.clone())
+            .await?;
+        let (client, opts) = (self.clone(), options);
+        let open: crate::StreamOpener = Arc::new(move |conversation, paused| {
+            let (client, opts) = (client.clone(), opts.clone());
+            Box::pin(async move { client.open_stream(&conversation, &opts, paused).await })
+        });
+        Ok(crate::continue_paused_stream(open, messages, first, paused).boxed())
     }
 
     fn model(&self) -> Option<&str> {

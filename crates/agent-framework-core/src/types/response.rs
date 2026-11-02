@@ -662,7 +662,7 @@ impl ChatResponseUpdate {
         }
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 
@@ -857,7 +857,7 @@ impl AgentResponseUpdate {
         }
         self.contents
             .iter()
-            .filter_map(Content::as_text)
+            .filter_map(Content::as_plain_text)
             .collect::<String>()
     }
 

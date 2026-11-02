@@ -12,6 +12,7 @@ readme.workspace = true
 description = "Anthropic (Claude) chat client for agent-framework-rs"
 
 [dependencies]
+base64 = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-bedrock = { workspace = true }
 agent-framework-azure = { workspace = true }

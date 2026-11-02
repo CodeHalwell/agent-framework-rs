@@ -33,6 +33,7 @@
 
 pub mod convert;
 pub mod embeddings;
+pub mod eventstream;
 pub mod sigv4;
 
 pub use embeddings::BedrockEmbeddingClient;
@@ -42,10 +43,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_framework_core::client::{ChatClient, ChatStream};
 use agent_framework_core::error::{Error, Result};
-use agent_framework_core::types::{
-    ChatOptions, ChatResponse, ChatResponseUpdate, Message, Role, UsageContent,
-};
-use futures::stream::{self, StreamExt};
+use agent_framework_core::types::{ChatOptions, ChatResponse, Message};
+use futures::stream::StreamExt;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::Value;
 
@@ -182,8 +181,11 @@ struct Inner {
     /// Present when using temporary/STS credentials.
     session_token: Option<String>,
     /// The `bedrock-runtime` host derived from `region`
-    /// (e.g. `bedrock-runtime.us-east-1.amazonaws.com`).
+    /// (e.g. `bedrock-runtime.us-east-1.amazonaws.com`), or the host of an
+    /// endpoint set with `with_endpoint`. It is also the signed `host`.
     host: String,
+    /// `https`, unless `with_endpoint` named another scheme.
+    scheme: String,
 }
 
 impl std::fmt::Debug for BedrockChatClient {
@@ -211,6 +213,7 @@ impl BedrockChatClient {
             inner: Arc::new(Inner {
                 http: crate::http_client(),
                 host: bedrock_host(&region),
+                scheme: "https".to_string(),
                 region,
                 model: model.into(),
                 access_key_id: access_key_id.into(),
@@ -246,6 +249,30 @@ impl BedrockChatClient {
         Ok(client)
     }
 
+    /// Send requests to `endpoint` (`scheme://host[:port]`) instead of the
+    /// region's public `bedrock-runtime` host — a VPC interface endpoint, a
+    /// FIPS endpoint, or a proxy. Requests are still signed for the client's
+    /// region, with this host as the signed `host`.
+    ///
+    /// # Errors
+    /// [`Error::Configuration`] when `endpoint` is not `http(s)://host`.
+    pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
+        let (scheme, rest) = endpoint
+            .split_once("://")
+            .filter(|(scheme, _)| *scheme == "https" || *scheme == "http")
+            .ok_or_else(|| Error::Configuration(format!("invalid Bedrock endpoint: {endpoint}")))?;
+        let host = rest.trim_end_matches('/');
+        if host.is_empty() || host.contains('/') {
+            return Err(Error::Configuration(format!(
+                "invalid Bedrock endpoint: {endpoint}"
+            )));
+        }
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.scheme = scheme.to_string();
+        inner.host = host.to_string();
+        Ok(self)
+    }
+
     /// Override the region (and derive a new `host` from it).
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         let region = region.into();
@@ -275,9 +302,18 @@ impl BedrockChatClient {
     /// returning the raw response on a success status (classifying a
     /// non-success status into a granular [`Error`] via
     /// [`classify_bedrock_error`]).
-    async fn send(&self, model: &str, payload: &[u8]) -> Result<reqwest::Response> {
-        let path = converse_path(model);
-        let url = format!("https://{}{path}", self.inner.host);
+    async fn send(
+        &self,
+        model: &str,
+        payload: &[u8],
+        streaming: bool,
+    ) -> Result<reqwest::Response> {
+        let path = if streaming {
+            format!("{}-stream", converse_path(model))
+        } else {
+            converse_path(model)
+        };
+        let url = format!("{}://{}{path}", self.inner.scheme, self.inner.host);
 
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -362,7 +398,7 @@ impl ChatClient for BedrockChatClient {
             Error::Serialization(format!("failed to serialize Bedrock Converse request: {e}"))
         })?;
 
-        let resp = self.send(&model, &payload).await?;
+        let resp = self.send(&model, &payload, false).await?;
         let value: Value = resp
             .json()
             .await
@@ -370,48 +406,44 @@ impl ChatClient for BedrockChatClient {
         Ok(convert::parse_response(&value, &model))
     }
 
-    /// Get a streaming response.
-    ///
-    /// Bedrock's `converse-stream` endpoint uses AWS's binary
-    /// [event-stream framing](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTSelectObjectAppendix.html)
-    /// (length-prefixed, CRC-checked frames), not line-delimited SSE like
-    /// every other streaming provider in this workspace — parsing it
-    /// correctly needs a dedicated binary frame decoder, which is
-    /// significant additional surface for a first cut of this client. This
-    /// method therefore calls the non-streaming `converse` endpoint (the
-    /// same request [`ChatClient::get_response`] sends) and adapts the
-    /// complete [`ChatResponse`] into a single [`ChatResponseUpdate`] rather
-    /// than a true incremental stream. Callers driving this client through
-    /// [`ChatResponse::from_updates`](agent_framework_core::types::ChatResponse::from_updates)
-    /// still get a correct aggregated result; they just don't see partial
-    /// text arrive incrementally.
+    /// Streams `ConverseStream` as it arrives: the AWS event-stream framing
+    /// is decoded by [`eventstream`] and each event mapped by
+    /// [`convert::parse_stream_event`]. This used to send the non-streaming
+    /// `converse` request and replay the finished response as one update,
+    /// so a caller saw nothing until the whole answer was ready.
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
-        let response = self.get_response(messages, options).await?;
-
-        let mut contents: Vec<_> = response
-            .messages
-            .iter()
-            .flat_map(|m| m.contents.iter().cloned())
-            .collect();
-        if let Some(usage) = response.usage_details.clone() {
-            contents.push(agent_framework_core::types::Content::Usage(UsageContent {
-                details: usage,
-            }));
-        }
-
-        let update = ChatResponseUpdate {
-            contents,
-            role: Some(Role::assistant()),
-            response_id: response.response_id.clone(),
-            model: response.model.clone(),
-            finish_reason: response.finish_reason.clone(),
-            ..Default::default()
-        };
-        Ok(stream::once(async move { Ok(update) }).boxed())
+        let model = self.effective_model(&options);
+        let body = convert::build_request(&messages, &options, &model);
+        let payload = serde_json::to_vec(&body).map_err(|e| {
+            Error::Serialization(format!("failed to serialize Bedrock Converse request: {e}"))
+        })?;
+        let resp = self.send(&model, &payload, true).await?;
+        let mut state = convert::ConverseStreamState::default();
+        let model_for_updates = model.clone();
+        let updates = eventstream::decode_body(resp).filter_map(move |msg| {
+            let out = match msg {
+                Err(e) => Some(Err(e)),
+                Ok(msg) => match msg.as_error() {
+                    Some(err) => Some(Err(err)),
+                    None => {
+                        let payload: Value =
+                            serde_json::from_slice(&msg.payload).unwrap_or(Value::Null);
+                        msg.event_type()
+                            .and_then(|t| convert::parse_stream_event(t, &payload, &mut state))
+                            .map(|mut u| {
+                                u.model.get_or_insert_with(|| model_for_updates.clone());
+                                Ok(u)
+                            })
+                    }
+                },
+            };
+            async move { out }
+        });
+        Ok(updates.boxed())
     }
 
     fn model(&self) -> Option<&str> {

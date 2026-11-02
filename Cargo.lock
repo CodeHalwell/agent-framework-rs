@@ -63,6 +63,7 @@ dependencies = [
  "agent-framework-bedrock",
  "agent-framework-core",
  "async-trait",
+ "base64",
  "bytes",
  "futures",
  "reqwest 0.12.28",

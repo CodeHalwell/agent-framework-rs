@@ -918,6 +918,19 @@ impl Content {
         }
     }
 
+    /// The text of a [`Content::Text`] item only — the answer, not the
+    /// model's reasoning. [`Self::as_text`] also returns
+    /// [`Content::TextReasoning`] text; this is what the `text()` accessors
+    /// use, as upstream's `Message.text` joins only `type == "text"`
+    /// contents. Folding reasoning in leaked a reasoning model's thinking
+    /// into the answer, and broke structured output, which parses `text()`.
+    pub fn as_plain_text(&self) -> Option<&str> {
+        match self {
+            Content::Text(t) => Some(&t.text),
+            _ => None,
+        }
+    }
+
     /// The function call carried by this item, if any.
     pub fn as_function_call(&self) -> Option<&FunctionCallContent> {
         match self {

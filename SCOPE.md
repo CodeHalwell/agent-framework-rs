@@ -63,9 +63,6 @@ from the roadmap, not from this file.
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control
   plane (`AIProjectClient.AsAIAgent`, `FoundryAgent(Uri, ...)`).
-- **Cloud-transport streaming for Anthropic on Bedrock and Vertex**: the
-  streaming methods buffer one non-streaming request into a single update.
-  The AWS event-stream and `:streamRawPredict` framings are not implemented.
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
