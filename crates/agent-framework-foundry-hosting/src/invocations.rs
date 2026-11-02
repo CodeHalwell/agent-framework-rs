@@ -610,7 +610,16 @@ async fn run_agent(inner: Arc<Inner>, request: &InvocationRequest, partition: St
     if !run.stream {
         let lock = inner.lock_for(&partition);
         let _turn = lock.lock().await;
-        let result = agent_turn(&server.target, &store, &key, run, options, None).await;
+        let result = agent_turn(
+            &server.target,
+            &server.config.agent_name,
+            &store,
+            &key,
+            run,
+            options,
+            None,
+        )
+        .await;
         return match result {
             Ok(text) if server.legacy_wire_format => text.into_response(),
             Ok(text) => Json(json!({"response": text})).into_response(),
@@ -629,6 +638,7 @@ async fn run_agent(inner: Arc<Inner>, request: &InvocationRequest, partition: St
         let _turn = lock.lock().await;
         let result = agent_turn(
             &task_inner.server.target,
+            &task_inner.server.config.agent_name,
             &store,
             &key,
             run,
@@ -664,6 +674,7 @@ async fn run_agent(inner: Arc<Inner>, request: &InvocationRequest, partition: St
 /// and save the session whether or not the run succeeded.
 async fn agent_turn(
     target: &Target,
+    configured_name: &str,
     store: &Arc<dyn AgentSessionStore>,
     key: &AgentSessionStoreKey,
     run: InvocationRun,
@@ -671,7 +682,8 @@ async fn agent_turn(
     stream: Option<(mpsc::Sender<Event>, bool)>,
 ) -> Result<String> {
     let agent = resolve_agent(target).await?;
-    let mut session = store.get_or_create_session(agent.as_ref(), key).await?;
+    let stored_as = StoreIdentity::new(agent.as_ref(), configured_name);
+    let mut session = store.get_or_create_session(&stored_as, key).await?;
     let result = match &stream {
         None => agent
             .run_with_options(run.messages, Some(&mut session), options)
@@ -716,7 +728,7 @@ async fn agent_turn(
             .await
         }
     };
-    let saved = store.save_session(agent.as_ref(), key, &session).await;
+    let saved = store.save_session(&stored_as, key, &session).await;
     match (result, saved) {
         (Ok(text), Ok(())) => Ok(text),
         (Ok(_), Err(e)) => Err(e),
@@ -724,6 +736,64 @@ async fn agent_turn(
         (Err(run), Err(save)) => Err(Error::AgentExecution(format!(
             "Invocation failed: {run}; session persistence also failed: {save}"
         ))),
+    }
+}
+
+/// An agent presented to the session store under a stable, host-level id
+/// (`foundry-invocations/{configured agent name}`, else the agent's name):
+/// an `agent_factory` may build each request's agent with a fresh id, and
+/// session stores key by agent id, so the same `agent_session_id` would
+/// otherwise never resume.
+struct StoreIdentity<'a> {
+    inner: &'a dyn SupportsAgentRun,
+    id: String,
+}
+
+impl<'a> StoreIdentity<'a> {
+    fn new(inner: &'a dyn SupportsAgentRun, configured: &str) -> Self {
+        let name = if configured.is_empty() {
+            inner.name().unwrap_or("agent")
+        } else {
+            configured
+        };
+        Self {
+            inner,
+            id: format!("foundry-invocations/{name}"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SupportsAgentRun for StoreIdentity<'_> {
+    async fn run(
+        &self,
+        messages: Vec<Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> Result<agent_framework_core::types::AgentResponse> {
+        self.inner.run(messages, session).await
+    }
+
+    async fn run_with_options(
+        &self,
+        messages: Vec<Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+        options: AgentRunOptions,
+    ) -> Result<agent_framework_core::types::AgentResponse> {
+        self.inner
+            .run_with_options(messages, session, options)
+            .await
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.inner.name()
+    }
+
+    fn create_session(&self) -> agent_framework_core::session::AgentSession {
+        self.inner.create_session()
     }
 }
 

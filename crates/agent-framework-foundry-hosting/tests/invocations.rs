@@ -317,3 +317,38 @@ async fn api_documents_are_served_when_registered() {
         .starts_with("application/yaml"));
     assert_eq!(body, "asyncapi: 3.0.0\n");
 }
+
+#[tokio::test]
+async fn factory_agents_with_fresh_ids_resume_their_sessions() {
+    use agent_framework_core::agent::SupportsAgentRun;
+    use agent_framework_core::prelude::Agent;
+    let echo = Echo::default();
+    let factory_echo = echo.clone();
+    let router = InvocationsHostServer::agent_factory(move || {
+        let echo = factory_echo.clone();
+        async move {
+            // No explicit id: every instance gets a fresh one.
+            let agent: Arc<dyn SupportsAgentRun> =
+                Arc::new(Agent::builder(echo).name("echo").build());
+            Ok(agent)
+        }
+    })
+    .into_router();
+    for message in ["one", "two"] {
+        let (status, reply) = json(
+            &router,
+            post(
+                "/invocations?agent_session_id=f1",
+                json!({"message": message}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    let seen = echo.seen.lock().unwrap();
+    assert_eq!(
+        seen.last().unwrap().len(),
+        3,
+        "prior user + assistant + new input"
+    );
+}
