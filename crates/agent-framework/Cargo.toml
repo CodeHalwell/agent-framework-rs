@@ -36,6 +36,8 @@ mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
 # Host agents and workflows as Azure AI Foundry hosted agents.
 foundry-hosting = ["dep:agent-framework-foundry-hosting"]
+# OpenTelemetry parenting and exporter setup for Foundry hosted agents.
+foundry-hosting-otel = ["foundry-hosting", "agent-framework-foundry-hosting/otel"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 # The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it

@@ -5,7 +5,7 @@
 //! | Route | |
 //! | --- | --- |
 //! | `POST {prefix}/responses` | create (sync, `stream`, `background`) |
-//! | `GET {prefix}/responses/{id}` | a stored response |
+//! | `GET {prefix}/responses/{id}` | a stored response; `?stream=true[&starting_after=N]` replays a background response's events (live while it runs) |
 //! | `DELETE {prefix}/responses/{id}` | delete it |
 //! | `POST {prefix}/responses/{id}/cancel` | cancel a background response |
 //! | `GET {prefix}/responses/{id}/input_items` | the request's input items |
@@ -15,12 +15,23 @@
 //! transcript (from `previous_response_id` or `conversation`) followed by
 //! the new input to the model. `store: false` persists nothing.
 //!
+//! [`HistorySource`] selects who supplies prior messages (the default
+//! replays the stored transcript; `Agent` / `Service` resume a host-kept
+//! agent session). Turns on one conversation are serialized.
+//!
 //! Streams are `event: <type>` / `data: <json>` SSE frames with a
-//! `sequence_number`: `response.created`, `response.in_progress`, the
-//! message's `output_item.added` / `content_part.added` /
-//! `output_text.delta`… / `output_text.done` / `content_part.done` /
-//! `output_item.done`, one `output_item.added`/`done` pair per declared
-//! function call, and `response.completed` (or `response.failed`).
+//! `sequence_number`: `response.created`, `response.in_progress`, each
+//! output item's events in order (`output_item.added`, its content or
+//! argument deltas, `output_item.done`; message text, refusals, reasoning
+//! summaries, function and MCP calls, tool outputs, images, approval and
+//! OAuth consent requests), and `response.completed` (or `incomplete` /
+//! `failed`), emitted only after the response is persisted. Sync and
+//! streamed responses carry the same `output` and `usage`.
+//!
+//! Workflows paused on `request_info` (with a
+//! [checkpoint store](ResponsesHostServer::with_checkpoint_store)) end with
+//! `request_info` function calls; answering them with
+//! `function_call_output` items resumes the workflow from its checkpoint.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -31,10 +42,11 @@ use std::time::Duration;
 
 use agent_framework_core::agent::{AgentRunOptions, SupportsAgentRun};
 use agent_framework_core::error::Result;
-use agent_framework_core::types::{AgentResponse, ChatOptions, Content, Message};
-use agent_framework_core::workflow::Workflow;
+use agent_framework_core::types::Content;
+use agent_framework_core::types::{AgentResponse, ChatOptions, Message};
+use agent_framework_core::workflow::{CheckpointStorage, Workflow};
 use agent_framework_hosting::responses::openai_error;
-use agent_framework_hosting::{responses_from_run, responses_to_run, ResponsesRequest};
+use agent_framework_hosting::{responses_to_run, ResponsesRequest};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -50,11 +62,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::FoundryHostConfig;
 use crate::host::{with_host_routes, HostOptions};
+use crate::output::{OutputError, OutputTracker};
 use crate::scope::{ids, FoundryRequestContext};
 
 /// A turn's request, as the hosted agent or workflow sees it (upstream
 /// `HostedResponseRequest`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostedResponseRequest {
     /// The new response's id.
     pub response_id: String,
@@ -71,6 +84,57 @@ pub struct HostedResponseRequest {
     pub conversation_id: Option<String>,
     /// The platform request context.
     pub context: FoundryRequestContext,
+    /// The server's checkpoint store ([`ResponsesHostServer::with_checkpoint_store`]).
+    /// A workflow factory passes it to
+    /// [`WorkflowBuilder::with_checkpointing`](agent_framework_core::workflow::WorkflowBuilder::with_checkpointing)
+    /// so a `request_info` pause can be resumed on a later turn.
+    pub checkpoint_storage: Option<Arc<dyn CheckpointStorage>>,
+}
+
+impl std::fmt::Debug for HostedResponseRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostedResponseRequest")
+            .field("response_id", &self.response_id)
+            .field("previous_response_id", &self.previous_response_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("checkpoint_storage", &self.checkpoint_storage.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Who supplies prior messages to the model (upstream `history_source`),
+/// independently of the caller's `store` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistorySource {
+    /// The host replays the stored outer transcript before this turn's
+    /// input, and runs the agent with `store: false` so a storing client
+    /// does not keep a second copy.
+    #[default]
+    AgentServer,
+    /// Only this turn's input is sent; the agent's own session (history
+    /// providers, or a service conversation it chose) supplies the rest.
+    /// The session is kept by the host between stored turns.
+    Agent,
+    /// Only this turn's input is sent; on a stored turn the client runs with
+    /// `store: true` and the service conversation it issues is kept in the
+    /// host's session for the next turn. Agents only.
+    Service,
+}
+
+/// Rewrites the caller's model options before an agent runs (upstream
+/// `prepare_options`).
+pub type OptionsHook =
+    Arc<dyn Fn(&HostedResponseRequest, ChatOptions) -> Result<ChatOptions> + Send + Sync>;
+
+/// A workflow paused on `request_info` requests at the end of a stored
+/// response: the checkpoint to resume and the wire call ids standing for
+/// the workflow's request ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowPause {
+    /// The checkpoint holding the pending requests.
+    pub checkpoint_id: String,
+    /// `(wire call id, workflow request id)` pairs, in request order.
+    pub requests: Vec<(String, String)>,
 }
 
 /// A stored response.
@@ -82,6 +146,8 @@ pub struct StoredResponse {
     pub input_items: Vec<Value>,
     /// The transcript up to and including this response's output.
     pub transcript: Vec<Message>,
+    /// The workflow pause this response ended on, if any.
+    pub pause: Option<WorkflowPause>,
 }
 
 /// Where responses (and conversation transcripts) are kept.
@@ -161,6 +227,11 @@ pub struct ResponsesHostServer {
     store: Arc<dyn ResponseStore>,
     prefix: String,
     host: HostOptions,
+    consent_origins: Option<Vec<String>>,
+    checkpoints: Option<Arc<dyn CheckpointStorage>>,
+    history: HistorySource,
+    prepare_options: Option<OptionsHook>,
+    sessions: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl std::fmt::Debug for ResponsesHostServer {
@@ -180,6 +251,11 @@ impl ResponsesHostServer {
             store: Arc::new(InMemoryResponseStore::default()),
             prefix: String::new(),
             host: HostOptions::default(),
+            consent_origins: None,
+            checkpoints: None,
+            history: HistorySource::default(),
+            prepare_options: None,
+            sessions: Arc::default(),
         }
     }
 
@@ -240,6 +316,52 @@ impl ResponsesHostServer {
         self
     }
 
+    /// Who supplies prior messages to the model (default
+    /// [`HistorySource::AgentServer`]). With `Agent` or `Service`, the
+    /// host keeps each stored turn's agent session (in process), keyed by
+    /// the response id and the conversation, and resumes it on the next
+    /// turn.
+    pub fn with_history_source(mut self, source: HistorySource) -> Self {
+        self.history = source;
+        self
+    }
+
+    /// Rewrite the caller's model options before an agent runs (upstream
+    /// `prepare_options`). Not applied to workflows.
+    pub fn with_prepare_options(
+        mut self,
+        hook: impl Fn(&HostedResponseRequest, ChatOptions) -> Result<ChatOptions>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.prepare_options = Some(Arc::new(hook));
+        self
+    }
+
+    /// Where workflow checkpoints are kept: it is handed to the workflow
+    /// factory ([`HostedResponseRequest::checkpoint_storage`]) and, when a
+    /// run pauses on `request_info`, its pending requests are returned as
+    /// `request_info` function calls; answering them with
+    /// `function_call_output` items (and `previous_response_id`) resumes the
+    /// workflow from its checkpoint (upstream's checkpoint-backed workflow
+    /// continuation).
+    pub fn with_checkpoint_store(mut self, storage: Arc<dyn CheckpointStorage>) -> Self {
+        self.checkpoints = Some(storage);
+        self
+    }
+
+    /// Restrict OAuth consent links surfaced as `oauth_consent_request`
+    /// items to these origins (`https://host[:port]`). Without it any safe
+    /// absolute HTTPS link is allowed.
+    pub fn with_allowed_oauth_consent_origins(
+        mut self,
+        origins: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.consent_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Lifecycle hooks and server-version segments for the shared routes.
     pub fn with_host_options(mut self, options: HostOptions) -> Self {
         self.host = options;
@@ -249,10 +371,20 @@ impl ResponsesHostServer {
     /// The router: the Responses routes plus the shared host routes.
     pub fn into_router(self) -> Router {
         let p = self.prefix.clone();
-        let host = self.host.clone().server_version_segment("responses");
+        let host = self
+            .host
+            .clone()
+            .server_version_segment("responses")
+            .agent_identity(
+                self.config.agent_name.clone(),
+                self.config.agent_version.clone(),
+                self.config.session_id.clone(),
+            );
         let state = Arc::new(Inner {
             server: self,
             running: Mutex::new(HashMap::new()),
+            replays: Mutex::new(HashMap::new()),
+            conversations: Mutex::new(HashMap::new()),
         });
         let router = Router::new()
             .route(&format!("{p}/responses"), post(create))
@@ -279,6 +411,48 @@ impl ResponsesHostServer {
 struct Inner {
     server: ResponsesHostServer,
     running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    replays: Mutex<HashMap<String, Arc<Replay>>>,
+    conversations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl Inner {
+    /// The lock serializing one conversation's turns, from loading its
+    /// transcript through persisting the new one, so concurrent turns
+    /// cannot drop each other.
+    fn conversation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.conversations.lock().unwrap();
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+        locks.entry(id.to_string()).or_default().clone()
+    }
+}
+
+/// How long a background response's events stay replayable after it ends
+/// (the agentserver's replay TTL).
+const REPLAY_TTL: Duration = Duration::from_secs(600);
+
+/// A background response's stream events, kept for
+/// `GET /responses/{id}?stream=true` (live while it runs, then for
+/// [`REPLAY_TTL`]).
+#[derive(Default)]
+struct Replay {
+    events: Mutex<Vec<(String, Value)>>,
+    done: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl Replay {
+    fn push(&self, kind: &str, payload: &Value) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((kind.to_string(), payload.clone()));
+        self.changed.notify_waiters();
+    }
+
+    fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
 }
 
 /// The `POST /responses` body fields the host reads.
@@ -354,6 +528,17 @@ struct Prepared {
     model: String,
     input_items: Vec<Value>,
     created_at: u64,
+    resume: Option<Resume>,
+    /// Held for the turn's whole life (it travels with the turn into
+    /// streaming and background tasks).
+    _conversation_turn: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+}
+
+/// Replies resuming a paused workflow.
+#[derive(Clone)]
+struct Resume {
+    checkpoint_id: String,
+    replies: HashMap<String, Value>,
 }
 
 impl Prepared {
@@ -449,9 +634,17 @@ async fn create(
         return bad_request("previous_response_id and conversation cannot both be set.");
     }
     let server = &inner.server;
+    let conversation_turn = match &conversation {
+        Some(id) => Some(Arc::new(inner.conversation_lock(id).lock_owned().await)),
+        None => None,
+    };
+    let mut pause = None;
     let history = if let Some(previous) = &create.previous_response_id {
         match server.store.get(previous).await {
-            Ok(Some(stored)) => stored.transcript,
+            Ok(Some(stored)) => {
+                pause = stored.pause;
+                stored.transcript
+            }
             Ok(None) => {
                 return bad_request(format!("Previous response with id '{previous}' not found."))
             }
@@ -464,6 +657,24 @@ async fn create(
         }
     } else {
         Vec::new()
+    };
+    if !store
+        && server.history == HistorySource::Service
+        && (create.previous_response_id.is_some() || conversation.is_some())
+    {
+        return bad_request(
+            "store=false cannot resume service-managed history; start a new one-shot request.",
+        );
+    }
+    let resume = match (&server.target, pause) {
+        (Target::Workflow { .. }, Some(pause)) => match workflow_replies(&pause, &create.input) {
+            Ok(replies) => Some(Resume {
+                checkpoint_id: pause.checkpoint_id,
+                replies,
+            }),
+            Err(e) => return bad_request(e),
+        },
+        _ => None,
     };
     let response_id = ids::response_id(create.previous_response_id.as_deref());
     let messages = responses_to_run(&ResponsesRequest {
@@ -479,7 +690,10 @@ async fn create(
             previous_response_id: create.previous_response_id.clone(),
             conversation_id: conversation,
             context: FoundryRequestContext::from_headers(&headers, None),
+            checkpoint_storage: server.checkpoints.clone(),
         },
+        resume,
+        _conversation_turn: conversation_turn,
         input_items: input_items_of(&create.input, &response_id),
         model: create
             .model
@@ -563,18 +777,34 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
         response: queued.clone(),
         input_items: prepared.input_items.clone(),
         transcript: Vec::new(),
+        pause: None,
     };
     if let Err(e) = inner.server.store.put(&id, stored).await {
         return server_error(e.to_string());
     }
     let stream = prepared.create.stream;
     let (tx, rx) = mpsc::channel::<Event>(256);
+    let replay = Arc::new(Replay::default());
+    inner
+        .replays
+        .lock()
+        .unwrap()
+        .insert(id.clone(), replay.clone());
     let task_inner = inner.clone();
     let task_id = id.clone();
     let task = tokio::spawn(async move {
         let mut events = Events::new(tx);
-        run_turn(&task_inner, &prepared, stream.then_some(&mut events)).await;
+        events.replay = Some(replay.clone());
+        // Events are always produced (and recorded for replay); with no
+        // streaming client the channel's receiver is simply gone.
+        run_turn(&task_inner, &prepared, Some(&mut events)).await;
         task_inner.running.lock().unwrap().remove(&task_id);
+        replay.finish();
+        let evict = task_inner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(REPLAY_TTL).await;
+            evict.replays.lock().unwrap().remove(&task_id);
+        });
     });
     inner
         .running
@@ -593,27 +823,35 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
 struct Events {
     tx: mpsc::Sender<Event>,
     sequence: u64,
+    replay: Option<Arc<Replay>>,
 }
 
 impl Events {
     fn new(tx: mpsc::Sender<Event>) -> Self {
-        Self { tx, sequence: 0 }
+        Self {
+            tx,
+            sequence: 0,
+            replay: None,
+        }
     }
 
     async fn emit(&mut self, kind: &str, mut payload: Value) {
         payload["type"] = json!(kind);
         payload["sequence_number"] = json!(self.sequence);
         self.sequence += 1;
+        if let Some(replay) = &self.replay {
+            replay.push(kind, &payload);
+        }
         let event = Event::default().event(kind).data(payload.to_string());
         // A disconnected client does not stop a background run.
         let _ = self.tx.send(event).await;
     }
-}
 
-/// The streamed assistant message, opened on the first text delta.
-struct OpenMessage {
-    id: String,
-    text: String,
+    async fn emit_all(&mut self, events: Vec<(String, Value)>) {
+        for (kind, payload) in events {
+            self.emit(&kind, payload).await;
+        }
+    }
 }
 
 /// Run one turn, emitting stream events when `events` is set; store the
@@ -638,15 +876,20 @@ async fn run_turn(
     } else if prepared.create.background {
         let _ = update_status(server, prepared, "in_progress").await;
     }
-    let mut open: Option<OpenMessage> = None;
-    let result = execute(server, prepared, events.as_deref_mut(), &mut open).await;
+    let mut tracker = OutputTracker::new(
+        &prepared.request.response_id,
+        server.consent_origins.clone(),
+    );
+    let result = execute(server, prepared, events.as_deref_mut(), &mut tracker).await;
+    let mut pause = None;
     let (status, response, transcript) = match result {
-        Ok(agent_response) => {
-            let response = final_response(
-                prepared,
-                &agent_response,
-                open.as_ref().map(|m| m.id.as_str()),
-            );
+        Ok((agent_response, paused)) => {
+            pause = paused;
+            tracker.close();
+            if let Some(events) = events.as_deref_mut() {
+                events.emit_all(tracker.drain()).await;
+            }
+            let response = final_response(prepared, tracker);
             let status = response["status"]
                 .as_str()
                 .unwrap_or("completed")
@@ -659,59 +902,23 @@ async fn run_turn(
         Err(e) => {
             tracing::error!(response_id = %prepared.request.response_id, error = %e, "hosted response failed");
             let mut response = prepared.skeleton("failed");
-            response["error"] = json!({"code": "server_error", "message": "The agent run failed."});
+            let message = match e {
+                TurnError::Public(m) => m,
+                TurnError::Run(_) => "The agent run failed.".to_string(),
+            };
+            response["error"] = json!({"code": "server_error", "message": message});
             ("failed".to_string(), response, Vec::new())
         }
     };
-    if let Some(events) = events {
-        if let Some(message) = open.take() {
-            close_message(events, &message).await;
-        }
-        if status != "failed" {
-            for (index, item) in response["output"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if item["type"] == "function_call" {
-                    events
-                        .emit(
-                            "response.output_item.added",
-                            json!({"output_index": index, "item": item}),
-                        )
-                        .await;
-                    events
-                        .emit(
-                            "response.function_call_arguments.done",
-                            json!({
-                                "output_index": index,
-                                "item_id": item["id"],
-                                "arguments": item["arguments"],
-                            }),
-                        )
-                        .await;
-                    events
-                        .emit(
-                            "response.output_item.done",
-                            json!({"output_index": index, "item": item}),
-                        )
-                        .await;
-                }
-            }
-        }
-        let kind = match status.as_str() {
-            "failed" => "response.failed",
-            "incomplete" => "response.incomplete",
-            _ => "response.completed",
-        };
-        events.emit(kind, json!({"response": response})).await;
-    }
+    // Persist before the terminal event: a client that closes the stream
+    // once it sees `response.completed` aborts this task, which must not
+    // cancel the write it was told succeeded.
     if prepared.store {
         let stored = StoredResponse {
             response: response.clone(),
             input_items: prepared.input_items.clone(),
             transcript: transcript.clone(),
+            pause,
         };
         if let Err(e) = server
             .store
@@ -731,7 +938,50 @@ async fn run_turn(
             }
         }
     }
+    if let Some(events) = events {
+        let kind = match status.as_str() {
+            "failed" => "response.failed",
+            "incomplete" => "response.incomplete",
+            _ => "response.completed",
+        };
+        events.emit(kind, json!({"response": response})).await;
+    }
     (status, response)
+}
+
+/// Why a turn failed: a run error (its text stays private) or a projection
+/// failure whose message is safe to return.
+#[derive(Debug)]
+enum TurnError {
+    Run(agent_framework_core::error::Error),
+    Public(String),
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run(e) => e.fmt(f),
+            Self::Public(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<agent_framework_core::error::Error> for TurnError {
+    fn from(e: agent_framework_core::error::Error) -> Self {
+        Self::Run(e)
+    }
+}
+
+impl From<OutputError> for TurnError {
+    fn from(e: OutputError) -> Self {
+        Self::Public(e.0)
+    }
+}
+
+impl From<serde_json::Error> for TurnError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Run(e.into())
+    }
 }
 
 async fn update_status(
@@ -747,159 +997,309 @@ async fn update_status(
     Ok(())
 }
 
-async fn close_message(events: &mut Events, message: &OpenMessage) {
-    let part = json!({"type": "output_text", "text": message.text, "annotations": []});
-    events
-        .emit(
-            "response.output_text.done",
-            json!({
-                "item_id": message.id, "output_index": 0, "content_index": 0, "text": message.text,
-            }),
-        )
-        .await;
-    events
-        .emit(
-            "response.content_part.done",
-            json!({
-                "item_id": message.id, "output_index": 0, "content_index": 0, "part": part,
-            }),
-        )
-        .await;
-    events
-        .emit(
-            "response.output_item.done",
-            json!({
-                "output_index": 0,
-                "item": {
-                    "id": message.id, "type": "message", "status": "completed", "role": "assistant",
-                    "content": [part],
-                },
-            }),
-        )
-        .await;
-}
-
-async fn text_delta(
-    events: &mut Events,
-    open: &mut Option<OpenMessage>,
-    response_id: &str,
-    delta: &str,
-) {
-    if delta.is_empty() {
-        return;
-    }
-    if open.is_none() {
-        let id = ids::message_id(Some(response_id));
-        events
-            .emit("response.output_item.added", json!({
-                "output_index": 0,
-                "item": {"id": id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
-            }))
-            .await;
-        events
-            .emit(
-                "response.content_part.added",
-                json!({
-                    "item_id": id, "output_index": 0, "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
-                }),
-            )
-            .await;
-        *open = Some(OpenMessage {
-            id,
-            text: String::new(),
-        });
-    }
-    if let Some(message) = open.as_mut() {
-        message.text.push_str(delta);
-        events
-            .emit(
-                "response.output_text.delta",
-                json!({
-                    "item_id": message.id, "output_index": 0, "content_index": 0, "delta": delta,
-                }),
-            )
-            .await;
-    }
-}
-
-fn run_options(create: &CreateResponse) -> AgentRunOptions {
+fn run_options(create: &CreateResponse) -> ChatOptions {
     let mut options = ChatOptions::new();
     options.temperature = create.temperature;
     options.top_p = create.top_p;
     options.max_tokens = create.max_output_tokens;
     options.instructions = create.instructions.clone();
-    AgentRunOptions::new().with_chat_options(options)
+    options
 }
 
+/// Fold a response (or each streamed update) into the tracker, emitting
+/// the stream events as they are produced.
 async fn execute(
     server: &ResponsesHostServer,
     prepared: &Prepared,
     events: Option<&mut Events>,
-    open: &mut Option<OpenMessage>,
-) -> Result<AgentResponse> {
+    tracker: &mut OutputTracker,
+) -> std::result::Result<(AgentResponse, Option<WorkflowPause>), TurnError> {
     let request = &prepared.request;
     let agent = match &server.target {
         Target::Agent(agent) => agent.clone(),
         Target::AgentFactory(factory) => factory().await?,
         Target::Workflow { factory, parse } => {
+            if server.history == HistorySource::Service {
+                return Err(TurnError::Public(
+                    "HistorySource::Service is only supported for agents.".into(),
+                ));
+            }
             let workflow = factory(request)?;
-            let input = match parse {
-                Some(parse) => parse(request)?,
-                None => {
-                    let mut all = request.history.clone();
-                    all.extend(request.messages.iter().cloned());
-                    serde_json::to_value(all)?
+            let storage = server.checkpoints.clone();
+            let run = match (&prepared.resume, &storage) {
+                (Some(resume), Some(storage)) => {
+                    let mut run = workflow
+                        .run_from_checkpoint(&resume.checkpoint_id, storage.clone())
+                        .await?;
+                    run.send_responses(resume.replies.clone()).await?;
+                    run
+                }
+                _ => {
+                    let input = match parse {
+                        Some(parse) => parse(request)?,
+                        None => {
+                            let mut all = request.history.clone();
+                            all.extend(request.messages.iter().cloned());
+                            serde_json::to_value(all)?
+                        }
+                    };
+                    workflow.run(input).await?
                 }
             };
-            let run = workflow.run(input).await?;
-            let text = run
-                .outputs()
-                .iter()
-                .map(output_text)
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let response = workflow_response(&run.outputs());
+            tracker.handle_response(&response)?;
+            let pending = run.pending_requests();
+            let pause = match (&storage, pending.is_empty()) {
+                (Some(storage), false) => {
+                    let checkpoint = pause_checkpoint(storage.as_ref(), workflow.id(), &pending)
+                        .await?
+                        .ok_or_else(|| {
+                            TurnError::Public(
+                                "The workflow paused without a checkpoint holding its requests; \
+                                 build it with the request's checkpoint storage."
+                                    .into(),
+                            )
+                        })?;
+                    let mut requests = Vec::new();
+                    for request in &pending {
+                        let wire_id = ids::new_id("call", Some(&prepared.request.response_id));
+                        tracker.handle(
+                            &request_info_call(&wire_id, &request.request_data),
+                            None,
+                            false,
+                        )?;
+                        requests.push((wire_id, request.request_id.clone()));
+                    }
+                    Some(WorkflowPause {
+                        checkpoint_id: checkpoint,
+                        requests,
+                    })
+                }
+                (None, false) => {
+                    tracing::warn!(
+                        "the workflow paused on request_info but the server has no checkpoint store; \
+                         its requests cannot be answered on a later turn"
+                    );
+                    None
+                }
+                _ => None,
+            };
             if let Some(events) = events {
-                text_delta(events, open, &request.response_id, &text).await;
+                events.emit_all(tracker.drain()).await;
             }
-            return Ok(AgentResponse {
-                messages: vec![Message::assistant(text)],
-                ..Default::default()
-            });
+            return Ok((response, pause));
         }
     };
-    let mut messages = request.history.clone();
+    let host_history = server.history == HistorySource::AgentServer;
+    let mut messages = if host_history {
+        request.history.clone()
+    } else {
+        Vec::new()
+    };
     messages.extend(request.messages.iter().cloned());
-    let options = run_options(&prepared.create);
-    let session = agent.create_session();
-    match events {
+    let mut options = run_options(&prepared.create);
+    options.store = match server.history {
+        HistorySource::AgentServer => Some(false),
+        HistorySource::Service => Some(prepared.store),
+        HistorySource::Agent => (!prepared.store).then_some(false),
+    };
+    if let Some(hook) = &server.prepare_options {
+        options = hook(request, options)?;
+    }
+    let options = AgentRunOptions::new().with_chat_options(options);
+    let mut session = if host_history {
+        agent.create_session()
+    } else {
+        load_session(server, request, agent.as_ref())?
+    };
+    let response = match events {
         None => {
-            let mut session = session;
-            agent
+            let response = agent
                 .run_with_options(messages, Some(&mut session), options)
-                .await
+                .await?;
+            if let Some(id) = response.conversation_id.as_deref() {
+                session.try_adopt_service_session_id(id);
+            }
+            tracker.handle_response(&response)?;
+            response
         }
         Some(events) => {
+            // The stream owns a clone; the state bag is shared, the service
+            // conversation id is adopted from the updates.
             let mut stream = agent
-                .run_stream(messages, Some(session), Some(options))
+                .run_stream(messages, Some(session.clone()), Some(options))
                 .await?;
             let mut updates = Vec::new();
             while let Some(update) = stream.next().await {
                 let update = update?;
-                let delta: String = update
-                    .contents
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                text_delta(events, open, &request.response_id, &delta).await;
+                if let Some(id) = update.conversation_id.as_deref() {
+                    session.try_adopt_service_session_id(id);
+                }
+                tracker.handle_update(&update)?;
+                events.emit_all(tracker.drain()).await;
                 updates.push(update);
             }
-            Ok(AgentResponse::from_updates(updates))
+            AgentResponse::from_updates(updates)
         }
+    };
+    if !host_history && prepared.store {
+        let state = session.to_dict();
+        let mut sessions = server.sessions.lock().unwrap();
+        sessions.insert(format!("response:{}", request.response_id), state.clone());
+        if let Some(conversation) = &request.conversation_id {
+            sessions.insert(format!("conversation:{conversation}"), state);
+        }
+    }
+    Ok((response, None))
+}
+
+/// The agent session to continue: the conversation's, else the previous
+/// response's, else a new one.
+fn load_session(
+    server: &ResponsesHostServer,
+    request: &HostedResponseRequest,
+    agent: &dyn SupportsAgentRun,
+) -> std::result::Result<agent_framework_core::session::AgentSession, TurnError> {
+    let key = match (&request.conversation_id, &request.previous_response_id) {
+        (Some(conversation), _) => Some(format!("conversation:{conversation}")),
+        (None, Some(previous)) => Some(format!("response:{previous}")),
+        _ => None,
+    };
+    let stored = key
+        .as_ref()
+        .and_then(|k| server.sessions.lock().unwrap().get(k).cloned());
+    match (
+        stored,
+        &request.previous_response_id,
+        &request.conversation_id,
+    ) {
+        (Some(state), _, _) => Ok(agent_framework_core::session::AgentSession::from_dict(
+            &state,
+        )?),
+        (None, Some(previous), None) => Err(TurnError::Public(format!(
+            "Cannot find an existing agent session for previous_response_id={previous}."
+        ))),
+        _ => Ok(agent.create_session()),
+    }
+}
+
+/// The newest checkpoint of `workflow_id` holding every pending request.
+async fn pause_checkpoint(
+    storage: &dyn CheckpointStorage,
+    workflow_id: &str,
+    pending: &[agent_framework_core::workflow::PendingRequest],
+) -> Result<Option<String>> {
+    let checkpoints = storage.list(Some(workflow_id)).await?;
+    Ok(checkpoints
+        .into_iter()
+        .filter(|cp| {
+            pending.iter().all(|p| {
+                cp.pending_requests
+                    .iter()
+                    .any(|q| q.request_id == p.request_id)
+            })
+        })
+        .max_by_key(|cp| cp.timestamp_millis)
+        .map(|cp| cp.checkpoint_id))
+}
+
+/// A pending request as the function call a client answers (upstream
+/// `request_info`): a framework function call keeps its name and arguments
+/// under the wire id; anything else is `request_info({request_id, request})`.
+fn request_info_call(wire_id: &str, data: &Value) -> Content {
+    use agent_framework_core::types::{FunctionArguments, FunctionCallContent};
+    if let Ok(Content::FunctionCall(mut call)) = serde_json::from_value::<Content>(data.clone()) {
+        call.call_id = wire_id.to_string();
+        return Content::FunctionCall(call);
+    }
+    let mut arguments = HashMap::new();
+    arguments.insert("request_id".to_string(), json!(wire_id));
+    arguments.insert("request".to_string(), data.clone());
+    Content::FunctionCall(FunctionCallContent::new(
+        wire_id,
+        "request_info",
+        Some(FunctionArguments::Object(arguments)),
+    ))
+}
+
+/// Map the turn's `function_call_output` items onto the paused workflow's
+/// requests. The whole pending batch must be answered, exactly once, and
+/// not mixed with new input. Outputs that parse as JSON are passed as
+/// JSON; otherwise as the string.
+fn workflow_replies(
+    pause: &WorkflowPause,
+    input: &Value,
+) -> std::result::Result<HashMap<String, Value>, String> {
+    let items: Vec<Value> = match input {
+        Value::Array(items) => items.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    };
+    if items.is_empty() {
+        return Err("Workflow replies require an exact pending stored checkpoint.".into());
+    }
+    let mut replies = HashMap::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            return Err("Pending workflow replies cannot be mixed with new input.".into());
+        }
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            return Err("A workflow reply requires its pending call ID.".into());
+        };
+        let Some((_, request_id)) = pause.requests.iter().find(|(wire, _)| wire == call_id) else {
+            return Err(
+                "A reply must match its wire ID in the exact pending workflow checkpoint.".into(),
+            );
+        };
+        let output = match item.get("output") {
+            Some(Value::String(text)) => {
+                serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
+            }
+            Some(other) => other.clone(),
+            None => Value::Null,
+        };
+        if replies.insert(request_id.clone(), output).is_some() {
+            return Err("Duplicate workflow replies are not allowed.".into());
+        }
+    }
+    if replies.len() != pause.requests.len() {
+        return Err("Answer exactly the complete pending workflow request batch.".into());
+    }
+    Ok(replies)
+}
+
+/// A workflow's outputs as an agent response: agent responses and messages
+/// keep their contents; anything else becomes text.
+fn workflow_response(outputs: &[Value]) -> AgentResponse {
+    let mut messages = Vec::new();
+    for value in outputs {
+        if let Ok(response) = serde_json::from_value::<AgentResponse>(value.clone()) {
+            if !response.messages.is_empty() {
+                messages.extend(response.messages);
+                continue;
+            }
+        }
+        if let Ok(list) = serde_json::from_value::<Vec<Message>>(value.clone()) {
+            if !list.is_empty() {
+                messages.extend(
+                    list.into_iter()
+                        .filter(|m| m.role.to_string() == "assistant"),
+                );
+                continue;
+            }
+        }
+        if let Ok(message) = serde_json::from_value::<Message>(value.clone()) {
+            messages.push(message);
+            continue;
+        }
+        let text = output_text(value);
+        if !text.is_empty() {
+            messages.push(Message::assistant(text));
+        }
+    }
+    AgentResponse {
+        messages,
+        ..Default::default()
     }
 }
 
@@ -908,59 +1308,103 @@ fn output_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        other => {
-            if let Ok(messages) = serde_json::from_value::<Vec<Message>>(other.clone()) {
-                return messages
-                    .iter()
-                    .filter(|m| m.role.to_string() == "assistant")
-                    .map(Message::text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            if let Ok(message) = serde_json::from_value::<Message>(other.clone()) {
-                return message.text();
-            }
-            other.to_string()
-        }
+        other => other.to_string(),
     }
 }
 
-/// The final response object, with agentserver ids; the streamed message
-/// keeps the id it was streamed under.
-fn final_response(
-    prepared: &Prepared,
-    response: &AgentResponse,
-    streamed_message: Option<&str>,
-) -> Value {
-    let id = &prepared.request.response_id;
-    let object = responses_from_run(response, id, &prepared.model);
-    let status = object.status;
-    let mut value = serde_json::to_value(&object).unwrap_or_else(|_| json!({}));
-    if let Some(items) = value.get_mut("output").and_then(Value::as_array_mut) {
-        let mut first_message = true;
-        for item in items.iter_mut() {
-            match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    item["id"] = json!(match (first_message, streamed_message) {
-                        (true, Some(streamed)) => streamed.to_string(),
-                        _ => ids::message_id(Some(id)),
-                    });
-                    first_message = false;
-                }
-                Some("function_call") => item["id"] = json!(ids::function_call_id(Some(id))),
-                _ => {}
-            }
-        }
+/// The final response object from the tracker's items.
+fn final_response(prepared: &Prepared, tracker: OutputTracker) -> Value {
+    let (output, usage, incomplete) = tracker.finish();
+    let output_text: String = output
+        .iter()
+        .filter(|i| i["type"] == "message")
+        .flat_map(|i| i["content"].as_array().cloned().unwrap_or_default())
+        .filter(|p| p["type"] == "output_text")
+        .filter_map(|p| p["text"].as_str().map(str::to_string))
+        .collect();
+    let status = if incomplete.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let mut value = json!({
+        "output": output,
+        "output_text": output_text,
+        "parallel_tool_calls": true,
+        "tool_choice": "auto",
+        "tools": [],
+        "error": null,
+        "incomplete_details": incomplete.map(|reason| json!({"reason": reason})),
+    });
+    if let Some(usage) = usage {
+        value["usage"] = usage;
     }
     prepared.decorate(value, status)
 }
 
-async fn get_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
-    match inner.server.store.get(&id).await {
-        Ok(Some(stored)) => Json(stored.response).into_response(),
-        Ok(None) => not_found(&id),
-        Err(e) => server_error(e.to_string()),
+#[derive(Debug, Deserialize, Default)]
+struct GetQuery {
+    #[serde(default)]
+    stream: Option<String>,
+    #[serde(default)]
+    starting_after: Option<String>,
+}
+
+async fn get_response(
+    State(inner): State<Arc<Inner>>,
+    Path(id): Path<String>,
+    Query(query): Query<GetQuery>,
+) -> Response {
+    let stored = match inner.server.store.get(&id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return not_found(&id),
+        Err(e) => return server_error(e.to_string()),
+    };
+    if !matches!(query.stream.as_deref(), Some("true") | Some("1")) {
+        return Json(stored.response).into_response();
     }
+    let after: i64 = match query.starting_after.as_deref().map(str::parse) {
+        None => -1,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return bad_request("starting_after must be an integer"),
+    };
+    if stored.response["background"] != json!(true) {
+        return bad_request(
+            "This response cannot be streamed because it was not created with background=true.",
+        );
+    }
+    let Some(replay) = inner.replays.lock().unwrap().get(&id).cloned() else {
+        return bad_request(
+            "This response cannot be streamed because it was not created with stream=true \
+             or the stream TTL has expired.",
+        );
+    };
+    let (tx, rx) = mpsc::channel::<Event>(256);
+    tokio::spawn(async move {
+        let mut next = 0usize;
+        loop {
+            let changed = replay.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let batch: Vec<(String, Value)> = replay.events.lock().unwrap()[next..].to_vec();
+            next += batch.len();
+            for (kind, payload) in batch {
+                if payload["sequence_number"].as_i64().unwrap_or(-1) <= after {
+                    continue;
+                }
+                let event = Event::default().event(kind).data(payload.to_string());
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            let done = replay.done.load(std::sync::atomic::Ordering::SeqCst);
+            if done && next >= replay.events.lock().unwrap().len() {
+                return;
+            }
+            changed.await;
+        }
+    });
+    sse(&inner.server.config, rx, None)
 }
 
 async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {

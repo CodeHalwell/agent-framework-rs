@@ -124,6 +124,9 @@ pub struct InvocationsHostServer {
     sessions: Arc<dyn SessionStoreProvider>,
     legacy_wire_format: bool,
     host: HostOptions,
+    openapi: Option<Value>,
+    asyncapi_json: Option<Value>,
+    asyncapi_yaml: Option<String>,
 }
 
 impl std::fmt::Debug for InvocationsHostServer {
@@ -144,6 +147,9 @@ impl InvocationsHostServer {
             sessions: Arc::new(InMemorySessionStoreProvider::default()),
             legacy_wire_format: false,
             host: HostOptions::default(),
+            openapi: None,
+            asyncapi_json: None,
+            asyncapi_yaml: None,
         }
     }
 
@@ -204,6 +210,26 @@ impl InvocationsHostServer {
         self
     }
 
+    /// An OpenAPI document served at `GET /invocations/docs/openapi.json`
+    /// (404 `not_found` without one), as the agentserver does.
+    pub fn with_openapi_spec(mut self, spec: Value) -> Self {
+        self.openapi = Some(spec);
+        self
+    }
+
+    /// An AsyncAPI document served at `GET /invocations/docs/asyncapi.json`.
+    pub fn with_asyncapi_spec_json(mut self, spec: Value) -> Self {
+        self.asyncapi_json = Some(spec);
+        self
+    }
+
+    /// An AsyncAPI document (YAML text) served at
+    /// `GET /invocations/docs/asyncapi.yaml`.
+    pub fn with_asyncapi_spec_yaml(mut self, spec: impl Into<String>) -> Self {
+        self.asyncapi_yaml = Some(spec.into());
+        self
+    }
+
     /// Lifecycle hooks and server-version segments for the shared routes.
     pub fn with_host_options(mut self, options: HostOptions) -> Self {
         self.host = options;
@@ -212,7 +238,20 @@ impl InvocationsHostServer {
 
     /// The router: the Invocations routes plus the shared host routes.
     pub fn into_router(self) -> Router {
-        let host = self.host.clone().server_version_segment("invocations");
+        let host = self
+            .host
+            .clone()
+            .server_version_segment("invocations")
+            .agent_identity(
+                self.config.agent_name.clone(),
+                self.config.agent_version.clone(),
+                self.config.session_id.clone(),
+            );
+        let (openapi, asyncapi_json, asyncapi_yaml) = (
+            self.openapi.clone(),
+            self.asyncapi_json.clone(),
+            self.asyncapi_yaml.clone(),
+        );
         let state = Arc::new(Inner {
             server: self,
             locks: Mutex::new(HashMap::new()),
@@ -221,7 +260,37 @@ impl InvocationsHostServer {
             .route("/invocations", post(invoke))
             .route("/invocations/{id}", axum::routing::get(unknown_invocation))
             .route("/invocations/{id}/cancel", post(unknown_invocation))
-            .with_state(state);
+            .with_state(state)
+            .route(
+                "/invocations/docs/openapi.json",
+                axum::routing::get(move || async move { spec_json(openapi, "OpenAPI") }),
+            )
+            .route(
+                "/invocations/docs/asyncapi.json",
+                axum::routing::get(
+                    move || async move { spec_json(asyncapi_json, "AsyncAPI (JSON)") },
+                ),
+            )
+            .route(
+                "/invocations/docs/asyncapi.yaml",
+                axum::routing::get(move || async move {
+                    match asyncapi_yaml {
+                        Some(yaml) => (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "application/yaml; charset=utf-8",
+                            )],
+                            yaml,
+                        )
+                            .into_response(),
+                        None => error_response(
+                            StatusCode::NOT_FOUND,
+                            "not_found",
+                            "No AsyncAPI (YAML) spec registered",
+                        ),
+                    }
+                }),
+            );
         with_host_routes(router, host)
     }
 
@@ -607,7 +676,14 @@ async fn agent_turn(
         None => agent
             .run_with_options(run.messages, Some(&mut session), options)
             .await
-            .map(|r| r.text()),
+            .map(|r| {
+                // An agent that does not update the session itself still
+                // hands back the service conversation it continued.
+                if let Some(id) = r.conversation_id.as_deref() {
+                    session.try_adopt_service_session_id(id);
+                }
+                r.text()
+            }),
         Some((tx, legacy)) => {
             async {
                 let mut updates = agent
@@ -615,7 +691,15 @@ async fn agent_turn(
                     .await?;
                 let mut text = String::new();
                 while let Some(update) = updates.next().await {
-                    let delta = update?.text();
+                    let update = update?;
+                    // The streamed run owns a clone of the session whose
+                    // service conversation id is not shared back, so adopt
+                    // it from the updates (text-less ones included) before
+                    // the session is saved.
+                    if let Some(id) = update.conversation_id.as_deref() {
+                        session.try_adopt_service_session_id(id);
+                    }
+                    let delta = update.text();
                     if delta.is_empty() {
                         continue;
                     }
@@ -640,6 +724,17 @@ async fn agent_turn(
         (Err(run), Err(save)) => Err(Error::AgentExecution(format!(
             "Invocation failed: {run}; session persistence also failed: {save}"
         ))),
+    }
+}
+
+fn spec_json(spec: Option<Value>, kind: &str) -> Response {
+    match spec {
+        Some(spec) => Json(spec).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("No {kind} spec registered"),
+        ),
     }
 }
 

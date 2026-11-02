@@ -6,16 +6,22 @@
 //!
 //! - [`FoundryHostConfig`]: the platform's `FOUNDRY_*` / `PORT` variables.
 //! - [`ResponsesHostServer`]: an agent or workflow on `POST /responses`
-//!   (sync, streamed, background; `previous_response_id` and
-//!   `conversation` continuation; get, delete, cancel, input items).
+//!   (sync, streamed, background with stream replay; `previous_response_id`
+//!   and `conversation` continuation; history sources; rich output items;
+//!   checkpoint-resumed workflow pauses; get, delete, cancel, input items),
+//!   with [`InMemoryResponseStore`] or [`FileResponseStore`].
 //! - `InvocationsHostServer` (the `session-store` feature): the
 //!   Invocations protocol, with durable per-session agent state.
 //! - [`FoundryStorage`] and the stores over it: [`FoundryCheckpointStore`],
 //!   [`FoundryFunctionApprovalStore`], and (the `session-store` feature,
 //!   since core's session store is experimental) `FoundryAgentSessionStore`.
 //! - [`FoundryToolbox`]: a Foundry toolbox's MCP endpoint as a tool source.
-//! - Every server adds `GET /readiness`, the snapshot lifecycle routes, and
+//! - Every server adds `GET /readiness`, the snapshot lifecycle routes
+//!   (`after-restore` binds the session and applies its environment
+//!   overrides), a request span joining the caller's `traceparent`, and
 //!   `x-request-id` / `x-platform-server` headers ([`with_host_routes`]).
+//!   The Invocations server also serves registered OpenAPI / AsyncAPI
+//!   documents.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -33,27 +39,39 @@
 //!
 //! # Divergences
 //!
-//! - **History.** The Responses server implements upstream's default
-//!   `history_source="agent_server"` only (the host replays the stored
-//!   transcript); `"service"` / `"agent"` sources, provider-native background
-//!   polling, OAuth consent links, and `prepare_options` are not ported.
-//! - **Responses output.** Text messages and declared (client-side) function
-//!   calls are emitted; reasoning, refusal, MCP, file/web-search, image and
-//!   computer-use items, annotations and usage streaming are not. Streamed
-//!   responses cannot be replayed with `GET …?stream=true`.
-//! - **Workflows** run fresh per request: checkpoint-backed continuation
-//!   (resuming `request_info` pauses on a later turn) is not ported.
-//! - **Local storage** defaults to in memory (upstream: files).
-//! - **Toolbox** tokens are fetched when the tool is built, not per request;
-//!   the toolbox skills provider is not ported.
-//! - The agentserver's resilient task runtime, WebSocket/voice
-//!   invocations, OpenAPI/AsyncAPI spec routes, and tracing are not ported.
+//! - **Responses output** covers text (with URL citations), refusals,
+//!   reasoning, function calls and results, MCP calls, image generation,
+//!   shell calls, approval and OAuth consent requests, and usage. Not
+//!   projected: code-interpreter, file/web-search and computer-use items
+//!   (no Rust content carries their wire shapes), container/file citations
+//!   (the Rust `Annotation` has no container or file index), and approval
+//!   requests are not saved for a later `mcp_approval_response`.
+//! - **History.** `HistorySource::Agent` / `Service` keep the agent session
+//!   in process (not in the Foundry session store), so it does not survive
+//!   a restart. Provider-native background polling (`background_source =
+//!   "provider"`) is not ported.
+//! - **Workflow pauses** answer only `function_call_output` replies;
+//!   approval (`mcp_approval_response`) and computer-call replies to a
+//!   paused workflow are not ported, and a typed reply is passed as JSON
+//!   when its output parses as JSON (the Rust request carries no response
+//!   type).
+//! - **Local storage** defaults to in memory; [`FileResponseStore`] gives
+//!   the agentserver's file-backed store (not partitioned by user).
+//! - **Toolbox** tokens are fetched when the tool is built (the MCP crate
+//!   has no per-request header hook), and the toolbox skills provider needs
+//!   MCP skills, which core does not have.
+//! - Not ported from the agentserver: the resilient (crash-recoverable)
+//!   task runtime, WebSocket/voice invocations, and its OpenTelemetry
+//!   distro beyond trace-context propagation and exporter selection (the
+//!   `otel` feature).
 
 pub mod config;
+pub mod file_store;
 pub mod host;
 #[cfg(feature = "session-store")]
 #[cfg_attr(docsrs, doc(cfg(feature = "session-store")))]
 pub mod invocations;
+mod output;
 pub mod responses;
 pub mod scope;
 #[cfg(feature = "session-store")]
@@ -64,12 +82,17 @@ pub mod stores;
 pub mod toolbox;
 
 pub use config::FoundryHostConfig;
-pub use host::{serve, with_host_routes, HostOptions};
+pub use file_store::FileResponseStore;
+#[cfg(feature = "otel")]
+pub use host::configure_observability;
+pub use host::{
+    parse_traceparent, serve, with_host_routes, AfterRestoreHook, AgentSessionContext, HostOptions,
+};
 #[cfg(feature = "session-store")]
 pub use invocations::{InvocationRequest, InvocationRun, InvocationsHostServer, WorkflowTurn};
 pub use responses::{
-    HostedResponseRequest, InMemoryResponseStore, ResponseStore, ResponsesHostServer,
-    StoredResponse,
+    HistorySource, HostedResponseRequest, InMemoryResponseStore, OptionsHook, ResponseStore,
+    ResponsesHostServer, StoredResponse, WorkflowPause,
 };
 pub use scope::{FoundryRequestContext, FoundryRequestScope};
 #[cfg(feature = "session-store")]

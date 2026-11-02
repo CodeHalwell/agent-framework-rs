@@ -35,6 +35,21 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-foundry-hosting`: rich Responses output (reasoning,
+  refusals, function calls and outputs streamed in order, MCP calls, image
+  generation, shell calls, approval and OAuth consent requests, URL
+  citations, usage, `incomplete` finishes), checkpoint-resumed workflow
+  `request_info` pauses (`with_checkpoint_store`),
+  `HistorySource::{AgentServer, Agent, Service}` and `with_prepare_options`,
+  background stream replay (`GET /responses/{id}?stream=true&starting_after=N`),
+  `FileResponseStore`, after-restore session binding and environment
+  overrides (`after_restore_with_context`), Invocations OpenAPI/AsyncAPI
+  document routes, and request spans joining the caller's `traceparent`
+  (feature `otel`, forwarded by the umbrella's `foundry-hosting-otel`, adds
+  OpenTelemetry parenting and `configure_observability`). Review fixes:
+  Invocations keeps a service conversation id across turns, responses are
+  persisted before their terminal event, and turns on one conversation are
+  serialized.
 - Agent hooks host declarations (`experimental-agent-hooks`, upstream
   `create_agent_hooks_middleware_from_declaration`): `HostDeclaration`
   (JSON documents `agent-hooks-declaration/1.0`, from text, value or file)

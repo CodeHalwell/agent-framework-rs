@@ -313,6 +313,8 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "http-body-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -321,6 +323,8 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 

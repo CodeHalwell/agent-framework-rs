@@ -214,3 +214,106 @@ async fn config_reads_the_platform_environment() {
         (8088, false, "")
     );
 }
+
+/// Answers inside a service conversation (`conv_1`) and records the
+/// conversation id each call was sent with. Streams the id on a text-less
+/// final update.
+#[derive(Clone, Default)]
+struct ServiceThreaded {
+    sent: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_core::client::ChatClient for ServiceThreaded {
+    async fn get_response(
+        &self,
+        _: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push(options.conversation_id.clone());
+        let mut response = agent_framework_core::types::ChatResponse::from_text("ok");
+        response.conversation_id = Some("conv_1".into());
+        Ok(response)
+    }
+
+    async fn get_streaming_response(
+        &self,
+        _: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use agent_framework_core::types::{ChatResponseUpdate, Content, Role};
+        use futures::StreamExt;
+        self.sent
+            .lock()
+            .unwrap()
+            .push(options.conversation_id.clone());
+        let updates = vec![
+            Ok(ChatResponseUpdate {
+                contents: vec![Content::text("ok")],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            }),
+            Ok(ChatResponseUpdate {
+                conversation_id: Some("conv_1".into()),
+                ..Default::default()
+            }),
+        ];
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+#[tokio::test]
+async fn a_service_conversation_id_is_kept_in_the_session() {
+    for stream in [false, true] {
+        let client = ServiceThreaded::default();
+        let agent: Arc<dyn agent_framework_core::agent::SupportsAgentRun> = Arc::new(
+            agent_framework_core::agent::Agent::builder(client.clone())
+                .name("svc")
+                .build(),
+        );
+        let router = InvocationsHostServer::agent(agent).into_router();
+        for message in ["one", "two"] {
+            let (status, _, body) = send(
+                &router,
+                post(
+                    "/invocations?agent_session_id=s",
+                    json!({"message": message, "stream": stream}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        assert_eq!(
+            *client.sent.lock().unwrap(),
+            [None, Some("conv_1".to_string())],
+            "stream={stream}: the second turn continues the service conversation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_documents_are_served_when_registered() {
+    let bare = InvocationsHostServer::agent(agent(Echo::default())).into_router();
+    let (status, body) = json(&bare, get("/invocations/docs/openapi.json")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "not_found");
+    let router = InvocationsHostServer::agent(agent(Echo::default()))
+        .with_openapi_spec(json!({"openapi": "3.1.0"}))
+        .with_asyncapi_spec_json(json!({"asyncapi": "3.0.0"}))
+        .with_asyncapi_spec_yaml("asyncapi: 3.0.0\n")
+        .into_router();
+    let (_, body) = json(&router, get("/invocations/docs/openapi.json")).await;
+    assert_eq!(body["openapi"], "3.1.0");
+    let (_, body) = json(&router, get("/invocations/docs/asyncapi.json")).await;
+    assert_eq!(body["asyncapi"], "3.0.0");
+    let (status, headers, body) = send(&router, get("/invocations/docs/asyncapi.yaml")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("application/yaml"));
+    assert_eq!(body, "asyncapi: 3.0.0\n");
+}

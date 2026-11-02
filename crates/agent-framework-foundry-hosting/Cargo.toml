@@ -28,16 +28,33 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 axum = "0.8"
 sha2 = "0.10"
+# The `otel` feature: caller trace-context propagation and exporter setup.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["trace"] }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [features]
 # `InvocationsHostServer` and the agent-session stores, over core's
 # `AgentSessionStore` (experimental upstream: SESSION_STORE).
 session-store = ["agent-framework-core/experimental-session-store"]
+# OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
+# and `configure_observability` exports to Application Insights or OTLP from
+# the host configuration (upstream agentserver tracing).
+otel = [
+    "agent-framework-core/azure-monitor",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
 
 [dev-dependencies]
 tokio = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

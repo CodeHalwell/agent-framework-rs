@@ -4,6 +4,8 @@ mod common;
 
 use std::sync::Arc;
 
+use agent_framework_core::client::ChatClient;
+use agent_framework_core::prelude::*;
 use agent_framework_core::workflow::{FunctionExecutor, WorkflowBuilder};
 use agent_framework_foundry_hosting::{FoundryHostConfig, ResponsesHostServer};
 use axum::http::StatusCode;
@@ -273,4 +275,592 @@ async fn workflows_and_prefixes() {
     assert_eq!(status, StatusCode::OK, "{r}");
     assert_eq!(r["model"], "shouter");
     assert_eq!(r["output"][0]["content"][0]["text"], "QUIET");
+}
+
+/// Calls `lookup` once, then answers with text, reporting usage and a
+/// reasoning step; streams each step's contents.
+#[derive(Clone, Default)]
+struct ToolUser {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolUser {
+    fn step(&self, messages: &[agent_framework_core::types::Message]) -> Vec<Content> {
+        use agent_framework_core::types::{
+            FunctionCallContent, TextReasoningContent, UsageContent, UsageDetails,
+        };
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let has_result = messages.iter().any(|m| {
+            m.contents
+                .iter()
+                .any(|c| matches!(c, Content::FunctionResult(_)))
+        });
+        let usage = Content::Usage(UsageContent {
+            details: UsageDetails {
+                input_token_count: Some(5),
+                output_token_count: Some(2),
+                ..Default::default()
+            },
+        });
+        if has_result {
+            vec![Content::text("found it"), usage]
+        } else {
+            vec![
+                Content::TextReasoning(TextReasoningContent {
+                    text: "need a lookup".into(),
+                    ..Default::default()
+                }),
+                Content::FunctionCall(FunctionCallContent::new(
+                    "call_1",
+                    "lookup",
+                    Some(agent_framework_core::types::FunctionArguments::Raw(
+                        r#"{"q":"x"}"#.into(),
+                    )),
+                )),
+                usage,
+            ]
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChatClient for ToolUser {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        let contents = self.step(&messages);
+        Ok(ChatResponse {
+            messages: vec![agent_framework_core::types::Message::with_contents(
+                Role::assistant(),
+                contents,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let updates: Vec<_> = self
+            .step(&messages)
+            .into_iter()
+            .map(|c| {
+                Ok(ChatResponseUpdate {
+                    contents: vec![c],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+fn tool_agent() -> Arc<dyn SupportsAgentRun> {
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "lookup",
+        "Look something up",
+        json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        |args: serde_json::Value| async move { Ok(json!({"found": args["q"]})) },
+    )
+    .into_definition();
+    Arc::new(
+        Agent::builder(ToolUser::default())
+            .name("tools")
+            .tool(tool)
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn rich_output_items_are_emitted_in_order() {
+    let router = ResponsesHostServer::agent(tool_agent()).into_router();
+    let (status, response) = json(&router, post("/responses", json!({"input": "go"}))).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let types: Vec<&str> = response["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "reasoning",
+            "function_call",
+            "function_call_output",
+            "message"
+        ]
+    );
+    assert_eq!(response["output"][0]["summary"][0]["text"], "need a lookup");
+    assert_eq!(response["output"][1]["arguments"], r#"{"q":"x"}"#);
+    assert_eq!(response["output"][2]["call_id"], "call_1");
+    assert_eq!(response["output"][2]["output"], r#"{"found":"x"}"#);
+    assert_eq!(response["output_text"], "found it");
+    assert_eq!(response["usage"]["input_tokens"], 10);
+    assert_eq!(response["usage"]["total_tokens"], 14);
+
+    // Streamed: the same items, with the function call streamed in place.
+    let (_, _, body) = send(
+        &router,
+        post("/responses", json!({"input": "go", "stream": true})),
+    )
+    .await;
+    let events = sse_events(&body);
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    let position = |k: &str| kinds.iter().position(|x| *x == k).unwrap();
+    assert!(
+        position("response.reasoning_summary_text.delta")
+            < position("response.function_call_arguments.delta")
+    );
+    assert!(
+        position("response.function_call_arguments.done") < position("response.output_text.delta")
+    );
+    let completed = &events.last().unwrap().1["response"];
+    assert_eq!(completed["output"].as_array().unwrap().len(), 4);
+    assert_eq!(completed["usage"]["output_tokens"], 4);
+    for (i, (_, data)) in events.iter().enumerate() {
+        assert_eq!(data["sequence_number"], i);
+    }
+}
+
+#[tokio::test]
+async fn a_workflow_pause_is_resumed_from_its_checkpoint_on_the_next_turn() {
+    use agent_framework_core::workflow::{
+        CheckpointStorage, InMemoryCheckpointStorage, RequestInfoExecutor, RequestResponse,
+    };
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let router = ResponsesHostServer::workflow(|request| {
+        let asker = FunctionExecutor::new("asker", |msg, ctx| async move {
+            if let Some(reply) = RequestResponse::from_message(&msg) {
+                ctx.yield_output(json!(format!(
+                    "hello {}",
+                    reply.data["name"].as_str().unwrap_or("?")
+                )))
+                .await?;
+            } else {
+                ctx.send_message(json!({"question": "name?"})).await?;
+            }
+            Ok(())
+        });
+        let mut builder = WorkflowBuilder::new()
+            .add_executor(Arc::new(asker))
+            .add_executor(Arc::new(RequestInfoExecutor::new("ask")))
+            .set_start("asker")
+            .add_edge("asker", "ask");
+        if let Some(storage) = request.checkpoint_storage.clone() {
+            builder = builder.with_checkpointing(storage);
+        }
+        builder.build()
+    })
+    .with_checkpoint_store(storage)
+    .into_router();
+
+    let (status, first) = json(&router, post("/responses", json!({"input": "start"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let call = &first["output"][0];
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["name"], "request_info");
+    let call_id = call["call_id"].as_str().unwrap().to_string();
+    let arguments: serde_json::Value =
+        serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments["request"], json!({"question": "name?"}));
+    let id = first["id"].as_str().unwrap();
+
+    // Replies must answer the pending batch exactly.
+    for bad in [
+        json!("plain text"),
+        json!([{"type": "function_call_output", "call_id": "call_nope", "output": "{}"}]),
+    ] {
+        let (status, body) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": bad, "previous_response_id": id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    let (status, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({
+                "previous_response_id": id,
+                "input": [{"type": "function_call_output", "call_id": call_id, "output": "{\"name\":\"Ada\"}"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["output_text"], "hello Ada");
+}
+
+/// `(message count, conversation id, store, temperature)` per model call.
+type Calls = Arc<std::sync::Mutex<Vec<(usize, Option<String>, Option<bool>, Option<f32>)>>>;
+
+/// Records what each model call received; answers inside service
+/// conversation `conv_1` when asked to store.
+#[derive(Clone, Default)]
+struct Recorder {
+    calls: Calls,
+}
+
+#[async_trait::async_trait]
+impl ChatClient for Recorder {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        self.calls.lock().unwrap().push((
+            messages.len(),
+            options.conversation_id.clone(),
+            options.store,
+            options.temperature,
+        ));
+        let mut response = ChatResponse::from_text(format!("{} messages", messages.len()));
+        if options.store == Some(true) {
+            response.conversation_id = Some("conv_1".into());
+        }
+        Ok(response)
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let response = self.get_response(messages, options).await?;
+        let updates = vec![
+            Ok(ChatResponseUpdate {
+                contents: vec![Content::text(response.text())],
+                role: Some(Role::assistant()),
+                ..Default::default()
+            }),
+            Ok(ChatResponseUpdate {
+                conversation_id: response.conversation_id.clone(),
+                ..Default::default()
+            }),
+        ];
+        Ok(futures::stream::iter(updates).boxed())
+    }
+}
+
+async fn two_turns(router: &axum::Router, stream: bool) {
+    let (status, _, body) = send(
+        router,
+        post("/responses", json!({"input": "one", "stream": stream})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first: serde_json::Value = if stream {
+        sse_events(&body).last().unwrap().1["response"].clone()
+    } else {
+        serde_json::from_str(&body).unwrap()
+    };
+    let id = first["id"].as_str().unwrap();
+    let (status, _, body) = send(
+        router,
+        post(
+            "/responses",
+            json!({"input": "two", "previous_response_id": id, "stream": stream}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn history_sources_decide_what_the_model_receives() {
+    use agent_framework_foundry_hosting::HistorySource;
+    let build = |source: HistorySource, recorder: Recorder| {
+        let agent: Arc<dyn SupportsAgentRun> = Arc::new(Agent::builder(recorder).name("r").build());
+        ResponsesHostServer::agent(agent)
+            .with_history_source(source)
+            .into_router()
+    };
+
+    // agent_server: the host replays the transcript and the client must not store.
+    let recorder = Recorder::default();
+    two_turns(&build(HistorySource::AgentServer, recorder.clone()), false).await;
+    let calls = recorder.calls.lock().unwrap().clone();
+    assert_eq!(calls[1].0, 3, "prior user + assistant + new input");
+    assert!(calls.iter().all(|c| c.2 == Some(false) && c.1.is_none()));
+
+    // service: only the new input, continuing the service conversation.
+    for stream in [false, true] {
+        let recorder = Recorder::default();
+        two_turns(&build(HistorySource::Service, recorder.clone()), stream).await;
+        let calls = recorder.calls.lock().unwrap().clone();
+        let last = calls.last().unwrap();
+        assert_eq!(last.0, 1, "stream={stream}: only this turn's input");
+        assert_eq!(last.1.as_deref(), Some("conv_1"), "stream={stream}");
+        assert_eq!(last.2, Some(true));
+    }
+
+    // A service continuation cannot run unstored; an unknown session fails.
+    let router = build(HistorySource::Service, Recorder::default());
+    let (status, _) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "x", "store": false, "previous_response_id": "caresp_x"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn prepare_options_rewrites_the_callers_options() {
+    let recorder = Recorder::default();
+    let agent: Arc<dyn SupportsAgentRun> =
+        Arc::new(Agent::builder(recorder.clone()).name("r").build());
+    let router = ResponsesHostServer::agent(agent)
+        .with_prepare_options(|_request, mut options| {
+            options.temperature = Some(0.25);
+            Ok(options)
+        })
+        .into_router();
+    let (status, _) = json(
+        &router,
+        post("/responses", json!({"input": "x", "temperature": 0.9})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recorder.calls.lock().unwrap()[0].3, Some(0.25));
+}
+
+/// Delays every write, to expose persistence racing the terminal event.
+struct SlowStore(agent_framework_foundry_hosting::InMemoryResponseStore);
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for SlowStore {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.0.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        self.0.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.0.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
+    {
+        self.0.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<agent_framework_core::types::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        self.0.set_conversation(id, transcript).await
+    }
+}
+
+#[tokio::test]
+async fn persistence_completes_before_the_terminal_event() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let store = Arc::new(SlowStore(Default::default()));
+    let echo = Echo::default();
+    let router = ResponsesHostServer::agent(agent(echo))
+        .with_response_store(store)
+        .into_router();
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/responses",
+            json!({"input": "hi", "stream": true, "conversation": "c1"}),
+        ))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    let mut text = String::new();
+    let mut id = None;
+    // Read until the terminal event, then drop the stream at once.
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            text.push_str(&String::from_utf8_lossy(&data));
+        }
+        if let Some((_, data)) = sse_events(&text)
+            .into_iter()
+            .find(|(k, _)| k == "response.completed")
+        {
+            id = data["response"]["id"].as_str().map(str::to_string);
+            break;
+        }
+    }
+    drop(body);
+    let id = id.expect("a terminal event");
+    let (status, fetched) = json(&router, get(&format!("/responses/{id}"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the response was stored before completion was reported"
+    );
+    assert_eq!(fetched["status"], "completed");
+    let (status, next) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "again", "previous_response_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["output_text"], "3 messages, last: again");
+    let (_, in_conversation) = json(
+        &router,
+        post("/responses", json!({"input": "more", "conversation": "c1"})),
+    )
+    .await;
+    assert_eq!(in_conversation["output_text"], "3 messages, last: more");
+}
+
+#[tokio::test]
+async fn background_streams_can_be_replayed() {
+    let router = ResponsesHostServer::agent(agent(Echo::default())).into_router();
+    let (_, queued) = json(
+        &router,
+        post("/responses", json!({"input": "bg", "background": true})),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    let (status, _, body) = send(&router, get(&format!("/responses/{id}?stream=true"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sse_events(&body);
+    assert_eq!(events.first().unwrap().0, "response.created");
+    assert_eq!(events.last().unwrap().0, "response.completed");
+    let (_, _, body) = send(
+        &router,
+        get(&format!("/responses/{id}?stream=true&starting_after=2")),
+    )
+    .await;
+    let resumed = sse_events(&body);
+    assert_eq!(resumed[0].1["sequence_number"], 3);
+    assert_eq!(resumed.len(), events.len() - 3);
+
+    // Only background responses can be replayed.
+    let (_, plain) = json(&router, post("/responses", json!({"input": "x"}))).await;
+    let (status, _) = json(
+        &router,
+        get(&format!(
+            "/responses/{}?stream=true",
+            plain["id"].as_str().unwrap()
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = json(
+        &router,
+        get(&format!("/responses/{id}?stream=true&starting_after=x")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_file_store_survives_a_restart() {
+    use agent_framework_foundry_hosting::FileResponseStore;
+    let dir = std::env::temp_dir().join(format!("af-fstore-{}", uuid_like()));
+    let build = || {
+        ResponsesHostServer::agent(agent(Echo::default()))
+            .with_response_store(Arc::new(FileResponseStore::new(&dir)))
+            .into_router()
+    };
+    let (_, first) = json(
+        &build(),
+        post("/responses", json!({"input": "hello", "conversation": "c"})),
+    )
+    .await;
+    let id = first["id"].as_str().unwrap().to_string();
+    // A new server over the same directory.
+    let router = build();
+    let (status, fetched) = json(&router, get(&format!("/responses/{id}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["output_text"], first["output_text"]);
+    let (_, next) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "again", "previous_response_id": id}),
+        ),
+    )
+    .await;
+    assert_eq!(next["output_text"], "3 messages, last: again");
+    let (_, conv) = json(
+        &router,
+        post("/responses", json!({"input": "more", "conversation": "c"})),
+    )
+    .await;
+    assert_eq!(conv["output_text"], "3 messages, last: more");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn uuid_like() -> String {
+    format!(
+        "{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+#[tokio::test]
+async fn concurrent_turns_on_one_conversation_are_both_kept() {
+    // A slow store widens the window between loading and persisting.
+    let router = ResponsesHostServer::agent(agent(Echo::default()))
+        .with_response_store(Arc::new(SlowStore(Default::default())))
+        .into_router();
+    let a = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "first", "conversation": "shared"}),
+        ),
+    );
+    let b = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "second", "conversation": "shared"}),
+        ),
+    );
+    let ((sa, _), (sb, _)) = tokio::join!(a, b);
+    assert_eq!((sa, sb), (StatusCode::OK, StatusCode::OK));
+    let (_, last) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "third", "conversation": "shared"}),
+        ),
+    )
+    .await;
+    // Both earlier turns (2 messages each) precede the new input.
+    assert_eq!(last["output_text"], "5 messages, last: third");
 }
