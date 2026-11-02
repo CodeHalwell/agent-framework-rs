@@ -306,6 +306,17 @@ struct TodoInner {
     instructions: String,
     store: Arc<dyn TodoStore>,
     mutation_lock: tokio::sync::Mutex<()>,
+    list_message: TodoListMessage,
+}
+
+/// Renders the current todo list into the message a run sees.
+pub type TodoListMessageBuilder = Arc<dyn Fn(&[TodoItem]) -> String + Send + Sync>;
+
+/// How the current list reaches each run.
+#[derive(Clone, Default)]
+struct TodoListMessage {
+    suppress: bool,
+    builder: Option<TodoListMessageBuilder>,
 }
 
 /// Gives an agent a session-scoped todo list.
@@ -350,40 +361,79 @@ impl TodoProvider {
     }
 
     fn build(source_id: String, instructions: String, store: Arc<dyn TodoStore>) -> Self {
+        Self::build_with(source_id, instructions, store, TodoListMessage::default())
+    }
+
+    fn build_with(
+        source_id: String,
+        instructions: String,
+        store: Arc<dyn TodoStore>,
+        list_message: TodoListMessage,
+    ) -> Self {
         Self {
             inner: Arc::new(TodoInner {
                 source_id,
                 instructions,
                 store,
                 mutation_lock: tokio::sync::Mutex::new(()),
+                list_message,
             }),
         }
     }
 
+    fn with_list_message(self, f: impl FnOnce(&mut TodoListMessage)) -> Self {
+        let mut list_message = self.inner.list_message.clone();
+        f(&mut list_message);
+        Self::build_with(
+            self.inner.source_id.clone(),
+            self.inner.instructions.clone(),
+            self.inner.store.clone(),
+            list_message,
+        )
+    }
+
+    /// Builder: do not add the current list to each run (upstream
+    /// `SuppressTodoListMessage`); the model reads it with its tools instead.
+    pub fn with_suppressed_todo_list_message(self, suppress: bool) -> Self {
+        self.with_list_message(|m| m.suppress = suppress)
+    }
+
+    /// Builder: render the current list with `builder` (upstream
+    /// `TodoListMessageBuilder`) instead of the default Markdown list.
+    pub fn with_todo_list_message_builder(
+        self,
+        builder: impl Fn(&[TodoItem]) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.with_list_message(|m| m.builder = Some(Arc::new(builder)))
+    }
+
     /// Builder: use `source_id` as the state key (default `"todo"`).
     pub fn with_source_id(self, source_id: impl Into<String>) -> Self {
-        Self::build(
+        Self::build_with(
             source_id.into(),
             self.inner.instructions.clone(),
             self.inner.store.clone(),
+            self.inner.list_message.clone(),
         )
     }
 
     /// Builder: replace the default instructions.
     pub fn with_instructions(self, instructions: impl Into<String>) -> Self {
-        Self::build(
+        Self::build_with(
             self.inner.source_id.clone(),
             instructions.into(),
             self.inner.store.clone(),
+            self.inner.list_message.clone(),
         )
     }
 
     /// Builder: persist todos through `store` instead of the session state.
     pub fn with_store(self, store: Arc<dyn TodoStore>) -> Self {
-        Self::build(
+        Self::build_with(
             self.inner.source_id.clone(),
             self.inner.instructions.clone(),
             store,
+            self.inner.list_message.clone(),
         )
     }
 
@@ -638,8 +688,15 @@ impl ContextProvider for TodoProvider {
         })?;
         ctx.add_instructions(self.inner.instructions.clone());
         ctx.tools.extend(self.tools(&session));
-        let items = self.items(&session).await?;
-        ctx.messages.push(Message::user(render_todo_list(&items)));
+        let message = &self.inner.list_message;
+        if !message.suppress {
+            let items = self.items(&session).await?;
+            let text = match &message.builder {
+                Some(build) => build(&items),
+                None => render_todo_list(&items),
+            };
+            ctx.messages.push(Message::user(text));
+        }
         Ok(())
     }
 }

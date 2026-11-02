@@ -110,12 +110,13 @@ pub use mode::{
     EXECUTE_MODE_INSTRUCTIONS, PLAN_MODE_INSTRUCTIONS,
 };
 pub use todo::{
-    TodoCompleteInput, TodoFileStore, TodoInput, TodoItem, TodoProvider, TodoSessionStore,
-    TodoStore, DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
+    TodoCompleteInput, TodoFileStore, TodoInput, TodoItem, TodoListMessageBuilder, TodoProvider,
+    TodoSessionStore, TodoStore, DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
 };
 pub use tool_approval::{
-    ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope, ToolApprovalState,
-    ToolAutoApprovalRule, DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS, DEFAULT_TOOL_APPROVAL_SOURCE_ID,
+    all_tools_auto_approval_rule, ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope,
+    ToolApprovalState, ToolAutoApprovalRule, DEFAULT_MAX_AUTO_APPROVAL_ITERATIONS,
+    DEFAULT_TOOL_APPROVAL_SOURCE_ID,
 };
 
 use std::future::Future;

@@ -94,6 +94,23 @@ pub fn attribute_message(
     }
 }
 
+/// Tag `message` with a source (upstream `WithAgentRequestMessageSource`),
+/// returning it.
+pub fn with_message_source(mut message: Message, source_type: &str, source_id: &str) -> Message {
+    attribute_message(&mut message, source_id, Some(source_type), &[]);
+    message
+}
+
+/// The type of the source a message was attributed to, if any (upstream
+/// `GetAgentRequestMessageSourceType`).
+pub fn message_source_type(message: &Message) -> Option<&str> {
+    message
+        .additional_properties
+        .get(ATTRIBUTION_KEY)?
+        .get("source_type")?
+        .as_str()
+}
+
 /// The source a context message was attributed to, if any.
 pub fn message_source_id(message: &Message) -> Option<&str> {
     message

@@ -275,6 +275,9 @@ pub struct SkillsProvider {
     loaded: Arc<Mutex<HashSet<String>>>,
     script_runner: Option<SkillScriptRunner>,
     script_approval: bool,
+    load_approval: bool,
+    resource_approval: bool,
+    instructions_prompt: Option<String>,
 }
 
 impl SkillsProvider {
@@ -287,7 +290,44 @@ impl SkillsProvider {
             loaded: Arc::new(Mutex::new(HashSet::new())),
             script_runner: None,
             script_approval: true,
+            load_approval: false,
+            resource_approval: false,
+            instructions_prompt: None,
         }
+    }
+
+    /// Keep only the skills `filter` accepts (upstream `UseFilter`).
+    pub fn with_filter(mut self, filter: impl Fn(&Skill) -> bool) -> Self {
+        let kept: HashMap<String, Skill> = self
+            .skills
+            .iter()
+            .filter(|(_, s)| filter(s))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.skills = Arc::new(kept);
+        self
+    }
+
+    /// Replace the catalog's introduction (upstream `SkillsInstructionPrompt`
+    /// / `UsePromptTemplate`). `{skills}` in the template is replaced by the
+    /// skill list; without it the list follows the template.
+    pub fn with_instructions_prompt(mut self, template: impl Into<String>) -> Self {
+        self.instructions_prompt = Some(template.into());
+        self
+    }
+
+    /// Whether `load_skill` requires approval (off by default here; upstream
+    /// requires it unless `DisableLoadSkillApproval`).
+    pub fn with_load_skill_approval(mut self, required: bool) -> Self {
+        self.load_approval = required;
+        self
+    }
+
+    /// Whether `read_skill_resource` requires approval (off by default
+    /// here; upstream requires it unless `DisableReadSkillResourceApproval`).
+    pub fn with_read_skill_resource_approval(mut self, required: bool) -> Self {
+        self.resource_approval = required;
+        self
     }
 
     /// Run file-based scripts with `runner`. Without one, running a file
@@ -321,17 +361,32 @@ impl SkillsProvider {
         let mut names: Vec<&String> = self.skills.keys().collect();
         names.sort();
 
-        let mut lines = vec![
-            "Available skills (progressive disclosure — each skill below is only \
+        let intro = "Available skills (progressive disclosure — each skill below is only \
              summarized; call the `load_skill` tool with a skill's name to reveal \
              its full instructions, and `read_skill_resource` to read one of its \
-             named resources):"
-                .to_string(),
-        ];
-        for name in names {
-            let skill = &self.skills[name];
-            lines.push(format!("- {}: {}", skill.name, skill.description));
-        }
+             named resources):";
+        let list: Vec<String> = names
+            .into_iter()
+            .map(|name| {
+                let skill = &self.skills[name];
+                format!("- {}: {}", skill.name, skill.description)
+            })
+            .collect();
+        let mut lines = match &self.instructions_prompt {
+            Some(template) if template.contains("{skills}") => {
+                vec![template.replace("{skills}", &list.join("\n"))]
+            }
+            Some(template) => {
+                let mut l = vec![template.clone()];
+                l.extend(list);
+                l
+            }
+            None => {
+                let mut l = vec![intro.to_string()];
+                l.extend(list);
+                l
+            }
+        };
         if self.has_scripts() {
             lines.push(
                 "Use `run_skill_script` to run a script a loaded skill lists, using the name \
@@ -564,9 +619,17 @@ impl ContextProvider for SkillsProvider {
             ctx.add_instructions(instructions);
         }
 
-        ctx.tools.push(self.load_skill_tool().into_definition());
+        let gate = |tool: FunctionTool, required: bool| {
+            if required {
+                tool.with_approval_mode(crate::tools::ApprovalMode::AlwaysRequire)
+            } else {
+                tool
+            }
+        };
         ctx.tools
-            .push(self.read_skill_resource_tool().into_definition());
+            .push(gate(self.load_skill_tool(), self.load_approval).into_definition());
+        ctx.tools
+            .push(gate(self.read_skill_resource_tool(), self.resource_approval).into_definition());
         if self.has_scripts() {
             ctx.tools
                 .push(self.run_skill_script_tool().into_definition());

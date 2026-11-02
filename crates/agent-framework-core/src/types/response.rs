@@ -728,6 +728,17 @@ pub struct AgentResponse {
 }
 
 impl AgentResponse {
+    /// The response as the stream of updates that would aggregate back into
+    /// it (upstream `ToAgentResponseUpdates`): one update per message with a
+    /// distinct id, ids on every update, and usage and finish reason on the
+    /// last.
+    pub fn to_updates(&self) -> Vec<AgentResponseUpdate> {
+        crate::agent::response_to_updates(self.clone())
+            .into_iter()
+            .filter_map(|u| u.ok())
+            .collect()
+    }
+
     /// The concatenated text of all messages (no separator), matching Python.
     ///
     /// Empty when the run's final assistant turn is a refusal — see

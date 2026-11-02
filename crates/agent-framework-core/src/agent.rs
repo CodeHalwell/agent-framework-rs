@@ -1596,6 +1596,12 @@ impl Agent {
         &self.chat_options.tools
     }
 
+    /// The chat client the agent calls: the configured client wrapped in the
+    /// function-invocation layer.
+    pub fn chat_client(&self) -> &Arc<dyn ChatClient> {
+        &self.client
+    }
+
     /// The context providers configured on the agent (a session's own
     /// providers run alongside them).
     pub fn context_providers(&self) -> &[Arc<dyn ContextProvider>] {

@@ -1061,70 +1061,98 @@
       },
       "AgentRequestMessageSourceAttribution": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+          "rust": [
+            "agent_framework_core::memory::ATTRIBUTION_KEY",
+            "agent_framework_core::memory::attribute_message"
+          ],
+          "status": "adapted",
+          "note": "Attribution is a JSON object under additional_properties[\"_attribution\"] (source_id, source_type, origin_session_ids), as upstream Python."
         },
         "constructors": {
           "AgentRequestMessageSourceAttribution(AgentRequestMessageSourceType, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::attribute_message"
+            ],
+            "status": "adapted",
+            "note": "attribute_message writes it."
           }
         },
         "properties": {
           "SourceId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_id"
+            ],
+            "status": "adapted",
+            "note": "Read with message_source_id."
           },
           "SourceType": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "Read with message_source_type."
           }
         },
         "fields": {
           "AdditionalPropertiesKey": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::ATTRIBUTION_KEY"
+            ],
+            "status": "mapped",
+            "note": "The additional_properties key."
           }
         }
       },
       "AgentRequestMessageSourceType": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+          "rust": [
+            "agent_framework_core::memory::message_source_type"
+          ],
+          "status": "adapted",
+          "note": "The source type is a string: the provider's type name for context messages (as upstream Python), or any caller-chosen value such as \"External\"."
         },
         "constructors": {
           "AgentRequestMessageSourceType(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           }
         },
         "properties": {
           "AIContextProvider": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "ChatHistory": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "External": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           },
           "Value": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source",
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "adapted",
+            "note": "A string value rather than a typed constant."
           }
         }
       },
@@ -1206,9 +1234,11 @@
         },
         "methods": {
           "ToAgentResponseUpdates()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The response-to-updates conversion is crate-private (agent::response_to_updates), not public API."
+            "rust": [
+              "agent_framework_core::types::response::AgentResponse::to_updates"
+            ],
+            "status": "mapped",
+            "note": "Public method."
           }
         }
       },
@@ -1733,9 +1763,11 @@
             "note": "from_paths discovers the skills; options come from FileSkillsSource and the runner from with_script_runner."
           },
           "UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No skill filter predicate; callers must filter the Vec<Skill> before SkillsProvider::new."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_filter"
+            ],
+            "status": "partial",
+            "note": "A predicate over skills; it takes no source context."
           },
           "UseLoggerFactory(ILoggerFactory)": {
             "rust": [
@@ -1745,14 +1777,18 @@
             "note": "Rust logs through the global tracing subscriber, so no logger is passed in."
           },
           "UseOptions(Action<AgentSkillsProviderOptions>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "SkillsProvider has no options type to configure."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider"
+            ],
+            "status": "adapted",
+            "note": "Options are builder methods on SkillsProvider."
           },
           "UsePromptTemplate(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_instructions_prompt"
+            ],
+            "status": "mapped",
+            "note": "Builder method; {skills} is replaced by the list."
           },
           "UseSkill(AgentSkill)": {
             "rust": [
@@ -1789,25 +1825,33 @@
       },
       "AgentSkillsProviderOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "SkillsProvider has no options type; prompt, approvals and error detail are fixed."
+          "rust": [
+            "agent_framework_core::skills::SkillsProvider"
+          ],
+          "status": "adapted",
+          "note": "Options are builder methods on SkillsProvider."
         },
         "properties": {
           "DisableLoadSkillApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_load_skill_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; off by default here (upstream requires approval by default)."
           },
           "DisableReadSkillResourceApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_read_skill_resource_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; off by default here (upstream requires approval by default)."
           },
           "DisableRunSkillScriptApproval": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill tools are always plain executable FunctionTools; there is no approval gating to disable."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_approval"
+            ],
+            "status": "adapted",
+            "note": "Builder method; approval required by default, as upstream."
           },
           "IncludeDetailedErrors": {
             "rust": [],
@@ -1815,9 +1859,11 @@
             "note": "No option controls error detail; unknown skills/resources always return a fixed message."
           },
           "SkillsInstructionPrompt": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_instructions_prompt"
+            ],
+            "status": "adapted",
+            "note": "Builder method."
           }
         }
       },
@@ -2005,9 +2051,11 @@
             "note": "Accessor for the agent's configured providers."
           },
           "ChatClient": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Agent has no accessor for its underlying ChatClient."
+            "rust": [
+              "agent_framework_core::agent::Agent::chat_client"
+            ],
+            "status": "adapted",
+            "note": "Returns the client wrapped in the function-invocation layer."
           },
           "ChatHistoryProvider": {
             "rust": [],
@@ -2145,9 +2193,11 @@
             "note": "Builder method."
           },
           "EnableMessageInjection": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No mid-run message injection."
+            "rust": [
+              "agent_framework_core::session::enqueue_messages"
+            ],
+            "status": "adapted",
+            "note": "Message injection is always available: messages queued on the session join the next model call (streaming and not)."
           },
           "Id": {
             "rust": [
@@ -2164,9 +2214,11 @@
             "note": "Builder method."
           },
           "RequirePerServiceCallChatHistoryPersistence": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "History is persisted once per run in after_run, never per service call inside the tool loop."
+            "rust": [
+              "agent_framework_core::agent::AgentBuilder::require_per_service_call_history_persistence"
+            ],
+            "status": "mapped",
+            "note": "Builder option."
           },
           "ThrowOnChatHistoryProviderConflict": {
             "rust": [],
@@ -2320,19 +2372,25 @@
       "ChatMessageExtensions": {
         "methods": {
           "GetAgentRequestMessageSourceId(ChatMessage)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_id"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           },
           "GetAgentRequestMessageSourceType(ChatMessage)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::message_source_type"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           },
           "WithAgentRequestMessageSource(ChatMessage, AgentRequestMessageSourceType, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source."
+            "rust": [
+              "agent_framework_core::memory::with_message_source"
+            ],
+            "status": "mapped",
+            "note": "Free function."
           }
         }
       },
@@ -3161,9 +3219,12 @@
       },
       "MessageInjectingChatClient": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+          "rust": [
+            "agent_framework_core::client::FunctionInvokingChatClient",
+            "agent_framework_core::session::enqueue_messages"
+          ],
+          "status": "adapted",
+          "note": "Injection is built into FunctionInvokingChatClient rather than a separate client."
         },
         "methods": {
           "EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)": {
@@ -3405,14 +3466,18 @@
             "note": "Replaces the todo instructions."
           },
           "SuppressTodoListMessage": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The current-list message is always injected; there is no option to suppress it."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::with_suppressed_todo_list_message"
+            ],
+            "status": "mapped",
+            "note": "Builder method."
           },
           "TodoListMessageBuilder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "The current-list message has a fixed format; there is no custom builder."
+            "rust": [
+              "agent_framework_core::harness::todo::TodoProvider::with_todo_list_message_builder"
+            ],
+            "status": "mapped",
+            "note": "Builder method taking a closure over the items."
           }
         }
       },
@@ -3435,9 +3500,11 @@
         },
         "properties": {
           "AllToolsAutoApprovalRule": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No predefined approve-everything rule; the closure |_: &FunctionCallContent| true serves."
+            "rust": [
+              "agent_framework_core::harness::tool_approval::all_tools_auto_approval_rule"
+            ],
+            "status": "mapped",
+            "note": "Free function usable as a rule."
           }
         },
         "constants": {

@@ -21,6 +21,13 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Smaller parity options: `AgentResponse::to_updates`, `Agent::chat_client`,
+  `memory::with_message_source` / `message_source_type`,
+  `SkillsProvider::with_filter`, `with_instructions_prompt`,
+  `with_load_skill_approval` and `with_read_skill_resource_approval`,
+  `TodoProvider::with_suppressed_todo_list_message` and
+  `with_todo_list_message_builder`, and
+  `harness::all_tools_auto_approval_rule`.
 - Workflow run controls: `WorkflowContext::request_halt` (stop after the
   superstep), `WorkflowRunStream::cancel`, per-run `session_id` on
   `WorkflowRun` and `WorkflowRunStream`, a defaulted `Executor::reset`

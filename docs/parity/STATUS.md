@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 2 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 144 / 206 / 19 / 93 / 0 | 41 | 22 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 154 / 225 / 20 / 63 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 59 / 14 / 4 / 0 / 0 | 2 | 4 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 5 / 0 / 8 / 0 | 0 | 0 |
@@ -52,18 +52,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(string, string, string, string, string, string, AdditionalPropertiesDictionary, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name, description and instructions; license, compatibility, allowedTools and metadata have no field. |
 | `Microsoft.Agents.AI::AgentInlineSkill methods::AddResource(string, Delegate, string, JsonSerializerOptions)` | partial | adapted | with_resource stores static string content only; there is no delegate-computed resource. |
 | `Microsoft.Agents.AI::AgentInlineSkill methods::AddResource(string, object, string)` | partial | adapted | with_resource takes name and string content but no resource description. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution constructors::AgentRequestMessageSourceAttribution(AgentRequestMessageSourceType, string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution fields::AdditionalPropertiesKey` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution properties::SourceId` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution properties::SourceType` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceAttribution` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType constructors::AgentRequestMessageSourceType(string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::AIContextProvider` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::ChatHistory` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::External` | unmapped | mapped | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType properties::Value` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentRequestMessageSourceType` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::AgentResponse methods::ToAgentResponseUpdates()` | unmapped | mapped | The response-to-updates conversion is crate-private (agent::response_to_updates), not public API. |
 | `Microsoft.Agents.AI::AgentResponse properties::AgentId` | unmapped | mapped | AgentResponse carries no agent id. |
 | `Microsoft.Agents.AI::AgentResponse properties::RawRepresentation` | unmapped | mapped | AgentResponse keeps no raw provider payload (only AgentResponseUpdate does). |
 | `Microsoft.Agents.AI::AgentResponse<T> properties::IsWrappedInObject` | unmapped | unmapped | Non-object schemas are not wrapped in an object envelope, so there is no unwrap flag. |
@@ -79,17 +67,10 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentSkillsProvider constructors::AgentSkillsProvider(AgentSkillsSource, AgentSkillsProviderOptions, ILoggerFactory, bool)` | partial | adapted | SkillsProvider::new takes a Vec<Skill>; there is no source, options or caching parameter. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::DisableCaching()` | unmapped | mapped | No source caching layer exists because skills are a fixed in-memory list. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseCachingOptions(Action<CachingAgentSkillsSourceOptions>)` | unmapped | unmapped | No source caching layer exists because skills are a fixed in-memory list. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)` | unmapped | partial | No skill filter predicate; callers must filter the Vec<Skill> before SkillsProvider::new. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseOptions(Action<AgentSkillsProviderOptions>)` | unmapped | adapted | SkillsProvider has no options type to configure. |
-| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UsePromptTemplate(string)` | unmapped | mapped | The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden. |
+| `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)` | partial | partial | A predicate over skills; it takes no source context. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseSource(AgentSkillsSource)` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsProviderBuilder methods::UseSource(Func<ILoggerFactory, AgentSkillsSource>)` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableLoadSkillApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableReadSkillResourceApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::DisableRunSkillScriptApproval` | unmapped | mapped | Skill tools are always plain executable FunctionTools; there is no approval gating to disable. |
 | `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::IncludeDetailedErrors` | unmapped | mapped | No option controls error detail; unknown skills/resources always return a fixed message. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions properties::SkillsInstructionPrompt` | unmapped | mapped | The catalog prompt text is hard-coded in SkillsProvider and cannot be overridden. |
-| `Microsoft.Agents.AI::AgentSkillsProviderOptions` | unmapped | mapped | SkillsProvider has no options type; prompt, approvals and error detail are fixed. |
 | `Microsoft.Agents.AI::AgentSkillsSource methods::GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsSource` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AgentSkillsSourceContext properties::Agent` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. No per-run agent context is passed to skill lookup. |
@@ -100,18 +81,12 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions` | unmapped | intentional | No options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::CachingAgentSkillsSource` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::ChatClientAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup hook; Agent exposes no accessor for its chat client or metadata. |
-| `Microsoft.Agents.AI::ChatClientAgent properties::ChatClient` | unmapped | unmapped | Agent has no accessor for its underlying ChatClient. |
 | `Microsoft.Agents.AI::ChatClientAgent properties::ChatHistoryProvider` | unmapped | unmapped | Agent has no accessor for a configured history provider. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::ClearOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
-| `Microsoft.Agents.AI::ChatClientAgentOptions properties::EnableMessageInjection` | unmapped | adapted | No mid-run message injection. |
-| `Microsoft.Agents.AI::ChatClientAgentOptions properties::RequirePerServiceCallChatHistoryPersistence` | unmapped | mapped | History is persisted once per run in after_run, never per service call inside the tool loop. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::ThrowOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
 | `Microsoft.Agents.AI::ChatClientAgentOptions properties::WarnOnChatHistoryProviderConflict` | unmapped | mapped | No configurable policy. A service-managed conversation id always disengages history providers for the run, as .NET does after clearing; Rust neither warns nor throws, including for a provider the caller attached. |
 | `Microsoft.Agents.AI::ChatClientAgentRunOptions properties::ChatClientFactory` | unmapped | unmapped | No per-run hook to wrap or replace the chat client. |
 | `Microsoft.Agents.AI::ChatHistoryProvider.InvokedContext properties::Agent` | unmapped | adapted | after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent). |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceId(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::GetAgentRequestMessageSourceType(ChatMessage)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
-| `Microsoft.Agents.AI::ChatMessageExtensions methods::WithAgentRequestMessageSource(ChatMessage, AgentRequestMessageSourceType, string)` | unmapped | adapted | No message source attribution: Rust keeps context-provider messages separate in SessionContext and never tags messages with a source. |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator constructors::CompletionMarkerLoopEvaluator(string, CompletionMarkerLoopEvaluatorOptions)` | unmapped | adapted | CompletionMarkerLoopEvaluator: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator methods::EvaluateAsync(LoopContext, CancellationToken)` | unmapped | mapped | EvaluateAsync: no built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
 | `Microsoft.Agents.AI::CompletionMarkerLoopEvaluator` | unmapped | mapped | No built-in completion-marker condition; a LoopAgent::builder closure checking the response text does the same. |
@@ -137,12 +112,8 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::LoopContext properties::AdditionalProperties` | unmapped | mapped | No property bag on the loop context; callbacks can keep state in the session or their own captures. |
 | `Microsoft.Agents.AI::LoopContext properties::Agent` | unmapped | adapted | The context carries no agent; helpers that need a provider take it explicitly. |
 | `Microsoft.Agents.AI::LoopContext properties::RunOptions` | unmapped | adapted | The run options are not exposed to loop callbacks. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient` | unmapped | adapted | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::ProviderSessionState<TState>` | partial | adapted | before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session). |
 | `Microsoft.Agents.AI::TodoCompletionLoopEvaluator constants::RemainingTodosPlaceholder` | unmapped | intentional | The todo reminder is not templated; todos_remaining_message lists the open items directly. |
-| `Microsoft.Agents.AI::TodoProviderOptions properties::SuppressTodoListMessage` | unmapped | mapped | The current-list message is always injected; there is no option to suppress it. |
-| `Microsoft.Agents.AI::TodoProviderOptions properties::TodoListMessageBuilder` | unmapped | mapped | The current-list message has a fixed format; there is no custom builder. |
-| `Microsoft.Agents.AI::ToolApprovalAgent properties::AllToolsAutoApprovalRule` | unmapped | mapped | No predefined approve-everything rule; the closure \|_: &FunctionCallContent\| true serves. |
 | `Microsoft.Agents.AI::ToolApprovalAgentOptions properties::JsonSerializerOptions` | unmapped | adapted | Rule arguments and state are serialized with serde; there are no serializer options. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext constructors::ToolAutoApprovalRuleContext(FunctionCallContent, AIAgent, AgentSession, IReadOnlyCollection<ChatMessage>, AgentRunOptions)` | unmapped | adapted | No rule context type; rules receive the function call directly. |
 | `Microsoft.Agents.AI::ToolAutoApprovalRuleContext properties::Agent` | unmapped | mapped | Auto-approval rules do not receive the agent. |
