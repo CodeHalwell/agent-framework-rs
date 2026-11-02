@@ -49,8 +49,6 @@ sql-server = ["dep:agent-framework-sql-server", "experimental-vector-stores"]
 mongodb = ["dep:agent-framework-mongodb", "experimental-vector-stores"]
 # The Azure DocumentDB (MongoDB vCore) vector store (experimental).
 azure-documentdb = ["dep:agent-framework-azure-documentdb", "experimental-vector-stores"]
-# The embedded DuckDB vector store (experimental; bundles DuckDB, a C++ build).
-duckdb = ["dep:agent-framework-duckdb", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -75,7 +73,6 @@ experimental-vector-stores = [
     "agent-framework-redis?/experimental-vector-stores",
     "agent-framework-qdrant?/experimental-vector-stores",
     "agent-framework-postgres?/experimental-vector-stores",
-    "agent-framework-duckdb?/experimental-vector-stores",
     "agent-framework-azure-documentdb?/experimental-vector-stores",
     "agent-framework-mongodb?/experimental-vector-stores",
     "agent-framework-sql-server?/experimental-vector-stores",
@@ -168,7 +165,6 @@ agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-qdrant = { workspace = true, optional = true }
 agent-framework-postgres = { workspace = true, optional = true }
-agent-framework-duckdb = { workspace = true, optional = true }
 agent-framework-azure-documentdb = { workspace = true, optional = true }
 agent-framework-mongodb = { workspace = true, optional = true }
 agent-framework-sql-server = { workspace = true, optional = true }

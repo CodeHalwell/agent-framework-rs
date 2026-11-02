@@ -93,8 +93,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   operation. Bytes fields and generated keys are not supported. Tested
   offline (statement building); live tests need `AF_SQL_SERVER_TEST_URL`.
 
-- `agent-framework-duckdb` (experimental, `VECTOR_STORES`; umbrella feature
-  `duckdb`): an embedded DuckDB vector store ported from upstream's
+- `agent-framework-duckdb` (experimental, `VECTOR_STORES`; depend on it
+  directly: it is not re-exported by the umbrella crate, whose
+  `--all-features` builds would otherwise link the bundled DuckDB library
+  into every example binary): an embedded DuckDB vector store ported from upstream's
   `agent_framework_duckdb`. Typed columns, `FLOAT[n]`/`DOUBLE[n]` vectors,
   cosine distance/similarity, dot product and Euclidean search, upserts
   with `ON CONFLICT`, and parameterized portable filters (equality, `in`,

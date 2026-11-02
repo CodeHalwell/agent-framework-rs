@@ -23,7 +23,6 @@ dependencies = [
  "agent-framework-core",
  "agent-framework-cosmos",
  "agent-framework-declarative",
- "agent-framework-duckdb",
  "agent-framework-foundry",
  "agent-framework-foundry-hosting",
  "agent-framework-foundry-local",

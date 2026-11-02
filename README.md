@@ -219,7 +219,6 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `sql-server` | [`agent-framework-sql-server`](crates/agent-framework-sql-server) — SQL Server vector store (experimental) | no |
 | `mongodb` | [`agent-framework-mongodb`](crates/agent-framework-mongodb) — MongoDB Atlas vector store (experimental) | no |
 | `azure-documentdb` | [`agent-framework-azure-documentdb`](crates/agent-framework-azure-documentdb) — Azure DocumentDB (MongoDB vCore) vector store (experimental) | no |
-| `duckdb` | [`agent-framework-duckdb`](crates/agent-framework-duckdb) — embedded DuckDB vector store (experimental) | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `claude` | [`agent-framework-claude`](crates/agent-framework-claude) — the Claude Code CLI as an agent | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
