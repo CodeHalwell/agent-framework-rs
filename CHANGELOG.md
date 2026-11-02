@@ -77,6 +77,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- Message injection now also applies to streamed runs: messages queued on
+  the session are streamed as their own updates and sent with the request,
+  and a message queued mid-turn earns another call on the same stream
+  (upstream `_stream_injected_messages`). To make that follow-up call from
+  inside the stream, `FunctionInvokingChatClient` holds its inner client in
+  an `Arc`, and its `ChatClient` impl requires `C: 'static`.
 - **Behavior change:** the Responses parsers (OpenAI, Azure OpenAI,
   Foundry) return one assistant message per `message` output item, with the
   item's id as `message_id`, instead of a single message whose id was the

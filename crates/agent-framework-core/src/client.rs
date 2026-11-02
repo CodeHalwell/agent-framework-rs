@@ -132,7 +132,9 @@ impl<T: EmbeddingClient + ?Sized> EmbeddingClient for Arc<T> {
 /// Wraps a [`ChatClient`] to automatically execute local tool calls in a loop,
 /// mirroring `use_function_invocation`.
 pub struct FunctionInvokingChatClient<C: ChatClient> {
-    inner: C,
+    // Shared so a streamed run with message injection can make its follow-up
+    // calls from inside the returned ('static) stream.
+    inner: Arc<C>,
     config: FunctionInvocationConfig,
     /// Governs the `execute_tool` spans this client emits: content capture and
     /// the GenAI semantic-convention version. Resolved from the environment
@@ -150,7 +152,7 @@ pub struct FunctionInvokingChatClient<C: ChatClient> {
 impl<C: ChatClient> FunctionInvokingChatClient<C> {
     pub fn new(inner: C) -> Self {
         Self {
-            inner,
+            inner: Arc::new(inner),
             config: FunctionInvocationConfig::default(),
             function_middleware: MiddlewarePipeline::default(),
             observability: crate::observability::ObservabilityConfig::from_env(),
@@ -254,6 +256,141 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
             earlier.extend(response.messages);
         }
     }
+}
+
+/// A streamed model call with message injection, the streaming counterpart
+/// of `inner_get_response`: messages queued on the session are streamed (as
+/// their own updates) and sent ahead of each call, and while a call's reply
+/// asks for nothing more and messages are still queued, another call answers
+/// them, its updates following on the same stream (upstream
+/// `_stream_injected_messages`). The aggregated stream carries what the
+/// non-streaming call returns: injected messages and every reply, in order.
+async fn inject_streaming<C: ChatClient + 'static>(
+    inner: Arc<C>,
+    messages: Vec<Message>,
+    options: ChatOptions,
+    session: AgentSession,
+) -> Result<ChatStream> {
+    struct State<C: ChatClient> {
+        inner: Arc<C>,
+        session: AgentSession,
+        conversation: Vec<Message>,
+        options: ChatOptions,
+        current: Option<ChatStream>,
+        round_updates: Vec<ChatResponseUpdate>,
+        queued: VecDeque<ChatResponseUpdate>,
+        round: usize,
+        done: bool,
+    }
+
+    fn injected_updates(messages: &[Message], round: usize) -> Vec<ChatResponseUpdate> {
+        messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ChatResponseUpdate {
+                contents: m.contents.clone(),
+                role: Some(m.role.clone()),
+                author_name: m.author_name.clone(),
+                message_id: Some(
+                    m.message_id
+                        .clone()
+                        .unwrap_or_else(|| format!("injected-{round}-{i}")),
+                ),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    // The first call starts here, so its errors surface from this function
+    // as they do without injection.
+    let mut conversation = messages;
+    let injected = crate::session::drain_pending_messages(&session);
+    let queued: VecDeque<_> = injected_updates(&injected, 0).into();
+    conversation.extend(injected);
+    let first = inner
+        .get_streaming_response(conversation.clone(), options.clone())
+        .await?;
+    let state = State {
+        inner,
+        session,
+        conversation,
+        options,
+        current: Some(first),
+        round_updates: Vec::new(),
+        queued,
+        round: 0,
+        done: false,
+    };
+    Ok(stream::unfold(state, |mut st| async move {
+        loop {
+            if let Some(update) = st.queued.pop_front() {
+                return Some((Ok(update), st));
+            }
+            if st.done {
+                return None;
+            }
+            if let Some(current) = st.current.as_mut() {
+                match current.next().await {
+                    Some(Ok(mut update)) => {
+                        // Later rounds follow injected user messages; an
+                        // unnamed reply would otherwise merge into the
+                        // previous round's assistant message on aggregation.
+                        if st.round > 0 && update.message_id.is_none() {
+                            update.message_id = Some(format!("injection-reply-{}", st.round));
+                        }
+                        st.round_updates.push(update.clone());
+                        return Some((Ok(update), st));
+                    }
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(e), st));
+                    }
+                    None => {}
+                }
+                st.current = None;
+                let response = ChatResponse::from_updates(std::mem::take(&mut st.round_updates));
+                let follow_up = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .any(|c| {
+                        matches!(
+                            c,
+                            Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
+                        )
+                    });
+                if follow_up || crate::session::pending_messages(&st.session).is_empty() {
+                    st.done = true;
+                    continue;
+                }
+                match response.conversation_id.clone() {
+                    // The service holds the history: send only what is new.
+                    Some(cid) => {
+                        st.options.conversation_id = Some(cid);
+                        st.conversation.clear();
+                    }
+                    None => st.conversation.extend(response.messages),
+                }
+                st.round += 1;
+                let injected = crate::session::drain_pending_messages(&st.session);
+                st.queued.extend(injected_updates(&injected, st.round));
+                st.conversation.extend(injected);
+                match st
+                    .inner
+                    .get_streaming_response(st.conversation.clone(), st.options.clone())
+                    .await
+                {
+                    Ok(next) => st.current = Some(next),
+                    Err(e) => {
+                        st.done = true;
+                        st.queued.clear();
+                        return Some((Err(e), st));
+                    }
+                }
+            }
+        }
+    })
+    .boxed())
 }
 
 /// Extract the executable tools from the options into a name→tool map.
@@ -1035,7 +1172,7 @@ fn replace_approval_contents_with_results(
 }
 
 #[async_trait]
-impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
+impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
     async fn get_response(
         &self,
         messages: Vec<Message>,
@@ -1617,7 +1754,13 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
         if tools.is_empty() || !self.config.enabled {
             let mut messages = messages;
             drop_settled_approval_responses(&mut messages);
-            return self.inner.get_streaming_response(messages, options).await;
+            let mut options = options;
+            return match options.session.take() {
+                None => self.inner.get_streaming_response(messages, options).await,
+                Some(session) => {
+                    inject_streaming(self.inner.clone(), messages, options, session).await
+                }
+            };
         }
         // With tools, run the full loop then stream the aggregated result.
         // Each message is replayed as its own update with a stable, distinct

@@ -46,10 +46,23 @@ impl ChatClient for Scripted {
 
     async fn get_streaming_response(
         &self,
-        _messages: Vec<Message>,
-        _options: ChatOptions,
+        messages: Vec<Message>,
+        options: ChatOptions,
     ) -> agent_framework_core::error::Result<ChatStream> {
-        unimplemented!("not used")
+        let response = self.get_response(messages, options).await?;
+        // Word by word, with no message id, as a plain provider streams.
+        let text = response.text();
+        let updates: Vec<_> = text
+            .split_inclusive(' ')
+            .map(|word| {
+                Ok(ChatResponseUpdate {
+                    contents: vec![Content::text(word)],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(Box::pin(futures::stream::iter(updates)))
     }
 }
 
@@ -108,6 +121,61 @@ async fn a_message_queued_mid_turn_gets_its_own_answer() {
         .run(vec![Message::user("next")], Some(&mut session))
         .await
         .unwrap();
+    let last = client.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        last,
+        ["hi", "answer one", "one more thing", "answer two", "next"]
+    );
+}
+
+async fn stream_texts(
+    agent: &Agent,
+    session: &AgentSession,
+    input: &str,
+) -> (Vec<String>, AgentResponse) {
+    use futures::StreamExt;
+    let mut stream = agent
+        .run_stream(vec![Message::user(input)], Some(session.clone()), None)
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Some(update) = stream.next().await {
+        updates.push(update.unwrap());
+    }
+    let response = AgentResponse::from_updates(updates);
+    let texts = response.messages.iter().map(Message::text).collect();
+    (texts, response)
+}
+
+#[tokio::test]
+async fn streaming_sends_queued_messages_with_the_request() {
+    let client = scripted(&["first answer"]);
+    let agent = Agent::builder(client.clone()).build();
+    let session = agent.create_session();
+    enqueue_messages(&session, "also: be brief");
+    let (texts, _) = stream_texts(&agent, &session, "hello").await;
+    assert!(pending_messages(&session).is_empty());
+    assert_eq!(client.seen.lock().unwrap()[0], ["hello", "also: be brief"]);
+    assert_eq!(texts, ["also: be brief", "first answer"]);
+}
+
+#[tokio::test]
+async fn streaming_answers_a_message_queued_mid_turn_on_the_same_stream() {
+    let client = scripted(&["answer one", "answer two"]);
+    let agent = Agent::builder(client.clone()).build();
+    let session = agent.create_session();
+    let queue_into = session.clone();
+    *client.during_first.lock().unwrap() = Some(Box::new(move || {
+        enqueue_messages(&queue_into, "one more thing")
+    }));
+    let (texts, _) = stream_texts(&agent, &session, "hi").await;
+    let seen = client.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[1], ["hi", "answer one", "one more thing"]);
+    assert_eq!(texts, ["answer one", "one more thing", "answer two"]);
+
+    // As without streaming, history recorded the whole exchange.
+    stream_texts(&agent, &session, "next").await;
     let last = client.seen.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
         last,
