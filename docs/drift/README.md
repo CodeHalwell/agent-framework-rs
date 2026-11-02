@@ -31,6 +31,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-11-02-ca65085e-round-5`](2026-11-02-ca65085e-round-5.md) | Parity push: harness, evaluation, Qdrant, Postgres, Valkey, cloud streaming (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-4`](2026-11-02-ca65085e-round-4.md) | Clearing the queue: Redis scope leak, AG-UI error echo, User-Agent, transport errors and more (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-3`](2026-11-02-ca65085e-round-3.md) | Anthropic server-tool replay + `pause_turn` continuation (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-2`](2026-11-02-ca65085e-round-2.md) | Queued fixes + the Azure Rust SDK review (same upstream baseline, `ca65085e`) |
