@@ -416,3 +416,37 @@ async fn a_function_call_never_announced_to_a_resumed_stream_comes_from_its_done
         (1, "lookup".into(), "{\"city\":\"paris\"}".into())
     );
 }
+
+#[tokio::test]
+async fn a_cancelled_background_stream_ends_the_operation() {
+    let (base_url, _seen) = scripted_server(vec![sse_reply(&[
+        json!({ "type": "response.created", "sequence_number": 0,
+                "response": { "id": "resp_c", "model": "gpt-test", "status": "queued" } }),
+        json!({ "type": "response.output_text.delta", "sequence_number": 1,
+                "item_id": "msg_1", "delta": "partial" }),
+        json!({ "type": "response.cancelled", "sequence_number": 2,
+                "response": { "id": "resp_c", "model": "gpt-test", "status": "cancelled",
+                              "output": [] } }),
+    ])]);
+    let updates = collect(
+        client(base_url)
+            .get_streaming_response(
+                vec![Message::user("go")],
+                ChatOptions::new().with_background(true),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    let last = updates.last().unwrap();
+    assert!(
+        last.continuation_token.is_none(),
+        "cancellation is terminal"
+    );
+    let aggregated = ChatResponse::from_updates(updates);
+    assert!(
+        aggregated.continuation_token.is_none(),
+        "a cancelled operation is not pending"
+    );
+    assert_eq!(aggregated.text(), "partial");
+}

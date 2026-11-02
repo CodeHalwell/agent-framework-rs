@@ -1974,7 +1974,11 @@ fn parse_responses_event(
         // stream would lose its finish reason, usage and response id
         // entirely, which is exactly the information the distinct event
         // name exists to deliver.
-        "response.completed" | "response.incomplete" => {
+        // `response.cancelled` (a background response cancelled mid-stream)
+        // ends the stream the same way: a final update with the response's
+        // metadata, which a background stream stamps as terminal so the
+        // aggregated continuation token is cleared.
+        "response.completed" | "response.incomplete" | "response.cancelled" => {
             let resp = value.get("response");
             let response_id = resp
                 .and_then(|r| r.get("id"))

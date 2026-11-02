@@ -97,6 +97,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   with `starting_after`, and background stream updates carry tokens
   (`parse_background_responses_sse_stream` is shared from
   `agent-framework-openai`).
+- OpenAI Responses (review fix): a streamed `response.cancelled` ends the
+  stream with a final update, so a cancelled background operation is
+  terminal (its continuation token is cleared) instead of appearing pending.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
