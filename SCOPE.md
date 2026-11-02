@@ -54,16 +54,15 @@ from the roadmap, not from this file.
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
-  container file citations announced in an MCP tool result's `_meta`;
-  provider-native background polling (needs a core
-  `background`/`continuation_token` contract and OpenAI Responses background
-  submit/poll); the agentserver's crash-recoverable task runtime (it runs on
-  the Foundry Tasks service; a startup sweep failing interrupted background
-  responses is the feasible local subset); WebSocket/voice invocations; and
-  Foundry span enrichment (needs a span-processor hook on core's
-  `OtelExport`). A toolbox skill refresh rebuilds the `SkillsProvider`, so
-  previously loaded skills are re-injected only once loaded again. Tested
-  in-process only.
+  container file citations announced in an MCP tool result's `_meta`; the
+  agentserver's resilient task runtime, which runs on the Foundry Tasks
+  service and can resume a workflow from its checkpoint (interrupted
+  background responses are failed at startup instead); voice invocations;
+  and host-side provider-native background polling (depends on the core
+  `background`/`continuation_token` contract). Span enrichment stamps agent
+  identity at span start (the Rust SDK has no on-end mutation). A toolbox
+  skill refresh rebuilds the `SkillsProvider`, so previously loaded skills
+  are re-injected only once loaded again. Tested in-process only.
 - **Computer use, remainder** (`experimental-computer-use`): Anthropic and
   Gemini skip the computer tool with a warning; upstream has no computer-use
   support for either provider. The workflow has no request-cancellation API,
