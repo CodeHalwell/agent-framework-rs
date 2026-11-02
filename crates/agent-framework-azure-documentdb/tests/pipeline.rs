@@ -744,6 +744,9 @@ async fn list_membership_does_not_use_an_element_sensitive_null_guard() {
         let e: FilterExpression = Filter::new("tags", op, Some(value)).unwrap().into();
         let rendered = format!("{:?}", c.filter_document(&e).unwrap());
         assert!(!rendered.contains("$ne"), "{rendered}");
-        assert!(rendered.contains(r#""$type": String("array")"#), "{rendered}");
+        assert!(
+            rendered.contains(r#""$type": String("array")"#),
+            "{rendered}"
+        );
     }
 }
