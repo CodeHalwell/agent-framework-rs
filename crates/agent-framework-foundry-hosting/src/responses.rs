@@ -408,6 +408,23 @@ impl ResponsesHostServer {
     }
 }
 
+/// Close a background response's replay (its streams end once they have
+/// sent every recorded event) and evict it after [`REPLAY_TTL`].
+fn end_replay(inner: &Arc<Inner>, id: &str, replay: &Arc<Replay>) {
+    replay.finish();
+    let evict = inner.clone();
+    let id = id.to_string();
+    let replay = replay.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(REPLAY_TTL).await;
+        let mut replays = evict.replays.lock().unwrap();
+        // Only this run's buffer (a later run cannot reuse the id, but be exact).
+        if replays.get(&id).is_some_and(|r| Arc::ptr_eq(r, &replay)) {
+            replays.remove(&id);
+        }
+    });
+}
+
 struct Inner {
     server: ResponsesHostServer,
     running: Mutex<HashMap<String, tokio::task::AbortHandle>>,
@@ -799,12 +816,7 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
         // streaming client the channel's receiver is simply gone.
         run_turn(&task_inner, &prepared, Some(&mut events)).await;
         task_inner.running.lock().unwrap().remove(&task_id);
-        replay.finish();
-        let evict = task_inner.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(REPLAY_TTL).await;
-            evict.replays.lock().unwrap().remove(&task_id);
-        });
+        end_replay(&task_inner, &task_id, &replay);
     });
     inner
         .running
@@ -885,7 +897,7 @@ async fn run_turn(
     let (status, response, transcript) = match result {
         Ok((agent_response, paused)) => {
             pause = paused;
-            tracker.close();
+            tracker.close_all();
             if let Some(events) = events.as_deref_mut() {
                 events.emit_all(tracker.drain()).await;
             }
@@ -1432,6 +1444,23 @@ async fn cancel(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Resp
     if let Some(handle) = handle {
         handle.abort();
         stored.response["status"] = json!("cancelled");
+        // The aborted task never closes its replay: record the cancellation,
+        // end the replay's streams, and schedule its eviction.
+        let replay = inner.replays.lock().unwrap().get(&id).cloned();
+        if let Some(replay) = replay {
+            if !replay.done.load(std::sync::atomic::Ordering::SeqCst) {
+                let sequence = replay.events.lock().unwrap().len();
+                replay.push(
+                    "response.cancelled",
+                    &json!({
+                        "type": "response.cancelled",
+                        "sequence_number": sequence,
+                        "response": stored.response,
+                    }),
+                );
+                end_replay(&inner, &id, &replay);
+            }
+        }
         if let Err(e) = inner.server.store.put(&id, stored.clone()).await {
             return server_error(e.to_string());
         }

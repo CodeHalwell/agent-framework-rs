@@ -864,3 +864,54 @@ async fn concurrent_turns_on_one_conversation_are_both_kept() {
     // Both earlier turns (2 messages each) precede the new input.
     assert_eq!(last["output_text"], "5 messages, last: third");
 }
+
+/// Never answers.
+struct Hanging;
+
+#[async_trait::async_trait]
+impl ChatClient for Hanging {
+    async fn get_response(
+        &self,
+        _: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        std::future::pending().await
+    }
+    async fn get_streaming_response(
+        &self,
+        _: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_background_stream_replay_ends() {
+    let agent: Arc<dyn SupportsAgentRun> = Arc::new(Agent::builder(Hanging).name("h").build());
+    let router = ResponsesHostServer::agent(agent).into_router();
+    let (_, queued) = json(
+        &router,
+        post("/responses", json!({"input": "x", "background": true})),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, cancelled) =
+        json(&router, post(&format!("/responses/{id}/cancel"), json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{cancelled}");
+    assert_eq!(cancelled["status"], "cancelled");
+    let replay = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send(&router, get(&format!("/responses/{id}?stream=true"))),
+    )
+    .await
+    .expect("the replay ends after the cancellation");
+    let events = sse_events(&replay.2);
+    let last = events.last().unwrap();
+    assert_eq!(last.0, "response.cancelled");
+    assert_eq!(last.1["response"]["status"], "cancelled");
+    for (i, (_, data)) in events.iter().enumerate() {
+        assert_eq!(data["sequence_number"], i);
+    }
+}

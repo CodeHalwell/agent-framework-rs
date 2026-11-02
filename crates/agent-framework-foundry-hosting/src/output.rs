@@ -46,11 +46,6 @@ enum Active {
         index: usize,
         encrypted: Option<String>,
     },
-    FunctionCall {
-        index: usize,
-        call_id: String,
-        name: String,
-    },
     Mcp {
         index: usize,
         call_id: String,
@@ -69,6 +64,18 @@ pub(crate) struct OutputTracker {
     events: Vec<(String, Value)>,
     consent_origins: Option<Vec<String>>,
     consents: HashSet<(String, String)>,
+    /// Function calls still receiving arguments, in first-seen order. They
+    /// accumulate per `call_id` (providers may interleave several calls'
+    /// deltas) and are finalized when their result arrives or the response
+    /// ends.
+    open_calls: Vec<OpenCall>,
+}
+
+struct OpenCall {
+    index: usize,
+    call_id: String,
+    name: String,
+    arguments: String,
 }
 
 /// A content the tracker refuses (fails the response).
@@ -94,6 +101,7 @@ impl OutputTracker {
             events: Vec::new(),
             consent_origins,
             consents: HashSet::new(),
+            open_calls: Vec::new(),
         }
     }
 
@@ -244,34 +252,56 @@ impl OutputTracker {
                 }
             }
             Content::FunctionCall(call) => {
-                let same = matches!(&self.active, Some(Active::FunctionCall { call_id, .. }) if *call_id == call.call_id);
-                if !same {
-                    self.close();
-                    let id = ids::function_call_id(Some(&self.response_id));
-                    let index = self.push_item(json!({
-                        "type": "function_call", "id": id, "call_id": call.call_id,
-                        "name": call.name, "arguments": "", "status": "in_progress",
-                    }));
-                    self.active = Some(Active::FunctionCall {
-                        index,
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                    });
-                }
                 let delta = arguments_string(call.arguments.as_ref());
-                if !delta.is_empty() {
-                    self.buffer.push_str(&delta);
-                    if let Some(Active::FunctionCall { index, .. }) = &self.active {
-                        let index = *index;
-                        let id = self.items[index]["id"].clone();
-                        self.emit(
-                            "response.function_call_arguments.delta",
-                            json!({"item_id": id, "output_index": index, "delta": delta}),
-                        );
+                let position = self
+                    .open_calls
+                    .iter()
+                    .position(|c| c.call_id == call.call_id);
+                let position = match position {
+                    Some(p) => p,
+                    None => {
+                        // A new call ends the item being streamed, not other calls.
+                        self.close();
+                        let id = ids::function_call_id(Some(&self.response_id));
+                        let index = self.push_item(json!({
+                            "type": "function_call", "id": id, "call_id": call.call_id,
+                            "name": call.name, "arguments": "", "status": "in_progress",
+                        }));
+                        self.open_calls.push(OpenCall {
+                            index,
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: String::new(),
+                        });
+                        self.open_calls.len() - 1
                     }
+                };
+                let open = &mut self.open_calls[position];
+                if open.name.is_empty() && !call.name.is_empty() {
+                    open.name = call.name.clone();
+                    self.items[open.index]["name"] = json!(call.name);
+                }
+                let open = &mut self.open_calls[position];
+                if !delta.is_empty() {
+                    open.arguments.push_str(&delta);
+                    let index = open.index;
+                    let id = self.items[index]["id"].clone();
+                    self.emit(
+                        "response.function_call_arguments.delta",
+                        json!({"item_id": id, "output_index": index, "delta": delta}),
+                    );
                 }
             }
             Content::FunctionResult(result) => {
+                // The call is complete before its result.
+                if let Some(p) = self
+                    .open_calls
+                    .iter()
+                    .position(|c| c.call_id == result.call_id)
+                {
+                    let call = self.open_calls.remove(p);
+                    self.finish_call(call);
+                }
                 self.close();
                 let output = match (&result.result, &result.exception) {
                     (Some(value), _) => json_text(value),
@@ -636,20 +666,6 @@ impl OutputTracker {
                 item["status"] = json!("completed");
                 self.done(index);
             }
-            Some(Active::FunctionCall {
-                index, ref name, ..
-            }) => {
-                let name = name.clone();
-                let arguments = std::mem::take(&mut self.buffer);
-                let id = self.items[index]["id"].clone();
-                self.emit(
-                    "response.function_call_arguments.done",
-                    json!({"item_id": id, "output_index": index, "name": name, "arguments": arguments}),
-                );
-                self.items[index]["arguments"] = json!(arguments);
-                self.items[index]["status"] = json!("completed");
-                self.done(index);
-            }
             Some(Active::Mcp { index, .. }) => {
                 let arguments = std::mem::take(&mut self.buffer);
                 let id = self.items[index]["id"].clone();
@@ -680,8 +696,27 @@ impl OutputTracker {
     }
 
     /// Close everything and return `(output, usage, incomplete reason)`.
-    pub(crate) fn finish(mut self) -> (Vec<Value>, Option<Value>, Option<&'static str>) {
+    fn finish_call(&mut self, call: OpenCall) {
+        let id = self.items[call.index]["id"].clone();
+        self.emit(
+            "response.function_call_arguments.done",
+            json!({"item_id": id, "output_index": call.index, "name": call.name, "arguments": call.arguments}),
+        );
+        self.items[call.index]["arguments"] = json!(call.arguments);
+        self.items[call.index]["status"] = json!("completed");
+        self.done(call.index);
+    }
+
+    /// Close the active item and every open function call (end of output).
+    pub(crate) fn close_all(&mut self) {
         self.close();
+        for call in std::mem::take(&mut self.open_calls) {
+            self.finish_call(call);
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> (Vec<Value>, Option<Value>, Option<&'static str>) {
+        self.close_all();
         let usage = self.usage.as_ref().map(usage_json);
         (self.items, usage, self.incomplete)
     }
@@ -984,5 +1019,40 @@ mod tests {
             Some("aGk=")
         );
         assert_eq!(image_generation_result(&json!("https://x/y.png")), None);
+    }
+}
+
+#[cfg(test)]
+mod interleaving_tests {
+    use super::*;
+    use agent_framework_core::types::FunctionCallContent;
+
+    fn delta(call_id: &str, name: &str, args: &str) -> Content {
+        Content::FunctionCall(FunctionCallContent::new(
+            call_id,
+            name,
+            Some(FunctionArguments::Raw(args.into())),
+        ))
+    }
+
+    #[test]
+    fn interleaved_call_deltas_accumulate_per_call() {
+        let mut t = OutputTracker::new("caresp_x", None);
+        for content in [
+            delta("a", "first", r#"{"x":"#),
+            delta("b", "second", r#"{"y":"#),
+            delta("a", "", "1}"),
+            delta("b", "", "2}"),
+        ] {
+            t.handle(&content, None, false).unwrap();
+        }
+        let (items, _, _) = t.finish();
+        assert_eq!(items.len(), 2, "one item per call: {items:?}");
+        assert_eq!(items[0]["call_id"], "a");
+        assert_eq!(items[0]["name"], "first");
+        assert_eq!(items[0]["arguments"], r#"{"x":1}"#);
+        assert_eq!(items[1]["call_id"], "b");
+        assert_eq!(items[1]["arguments"], r#"{"y":2}"#);
+        assert!(items.iter().all(|i| i["status"] == "completed"));
     }
 }
