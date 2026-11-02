@@ -9,10 +9,11 @@
 //! | Upstream (Python) | Here |
 //! |---|---|
 //! | `_loop.py`: `AgentLoopMiddleware`, `JudgeVerdict`, `todos_remaining`, `todos_remaining_message` | [`LoopAgent`], [`Judge`], [`JudgeVerdict`], [`todos_remaining`], [`todos_remaining_message`] |
-//! | `_todo.py`: `TodoProvider`, `TodoStore`, `TodoSessionStore`, `TodoItem`, … | [`TodoProvider`], [`TodoStore`], [`TodoSessionStore`], [`TodoItem`], … |
+//! | `_todo.py`: `TodoProvider`, `TodoStore`, `TodoSessionStore`, `TodoFileStore`, `TodoItem`, … | [`TodoProvider`], [`TodoStore`], [`TodoSessionStore`], [`TodoFileStore`], [`TodoItem`], … |
 //! | `_tool_approval.py`: `ToolApprovalMiddleware`, `ToolApprovalRule`, `ToolApprovalState`, `create_always_approve_*` | [`ToolApprovalAgent`], [`ToolApprovalRule`], [`ToolApprovalState`], [`ToolApprovalAgent::always_approve_tool_response`], … |
 //! | `_mode.py`: `AgentModeProvider`, `get_agent_mode`, `set_agent_mode` | [`AgentModeProvider`], [`get_agent_mode`], [`set_agent_mode`] |
 //! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
+//! | `_file_access.py` (the tool half): `FileAccessProvider` | [`FileAccessProvider`] |
 //! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
 //!
 //! # Not ported here
@@ -20,12 +21,8 @@
 //! - **Background agents** (`_background_agents.py`) have no Rust
 //!   counterpart, so the loop's `background_tasks_running` /
 //!   `background_tasks_running_message` helpers are not ported either.
-//! - **File access and memory**: `FileAccessProvider` (the tool half of
-//!   `_file_access.py`), `_memory.py` and the full `create_harness_agent`
-//!   assembly are out of scope for now. The file store they would build on
-//!   is here.
-//! - `TodoFileStore` is not ported: [`TodoStore`] is a public trait, so a
-//!   file-backed store can be supplied by the application.
+//! - **Memory**: `_memory.py` and the full `create_harness_agent`
+//!   assembly are out of scope for now.
 //!
 //! # Divergences from upstream
 //!
@@ -56,6 +53,7 @@
 //! See each submodule's documentation for the divergences specific to it.
 
 pub mod agent_loop;
+pub mod file_access;
 pub mod file_memory;
 pub mod file_store;
 pub mod mode;
@@ -69,13 +67,20 @@ pub use agent_loop::{
     DEFAULT_JUDGE_INSTRUCTIONS, DEFAULT_JUDGE_MAX_ITERATIONS, DEFAULT_MAX_ITERATIONS,
     DEFAULT_NEXT_MESSAGE, JUDGE_VERDICT_DONE, JUDGE_VERDICT_MORE,
 };
+pub use file_access::{
+    FileAccessProvider, DEFAULT_FILE_ACCESS_INSTRUCTIONS, DEFAULT_FILE_ACCESS_SOURCE_ID,
+    FILE_ACCESS_DELETE_TOOL_NAME, FILE_ACCESS_GREP_TOOL_NAME, FILE_ACCESS_LS_TOOL_NAME,
+    FILE_ACCESS_READ_LINES_TOOL_NAME, FILE_ACCESS_READ_ONLY_TOOL_NAMES, FILE_ACCESS_READ_TOOL_NAME,
+    FILE_ACCESS_REPLACE_LINES_TOOL_NAME, FILE_ACCESS_REPLACE_TOOL_NAME,
+    FILE_ACCESS_WRITE_TOOL_NAME, FILE_ACCESS_WRITE_TOOL_NAMES,
+};
 pub use file_memory::{
     FileMemoryProvider, DEFAULT_FILE_MEMORY_INSTRUCTIONS, DEFAULT_FILE_MEMORY_SOURCE_ID,
     SCOPED_FILE_MEMORY_INSTRUCTIONS,
 };
 pub use file_store::{
     apply_replace, apply_replace_lines, compile_search_regex, matches_glob,
-    normalize_relative_path, scan_content, split_lines, AgentFileStore, FileLineEdit,
+    normalize_relative_path, scan_content, slice_lines, split_lines, AgentFileStore, FileLineEdit,
     FileSearchMatch, FileSearchResult, FileStoreEntry, FileStoreEntryType,
     FileSystemAgentFileStore, InMemoryAgentFileStore, MAX_SEARCH_PATTERN_LENGTH, SEARCH_TIMEOUT,
 };
@@ -85,8 +90,8 @@ pub use mode::{
     EXECUTE_MODE_INSTRUCTIONS, PLAN_MODE_INSTRUCTIONS,
 };
 pub use todo::{
-    TodoCompleteInput, TodoInput, TodoItem, TodoProvider, TodoSessionStore, TodoStore,
-    DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
+    TodoCompleteInput, TodoFileStore, TodoInput, TodoItem, TodoProvider, TodoSessionStore,
+    TodoStore, DEFAULT_TODO_INSTRUCTIONS, DEFAULT_TODO_SOURCE_ID,
 };
 pub use tool_approval::{
     ToolApprovalAgent, ToolApprovalRule, ToolApprovalScope, ToolApprovalState,

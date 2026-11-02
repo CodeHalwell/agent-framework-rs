@@ -43,7 +43,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -659,6 +659,77 @@ pub fn apply_replace_lines(content: &str, edits: &[FileLineEdit]) -> Result<Stri
         lines[edit.line_number - 1] = &edit.new_line;
     }
     Ok(lines.concat())
+}
+
+/// The 1-based inclusive `[start_line, end_line]` slice of `content`, numbered
+/// by [`split_lines`] and keeping terminators.
+///
+/// `end_line` of `None` reads to the end, and one past the last line is
+/// clamped. Fails when either bound is below 1, `end_line` precedes
+/// `start_line`, or `start_line` is past the last line, so a successful slice
+/// is never empty.
+pub fn slice_lines(content: &str, start_line: usize, end_line: Option<usize>) -> Result<Vec<&str>> {
+    let lines = split_lines(content);
+    let total = lines.len();
+    if start_line < 1 {
+        return Err(Error::tool(format!(
+            "start_line must be a positive integer, got {start_line}."
+        )));
+    }
+    if let Some(end) = end_line {
+        if end < 1 {
+            return Err(Error::tool(format!(
+                "end_line must be a positive integer, got {end}."
+            )));
+        }
+        if end < start_line {
+            return Err(Error::tool(format!(
+                "end_line ({end}) must not be less than start_line ({start_line})."
+            )));
+        }
+    }
+    if start_line > total {
+        return Err(Error::tool(format!(
+            "start_line {start_line} is out of range (file has {total} lines)."
+        )));
+    }
+    let end = end_line.map_or(total, |e| e.min(total));
+    Ok(lines[start_line - 1..end].to_vec())
+}
+
+type WriteLockMap =
+    std::collections::HashMap<(usize, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
+
+/// The lock that serializes edits of the files directly inside `folder` of
+/// `store`.
+///
+/// Mutating harness tools hold it across their read-modify-write. It belongs
+/// to the store instance, not to a provider, so every provider writing
+/// through one store (file access and file memory alike) waits for the
+/// others, and none can read a file between another's read and write. The
+/// folder is compared ignoring case, as [`InMemoryAgentFileStore`] does.
+/// Entries are held weakly and pruned, so the map does not grow with the
+/// number of folders ever edited. The lock is process-local.
+pub(crate) fn store_write_lock(
+    store: &Arc<dyn AgentFileStore>,
+    folder: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<WriteLockMap>> = std::sync::OnceLock::new();
+    let key = (
+        Arc::as_ptr(store) as *const () as usize,
+        folder.to_lowercase(),
+    );
+    let mut map = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 /// An [`AgentFileStore`] held in memory.
