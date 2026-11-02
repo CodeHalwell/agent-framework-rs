@@ -48,6 +48,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - **Cloud streaming**: Anthropic on Foundry, Vertex and Bedrock now stream
   (Bedrock via a new AWS event-stream decoder), and the Bedrock Converse
   client streams through `converse-stream` instead of buffering.
+- `ContentUnderstandingContextProvider` (`agent-framework-azure`, feature
+  `content-understanding`; umbrella `azure-content-understanding`): analyzes
+  supported attachments with Azure Content Understanding, strips them from
+  the model input, injects the rendered document (or uploads it through a
+  `FileSearchBackend`), resumes slow analyses on later turns, and offers
+  `list_documents`.
 - Message injection: `session::enqueue_messages` / `pending_messages`
   queue messages for a run's next model call, including from a tool
   mid-run; a queue left at the end of a turn earns another call. Built into

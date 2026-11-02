@@ -22,6 +22,8 @@ foundry-local = ["dep:agent-framework-foundry-local"]
 bedrock = ["dep:agent-framework-bedrock"]
 github-copilot = ["dep:agent-framework-github-copilot"]
 azure = ["dep:agent-framework-azure"]
+# Azure Content Understanding attachment analysis (`ContentUnderstandingContextProvider`).
+azure-content-understanding = ["azure", "agent-framework-azure/content-understanding"]
 mcp = ["dep:agent-framework-mcp"]
 a2a = ["dep:agent-framework-a2a"]
 hosting = ["dep:agent-framework-hosting"]

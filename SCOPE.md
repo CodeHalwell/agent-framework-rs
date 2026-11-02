@@ -60,7 +60,7 @@ from the roadmap, not from this file.
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
-- **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
+- **Azure**: the Cosmos DB memory provider (blocked
   on the Agent Memory Toolkit) and the dedicated Application Insights
   exporter. `azure_core_opentelemetry` is stable at 1.0.0, and with the
   `microsoft.agent-framework` resource attribute `otel-export` now sets, it

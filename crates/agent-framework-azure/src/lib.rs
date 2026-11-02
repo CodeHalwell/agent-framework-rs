@@ -68,6 +68,9 @@
 
 #[cfg(feature = "session-store")]
 pub mod blob_session_store;
+#[cfg(feature = "content-understanding")]
+#[cfg_attr(docsrs, doc(cfg(feature = "content-understanding")))]
+pub mod content_understanding;
 mod credential;
 mod credentials;
 pub mod embeddings;
