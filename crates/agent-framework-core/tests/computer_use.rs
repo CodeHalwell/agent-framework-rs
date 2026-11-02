@@ -243,3 +243,86 @@ async fn a_workflow_pauses_on_a_computer_call_and_resumes_with_the_result() {
         .iter()
         .any(|c| matches!(c, Content::ComputerToolResult(r) if r.call_id == "call_1")));
 }
+
+async fn paused_run(client: Scripted) -> (agent_framework_core::workflow::WorkflowRun, String) {
+    let agent: Arc<dyn SupportsAgentRun> =
+        Arc::new(Agent::builder(client).name("operator").build());
+    let workflow = SequentialBuilder::new()
+        .participants(vec![agent])
+        .build()
+        .unwrap();
+    let run = workflow.run("click the button").await.unwrap();
+    let id = run.pending_requests()[0].request_id.clone();
+    (run, id)
+}
+
+fn cancelled_errors(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|m| &m.contents)
+        .filter_map(|c| match c {
+            Content::Error(e)
+                if e.error_code.as_deref()
+                    == Some(agent_framework_core::workflow::CANCELLED_COMPUTER_CALL) =>
+            {
+                e.message.clone()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_cancelled_computer_call_ends_the_turn_without_rerunning_the_agent() {
+    for answer in [
+        json!({"call_id": "call_1", "cancelled": true}),
+        json!([{"call_id": "call_1", "cancelled": true}]),
+        json!({"cancelled": true}),
+    ] {
+        let (client, seen) = scripted(vec![vec![computer_call()], vec![Content::text("rerun")]]);
+        let (mut run, id) = paused_run(client).await;
+        run.send_response(id, answer.clone()).await.unwrap();
+        assert!(run.pending_requests().is_empty(), "{answer}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the agent is not run again");
+        let messages: Vec<Message> = serde_json::from_value(run.last_output().unwrap()).unwrap();
+        assert_eq!(
+            cancelled_errors(&messages),
+            ["Computer call call_1 was cancelled without a result."]
+        );
+        // The cancelled call no longer awaits the application.
+        assert!(messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .all(|c| !matches!(c, Content::ComputerToolCall(call) if call.user_input_request)));
+    }
+}
+
+#[tokio::test]
+async fn streamed_updates_never_carry_a_pending_computer_call() {
+    use agent_framework_core::workflow::WorkflowEvent;
+    let (client, _) = scripted(vec![
+        vec![Content::text("looking"), computer_call()],
+        vec![Content::text("done")],
+    ]);
+    let (run, _) = paused_run(client).await;
+    let updates: Vec<&Value> = run
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::AgentRunUpdate { update, .. } => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert!(!updates.is_empty(), "the text is still streamed");
+    for update in updates {
+        let contents: Vec<Content> =
+            serde_json::from_value(update["contents"].clone()).unwrap_or_default();
+        assert!(
+            !contents
+                .iter()
+                .any(|c| matches!(c, Content::ComputerToolCall(call) if call.user_input_request)),
+            "{update}"
+        );
+        assert!(contents.iter().any(|c| c.as_text() == Some("looking")));
+    }
+}

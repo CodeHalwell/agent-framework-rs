@@ -1855,6 +1855,10 @@ fn parse_responses_event(
 /// (upstream `_chat_client.py`). Malformed provider items are skipped with a
 /// warning; upstream raises.
 #[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub use computer::{SCREENSHOT_DETAIL_KEY, SCREENSHOT_FILE_ID_KEY, SCREENSHOT_IMAGE_URL_KEY};
+
+#[cfg(feature = "experimental-computer-use")]
 mod computer {
     use agent_framework_core::types::{
         ComputerSafetyCheck, ComputerToolCallContent, ComputerToolResultContent, Content,
@@ -1913,6 +1917,16 @@ mod computer {
         }))
     }
 
+    /// Result `additional_properties` keys carrying the screenshot metadata
+    /// the screenshot content cannot hold: OpenAI's image `detail`, and the
+    /// secondary reference when a screenshot has both an image URL and a
+    /// file id (upstream keeps these on the screenshot content).
+    pub const SCREENSHOT_DETAIL_KEY: &str = "screenshot_detail";
+    /// See [`SCREENSHOT_DETAIL_KEY`]: the file id alongside an image URL.
+    pub const SCREENSHOT_FILE_ID_KEY: &str = "screenshot_file_id";
+    /// See [`SCREENSHOT_DETAIL_KEY`]: the image URL alongside a file id.
+    pub const SCREENSHOT_IMAGE_URL_KEY: &str = "screenshot_image_url";
+
     pub(super) fn parse_result(item: &Value) -> Option<Content> {
         let output = item
             .get("output")
@@ -1954,6 +1968,17 @@ mod computer {
                 return None;
             }
         };
+        let mut additional_properties = Map::new();
+        if let Some(detail) = output.get("detail").filter(|d| !d.is_null()) {
+            additional_properties.insert(SCREENSHOT_DETAIL_KEY.into(), detail.clone());
+        }
+        match (image_url, file_id) {
+            (Some(_), Some(file_id)) => {
+                additional_properties.insert(SCREENSHOT_FILE_ID_KEY.into(), json!(file_id));
+            }
+            (None, Some(_)) => {}
+            _ => {}
+        }
         Some(Content::ComputerToolResult(ComputerToolResultContent {
             call_id: call_id.into(),
             id: item.get("id").and_then(Value::as_str).map(str::to_string),
@@ -1963,7 +1988,7 @@ mod computer {
                 .map(str::to_string),
             screenshot: Some(Box::new(screenshot)),
             acknowledged_safety_checks: safety_checks(item.get("acknowledged_safety_checks")),
-            additional_properties: Map::new(),
+            additional_properties,
         }))
     }
 
@@ -2010,6 +2035,22 @@ mod computer {
                 );
                 return None;
             }
+        }
+        let extra = |key: &str| {
+            result
+                .additional_properties
+                .get(key)
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        };
+        if output.contains_key("image_url") {
+            if let Some(file_id) = extra(SCREENSHOT_FILE_ID_KEY) {
+                output.insert("file_id".into(), file_id.clone());
+            }
+        } else if let Some(url) = extra(SCREENSHOT_IMAGE_URL_KEY) {
+            output.insert("image_url".into(), url.clone());
+        }
+        if let Some(detail) = extra(SCREENSHOT_DETAIL_KEY) {
+            output.insert("detail".into(), detail.clone());
         }
         let mut item = Map::new();
         item.insert("type".into(), json!("computer_call_output"));
@@ -2058,6 +2099,28 @@ mod computer {
 mod computer_tests {
     use super::*;
     use agent_framework_core::types::{ComputerSafetyCheck, ComputerToolResultContent, UriContent};
+
+    #[test]
+    fn screenshot_detail_and_secondary_references_round_trip() {
+        for output in [
+            json!({"type": "computer_screenshot", "image_url": "https://x/s.png",
+                   "file_id": "file_1", "detail": "high"}),
+            json!({"type": "computer_screenshot", "file_id": "file_2",
+                   "image_url": "https://x/t.png", "detail": "low"}),
+        ] {
+            let response = response_with(vec![
+                computer_call("cu_1"),
+                json!({"type": "computer_call_output", "call_id": "call_1", "output": output}),
+            ]);
+            let msgs = response.messages.clone();
+            let input = messages_to_input(&msgs);
+            let replayed = input
+                .iter()
+                .find(|i| i["type"] == "computer_call_output")
+                .expect("the result is replayed");
+            assert_eq!(replayed["output"], output, "{replayed}");
+        }
+    }
 
     fn response_with(items: Vec<Value>) -> ChatResponse {
         parse_response(&json!({"id": "resp_1", "output": items}), None)

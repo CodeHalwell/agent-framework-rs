@@ -43,10 +43,12 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Agent hooks, remainder** (`experimental-agent-hooks`): §5.4
-  result-label flow (labels reach the combined verdict and the record but
-  are not persisted with the produced data or resurfaced as
-  `source_labels`; upstream's framework layer does not do this either).
+- **Agent hooks, remainder** (`experimental-agent-hooks`): §5.4 result
+  labels are unioned from permitting verdicts onto the combined verdict and
+  its record, as the agent-hooks SDK (0.1.0-beta.3) does; neither upstream
+  nor the SDK persists them with produced data or resurfaces them as
+  `extensions.*.source_labels`, so there is nothing further to port.
+  FIDES's `source_labels` is a separate, ported feature (`security`).
 - **Evaluation, remainder**:
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
@@ -60,10 +62,11 @@ from the roadmap, not from this file.
   crash-recoverable task runtime, WebSocket/voice invocations, and
   OpenTelemetry distro beyond trace-context propagation and exporter
   selection. Tested in-process only.
-- **Computer use, remainder** (`experimental-computer-use`): cancelling a
-  pending computer call in a workflow and deferring computer updates while
-  paused; OpenAI screenshot `detail` metadata; Anthropic and Gemini skip the
-  computer tool.
+- **Computer use, remainder** (`experimental-computer-use`): Anthropic and
+  Gemini skip the computer tool with a warning; upstream has no computer-use
+  support for either provider. The workflow has no request-cancellation API,
+  so a pending computer call is cancelled from the reply instead
+  (`{"call_id", "cancelled": true}` or `{"cancelled": true}`).
 - **Durable Task hosting** (`agent-framework-durabletask`, now published
   from its own repository). Blocked: it sits on the `durabletask` SDK, a
   deterministic-replay orchestration engine with durable entities and a

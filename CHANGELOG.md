@@ -35,6 +35,16 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Workflows (`experimental-computer-use`): a pending computer call can be
+  cancelled by replying `{"call_id": …, "cancelled": true}` (alone or in an
+  array) or `{"cancelled": true}` to cancel all; cancelled calls become
+  `ErrorContent` (`CANCELLED_COMPUTER_CALL`) and the turn ends with the
+  conversation as output instead of re-running the agent. `AgentExecutor`
+  defers streamed updates while a computer call is pending.
+- OpenAI Responses (`experimental-computer-use`): screenshot `detail` and a
+  secondary `file_id` / `image_url` survive the round trip
+  (`SCREENSHOT_DETAIL_KEY`, `SCREENSHOT_FILE_ID_KEY`,
+  `SCREENSHOT_IMAGE_URL_KEY`).
 - Foundry hosting (review fixes): a conversation's transcript and session
   state are written together through `ResponseStore::update_conversation`
   (in-memory: one record under one lock; `FileResponseStore`: one file by

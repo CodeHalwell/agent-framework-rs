@@ -43,9 +43,6 @@ pub use edge::{
 };
 pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
-#[cfg(feature = "experimental-computer-use")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
-pub use orchestration::ComputerUseRequest;
 pub use orchestration::{
     handoff_tool_name, handoff_tool_spec, AgentApprovalExecutor, AgentExecutor, ApprovalRequest,
     AutonomousMode, ConcurrentAggregator, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,
@@ -62,6 +59,9 @@ pub use orchestration::{
     ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT, ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 };
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub use orchestration::{ComputerUseRequest, CANCELLED_COMPUTER_CALL};
 pub use protocol::{ProtocolBuilder, ProtocolDescriptor, RequestPortInfo};
 pub use request_info::{PendingRequest, RequestInfoExecutor, RequestResponse};
 pub use runner::{

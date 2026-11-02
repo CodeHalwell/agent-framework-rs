@@ -54,7 +54,7 @@ mod workflow_agent;
 pub use approval::{AgentApprovalExecutor, ApprovalRequest};
 #[cfg(feature = "experimental-computer-use")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
-pub use computer_use::ComputerUseRequest;
+pub use computer_use::{ComputerUseRequest, CANCELLED_COMPUTER_CALL};
 pub use concurrent::{ConcurrentAggregator, ConcurrentBuilder};
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
@@ -283,21 +283,54 @@ pub(crate) async fn run_agent_and_emit(
     let input = serde_json::to_value(&conversation).unwrap_or(Value::Null);
     let mut stream = agent.run_stream(conversation, None, None).await?;
     let mut updates: Vec<AgentResponseUpdate> = Vec::new();
-    while let Some(item) = stream.next().await {
-        let mut update = item?;
-        if update.author_name.is_none() {
-            update.author_name = Some(author.to_string());
-        }
-        if let Ok(update_value) = serde_json::to_value(&update) {
+    let emit = |update: &AgentResponseUpdate| {
+        if let Ok(update_value) = serde_json::to_value(update) {
             ctx.add_event(WorkflowEvent::AgentRunUpdate {
                 executor_id: executor_id.to_string(),
                 update: update_value,
             });
         }
+    };
+    // From the first pending computer call on, updates are held back until
+    // the run ends (upstream's deferred computer updates).
+    #[cfg(feature = "experimental-computer-use")]
+    let mut deferred: Vec<AgentResponseUpdate> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let mut update = item?;
+        if update.author_name.is_none() {
+            update.author_name = Some(author.to_string());
+        }
+        #[cfg(feature = "experimental-computer-use")]
+        if !deferred.is_empty() || computer_use::has_pending_call(&update.contents) {
+            deferred.push(update.clone());
+            updates.push(update);
+            continue;
+        }
+        emit(&update);
         updates.push(update);
     }
 
     let mut response = AgentResponse::from_updates(updates);
+    #[cfg(feature = "experimental-computer-use")]
+    if !deferred.is_empty() {
+        let completed: std::collections::HashSet<String> = response
+            .messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .filter_map(|c| match c {
+                crate::types::Content::ComputerToolCall(call) if !call.user_input_request => {
+                    Some(call.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for mut update in deferred {
+            if let Some(contents) = computer_use::finalize_deferred(update.contents, &completed) {
+                update.contents = contents;
+                emit(&update);
+            }
+        }
+    }
     for msg in &mut response.messages {
         if msg.author_name.is_none() {
             msg.author_name = Some(author.to_string());
@@ -406,8 +439,19 @@ impl Executor for AgentExecutor {
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         #[cfg(feature = "experimental-computer-use")]
-        if let Some(resumed) = computer_use::resume_conversation(&message)? {
-            return self.execute(resumed, ctx).await;
+        match computer_use::resume_conversation(&message)? {
+            Some(computer_use::Resumption::Resume(resumed)) => {
+                return self.execute(resumed, ctx).await;
+            }
+            // A cancelled call ends the turn: no further agent run, and the
+            // conversation is the executor's output (upstream).
+            Some(computer_use::Resumption::Cancelled(conversation)) => {
+                let payload = serde_json::to_value(&conversation).map_err(|e| {
+                    Error::Workflow(format!("failed to serialize conversation: {e}"))
+                })?;
+                return ctx.yield_output(payload).await;
+            }
+            None => {}
         }
         let mut conversation = parse_conversation(&message)?;
         let mut invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
