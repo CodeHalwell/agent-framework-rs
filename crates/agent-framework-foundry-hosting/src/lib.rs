@@ -78,6 +78,11 @@
 //!   workflow from its checkpoint, and provider-native background polling.
 //! - **WebSocket invocations** (feature `websocket`): [`invocations_ws`]
 //!   serves `/invocations_ws`.
+//! - **Voice invocations** (feature `voice`, implies `websocket`):
+//!   [`voice`] serves upstream's experimental typed Voice Live Bridge relay
+//!   (`VoiceAgentServerHost`) on `/voice_conversation_engine` and
+//!   `/invocations_ws`. Not ported: the `x-agent-original-subject` header
+//!   check.
 //! - **Telemetry** (feature `otel`): caller trace context and W3C baggage,
 //!   exporter selection, and Foundry span enrichment
 //!   ([`FoundryEnrichmentSpanProcessor`]); the agentserver's OTel distro is
@@ -103,6 +108,9 @@ pub mod sessions;
 pub mod storage;
 pub mod stores;
 pub mod toolbox;
+#[cfg(feature = "voice")]
+#[cfg_attr(docsrs, doc(cfg(feature = "voice")))]
+pub mod voice;
 
 pub use config::FoundryHostConfig;
 pub use file_store::FileResponseStore;

@@ -28,6 +28,7 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 axum = "0.8"
 sha2 = "0.10"
+regex = { workspace = true, optional = true }
 # The `otel` feature: caller trace-context propagation and exporter setup.
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true, features = ["trace"] }
@@ -42,11 +43,15 @@ skills = ["agent-framework-mcp/skills"]
 # COMPUTER_USE (experimental upstream): computer calls and results as
 # `computer_call` / `computer_call_output` items, in and out.
 experimental-computer-use = ["agent-framework-core/experimental-computer-use"]
+# `invocations_ws`: the agentserver's `/invocations_ws` WebSocket route.
+websocket = ["axum/ws"]
+# `voice`: upstream's experimental Voice Live Bridge typed event relay
+# (`VoiceAgentServerHost`) on `/voice_conversation_engine` and
+# `/invocations_ws`. Implies `websocket`.
+voice = ["websocket", "dep:regex"]
 # OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
 # and `configure_observability` exports to Application Insights or OTLP from
 # the host configuration (upstream agentserver tracing).
-# `invocations_ws`: the agentserver's `/invocations_ws` WebSocket route.
-websocket = ["axum/ws"]
 otel = [
     "agent-framework-core/azure-monitor",
     "dep:opentelemetry",

@@ -53,18 +53,17 @@ from the roadmap, not from this file.
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
-- **Foundry hosting, remainder** (`agent-framework-foundry-hosting`): voice
-  invocations (upstream's experimental `VoiceAgentServerHost` typed event
-  relay on `/voice_conversation_engine` and `/invocations_ws`; a host-side
-  protocol not yet ported). Also the agentserver's resilient task runtime,
-  which runs on the Foundry Tasks service and can resume a workflow from its
-  checkpoint (interrupted background responses are failed at startup
-  instead, and provider background polling does not resume after a
-  restart); pending container-file citations are not carried across a
-  restart either. Span enrichment stamps agent identity at span start (the
-  Rust SDK has no on-end mutation). A toolbox skill refresh rebuilds the
-  `SkillsProvider`, so previously loaded skills are re-injected only once
-  loaded again. Tested in-process only.
+- **Foundry hosting, remainder** (`agent-framework-foundry-hosting`): the
+  agentserver's resilient task runtime, which runs on the Foundry Tasks
+  service and can resume a workflow from its checkpoint (interrupted
+  background responses are failed at startup instead, and provider
+  background polling does not resume after a restart); pending
+  container-file citations are not carried across a restart either. Span
+  enrichment stamps agent identity at span start (the Rust SDK has no
+  on-end mutation). A toolbox skill refresh rebuilds the `SkillsProvider`,
+  so previously loaded skills are re-injected only once loaded again. Voice
+  invocations (feature `voice`) do not check the `x-agent-original-subject`
+  header. Tested in-process only.
 - **Background responses, divergences**: the agent does not wrap the
   provider token with the saved input and earlier updates (.NET's
   `ChatClientAgentContinuationToken`), so after an interrupted stream the

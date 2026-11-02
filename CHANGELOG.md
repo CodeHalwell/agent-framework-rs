@@ -151,6 +151,17 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   `FLOAT` only when a double holds it exactly; beyond that it equals nothing
   and is refused for ordered filters (as the DuckDB store), instead of
   rounding onto a neighbouring stored value.
+- Foundry hosting: voice invocations (feature `voice`, implies `websocket`;
+  upstream's experimental `VoiceAgentServerHost`).
+  `voice::VoiceAgentServerHost` serves the typed Voice Live Bridge relay on
+  `/voice_conversation_engine` and `/invocations_ws`; `VoiceHandler` has one
+  async callback per inbound event plus `on_disconnect` and
+  `on_connection_terminating`; outbound events go through a send-only
+  `Session`. The codec applies upstream's validation, messages and close
+  codes (1002/1003/1009; 1000 on `session.end`; 1011 on callback failure).
+  With `otel`, `agentserver.connection`, `voice.callback` and `invoke_agent`
+  (`TargetTurn`) spans join the caller's trace and allow-listed baggage and
+  record upstream's voice metrics.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
