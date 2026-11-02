@@ -512,17 +512,19 @@ impl FilterCompiler<'_> {
                     .iter()
                     .map(|o| json_to_bson(o, &format!("{}[]", field.name), KeyRules::TopLevelSafe))
                     .collect::<Result<Vec<_>>>()?;
+                // Guard on the field being an array, not on `$ne: null`:
+                // MongoDB compares `$ne` against each element, so `[null, "x"]`
+                // would fail a non-null guard although it contains "x".
+                let is_array = doc! { name: { "$type": "array" } };
                 if prepared.is_empty() {
                     return Ok(if *op == FilterOperator::ContainsAll {
-                        doc! { "$and": Self::present(name) }
+                        is_array
                     } else {
                         Self::false_filter()
                     });
                 }
                 let native = if *op == FilterOperator::ContainsAll { "$all" } else { "$in" };
-                let mut all = Self::present(name);
-                all.push(doc! { name: { native: prepared } });
-                doc! { "$and": all }
+                doc! { "$and": [ is_array, { name: { native: prepared } } ] }
             }
             other => {
                 return Err(config(format!(

@@ -236,7 +236,7 @@ async fn filters_use_mongo_wire_operators() {
             Filter::new("tags", FilterOperator::Contains, Some(json!("azure")))
                 .unwrap()
                 .into(),
-            doc! { "$and": [ { "tags": { "$exists": true } }, { "tags": { "$ne": Bson::Null } }, { "tags": { "$in": ["azure"] } } ] },
+            doc! { "$and": [ { "tags": { "$type": "array" } }, { "tags": { "$in": ["azure"] } } ] },
         ),
         (
             Filter::new(
@@ -246,7 +246,7 @@ async fn filters_use_mongo_wire_operators() {
             )
             .unwrap()
             .into(),
-            doc! { "$and": [ { "tags": { "$exists": true } }, { "tags": { "$ne": Bson::Null } }, { "tags": { "$all": ["azure", 1_i64] } } ] },
+            doc! { "$and": [ { "tags": { "$type": "array" } }, { "tags": { "$all": ["azure", 1_i64] } } ] },
         ),
         (
             Filter::eq("id", "one").unwrap().into(),
@@ -728,4 +728,22 @@ async fn list_fields_refuse_whole_value_equality() {
     // A null operand is still an is-null test.
     let e: FilterExpression = Filter::eq("tags", Value::Null).unwrap().into();
     assert!(c.filter_document(&e).is_ok());
+}
+
+#[tokio::test]
+async fn list_membership_does_not_use_an_element_sensitive_null_guard() {
+    // `$ne: null` compares array elements, so `[null, "x"]` would be
+    // excluded from `contains "x"`; the guard must be on the field's type.
+    let c = collection().await;
+    for (op, value) in [
+        (FilterOperator::Contains, json!("x")),
+        (FilterOperator::ContainsAny, json!(["x"])),
+        (FilterOperator::ContainsAll, json!(["x"])),
+        (FilterOperator::ContainsAll, json!([])),
+    ] {
+        let e: FilterExpression = Filter::new("tags", op, Some(value)).unwrap().into();
+        let rendered = format!("{:?}", c.filter_document(&e).unwrap());
+        assert!(!rendered.contains("$ne"), "{rendered}");
+        assert!(rendered.contains(r#""$type": String("array")"#), "{rendered}");
+    }
 }
