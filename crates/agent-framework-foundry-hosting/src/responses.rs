@@ -796,6 +796,9 @@ struct Prepared {
     /// Held from before the turn can be cancelled or deleted until its
     /// persistence ends.
     terminal: Arc<TerminalHandle>,
+    /// The agent, when resolved before the turn runs (see
+    /// [`snapshot_inherited_session`]).
+    agent: Option<Arc<dyn SupportsAgentRun>>,
 }
 
 /// Replies resuming a paused workflow.
@@ -982,6 +985,7 @@ async fn create(
         session_state,
         session_out: Arc::default(),
         terminal: Arc::new(inner.terminal(&response_id)),
+        agent: None,
         input_items: input_items_of(&create.input, &response_id),
         model: create
             .model
@@ -998,6 +1002,16 @@ async fn create(
         created_at: now_secs(),
         create,
     };
+    let mut prepared = prepared;
+    if let Err(e) = snapshot_inherited_session(server, &mut prepared).await {
+        return match e {
+            TurnError::Public(message) => bad_request(message),
+            TurnError::Run(e) => {
+                tracing::error!(error = %e, "failed to record a turn's inherited session");
+                server_error("The response could not be started.".to_string())
+            }
+        };
+    }
 
     if prepared.create.background {
         return start_background(inner, prepared).await;
@@ -1451,6 +1465,7 @@ async fn execute(
 ) -> std::result::Result<(AgentResponse, Option<WorkflowPause>), TurnError> {
     let request = &prepared.request;
     let agent = match &server.target {
+        _ if prepared.agent.is_some() => prepared.agent.clone().expect("checked"),
         Target::Agent(agent) => agent.clone(),
         Target::AgentFactory(factory) => factory().await?,
         Target::Workflow { factory, parse } => {
@@ -1770,6 +1785,41 @@ fn attach_local_history(
     None
 }
 
+/// For a stored conversation turn kept in host sessions, record the
+/// conversation's session as it is now under the turn's own response key,
+/// before the turn can run, fail or be cancelled (even while queued). The
+/// conversation's turn lock is held, so this is exactly the session the turn
+/// inherits; a completed turn replaces it with its own, and a cancelled or
+/// failed one keeps it, so continuing from it never picks up the
+/// conversation's later turns. Resolves the agent (kept for the turn) to
+/// address its sessions.
+async fn snapshot_inherited_session(
+    server: &ResponsesHostServer,
+    prepared: &mut Prepared,
+) -> std::result::Result<(), TurnError> {
+    let Some(conversation) = &prepared.request.conversation_id else {
+        return Ok(());
+    };
+    if !prepared.store || server.history == HistorySource::AgentServer {
+        return Ok(());
+    }
+    let agent = match &server.target {
+        Target::Agent(agent) => agent.clone(),
+        Target::AgentFactory(factory) => factory().await?,
+        Target::Workflow { .. } => return Ok(()),
+    };
+    let sessions = server.host_sessions(&prepared.request.context)?;
+    sessions
+        .copy_or_fresh(
+            agent.as_ref(),
+            &conversation_session_key(conversation),
+            &response_session_key(&prepared.request.response_id),
+        )
+        .await?;
+    prepared.agent = Some(agent);
+    Ok(())
+}
+
 /// What [`HostSessions::load`] returns: the session and, without the
 /// `session-store` feature, its detached history.
 type LoadedSession = (
@@ -1797,6 +1847,40 @@ impl HostSessions {
                     ))
                 })
                 .transpose()
+        }
+    }
+
+    /// Store `from`'s session under `to` as it is now, or a new session
+    /// when `from` has none.
+    async fn copy_or_fresh(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        #[cfg(feature = "session-store")]
+        {
+            let from = agent_framework_core::session_store::AgentSessionStoreKey::new(from)?;
+            let to = agent_framework_core::session_store::AgentSessionStoreKey::new(to)?;
+            let namespaced = Namespaced::new(agent, &self.1);
+            let session = match self.0.get_session(&namespaced, &from).await? {
+                Some(session) => session,
+                None => agent.create_session(),
+            };
+            self.0.save_session(&namespaced, &to, &session).await
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            let mut sessions = self.0.lock().unwrap();
+            let snapshot = match sessions.get(from) {
+                Some(snapshot) => snapshot.clone(),
+                None => SessionSnapshot {
+                    state: agent.create_session().to_dict(),
+                    history: None,
+                },
+            };
+            sessions.insert(to.to_string(), snapshot);
+            Ok(())
         }
     }
 
@@ -1865,7 +1949,8 @@ async fn load_session(
 /// The session a cancelled or failed response inherited, since only a
 /// completed turn saves one under its response (the counterpart of the
 /// `session_state` an `AgentServer` record keeps): its predecessor's, else
-/// its conversation's, else a new one. `None` when `previous` is not such a
+/// a new one. (A conversation turn records its inherited session under its
+/// own key before running; see [`snapshot_inherited_session`].) `None` when `previous` is not such a
 /// response (or the chain is too long or broken).
 async fn inherited_session(
     server: &ResponsesHostServer,
@@ -1882,16 +1967,11 @@ async fn inherited_session(
         if !matches!(response["status"].as_str(), Some("cancelled" | "failed")) {
             return Ok(None);
         }
-        if let Some(conversation) = response["conversation"]["id"].as_str() {
-            return Ok(Some(
-                match sessions
-                    .load(agent, &conversation_session_key(conversation))
-                    .await?
-                {
-                    Some(loaded) => loaded,
-                    None => (agent.create_session(), None),
-                },
-            ));
+        if response["conversation"]["id"].is_string() {
+            // A conversation turn records the session it inherited under its
+            // own key before it runs; the conversation's current session has
+            // moved on, so without that record there is nothing to resume.
+            return Ok(None);
         }
         let Some(next) = response["previous_response_id"].as_str() else {
             return Ok(Some((agent.create_session(), None)));

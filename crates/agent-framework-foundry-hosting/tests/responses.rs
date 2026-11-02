@@ -2151,3 +2151,70 @@ async fn agent_kept_sessions_survive_cancelled_and_failed_predecessors() {
         assert_eq!(text(&next), "turn 1");
     }
 }
+
+#[tokio::test]
+async fn a_conversation_turns_continuation_keeps_the_session_it_inherited() {
+    use agent_framework_foundry_hosting::HistorySource;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .into_router();
+        let text = |r: &serde_json::Value| {
+            r["output"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let in_conversation = |input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "conversation": "conv_k"}),
+            )
+        };
+        let continue_from = |id: &serde_json::Value, input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "previous_response_id": id}),
+            )
+        };
+        let (_, first) = json(&router, in_conversation("a")).await;
+        assert_eq!(text(&first), "turn 1", "{history:?}");
+        // B fails in the conversation, then the conversation moves on.
+        let failed = failed_turn(&router, json!({"input": "fail", "conversation": "conv_k"})).await;
+        let (_, second) = json(&router, in_conversation("b")).await;
+        assert_eq!(text(&second), "turn 2", "{history:?}");
+        // Continuing from B sees the session B inherited, not the later turn.
+        let (status, next) = json(&router, continue_from(&failed["id"], "x")).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(text(&next), "turn 2", "{history:?}: B's inherited session");
+
+        // Likewise for a turn cancelled mid-run.
+        let (_, queued) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "hang", "background": true, "conversation": "conv_k"}),
+            ),
+        )
+        .await;
+        let cancelled = queued["id"].clone();
+        let (status, _) = json(
+            &router,
+            post(
+                &format!("/responses/{}/cancel", cancelled.as_str().unwrap()),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, third) = json(&router, in_conversation("c")).await;
+        assert_eq!(text(&third), "turn 3", "{history:?}");
+        let (status, next) = json(&router, continue_from(&cancelled, "y")).await;
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(
+            text(&next),
+            "turn 3",
+            "{history:?}: the cancelled turn's inherited session"
+        );
+    }
+}

@@ -35,6 +35,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting: with `HistorySource::Agent`/`Service`, each stored
+  conversation turn records the session it inherited before it runs, so
+  continuing from a cancelled or failed conversation turn with
+  `previous_response_id` restores that exact session rather than the
+  conversation's later state.
 - FIDES for MCP (review fix): an MCP error result whose server `_meta.ifc`
   label is untrusted or confidential has its details withheld, instead of
   its text reaching the model unlabeled through a locally trusted/public tool.
