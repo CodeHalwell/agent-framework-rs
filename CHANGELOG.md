@@ -21,6 +21,14 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Workflow run controls: `WorkflowContext::request_halt` (stop after the
+  superstep), `WorkflowRunStream::cancel`, per-run `session_id` on
+  `WorkflowRun` and `WorkflowRunStream`, a defaulted `Executor::reset`
+  called before each fresh run, `WorkflowContext::add_warning` with the new
+  `WorkflowEvent::Warning` / `SubworkflowWarning` variants (forwarded from
+  nested workflows), `SequentialBuilder::with_chain_only_agent_responses`,
+  `ConcurrentBuilder::with_aggregator` and
+  `AgentExecutor::with_reassign_other_agents_as_users`.
 - Workflow telemetry: runs emit `workflow.build`, `workflow.run`,
   `executor.process {id}`, `message.send` and `edge_group.process {type}`
   spans (upstream's names and attributes) through `tracing`;
@@ -118,6 +126,8 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- **Breaking:** `WorkflowEvent` gains `Warning` and `SubworkflowWarning`
+  variants; exhaustive matches need arms for them.
 - **Behavior change:** mixed declaration-only batches follow upstream
   #9050 and #9203. With a session, a declaration-only call's local siblings
   no longer run on the same turn: the batch pauses, the siblings are held in

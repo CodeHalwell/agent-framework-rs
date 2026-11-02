@@ -95,6 +95,14 @@ pub enum WorkflowEvent {
     },
     /// The run failed terminally (`WorkflowFailedEvent`).
     Failed { error: String },
+    /// A non-fatal problem an executor reported (`WorkflowWarningEvent`).
+    Warning { message: String },
+    /// A warning from a nested workflow, forwarded by its
+    /// [`WorkflowExecutor`](super::WorkflowExecutor) (`SubworkflowWarningEvent`).
+    SubworkflowWarning {
+        sub_workflow_id: String,
+        message: String,
+    },
 }
 
 impl WorkflowEvent {

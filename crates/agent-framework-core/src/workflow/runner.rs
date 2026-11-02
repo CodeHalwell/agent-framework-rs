@@ -668,8 +668,11 @@ impl Workflow {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = self.shared.clone();
         let input = input.into();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let run_session_id = session_id.clone();
         let handle = tokio::spawn(async move {
             let mut run = WorkflowRun::new(shared, Some(tx));
+            run.session_id = run_session_id;
             let result = run.start(input).await;
             // Drop the streaming sender so the receiver observes end-of-stream;
             // otherwise the sender lives on inside the returned run and the
@@ -681,6 +684,7 @@ impl Workflow {
         WorkflowRunStream {
             rx,
             handle: Some(handle),
+            session_id,
         }
     }
 
@@ -823,9 +827,17 @@ pub struct WorkflowRun {
     events: Vec<WorkflowEvent>,
     state: WorkflowRunState,
     event_tx: Option<UnboundedSender<WorkflowEvent>>,
+    halt: Arc<std::sync::atomic::AtomicBool>,
+    session_id: String,
 }
 
 impl WorkflowRun {
+    /// This run's id (upstream `Run.SessionId`), distinct for every run of
+    /// the workflow.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn new(shared: Arc<WorkflowShared>, event_tx: Option<UnboundedSender<WorkflowEvent>>) -> Self {
         Self {
             shared,
@@ -837,6 +849,8 @@ impl WorkflowRun {
             events: Vec::new(),
             state: WorkflowRunState::Started,
             event_tx,
+            halt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -884,6 +898,9 @@ impl WorkflowRun {
     }
 
     async fn start(&mut self, input: Value) -> Result<()> {
+        for executor in self.shared.executors.values() {
+            executor.reset().await?;
+        }
         self.emit(WorkflowEvent::Started);
         self.state = WorkflowRunState::InProgress;
         self.emit(WorkflowEvent::Status(WorkflowRunState::InProgress));
@@ -1097,8 +1114,10 @@ impl WorkflowRun {
             // relies on for determinism.
             let shared_state = self.shared_state.clone();
             let telemetry = self.shared.telemetry;
+            let halt = self.halt.clone();
             let group_results = futures::future::join_all(groups.into_iter().map(|group| {
                 let shared_state = shared_state.clone();
+                let halt = halt.clone();
                 async move {
                     let mut out = Vec::with_capacity(group.len());
                     for inv in group {
@@ -1109,6 +1128,7 @@ impl WorkflowRun {
                                 inv.source_ids,
                                 shared_state.clone(),
                                 telemetry,
+                                halt.clone(),
                             )
                             .await,
                         );
@@ -1200,6 +1220,11 @@ impl WorkflowRun {
             self.emit(WorkflowEvent::SuperStepCompleted(step));
             self.queue = next;
             self.iteration += 1;
+            if self.halt.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // An executor asked the run to stop: what this superstep sent
+                // is not delivered.
+                self.queue.clear();
+            }
             self.maybe_checkpoint(step).await;
         }
 
@@ -1230,6 +1255,7 @@ impl WorkflowRun {
         source_ids: Vec<String>,
         shared_state: SharedState,
         telemetry: WorkflowTelemetryOptions,
+        halt: Arc<std::sync::atomic::AtomicBool>,
     ) -> (String, Result<DrainedEffects>) {
         use tracing::Instrument;
         let id = executor.id().to_string();
@@ -1250,8 +1276,9 @@ impl WorkflowRun {
         if telemetry.enable_sensitive_data {
             span.record("message.content", data.to_string());
         }
-        let ctx =
-            WorkflowContext::new(id.clone(), source_ids, shared_state).with_telemetry(telemetry);
+        let ctx = WorkflowContext::new(id.clone(), source_ids, shared_state)
+            .with_telemetry(telemetry)
+            .with_halt(halt);
         let result = match executor
             .execute(data, ctx.clone())
             .instrument(span.clone())
@@ -1549,9 +1576,25 @@ impl WorkflowRun {
 pub struct WorkflowRunStream {
     rx: UnboundedReceiver<WorkflowEvent>,
     handle: Option<tokio::task::JoinHandle<Result<WorkflowRun>>>,
+    session_id: String,
 }
 
 impl WorkflowRunStream {
+    /// The run's id (see [`WorkflowRun::session_id`]).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Stop the run (upstream `CancelRunAsync`): its task is aborted at its
+    /// next await point, the stream ends, and [`into_run`](Self::into_run)
+    /// then reports the cancellation as an error. Work an executor already
+    /// started outside the runtime (a request in flight) is not undone.
+    pub fn cancel(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
     /// Await the driving task and return the final run state.
     ///
     /// Drains any remaining buffered events first so the run completes.

@@ -818,6 +818,17 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
         WorkflowEvent::Failed { error } => {
             json!({ "event_type": "WorkflowFailedEvent", "message": error })
         }
+        WorkflowEvent::Warning { message } => {
+            json!({ "event_type": "WorkflowWarningEvent", "message": message })
+        }
+        WorkflowEvent::SubworkflowWarning {
+            sub_workflow_id,
+            message,
+        } => json!({
+            "event_type": "SubworkflowWarningEvent",
+            "sub_workflow_id": sub_workflow_id,
+            "message": message,
+        }),
         // Handled by the caller; included for completeness.
         WorkflowEvent::ExecutorInvoked { executor_id } => {
             json!({ "event_type": "ExecutorInvokedEvent", "executor_id": executor_id })

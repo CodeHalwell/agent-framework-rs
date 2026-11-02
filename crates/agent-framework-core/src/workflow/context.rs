@@ -53,6 +53,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct WorkflowContext {
     telemetry: super::runner::WorkflowTelemetryOptions,
+    halt: Option<Arc<std::sync::atomic::AtomicBool>>,
     executor_id: String,
     source_ids: Arc<Vec<String>>,
     shared: SharedState,
@@ -63,6 +64,7 @@ impl WorkflowContext {
     pub(crate) fn new(executor_id: String, source_ids: Vec<String>, shared: SharedState) -> Self {
         Self {
             telemetry: Default::default(),
+            halt: None,
             executor_id,
             source_ids: Arc::new(source_ids),
             shared,
@@ -80,6 +82,27 @@ impl WorkflowContext {
             target_id: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn with_halt(mut self, halt: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    /// Ask the run to stop once the current superstep completes (upstream
+    /// `RequestHaltAsync`): this superstep's effects are applied, and the
+    /// messages it sent are dropped rather than delivered.
+    pub fn request_halt(&self) {
+        if let Some(halt) = &self.halt {
+            halt.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Report a non-fatal problem as a [`WorkflowEvent::Warning`].
+    pub fn add_warning(&self, message: impl Into<String>) {
+        self.add_event(WorkflowEvent::Warning {
+            message: message.into(),
+        });
     }
 
     pub(crate) fn with_telemetry(

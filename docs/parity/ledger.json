@@ -5239,9 +5239,11 @@
             "note": "AgentExecutor does not intercept agent approval/user-input requests; AgentApprovalExecutor is a separate post-response approval loop."
           },
           "ReassignOtherAgentsAsUsers": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "AgentExecutor passes the conversation unchanged; other agents' assistant messages are not rewritten as user messages."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::AgentExecutor::with_reassign_other_agents_as_users"
+            ],
+            "status": "mapped",
+            "note": "Option on AgentExecutor."
           }
         }
       },
@@ -5492,9 +5494,11 @@
             "note": "Builds the dispatcher, participant executors and aggregator into a Workflow."
           },
           "WithAggregator(Func<IList<List<ChatMessage>>, List<ChatMessage>>)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "ConcurrentBuilder uses a fixed internal aggregator; there is no hook to supply a custom aggregation function."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::concurrent::ConcurrentBuilder::with_aggregator"
+            ],
+            "status": "mapped",
+            "note": "Closure over the participants' conversations."
           }
         }
       },
@@ -5694,9 +5698,11 @@
             "note": "The Executor trait requires Send + Sync, so every instance is assumed safe to share across concurrent runs."
           },
           "SupportsResetting": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Executors have no reset hook between runs; only snapshot_state/restore_state for checkpoints."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Every executor can reset; the default does nothing."
           }
         }
       },
@@ -5840,9 +5846,11 @@
             "note": "Executor requires Send + Sync, so shared instances are assumed safe under concurrent runs."
           },
           "SupportsResetting": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No reset capability exists for shared executor instances between runs."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Every executor can reset; the default does nothing."
           }
         }
       },
@@ -6082,15 +6090,19 @@
       },
       "IResettableExecutor": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No reset trait; executors are reused across runs without a reset hook."
+          "rust": [
+            "agent_framework_core::workflow::executor::Executor::reset"
+          ],
+          "status": "adapted",
+          "note": "A defaulted trait method rather than a separate interface; the runner calls it on every executor before a fresh run."
         },
         "methods": {
           "ResetAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No reset method exists on Executor."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::reset"
+            ],
+            "status": "adapted",
+            "note": "Defaulted async trait method."
           }
         }
       },
@@ -6151,9 +6163,11 @@
             "note": "No key-listing method; SharedState::export returns the whole map, and scopes do not exist."
           },
           "RequestHaltAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WorkflowContext has no way for an executor to request the run halt at the end of the superstep."
+            "rust": [
+              "agent_framework_core::workflow::context::WorkflowContext::request_halt"
+            ],
+            "status": "mapped",
+            "note": "The run stops once the superstep completes; messages the superstep sent are dropped."
           },
           "SendMessageAsync(object, string, CancellationToken)": {
             "rust": [
@@ -6632,9 +6646,11 @@
             "note": "events() returns every event the run has emitted."
           },
           "SessionId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "WorkflowRun has no session id; only the workflow-level Workflow::id exists."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRun::session_id"
+            ],
+            "status": "mapped",
+            "note": "A fresh id per run."
           }
         },
         "methods": {
@@ -6783,9 +6799,12 @@
             "note": "build() validates participants and returns the sequential Workflow."
           },
           "WithChainOnlyAgentResponses(bool)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Each stage always receives the full running conversation; there is no option to chain only agent responses."
+            "rust": [
+              "agent_framework_core::workflow::orchestration::sequential::SequentialBuilder::with_chain_only_agent_responses",
+              "agent_framework_core::workflow::orchestration::AgentExecutor::with_chain_only_responses"
+            ],
+            "status": "mapped",
+            "note": "Builder option; each participant receives only the previous response."
           }
         }
       },
@@ -6821,16 +6840,20 @@
         },
         "properties": {
           "SessionId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Streaming runs carry no session id."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRunStream::session_id"
+            ],
+            "status": "mapped",
+            "note": "A fresh id per run."
           }
         },
         "methods": {
           "CancelRunAsync()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No cancel operation; dropping the stream detaches the spawned run task rather than stopping it, and WorkflowRunState::Cancelled is never set."
+            "rust": [
+              "agent_framework_core::workflow::runner::WorkflowRunStream::cancel"
+            ],
+            "status": "mapped",
+            "note": "Aborts the run task; into_run reports the cancellation."
           },
           "DisposeAsync()": {
             "rust": [
@@ -6885,22 +6908,28 @@
       },
       "SubworkflowWarningEvent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Workflows emit no warning events; warnings go to tracing only."
+          "rust": [
+            "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+          ],
+          "status": "mapped",
+          "note": "Forwarded by WorkflowExecutor from a nested workflow's warnings."
         },
         "constructors": {
           "SubworkflowWarningEvent(string, string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No warning event to construct."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+            ],
+            "status": "mapped",
+            "note": "Variant constructor."
           }
         },
         "properties": {
           "SubWorkflowId": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No subworkflow warning event, so no subworkflow id field."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::SubworkflowWarning"
+            ],
+            "status": "mapped",
+            "note": "The sub_workflow_id field."
           }
         }
       },
@@ -7298,15 +7327,20 @@
       },
       "WorkflowWarningEvent": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No workflow warning event; warnings are logged via tracing."
+          "rust": [
+            "agent_framework_core::workflow::events::WorkflowEvent::Warning",
+            "agent_framework_core::workflow::context::WorkflowContext::add_warning"
+          ],
+          "status": "mapped",
+          "note": "Event variant, emitted with WorkflowContext::add_warning."
         },
         "constructors": {
           "WorkflowWarningEvent(string)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No warning event to construct."
+            "rust": [
+              "agent_framework_core::workflow::events::WorkflowEvent::Warning"
+            ],
+            "status": "mapped",
+            "note": "Variant constructor."
           }
         }
       }

@@ -44,8 +44,8 @@ pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
 pub use orchestration::{
     handoff_tool_name, handoff_tool_spec, AgentApprovalExecutor, AgentExecutor, ApprovalRequest,
-    AutonomousMode, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective, GroupChatManager,
-    GroupChatState, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
+    AutonomousMode, ConcurrentAggregator, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,
+    GroupChatManager, GroupChatState, HandoffBuilder, HandoffEdgeBuilder, HandoffInteractionMode,
     HandoffUserInputRequest, MagenticBuilder, MagenticContext, MagenticManager,
     MagenticPlanReviewDecision, MagenticPlanReviewRequest, MagenticProgressLedger,
     MagenticProgressLedgerItem, MagenticStallInterventionDecision,

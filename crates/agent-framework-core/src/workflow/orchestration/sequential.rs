@@ -20,6 +20,7 @@ pub struct SequentialBuilder {
     intermediate_output_from: Vec<String>,
     request_info: bool,
     ensure_trailing_user_turn: bool,
+    chain_only_agent_responses: bool,
 }
 
 impl SequentialBuilder {
@@ -114,6 +115,14 @@ impl SequentialBuilder {
         self
     }
 
+    /// Pass each participant only the previous one's response rather than
+    /// the whole conversation (upstream `WithChainOnlyAgentResponses`). Not
+    /// applied to participants wrapped for request info.
+    pub fn with_chain_only_agent_responses(mut self, chain_only: bool) -> Self {
+        self.chain_only_agent_responses = chain_only;
+        self
+    }
+
     /// Validate and build the sequential workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -174,7 +183,8 @@ impl SequentialBuilder {
                     AgentExecutor::new(exec_id.clone(), agent)
                         .with_output(emit)
                         .with_also_send(has_designation)
-                        .with_trailing_user_turn(self.ensure_trailing_user_turn),
+                        .with_trailing_user_turn(self.ensure_trailing_user_turn)
+                        .with_chain_only_responses(self.chain_only_agent_responses),
                 )
             };
             builder = builder.add_executor(exec);

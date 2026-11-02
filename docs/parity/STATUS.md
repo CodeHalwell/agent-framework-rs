@@ -20,7 +20,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 44 / 14 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 57 / 98 / 43 / 68 / 0 | 41 | 0 |
+| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 69 / 102 / 43 / 52 / 0 | 41 | 0 |
 | `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
 | `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
 | `Microsoft.Agents.AI.Workflows.InProc` | 5 / 3 / 0 / 0 / 0 | 1 / 2 / 5 / 0 / 0 | 0 | 0 |
@@ -179,7 +179,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::ForwardIncomingMessages` | partial | mapped | AgentExecutor always sends the incoming conversation plus the reply downstream; forwarding only the reply is not configurable. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::InterceptUnterminatedFunctionCalls` | unmapped | mapped | AgentExecutor has no option to route unresolved function calls as workflow messages or external requests. |
 | `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::InterceptUserInputRequests` | unmapped | mapped | AgentExecutor does not intercept agent approval/user-input requests; AgentApprovalExecutor is a separate post-response approval loop. |
-| `Microsoft.Agents.AI.Workflows::AIAgentHostOptions properties::ReassignOtherAgentsAsUsers` | unmapped | mapped | AgentExecutor passes the conversation unchanged; other agents' assistant messages are not rewritten as user messages. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildConcurrent(IEnumerable<AIAgent>, Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | partial | adapted | ConcurrentBuilder builds the fan-out/fan-in, but its aggregator is fixed (prompt plus each last reply); no custom aggregator. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildConcurrent(string, IEnumerable<AIAgent>, Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | partial | adapted | ConcurrentBuilder::name sets the workflow name, but a custom aggregator function cannot be supplied. |
 | `Microsoft.Agents.AI.Workflows::AgentWorkflowBuilder methods::BuildSequential(bool, IEnumerable<AIAgent>)` | partial | adapted | SequentialBuilder always forwards the full accumulated conversation; there is no chain-only-agent-responses mode. |
@@ -188,7 +187,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::Checkpoints` | partial | adapted | WorkflowRun does not expose its checkpoints; callers query the CheckpointStorage by workflow id instead. |
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::IsCheckpointingEnabled` | partial | adapted | Checkpointing is enabled on WorkflowBuilder::with_checkpointing, but neither Workflow nor WorkflowRun reports whether it is on. |
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::LastCheckpoint` | partial | adapted | WorkflowRun has no last-checkpoint accessor; the latest must be found by listing the storage. |
-| `Microsoft.Agents.AI.Workflows::ConcurrentWorkflowBuilder methods::WithAggregator(Func<IList<List<ChatMessage>>, List<ChatMessage>>)` | unmapped | adapted | ConcurrentBuilder uses a fixed internal aggregator; there is no hook to supply a custom aggregation function. |
 | `Microsoft.Agents.AI.Workflows::EdgeData properties::Label` | partial | adapted | Labels exist only on switch Case edges; plain, fan-out and fan-in edges carry no label. |
 | `Microsoft.Agents.AI.Workflows::EdgeId` | unmapped | adapted | Edges have no public identity type; they are not individually addressable. |
 | `Microsoft.Agents.AI.Workflows::Executor methods::DescribeProtocol()` | unmapped | mapped | There is no protocol descriptor; message routing is by edges only, without type checks. |
@@ -200,23 +198,18 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::FactoryAsync` | unmapped | adapted | No per-run executor factory; every run shares the registered Arc<dyn Executor> instance. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::IsPlaceholder` | unmapped | adapted | Placeholder bindings resolved later do not exist; executors must be supplied when added. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::RawValue` | unmapped | adapted | No raw source value is retained alongside the registered executor. |
-| `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::SupportsResetting` | unmapped | adapted | Executors have no reset hook between runs; only snapshot_state/restore_state for checkpoints. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBindingExtensions methods::BindAsExecutor(AIAgent, bool)` | partial | adapted | AgentExecutor::new wraps the agent, but update-event emission is always on and cannot be toggled. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBindingExtensions methods::BindExecutor<TExecutor>(Func<string, string, ValueTask<TExecutor>>, string)` | unmapped | adapted | No lazily invoked per-session executor factory; executors are constructed before being added. |
 | `Microsoft.Agents.AI.Workflows::ExecutorCompletedEvent` | partial | mapped | WorkflowEvent::ExecutorCompleted carries only executor_id, not the handler result payload. |
-| `Microsoft.Agents.AI.Workflows::ExecutorInstanceBinding properties::SupportsResetting` | unmapped | adapted | No reset capability exists for shared executor instances between runs. |
 | `Microsoft.Agents.AI.Workflows::ExecutorInvokedEvent` | partial | mapped | WorkflowEvent::ExecutorInvoked carries only executor_id, not the incoming message payload. |
 | `Microsoft.Agents.AI.Workflows::ExternalRequest properties::PortInfo` | partial | mapped | There are no typed request ports; only the emitting and reply-to executor ids are recorded. |
 | `Microsoft.Agents.AI.Workflows::ExternalResponse properties::PortInfo` | partial | mapped | No request port metadata; the response carries original_request instead. |
 | `Microsoft.Agents.AI.Workflows::FunctionExecutor<TInput, TOutput>` | partial | adapted | FunctionExecutor wraps an async closure over serde_json::Value; there is no typed output that is auto-sent. |
-| `Microsoft.Agents.AI.Workflows::IResettableExecutor methods::ResetAsync()` | unmapped | adapted | No reset method exists on Executor. |
-| `Microsoft.Agents.AI.Workflows::IResettableExecutor` | unmapped | adapted | No reset trait; executors are reused across runs without a reset hook. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::QueueClearScopeAsync(string, CancellationToken)` | partial | adapted | SharedState::clear wipes the single run-wide namespace; there are no named or executor-local scopes. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::QueueStateUpdateAsync<T>(string, T, string, CancellationToken)` | partial | adapted | SharedState::set stages an update committed at the superstep boundary, but the scope parameter has no counterpart. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadOrInitStateAsync<T>(string, Func<T>, string, CancellationToken)` | partial | adapted | SharedState::update can initialise a missing key from a closure, but state has no scopes. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadStateAsync<T>(string, string, CancellationToken)` | partial | adapted | SharedState::get reads a Value by key; there is no scope parameter and no typed read. |
 | `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::ReadStateKeysAsync(string, CancellationToken)` | partial | adapted | No key-listing method; SharedState::export returns the whole map, and scopes do not exist. |
-| `Microsoft.Agents.AI.Workflows::IWorkflowContext methods::RequestHaltAsync()` | unmapped | adapted | WorkflowContext has no way for an executor to request the run halt at the end of the superstep. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::OpenStreamingAsync(Workflow, CheckpointManager, string?, CancellationToken)` | partial | adapted | run_stream always requires an initial input; opening a run with no input and a session id is not supported. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::OpenStreamingAsync(Workflow, string?, CancellationToken)` | partial | adapted | A streaming run cannot be opened without an initial input message, and session ids are not supported. |
 | `Microsoft.Agents.AI.Workflows::InProcessExecution methods::ResumeStreamingAsync(Workflow, CheckpointInfo, CheckpointManager, CancellationToken)` | partial | adapted | Resume is non-streaming only; there is no run_stream variant that restores from a checkpoint. |
@@ -239,7 +232,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::RequestPort properties::Response` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no response type on a request node. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEventCount` | partial | mapped | events() returns all events; there is no bookmark, so the count of new events since last read is not tracked. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEvents` | partial | mapped | events() returns the full slice each time; no cursor advances to yield only newly arrived events. |
-| `Microsoft.Agents.AI.Workflows::Run properties::SessionId` | unmapped | mapped | WorkflowRun has no session id; only the workflow-level Workflow::id exists. |
 | `Microsoft.Agents.AI.Workflows::RunStatus constants::Ended` | partial | mapped | Failed and Cancelled are terminal, but a normally finished run reports Idle; there is no distinct Ended state. |
 | `Microsoft.Agents.AI.Workflows::RunStatus constants::NotStarted` | unmapped | mapped | No pre-start state; Workflow::run and run_stream start immediately and first report Started. |
 | `Microsoft.Agents.AI.Workflows::ScopeId methods::Equals(object?)` | unmapped | partial | No scope identity type to compare. |
@@ -249,17 +241,11 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::ScopeKey methods::Equals(object?)` | unmapped | partial | No scope/key type; keys are plain Strings compared by value. |
 | `Microsoft.Agents.AI.Workflows::ScopeKey properties::ScopeId` | unmapped | adapted | No scope component on SharedState keys. |
 | `Microsoft.Agents.AI.Workflows::ScopeKey` | unmapped | adapted | No scope/key pair; SharedState is addressed by a plain String key. |
-| `Microsoft.Agents.AI.Workflows::SequentialWorkflowBuilder methods::WithChainOnlyAgentResponses(bool)` | unmapped | mapped | Each stage always receives the full running conversation; there is no option to chain only agent responses. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions properties::ScopeName` | unmapped | partial | No state scopes; executor state is not stored under a named shared scope. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions properties::StateKey` | unmapped | partial | No configurable state key; executor state is checkpointed by executor id. |
 | `Microsoft.Agents.AI.Workflows::StatefulExecutorOptions` | partial | adapted | Executors persist state via snapshot_state/restore_state into checkpoints; no options type binding state to a key and scope. |
-| `Microsoft.Agents.AI.Workflows::StreamingRun methods::CancelRunAsync()` | unmapped | mapped | No cancel operation; dropping the stream detaches the spawned run task rather than stopping it, and WorkflowRunState::Cancelled is never set. |
 | `Microsoft.Agents.AI.Workflows::StreamingRun methods::GetStatusAsync(CancellationToken)` | partial | mapped | Status arrives as WorkflowEvent::Status on the stream or via into_run().state(); no query on the live stream. |
 | `Microsoft.Agents.AI.Workflows::StreamingRun methods::SendResponseAsync(ExternalResponse)` | partial | mapped | Responses go to WorkflowRun::send_response after into_run(); events after the response are not streamed. |
-| `Microsoft.Agents.AI.Workflows::StreamingRun properties::SessionId` | unmapped | mapped | Streaming runs carry no session id. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent constructors::SubworkflowWarningEvent(string, string)` | unmapped | adapted | No warning event to construct. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent properties::SubWorkflowId` | unmapped | mapped | No subworkflow warning event, so no subworkflow id field. |
-| `Microsoft.Agents.AI.Workflows::SubworkflowWarningEvent` | unmapped | adapted | Workflows emit no warning events; warnings go to tracing only. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletedEvent properties::CompletionInfo` | unmapped | mapped | SuperStepCompleted carries only the step number, no completion diagnostics. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletionInfo properties::ActivatedExecutors` | unmapped | adapted | Activated executors per superstep are not reported; ExecutorInvoked events are the closest signal. |
 | `Microsoft.Agents.AI.Workflows::SuperStepCompletionInfo properties::Checkpoint` | unmapped | mapped | Superstep checkpoints are saved but not reported on the completion event. |
@@ -283,8 +269,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::WorkflowBuilder methods::Build(bool)` | partial | partial | build() always validates graph connectivity; there is no switch to skip the orphan-executor check. |
 | `Microsoft.Agents.AI.Workflows::WorkflowHostingExtensions methods::AsAIAgent(Workflow, string, string, string, IWorkflowExecutionEnvironment, bool, bool)` | partial | adapted | as_agent(name) plus with_id/with_description; no execution-environment, exception-detail or include-outputs options. |
 | `Microsoft.Agents.AI.Workflows::WorkflowSessionCheckpointRecovery` | unmapped | unmapped | No recovery of workflow-agent sessions from checkpoints; WorkflowAgent sessions are not checkpoint-backed. |
-| `Microsoft.Agents.AI.Workflows::WorkflowWarningEvent constructors::WorkflowWarningEvent(string)` | unmapped | mapped | No warning event to construct. |
-| `Microsoft.Agents.AI.Workflows::WorkflowWarningEvent` | unmapped | mapped | No workflow warning event; warnings are logged via tracing. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::EdgeInfo` | partial | adapted | EdgeGroup (Single/FanOut/FanIn) describes edges, but Workflow does not expose its edge groups publicly. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::ICheckpointStore<TStoreObject> methods::CreateCheckpointAsync(string, TStoreObject, CheckpointInfo)` | partial | mapped | save() persists a checkpoint and returns its id; checkpoints do not record a parent link. |
 | `Microsoft.Agents.AI.Workflows.Checkpointing::ICheckpointStore<TStoreObject> methods::RetrieveIndexAsync(string, CheckpointInfo)` | partial | mapped | list() filters by workflow id, not session, and cannot filter by parent checkpoint. |

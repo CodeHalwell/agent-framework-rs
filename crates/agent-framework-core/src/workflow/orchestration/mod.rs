@@ -50,7 +50,7 @@ mod sequential;
 mod workflow_agent;
 
 pub use approval::{AgentApprovalExecutor, ApprovalRequest};
-pub use concurrent::ConcurrentBuilder;
+pub use concurrent::{ConcurrentAggregator, ConcurrentBuilder};
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
     ManagerSelectionResponse, RoundRobinManager, DEFAULT_GROUP_CHAT_MAX_ITERATIONS,
@@ -324,6 +324,10 @@ pub struct AgentExecutor {
     also_send: bool,
     /// See [`Self::with_trailing_user_turn`].
     ensure_trailing_user_turn: bool,
+    /// See [`Self::with_chain_only_responses`].
+    chain_only_responses: bool,
+    /// See [`Self::with_reassign_other_agents_as_users`].
+    reassign_other_agents_as_users: bool,
 }
 
 impl AgentExecutor {
@@ -335,7 +339,26 @@ impl AgentExecutor {
             emit_output: false,
             also_send: false,
             ensure_trailing_user_turn: false,
+            chain_only_responses: false,
+            reassign_other_agents_as_users: false,
         }
+    }
+
+    /// Send downstream only this agent's response, not the whole
+    /// conversation (upstream `WithChainOnlyAgentResponses`). Its workflow
+    /// output, when it yields one, is still the whole conversation.
+    pub fn with_chain_only_responses(mut self, chain_only: bool) -> Self {
+        self.chain_only_responses = chain_only;
+        self
+    }
+
+    /// Present other agents' assistant messages to this agent as user
+    /// messages (upstream `AIAgentHostOptions.ReassignOtherAgentsAsUsers`), so
+    /// it answers them rather than treating them as its own earlier turns.
+    /// Messages keep their author name.
+    pub fn with_reassign_other_agents_as_users(mut self, reassign: bool) -> Self {
+        self.reassign_other_agents_as_users = reassign;
+        self
     }
 
     /// When set, a conversation ending on an assistant message is run with a
@@ -378,18 +401,37 @@ impl Executor for AgentExecutor {
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         let mut conversation = parse_conversation(&message)?;
-        let invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
+        let mut invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
+        if self.reassign_other_agents_as_users {
+            let own = self.agent.name().map(str::to_string);
+            for m in &mut invocation {
+                let from_other = m.role == crate::types::Role::assistant()
+                    && m.author_name.is_some()
+                    && m.author_name != own;
+                if from_other {
+                    m.role = crate::types::Role::user();
+                }
+            }
+        }
         let response =
             run_agent_and_emit(&self.agent, invocation, &self.id, &self.id, &ctx).await?;
 
-        conversation.extend(response.messages);
-        let payload = serde_json::to_value(&conversation)
-            .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))?;
+        let reply = response.messages;
+        conversation.extend(reply.iter().cloned());
+        let to_value = |messages: &Vec<Message>| {
+            serde_json::to_value(messages)
+                .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))
+        };
+        let payload = to_value(&conversation)?;
         if self.emit_output {
             ctx.yield_output(payload.clone()).await?;
         }
         if !self.emit_output || self.also_send {
-            ctx.send_message(payload).await?;
+            if self.chain_only_responses {
+                ctx.send_message(to_value(&reply)?).await?;
+            } else {
+                ctx.send_message(payload).await?;
+            }
         }
         Ok(())
     }
