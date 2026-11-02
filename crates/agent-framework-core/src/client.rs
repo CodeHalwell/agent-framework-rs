@@ -26,6 +26,23 @@ use crate::types::{
 /// A boxed stream of streaming chat updates.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatResponseUpdate>> + Send>>;
 
+/// Observes each model call of a function-invocation loop: the request it
+/// was sent and the response it returned. Framework-internal; carried in
+/// [`ChatOptions::service_call_observer`].
+#[derive(Clone)]
+pub struct ServiceCallObserver(
+    #[allow(clippy::type_complexity)]
+    pub(crate)  Arc<
+        dyn Fn(Vec<Message>, ChatResponse) -> crate::tools::BoxFuture<Result<()>> + Send + Sync,
+    >,
+);
+
+impl std::fmt::Debug for ServiceCallObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServiceCallObserver")
+    }
+}
+
 /// The interface every chat client implements.
 ///
 /// Implementors provide [`ChatClient::get_response`] and
@@ -206,6 +223,23 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
     /// extra calls are returned, in order, ahead of the last reply, so the
     /// tool loop's later requests and the session history both carry them.
     async fn inner_get_response(
+        &self,
+        messages: Vec<Message>,
+        options: ChatOptions,
+        session: Option<&crate::session::AgentSession>,
+        observer: Option<&ServiceCallObserver>,
+    ) -> Result<ChatResponse> {
+        let Some(observer) = observer else {
+            return self.inject_get_response(messages, options, session).await;
+        };
+        let response = self
+            .inject_get_response(messages.clone(), options, session)
+            .await?;
+        (observer.0)(messages, response.clone()).await?;
+        Ok(response)
+    }
+
+    async fn inject_get_response(
         &self,
         messages: Vec<Message>,
         mut options: ChatOptions,
@@ -1193,6 +1227,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // `effective_client_kwargs.pop("session")`); it is handed to
             // invoked tools via `FunctionInvocationContext::session`.
             let session = options.session.take();
+            let observer = options.service_call_observer.take();
 
             // Default tool choice to auto when tools are present and unset.
             if !options.tools.is_empty() && options.tool_choice.is_none() {
@@ -1206,7 +1241,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             drop_settled_approval_responses(&mut messages);
             if executable_tools(&options).is_empty() || !self.config.enabled {
                 return self
-                    .inner_get_response(messages, options, session.as_ref())
+                    .inner_get_response(messages, options, session.as_ref(), observer.as_ref())
                     .await;
             }
 
@@ -1369,7 +1404,12 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 }
 
                 let response = self
-                    .inner_get_response(conversation.clone(), options.clone(), session.as_ref())
+                    .inner_get_response(
+                        conversation.clone(),
+                        options.clone(),
+                        session.as_ref(),
+                        observer.as_ref(),
+                    )
                     .await
                     // An error ends the run, so a budget parked by an earlier
                     // approval must not outlive it: the next, unrelated run on
@@ -1731,7 +1771,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             InvocationBudget::clear(session.as_ref());
             options.tool_choice = Some(ToolMode::None);
             let mut final_resp = self
-                .inner_get_response(conversation, options, session.as_ref())
+                .inner_get_response(conversation, options, session.as_ref(), observer.as_ref())
                 .await?;
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);
@@ -1755,6 +1795,9 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             let mut messages = messages;
             drop_settled_approval_responses(&mut messages);
             let mut options = options;
+            // Without a tool loop there is one call per run (or one per
+            // injected round); the agent persists the run as a whole.
+            options.service_call_observer = None;
             return match options.session.take() {
                 None => self.inner.get_streaming_response(messages, options).await,
                 Some(session) => {

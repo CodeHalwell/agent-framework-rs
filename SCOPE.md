@@ -77,10 +77,7 @@ from the roadmap, not from this file.
   skills beyond inline and file-based skills (scripts and script
   runners, class-based and MCP skills, source pipelines); compaction's message-group model, triggers and summarization;
   workflow telemetry, run cancellation and graph reflection; message source
-  attribution; history persisted after every model
-  call rather than every run (upstream's
-  `require_per_service_call_history_persistence`, which
-  `create_harness_agent` turns on); context providers seeing the agent
+  attribution; context providers seeing the agent
   (they see the session in `before_run` and, through
   `after_run_in_session`, after the run).
 - **Vector stores**: MongoDB, DuckDB, SQL Server and Azure DocumentDB

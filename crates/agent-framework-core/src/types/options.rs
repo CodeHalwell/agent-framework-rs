@@ -240,6 +240,13 @@ pub struct ChatOptions {
     /// function-invocation layer pops it (`_middleware.py:1188`). Provider
     /// converters must ignore it.
     pub session: Option<crate::session::AgentSession>,
+    /// Framework-internal, like [`Self::session`]: the agent's per-model-call
+    /// history persistence hook (see
+    /// [`AgentBuilder::require_per_service_call_history_persistence`](crate::agent::AgentBuilder::require_per_service_call_history_persistence)).
+    /// The function-invocation loop pops it and calls it after every model
+    /// call. Provider converters must ignore it.
+    #[doc(hidden)]
+    pub service_call_observer: Option<crate::client::ServiceCallObserver>,
 }
 
 impl ChatOptions {
@@ -329,6 +336,7 @@ impl ChatOptions {
         take!(top_p);
         take!(user);
         take!(session);
+        take!(service_call_observer);
 
         // instructions: newline-concatenate.
         self.instructions = match (self.instructions.take(), other.instructions) {

@@ -21,6 +21,10 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- `AgentBuilder::require_per_service_call_history_persistence` (upstream's
+  option of the same name): with a local history provider, each model call
+  of the tool loop records what it added, so a run that fails midway keeps
+  its completed turns. `create_harness_agent` turns it on, as upstream.
 - `agent-framework-redis`: `RedisVectorStore` / `RedisVectorCollection`
   (port of upstream `agent_framework_redis._vector_store`), HASH or JSON
   documents indexed by Redis Search, behind the crate's

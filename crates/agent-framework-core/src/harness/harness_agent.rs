@@ -36,9 +36,9 @@
 //! - **History.** History stays on the session, as everywhere in this
 //!   port: a session from [`HarnessAgent::create_session`] gets an
 //!   in-memory history provider. Attach another history provider to the
-//!   session to persist elsewhere. Upstream persists history after every
-//!   model call (`require_per_service_call_history_persistence`); this port
-//!   persists after each run.
+//!   session to persist elsewhere. As upstream, history is persisted after
+//!   every model call
+//!   ([`AgentBuilder::require_per_service_call_history_persistence`]).
 //! - **Compaction** runs before each run, over the history-prepended
 //!   messages ([`AgentBuilder::with_compaction`]); there is no after-run
 //!   compaction of the stored history.
@@ -445,7 +445,8 @@ impl HarnessAgentBuilder {
         .trim()
         .to_string();
 
-        let mut builder = Agent::builder(self.client.clone());
+        let mut builder =
+            Agent::builder(self.client.clone()).require_per_service_call_history_persistence(true);
         if let Some(id) = self.id {
             builder = builder.id(id);
         }

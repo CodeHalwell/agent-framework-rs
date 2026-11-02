@@ -342,6 +342,8 @@ pub struct Agent {
     /// the [`ObservableChatClient`](crate::observability::ObservableChatClient)
     /// the same builder call installs.
     observability: crate::observability::ObservabilityConfig,
+    /// See [`AgentBuilder::require_per_service_call_history_persistence`].
+    per_service_call_history: bool,
 }
 
 /// A callback receiving each [`AgentResponseUpdate`] streamed by an agent
@@ -489,10 +491,11 @@ impl Agent {
         run_options: AgentRunOptions,
     ) -> Result<AgentRunStream> {
         let mut session = session.unwrap_or_else(|| self.create_session());
-        let (final_messages, options) = self
+        let (final_messages, mut options) = self
             .prepare_request(&input, &mut session, &run_options)
             .await?;
         let service_history = options.conversation_id.is_some();
+        let per_call = self.per_call_history(&session, service_history, &input, &mut options);
 
         // When agent middleware is configured, route the run through the same
         // pipeline as `run` (so guardrails/rewrites/termination apply) and then
@@ -502,7 +505,7 @@ impl Agent {
             let response = match self.run_core(final_messages, options, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    for cp in self.run_providers(&session, service_history) {
+                    for cp in self.finish_providers(&session, service_history, per_call.as_ref()) {
                         let _ = cp
                             .after_run_in_session(&session, &input, &[], Some(&e))
                             .await;
@@ -511,7 +514,7 @@ impl Agent {
                 }
             };
             self.update_session_conversation_id(&mut session, response.conversation_id.as_deref())?;
-            for cp in self.run_providers(&session, service_history) {
+            for cp in self.finish_providers(&session, service_history, per_call.as_ref()) {
                 cp.after_run_in_session(&session, &input, &response.messages, None)
                     .await?;
             }
@@ -528,7 +531,7 @@ impl Agent {
         // the stream's terminal aggregation can auto-populate `value` (task 3).
         let response_format = options.response_format.clone();
         let agent_name = self.name.clone();
-        let providers = self.run_providers(&session, service_history);
+        let providers = self.finish_providers(&session, service_history, per_call.as_ref());
         let inner = match self
             .client
             .get_streaming_response(final_messages, options)
@@ -852,6 +855,72 @@ impl Agent {
         )
     }
 
+    /// Install per-model-call history persistence for this run, when it is
+    /// on and a local history provider records the run.
+    fn per_call_history(
+        &self,
+        session: &AgentSession,
+        service_history: bool,
+        input: &[Message],
+        options: &mut ChatOptions,
+    ) -> Option<Arc<PerCallHistory>> {
+        if !self.per_service_call_history {
+            return None;
+        }
+        let providers: Vec<_> = self
+            .run_providers(session, service_history)
+            .into_iter()
+            .filter(|p| p.is_history_provider())
+            .collect();
+        if providers.is_empty() {
+            return None;
+        }
+        let state = Arc::new(PerCallHistory {
+            providers,
+            session: session.clone(),
+            input: input.to_vec(),
+            author_name: self.name.clone(),
+            last_len: std::sync::Mutex::new(None),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        });
+        let observer_state = state.clone();
+        options.service_call_observer = Some(crate::client::ServiceCallObserver(Arc::new(
+            move |request, response| {
+                let state = observer_state.clone();
+                Box::pin(async move { state.observe(request, response).await })
+            },
+        )));
+        Some(state)
+    }
+
+    /// The providers whose completion hooks end a run: [`Self::run_providers`],
+    /// with history providers that recorded the run call by call replaced so
+    /// they do not record it again.
+    fn finish_providers(
+        &self,
+        session: &AgentSession,
+        service_history: bool,
+        per_call: Option<&Arc<PerCallHistory>>,
+    ) -> Vec<Arc<dyn ContextProvider>> {
+        let providers = self.run_providers(session, service_history);
+        let Some(per_call) = per_call else {
+            return providers;
+        };
+        providers
+            .into_iter()
+            .map(|p| {
+                if p.is_history_provider() {
+                    Arc::new(PerCallFinish {
+                        inner: p,
+                        state: per_call.clone(),
+                    }) as Arc<dyn ContextProvider>
+                } else {
+                    p
+                }
+            })
+            .collect()
+    }
+
     /// The session's providers then the agent's, without history providers
     /// when the service stores the conversation, as .NET's
     /// `ResolveChatHistoryProvider` does: the service already has those
@@ -900,6 +969,90 @@ impl Agent {
                 Ok(())
             }
         }
+    }
+}
+
+/// One run's per-model-call history persistence; see
+/// [`AgentBuilder::require_per_service_call_history_persistence`].
+struct PerCallHistory {
+    providers: Vec<Arc<dyn ContextProvider>>,
+    session: AgentSession,
+    input: Vec<Message>,
+    author_name: Option<String>,
+    /// How much of the next request is already recorded: the previous
+    /// request plus its reply (the loop only appends to the conversation).
+    /// `None` before the first call, whose new messages are the run input.
+    last_len: std::sync::Mutex<Option<usize>>,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl PerCallHistory {
+    async fn observe(&self, request: Vec<Message>, response: ChatResponse) -> Result<()> {
+        // A conversation id means the service holds this turn.
+        if response.conversation_id.is_some() {
+            return Ok(());
+        }
+        let new_request = {
+            let mut last = self
+                .last_len
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let new_request = match *last {
+                None => self.input.clone(),
+                Some(n) if n <= request.len() => request[n..].to_vec(),
+                Some(_) => request.clone(),
+            };
+            *last = Some(request.len() + response.messages.len());
+            new_request
+        };
+        let mut reply = response.messages;
+        if let Some(name) = &self.author_name {
+            for m in &mut reply {
+                if m.author_name.is_none() && m.role == crate::types::Role::assistant() {
+                    m.author_name = Some(name.clone());
+                }
+            }
+        }
+        for provider in self.providers.iter().rev() {
+            provider
+                .after_run_in_session(&self.session, &new_request, &reply, None)
+                .await?;
+        }
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A history provider at the end of a run it recorded call by call: it
+/// records the run only if no model call did (a run without a tool loop).
+struct PerCallFinish {
+    inner: Arc<dyn ContextProvider>,
+    state: Arc<PerCallHistory>,
+}
+
+#[async_trait]
+impl ContextProvider for PerCallFinish {
+    async fn before_run(&self, ctx: &mut SessionContext) -> Result<()> {
+        self.inner.before_run(ctx).await
+    }
+
+    async fn after_run_in_session(
+        &self,
+        session: &AgentSession,
+        request_messages: &[Message],
+        response_messages: &[Message],
+        error: Option<&Error>,
+    ) -> Result<()> {
+        if error.is_none() && self.state.fired.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner
+            .after_run_in_session(session, request_messages, response_messages, error)
+            .await
+    }
+
+    fn is_history_provider(&self) -> bool {
+        true
     }
 }
 
@@ -1040,16 +1193,18 @@ impl SupportsAgentRun for Agent {
             }
         };
 
-        let (final_messages, chat_options) =
+        let (final_messages, mut chat_options) =
             self.prepare_request(&messages, session, &options).await?;
         let service_history = chat_options.conversation_id.is_some();
+        let per_call =
+            self.per_call_history(session, service_history, &messages, &mut chat_options);
         let response = match self.run_core(final_messages, chat_options, false).await {
             Ok(r) => r,
             Err(e) => {
                 // Failure path: let context providers observe the error.
                 // The run's error takes precedence over any hook failure, so
                 // the hook result is intentionally discarded.
-                for cp in self.run_providers(session, service_history) {
+                for cp in self.finish_providers(session, service_history, per_call.as_ref()) {
                     let _ = cp
                         .after_run_in_session(session, &messages, &[], Some(&e))
                         .await;
@@ -1065,7 +1220,7 @@ impl SupportsAgentRun for Agent {
 
         // Fire the context providers' success completion hook (this is what
         // records history, for any attached `HistoryProvider`).
-        for cp in self.run_providers(session, service_history) {
+        for cp in self.finish_providers(session, service_history, per_call.as_ref()) {
             cp.after_run_in_session(session, &messages, &response.messages, None)
                 .await?;
         }
@@ -1138,6 +1293,7 @@ pub struct AgentBuilder {
     observability: Option<crate::observability::ObservabilityConfig>,
     function_invocation_config: Option<crate::tools::FunctionInvocationConfig>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
+    per_service_call_history: bool,
 }
 
 impl AgentBuilder {
@@ -1156,7 +1312,24 @@ impl AgentBuilder {
             observability: None,
             function_invocation_config: None,
             tool_sources: Vec::new(),
+            per_service_call_history: false,
         }
+    }
+
+    /// Persist history after every model call instead of once per run
+    /// (upstream's `require_per_service_call_history_persistence`, which
+    /// `create_harness_agent` turns on).
+    ///
+    /// With a local history provider (the service does not store the
+    /// conversation), each model call of the tool loop records what it added:
+    /// the run's input with the first reply, then each batch of tool results
+    /// with the reply that followed. A long tool run that fails midway keeps
+    /// the turns it completed. Runs without a tool loop record once, at the
+    /// end, as before. When the service stores the conversation this has no
+    /// effect: history providers are not used then.
+    pub fn require_per_service_call_history_persistence(mut self, enabled: bool) -> Self {
+        self.per_service_call_history = enabled;
+        self
     }
 
     pub fn id(mut self, id: impl Into<String>) -> Self {
@@ -1356,6 +1529,7 @@ impl AgentBuilder {
             chat_middleware: MiddlewarePipeline::new(self.chat_middleware),
             tool_sources: self.tool_sources,
             observability,
+            per_service_call_history: self.per_service_call_history,
         }
     }
 }
