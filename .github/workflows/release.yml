@@ -153,7 +153,7 @@ jobs:
             return 1
           }
           publish agent-framework-core
-          for c in a2a bedrock copilotstudio declarative duckdb sql-server mongodb gemini hosting mcp mem0 openai postgres purview qdrant redis tools; do
+          for c in a2a bedrock claude copilotstudio declarative duckdb sql-server mongodb gemini hosting mcp mem0 openai postgres purview qdrant redis tools; do
             publish agent-framework-$c
           done
           for c in azure azure-documentdb foundry-local github-copilot mistral ollama; do

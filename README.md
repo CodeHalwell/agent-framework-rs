@@ -122,6 +122,7 @@ parity with the Python and .NET implementations.
 | [`agent-framework-redis`](crates/agent-framework-redis) | Redis-backed `ChatMessageStore` and long-term-memory `ContextProvider` (RediSearch BM25). |
 | [`agent-framework-mem0`](crates/agent-framework-mem0) | Mem0 hosted-API long-term-memory `ContextProvider`. |
 | [`agent-framework-cosmos`](crates/agent-framework-cosmos) | Azure Cosmos DB NoSQL `ChatMessageStore`, workflow checkpoints, and vector store (master key or Entra ID, REST). |
+| [`agent-framework-claude`](crates/agent-framework-claude) | Claude Code CLI as an agent (`ClaudeAgent`): stream-json control protocol, session resume, in-process MCP function tools, permission and hook callbacks. |
 | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) | Microsoft Copilot Studio agent client (Direct-to-Engine). |
 | [`agent-framework-purview`](crates/agent-framework-purview) | Microsoft Purview compliance middleware (`processContent` DLP checks). |
 | [`agent-framework-tools`](crates/agent-framework-tools) | Built-in tools: a local shell tool (approval required by default, policy pre-filter, persistent or stateless sessions) and a Docker shell tool with locked-down container defaults. |
@@ -218,6 +219,7 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `azure-documentdb` | [`agent-framework-azure-documentdb`](crates/agent-framework-azure-documentdb) — Azure DocumentDB (MongoDB vCore) vector store (experimental) | no |
 | `duckdb` | [`agent-framework-duckdb`](crates/agent-framework-duckdb) — embedded DuckDB vector store (experimental) | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
+| `claude` | [`agent-framework-claude`](crates/agent-framework-claude) — the Claude Code CLI as an agent | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |
 | `purview` | [`agent-framework-purview`](crates/agent-framework-purview) — Purview compliance middleware | no |
 | `tools` | [`agent-framework-tools`](crates/agent-framework-tools) — local and Docker shell tools (re-exported as `builtin_tools`) | no |

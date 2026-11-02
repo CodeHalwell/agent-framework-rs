@@ -35,6 +35,16 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-claude` (umbrella feature `claude`, in `full`): the
+  Claude Code CLI as an agent (`ClaudeAgent`), ported from upstream's
+  `agent_framework_claude`. With no Rust Claude Agent SDK, it drives the
+  CLI directly over the SDK's stream-json control protocol: one process per
+  run, resuming the session's CLI conversation, streaming text and thinking
+  deltas, usage, finish reason, cost and structured output. Function tools
+  are served from an in-process MCP server (approval-gated via
+  `on_function_approval`), and `can_use_tool` permission prompts, hooks and
+  per-run model and permission-mode switches are supported. Tested against
+  a scripted fake CLI (Unix); a live test needs `AF_CLAUDE_CLI_TEST`.
 - `agent-framework-mongodb` (experimental, `VECTOR_STORES`; umbrella feature
   `mongodb`): a MongoDB Atlas vector store ported from upstream's
   `agent_framework_mongodb` over the `mongodb` 3.9 driver. BSON documents

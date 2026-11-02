@@ -22,7 +22,7 @@ the order does not matter:
 1. **Tier 0** — `agent-framework-core`
 2. **Tier 1** — `agent-framework-a2a`, `agent-framework-bedrock`,
    `agent-framework-copilotstudio`,
-   `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-mongodb`, `agent-framework-sql-server`, `agent-framework-gemini`,
+   `agent-framework-claude`, `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-mongodb`, `agent-framework-sql-server`, `agent-framework-gemini`,
    `agent-framework-hosting`, `agent-framework-mcp`, `agent-framework-mem0`,
    `agent-framework-openai`, `agent-framework-purview`,
    `agent-framework-postgres`, `agent-framework-qdrant`, `agent-framework-redis`, `agent-framework-tools`
@@ -38,10 +38,10 @@ the order does not matter:
 # One tier at a time; crates.io indexing is fast but not instant, so give
 # each tier a moment before publishing the next.
 cargo publish -p agent-framework-core
-for c in a2a bedrock copilotstudio declarative gemini hosting mcp mem0 openai postgres purview qdrant redis tools; do
+for c in a2a bedrock claude copilotstudio declarative duckdb gemini hosting mcp mem0 mongodb openai postgres purview qdrant redis sql-server tools; do
   cargo publish -p agent-framework-$c
 done
-for c in azure foundry-local github-copilot mistral ollama; do
+for c in azure azure-documentdb foundry-local github-copilot mistral ollama; do
   cargo publish -p agent-framework-$c
 done
 for c in anthropic azure-ai-search cosmos foundry; do

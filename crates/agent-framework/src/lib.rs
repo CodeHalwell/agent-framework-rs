@@ -16,6 +16,7 @@
 //! | `foundry-local` | [`agent_framework_foundry_local`] — Microsoft Foundry Local (OpenAI-compatible localhost endpoint) | no |
 //! | `bedrock` | [`agent_framework_bedrock`] — AWS Bedrock Converse API (SigV4-signed) | no |
 //! | `github-copilot` | [`agent_framework_github_copilot`] — GitHub Copilot chat API | no |
+//! | `claude` | [`agent_framework_claude`] — the Claude Code CLI as an agent (Claude Agent SDK protocol) | no |
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
@@ -93,6 +94,9 @@ pub use agent_framework_foundry_local as foundry_local;
 #[cfg(feature = "bedrock")]
 pub use agent_framework_bedrock as bedrock;
 
+/// The Claude Code CLI as an agent (enable the `claude` feature).
+#[cfg(feature = "claude")]
+pub use agent_framework_claude as claude;
 /// The GitHub Copilot provider (enable the `github-copilot` feature).
 #[cfg(feature = "github-copilot")]
 pub use agent_framework_github_copilot as github_copilot;

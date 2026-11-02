@@ -21,6 +21,8 @@ mistral = ["dep:agent-framework-mistral"]
 foundry-local = ["dep:agent-framework-foundry-local"]
 bedrock = ["dep:agent-framework-bedrock"]
 github-copilot = ["dep:agent-framework-github-copilot"]
+# The Claude Code CLI as an agent (Claude Agent SDK protocol).
+claude = ["dep:agent-framework-claude"]
 azure = ["dep:agent-framework-azure"]
 # Azure Content Understanding attachment analysis (`ContentUnderstandingContextProvider`).
 azure-content-understanding = ["azure", "agent-framework-azure/content-understanding"]
@@ -116,6 +118,7 @@ full = [
     "foundry-local",
     "bedrock",
     "github-copilot",
+    "claude",
     "azure",
     "mcp",
     "a2a",
@@ -141,6 +144,7 @@ agent-framework-mistral = { workspace = true, optional = true }
 agent-framework-foundry-local = { workspace = true, optional = true }
 agent-framework-bedrock = { workspace = true, optional = true }
 agent-framework-github-copilot = { workspace = true, optional = true }
+agent-framework-claude = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
 agent-framework-a2a = { workspace = true, optional = true }

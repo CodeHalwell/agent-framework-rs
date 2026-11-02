@@ -61,8 +61,6 @@ from the roadmap, not from this file.
   gRPC sidecar protocol (about 18,000 lines on top of the package's own
   20,000). There is no Rust Durable Task SDK to build on, and no sidecar or
   scheduler emulator to verify a port against.
-- **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
-  to build on.
 - **Azure**: the Cosmos DB memory provider (blocked on the Agent Memory
   Toolkit). The Application Insights exporter is ported
   (`agent-framework-core`'s `azure-monitor` feature); the
