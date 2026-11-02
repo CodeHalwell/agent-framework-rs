@@ -9,11 +9,30 @@ may break APIs).
 
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
 in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
-and a second round against the same baseline in
-[`docs/drift/2026-11-02-ca65085e-round-2.md`](docs/drift/2026-11-02-ca65085e-round-2.md).
-Eight changes, five of them defects that were live in this port. A review of
-the official Azure SDK for Rust crates is in
-[`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+and two further rounds against the same baseline in
+[`docs/drift/2026-11-02-ca65085e-round-2.md`](docs/drift/2026-11-02-ca65085e-round-2.md) and
+[`docs/drift/2026-11-02-ca65085e-round-3.md`](docs/drift/2026-11-02-ca65085e-round-3.md).
+Nine changes fixing seven defects that were live in this port (round
+three's single change fixes two). A review of the official Azure SDK for
+Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+### Fixed (round three)
+
+- Every follow-up question after an Anthropic server-side web search was
+  refused (upstream #9718). The search's `server_tool_use` and
+  `web_search_tool_result` blocks replayed as a client `tool_use` and a
+  `tool_result` inside the assistant turn, which the Messages API rejects. A
+  `srvtoolu_` call now replays as `server_tool_use` and its result as the
+  typed block it arrived as, `content` verbatim (including the
+  `encrypted_content` the API validates). A server tool this client cannot
+  replay faithfully is omitted with its result, keeping the request valid.
+  Covers `web_search` and `web_fetch`, as upstream does.
+- A turn the API paused (`stop_reason: "pause_turn"`, during a long server
+  tool) was returned to the caller as finished — often a search call with no
+  answer. All four Anthropic clients (direct, Foundry, Bedrock, Vertex) now
+  continue the turn, up to 10 times and only while the paused content
+  replays faithfully, merging the turns into one response with summed usage.
+  Streaming continues too, forwarding every update as it arrives.
 
 ### Fixed (round two)
 

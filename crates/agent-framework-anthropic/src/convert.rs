@@ -309,6 +309,19 @@ fn thinking_block(content: &TextReasoningContent) -> Option<Value> {
 /// `assistant` (including tool results) is sent as a `user` turn, matching
 /// the Python client's `ROLE_MAP`.
 pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
+    // A server tool's result is replayed as a block type named after the
+    // tool (`web_search` -> `web_search_tool_result`), and the result content
+    // alone does not say which tool produced it — so record each server
+    // call's name first. A paused turn can also put the call and its result
+    // in different messages, hence a pass over the whole conversation.
+    let server_tool_names: HashMap<&str, &str> = messages
+        .iter()
+        .flat_map(|m| m.contents.iter())
+        .filter_map(Content::as_function_call)
+        .filter(|fc| is_server_tool_call_id(&fc.call_id))
+        .map(|fc| (fc.call_id.as_str(), fc.name.as_str()))
+        .collect();
+
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         let role = if msg.role == Role::assistant() {
@@ -322,6 +335,16 @@ pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
                 Content::Text(t) => blocks.push(json!({ "type": "text", "text": t.text })),
                 Content::TextReasoning(t) => {
                     if let Some(block) = thinking_block(t) {
+                        blocks.push(block);
+                    }
+                }
+                Content::FunctionCall(fc) if is_server_tool_call_id(&fc.call_id) => {
+                    if let Some(block) = server_tool_use_block(fc) {
+                        blocks.push(block);
+                    }
+                }
+                Content::FunctionResult(fr) if is_server_tool_call_id(&fr.call_id) => {
+                    if let Some(block) = server_tool_result_block(fr, &server_tool_names) {
                         blocks.push(block);
                     }
                 }
@@ -379,6 +402,128 @@ fn normalize_role_alternation(messages: Vec<Value>) -> Vec<Value> {
         );
     }
     out
+}
+
+/// The id prefix Anthropic gives a *server* tool call — one the API ran
+/// itself (web search, web fetch), as opposed to a `toolu_` call this
+/// framework is asked to run. Upstream keys off the same prefix.
+const SERVER_TOOL_USE_ID_PREFIX: &str = "srvtoolu_";
+
+/// Server tools whose calls and results this client replays, and the result
+/// block type each one's result is sent back as.
+///
+/// Limited to the tools whose result `content` [`parse_content_blocks`]
+/// keeps **verbatim** — `web_search_tool_result` carries
+/// `encrypted_content` the API validates on replay, so anything less than
+/// the exact payload is refused. Matches upstream's set (#9718).
+const REPLAYABLE_SERVER_TOOLS: &[(&str, &str)] = &[
+    ("web_search", "web_search_tool_result"),
+    ("web_fetch", "web_fetch_tool_result"),
+];
+
+/// Whether `call_id` names a server tool call. See
+/// [`SERVER_TOOL_USE_ID_PREFIX`].
+fn is_server_tool_call_id(call_id: &str) -> bool {
+    call_id.starts_with(SERVER_TOOL_USE_ID_PREFIX)
+}
+
+/// The result block type a server tool named `name` replays its result as,
+/// or `None` when this client cannot replay that tool faithfully.
+fn server_tool_result_type(name: &str) -> Option<&'static str> {
+    REPLAYABLE_SERVER_TOOLS
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .map(|(_, result_type)| *result_type)
+}
+
+/// Replay a server tool call as the `server_tool_use` block it arrived as.
+///
+/// Sending it back as a client `tool_use` — which is what happened before —
+/// makes the request invalid twice over: the API then expects a matching
+/// client `tool_result` in the *next user turn*, and the server result block
+/// that follows the call in this same assistant turn became a `tool_result`,
+/// which is only allowed in user turns. Every follow-up turn after a
+/// server-side web search was refused (upstream #9718).
+///
+/// A server tool this client cannot replay faithfully is omitted, with its
+/// result (see [`server_tool_result_block`]). The model loses the record
+/// that it called the tool, but keeps the answer it wrote from it, and the
+/// request stays valid — where replaying it any other way is a 400.
+fn server_tool_use_block(fc: &FunctionCallContent) -> Option<Value> {
+    server_tool_result_type(&fc.name)?;
+    let input = fc.parse_arguments().unwrap_or_default();
+    Some(json!({
+        "type": "server_tool_use",
+        "id": fc.call_id,
+        "name": fc.name,
+        "input": Value::Object(input.into_iter().collect()),
+    }))
+}
+
+/// Replay a server tool's result as the typed block it arrived as, with its
+/// `content` exactly as the API sent it. `None` when the call it answers is
+/// unknown or not replayable — see [`server_tool_use_block`].
+fn server_tool_result_block(
+    fr: &FunctionResultContent,
+    server_tool_names: &HashMap<&str, &str>,
+) -> Option<Value> {
+    let name = server_tool_names.get(fr.call_id.as_str())?;
+    let result_type = server_tool_result_type(name)?;
+    Some(json!({
+        "type": result_type,
+        "tool_use_id": fr.call_id,
+        "content": fr.result.clone().unwrap_or(Value::Null),
+    }))
+}
+
+/// Whether a paused assistant message can be sent back to continue its turn.
+///
+/// Continuing means replaying the message as the trailing assistant turn,
+/// so every block in it has to survive [`messages_to_anthropic`] exactly:
+/// text, a signed thinking block, and a server tool call or result this
+/// client replays. Anything else would be dropped or reshaped on the way
+/// back, and the model would resume from a turn that is not the one it
+/// paused — so the paused response is returned instead. Upstream applies the
+/// same rule (#9718).
+pub fn is_pause_turn_replayable(message: &Message) -> bool {
+    message.role == Role::assistant()
+        && message.contents.iter().all(|content| match content {
+            Content::Text(_) => true,
+            Content::TextReasoning(t) => thinking_block(t).is_some(),
+            Content::FunctionCall(fc) => {
+                is_server_tool_call_id(&fc.call_id) && server_tool_result_type(&fc.name).is_some()
+            }
+            // A result's own replayability depends on its call's name, which
+            // the call in the same paused message is checked for above.
+            Content::FunctionResult(fr) => is_server_tool_call_id(&fr.call_id),
+            _ => false,
+        })
+}
+
+/// Merge a continued turn into the response accumulated so far: its
+/// assistant content is appended to the first message, usage is summed, and
+/// the later turn's id, model and finish reason win, since it is the one
+/// that ended the turn.
+pub fn merge_pause_turn(mut acc: ChatResponse, next: ChatResponse) -> ChatResponse {
+    let next_contents = next.messages.into_iter().flat_map(|m| m.contents);
+    match acc.messages.first_mut() {
+        Some(first) => first.contents.extend(next_contents),
+        None => acc.messages.push(Message::with_contents(
+            Role::assistant(),
+            next_contents.collect(),
+        )),
+    }
+    acc.usage_details = match (acc.usage_details.take(), next.usage_details) {
+        (Some(mut a), Some(b)) => {
+            a.add_assign(&b);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    };
+    acc.response_id = next.response_id.or(acc.response_id);
+    acc.model = next.model.or(acc.model);
+    acc.finish_reason = next.finish_reason.or(acc.finish_reason);
+    acc
 }
 
 fn function_call_block(fc: &FunctionCallContent) -> Value {
@@ -2282,6 +2427,94 @@ mod tests {
         let blocks = vec![json!({ "type": "totally_unknown_block" })];
         let contents = parse_content_blocks(&blocks);
         assert!(contents.is_empty());
+    }
+
+    /// The assistant turn of a completed server-side web search, as parsed
+    /// from the API: the call, its result, and the answer.
+    fn searched_turn(tool: &str, result_type: &str) -> Message {
+        let value = json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [
+                { "type": "server_tool_use", "id": "srvtoolu_1", "name": tool,
+                  "input": { "query": "rust" } },
+                { "type": result_type, "tool_use_id": "srvtoolu_1",
+                  "content": [{ "type": "web_search_result", "encrypted_content": "ENC" }] },
+                { "type": "text", "text": "Rust is a systems language." }
+            ]
+        });
+        parse_response(&value).messages.remove(0)
+    }
+
+    #[test]
+    fn a_follow_up_after_a_server_web_search_replays_valid_server_blocks() {
+        // The common case, no pause involved: the user asks a follow-up after
+        // an answer that used web search. The searched turn used to replay as
+        // a client `tool_use` plus a `tool_result` inside the assistant turn,
+        // which the API refuses — so every follow-up after a web search
+        // failed (upstream #9718).
+        let history = vec![
+            Message::user("what is rust?"),
+            searched_turn("web_search", "web_search_tool_result"),
+            Message::user("and who made it?"),
+        ];
+        let out = messages_to_anthropic(&history);
+        let assistant = &out[1];
+        assert_eq!(assistant["role"], "assistant");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "server_tool_use");
+        assert_eq!(blocks[0]["input"], json!({ "query": "rust" }));
+        assert_eq!(blocks[1]["type"], "web_search_tool_result");
+        assert_eq!(blocks[1]["content"][0]["encrypted_content"], "ENC");
+        assert_eq!(blocks[2]["type"], "text");
+
+        let all_types: Vec<&str> = out
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .filter_map(|b| b["type"].as_str())
+            .collect();
+        assert!(
+            !all_types.contains(&"tool_use") && !all_types.contains(&"tool_result"),
+            "no client tool blocks may be invented for a server tool: {all_types:?}"
+        );
+    }
+
+    #[test]
+    fn a_web_fetch_result_replays_as_its_own_block_type() {
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            searched_turn("web_fetch", "web_fetch_tool_result"),
+        ]);
+        let blocks = out[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[1]["type"], "web_fetch_tool_result");
+    }
+
+    #[test]
+    fn a_server_tool_this_client_cannot_replay_is_omitted_with_its_result() {
+        // Replaying it any other way is a 400; omitting it keeps the request
+        // valid and keeps the answer the model wrote from it.
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            searched_turn("tool_search_tool_regex", "tool_search_tool_result"),
+        ]);
+        let blocks = out[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "only the answer survives: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn a_client_tool_call_still_replays_as_tool_use() {
+        // The server-tool path keys off the `srvtoolu_` id prefix; an ordinary
+        // `toolu_` call must be unaffected.
+        let call = FunctionCallContent::new(
+            "toolu_1",
+            "get_weather",
+            Some(FunctionArguments::Object(Default::default())),
+        );
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call)]),
+        ]);
+        assert_eq!(out[1]["content"][0]["type"], "tool_use");
     }
 
     #[test]

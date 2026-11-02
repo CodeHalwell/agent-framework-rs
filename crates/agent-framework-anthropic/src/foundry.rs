@@ -253,19 +253,23 @@ impl ChatClient for AnthropicFoundryClient {
         // override into; the configured `model` is descriptive only (see
         // `model()`/`Debug`).
         let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
-        let body = convert::build_cloud_request(
-            &messages,
-            &options,
-            max_tokens,
-            false,
-            &self.inner.anthropic_version,
-        );
-        let resp = self.send(&body).await?;
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        Ok(convert::parse_response(&value))
+        let options = &options;
+        // Continues the turn while the API pauses it — see
+        // `continue_paused_turns`.
+        crate::continue_paused_turns(messages, |conversation| async move {
+            let body = convert::build_cloud_request(
+                &conversation,
+                options,
+                max_tokens,
+                false,
+                &self.inner.anthropic_version,
+            );
+            let resp = self.send(&body).await?;
+            resp.json::<Value>()
+                .await
+                .map_err(|e| Error::service(format!("invalid response json: {e}")))
+        })
+        .await
     }
 
     /// Get a streaming response.

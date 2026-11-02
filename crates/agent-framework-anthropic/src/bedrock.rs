@@ -304,19 +304,24 @@ impl ChatClient for AnthropicBedrockClient {
     ) -> Result<ChatResponse> {
         let model = self.effective_model(&options);
         let max_tokens = options.max_tokens.unwrap_or(self.inner.max_tokens);
-        let body = convert::build_cloud_request(
-            &messages,
-            &options,
-            max_tokens,
-            false,
-            ANTHROPIC_BEDROCK_VERSION,
-        );
-        let resp = self.send(&model, &body).await?;
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
-        Ok(convert::parse_response(&value))
+        let options = &options;
+        let model = &model;
+        // Continues the turn while the API pauses it — see
+        // `continue_paused_turns`.
+        crate::continue_paused_turns(messages, |conversation| async move {
+            let body = convert::build_cloud_request(
+                &conversation,
+                options,
+                max_tokens,
+                false,
+                ANTHROPIC_BEDROCK_VERSION,
+            );
+            let resp = self.send(model, &body).await?;
+            resp.json::<Value>()
+                .await
+                .map_err(|e| Error::service(format!("invalid response json: {e}")))
+        })
+        .await
     }
 
     /// Get a streaming response.
