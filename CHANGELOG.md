@@ -7,6 +7,8 @@ may break APIs).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-02
+
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
 in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
 and three further rounds against the same baseline in
