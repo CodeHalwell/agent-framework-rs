@@ -75,6 +75,7 @@ pub(crate) struct OutputTracker {
     /// Computer calls already emitted in this response, by `call_id`, so a
     /// replayed call is not emitted twice (upstream
     /// `_outstanding_computer_calls`).
+    #[cfg(feature = "experimental-computer-use")]
     computer_calls: HashSet<String>,
 }
 
@@ -110,6 +111,7 @@ impl OutputTracker {
             consents: HashSet::new(),
             open_calls: Vec::new(),
             approvals: Vec::new(),
+            #[cfg(feature = "experimental-computer-use")]
             computer_calls: HashSet::new(),
         }
     }

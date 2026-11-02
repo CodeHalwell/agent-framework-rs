@@ -75,6 +75,38 @@ impl FileResponseStore {
         }
     }
 
+    /// A conversation's transcript and state. Reads the combined record,
+    /// and the earlier layout (a bare transcript array, with the state in a
+    /// separate `conversation_states` file).
+    async fn read_conversation(&self, id: &str) -> Result<Option<(Vec<Message>, Option<Value>)>> {
+        match self.read(&self.path("conversations", id)).await? {
+            None => Ok(None),
+            Some(Value::Array(items)) => {
+                let transcript = serde_json::from_value(Value::Array(items))?;
+                let state = self.read(&self.path("conversation_states", id)).await?;
+                Ok(Some((transcript, state)))
+            }
+            Some(record) => {
+                let transcript = serde_json::from_value(record["transcript"].clone())?;
+                let state = match &record["session_state"] {
+                    Value::Null => None,
+                    state => Some(state.clone()),
+                };
+                Ok(Some((transcript, state)))
+            }
+        }
+    }
+
+    async fn write_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<Message>,
+        state: Option<Value>,
+    ) -> Result<()> {
+        let record = serde_json::json!({"transcript": transcript, "session_state": state});
+        self.write(&self.path("conversations", id), &record).await
+    }
+
     async fn write(&self, path: &Path, value: &Value) -> Result<()> {
         let parent = path.parent().unwrap_or(&self.dir);
         tokio::fs::create_dir_all(parent).await.map_err(io)?;
@@ -150,28 +182,95 @@ impl ResponseStore for FileResponseStore {
     }
 
     async fn conversation(&self, id: &str) -> Result<Option<Vec<Message>>> {
-        match self.read(&self.path("conversations", id)).await? {
-            Some(value) => Ok(Some(serde_json::from_value(value)?)),
-            None => Ok(None),
-        }
+        Ok(self
+            .read_conversation(id)
+            .await?
+            .map(|(transcript, _)| transcript))
     }
 
     async fn set_conversation(&self, id: &str, transcript: Vec<Message>) -> Result<()> {
         let _guard = self.lock.lock().await;
-        self.write(
-            &self.path("conversations", id),
-            &serde_json::to_value(transcript)?,
-        )
-        .await
+        let state = self.read_conversation(id).await?.and_then(|(_, s)| s);
+        self.write_conversation(id, transcript, state).await
     }
 
     async fn conversation_state(&self, id: &str) -> Result<Option<Value>> {
-        self.read(&self.path("conversation_states", id)).await
+        Ok(self
+            .read_conversation(id)
+            .await?
+            .and_then(|(_, state)| state))
     }
 
     async fn set_conversation_state(&self, id: &str, state: Value) -> Result<()> {
         let _guard = self.lock.lock().await;
-        self.write(&self.path("conversation_states", id), &state)
+        let transcript = self
+            .read_conversation(id)
+            .await?
+            .map(|(t, _)| t)
+            .unwrap_or_default();
+        self.write_conversation(id, transcript, Some(state)).await
+    }
+
+    /// One file, written by atomic rename: transcript and state together.
+    async fn update_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<Message>,
+        state: Option<Value>,
+    ) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        self.write_conversation(id, transcript, state).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn conversations_keep_transcript_and_state_in_one_record() {
+        let dir = std::env::temp_dir().join(format!("af-fs-{}", uuid::Uuid::new_v4().simple()));
+        let store = FileResponseStore::new(&dir);
+        store
+            .update_conversation("c", vec![Message::user("a")], Some(json!({"turns": 1})))
             .await
+            .unwrap();
+        assert_eq!(store.conversation("c").await.unwrap().unwrap().len(), 1);
+        assert_eq!(
+            store.conversation_state("c").await.unwrap(),
+            Some(json!({"turns": 1}))
+        );
+        // The separate setters keep the other half.
+        store
+            .set_conversation("c", vec![Message::user("a"), Message::user("b")])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.conversation_state("c").await.unwrap(),
+            Some(json!({"turns": 1}))
+        );
+        // The earlier layout (a bare transcript array and a separate state
+        // file) still reads.
+        store
+            .write(
+                &store.path("conversations", "old"),
+                &json!([{"role": "user", "contents": [{"type": "text", "text": "x"}]}]),
+            )
+            .await
+            .unwrap();
+        store
+            .write(
+                &store.path("conversation_states", "old"),
+                &json!({"turns": 7}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.conversation("old").await.unwrap().unwrap().len(), 1);
+        assert_eq!(
+            store.conversation_state("old").await.unwrap(),
+            Some(json!({"turns": 7}))
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

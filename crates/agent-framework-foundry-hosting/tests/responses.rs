@@ -1529,3 +1529,229 @@ async fn a_cancelled_continuation_keeps_its_inherited_session_state() {
     .await;
     assert_eq!(text(&next), "turn 2", "{next}");
 }
+
+/// Counts turns in session state and replies with the count and how many
+/// messages it was given, so a transcript paired with another turn's state
+/// shows up as an inconsistent reply.
+struct Tally;
+
+#[async_trait::async_trait]
+impl SupportsAgentRun for Tally {
+    async fn run(
+        &self,
+        messages: Vec<agent_framework_core::prelude::Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::AgentResponse> {
+        let session = session.expect("a session");
+        let n = session
+            .state
+            .get("turns")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + 1;
+        session.state.insert("turns", json!(n));
+        Ok(agent_framework_core::types::AgentResponse {
+            messages: vec![agent_framework_core::prelude::Message::assistant(format!(
+                "turn {n}, {} messages",
+                messages.len()
+            ))],
+            ..Default::default()
+        })
+    }
+
+    fn id(&self) -> &str {
+        "tally"
+    }
+}
+
+/// An in-memory store whose conversation state write can fail once or be
+/// slow, and that uses the trait's default (non-atomic) conversation update.
+#[derive(Default)]
+struct Flaky {
+    inner: agent_framework_foundry_hosting::InMemoryResponseStore,
+    fail_state_once: std::sync::atomic::AtomicBool,
+    slow_state: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for Flaky {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.inner.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.inner.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::prelude::Message>>>
+    {
+        self.inner.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<agent_framework_core::prelude::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.set_conversation(id, transcript).await
+    }
+    async fn conversation_state(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<serde_json::Value>> {
+        self.inner.conversation_state(id).await
+    }
+    async fn set_conversation_state(
+        &self,
+        id: &str,
+        state: serde_json::Value,
+    ) -> agent_framework_core::error::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.slow_state.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        if self.fail_state_once.swap(false, Ordering::SeqCst) {
+            return Err(agent_framework_core::error::Error::Other(
+                "disk full".into(),
+            ));
+        }
+        self.inner.set_conversation_state(id, state).await
+    }
+}
+
+fn tally_text(r: &serde_json::Value) -> String {
+    r["output"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_failed_conversation_write_keeps_transcript_and_state_together() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(Flaky::default());
+    let router = ResponsesHostServer::agent(Arc::new(Tally))
+        .with_response_store(store.clone())
+        .into_router();
+    let turn = |input: &'static str| {
+        post(
+            "/responses",
+            json!({"input": input, "conversation": "conv_f"}),
+        )
+    };
+    let (_, first) = json(&router, turn("a")).await;
+    assert_eq!(tally_text(&first), "turn 1, 1 messages");
+    store.fail_state_once.store(true, Ordering::SeqCst);
+    let (status, _) = json(&router, turn("b")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let (_, third) = json(&router, turn("c")).await;
+    assert_eq!(
+        tally_text(&third),
+        "turn 2, 3 messages",
+        "the failed turn left the previous transcript and state together"
+    );
+}
+
+#[tokio::test]
+async fn a_disconnect_cannot_split_a_conversation_update() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(Flaky::default());
+    let router = ResponsesHostServer::agent(Arc::new(Tally))
+        .with_response_store(store.clone())
+        .into_router();
+    let turn = |input: &'static str| {
+        post(
+            "/responses",
+            json!({"input": input, "conversation": "conv_d"}),
+        )
+    };
+    let (_, first) = json(&router, turn("a")).await;
+    assert_eq!(tally_text(&first), "turn 1, 1 messages");
+    store.slow_state.store(true, Ordering::SeqCst);
+    // The client gives up mid-write.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        json(&router, turn("b")),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    store.slow_state.store(false, Ordering::SeqCst);
+    let (_, third) = json(&router, turn("c")).await;
+    assert_eq!(
+        tally_text(&third),
+        "turn 3, 5 messages",
+        "the turn's update completed whole"
+    );
+}
+
+/// [`Tally`], except that an input of `boom` fails the run.
+struct Brittle;
+
+#[async_trait::async_trait]
+impl SupportsAgentRun for Brittle {
+    async fn run(
+        &self,
+        messages: Vec<agent_framework_core::prelude::Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::AgentResponse> {
+        if messages.last().map(|m| m.text()).as_deref() == Some("boom") {
+            return Err(agent_framework_core::error::Error::Other("boom".into()));
+        }
+        Tally.run(messages, session).await
+    }
+
+    fn id(&self) -> &str {
+        "brittle"
+    }
+}
+
+#[tokio::test]
+async fn a_failed_continuation_keeps_the_inherited_session_state() {
+    let router = ResponsesHostServer::agent(Arc::new(Brittle)).into_router();
+    let (_, first) = json(&router, post("/responses", json!({"input": "a"}))).await;
+    assert_eq!(tally_text(&first), "turn 1, 1 messages");
+    // In the background, so the failed response's id is known.
+    let (_, queued) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "boom", "previous_response_id": first["id"], "background": true}),
+        ),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    let mut failed = json!(null);
+    for _ in 0..200 {
+        let (_, polled) = json(&router, get(&format!("/responses/{id}"))).await;
+        if polled["status"] == "failed" {
+            failed = polled;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(failed["status"], "failed", "{failed}");
+    let (_, third) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "c", "previous_response_id": failed["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        tally_text(&third),
+        "turn 2, 4 messages",
+        "the failed record kept turn 1's state with its inherited transcript"
+    );
+}

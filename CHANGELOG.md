@@ -35,6 +35,17 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting (review fixes): a conversation's transcript and session
+  state are written together through `ResponseStore::update_conversation`
+  (in-memory: one record under one lock; `FileResponseStore`: one file by
+  atomic rename, still reading the earlier two-file layout), persistence runs
+  in a spawned task so a client disconnect cannot interrupt it, and a failed
+  update puts the previous transcript and state back. A turn that produces
+  no new session snapshot (a failed run, a workflow) keeps the state it
+  inherited, so continuing from a failed response keeps session-scoped state
+  such as FIDES labels. Custom `ResponseStore`s should override
+  `update_conversation` to write atomically; the default writes the two
+  halves in sequence.
 - Computer use (`experimental-computer-use`, upstream `COMPUTER_USE`;
   umbrella `experimental-computer-use`, in `experimental`):
   `ComputerToolCallContent` / `ComputerToolResultContent` /

@@ -181,14 +181,36 @@ pub trait ResponseStore: Send + Sync {
     async fn set_conversation_state(&self, _id: &str, _state: Value) -> Result<()> {
         Ok(())
     }
+    /// Replace a conversation's transcript and session state together (the
+    /// state is cleared when `state` is `None`). The host writes a turn's
+    /// conversation through this one call, so a store should apply it
+    /// atomically: a transcript paired with another turn's state would carry
+    /// the wrong session-scoped state (e.g. FIDES labels) into the next turn.
+    /// The default calls [`Self::set_conversation`] then
+    /// [`Self::set_conversation_state`], which is not atomic; the host
+    /// restores the previous transcript and state if it fails.
+    async fn update_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<Message>,
+        state: Option<Value>,
+    ) -> Result<()> {
+        self.set_conversation(id, transcript).await?;
+        if let Some(state) = state {
+            self.set_conversation_state(id, state).await?;
+        }
+        Ok(())
+    }
 }
+
+/// A conversation's transcript and session state.
+type ConversationRecord = (Vec<Message>, Option<Value>);
 
 /// A process-local [`ResponseStore`].
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryResponseStore {
     responses: Arc<Mutex<HashMap<String, StoredResponse>>>,
-    conversations: Arc<Mutex<HashMap<String, Vec<Message>>>>,
-    conversation_states: Arc<Mutex<HashMap<String, Value>>>,
+    conversations: Arc<Mutex<HashMap<String, ConversationRecord>>>,
 }
 
 #[async_trait]
@@ -207,23 +229,49 @@ impl ResponseStore for InMemoryResponseStore {
         Ok(self.responses.lock().unwrap().remove(id).is_some())
     }
     async fn conversation(&self, id: &str) -> Result<Option<Vec<Message>>> {
-        Ok(self.conversations.lock().unwrap().get(id).cloned())
+        Ok(self
+            .conversations
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|(transcript, _)| transcript.clone()))
     }
     async fn set_conversation(&self, id: &str, transcript: Vec<Message>) -> Result<()> {
         self.conversations
             .lock()
             .unwrap()
-            .insert(id.to_string(), transcript);
+            .entry(id.to_string())
+            .or_default()
+            .0 = transcript;
         Ok(())
     }
     async fn conversation_state(&self, id: &str) -> Result<Option<Value>> {
-        Ok(self.conversation_states.lock().unwrap().get(id).cloned())
-    }
-    async fn set_conversation_state(&self, id: &str, state: Value) -> Result<()> {
-        self.conversation_states
+        Ok(self
+            .conversations
             .lock()
             .unwrap()
-            .insert(id.to_string(), state);
+            .get(id)
+            .and_then(|(_, state)| state.clone()))
+    }
+    async fn set_conversation_state(&self, id: &str, state: Value) -> Result<()> {
+        self.conversations
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .1 = Some(state);
+        Ok(())
+    }
+    async fn update_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<Message>,
+        state: Option<Value>,
+    ) -> Result<()> {
+        self.conversations
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), (transcript, state));
         Ok(())
     }
 }
@@ -1062,11 +1110,32 @@ async fn run_turn(
     // once it sees `response.completed` aborts this task, which must not
     // cancel the write it was told succeeded.
     let (status, response) = if prepared.store {
-        match persist(
-            server, prepared, &status, &response, transcript, pause, approvals,
-        )
-        .await
-        {
+        // Spawned so a disconnect (which drops this task) cannot cut the
+        // writes short and leave the conversation half-updated.
+        let persisted = {
+            let inner = inner.clone();
+            let prepared = prepared.clone();
+            let (status, response) = (status.clone(), response.clone());
+            tokio::spawn(async move {
+                persist(
+                    &inner.server,
+                    &prepared,
+                    &status,
+                    &response,
+                    transcript,
+                    pause,
+                    approvals,
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(agent_framework_core::error::Error::Other(format!(
+                    "persisting the response failed: {e}"
+                )))
+            })
+        };
+        match persisted {
             Ok(()) => (status, response),
             Err(e) => {
                 // A turn whose outcome could not be stored did not succeed:
@@ -1132,7 +1201,15 @@ async fn persist(
             store.save_approval_request(id, request).await?;
         }
     }
-    let session_state = prepared.session_out.lock().unwrap().take();
+    // A turn that produced no new snapshot (a failed or interrupted run, a
+    // workflow) keeps the state it inherited, next to the inherited
+    // transcript: continuing from it must not start from a fresh session.
+    let session_state = prepared
+        .session_out
+        .lock()
+        .unwrap()
+        .take()
+        .or_else(|| prepared.session_state.clone());
     let stored = StoredResponse {
         response: response.clone(),
         input_items: prepared.input_items.clone(),
@@ -1145,15 +1222,28 @@ async fn persist(
         .put(&prepared.request.response_id, stored)
         .await?;
     if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
-        server
+        // Transcript and state move together. The previous pair is read
+        // first (under the conversation's turn lock) so a failed update can
+        // put it back rather than leave a new transcript with an old state.
+        let previous_transcript = server.store.conversation(conversation).await?;
+        let previous_state = server.store.conversation_state(conversation).await?;
+        if let Err(e) = server
             .store
-            .set_conversation(conversation, transcript)
-            .await?;
-        if let Some(state) = session_state {
-            server
+            .update_conversation(conversation, transcript, session_state)
+            .await
+        {
+            if let Err(restore) = server
                 .store
-                .set_conversation_state(conversation, state)
-                .await?;
+                .update_conversation(
+                    conversation,
+                    previous_transcript.unwrap_or_default(),
+                    previous_state,
+                )
+                .await
+            {
+                tracing::error!(error = %restore, "failed to restore a conversation after a failed update");
+            }
+            return Err(e);
         }
     }
     Ok(())
