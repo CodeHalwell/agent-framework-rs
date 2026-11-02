@@ -10,11 +10,11 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 |---|---|---|---|---|
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
-| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 1 / 0 / 1 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 132 / 164 / 24 / 142 / 0 | 41 | 22 |
+| `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 2 / 0 / 0 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 132 / 180 / 24 / 126 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 1 / 5 / 10 / 57 / 0 | 2 | 0 |
-| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 4 / 0 / 9 / 0 | 0 | 0 |
+| `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 4 / 5 / 0 / 8 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.GitHub.Copilot` | 1 / 5 / 0 / 0 / 0 | 0 / 1 / 5 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.A2A` | 0 / 5 / 0 / 0 / 0 | 0 / 1 / 0 / 4 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
@@ -38,7 +38,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 
 | Declaration | Rust | Go | Note |
 |---|---|---|---|
-| `Azure.AI.Projects::AIProjectClientExtensions methods::AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent methods::GetService<TService>(object)` | unmapped | unmapped | No service-lookup or downcast hook on SupportsAgentRun; callers keep the concrete agent type to reach its services. |
 | `Microsoft.Agents.AI::AIAgent properties::CurrentRunContext` | partial | adapted | Middleware gets AgentContext and tools get the session, but there is no ambient run context carrying agent, session and options. |
@@ -52,24 +51,17 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AIContextProvider.InvokedContext properties::Session` | unmapped | adapted | after_run receives no session, so a provider cannot read the session or its state bag after a run. |
 | `Microsoft.Agents.AI::AIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
 | `Microsoft.Agents.AI::AIJudgeLoopEvaluator constants::GapAnalysisPlaceholder` | unmapped | intentional | Judge feedback is not templated; judge_feedback_message inserts the judge's reasoning directly. |
-| `Microsoft.Agents.AI::AgentFileSkill properties::Path` | unmapped | unmapped | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
+| `Microsoft.Agents.AI::AgentFileSkill properties::Path` | unmapped | unmapped | File skills load into plain Skill values (instructions + resources); the directory path is not kept. |
 | `Microsoft.Agents.AI::AgentFileSkill` | unmapped | adapted | No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillFilterContext properties::RelativeFilePath` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
-| `Microsoft.Agents.AI::AgentFileSkillFilterContext properties::SkillName` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
 | `Microsoft.Agents.AI::AgentFileSkillFilterContext` | unmapped | mapped | No resource/script filter context because rust has no file-based skill discovery; skills are built in code only. |
 | `Microsoft.Agents.AI::AgentFileSkillScript methods::RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
 | `Microsoft.Agents.AI::AgentFileSkillScript properties::FullPath` | unmapped | unmapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
 | `Microsoft.Agents.AI::AgentFileSkillScript properties::ParametersSchema` | unmapped | mapped | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
 | `Microsoft.Agents.AI::AgentFileSkillScript` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
 | `Microsoft.Agents.AI::AgentFileSkillScriptRunner` | unmapped | adapted | Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool. |
-| `Microsoft.Agents.AI::AgentFileSkillsSource constructors::AgentFileSkillsSource(string, AgentFileSkillScriptRunner, AgentFileSkillsSourceOptions, ILoggerFactory)` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSource methods::GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
 | `Microsoft.Agents.AI::AgentFileSkillsSource` | unmapped | adapted | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::AllowedResourceExtensions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::AllowedScriptExtensions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ResourceFilter` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ScriptFilter` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
-| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::SearchDepth` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
+| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::AllowedScriptExtensions` | unmapped | mapped | Skill scripts are not ported, so there is nothing to filter. |
+| `Microsoft.Agents.AI::AgentFileSkillsSourceOptions properties::ScriptFilter` | unmapped | mapped | Skill scripts are not ported, so there is nothing to filter. |
 | `Microsoft.Agents.AI::AgentFileSkillsSourceOptions` | unmapped | mapped | Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist. |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(AgentSkillFrontmatter, string, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name/description/instructions; there is no frontmatter type and no argument marshaler. |
 | `Microsoft.Agents.AI::AgentInlineSkill constructors::AgentInlineSkill(string, string, string, string, string, string, AdditionalPropertiesDictionary, JsonSerializerOptions, Func<JsonElement?, AIFunctionArguments>)` | partial | adapted | Skill::new plus with_instructions covers name, description and instructions; license, compatibility, allowedTools and metadata have no field. |
@@ -138,14 +130,7 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentSkillsSourceContext properties::Session` | unmapped | unmapped | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AggregatingAgentSkillsSource` | unmapped | adapted | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::AlwaysApproveToolApprovalResponseContent properties::InnerResponse` | unmapped | mapped | There is no wrapper, so the returned FunctionApprovalResponseContent is the response itself. |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::DefaultFeedbackMessageTemplate` | unmapped | intentional | DefaultFeedbackMessageTemplate: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::IncompleteTaskCountPlaceholder` | unmapped | intentional | IncompleteTaskCountPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constants::IncompleteTasksPlaceholder` | unmapped | intentional | IncompleteTasksPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator constructors::BackgroundTaskCompletionLoopEvaluator(BackgroundTaskCompletionLoopEvaluatorOptions)` | unmapped | intentional | BackgroundTaskCompletionLoopEvaluator: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator methods::EvaluateAsync(LoopContext, CancellationToken)` | unmapped | intentional | EvaluateAsync: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluator` | unmapped | intentional | No background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions constructors::BackgroundTaskCompletionLoopEvaluatorOptions()` | unmapped | intentional | BackgroundTaskCompletionLoopEvaluatorOptions: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
-| `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions properties::FeedbackMessageTemplate` | unmapped | intentional | FeedbackMessageTemplate: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::BackgroundTaskCompletionLoopEvaluatorOptions` | unmapped | intentional | No options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported'). |
 | `Microsoft.Agents.AI::CachingAgentSkillsSource` | unmapped | partial | Rust has no skill-source abstraction; SkillsProvider::new takes a fixed Vec<Skill>. |
 | `Microsoft.Agents.AI::ChatClientAgent methods::GetService(Type, object)` | unmapped | unmapped | No service-lookup hook; Agent exposes no accessor for its chat client or metadata. |
@@ -190,8 +175,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::LoopContext properties::Agent` | unmapped | adapted | The context carries no agent; helpers that need a provider take it explicitly. |
 | `Microsoft.Agents.AI::LoopContext properties::RunOptions` | unmapped | adapted | The run options are not exposed to loop callbacks. |
 | `Microsoft.Agents.AI::MessageAIContextProvider.InvokingContext properties::Agent` | unmapped | adapted | before_run receives no agent reference. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient methods::EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
-| `Microsoft.Agents.AI::MessageInjectingChatClient methods::GetPendingMessagesAsync(AgentSession, CancellationToken)` | unmapped | mapped | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::MessageInjectingChatClient` | unmapped | adapted | No message-injecting chat client: messages cannot be queued into a run in progress. |
 | `Microsoft.Agents.AI::ProviderSessionState<TState>` | partial | adapted | before_run reaches the session through SessionContext::session, and a provider keeps its state as JSON under its own key in the state bag; there is no typed ProviderSessionState<T> wrapper (after_run gets no session). |
 | `Microsoft.Agents.AI::TodoCompletionLoopEvaluator constants::RemainingTodosPlaceholder` | unmapped | intentional | The todo reminder is not templated; todos_remaining_message lists the open items directly. |
@@ -275,7 +258,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Compaction::ToolResultCompactionStrategy properties::ToolCallFormatter` | partial | mapped | The replacement text is the fixed OMITTED_TOOL_RESULT constant; a custom formatter cannot be supplied. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy constructors::TruncationCompactionStrategy(CompactionTrigger, int, CompactionTrigger)` | partial | adapted | Truncation::new takes a max message count; there are no trigger/target triggers. |
 | `Microsoft.Agents.AI.Compaction::TruncationCompactionStrategy properties::MinimumPreservedGroups` | partial | adapted | max_messages caps retained messages rather than guaranteeing a minimum number of preserved groups. |
-| `Microsoft.Agents.AI.Foundry::FoundryAgent constructors::FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)` | unmapped | adapted | FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureMemoryStoreCreatedAsync(string, string, string?, CancellationToken)` | unmapped | mapped | FoundryMemoryProvider only calls search_memories/update_memories; it cannot create the memory store. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProvider methods::EnsureStoredMemoriesDeletedAsync(AgentSession, CancellationToken)` | unmapped | mapped | No operation to delete stored memories for a scope. |
 | `Microsoft.Agents.AI.Foundry::FoundryMemoryProviderOptions properties::EnableSensitiveTelemetryData` | unmapped | unmapped | FoundryMemoryProvider emits no sensitive-data telemetry toggle. |

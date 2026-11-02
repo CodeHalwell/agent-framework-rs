@@ -70,9 +70,11 @@
       "AIProjectClientExtensions": {
         "methods": {
           "AsAIAgent(AIProjectClient, Uri, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
+            "rust": [
+              "agent_framework_foundry::hosted_agent::FoundryAgentChatClient::as_agent"
+            ],
+            "status": "adapted",
+            "note": "FoundryAgentChatClient binds to a server-hosted Prompt or Hosted Agent by agent_reference; as_agent() builds the Agent, local function tools dispatching its calls."
           },
           "AsAIAgent(AIProjectClient, string, string, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
@@ -615,9 +617,8 @@
         },
         "properties": {
           "Path": {
-            "rust": [],
             "status": "unmapped",
-            "note": "No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only."
+            "note": "File skills load into plain Skill values (instructions + resources); the directory path is not kept."
           }
         }
       },
@@ -629,14 +630,18 @@
         },
         "properties": {
           "RelativeFilePath": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "The resource filter is a closure called with (skill name, relative path); there is no context type, and scripts are not ported."
           },
           "SkillName": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "The resource filter is a closure called with (skill name, relative path); there is no context type, and scripts are not ported."
           }
         }
       },
@@ -681,16 +686,20 @@
         },
         "constructors": {
           "AgentFileSkillsSource(string, AgentFileSkillScriptRunner, AgentFileSkillsSourceOptions, ILoggerFactory)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::new"
+            ],
+            "status": "adapted",
+            "note": "FileSkillsSource::new takes the paths; options are builder methods; no script runner (scripts are not ported)."
           }
         },
         "methods": {
           "GetSkillsAsync(AgentSkillsSourceContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::load"
+            ],
+            "status": "adapted",
+            "note": "load() discovers synchronously and reads resources eagerly; it takes no context."
           }
         }
       },
@@ -702,29 +711,33 @@
         },
         "properties": {
           "AllowedResourceExtensions": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_extensions"
+            ],
+            "status": "adapted",
+            "note": "Builder method on the source."
           },
           "AllowedScriptExtensions": {
-            "rust": [],
             "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "note": "Skill scripts are not ported, so there is nothing to filter."
           },
           "ResourceFilter": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter"
+            ],
+            "status": "adapted",
+            "note": "Builder method taking a (skill name, relative path) closure."
           },
           "ScriptFilter": {
-            "rust": [],
             "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "note": "Skill scripts are not ported, so there is nothing to filter."
           },
           "SearchDepth": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_search_depth"
+            ],
+            "status": "adapted",
+            "note": "Builder method; errors below 1."
           }
         }
       },
@@ -1813,33 +1826,43 @@
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluator(BackgroundTaskCompletionLoopEvaluatorOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluator: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running"
+            ],
+            "status": "adapted",
+            "note": "background_tasks_running(&provider) is the LoopAgent condition; it takes the provider instead of finding it on the agent."
           }
         },
         "methods": {
           "EvaluateAsync(LoopContext, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "EvaluateAsync: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::BackgroundTasksRunning"
+            ],
+            "status": "adapted",
+            "note": "LoopCallback<LoopDecision> on BackgroundTasksRunning."
           }
         },
         "constants": {
           "DefaultFeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "DefaultFeedbackMessageTemplate: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           },
           "IncompleteTaskCountPlaceholder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "IncompleteTaskCountPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           },
           "IncompleteTasksPlaceholder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "IncompleteTasksPlaceholder: no background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "The reminder is a fixed message from background_tasks_running_message, not a template with placeholders."
           }
         }
       },
@@ -1851,16 +1874,20 @@
         },
         "constructors": {
           "BackgroundTaskCompletionLoopEvaluatorOptions()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "BackgroundTaskCompletionLoopEvaluatorOptions: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "No options type; a custom next-message LoopCallback replaces the template."
           }
         },
         "properties": {
           "FeedbackMessageTemplate": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FeedbackMessageTemplate: no options for a background-task loop condition; background agents are not ported (SCOPE.md lists 'Harness, remainder' under 'Not yet ported')."
+            "rust": [
+              "agent_framework_core::harness::background_agents::background_tasks_running_message"
+            ],
+            "status": "adapted",
+            "note": "No options type; a custom next-message LoopCallback replaces the template."
           }
         }
       },
@@ -3061,14 +3088,18 @@
         },
         "methods": {
           "EnqueueMessagesAsync(AgentSession, IEnumerable<ChatMessage>, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+            "rust": [
+              "agent_framework_core::session::enqueue_messages"
+            ],
+            "status": "adapted",
+            "note": "A free function over the session; injection is built into the function-invocation loop (non-streaming) rather than a separate chat client."
           },
           "GetPendingMessagesAsync(AgentSession, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No message-injecting chat client: messages cannot be queued into a run in progress."
+            "rust": [
+              "agent_framework_core::session::pending_messages"
+            ],
+            "status": "adapted",
+            "note": "A free function returning a snapshot of the queue."
           }
         }
       },
@@ -4215,9 +4246,11 @@
         },
         "constructors": {
           "FoundryAgent(Uri, AuthenticationTokenProvider, ProjectOpenAIClientOptions?, IList<AITool>?, Func<IChatClient, IChatClient>?, IServiceProvider?)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "FoundryAgent is client-side only and cannot yet bind to a server-hosted agent; SCOPE.md lists this under 'Not yet ported'."
+            "rust": [
+              "agent_framework_foundry::hosted_agent::FoundryAgentChatClient::with_token_credential"
+            ],
+            "status": "adapted",
+            "note": "A server-hosted agent is reached through FoundryAgentChatClient (endpoint, agent name/version, credential) and its as_agent()."
           },
           "FoundryAgent(Uri, AuthenticationTokenProvider, string, string, AIProjectClientOptions?, string?, string?, IList<AITool>?, Func<IChatClient, IChatClient>?, ILoggerFactory?, IServiceProvider?)": {
             "rust": [
