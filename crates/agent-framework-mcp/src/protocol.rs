@@ -21,6 +21,10 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const COMPATIBLE_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// The modern (handshake-free) protocol revision: version, client identity
+/// and capabilities travel in every request's `_meta` (upstream #9236).
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// A monotonically increasing JSON-RPC request id generator, starting at 1.
 #[derive(Debug, Default)]
 pub struct IdGenerator(AtomicI64);

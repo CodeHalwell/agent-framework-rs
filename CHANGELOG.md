@@ -21,6 +21,12 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- MCP `2026-07-28` (upstream #9236): `McpProtocolMode` (`Auto` by default,
+  `Legacy`, `Modern`) on `McpClient` and the MCP tools. `Auto` probes with
+  `server/discover` and, when the server offers the modern era, sends
+  version, client info and capabilities in every request's `_meta` (and
+  `MCP-Protocol-Version` over HTTP) instead of the `initialize` handshake;
+  otherwise it falls back to the handshake.
 - `FoundryMemoryProvider`: `with_max_memories`, search and storage message
   filters, `ensure_stored_memories_deleted` and
   `ensure_memory_store_created`.

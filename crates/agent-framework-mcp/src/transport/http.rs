@@ -94,6 +94,8 @@ pub struct McpStreamableHttpTransport {
     headers: HeaderMap,
     timeout: Option<Duration>,
     session_id: RwLock<Option<String>>,
+    /// The negotiated protocol version, sent as `MCP-Protocol-Version`.
+    protocol_version: StdMutex<Option<String>>,
     next_id: IdGenerator,
     server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
     /// Handler for server notifications (e.g. `notifications/tools/list_changed`),
@@ -137,6 +139,7 @@ impl McpStreamableHttpTransport {
             headers,
             timeout,
             session_id: RwLock::new(None),
+            protocol_version: StdMutex::new(None),
             next_id: IdGenerator::new(),
             server_request_handler: StdMutex::new(None),
             notification_handler: StdMutex::new(None),
@@ -210,6 +213,10 @@ impl McpStreamableHttpTransport {
                 if let Some(session_id) = self.session_id.read().await.clone() {
                     req = req.header(SESSION_ID_HEADER, session_id);
                 }
+                let version = self.protocol_version.lock().unwrap().clone();
+                if let Some(version) = version {
+                    req = req.header("mcp-protocol-version", version);
+                }
             }
             if let Some(timeout) = self.timeout {
                 req = req.timeout(timeout);
@@ -274,6 +281,10 @@ impl McpStreamableHttpTransport {
 
 #[async_trait]
 impl McpTransport for McpStreamableHttpTransport {
+    fn set_protocol_version(&self, version: Option<String>) {
+        *self.protocol_version.lock().unwrap() = version;
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_request_id();
         let body = protocol::build_request(id, method, params);

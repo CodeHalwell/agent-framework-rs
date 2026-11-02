@@ -89,10 +89,13 @@ from the roadmap, not from this file.
   `VectorDistance` queries `vector_store.rs` issues. See
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
-- **MCP 2.x protocol negotiation** (upstream #9236): the `2026-07-28`
-  protocol era upstream's `auto` mode negotiates. This client requests
-  `2025-06-18` and accepts servers that answer with `2025-11-25` or older;
-  the new era's wire changes are not ported.
+- **MCP 2.x, remainder**: the `2026-07-28` era is negotiated
+  (`McpProtocolMode`, `server/discover`, per-request `_meta`, the
+  `MCP-Protocol-Version` header). Not ported from that era:
+  `subscriptions/listen` streams (list-changed notifications still arrive
+  only the legacy way), the `input_required` result type (refused with an
+  error), result caching hints (`ttlMs`, `cacheScope`) and the Tasks
+  extension.
 - **Workflow pause/restore bookkeeping** (upstream #9291, #9289):
   preserving concurrent steps across a pause, and restored sub-workflow
   sibling requests. Both land on upstream's `WorkflowExecutor`; this

@@ -360,3 +360,38 @@ async fn a_session_teardown_follows_a_same_origin_redirect() {
         "and must still carry the session it is tearing down: {followed}"
     );
 }
+
+#[tokio::test]
+async fn a_modern_connection_sends_the_protocol_version_header() {
+    use agent_framework_mcp::McpClient;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let server = std::thread::spawn(move || {
+        let mut headers_seen = Vec::new();
+        for result in [
+            json!({"resultType": "complete", "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}),
+            json!({"resultType": "complete", "tools": []}),
+        ] {
+            let mut stream = accept_with_timeout(&listener);
+            let (head, body) = read_request_parts(&mut stream);
+            headers_seen.push(head.to_ascii_lowercase());
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            write_json_response(
+                &mut stream,
+                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            );
+        }
+        headers_seen
+    });
+    let transport =
+        McpStreamableHttpTransport::new(format!("http://{addr}/mcp"), Default::default(), None)
+            .unwrap();
+    let client = McpClient::new(std::sync::Arc::new(transport));
+    client.initialize("c", "1").await.unwrap();
+    client.list_tools().await.unwrap();
+    let heads = server.join().unwrap();
+    for head in heads {
+        assert!(head.contains("mcp-protocol-version: 2026-07-28"), "{head}");
+    }
+}

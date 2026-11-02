@@ -137,7 +137,7 @@ mod sampling;
 mod tool;
 mod transport;
 
-pub use client::McpClient;
+pub use client::{McpClient, McpProtocolMode};
 pub use protocol::{
     CallToolResult, ContentBlock, GetPromptResult, Implementation, InitializeResult,
     ListPromptsResult, ListToolsResult, PromptArgument, PromptDescriptor, PromptMessage, RpcError,

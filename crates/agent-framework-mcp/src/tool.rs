@@ -348,6 +348,7 @@ pub struct McpStdioTool {
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     request_timeout: Option<Duration>,
@@ -371,6 +372,7 @@ impl McpStdioTool {
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             request_timeout: None,
@@ -461,6 +463,14 @@ impl McpStdioTool {
         self
     }
 
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
+        self
+    }
+
     /// Register the handler for server-initiated `sampling/createMessage`
     /// requests, applied when the underlying session is created. See
     /// [`McpClient::sampling_handler`].
@@ -534,7 +544,8 @@ impl McpStdioTool {
                 if let Some(timeout) = self.request_timeout {
                     transport = transport.with_request_timeout(timeout);
                 }
-                let mut client = McpClient::new(Arc::new(transport));
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
@@ -685,6 +696,7 @@ pub struct McpStreamableHttpTool {
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     session: OnceCell<Arc<McpClient>>,
@@ -703,6 +715,7 @@ impl McpStreamableHttpTool {
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             session: OnceCell::new(),
@@ -746,6 +759,14 @@ impl McpStreamableHttpTool {
     /// Set the approval policy applied to produced [`ToolDefinition`]s.
     pub fn approval_mode(mut self, mode: McpApprovalMode) -> Self {
         self.approval_mode = mode;
+        self
+    }
+
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
         self
     }
 
@@ -798,7 +819,8 @@ impl McpStreamableHttpTool {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
                 let transport =
                     McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout)?;
-                let mut client = McpClient::new(Arc::new(transport));
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
@@ -948,6 +970,7 @@ pub struct McpWebsocketTool {
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     request_timeout: Option<Duration>,
@@ -967,6 +990,7 @@ impl McpWebsocketTool {
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             request_timeout: None,
@@ -1006,6 +1030,14 @@ impl McpWebsocketTool {
     /// Set the approval policy applied to produced [`ToolDefinition`]s.
     pub fn approval_mode(mut self, mode: McpApprovalMode) -> Self {
         self.approval_mode = mode;
+        self
+    }
+
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
         self
     }
 
@@ -1071,7 +1103,8 @@ impl McpWebsocketTool {
                 if let Some(timeout) = self.request_timeout {
                     transport = transport.with_request_timeout(timeout);
                 }
-                let mut client = McpClient::new(Arc::new(transport));
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
