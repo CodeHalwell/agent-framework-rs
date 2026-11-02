@@ -60,7 +60,10 @@ experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
 experimental-agent-hooks = ["agent-framework-core/experimental-agent-hooks"]
 experimental-harness = ["agent-framework-core/experimental-harness"]
-experimental-evals = ["agent-framework-core/experimental-evals"]
+experimental-evals = [
+    "agent-framework-core/experimental-evals",
+    "agent-framework-foundry?/evals",
+]
 experimental-session-store = [
     "agent-framework-core/experimental-session-store",
     "agent-framework-azure?/session-store",

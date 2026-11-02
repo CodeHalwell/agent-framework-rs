@@ -53,8 +53,9 @@ from the roadmap, not from this file.
   `source_labels`; upstream's framework layer does not do this either).
 - **Security (FIDES)**: marked experimental upstream; when ported it goes
   behind an `experimental-*` feature (see `docs/feature-stages.md`).
-  Evaluation is ported (`experimental-evals`); Foundry's cloud evaluator
-  (`FoundryEvals`) is not.
+  Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
+  `agent-framework-foundry`'s `evals` feature); upstream's
+  `evaluate_foundry_target` is not.
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK

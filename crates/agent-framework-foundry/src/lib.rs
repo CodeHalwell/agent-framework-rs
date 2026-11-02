@@ -91,6 +91,9 @@ pub(crate) fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest:
 }
 
 pub mod embeddings;
+#[cfg(feature = "evals")]
+#[cfg_attr(docsrs, doc(cfg(feature = "evals")))]
+pub mod evals;
 pub mod hosted_agent;
 pub mod memory;
 mod tool_definition_wire;

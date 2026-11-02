@@ -29,7 +29,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   per store and folder, as upstream.
 - **Evaluation** (`experimental-evals`): `evaluate_agent`,
   `evaluate_workflow`, `LocalEvaluator`, the keyword / tool-call /
-  function checks and `EvalResults` CI assertions.
+  function checks and `EvalResults` CI assertions; `FoundryEvals` (Foundry's
+  built-in and generated rubric evaluators over the Evals API) behind
+  `agent-framework-foundry`'s `evals` feature.
 - **`agent-framework-qdrant`**: the Qdrant vector store (umbrella feature
   `qdrant`, experimental).
 - **`agent-framework-postgres`**: the PostgreSQL + pgvector vector store
