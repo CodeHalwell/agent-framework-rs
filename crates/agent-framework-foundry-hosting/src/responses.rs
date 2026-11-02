@@ -925,31 +925,38 @@ async fn run_turn(
     // Persist before the terminal event: a client that closes the stream
     // once it sees `response.completed` aborts this task, which must not
     // cancel the write it was told succeeded.
-    if prepared.store {
-        let stored = StoredResponse {
-            response: response.clone(),
-            input_items: prepared.input_items.clone(),
-            transcript: transcript.clone(),
-            pause,
-        };
-        if let Err(e) = server
-            .store
-            .put(&prepared.request.response_id, stored)
-            .await
-        {
-            tracing::error!(error = %e, "failed to store a hosted response");
-        }
-        if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed")
-        {
-            if let Err(e) = server
-                .store
-                .set_conversation(conversation, transcript)
-                .await
-            {
-                tracing::error!(error = %e, "failed to store a conversation transcript");
+    let (status, response) = if prepared.store {
+        match persist(server, prepared, &status, &response, transcript, pause).await {
+            Ok(()) => (status, response),
+            Err(e) => {
+                // A turn whose outcome could not be stored did not succeed:
+                // report it as failed, and record that (best effort) so a
+                // background response is not left in progress.
+                tracing::error!(error = %e, "failed to persist a hosted response");
+                let mut failed = prepared.skeleton("failed");
+                failed["error"] = json!({
+                    "code": "server_error",
+                    "message": "The response could not be stored.",
+                });
+                let record = StoredResponse {
+                    response: failed.clone(),
+                    input_items: prepared.input_items.clone(),
+                    transcript: Vec::new(),
+                    pause: None,
+                };
+                if let Err(e) = server
+                    .store
+                    .put(&prepared.request.response_id, record)
+                    .await
+                {
+                    tracing::error!(error = %e, "failed to record a persistence failure");
+                }
+                ("failed".to_string(), failed)
             }
         }
-    }
+    } else {
+        (status, response)
+    };
     if let Some(events) = events {
         let kind = match status.as_str() {
             "failed" => "response.failed",
@@ -959,6 +966,35 @@ async fn run_turn(
         events.emit(kind, json!({"response": response})).await;
     }
     (status, response)
+}
+
+/// Store the response, then (unless it failed) its conversation's
+/// transcript.
+async fn persist(
+    server: &ResponsesHostServer,
+    prepared: &Prepared,
+    status: &str,
+    response: &Value,
+    transcript: Vec<Message>,
+    pause: Option<WorkflowPause>,
+) -> Result<()> {
+    let stored = StoredResponse {
+        response: response.clone(),
+        input_items: prepared.input_items.clone(),
+        transcript: transcript.clone(),
+        pause,
+    };
+    server
+        .store
+        .put(&prepared.request.response_id, stored)
+        .await?;
+    if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
+        server
+            .store
+            .set_conversation(conversation, transcript)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Why a turn failed: a run error (its text stays private) or a projection
@@ -1422,6 +1458,12 @@ async fn get_response(
 async fn delete_response(State(inner): State<Arc<Inner>>, Path(id): Path<String>) -> Response {
     if let Some(handle) = inner.running.lock().unwrap().remove(&id) {
         handle.abort();
+    }
+    // A deleted response is not replayable: end any open replay streams
+    // (the aborted task never will) and drop its buffer.
+    let replay = inner.replays.lock().unwrap().remove(&id);
+    if let Some(replay) = replay {
+        replay.finish();
     }
     match inner.server.store.delete(&id).await {
         Ok(true) => Json(json!({"id": id, "object": "response", "deleted": true})).into_response(),

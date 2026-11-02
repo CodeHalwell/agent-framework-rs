@@ -915,3 +915,127 @@ async fn a_cancelled_background_stream_replay_ends() {
         assert_eq!(data["sequence_number"], i);
     }
 }
+
+#[tokio::test]
+async fn deleting_a_running_background_response_ends_its_replay() {
+    let agent: Arc<dyn SupportsAgentRun> = Arc::new(Agent::builder(Hanging).name("h").build());
+    let router = ResponsesHostServer::agent(agent).into_router();
+    let (_, queued) = json(
+        &router,
+        post("/responses", json!({"input": "x", "background": true})),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let replay = tokio::spawn({
+        let router = router.clone();
+        let id = id.clone();
+        async move { send(&router, get(&format!("/responses/{id}?stream=true"))).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, _) = json(
+        &router,
+        axum::http::Request::delete(format!("/responses/{id}"))
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, body) = tokio::time::timeout(std::time::Duration::from_secs(5), replay)
+        .await
+        .expect("the open replay ends when its response is deleted")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sse_events(&body).first().unwrap().0, "response.created");
+    let (status, _) = json(&router, get(&format!("/responses/{id}?stream=true"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Refuses to store a completed response or any conversation.
+struct FailingStore(agent_framework_foundry_hosting::InMemoryResponseStore);
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for FailingStore {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.0.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        if response.response["status"] == "completed" {
+            return Err(agent_framework_core::error::Error::Other(
+                "disk full".into(),
+            ));
+        }
+        self.0.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.0.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
+    {
+        self.0.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        _: &str,
+        _: Vec<agent_framework_core::types::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        Err(agent_framework_core::error::Error::Other(
+            "disk full".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn persistence_failures_fail_the_response() {
+    let router = ResponsesHostServer::agent(agent(Echo::default()))
+        .with_response_store(Arc::new(FailingStore(Default::default())))
+        .into_router();
+
+    let (status, body) = json(&router, post("/responses", json!({"input": "x"}))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body["error"]["message"].is_string());
+
+    let (_, _, body) = send(
+        &router,
+        post("/responses", json!({"input": "x", "stream": true})),
+    )
+    .await;
+    let events = sse_events(&body);
+    let (kind, data) = events.last().unwrap();
+    assert_eq!(kind, "response.failed");
+    assert_eq!(data["response"]["status"], "failed");
+    assert!(data["response"]["error"]["message"].is_string());
+    assert!(!events.iter().any(|(k, _)| k == "response.completed"));
+
+    // A background response whose conversation write fails ends failed.
+    let (_, queued) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "x", "background": true, "conversation": "c"}),
+        ),
+    )
+    .await;
+    let id = queued["id"].as_str().unwrap().to_string();
+    let mut last = json!(null);
+    for _ in 0..100 {
+        let (_, polled) = json(&router, get(&format!("/responses/{id}"))).await;
+        if polled["status"] == "failed" || polled["status"] == "completed" {
+            last = polled;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(last["status"], "failed", "{last}");
+}
