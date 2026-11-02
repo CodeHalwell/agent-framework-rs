@@ -122,6 +122,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   token no longer counts as a model iteration — the operation was charged
   once when submitted — so a slow provider cannot spend `max_iterations` on
   polls before its tool calls run.
+- Foundry hosting (`websocket`, review fix): when the client disconnects,
+  the handler's outbound channel is closed, so an output-only handler's next
+  `WsSession::send` fails and it can stop instead of streaming forever.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

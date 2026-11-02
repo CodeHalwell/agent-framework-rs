@@ -197,3 +197,46 @@ async fn a_handler_that_does_not_read_cannot_stall_its_output() {
     assert_eq!(received, (500, Some(1000)));
     flood.abort();
 }
+
+#[tokio::test]
+async fn a_client_disconnect_stops_an_output_only_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let flag = stopped.clone();
+    // Streams forever without reading, until a send fails.
+    let ws = InvocationsWs::new(move |session: WsSession| {
+        let flag = flag.clone();
+        async move {
+            let mut i = 0u64;
+            while session
+                .send(Message::Text(format!("tick {i}").into()))
+                .await
+                .is_ok()
+            {
+                i += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, ws.into_router()).await.unwrap() });
+    let mut client = connect(&format!("ws://{addr}/invocations_ws")).await;
+    assert!(matches!(
+        next(&mut client).await,
+        tungstenite::Message::Text(_)
+    ));
+    client.close(None).await.unwrap();
+    drop(client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !stopped.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handler's sends must fail once the client is gone"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

@@ -209,21 +209,29 @@ async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: Foun
     });
     let mut client_open = true;
     let mut outgoing_open = true;
+    // Once the client is gone (it closed, or a write failed), the handler's
+    // outbound channel is closed so its next `send` fails: a handler that
+    // only produces output, never reading, would otherwise keep generating
+    // it, with its side effects, for no one.
+    fn client_gone(client_open: &mut bool, out_rx: &mut mpsc::Receiver<Message>) {
+        *client_open = false;
+        out_rx.close();
+    }
     let outcome = loop {
         tokio::select! {
             outcome = &mut handler => break outcome,
-            _ = &mut closed_rx, if client_open => client_open = false,
-            message = out_rx.recv(), if outgoing_open => match message {
+            _ = &mut closed_rx, if client_open => client_gone(&mut client_open, &mut out_rx),
+            message = out_rx.recv(), if outgoing_open && client_open => match message {
                 Some(message) => {
                     if sink.send(message).await.is_err() {
-                        client_open = false;
+                        client_gone(&mut client_open, &mut out_rx);
                     }
                 }
                 None => outgoing_open = false,
             },
             _ = async { ping.as_mut().expect("guarded").tick().await }, if ping.is_some() && client_open => {
                 if sink.send(Message::Ping(Default::default())).await.is_err() {
-                    client_open = false;
+                    client_gone(&mut client_open, &mut out_rx);
                 }
             }
         }
@@ -231,6 +239,9 @@ async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: Foun
     reader.abort();
     // Frames the handler sent before returning go out before the close.
     while let Ok(message) = out_rx.try_recv() {
+        if !client_open {
+            break;
+        }
         if sink.send(message).await.is_err() {
             break;
         }
