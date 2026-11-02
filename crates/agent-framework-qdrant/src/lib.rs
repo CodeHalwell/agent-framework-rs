@@ -57,6 +57,9 @@
 //! - Operation options (consistency, shard keys, timeouts) are not exposed.
 //! - There is no local (in-process) mode; use the server.
 
+#![cfg(feature = "experimental-vector-stores")]
+#![cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
+
 use std::collections::HashMap;
 
 use agent_framework_core::error::{Error, Result};

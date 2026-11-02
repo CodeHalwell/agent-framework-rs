@@ -2,6 +2,8 @@
 //! (for example `host=127.0.0.1 port=5432 user=postgres`) to run them;
 //! without it they pass vacuously. Each test uses its own table.
 
+#![cfg(feature = "experimental-vector-stores")]
+
 use agent_framework_core::vectors::{
     DistanceFunction, Filter, FilterGroup, FilterOperator, IndexKind, VectorSearchOptions,
     VectorStore, VectorStoreCollectionDefinition, VectorStoreField,
