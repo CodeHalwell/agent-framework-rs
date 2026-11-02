@@ -481,3 +481,134 @@ async fn the_call_budget_carries_across_background_continuations() {
         "a continuation must not get a fresh call budget"
     );
 }
+
+/// A tool that counts its executions.
+fn counting_tool(name: &str, runs: Arc<std::sync::atomic::AtomicUsize>) -> ToolDefinition {
+    FunctionTool::new(
+        name,
+        "Counts its runs.",
+        json!({"type": "object", "properties": {}}),
+        move |_| {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!("ran"))
+            }
+        },
+    )
+    .into_definition()
+}
+
+fn ask_tool(call_id: &str, name: &str) -> ChatResponse {
+    ChatResponse {
+        messages: vec![Message::with_contents(
+            Role::assistant(),
+            vec![Content::FunctionCall(FunctionCallContent::new(
+                call_id,
+                name,
+                Some(FunctionArguments::Raw("{}".into())),
+            ))],
+        )],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_iteration_limit_carries_across_background_continuations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runs = Arc::new(AtomicUsize::new(0));
+    // Request 1 uses both iterations (one tool call, then a pending poll).
+    // The continuation must go straight to the tools-disabled failsafe.
+    let script = Script::replies(vec![
+        ask_tool("c1", "lookup"),
+        pending("op-10", None),
+        ask_tool("c2", "lookup"),
+        ask_tool("c3", "lookup"),
+        ChatResponse::from_text("done"),
+    ]);
+    let agent = Agent::builder(script.clone())
+        .tool(counting_tool("lookup", runs.clone()))
+        .function_invocation_config(FunctionInvocationConfig {
+            max_iterations: 2,
+            ..Default::default()
+        })
+        .build();
+    let mut session = agent.create_session();
+    let first = agent
+        .run_with_options(
+            vec![Message::user("go")],
+            Some(&mut session),
+            AgentRunOptions::new().with_background(true),
+        )
+        .await
+        .unwrap();
+    let token = first.continuation_token.clone().expect("still running");
+    agent
+        .run_with_options(
+            Vec::new(),
+            Some(&mut session),
+            AgentRunOptions::new()
+                .with_background(true)
+                .with_continuation_token(token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a continuation must not get fresh iterations"
+    );
+}
+
+/// Injects a tool, plus a message that a continuation must not send.
+struct ToolProvider(ToolDefinition);
+
+#[async_trait]
+impl agent_framework_core::memory::ContextProvider for ToolProvider {
+    async fn before_run(
+        &self,
+        ctx: &mut agent_framework_core::memory::SessionContext,
+    ) -> Result<()> {
+        ctx.tools.push(self.0.clone());
+        ctx.messages.push(Message::user("provider context"));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn provider_tools_are_available_to_a_continuation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runs = Arc::new(AtomicUsize::new(0));
+    let script = Script::replies(vec![
+        ask_tool("c1", "provided"),
+        ChatResponse::from_text("done"),
+    ]);
+    let agent = Agent::builder(script.clone())
+        .context_provider(Arc::new(ToolProvider(counting_tool(
+            "provided",
+            runs.clone(),
+        ))))
+        .build();
+    let mut session = agent.create_session();
+    let response = agent
+        .run_with_options(
+            Vec::new(),
+            Some(&mut session),
+            AgentRunOptions::new()
+                .with_background(true)
+                .with_continuation_token(token("op-11")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.text(), "done");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the provider's tool ran");
+    let requests = script.requests();
+    assert!(
+        requests[0].1.tools.iter().any(|t| t.name == "provided"),
+        "the continuation offers the provider's tool"
+    );
+    assert!(
+        requests[0].0.is_empty(),
+        "no provider context is sent with a continuation"
+    );
+}

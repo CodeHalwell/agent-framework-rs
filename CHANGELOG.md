@@ -105,6 +105,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   back and resumed by the continuation-token request — so polling through
   continuations cannot exceed `max_function_calls` or
   `max_duration_seconds`.
+- Core (review fixes): background continuations keep the tool loop's
+  iteration count, so polling through continuations still reaches
+  `max_iterations`'s tools-disabled failsafe; and a continuation still offers
+  the tools context providers inject (consulting non-history providers for
+  their tools only, dropping their messages and instructions), so a resumed
+  operation's call to such a tool runs.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

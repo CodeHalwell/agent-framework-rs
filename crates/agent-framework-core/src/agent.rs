@@ -744,6 +744,29 @@ impl Agent {
         // attachment it has analyzed and summarized), as upstream allows.
         let input_for_model = ctx.input_messages;
 
+        // A continuation still needs the tools the providers inject: the
+        // operation may come back with a call to one of them (a FIDES
+        // `inspect_variable`, a skill's `load_skill`), and without its
+        // executor the call could not run. So the non-history providers are
+        // consulted on a scratch context for their tools only; whatever
+        // messages or instructions they would add are dropped, since the
+        // operation already has its input.
+        if continuing {
+            let mut scratch = SessionContext::new(Vec::new());
+            scratch.session_id = ctx.session_id.clone();
+            scratch.service_session_id = ctx.service_session_id.clone();
+            scratch.session = ctx.session.clone();
+            scratch.agent = ctx.agent.clone();
+            for provider in self
+                .providers_for(session, options.conversation_id.is_some())
+                .into_iter()
+                .filter(|p| !p.is_history_provider())
+            {
+                provider.before_run(&mut scratch).await?;
+            }
+            ctx.tools.append(&mut scratch.tools);
+        }
+
         // Deduplicate by name: a tool may be defined on the agent and also
         // injected by a context provider. Providers rejecting duplicate
         // tool names would otherwise fail the request.

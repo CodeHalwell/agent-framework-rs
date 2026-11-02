@@ -575,6 +575,12 @@ struct InvocationBudget {
     /// `Instant` cannot.
     started_millis: u64,
     executed: usize,
+    /// Model iterations used so far, against
+    /// [`FunctionInvocationConfig::max_iterations`]. Carried across
+    /// background continuations (not approval replies), so a loop polled
+    /// through continuation after continuation still reaches the
+    /// tools-disabled failsafe.
+    iterations: usize,
     max_calls: Option<usize>,
     max_duration: Option<Duration>,
 }
@@ -593,10 +599,12 @@ impl InvocationBudget {
         config: &FunctionInvocationConfig,
         session: Option<&AgentSession>,
         resuming_approval: bool,
+        continuing: bool,
     ) -> Self {
         let mut budget = Self {
             started_millis: epoch_millis(),
             executed: 0,
+            iterations: 0,
             max_calls: config.max_function_calls,
             // `FunctionInvocationConfig::validate` — which every run calls
             // before reaching here — rejects everything `try_from_secs_f64`
@@ -625,6 +633,11 @@ impl InvocationBudget {
             if let Some(executed) = parked.get("executed").and_then(Value::as_u64) {
                 budget.executed = executed as usize;
             }
+            if continuing {
+                if let Some(iterations) = parked.get("iterations").and_then(Value::as_u64) {
+                    budget.iterations = iterations as usize;
+                }
+            }
         }
         budget
     }
@@ -637,6 +650,7 @@ impl InvocationBudget {
                 serde_json::json!({
                     "started_millis": self.started_millis,
                     "executed": self.executed,
+                    "iterations": self.iterations,
                 }),
             );
         }
@@ -1323,13 +1337,15 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // handed back while it was still running, and with it the budget
             // parked at that point: polling through continuations must not
             // start each leg with a full budget.
+            let continuing = options.continuation_token.is_some();
             let resuming_approval = !collect_approval_responses(&conversation).is_empty()
                 || deferred.is_some()
-                || options.continuation_token.is_some();
+                || continuing;
             let mut budget = InvocationBudget::resume_or_start(
                 &self.config,
                 session.as_ref(),
                 resuming_approval,
+                continuing,
             );
             // Usage summed over every model call this loop makes, applied to
             // whichever response is returned so the caller sees the cost of the
@@ -1408,7 +1424,8 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 }
             }
 
-            for _ in 0..self.config.max_iterations {
+            while budget.iterations < self.config.max_iterations {
+                budget.iterations += 1;
                 options.tools = live_tools.snapshot();
                 let tools = executable_tools(&options);
                 // Checked before the approval replay below, not only after
