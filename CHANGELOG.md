@@ -168,6 +168,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   and `computer_call_output` replies (one per call, any order) resume it with
   all the results, instead of a generic `request_info` call that rejected
   computer replies.
+- Workflows: `SequentialBuilder`, `ConcurrentBuilder`, `GroupChatBuilder`,
+  `HandoffBuilder` and `MagenticBuilder` gain `with_checkpointing`, as
+  upstream's `checkpoint_storage`, so orchestrations can checkpoint (and a
+  hosted orchestration can pause and resume).
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

@@ -733,6 +733,9 @@ pub struct HandoffBuilder {
     prompt: Option<String>,
     name: Option<String>,
     autonomous: Option<AutonomousMode>,
+    /// Checkpoint storage for the built workflow (see
+    /// [`WorkflowBuilder::with_checkpointing`]).
+    checkpoint_storage: Option<Arc<dyn crate::workflow::CheckpointStorage>>,
 }
 
 impl Default for HandoffBuilder {
@@ -747,11 +750,24 @@ impl Default for HandoffBuilder {
             prompt: None,
             name: None,
             autonomous: None,
+            checkpoint_storage: None,
         }
     }
 }
 
 impl HandoffBuilder {
+    /// Enable checkpointing of the built workflow to `storage` at each
+    /// superstep boundary, as upstream's `checkpoint_storage` /
+    /// `with_checkpointing` (required for a hosted workflow to pause and
+    /// resume).
+    pub fn with_checkpointing(
+        mut self,
+        storage: Arc<dyn crate::workflow::CheckpointStorage>,
+    ) -> Self {
+        self.checkpoint_storage = Some(storage);
+        self
+    }
+
     /// Create an empty builder.
     pub fn new() -> Self {
         Self::default()
@@ -861,6 +877,7 @@ impl HandoffBuilder {
 
     /// Validate and build the handoff workflow.
     pub fn build(self) -> Result<Workflow> {
+        let checkpoint_storage = self.checkpoint_storage.clone();
         if self.participants.is_empty() {
             return Err(Error::Workflow(
                 "handoff workflow needs at least one participant".into(),
@@ -965,6 +982,9 @@ impl HandoffBuilder {
             .set_start("handoff_coordinator");
         if let Some(name) = self.name {
             builder = builder.name(name);
+        }
+        if let Some(storage) = checkpoint_storage {
+            builder = builder.with_checkpointing(storage);
         }
         builder.build()
     }

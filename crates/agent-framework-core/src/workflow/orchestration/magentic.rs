@@ -1450,6 +1450,9 @@ pub struct MagenticBuilder {
     enable_stall_intervention: bool,
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
+    /// Checkpoint storage for the built workflow (see
+    /// [`WorkflowBuilder::with_checkpointing`]).
+    checkpoint_storage: Option<Arc<dyn crate::workflow::CheckpointStorage>>,
 }
 
 /// Default cap on plan-review *revise* rounds before the orchestrator
@@ -1460,6 +1463,18 @@ pub struct MagenticBuilder {
 const DEFAULT_MAX_PLAN_REVIEW_ROUNDS: u32 = 10;
 
 impl MagenticBuilder {
+    /// Enable checkpointing of the built workflow to `storage` at each
+    /// superstep boundary, as upstream's `checkpoint_storage` /
+    /// `with_checkpointing` (required for a hosted workflow to pause and
+    /// resume).
+    pub fn with_checkpointing(
+        mut self,
+        storage: Arc<dyn crate::workflow::CheckpointStorage>,
+    ) -> Self {
+        self.checkpoint_storage = Some(storage);
+        self
+    }
+
     /// Create an empty builder.
     pub fn new() -> Self {
         Self::default()
@@ -1617,6 +1632,7 @@ impl MagenticBuilder {
 
     /// Validate and build the Magentic workflow.
     pub fn build(self) -> Result<Workflow> {
+        let checkpoint_storage = self.checkpoint_storage.clone();
         if self.participants.is_empty() {
             return Err(Error::Workflow(
                 "magentic workflow needs at least one participant".into(),
@@ -1694,6 +1710,9 @@ impl MagenticBuilder {
         }
         if let Some(name) = self.name {
             builder = builder.name(name);
+        }
+        if let Some(storage) = checkpoint_storage {
+            builder = builder.with_checkpointing(storage);
         }
         builder.build()
     }

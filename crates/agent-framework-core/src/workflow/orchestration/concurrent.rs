@@ -95,9 +95,24 @@ pub struct ConcurrentBuilder {
     intermediate_output_from: Vec<String>,
     request_info: bool,
     aggregator: Option<ConcurrentAggregator>,
+    /// Checkpoint storage for the built workflow (see
+    /// [`WorkflowBuilder::with_checkpointing`]).
+    checkpoint_storage: Option<Arc<dyn crate::workflow::CheckpointStorage>>,
 }
 
 impl ConcurrentBuilder {
+    /// Enable checkpointing of the built workflow to `storage` at each
+    /// superstep boundary, as upstream's `checkpoint_storage` /
+    /// `with_checkpointing` (required for a hosted workflow to pause and
+    /// resume).
+    pub fn with_checkpointing(
+        mut self,
+        storage: Arc<dyn crate::workflow::CheckpointStorage>,
+    ) -> Self {
+        self.checkpoint_storage = Some(storage);
+        self
+    }
+
     /// Combine the participants' conversations (in participant order) with
     /// `aggregator` instead of the default prompt-plus-last-replies merge
     /// (upstream `WithAggregator`).
@@ -190,6 +205,7 @@ impl ConcurrentBuilder {
 
     /// Validate and build the concurrent workflow.
     pub fn build(self) -> Result<Workflow> {
+        let checkpoint_storage = self.checkpoint_storage.clone();
         if self.participants.is_empty() {
             return Err(Error::Workflow(
                 "concurrent workflow needs at least one participant".into(),
@@ -264,6 +280,9 @@ impl ConcurrentBuilder {
         }
         if let Some(name) = self.name {
             builder = builder.name(name);
+        }
+        if let Some(storage) = checkpoint_storage {
+            builder = builder.with_checkpointing(storage);
         }
         builder.build()
     }
