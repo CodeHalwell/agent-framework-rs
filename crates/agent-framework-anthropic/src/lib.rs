@@ -64,7 +64,7 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::types::{
     ChatOptions, ChatResponse, ChatResponseUpdate, Content, FunctionArguments, FunctionCallContent,
-    Message, Role, TextContent, TextReasoningContent, UsageContent,
+    McpServerToolCallContent, Message, Role, TextContent, TextReasoningContent, UsageContent,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -564,9 +564,9 @@ struct SseState {
     buffer: String,
     utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
-    /// `content_block` index -> `tool_use` call id, so `input_json_delta`
+    /// `content_block` index -> what that block is, so `input_json_delta`
     /// fragments (which carry only the index) resolve to the right call.
-    tool_use_ids: HashMap<i64, String>,
+    tool_use_ids: HashMap<i64, StreamBlock>,
     /// Turns Anthropic's cumulative usage snapshots into per-update increments.
     usage: convert::StreamUsageAccumulator,
     done: bool,
@@ -658,9 +658,26 @@ fn continue_paused_stream(
 /// Parse one decoded SSE event into an update, or `None` for event types that
 /// carry no content of their own (`content_block_stop`, `message_stop`,
 /// `ping`, ...).
+/// What a streamed content block at a given index is, for the deltas that
+/// carry only the index.
+enum StreamBlock {
+    /// A client or server tool call: its `input_json_delta` fragments are
+    /// emitted as `FunctionCall` argument fragments under this call id.
+    Tool(String),
+    /// An MCP-connector call, buffered until `content_block_stop` and then
+    /// emitted whole as one `McpServerToolCall` — that content type has no
+    /// fragment merging, and replaying it needs the complete input.
+    Mcp {
+        id: String,
+        name: String,
+        server_name: Option<String>,
+        input: String,
+    },
+}
+
 fn parse_stream_event(
     value: &Value,
-    tool_use_ids: &mut HashMap<i64, String>,
+    tool_use_ids: &mut HashMap<i64, StreamBlock>,
     usage_acc: &mut convert::StreamUsageAccumulator,
 ) -> Option<ChatResponseUpdate> {
     match value.get("type").and_then(Value::as_str)? {
@@ -693,7 +710,21 @@ fn parse_stream_event(
             let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
             let block = value.get("content_block")?;
             match block.get("type").and_then(Value::as_str)? {
-                "tool_use" | "mcp_tool_use" | "server_tool_use" => {
+                "mcp_tool_use" => {
+                    let str_field =
+                        |k: &str| block.get(k).and_then(Value::as_str).map(str::to_string);
+                    tool_use_ids.insert(
+                        index,
+                        StreamBlock::Mcp {
+                            id: str_field("id").unwrap_or_default(),
+                            name: str_field("name").unwrap_or_default(),
+                            server_name: str_field("server_name"),
+                            input: String::new(),
+                        },
+                    );
+                    None
+                }
+                "tool_use" | "server_tool_use" => {
                     let id = block
                         .get("id")
                         .and_then(Value::as_str)
@@ -704,7 +735,7 @@ fn parse_stream_event(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    tool_use_ids.insert(index, id.clone());
+                    tool_use_ids.insert(index, StreamBlock::Tool(id.clone()));
                     Some(ChatResponseUpdate {
                         contents: vec![Content::FunctionCall(FunctionCallContent::new(
                             id, name, None,
@@ -778,16 +809,28 @@ fn parse_stream_event(
                     ..Default::default()
                 }),
                 "input_json_delta" => {
-                    let call_id = tool_use_ids.get(&index).cloned().unwrap_or_default();
                     let partial = delta
                         .get("partial_json")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    Content::FunctionCall(FunctionCallContent::new(
-                        call_id,
-                        "",
-                        Some(FunctionArguments::Raw(partial.to_string())),
-                    ))
+                    match tool_use_ids.get_mut(&index) {
+                        Some(StreamBlock::Mcp { input, .. }) => {
+                            input.push_str(partial);
+                            return None;
+                        }
+                        Some(StreamBlock::Tool(call_id)) => {
+                            Content::FunctionCall(FunctionCallContent::new(
+                                call_id.clone(),
+                                "",
+                                Some(FunctionArguments::Raw(partial.to_string())),
+                            ))
+                        }
+                        None => Content::FunctionCall(FunctionCallContent::new(
+                            String::new(),
+                            "",
+                            Some(FunctionArguments::Raw(partial.to_string())),
+                        )),
+                    }
                 }
                 _ => return None,
             };
@@ -817,8 +860,43 @@ fn parse_stream_event(
                 ..Default::default()
             })
         }
-        // `content_block_stop`, `message_stop`, `ping`, and anything else
-        // carry no content of their own.
+        // A buffered MCP-connector call is complete at its block's stop.
+        "content_block_stop" => {
+            let index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
+            match tool_use_ids.remove(&index) {
+                Some(StreamBlock::Mcp {
+                    id,
+                    name,
+                    server_name,
+                    input,
+                }) => {
+                    let arguments = if input.trim().is_empty() {
+                        FunctionArguments::Object(HashMap::new())
+                    } else {
+                        FunctionArguments::Raw(input)
+                    };
+                    Some(ChatResponseUpdate {
+                        contents: vec![Content::McpServerToolCall(McpServerToolCallContent {
+                            call_id: id,
+                            tool_name: name,
+                            server_name,
+                            arguments: Some(arguments),
+                            approval_request_id: None,
+                        })],
+                        role: Some(Role::assistant()),
+                        ..Default::default()
+                    })
+                }
+                Some(tool) => {
+                    // Keep the mapping: a late delta still resolves.
+                    tool_use_ids.insert(index, tool);
+                    None
+                }
+                None => None,
+            }
+        }
+        // `message_stop`, `ping`, and anything else carry no content of
+        // their own.
         _ => None,
     }
 }
@@ -1247,17 +1325,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_mcp_tool_use_via_content_block_start() {
-        let text = sse_frame(
+    async fn stream_mcp_tool_use_is_buffered_and_emitted_whole_at_block_stop() {
+        // The input streams in fragments after an empty start; the hosted-MCP
+        // content type has no fragment merging, so the call is emitted once,
+        // complete, when its block stops — and is not a local function call.
+        let mut text = sse_frame(
             "content_block_start",
             &serde_json::json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "mcp_tool_use", "id": "mcptoolu_1", "name": "search_docs", "server_name": "docs", "input": {} } }),
         );
+        for partial in ["{\"q\": \"ru", "st\"}"] {
+            text.push_str(&sse_frame(
+                "content_block_delta",
+                &serde_json::json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": partial } }),
+            ));
+        }
+        text.push_str(&sse_frame(
+            "content_block_stop",
+            &serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+        ));
         let updates = collect_updates(text).await;
         let resp = ChatResponse::from_updates(updates);
-        let calls = resp.function_calls();
-        assert_eq!(calls.len(), 1);
+        assert!(
+            resp.function_calls().is_empty(),
+            "not a local function call"
+        );
+        let calls: Vec<_> = resp
+            .messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .filter_map(|c| match c {
+                Content::McpServerToolCall(call) => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{:?}", resp.messages);
         assert_eq!(calls[0].call_id, "mcptoolu_1");
-        assert_eq!(calls[0].name, "search_docs");
+        assert_eq!(calls[0].server_name.as_deref(), Some("docs"));
+        let args = match calls[0].arguments.as_ref().unwrap() {
+            FunctionArguments::Raw(raw) => serde_json::from_str::<Value>(raw).unwrap(),
+            FunctionArguments::Object(m) => serde_json::to_value(m).unwrap(),
+        };
+        assert_eq!(args, serde_json::json!({ "q": "rust" }));
     }
 
     #[tokio::test]

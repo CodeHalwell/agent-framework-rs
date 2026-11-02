@@ -6,9 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, HostedFileContent, Message, RegionCoordinateSpace,
-    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
-    UsageContent, UsageDetails,
+    FunctionCallContent, FunctionResultContent, HostedFileContent, McpServerToolCallContent,
+    McpServerToolResultContent, Message, RegionCoordinateSpace, ResponseFormat, Role, TextContent,
+    TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -350,6 +350,16 @@ pub fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
                 }
                 Content::FunctionCall(fc) => blocks.push(function_call_block(fc)),
                 Content::FunctionResult(fr) => blocks.push(function_result_block(fr)),
+                Content::McpServerToolCall(call) => {
+                    if let Some(block) = mcp_tool_use_block(call) {
+                        blocks.push(block);
+                    }
+                }
+                Content::McpServerToolResult(result) => {
+                    if let Some(block) = mcp_tool_result_block(result) {
+                        blocks.push(block);
+                    }
+                }
                 Content::Data(dc) => {
                     if let Some(block) = image_block_from_data(dc) {
                         blocks.push(block);
@@ -496,6 +506,13 @@ pub fn is_pause_turn_replayable(message: &Message) -> bool {
             // A result's own replayability depends on its call's name, which
             // the call in the same paused message is checked for above.
             Content::FunctionResult(fr) => is_server_tool_call_id(&fr.call_id),
+            Content::McpServerToolCall(call) => call.call_id.starts_with(MCP_TOOL_USE_ID_PREFIX),
+            Content::McpServerToolResult(result) => {
+                result.call_id.starts_with(MCP_TOOL_USE_ID_PREFIX)
+            }
+            // Usage is metadata of the turn, not content of it; it is
+            // dropped on replay and does not stop a continuation.
+            Content::Usage(_) => true,
             _ => false,
         })
 }
@@ -524,6 +541,58 @@ pub fn merge_pause_turn(mut acc: ChatResponse, next: ChatResponse) -> ChatRespon
     acc.model = next.model.or(acc.model);
     acc.finish_reason = next.finish_reason.or(acc.finish_reason);
     acc
+}
+
+/// The id prefix Anthropic gives an MCP-connector call.
+const MCP_TOOL_USE_ID_PREFIX: &str = "mcptoolu_";
+
+/// Replay an MCP-connector call as the `mcp_tool_use` block it arrived as.
+///
+/// Sent back as a client `tool_use` — as it was before — the API expected a
+/// client `tool_result` for it in the next user turn and refused the request.
+/// Only calls Anthropic issued (`mcptoolu_` ids) are replayed: a hosted MCP
+/// call carried over from another provider has an id Anthropic would reject,
+/// so it is omitted, which keeps the request valid.
+fn mcp_tool_use_block(call: &McpServerToolCallContent) -> Option<Value> {
+    if !call.call_id.starts_with(MCP_TOOL_USE_ID_PREFIX) {
+        return None;
+    }
+    let input = match &call.arguments {
+        Some(FunctionArguments::Object(m)) => Value::Object(m.clone().into_iter().collect()),
+        Some(FunctionArguments::Raw(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Map::new()))
+        }
+        None => Value::Object(Map::new()),
+    };
+    let mut block = json!({
+        "type": "mcp_tool_use",
+        "id": call.call_id,
+        "name": call.tool_name,
+        "input": input,
+    });
+    if let Some(server) = &call.server_name {
+        block["server_name"] = json!(server);
+    }
+    Some(block)
+}
+
+/// Replay an MCP-connector result as the `mcp_tool_result` block it arrived
+/// as, content verbatim. See [`mcp_tool_use_block`].
+fn mcp_tool_result_block(result: &McpServerToolResultContent) -> Option<Value> {
+    if !result.call_id.starts_with(MCP_TOOL_USE_ID_PREFIX) {
+        return None;
+    }
+    let (content, is_error) = match (&result.output, &result.error) {
+        (_, Some(error)) => (error.clone(), true),
+        (Some(output), None) => (output.clone(), false),
+        (None, None) => (Value::Array(Vec::new()), false),
+    };
+    Some(json!({
+        "type": "mcp_tool_result",
+        "tool_use_id": result.call_id,
+        "is_error": is_error,
+        "content": content,
+    }))
 }
 
 fn function_call_block(fc: &FunctionCallContent) -> Value {
@@ -855,7 +924,26 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                     refusal: false,
                 }));
             }
-            "tool_use" | "mcp_tool_use" | "server_tool_use" => {
+            // A call the API made to an MCP server it connected to itself
+            // (the MCP connector). It is not a function this framework runs,
+            // so it is the hosted-MCP content type — as the OpenAI parser
+            // produces — not a `FunctionCall`, and it keeps `server_name`,
+            // without which it cannot be replayed.
+            "mcp_tool_use" => {
+                let str_field = |k: &str| block.get(k).and_then(Value::as_str).map(str::to_string);
+                let input = match block.get("input") {
+                    Some(Value::Object(m)) => m.clone().into_iter().collect(),
+                    _ => HashMap::new(),
+                };
+                out.push(Content::McpServerToolCall(McpServerToolCallContent {
+                    call_id: str_field("id").unwrap_or_default(),
+                    tool_name: str_field("name").unwrap_or_default(),
+                    server_name: str_field("server_name"),
+                    arguments: Some(FunctionArguments::Object(input)),
+                    approval_request_id: None,
+                }));
+            }
+            "tool_use" | "server_tool_use" => {
                 let id = block
                     .get("id")
                     .and_then(Value::as_str)
@@ -876,19 +964,17 @@ pub(crate) fn parse_content_blocks(blocks: &[Value]) -> Vec<Content> {
                     Some(FunctionArguments::Object(input)),
                 )));
             }
+            // The MCP server's answer, kept *verbatim*: replaying the turn
+            // sends this block back as it arrived, and a re-serialized parse
+            // of it would not be the same payload.
             "mcp_tool_result" => {
-                let call_id = tool_use_id(block);
-                let result = match block.get("content") {
-                    Some(Value::Array(items)) => {
-                        serde_json::to_value(parse_content_blocks(items)).unwrap_or(Value::Null)
-                    }
-                    Some(other) => other.clone(),
-                    None => Value::Null,
-                };
-                out.push(Content::FunctionResult(FunctionResultContent::new(
-                    call_id,
-                    Some(result),
-                )));
+                let content = block.get("content").cloned().unwrap_or(Value::Null);
+                let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                out.push(Content::McpServerToolResult(McpServerToolResultContent {
+                    call_id: tool_use_id(block),
+                    output: (!is_error).then(|| content.clone()),
+                    error: is_error.then_some(content),
+                }));
             }
             "web_search_tool_result" | "web_fetch_tool_result" => {
                 let call_id = tool_use_id(block);
@@ -2252,59 +2338,123 @@ mod tests {
     }
 
     #[test]
-    fn parse_content_blocks_mcp_tool_use_is_function_call() {
+    fn an_mcp_connector_call_is_a_hosted_mcp_call_not_a_function_call() {
+        // The API ran it against an MCP server it connected to itself; it is
+        // not a function this framework invokes, and replaying it needs its
+        // `server_name`, which a `FunctionCall` cannot carry.
         let blocks = vec![json!({
             "type": "mcp_tool_use",
             "id": "mcptoolu_1",
             "name": "search_docs",
-            "input": {}
+            "server_name": "docs",
+            "input": { "q": "rust" }
         })];
-        let contents = parse_content_blocks(&blocks);
-        assert!(matches!(
-            &contents[0],
-            Content::FunctionCall(fc) if fc.call_id == "mcptoolu_1" && fc.name == "search_docs"
-        ));
+        match &parse_content_blocks(&blocks)[0] {
+            Content::McpServerToolCall(call) => {
+                assert_eq!(call.call_id, "mcptoolu_1");
+                assert_eq!(call.tool_name, "search_docs");
+                assert_eq!(call.server_name.as_deref(), Some("docs"));
+            }
+            other => panic!("expected McpServerToolCall, got {other:?}"),
+        }
     }
 
     #[test]
-    fn parse_content_blocks_mcp_tool_result_with_list_content_is_recursively_parsed() {
+    fn an_mcp_connector_result_keeps_its_content_verbatim() {
         let blocks = vec![json!({
             "type": "mcp_tool_result",
             "tool_use_id": "mcptoolu_1",
             "is_error": false,
             "content": [{ "type": "text", "text": "result text" }]
         })];
-        let contents = parse_content_blocks(&blocks);
-        assert_eq!(contents.len(), 1);
-        match &contents[0] {
-            Content::FunctionResult(fr) => {
-                assert_eq!(fr.call_id, "mcptoolu_1");
-                assert_eq!(fr.exception, None);
-                // The nested `content` array is itself parsed via
-                // `parse_content_blocks` and serialized back to JSON.
+        match &parse_content_blocks(&blocks)[0] {
+            Content::McpServerToolResult(r) => {
+                assert_eq!(r.call_id, "mcptoolu_1");
                 assert_eq!(
-                    fr.result,
+                    r.output,
                     Some(json!([{ "type": "text", "text": "result text" }]))
                 );
+                assert_eq!(r.error, None);
             }
-            other => panic!("expected FunctionResult, got {other:?}"),
+            other => panic!("expected McpServerToolResult, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_content_blocks_mcp_tool_result_with_string_content_passes_through() {
+    fn an_mcp_connector_error_result_is_carried_as_the_error() {
         let blocks = vec![json!({
             "type": "mcp_tool_result",
             "tool_use_id": "mcptoolu_1",
-            "content": "plain string result"
+            "is_error": true,
+            "content": "plain string failure"
         })];
-        let contents = parse_content_blocks(&blocks);
-        match &contents[0] {
-            Content::FunctionResult(fr) => {
-                assert_eq!(fr.result, Some(json!("plain string result")));
+        match &parse_content_blocks(&blocks)[0] {
+            Content::McpServerToolResult(r) => {
+                assert_eq!(r.output, None);
+                assert_eq!(r.error, Some(json!("plain string failure")));
             }
-            other => panic!("expected FunctionResult, got {other:?}"),
+            other => panic!("expected McpServerToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_mcp_connector_turn_replays_as_mcp_blocks() {
+        // Replayed as a client `tool_use` + `tool_result`, the API refused the
+        // next request — the same shape problem as server-side web search.
+        let turn = parse_response(&json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [
+                { "type": "mcp_tool_use", "id": "mcptoolu_1", "name": "search_docs",
+                  "server_name": "docs", "input": { "q": "rust" } },
+                { "type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "is_error": false,
+                  "content": [{ "type": "text", "text": "found it" }] },
+                { "type": "text", "text": "Here is what I found." }
+            ]
+        }))
+        .messages
+        .remove(0);
+        let out = messages_to_anthropic(&[Message::user("q"), turn, Message::user("thanks")]);
+        let blocks = out[1]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            json!({ "type": "mcp_tool_use", "id": "mcptoolu_1", "name": "search_docs",
+                    "server_name": "docs", "input": { "q": "rust" } })
+        );
+        assert_eq!(
+            blocks[1],
+            json!({ "type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "is_error": false,
+                    "content": [{ "type": "text", "text": "found it" }] })
+        );
+        let types: Vec<&str> = out
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .filter_map(|b| b["type"].as_str())
+            .collect();
+        assert!(
+            !types.contains(&"tool_use") && !types.contains(&"tool_result"),
+            "{types:?}"
+        );
+    }
+
+    #[test]
+    fn a_hosted_mcp_call_from_another_provider_is_not_replayed_to_anthropic() {
+        let foreign = McpServerToolCallContent {
+            call_id: "mcp_abc123".into(),
+            tool_name: "t".into(),
+            server_name: Some("s".into()),
+            arguments: None,
+            approval_request_id: None,
+        };
+        let out = messages_to_anthropic(&[
+            Message::user("q"),
+            Message::with_contents(
+                Role::assistant(),
+                vec![Content::McpServerToolCall(foreign), Content::text("answer")],
+            ),
+        ]);
+        let blocks = out[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert_eq!(blocks[0]["type"], "text");
     }
 
     #[test]

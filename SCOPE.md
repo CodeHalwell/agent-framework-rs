@@ -70,39 +70,22 @@ from the roadmap, not from this file.
 - **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
   to build on.
 - **Azure**: Content Understanding, the Cosmos DB memory provider (blocked
-  on the Agent Memory Toolkit), the dedicated Application Insights exporter,
-  and a session store backed by Azure storage. Two of these are no longer
-  blocked on a dependency, only on the work (see
-  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)):
-  `azure_core_opentelemetry` is stable at 1.0.0, and with the
+  on the Agent Memory Toolkit) and the dedicated Application Insights
+  exporter. `azure_core_opentelemetry` is stable at 1.0.0, and with the
   `microsoft.agent-framework` resource attribute `otel-export` now sets, it
-  is most of what the Application Insights exporter needs;
-  `azure_storage_blob` is stable at 1.1.0 for the session store. The last one is an
-  implementation of the ported `session_store` abstraction, not new surface:
-  upstream's `AzureBlobAgentSessionStore`
-  (`Microsoft.Agents.AI.Hosting.AzureStorage`) saves, gets and deletes a
-  serialized session as a blob, which `agent-framework-azure`'s Entra
-  credential chain and `azure_http_client` already have what is needed to
-  reach — or `azure_storage_blob` 1.1, which shares the `azure_core` 1.x
-  line the optional `entra-sdk` feature already pulls.
+  is most of what the exporter needs (see
+  [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)). The Blob session
+  store is ported (`agent-framework-azure`'s `session-store` feature).
 - **Function-invocation pauses with mixed batches**. A declaration-only
   call's local siblings run on the same turn. Upstream instead holds them
   until the caller answers whenever a session is present (#9050). An
   approval batch also defers a declaration-only sibling as an approval,
   where upstream pauses it as Host input (#9203).
-- **Anthropic MCP-connector replay**. `mcp_tool_use` / `mcp_tool_result`
-  blocks replay as client `tool_use` / `tool_result`, the same shape problem
-  the 2026-11-02 round three fixed for web search and web fetch. Fixing it
-  needs `parse_content_blocks` to keep `mcp_tool_result` content verbatim
-  rather than parsing it recursively; upstream has not addressed it either.
 - **Responses per-item message identity** (upstream #9768). The Responses
   parser returns one assistant message whose id is the *response* id;
   upstream now returns one message per `message` output item with that
   item's id, and attributes logprobs per message. A fidelity change that
   alters a value existing consumers read, so not made silently.
-- **Streamed code-interpreter content**. The OpenAI Responses client
-  produces no `CodeInterpreterToolCallContent`, so there is nothing to
-  stream or merge.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline skills (scripts, file-based sources, source

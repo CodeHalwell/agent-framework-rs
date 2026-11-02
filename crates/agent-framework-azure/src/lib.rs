@@ -66,12 +66,16 @@
 //! # }
 //! ```
 
+#[cfg(feature = "session-store")]
+pub mod blob_session_store;
 mod credential;
 mod credentials;
 pub mod embeddings;
 #[cfg(feature = "entra-sdk")]
 pub mod entra_sdk;
 pub mod responses;
+#[cfg(feature = "session-store")]
+pub use blob_session_store::{AzureBlobAgentSessionStore, BlobAuth, STORAGE_SCOPE};
 
 pub use credential::{StaticTokenCredential, TokenCredential};
 pub use credentials::{

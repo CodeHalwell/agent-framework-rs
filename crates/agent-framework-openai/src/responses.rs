@@ -29,7 +29,8 @@ use agent_framework_core::error::{Error, Result};
 use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
-    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, Content, DataContent, FinishReason,
+    Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, CodeInterpreterToolCallContent,
+    CodeInterpreterToolResultContent, Content, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
     McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
     ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
@@ -838,6 +839,70 @@ fn user_location_to_responses(location: &Value) -> Value {
     Value::Object(loc)
 }
 
+/// The contents of a `code_interpreter_call` output item: a
+/// [`Content::CodeInterpreterToolCall`] carrying the submitted code, and a
+/// [`Content::CodeInterpreterToolResult`] carrying its `logs` (as text) and
+/// `image` outputs (as URIs), as upstream's
+/// `from_code_interpreter_tool_call` / `_tool_result`.
+///
+/// These used to be flattened into ordinary [`Content::Text`] — the run's
+/// console output, or its source when there was none — so the tool's
+/// output read as part of the model's answer, in `text()` and in anything
+/// built from it. Used for both a full response and the streamed
+/// `response.output_item.done`, which is the only event that carries
+/// `outputs` during streaming (upstream #9744).
+fn code_interpreter_contents(item: &Value) -> Vec<Content> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let mut outputs = Vec::new();
+    for output in item
+        .get("outputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match output.get("type").and_then(Value::as_str) {
+            Some("logs") => {
+                if let Some(logs) = output.get("logs").and_then(Value::as_str) {
+                    outputs.push(Content::Text(TextContent::new(logs)));
+                }
+            }
+            Some("image") => {
+                if let Some(url) = output.get("url").and_then(Value::as_str) {
+                    outputs.push(Content::Uri(UriContent {
+                        uri: url.to_string(),
+                        media_type: "image".to_string(),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut contents = Vec::new();
+    if let Some(code) = item
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+    {
+        contents.push(Content::CodeInterpreterToolCall(
+            CodeInterpreterToolCallContent {
+                call_id: call_id.clone(),
+                inputs: Some(vec![Content::Text(TextContent::new(code))]),
+            },
+        ));
+    }
+    contents.push(Content::CodeInterpreterToolResult(
+        CodeInterpreterToolResultContent {
+            call_id,
+            outputs: Some(outputs),
+        },
+    ));
+    contents
+}
+
 /// Build the Responses MCP `require_approval` value. A `parameters.approval_mode`
 /// override — either the string `"always_require"`/`"never_require"` or an
 /// object `{"always": [...], "never": [...]}` — takes precedence over the
@@ -1129,37 +1194,9 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
                 }
             }
         }
-        // Code-interpreter runs surface `logs` as text and `image` outputs as
-        // URIs; a bare `code` (no outputs) is a text fallback
-        // (`_create_response_content:748-764`).
-        Some("code_interpreter_call") => {
-            let outputs = item
-                .get("outputs")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty());
-            if let Some(outputs) = outputs {
-                for output in outputs {
-                    match output.get("type").and_then(Value::as_str) {
-                        Some("logs") => {
-                            if let Some(logs) = output.get("logs").and_then(Value::as_str) {
-                                contents.push(Content::Text(TextContent::new(logs)));
-                            }
-                        }
-                        Some("image") => {
-                            if let Some(url) = output.get("url").and_then(Value::as_str) {
-                                contents.push(Content::Uri(UriContent {
-                                    uri: url.to_string(),
-                                    media_type: "image".to_string(),
-                                }));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if let Some(code) = item.get("code").and_then(Value::as_str) {
-                contents.push(Content::Text(TextContent::new(code)));
-            }
-        }
+        // A code-interpreter run is a hosted tool call and its result, not
+        // assistant text (see `code_interpreter_contents`).
+        Some("code_interpreter_call") => contents.extend(code_interpreter_contents(item)),
         // A generated image is returned as base64; default to image/png unless
         // the result is a data URI that states its own type
         // (`_create_response_content:788-811`).
@@ -1683,6 +1720,22 @@ fn parse_responses_event(
             })
         }
         "response.output_item.done" => {
+            // A finished code-interpreter run: the done item is the only
+            // place its `outputs` arrive while streaming, and its `code` is
+            // final. Emitted whole, once. (Upstream also streams the code
+            // live from `code_interpreter_call_code.delta` with a merge mode
+            // this port's content model has no counterpart for, so the code
+            // arrives here instead of in fragments.)
+            if let Some(item) = value
+                .get("item")
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("code_interpreter_call"))
+            {
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents: code_interpreter_contents(item),
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
             let Some(item) = value
                 .get("item")
                 .filter(|i| i.get("type").and_then(Value::as_str) == Some("mcp_call"))
@@ -2798,26 +2851,77 @@ mod tests {
     }
 
     #[test]
-    fn code_interpreter_outputs_become_text_and_uri() {
+    fn a_code_interpreter_run_is_a_hosted_call_and_result_not_answer_text() {
+        // Its console output and source used to be flattened into ordinary
+        // text, so they read as part of the model's answer.
         let contents = parse_item(json!({
             "type": "code_interpreter_call",
+            "id": "ci_1",
+            "code": "print('hello stdout')",
             "outputs": [
                 { "type": "logs", "logs": "hello stdout" },
                 { "type": "image", "url": "https://ex.com/plot.png" },
             ],
         }));
-        assert!(matches!(&contents[0], Content::Text(t) if t.text == "hello stdout"));
         assert!(
-            matches!(&contents[1], Content::Uri(u) if u.uri == "https://ex.com/plot.png" && u.media_type == "image")
+            contents.iter().all(|c| !matches!(c, Content::Text(_))),
+            "{contents:?}"
+        );
+        let Content::CodeInterpreterToolCall(call) = &contents[0] else {
+            panic!("expected the call first: {contents:?}");
+        };
+        assert_eq!(call.call_id.as_deref(), Some("ci_1"));
+        assert!(
+            matches!(&call.inputs.as_ref().unwrap()[0], Content::Text(t) if t.text == "print('hello stdout')")
+        );
+        let Content::CodeInterpreterToolResult(result) = &contents[1] else {
+            panic!("expected the result second: {contents:?}");
+        };
+        let outputs = result.outputs.as_ref().unwrap();
+        assert!(matches!(&outputs[0], Content::Text(t) if t.text == "hello stdout"));
+        assert!(
+            matches!(&outputs[1], Content::Uri(u) if u.uri == "https://ex.com/plot.png" && u.media_type == "image")
         );
     }
 
     #[test]
-    fn code_interpreter_without_outputs_falls_back_to_code() {
+    fn a_code_interpreter_run_with_no_outputs_still_reports_its_result() {
         let contents = parse_item(json!({
-            "type": "code_interpreter_call", "code": "print(1)",
+            "type": "code_interpreter_call", "call_id": "ci_2", "code": "x = 1",
         }));
-        assert!(matches!(&contents[0], Content::Text(t) if t.text == "print(1)"));
+        assert_eq!(contents.len(), 2);
+        assert!(
+            matches!(&contents[1], Content::CodeInterpreterToolResult(r) if r.outputs.as_deref() == Some(&[][..]))
+        );
+    }
+
+    #[test]
+    fn a_streamed_code_interpreter_run_is_captured_from_output_item_done() {
+        // The done item is the only streaming event that carries `outputs`
+        // (upstream #9744); before this they were never seen while streaming.
+        let mut call_ids = HashMap::new();
+        let outcome = parse_responses_event(
+            &json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "code_interpreter_call", "id": "ci_3", "code": "1+1",
+                    "outputs": [{ "type": "logs", "logs": "2" }]
+                }
+            }),
+            &mut call_ids,
+            None,
+        );
+        let EventOutcome::Update(update) = outcome else {
+            panic!("expected an update");
+        };
+        assert!(matches!(
+            &update.contents[0],
+            Content::CodeInterpreterToolCall(_)
+        ));
+        let Content::CodeInterpreterToolResult(r) = &update.contents[1] else {
+            panic!("{:?}", update.contents);
+        };
+        assert!(matches!(&r.outputs.as_ref().unwrap()[0], Content::Text(t) if t.text == "2"));
     }
 
     #[test]
