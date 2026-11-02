@@ -24,6 +24,7 @@ mod edge;
 mod events;
 mod executor;
 mod orchestration;
+pub mod protocol;
 mod request_info;
 mod runner;
 mod shared_state;
@@ -58,6 +59,7 @@ pub use orchestration::{
     ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT, ORCHESTRATOR_TASK_LEDGER_PLAN_PROMPT,
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 };
+pub use protocol::{ProtocolBuilder, ProtocolDescriptor, RequestPortInfo};
 pub use request_info::{PendingRequest, RequestInfoExecutor, RequestResponse};
 pub use runner::{
     Workflow, WorkflowBuilder, WorkflowRun, WorkflowRunStream, WorkflowTelemetryOptions,

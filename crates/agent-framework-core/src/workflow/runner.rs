@@ -643,6 +643,80 @@ impl Workflow {
         &self.shared.start
     }
 
+    /// What the workflow accepts and yields (upstream
+    /// `DescribeProtocolAsync`): its start executor's accepted types, and the
+    /// yielded types of its output executors (every executor when none is
+    /// designated).
+    pub fn describe_protocol(&self) -> super::protocol::ProtocolDescriptor {
+        let start = self
+            .shared
+            .executors
+            .get(&self.shared.start)
+            .map(|e| e.describe_protocol())
+            .unwrap_or_else(super::protocol::ProtocolDescriptor::accepts_all);
+        let mut ids: Vec<&String> = self.shared.executors.keys().collect();
+        ids.sort();
+        let mut yields: Vec<String> = Vec::new();
+        for id in ids {
+            let designated = self.shared.output_executors.is_empty()
+                || self.shared.output_executors.contains(id);
+            if !designated {
+                continue;
+            }
+            for y in self.shared.executors[id].describe_protocol().yields {
+                if !yields.contains(&y) {
+                    yields.push(y);
+                }
+            }
+        }
+        super::protocol::ProtocolDescriptor {
+            accepts: start.accepts,
+            accepts_all: start.accepts_all,
+            sends: Vec::new(),
+            yields,
+        }
+    }
+
+    /// The executor ids, sorted (upstream `ReflectExecutors`).
+    pub fn reflect_executors(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.shared.executors.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// The `(source, target)` pairs of every edge, in declaration order
+    /// (upstream `ReflectEdges`).
+    pub fn reflect_edges(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for group in &self.shared.edge_groups {
+            match group {
+                EdgeGroup::Single { source, target, .. } => {
+                    out.push((source.clone(), target.clone()))
+                }
+                EdgeGroup::FanOut {
+                    source, targets, ..
+                } => out.extend(targets.iter().map(|t| (source.clone(), t.clone()))),
+                EdgeGroup::FanIn { sources, target } => {
+                    out.extend(sources.iter().map(|s| (s.clone(), target.clone())))
+                }
+            }
+        }
+        out
+    }
+
+    /// The request ports (nodes handing requests to the caller), sorted by
+    /// id (upstream `ReflectPorts`).
+    pub fn reflect_ports(&self) -> Vec<super::protocol::RequestPortInfo> {
+        let mut ports: Vec<_> = self
+            .shared
+            .executors
+            .values()
+            .filter_map(|e| e.request_port())
+            .collect();
+        ports.sort_by(|a, b| a.port_id.cmp(&b.port_id));
+        ports
+    }
+
     /// This workflow's deterministic graph signature (see
     /// [`WorkflowBuilder::build`]). Checkpoints record the signature of the
     /// graph that produced them; [`Workflow::run_from_checkpoint`] refuses to

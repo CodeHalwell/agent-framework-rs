@@ -5688,21 +5688,27 @@
             "note": "Executor::id returns the workflow-unique id."
           },
           "InputTypes": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Executors receive untyped serde_json::Value messages and declare no accepted input types."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::describe_protocol"
+            ],
+            "status": "adapted",
+            "note": "The accepts list of the descriptor."
           },
           "OutputTypes": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Executors declare no sent or yielded output types; payloads are untyped JSON."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::describe_protocol"
+            ],
+            "status": "adapted",
+            "note": "The sends and yields lists of the descriptor."
           }
         },
         "methods": {
           "DescribeProtocol()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "There is no protocol descriptor; message routing is by edges only, without type checks."
+            "rust": [
+              "agent_framework_core::workflow::executor::Executor::describe_protocol"
+            ],
+            "status": "mapped",
+            "note": "Defaulted trait method (accepts anything)."
           }
         }
       },
@@ -6541,15 +6547,19 @@
       },
       "ProtocolBuilder": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust executors exchange untyped serde_json::Value messages, so there is no per-executor protocol declaration to build."
+          "rust": [
+            "agent_framework_core::workflow::protocol::ProtocolBuilder"
+          ],
+          "status": "adapted",
+          "note": "Builds a ProtocolDescriptor from type names."
         },
         "properties": {
           "RouteBuilder": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No route-builder object; an executor dispatches inside its single Executor::execute."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolBuilder::accepts"
+            ],
+            "status": "adapted",
+            "note": "Accepted types are declared on the builder; routing within an executor stays in its execute."
           }
         },
         "methods": {
@@ -6561,43 +6571,57 @@
             "note": "Routes collapse into one async Executor::execute(Value, WorkflowContext) that inspects the message itself."
           },
           "SendsMessageType(Type)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust executors exchange untyped serde_json::Value messages, so there is no way to declare sent message types."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolBuilder::sends_message_type"
+            ],
+            "status": "adapted",
+            "note": "Takes a type name."
           },
           "YieldsOutputType(Type)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust executors exchange untyped serde_json::Value messages, so there is no way to declare yielded output types."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolBuilder::yields_output_type"
+            ],
+            "status": "adapted",
+            "note": "Takes a type name."
           }
         }
       },
       "ProtocolDescriptor": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No protocol descriptor; executors and workflows do not advertise accepted, sent or yielded types."
+          "rust": [
+            "agent_framework_core::workflow::protocol::ProtocolDescriptor"
+          ],
+          "status": "adapted",
+          "note": "Types are names (author-chosen or JSON type names), since payloads are JSON values."
         },
         "properties": {
           "Accepts": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No accepted-types introspection; Executor::execute takes any Value."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolDescriptor::accepts"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "AcceptsAll": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No catch-all flag; every executor effectively accepts all messages."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolDescriptor::accepts_all"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "Sends": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No sent-types introspection on executors."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolDescriptor::sends"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "Yields": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No yielded-output-types introspection on executors or workflows."
+            "rust": [
+              "agent_framework_core::workflow::protocol::ProtocolDescriptor::yields"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           }
         }
       },
@@ -6636,14 +6660,20 @@
             "note": "The port identity is the RequestInfoExecutor's executor id."
           },
           "Request": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust executors exchange untyped serde_json::Value messages, so there is no request type on a request node."
+            "rust": [
+              "agent_framework_core::workflow::request_info::RequestInfoExecutor::with_types",
+              "agent_framework_core::workflow::protocol::RequestPortInfo::request"
+            ],
+            "status": "adapted",
+            "note": "A type name."
           },
           "Response": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust executors exchange untyped serde_json::Value messages, so there is no response type on a request node."
+            "rust": [
+              "agent_framework_core::workflow::request_info::RequestInfoExecutor::with_types",
+              "agent_framework_core::workflow::protocol::RequestPortInfo::response"
+            ],
+            "status": "adapted",
+            "note": "A type name."
           }
         }
       },
@@ -7172,30 +7202,33 @@
         },
         "methods": {
           "DescribeProtocolAsync(CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No workflow protocol description; workflows accept and yield untyped Values."
+            "rust": [
+              "agent_framework_core::workflow::runner::Workflow::describe_protocol"
+            ],
+            "status": "mapped",
+            "note": "Synchronous: the start executor's accepts and the output executors' yields."
           },
           "ReflectEdges()": {
             "rust": [
-              "agent_framework_core::workflow::runner::Workflow::viz",
-              "agent_framework_core::workflow::viz::WorkflowViz::to_dot"
+              "agent_framework_core::workflow::runner::Workflow::reflect_edges"
             ],
-            "status": "partial",
-            "note": "Edges are only exposed as rendered DOT/Mermaid via viz(); the EdgeGroup list is crate-private on Workflow."
+            "status": "adapted",
+            "note": "(source, target) pairs."
           },
           "ReflectExecutors()": {
             "rust": [
-              "agent_framework_core::workflow::runner::Workflow::viz",
-              "agent_framework_core::workflow::viz::WorkflowViz::to_mermaid"
+              "agent_framework_core::workflow::runner::Workflow::reflect_executors"
             ],
-            "status": "partial",
-            "note": "Executors appear only in viz() renderings; the executor map is crate-private on Workflow."
+            "status": "adapted",
+            "note": "Sorted executor ids."
           },
           "ReflectPorts()": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No request-port reflection; RequestInfoExecutor nodes are not enumerated."
+            "rust": [
+              "agent_framework_core::workflow::runner::Workflow::reflect_ports",
+              "agent_framework_core::workflow::protocol::RequestPortInfo"
+            ],
+            "status": "mapped",
+            "note": "Request ports with their type names."
           }
         }
       },

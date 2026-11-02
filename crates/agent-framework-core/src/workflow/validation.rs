@@ -27,6 +27,9 @@ pub enum ValidationType {
     /// is invalid: the two sets overlap, or a designated id is not a known
     /// executor.
     OutputValidation,
+    /// An edge's source sends no type its target accepts (both declared
+    /// through [`Executor::describe_protocol`](super::Executor::describe_protocol)).
+    TypeCompatibility,
 }
 
 impl fmt::Display for ValidationType {
@@ -37,6 +40,7 @@ impl fmt::Display for ValidationType {
             ValidationType::UnknownExecutor => "UNKNOWN_EXECUTOR",
             ValidationType::GraphConnectivity => "GRAPH_CONNECTIVITY",
             ValidationType::OutputValidation => "OUTPUT_VALIDATION",
+            ValidationType::TypeCompatibility => "TYPE_COMPATIBILITY",
         };
         f.write_str(s)
     }
@@ -158,6 +162,42 @@ pub fn validate_workflow_graph(
     // 5. Workflow-output designation: the two sets must be disjoint, and every
     //    designated id must name a known executor.
     validate_output_designation(executors, output_executors, intermediate_executors)?;
+
+    // 6. Declared protocols: a source that declares what it sends must send
+    //    something each declared target accepts.
+    for group in edge_groups {
+        let pairs: Vec<(&String, &String)> = match group {
+            EdgeGroup::Single { source, target, .. } => vec![(source, target)],
+            EdgeGroup::FanOut {
+                source, targets, ..
+            } => targets.iter().map(|t| (source, t)).collect(),
+            EdgeGroup::FanIn { sources, target } => sources.iter().map(|s| (s, target)).collect(),
+        };
+        for (source, target) in pairs {
+            let (Some(s), Some(t)) = (executors.get(source), executors.get(target)) else {
+                continue;
+            };
+            let (sends, accepts) = (s.describe_protocol(), t.describe_protocol());
+            if sends.sends.is_empty() || accepts.accepts_all {
+                continue;
+            }
+            // A fan-in target receives the collected list, not a single
+            // message, so only its declared acceptance of that is checked
+            // when the target names one; skip it otherwise.
+            if matches!(group, EdgeGroup::FanIn { .. }) {
+                continue;
+            }
+            if !sends.sends.iter().any(|ty| accepts.accepts_type(ty)) {
+                return Err(WorkflowValidationError::new(
+                    ValidationType::TypeCompatibility,
+                    format!(
+                        "executor '{source}' sends {:?}, none of which executor '{target}' accepts ({:?})",
+                        sends.sends, accepts.accepts
+                    ),
+                ));
+            }
+        }
+    }
 
     Ok(())
 }

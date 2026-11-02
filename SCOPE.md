@@ -70,8 +70,7 @@ from the roadmap, not from this file.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline and file-based skills with scripts (class-based and
-  MCP skills, source pipelines); compaction's in-place annotation model (groups here are computed per pass rather than stamped on messages, and summaries are not linked back to the messages they replace);
-  workflow graph reflection of request ports and typed protocol descriptors; context
+  MCP skills, source pipelines); compaction's in-place annotation model (groups here are computed per pass rather than stamped on messages, and summaries are not linked back to the messages they replace); context
   providers seeing the agent object (they see its
   identity, `SessionContext::agent`, and the session in `before_run`, and
   the session after the run, but not the agent itself).

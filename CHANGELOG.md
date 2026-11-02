@@ -21,6 +21,13 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Typed workflow protocols: `workflow::protocol` (`ProtocolDescriptor`,
+  `ProtocolBuilder`, `RequestPortInfo`), a defaulted
+  `Executor::describe_protocol`, `FunctionExecutor::with_protocol`,
+  `RequestInfoExecutor::with_types`, build-time refusal of an edge whose
+  declared types do not meet (`ValidationType::TypeCompatibility`), and
+  `Workflow::describe_protocol`, `reflect_executors`, `reflect_edges` and
+  `reflect_ports`. Types are names, since payloads are JSON.
 - MCP `2026-07-28` (upstream #9236): `McpProtocolMode` (`Auto` by default,
   `Legacy`, `Modern`) on `McpClient` and the MCP tools. `Auto` probes with
   `server/discover` and, when the server offers the modern era, sends
@@ -142,6 +149,7 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- **Breaking:** `ValidationType` gains `TypeCompatibility`.
 - **Breaking:** `WorkflowEvent` gains `Warning` and `SubworkflowWarning`
   variants; exhaustive matches need arms for them.
 - **Behavior change:** mixed declaration-only batches follow upstream

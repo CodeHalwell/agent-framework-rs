@@ -20,7 +20,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `Microsoft.Agents.AI.Hosting.AGUI.AspNetCore` | 0 / 0 / 1 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Mem0` | 0 / 0 / 0 / 2 / 0 | 1 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Tools.Shell` | 42 / 14 / 0 / 2 / 0 | 44 / 14 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 69 / 102 / 43 / 52 / 0 | 41 | 0 |
+| `Microsoft.Agents.AI.Workflows` | 108 / 138 / 17 / 3 / 0 | 76 / 113 / 41 / 36 / 0 | 41 | 0 |
 | `Microsoft.Agents.AI.Workflows.Checkpointing` | 10 / 4 / 1 / 2 / 0 | 6 / 4 / 3 / 4 / 0 | 4 | 0 |
 | `Microsoft.Agents.AI.Workflows.Execution` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 | 1 | 0 |
 | `Microsoft.Agents.AI.Workflows.InProc` | 5 / 3 / 0 / 0 / 0 | 1 / 2 / 5 / 0 / 0 | 0 | 0 |
@@ -154,9 +154,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::CheckpointableRunBase properties::LastCheckpoint` | partial | adapted | WorkflowRun has no last-checkpoint accessor; the latest must be found by listing the storage. |
 | `Microsoft.Agents.AI.Workflows::EdgeData properties::Label` | partial | adapted | Labels exist only on switch Case edges; plain, fan-out and fan-in edges carry no label. |
 | `Microsoft.Agents.AI.Workflows::EdgeId` | unmapped | adapted | Edges have no public identity type; they are not individually addressable. |
-| `Microsoft.Agents.AI.Workflows::Executor methods::DescribeProtocol()` | unmapped | mapped | There is no protocol descriptor; message routing is by edges only, without type checks. |
-| `Microsoft.Agents.AI.Workflows::Executor properties::InputTypes` | unmapped | adapted | Executors receive untyped serde_json::Value messages and declare no accepted input types. |
-| `Microsoft.Agents.AI.Workflows::Executor properties::OutputTypes` | unmapped | adapted | Executors declare no sent or yielded output types; payloads are untyped JSON. |
 | `Microsoft.Agents.AI.Workflows::Executor<TInput, TOutput>` | partial | adapted | Executors take and emit serde_json::Value; there is no typed TInput/TOutput executor or automatic result send. |
 | `Microsoft.Agents.AI.Workflows::Executor<TInput>` | partial | adapted | Executors take serde_json::Value; typed input must be deserialized manually inside execute. |
 | `Microsoft.Agents.AI.Workflows::ExecutorBinding properties::ExecutorType` | unmapped | adapted | No implementation-type identity is recorded for registered executors. |
@@ -184,17 +181,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::OutputTag properties::Value` | unmapped | adapted | Output kinds are enum variants, so there is no tag string value. |
 | `Microsoft.Agents.AI.Workflows::OutputTag` | partial | partial | Output classification is the Output vs Intermediate event variant; custom tag values are not supported. |
 | `Microsoft.Agents.AI.Workflows::PortableValue properties::TypeId` | unmapped | adapted | serde_json::Value payloads carry no type identity. |
-| `Microsoft.Agents.AI.Workflows::ProtocolBuilder methods::SendsMessageType(Type)` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no way to declare sent message types. |
-| `Microsoft.Agents.AI.Workflows::ProtocolBuilder methods::YieldsOutputType(Type)` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no way to declare yielded output types. |
-| `Microsoft.Agents.AI.Workflows::ProtocolBuilder properties::RouteBuilder` | unmapped | mapped | No route-builder object; an executor dispatches inside its single Executor::execute. |
-| `Microsoft.Agents.AI.Workflows::ProtocolBuilder` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no per-executor protocol declaration to build. |
-| `Microsoft.Agents.AI.Workflows::ProtocolDescriptor properties::Accepts` | unmapped | mapped | No accepted-types introspection; Executor::execute takes any Value. |
-| `Microsoft.Agents.AI.Workflows::ProtocolDescriptor properties::AcceptsAll` | unmapped | mapped | No catch-all flag; every executor effectively accepts all messages. |
-| `Microsoft.Agents.AI.Workflows::ProtocolDescriptor properties::Sends` | unmapped | mapped | No sent-types introspection on executors. |
-| `Microsoft.Agents.AI.Workflows::ProtocolDescriptor properties::Yields` | unmapped | mapped | No yielded-output-types introspection on executors or workflows. |
-| `Microsoft.Agents.AI.Workflows::ProtocolDescriptor` | unmapped | mapped | No protocol descriptor; executors and workflows do not advertise accepted, sent or yielded types. |
-| `Microsoft.Agents.AI.Workflows::RequestPort properties::Request` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no request type on a request node. |
-| `Microsoft.Agents.AI.Workflows::RequestPort properties::Response` | unmapped | mapped | Rust executors exchange untyped serde_json::Value messages, so there is no response type on a request node. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEventCount` | partial | mapped | events() returns all events; there is no bookmark, so the count of new events since last read is not tracked. |
 | `Microsoft.Agents.AI.Workflows::Run properties::NewEvents` | partial | mapped | events() returns the full slice each time; no cursor advances to yield only newly arrived events. |
 | `Microsoft.Agents.AI.Workflows::RunStatus constants::Ended` | partial | mapped | Failed and Cancelled are terminal, but a normally finished run reports Idle; there is no distinct Ended state. |
@@ -224,10 +210,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI.Workflows::SuperStepStartInfo` | unmapped | mapped | No superstep start diagnostics type. |
 | `Microsoft.Agents.AI.Workflows::SuperStepStartedEvent properties::StartInfo` | unmapped | mapped | SuperStepStarted carries only the step number, no start diagnostics. |
 | `Microsoft.Agents.AI.Workflows::TurnToken properties::EmitEvents` | unmapped | mapped | AgentExecutor always emits AgentRunUpdate and AgentRun events; no per-turn override to suppress them. |
-| `Microsoft.Agents.AI.Workflows::Workflow methods::DescribeProtocolAsync(CancellationToken)` | unmapped | adapted | No workflow protocol description; workflows accept and yield untyped Values. |
-| `Microsoft.Agents.AI.Workflows::Workflow methods::ReflectEdges()` | partial | adapted | Edges are only exposed as rendered DOT/Mermaid via viz(); the EdgeGroup list is crate-private on Workflow. |
-| `Microsoft.Agents.AI.Workflows::Workflow methods::ReflectExecutors()` | partial | mapped | Executors appear only in viz() renderings; the executor map is crate-private on Workflow. |
-| `Microsoft.Agents.AI.Workflows::Workflow methods::ReflectPorts()` | unmapped | mapped | No request-port reflection; RequestInfoExecutor nodes are not enumerated. |
 | `Microsoft.Agents.AI.Workflows::WorkflowBuilder methods::AddEdge<T>(ExecutorBinding, ExecutorBinding, Func<T, bool>, string, bool)` | partial | adapted | Plain and conditional edges are separate methods over Value; no edge label or idempotent-add flag. |
 | `Microsoft.Agents.AI.Workflows::WorkflowBuilder methods::AddFanInBarrierEdge(IEnumerable<ExecutorBinding>, ExecutorBinding, string)` | partial | adapted | add_fan_in builds the barrier edge; there is no edge label parameter. |
 | `Microsoft.Agents.AI.Workflows::WorkflowBuilder methods::AddFanOutEdge<T>(ExecutorBinding, IEnumerable<ExecutorBinding>, Func<T, int, IEnumerable<int>>, string)` | partial | adapted | Fan-out with optional target selection via add_multi_selection/add_switch; no edge label parameter (only switch case labels). |
