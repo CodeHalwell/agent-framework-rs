@@ -1319,8 +1319,13 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // carrying approval responses is resuming the paused run whose
             // budget is parked on this session.
             let deferred = ready_deferred_siblings(session.as_ref(), &conversation);
-            let resuming_approval =
-                !collect_approval_responses(&conversation).is_empty() || deferred.is_some();
+            // A continuation token resumes a background operation this loop
+            // handed back while it was still running, and with it the budget
+            // parked at that point: polling through continuations must not
+            // start each leg with a full budget.
+            let resuming_approval = !collect_approval_responses(&conversation).is_empty()
+                || deferred.is_some()
+                || options.continuation_token.is_some();
             let mut budget = InvocationBudget::resume_or_start(
                 &self.config,
                 session.as_ref(),
@@ -1551,6 +1556,9 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 // for the loop to act on yet: hand it back, token and all, so
                 // the caller can poll it.
                 if response.continuation_token.is_some() {
+                    // Parked like an approval pause, so the continuation
+                    // resumes this run's call count and clock.
+                    budget.park(session.as_ref());
                     let mut pending = response;
                     let mut msgs = std::mem::take(&mut carried);
                     msgs.append(&mut pending.messages);
@@ -1958,6 +1966,12 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             let mut final_resp = self
                 .inner_get_response(conversation, options, session.as_ref(), observer.as_ref())
                 .await?;
+            // A background operation still running after the tools-disabled
+            // call is handed back for polling; its continuation must resume
+            // this run's (spent) budget rather than start a fresh one.
+            if final_resp.continuation_token.is_some() {
+                budget.park(session.as_ref());
+            }
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);
             msgs.append(&mut final_resp.messages);

@@ -419,3 +419,65 @@ async fn the_tool_loop_hands_back_an_operation_that_is_still_running() {
     let response = AgentResponse::from_updates(updates);
     assert_eq!(response.continuation_token, Some(token("op-8")));
 }
+
+#[tokio::test]
+async fn the_call_budget_carries_across_background_continuations() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    let tool = FunctionTool::new(
+        "lookup",
+        "Look something up.",
+        json!({"type": "object", "properties": {}}),
+        move |_| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!("found"))
+            }
+        },
+    )
+    .into_definition();
+    // Request 1 runs the tool once (spending the whole budget of one call),
+    // then the operation is still running. Request 2 resumes it and the
+    // model asks for the tool again: the budget is already spent.
+    let script = Script::replies(vec![
+        ask("c1"),
+        pending("op-9", None),
+        ask("c2"),
+        ChatResponse::from_text("done"),
+    ]);
+    let agent = Agent::builder(script.clone())
+        .tool(tool)
+        .function_invocation_config(FunctionInvocationConfig {
+            max_function_calls: Some(1),
+            ..Default::default()
+        })
+        .build();
+    let mut session = agent.create_session();
+    let first = agent
+        .run_with_options(
+            vec![Message::user("go")],
+            Some(&mut session),
+            AgentRunOptions::new().with_background(true),
+        )
+        .await
+        .unwrap();
+    let token = first.continuation_token.clone().expect("still running");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    agent
+        .run_with_options(
+            Vec::new(),
+            Some(&mut session),
+            AgentRunOptions::new()
+                .with_background(true)
+                .with_continuation_token(token),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a continuation must not get a fresh call budget"
+    );
+}

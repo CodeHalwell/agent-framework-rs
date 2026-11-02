@@ -100,6 +100,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - OpenAI Responses (review fix): a streamed `response.cancelled` ends the
   stream with a final update, so a cancelled background operation is
   terminal (its continuation token is cleared) instead of appearing pending.
+- Core (review fix): the tool loop's call and time budget carries across
+  background continuations — it is parked when a pending operation is handed
+  back and resumed by the continuation-token request — so polling through
+  continuations cannot exceed `max_function_calls` or
+  `max_duration_seconds`.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
