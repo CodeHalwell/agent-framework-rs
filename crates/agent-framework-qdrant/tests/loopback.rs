@@ -1,6 +1,8 @@
 //! Hermetic loopback tests for the Qdrant store against a stateful fake
 //! Qdrant REST server on a bare `std::net::TcpListener`.
 
+#![cfg(feature = "experimental-vector-stores")]
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -61,6 +61,8 @@ experimental-vector-stores = [
     "agent-framework-cosmos?/experimental-vector-stores",
     "agent-framework-azure-ai-search?/experimental-vector-stores",
     "agent-framework-redis?/experimental-vector-stores",
+    "agent-framework-qdrant?/experimental-vector-stores",
+    "agent-framework-postgres?/experimental-vector-stores",
 ]
 experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]

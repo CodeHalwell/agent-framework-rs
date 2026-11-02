@@ -60,6 +60,9 @@
 //! - No search operation options (`exact`, `hnsw_ef_search`,
 //!   `ivfflat_probes`) or score threshold: the trait has no slot for them.
 
+#![cfg(feature = "experimental-vector-stores")]
+#![cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
+
 use std::sync::Arc;
 
 use agent_framework_core::error::{Error, Result};

@@ -12,12 +12,17 @@ readme.workspace = true
 description = "Qdrant vector store for agent-framework (experimental: VECTOR_STORES)"
 
 [dependencies]
-agent-framework-core = { workspace = true, features = ["experimental-vector-stores"] }
+agent-framework-core = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+# The whole crate is a vector store, experimental upstream (VECTOR_STORES):
+# without this feature it is empty.
+experimental-vector-stores = ["agent-framework-core/experimental-vector-stores"]
 
 [dev-dependencies]
 tokio = { workspace = true }
