@@ -29,6 +29,8 @@
 //! | `qdrant` | [`agent_framework_qdrant`] — Qdrant vector store (experimental) | no |
 //! | `postgres` | [`agent_framework_postgres`] — PostgreSQL + pgvector vector store (experimental) | no |
 //! | `sql-server` | [`agent_framework_sql_server`] — SQL Server vector store (experimental) | no |
+//! | `mongodb` | [`agent_framework_mongodb`] — MongoDB Atlas vector store (experimental) | no |
+//! | `azure-documentdb` | [`agent_framework_azure_documentdb`] — Azure DocumentDB (MongoDB vCore) vector store (experimental) | no |
 //! | `duckdb` | [`agent_framework_duckdb`] — DuckDB vector store, embedded (experimental) | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
@@ -135,6 +137,12 @@ pub use agent_framework_azure_ai_search as azure_ai_search;
 /// The SQL Server vector store (the experimental `sql-server` feature).
 #[cfg(feature = "sql-server")]
 pub use agent_framework_sql_server as sql_server;
+/// The MongoDB Atlas vector store (the experimental `mongodb` feature).
+#[cfg(feature = "mongodb")]
+pub use agent_framework_mongodb as mongodb;
+/// The Azure DocumentDB (MongoDB vCore) vector store (the experimental `azure-documentdb` feature).
+#[cfg(feature = "azure-documentdb")]
+pub use agent_framework_azure_documentdb as azure_documentdb;
 /// The embedded DuckDB vector store (the experimental `duckdb` feature).
 #[cfg(feature = "duckdb")]
 pub use agent_framework_duckdb as duckdb;

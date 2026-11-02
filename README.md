@@ -112,6 +112,8 @@ parity with the Python and .NET implementations.
 | [`agent-framework-qdrant`](crates/agent-framework-qdrant) | Qdrant vector store over the REST API: named dense vectors, payload indexes, portable filters (experimental). |
 | [`agent-framework-postgres`](crates/agent-framework-postgres) | PostgreSQL + pgvector vector store: typed columns, HNSW / IVFFlat indexes, parameterized portable filters (experimental). |
 | [`agent-framework-sql-server`](crates/agent-framework-sql-server) | SQL Server vector store: native `VECTOR(n)` columns, exact `VECTOR_DISTANCE` search, parameterized portable filters (experimental). |
+| [`agent-framework-mongodb`](crates/agent-framework-mongodb) | MongoDB Atlas vector store: `$vectorSearch` over Atlas Vector Search indexes, MQL prefilters, shared BSON codec (experimental). |
+| [`agent-framework-azure-documentdb`](crates/agent-framework-azure-documentdb) | Azure DocumentDB (MongoDB vCore) vector store: `cosmosSearch` IVF / HNSW / DiskANN indexes, parameterized MQL filters (experimental). |
 | [`agent-framework-duckdb`](crates/agent-framework-duckdb) | Embedded DuckDB vector store: fixed-size array columns, cosine / dot / Euclidean search, parameterized portable filters (experimental). |
 | [`agent-framework-mcp`](crates/agent-framework-mcp) | MCP client: stdio/HTTP/WebSocket transports, tools, prompts, sampling, roots. |
 | [`agent-framework-a2a`](crates/agent-framework-a2a) | Agent2Agent protocol client: `A2AAgent` + `A2AClient` (full task surface). |
@@ -212,6 +214,8 @@ unconditionally, plus each companion crate behind a cargo feature:
 | `qdrant` | [`agent-framework-qdrant`](crates/agent-framework-qdrant) — Qdrant vector store (experimental) | no |
 | `postgres` | [`agent-framework-postgres`](crates/agent-framework-postgres) — PostgreSQL + pgvector vector store (experimental) | no |
 | `sql-server` | [`agent-framework-sql-server`](crates/agent-framework-sql-server) — SQL Server vector store (experimental) | no |
+| `mongodb` | [`agent-framework-mongodb`](crates/agent-framework-mongodb) — MongoDB Atlas vector store (experimental) | no |
+| `azure-documentdb` | [`agent-framework-azure-documentdb`](crates/agent-framework-azure-documentdb) — Azure DocumentDB (MongoDB vCore) vector store (experimental) | no |
 | `duckdb` | [`agent-framework-duckdb`](crates/agent-framework-duckdb) — embedded DuckDB vector store (experimental) | no |
 | `cosmos` | [`agent-framework-cosmos`](crates/agent-framework-cosmos) — Cosmos DB NoSQL message store and checkpoints (its vector store is experimental) | no |
 | `copilotstudio` | [`agent-framework-copilotstudio`](crates/agent-framework-copilotstudio) — Copilot Studio agents | no |

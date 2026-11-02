@@ -35,6 +35,19 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- `agent-framework-mongodb` (experimental, `VECTOR_STORES`; umbrella feature
+  `mongodb`): a MongoDB Atlas vector store ported from upstream's
+  `agent_framework_mongodb` over the `mongodb` 3.9 driver. BSON documents
+  keyed by `_id`, one Atlas Vector Search index per vector field (a
+  mismatched existing index is refused), `$vectorSearch` approximate or
+  exact search, normalized scores, and portable filters compiled to MQL
+  prefilters (anything inexpressible is refused, not dropped).
+- `agent-framework-azure-documentdb` (experimental, `VECTOR_STORES`;
+  umbrella feature `azure-documentdb`): an Azure DocumentDB (MongoDB vCore)
+  vector store ported from `agent_framework_azure_documentdb`:
+  `cosmosSearch` IVF / HNSW / DiskANN indexes (`IndexParameters`),
+  `$search` with `k`, `nProbes`, `efSearch`, `lSearch`, MQL filters
+  including list containment, TLS on and retryable writes off.
 - `agent-framework-sql-server` (experimental, `VECTOR_STORES`; umbrella
   feature `sql-server`): a SQL Server 2025 vector store ported from
   upstream's `agent_framework_sql_server`, over `tiberius` (rustls). Native

@@ -23,6 +23,8 @@ members = [
     "crates/agent-framework-postgres",
     "crates/agent-framework-duckdb",
     "crates/agent-framework-sql-server",
+    "crates/agent-framework-mongodb",
+    "crates/agent-framework-azure-documentdb",
     "crates/agent-framework-cosmos",
     "crates/agent-framework-copilotstudio",
     "crates/agent-framework-purview",
@@ -151,6 +153,8 @@ agent-framework-qdrant = { path = "crates/agent-framework-qdrant", version = "0.
 agent-framework-postgres = { path = "crates/agent-framework-postgres", version = "0.14.0" }
 agent-framework-duckdb = { path = "crates/agent-framework-duckdb", version = "0.14.0" }
 agent-framework-sql-server = { path = "crates/agent-framework-sql-server", version = "0.14.0" }
+agent-framework-mongodb = { path = "crates/agent-framework-mongodb", version = "0.14.0" }
+agent-framework-azure-documentdb = { path = "crates/agent-framework-azure-documentdb", version = "0.14.0" }
 agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.14.0" }
 agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.14.0" }
 agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.14.0" }

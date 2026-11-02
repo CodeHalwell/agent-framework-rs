@@ -22,13 +22,13 @@ the order does not matter:
 1. **Tier 0** — `agent-framework-core`
 2. **Tier 1** — `agent-framework-a2a`, `agent-framework-bedrock`,
    `agent-framework-copilotstudio`,
-   `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-sql-server`, `agent-framework-gemini`,
+   `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-mongodb`, `agent-framework-sql-server`, `agent-framework-gemini`,
    `agent-framework-hosting`, `agent-framework-mcp`, `agent-framework-mem0`,
    `agent-framework-openai`, `agent-framework-purview`,
    `agent-framework-postgres`, `agent-framework-qdrant`, `agent-framework-redis`, `agent-framework-tools`
 3. **Tier 2** — `agent-framework-azure`, `agent-framework-foundry-local`,
    `agent-framework-github-copilot`, `agent-framework-mistral`,
-   `agent-framework-ollama` (need `openai`)
+   `agent-framework-ollama` (need `openai`), `agent-framework-azure-documentdb` (needs `mongodb`)
 4. **Tier 3** — `agent-framework-anthropic` (needs `azure` + `bedrock`),
    `agent-framework-azure-ai-search`, `agent-framework-cosmos`,
    `agent-framework-foundry` (need `azure`)

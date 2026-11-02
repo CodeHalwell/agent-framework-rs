@@ -77,13 +77,14 @@ from the roadmap, not from this file.
   providers seeing the agent object (they see its
   identity, `SessionContext::agent`, and the session in `before_run`, and
   the session after the run, but not the agent itself).
-- **Vector stores**: MongoDB and Azure DocumentDB. DuckDB
-  (`agent-framework-duckdb`, embedded, tested in-process) and SQL Server
-  (`agent-framework-sql-server`, query building tested offline; no live
-  SQL Server 2025 in CI) are ported. The Redis vector store is ported
-  (`agent-framework-redis`'s `experimental-vector-stores` feature); its
-  live tests run only against a Redis with Search and JSON
-  (`AF_REDIS_SEARCH_TEST_URL`), which this repository's CI does not start.
+- **Live verification of the database vector stores**: DuckDB is tested
+  in-process; the SQL Server (`agent-framework-sql-server`), MongoDB Atlas
+  (`agent-framework-mongodb`) and Azure DocumentDB
+  (`agent-framework-azure-documentdb`) stores are tested offline (statement
+  and pipeline building) with live tests gated on `AF_SQL_SERVER_TEST_URL`,
+  `AF_MONGODB_TEST_URL` and `AF_DOCUMENTDB_TEST_URL`, which CI does not
+  start. The Redis vector store's live tests likewise need a Redis with
+  Search and JSON (`AF_REDIS_SEARCH_TEST_URL`).
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
   optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
   `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
