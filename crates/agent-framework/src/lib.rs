@@ -43,7 +43,8 @@
 //! `experimental-vector-stores`, `experimental-file-history`,
 //! `experimental-progressive-tools`, `experimental-agent-hooks` (the
 //! `agent_hooks` module of [`agent_framework_core`]), `experimental-fides`
-//! (its `security` module), `experimental-harness` and
+//! (its `security` module), `experimental-computer-use` (computer-use content,
+//! the OpenAI and Foundry mappings), `experimental-harness` and
 //! `experimental-declarative-agents`.
 //! `experimental` turns them all on.
 //!

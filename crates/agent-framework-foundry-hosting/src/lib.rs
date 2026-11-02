@@ -71,6 +71,8 @@
 //!   distro beyond trace-context propagation and exporter selection (the
 //!   `otel` feature).
 
+#[cfg(feature = "experimental-computer-use")]
+mod computer;
 pub mod config;
 pub mod file_store;
 pub mod host;

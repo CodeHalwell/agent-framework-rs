@@ -119,6 +119,10 @@ pub enum ToolKind {
         url: String,
         allowed_tools: Option<Vec<String>>,
     },
+    /// Service-side computer use (experimental `COMPUTER_USE`): the model
+    /// emits [`ComputerToolCall`](crate::types::Content::ComputerToolCall)
+    /// requests that the application performs and answers.
+    HostedComputer,
 }
 
 /// Whether a call to a tool must be approved by a human before it runs.
@@ -747,6 +751,26 @@ pub fn hosted_image_generation() -> ToolDefinition {
         description: String::new(),
         parameters: empty_schema(),
         kind: ToolKind::HostedImageGeneration,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
+/// Construct a hosted computer-use tool marker (experimental
+/// `COMPUTER_USE`; upstream `get_computer_tool()`). The model answers with
+/// [`ComputerToolCallContent`](crate::types::ComputerToolCallContent)
+/// requests: run their actions and reply with a
+/// [`ComputerToolResultContent`](crate::types::ComputerToolResultContent)
+/// carrying a screenshot. Safety checks are never acknowledged
+/// automatically.
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub fn hosted_computer() -> ToolDefinition {
+    ToolDefinition {
+        name: "computer".into(),
+        description: String::new(),
+        parameters: empty_schema(),
+        kind: ToolKind::HostedComputer,
         approval_mode: ApprovalMode::NeverRequire,
         executor: None,
     }

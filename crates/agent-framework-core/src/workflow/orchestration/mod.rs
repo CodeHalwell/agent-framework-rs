@@ -42,6 +42,8 @@ use crate::error::{Error, Result};
 use crate::types::{AgentResponse, AgentResponseUpdate, Message, Role};
 
 mod approval;
+#[cfg(feature = "experimental-computer-use")]
+mod computer_use;
 mod concurrent;
 mod group_chat;
 mod handoff;
@@ -50,6 +52,9 @@ mod sequential;
 mod workflow_agent;
 
 pub use approval::{AgentApprovalExecutor, ApprovalRequest};
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub use computer_use::ComputerUseRequest;
 pub use concurrent::{ConcurrentAggregator, ConcurrentBuilder};
 pub use group_chat::{
     GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState,
@@ -400,6 +405,10 @@ impl Executor for AgentExecutor {
     }
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
+        #[cfg(feature = "experimental-computer-use")]
+        if let Some(resumed) = computer_use::resume_conversation(&message)? {
+            return self.execute(resumed, ctx).await;
+        }
         let mut conversation = parse_conversation(&message)?;
         let mut invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
         if self.reassign_other_agents_as_users {
@@ -418,6 +427,21 @@ impl Executor for AgentExecutor {
 
         let reply = response.messages;
         conversation.extend(reply.iter().cloned());
+        #[cfg(feature = "experimental-computer-use")]
+        if computer_use::pause_for_pending_calls(&conversation, &reply, &ctx).await? {
+            return Ok(());
+        }
+        self.forward(conversation, reply, &ctx).await
+    }
+}
+
+impl AgentExecutor {
+    async fn forward(
+        &self,
+        conversation: Vec<Message>,
+        reply: Vec<Message>,
+        ctx: &WorkflowContext,
+    ) -> Result<()> {
         let to_value = |messages: &Vec<Message>| {
             serde_json::to_value(messages)
                 .map_err(|e| Error::Workflow(format!("failed to serialize conversation: {e}")))

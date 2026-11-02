@@ -52,18 +52,18 @@ from the roadmap, not from this file.
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
 - **Foundry hosting, remainder** (`agent-framework-foundry-hosting`):
-  computer-use output items and replies (core has no computer-use content:
-  upstream's experimental `COMPUTER_USE` feature is not ported); container
+  container
   file citations announced in an MCP tool result's `_meta`; approval
-  (`mcp_approval_response`) and computer-call replies to paused workflows
+  (`mcp_approval_response`) and computer-call replies to paused hosted workflows
   (agent approvals round-trip); toolbox archive skills and skill-cache
   refresh; provider-native background polling; and the agentserver's
   crash-recoverable task runtime, WebSocket/voice invocations, and
   OpenTelemetry distro beyond trace-context propagation and exporter
   selection. Tested in-process only.
-- **Computer use** (`COMPUTER_USE`, experimental upstream): computer-tool
-  content types and their tool-loop, compaction, session, workflow and
-  OpenAI provider support.
+- **Computer use, remainder** (`experimental-computer-use`): cancelling a
+  pending computer call in a workflow and deferring computer updates while
+  paused; OpenAI screenshot `detail` metadata; Anthropic and Gemini skip the
+  computer tool.
 - **Durable Task hosting** (`agent-framework-durabletask`, now published
   from its own repository). Blocked: it sits on the `durabletask` SDK, a
   deterministic-replay orchestration engine with durable entities and a

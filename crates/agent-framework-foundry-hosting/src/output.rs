@@ -72,6 +72,10 @@ pub(crate) struct OutputTracker {
     /// `(mcp_approval_request id, original approval request)` pairs, to be
     /// saved so a later `mcp_approval_response` can be resolved.
     approvals: Vec<(String, Content)>,
+    /// Computer calls already emitted in this response, by `call_id`, so a
+    /// replayed call is not emitted twice (upstream
+    /// `_outstanding_computer_calls`).
+    computer_calls: HashSet<String>,
 }
 
 struct OpenCall {
@@ -106,6 +110,7 @@ impl OutputTracker {
             consents: HashSet::new(),
             open_calls: Vec::new(),
             approvals: Vec::new(),
+            computer_calls: HashSet::new(),
         }
     }
 
@@ -422,6 +427,22 @@ impl OutputTracker {
                     "response.output_item.done",
                     json!({"output_index": index, "item": item}),
                 );
+            }
+            #[cfg(feature = "experimental-computer-use")]
+            Content::ComputerToolCall(call) => {
+                if !self.computer_calls.insert(call.call_id.clone()) {
+                    return Ok(());
+                }
+                self.close();
+                let item = crate::computer::call_item(call, &self.response_id)?;
+                self.simple_item(item);
+            }
+            #[cfg(feature = "experimental-computer-use")]
+            Content::ComputerToolResult(result) => {
+                self.close();
+                let item = crate::computer::result_item(result, &self.response_id)?;
+                self.computer_calls.remove(&result.call_id);
+                self.simple_item(item);
             }
             Content::ShellToolCall(call) => {
                 self.close();

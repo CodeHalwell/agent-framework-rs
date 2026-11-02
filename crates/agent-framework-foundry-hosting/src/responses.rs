@@ -1629,6 +1629,12 @@ async fn turn_messages(
         }
     };
     for item in items {
+        #[cfg(feature = "experimental-computer-use")]
+        if let Some(message) = crate::computer::item_to_message(&item)? {
+            flush(&mut pending, &mut messages);
+            messages.push(message);
+            continue;
+        }
         if item.get("type").and_then(Value::as_str) != Some("mcp_approval_response") {
             pending.push(item);
             continue;

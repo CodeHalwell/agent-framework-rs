@@ -399,6 +399,12 @@ fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> 
                 match content {
                     Content::FunctionResult(fr) => out.push(function_result_to_item(fr)),
                     Content::McpServerToolResult(r) => attach_mcp_output(&mut out, r),
+                    #[cfg(feature = "experimental-computer-use")]
+                    Content::ComputerToolResult(r) => {
+                        if let Some(item) = computer::result_to_item(r) {
+                            out.push(item);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -507,6 +513,22 @@ fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> 
                 Content::McpServerToolResult(result) => {
                     flush_text(&mut out, &mut buffered, role);
                     attach_mcp_output(&mut out, result);
+                }
+                // Under service-side storage the call is already stored; only
+                // its output is sent (upstream skips outbound replay there).
+                #[cfg(feature = "experimental-computer-use")]
+                Content::ComputerToolCall(call) => {
+                    if !continues_stored {
+                        flush_text(&mut out, &mut buffered, role);
+                        out.push(computer::call_to_item(call));
+                    }
+                }
+                #[cfg(feature = "experimental-computer-use")]
+                Content::ComputerToolResult(result) => {
+                    flush_text(&mut out, &mut buffered, role);
+                    if let Some(item) = computer::result_to_item(result) {
+                        out.push(item);
+                    }
                 }
                 Content::TextReasoning(tr) => {
                     // Re-emit the original reasoning item verbatim (store:false
@@ -817,6 +839,8 @@ pub fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             }
             Value::Object(spec)
         }
+        // Upstream `get_computer_tool()`.
+        ToolKind::HostedComputer => json!({ "type": "computer" }),
         ToolKind::Function => json!({
             "type": "function",
             "name": tool.name,
@@ -1052,6 +1076,8 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     if messages.is_empty() {
         messages.push(Message::with_contents(Role::assistant(), Vec::new()));
     }
+    #[cfg(feature = "experimental-computer-use")]
+    computer::mark_completed_calls(&mut messages);
     response.messages = messages;
 
     response.finish_reason = finish_reason_from_response(value);
@@ -1246,6 +1272,10 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
         // later `FunctionApprovalResponse` refers back to it
         // (`_create_response_content:775-787`).
         Some("mcp_call") => contents.extend(mcp_call_item_contents(item)),
+        #[cfg(feature = "experimental-computer-use")]
+        Some("computer_call") => contents.extend(computer::parse_call(item)),
+        #[cfg(feature = "experimental-computer-use")]
+        Some("computer_call_output") => contents.extend(computer::parse_result(item)),
         Some("mcp_approval_request") => {
             let id = item
                 .get("id")
@@ -1775,6 +1805,21 @@ fn parse_responses_event(
                     ..Default::default()
                 });
             }
+            #[cfg(feature = "experimental-computer-use")]
+            if let Some(item) = value.get("item").filter(|i| {
+                matches!(
+                    i.get("type").and_then(Value::as_str),
+                    Some("computer_call" | "computer_call_output")
+                )
+            }) {
+                let mut contents = Vec::new();
+                parse_output_item(item, &mut contents);
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents,
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
             let Some(item) = value
                 .get("item")
                 .filter(|i| i.get("type").and_then(Value::as_str) == Some("mcp_call"))
@@ -1803,6 +1848,340 @@ fn parse_responses_event(
 }
 
 // endregion
+
+/// Computer use (experimental `COMPUTER_USE`): `computer_call` /
+/// `computer_call_output` items to and from
+/// [`ComputerToolCallContent`] / [`ComputerToolResultContent`]
+/// (upstream `_chat_client.py`). Malformed provider items are skipped with a
+/// warning; upstream raises.
+#[cfg(feature = "experimental-computer-use")]
+mod computer {
+    use agent_framework_core::types::{
+        ComputerSafetyCheck, ComputerToolCallContent, ComputerToolResultContent, Content,
+        DataContent, HostedFileContent, Message, UriContent,
+    };
+    use serde_json::{json, Map, Value};
+
+    /// Marks a call parsed from the preview single-`action` form, so it is
+    /// replayed in that form.
+    const ACTION_FORMAT_KEY: &str = "computer_action_format";
+
+    fn safety_checks(value: Option<&Value>) -> Option<Vec<ComputerSafetyCheck>> {
+        let items = value?.as_array()?;
+        Some(
+            items
+                .iter()
+                .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                .collect(),
+        )
+    }
+
+    pub(super) fn parse_call(item: &Value) -> Option<Content> {
+        let (actions, single) = match (item.get("actions"), item.get("action")) {
+            (Some(Value::Array(actions)), _) => (actions.clone(), false),
+            (None, Some(action)) => (vec![action.clone()], true),
+            _ => (Vec::new(), false),
+        };
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || call_id.is_empty() || actions.is_empty() {
+            tracing::warn!("Responses: skipping a computer_call without an id, call_id or actions");
+            return None;
+        }
+        if actions.iter().any(|a| !a.is_object()) {
+            tracing::warn!("Responses: skipping a computer_call whose actions are not objects");
+            return None;
+        }
+        let mut additional_properties = Map::new();
+        if single {
+            additional_properties.insert(ACTION_FORMAT_KEY.into(), json!("single"));
+        }
+        Some(Content::ComputerToolCall(ComputerToolCallContent {
+            id: id.into(),
+            call_id: call_id.into(),
+            actions,
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            pending_safety_checks: safety_checks(item.get("pending_safety_checks")),
+            user_input_request: true,
+            additional_properties,
+        }))
+    }
+
+    pub(super) fn parse_result(item: &Value) -> Option<Content> {
+        let output = item
+            .get("output")
+            .filter(|o| o.get("type").and_then(Value::as_str) == Some("computer_screenshot"));
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (Some(output), false) = (output, call_id.is_empty()) else {
+            tracing::warn!(
+                "Responses: skipping a computer_call_output without a call_id or computer screenshot"
+            );
+            return None;
+        };
+        let image_url = output
+            .get("image_url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty());
+        let file_id = output
+            .get("file_id")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty());
+        let screenshot = match (image_url, file_id) {
+            (Some(url), _) if url.starts_with("data:") => Content::Data(DataContent {
+                uri: url.into(),
+                media_type: DataContent::media_type_from_uri(url).ok(),
+            }),
+            (Some(url), _) => Content::Uri(UriContent {
+                uri: url.into(),
+                media_type: "image/png".into(),
+            }),
+            (None, Some(file_id)) => Content::HostedFile(HostedFileContent {
+                file_id: file_id.into(),
+            }),
+            (None, None) => {
+                tracing::warn!(
+                    "Responses: skipping a computer screenshot without an image URL or file id"
+                );
+                return None;
+            }
+        };
+        Some(Content::ComputerToolResult(ComputerToolResultContent {
+            call_id: call_id.into(),
+            id: item.get("id").and_then(Value::as_str).map(str::to_string),
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            screenshot: Some(Box::new(screenshot)),
+            acknowledged_safety_checks: safety_checks(item.get("acknowledged_safety_checks")),
+            additional_properties: Map::new(),
+        }))
+    }
+
+    pub(super) fn call_to_item(call: &ComputerToolCallContent) -> Value {
+        let mut item = Map::new();
+        item.insert("type".into(), json!("computer_call"));
+        item.insert("id".into(), json!(call.id));
+        item.insert("call_id".into(), json!(call.call_id));
+        let single = call.additional_properties.get(ACTION_FORMAT_KEY) == Some(&json!("single"))
+            && call.actions.len() == 1;
+        if single {
+            item.insert("action".into(), call.actions[0].clone());
+        } else {
+            item.insert("actions".into(), json!(call.actions));
+        }
+        if let Some(status) = &call.status {
+            item.insert("status".into(), json!(status));
+        }
+        if let Some(checks) = &call.pending_safety_checks {
+            item.insert("pending_safety_checks".into(), json!(checks));
+        }
+        Value::Object(item)
+    }
+
+    /// `None` (with a warning) when the result has no screenshot the
+    /// Responses API can take; upstream raises.
+    pub(super) fn result_to_item(result: &ComputerToolResultContent) -> Option<Value> {
+        let mut output = Map::new();
+        output.insert("type".into(), json!("computer_screenshot"));
+        match result.screenshot.as_deref() {
+            Some(Content::Uri(u)) => {
+                output.insert("image_url".into(), json!(u.uri));
+            }
+            Some(Content::Data(d)) => {
+                output.insert("image_url".into(), json!(d.uri));
+            }
+            Some(Content::HostedFile(f)) => {
+                output.insert("file_id".into(), json!(f.file_id));
+            }
+            _ => {
+                tracing::warn!(
+                    call_id = %result.call_id,
+                    "Responses: a computer result needs a screenshot (image URL or file id); dropping it"
+                );
+                return None;
+            }
+        }
+        let mut item = Map::new();
+        item.insert("type".into(), json!("computer_call_output"));
+        item.insert("call_id".into(), json!(result.call_id));
+        item.insert("output".into(), Value::Object(output));
+        if let Some(id) = &result.id {
+            item.insert("id".into(), json!(id));
+        }
+        if let Some(status) = &result.status {
+            item.insert("status".into(), json!(status));
+        }
+        if let Some(checks) = &result.acknowledged_safety_checks {
+            item.insert("acknowledged_safety_checks".into(), json!(checks));
+        }
+        Some(Value::Object(item))
+    }
+
+    /// A call answered by a completed result no longer awaits the
+    /// application (upstream `_mark_completed_computer_calls`).
+    pub(super) fn mark_completed_calls(messages: &mut [Message]) {
+        let completed: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::ComputerToolResult(r)
+                    if matches!(r.status.as_deref(), None | Some("completed")) =>
+                {
+                    Some(r.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut remaining = completed;
+        for content in messages.iter_mut().flat_map(|m| m.contents.iter_mut()) {
+            if let Content::ComputerToolCall(call) = content {
+                if let Some(i) = remaining.iter().position(|id| *id == call.call_id) {
+                    call.user_input_request = false;
+                    remaining.remove(i);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "experimental-computer-use"))]
+mod computer_tests {
+    use super::*;
+    use agent_framework_core::types::{ComputerSafetyCheck, ComputerToolResultContent, UriContent};
+
+    fn response_with(items: Vec<Value>) -> ChatResponse {
+        parse_response(&json!({"id": "resp_1", "output": items}), None)
+    }
+
+    fn computer_call(id: &str) -> Value {
+        json!({
+            "type": "computer_call", "id": id, "call_id": "call_1", "status": "completed",
+            "actions": [{"type": "click", "x": 1, "y": 2, "button": "left"}],
+            "pending_safety_checks": [{"id": "sc_1", "code": "irrelevant_domain", "message": "check"}]
+        })
+    }
+
+    fn contents(response: &ChatResponse) -> Vec<Content> {
+        response
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_computer_tool_is_declared() {
+        assert_eq!(
+            tool_to_responses_spec(&agent_framework_core::tools::hosted_computer()),
+            json!({"type": "computer"})
+        );
+    }
+
+    #[test]
+    fn computer_calls_parse_and_stay_pending_until_answered() {
+        let response = response_with(vec![computer_call("cu_1")]);
+        let all = contents(&response);
+        let [Content::ComputerToolCall(call)] = all.as_slice() else {
+            panic!("one computer call: {all:?}");
+        };
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(call.actions[0]["type"], "click");
+        assert!(call.user_input_request);
+        assert_eq!(
+            call.pending_safety_checks,
+            Some(vec![ComputerSafetyCheck {
+                id: "sc_1".into(),
+                code: Some("irrelevant_domain".into()),
+                message: Some("check".into()),
+            }])
+        );
+
+        // A completed output for the call clears it.
+        let answered = response_with(vec![
+            computer_call("cu_1"),
+            json!({"type": "computer_call_output", "call_id": "call_1", "status": "completed",
+                   "output": {"type": "computer_screenshot", "image_url": "https://x/s.png"}}),
+        ]);
+        let all = contents(&answered);
+        assert!(matches!(&all[0], Content::ComputerToolCall(c) if !c.user_input_request));
+        assert!(matches!(&all[1], Content::ComputerToolResult(r)
+            if matches!(r.screenshot.as_deref(), Some(Content::Uri(u)) if u.uri == "https://x/s.png")));
+
+        // Malformed items are skipped.
+        assert!(contents(&response_with(vec![
+            json!({"type": "computer_call", "id": "x"})
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn preview_single_action_calls_replay_in_their_form() {
+        let response = response_with(vec![json!({
+            "type": "computer_call", "id": "cu_2", "call_id": "call_2",
+            "action": {"type": "screenshot"}
+        })]);
+        let msgs = response.messages.clone();
+        let input = messages_to_input(&msgs);
+        assert_eq!(input[0]["type"], "computer_call");
+        assert_eq!(input[0]["action"]["type"], "screenshot");
+        assert!(input[0].get("actions").is_none());
+    }
+
+    #[test]
+    fn results_become_computer_call_outputs() {
+        let call = contents(&response_with(vec![computer_call("cu_1")]));
+        let result = ComputerToolResultContent::new("call_1")
+            .unwrap()
+            .with_screenshot(Content::Uri(UriContent {
+                uri: "https://x/after.png".into(),
+                media_type: "image/png".into(),
+            }))
+            .unwrap()
+            .with_acknowledged_safety_checks(vec![ComputerSafetyCheck {
+                id: "sc_1".into(),
+                ..Default::default()
+            }]);
+        let messages = vec![
+            Message::with_contents(Role::assistant(), call),
+            Message::with_contents(Role::tool(), vec![Content::ComputerToolResult(result)]),
+        ];
+        let input = messages_to_input(&messages);
+        assert_eq!(input[0]["type"], "computer_call");
+        assert_eq!(input[0]["actions"][0]["type"], "click");
+        assert_eq!(
+            input[1],
+            json!({"type": "computer_call_output", "call_id": "call_1",
+                   "output": {"type": "computer_screenshot", "image_url": "https://x/after.png"},
+                   "acknowledged_safety_checks": [{"id": "sc_1"}]})
+        );
+        // Continuing a stored response sends only the output.
+        let continued = messages_to_continuation_input(&messages);
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0]["type"], "computer_call_output");
+    }
+
+    #[test]
+    fn a_streamed_computer_call_arrives_with_its_done_item() {
+        let EventOutcome::Update(update) = parse_responses_event(
+            &json!({"type": "response.output_item.done", "output_index": 0, "item": computer_call("cu_9")}),
+            &mut HashMap::new(),
+            None,
+        ) else {
+            panic!("an update");
+        };
+        assert!(matches!(&update.contents[0], Content::ComputerToolCall(c) if c.id == "cu_9"));
+    }
+}
 
 #[cfg(test)]
 mod tests {

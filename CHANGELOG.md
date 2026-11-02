@@ -35,6 +35,17 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Computer use (`experimental-computer-use`, upstream `COMPUTER_USE`;
+  umbrella `experimental-computer-use`, in `experimental`):
+  `ComputerToolCallContent` / `ComputerToolResultContent` /
+  `ComputerSafetyCheck` (new `Content::ComputerToolCall` /
+  `ComputerToolResult` variants and `ToolKind::HostedComputer`, always
+  present; **breaking** for exhaustive matches), validated constructors and
+  `validate_result`, `tools::hosted_computer()`; the tool loop returns to
+  the caller on a pending computer call; `AgentExecutor` pauses with a
+  `ComputerUseRequest` and resumes with validated results; the OpenAI
+  Responses client maps `computer_call` / `computer_call_output`; the
+  Foundry Responses host emits and accepts computer items.
 - Foundry hosting and MCP: `FoundryToolbox` fetches its bearer token for
   every request through a new per-request header hook
   (`McpStreamableHttpTool::header_provider`, `HeaderProvider`); with the

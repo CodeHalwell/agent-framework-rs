@@ -10,12 +10,13 @@ mod response;
 
 pub use content::{
     prepare_function_call_results, Annotation, AnnotationKind, CodeInterpreterToolCallContent,
-    CodeInterpreterToolResultContent, Content, DataContent, ErrorContent,
-    FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
-    McpServerToolCallContent, McpServerToolResultContent, OauthConsentRequestContent,
-    RegionCoordinateSpace, ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent,
-    TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
+    CodeInterpreterToolResultContent, ComputerSafetyCheck, ComputerToolCallContent,
+    ComputerToolResultContent, Content, DataContent, ErrorContent, FunctionApprovalRequestContent,
+    FunctionApprovalResponseContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+    HostedFileContent, HostedVectorStoreContent, McpServerToolCallContent,
+    McpServerToolResultContent, OauthConsentRequestContent, RegionCoordinateSpace,
+    ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
+    TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
     FUNCTION_INVOCATION_ERROR_MARKER,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};

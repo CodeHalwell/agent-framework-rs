@@ -43,6 +43,9 @@ pub use edge::{
 };
 pub use events::{WorkflowEvent, WorkflowRunState};
 pub use executor::{Executor, FunctionExecutor};
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub use orchestration::ComputerUseRequest;
 pub use orchestration::{
     handoff_tool_name, handoff_tool_spec, AgentApprovalExecutor, AgentExecutor, ApprovalRequest,
     AutonomousMode, ConcurrentAggregator, ConcurrentBuilder, GroupChatBuilder, GroupChatDirective,

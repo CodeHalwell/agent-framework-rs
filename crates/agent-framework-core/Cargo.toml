@@ -67,6 +67,9 @@ experimental-progressive-tools = []
 # AGENT_HOOKS: the `agent_hooks` module (AGENT-HOOKS-0.1 interception
 # contract and the enforcement bundle over the agent, chat and function seams).
 experimental-agent-hooks = ["dep:ryu-js", "dep:sha2"]
+# COMPUTER_USE: constructors and validation for computer-use content
+# (`ComputerToolCallContent` / `ComputerToolResultContent`).
+experimental-computer-use = []
 # FIDES information-flow control (`security` module): SHA-256 binds policy
 # approvals to the exact invocation.
 experimental-fides = ["dep:sha2"]

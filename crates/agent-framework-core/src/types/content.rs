@@ -810,6 +810,207 @@ impl OauthConsentRequestContent {
     }
 }
 
+/// A provider safety warning that must be reviewed before a computer call's
+/// actions are run (upstream `ComputerSafetyCheck`, `COMPUTER_USE`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerSafetyCheck {
+    /// The check's id; a result acknowledges a check by echoing it.
+    pub id: String,
+    /// A machine-readable code.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub code: Option<String>,
+    /// A human-readable message.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub message: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// A computer-use request from the model: an ordered list of UI actions for
+/// the application to perform, plus any safety checks the application must
+/// review (upstream `computer_tool_call`, experimental `COMPUTER_USE`).
+///
+/// The data type is always available so transcripts holding it deserialize
+/// anywhere; construct and answer one through the `experimental-computer-use`
+/// feature's API. A pending call (`user_input_request`) stops the function
+/// invocation loop: the caller runs the actions and answers with a
+/// [`ComputerToolResultContent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputerToolCallContent {
+    /// The provider's output item id.
+    pub id: String,
+    /// The call id a result answers.
+    pub call_id: String,
+    /// The ordered actions (provider-shaped objects: `click`, `type`, ...).
+    pub actions: Vec<Value>,
+    /// The provider status, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+    /// Safety checks the application must review and acknowledge explicitly.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pending_safety_checks: Option<Vec<ComputerSafetyCheck>>,
+    /// Whether the call still awaits the application's result. Providers
+    /// clear it once a completed result answering the call is in the
+    /// transcript.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub user_input_request: bool,
+    /// Provider-specific extras.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty", default)]
+    pub additional_properties: serde_json::Map<String, Value>,
+}
+
+/// The application's result for a [`ComputerToolCallContent`], after running
+/// its actions: usually a screenshot of the new state (upstream
+/// `computer_tool_result`, experimental `COMPUTER_USE`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ComputerToolResultContent {
+    /// The call this answers.
+    pub call_id: String,
+    /// The provider's output item id, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub id: Option<String>,
+    /// The status, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+    /// The screenshot: image data, a URI or a hosted file.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub screenshot: Option<Box<Content>>,
+    /// The safety checks the application explicitly acknowledged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub acknowledged_safety_checks: Option<Vec<ComputerSafetyCheck>>,
+    /// Provider-specific extras.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty", default)]
+    pub additional_properties: serde_json::Map<String, Value>,
+}
+
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+impl ComputerToolCallContent {
+    /// A pending computer call. `id`, `call_id` and at least one action are
+    /// required (upstream `Content.from_computer_tool_call`).
+    pub fn new(
+        id: impl Into<String>,
+        call_id: impl Into<String>,
+        actions: Vec<Value>,
+    ) -> crate::error::Result<Self> {
+        let (id, call_id) = (id.into(), call_id.into());
+        if id.is_empty() || call_id.is_empty() || actions.is_empty() {
+            return Err(crate::error::Error::Content(
+                "A computer tool call requires an id, call_id, and at least one action.".into(),
+            ));
+        }
+        Ok(Self {
+            id,
+            call_id,
+            actions,
+            status: None,
+            pending_safety_checks: None,
+            user_input_request: true,
+            additional_properties: serde_json::Map::new(),
+        })
+    }
+
+    /// Builder: the provider status.
+    #[must_use]
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    /// Builder: the provider's pending safety checks. They are never
+    /// acknowledged automatically.
+    #[must_use]
+    pub fn with_pending_safety_checks(mut self, checks: Vec<ComputerSafetyCheck>) -> Self {
+        self.pending_safety_checks = Some(checks);
+        self
+    }
+
+    /// Check that `result` answers this call: same `call_id`, and the
+    /// result acknowledges exactly the pending safety checks (by id), as
+    /// upstream's workflow executor requires.
+    pub fn validate_result(&self, result: &ComputerToolResultContent) -> crate::error::Result<()> {
+        if result.call_id != self.call_id {
+            return Err(crate::error::Error::Content(
+                "Computer result must match its pending computer call ID.".into(),
+            ));
+        }
+        let ids = |checks: &Option<Vec<ComputerSafetyCheck>>| {
+            checks
+                .iter()
+                .flatten()
+                .map(|c| c.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        if ids(&self.pending_safety_checks) != ids(&result.acknowledged_safety_checks) {
+            return Err(crate::error::Error::Content(
+                "Computer result must explicitly acknowledge exactly the pending safety checks."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+impl ComputerToolResultContent {
+    /// A result for `call_id` (upstream `Content.from_computer_tool_result`).
+    pub fn new(call_id: impl Into<String>) -> crate::error::Result<Self> {
+        let call_id = call_id.into();
+        if call_id.is_empty() {
+            return Err(crate::error::Error::Content(
+                "A computer tool result requires a call_id.".into(),
+            ));
+        }
+        Ok(Self {
+            call_id,
+            ..Default::default()
+        })
+    }
+
+    /// Builder: the screenshot, which must be image data, a URI or a hosted
+    /// file.
+    pub fn with_screenshot(mut self, screenshot: Content) -> crate::error::Result<Self> {
+        if !matches!(
+            screenshot,
+            Content::Data(_) | Content::Uri(_) | Content::HostedFile(_)
+        ) {
+            return Err(crate::error::Error::Content(
+                "A computer screenshot must be image data, a URI, or a hosted file Content.".into(),
+            ));
+        }
+        self.screenshot = Some(Box::new(screenshot));
+        Ok(self)
+    }
+
+    /// Builder: the item id.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Builder: the status.
+    #[must_use]
+    pub fn with_status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    /// Builder: the safety checks the application explicitly acknowledges.
+    #[must_use]
+    pub fn with_acknowledged_safety_checks(mut self, checks: Vec<ComputerSafetyCheck>) -> Self {
+        self.acknowledged_safety_checks = Some(checks);
+        self
+    }
+}
+
 /// The unified content union, discriminated by the `type` tag.
 ///
 /// This is the Rust equivalent of the Python `Contents` union.
@@ -850,6 +1051,10 @@ pub enum Content {
     FunctionApprovalRequest(FunctionApprovalRequestContent),
     FunctionApprovalResponse(FunctionApprovalResponseContent),
     OauthConsentRequest(OauthConsentRequestContent),
+    /// A computer-use request (experimental `COMPUTER_USE`).
+    ComputerToolCall(ComputerToolCallContent),
+    /// A computer-use result (experimental `COMPUTER_USE`).
+    ComputerToolResult(ComputerToolResultContent),
     /// A content item whose `type` tag is unknown to this version of the
     /// library. Deserialization falls back to this inert variant instead of
     /// erroring; see the type-level docs.

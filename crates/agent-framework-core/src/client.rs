@@ -1862,7 +1862,17 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     result_contents.push(Content::FunctionResult(content));
                 }
 
-                if has_declaration_only {
+                // A pending computer call is answered by the application, not
+                // by a tool here (upstream `_tools.py`, COMPUTER_USE): run the
+                // batch's local calls, then return so the caller can act.
+                let has_pending_computer_call = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .any(
+                        |c| matches!(c, Content::ComputerToolCall(call) if call.user_input_request),
+                    );
+                if has_declaration_only || has_pending_computer_call {
                     InvocationBudget::clear(session.as_ref());
                     let mut resp = response;
                     // `carried` already holds this response's messages

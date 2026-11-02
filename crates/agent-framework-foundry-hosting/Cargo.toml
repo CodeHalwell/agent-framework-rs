@@ -39,6 +39,9 @@ tracing-opentelemetry = { workspace = true, optional = true }
 session-store = ["agent-framework-core/experimental-session-store"]
 # `FoundryToolbox::skills_provider`: Agent Skills a toolbox serves over MCP.
 skills = ["agent-framework-mcp/skills"]
+# COMPUTER_USE (experimental upstream): computer calls and results as
+# `computer_call` / `computer_call_output` items, in and out.
+experimental-computer-use = ["agent-framework-core/experimental-computer-use"]
 # OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
 # and `configure_observability` exports to Application Insights or OTLP from
 # the host configuration (upstream agentserver tracing).
