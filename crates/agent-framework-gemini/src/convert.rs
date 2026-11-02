@@ -440,7 +440,18 @@ pub fn tools_to_gemini(tools: &[ToolDefinition]) -> Vec<Value> {
 }
 
 /// Parse a full (non-streaming) Gemini `GenerateContentResponse`.
-pub fn parse_response(value: &Value) -> agent_framework_core::types::ChatResponse {
+///
+/// `requested_model` is the model id the request was sent to (the `model`
+/// path segment the caller resolved; see
+/// [`GeminiChatClient::build_body`](crate::GeminiChatClient)). Gemini omits
+/// `modelVersion` from some responses, so it is reported when the body
+/// carries no version of its own — without it `ChatResponse::model` came
+/// back `None` and a per-request `ChatOptions::model` override was invisible
+/// on the response.
+pub fn parse_response(
+    value: &Value,
+    requested_model: Option<&str>,
+) -> agent_framework_core::types::ChatResponse {
     use agent_framework_core::types::ChatResponse;
 
     let mut response = ChatResponse {
@@ -451,7 +462,8 @@ pub fn parse_response(value: &Value) -> agent_framework_core::types::ChatRespons
         model: value
             .get("modelVersion")
             .and_then(Value::as_str)
-            .map(String::from),
+            .map(String::from)
+            .or_else(|| requested_model.map(String::from)),
         ..Default::default()
     };
 
@@ -666,8 +678,14 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 /// `GenerateContentResponse`, not an incremental delta protocol) into a
 /// [`agent_framework_core::types::ChatResponseUpdate`]. Returns `None` for a
 /// chunk that carries nothing new (defensive; not expected in practice).
+///
+/// `requested_model` is reported on a chunk that carries no `modelVersion`
+/// of its own, as [`parse_response`] does. It is applied *after* the
+/// "carries nothing new" test, so a fallback model alone never turns an
+/// otherwise-empty chunk into an update.
 pub(crate) fn parse_stream_chunk(
     value: &Value,
+    requested_model: Option<&str>,
 ) -> Option<agent_framework_core::types::ChatResponseUpdate> {
     use agent_framework_core::types::{ChatResponseUpdate, UsageContent};
 
@@ -717,7 +735,7 @@ pub(crate) fn parse_stream_chunk(
         contents,
         role: Some(Role::assistant()),
         response_id,
-        model,
+        model: model.or_else(|| requested_model.map(String::from)),
         finish_reason,
         ..Default::default()
     })
@@ -779,7 +797,7 @@ mod tests {
                 { "functionCall": { "name": "get_weather", "args": { "city": "SF" } } },
             ] } }]
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         let contents = &resp.messages[0].contents;
         match &contents[0] {
             Content::TextReasoning(t) => {
@@ -801,7 +819,7 @@ mod tests {
                 },
             ] } }]
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         match &resp.messages[0].contents[0] {
             Content::FunctionCall(fc) => {
                 assert_eq!(fc.protected_data.as_deref(), Some("c2ln"));
@@ -1014,7 +1032,7 @@ mod tests {
                 },
             ] } }]
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         let parts = message_contents_to_parts(
             &resp.messages[0].contents,
             &HashMap::new(),
@@ -1476,7 +1494,7 @@ mod tests {
             }],
             "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15 },
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         assert_eq!(resp.model.as_deref(), Some("gemini-x"));
         assert_eq!(resp.text(), "Hello!");
         assert_eq!(resp.finish_reason, Some(FinishReason::stop()));
@@ -1496,7 +1514,7 @@ mod tests {
                 "finishReason": "STOP",
             }],
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         let calls = resp.function_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
@@ -1522,7 +1540,7 @@ mod tests {
                 "finishReason": "MAX_TOKENS",
             }],
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         assert_eq!(
             resp.finish_reason,
             Some(FinishReason::new(FinishReason::LENGTH))
@@ -1539,7 +1557,7 @@ mod tests {
                 ] },
             }],
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         let msg = &resp.messages[0];
         assert!(matches!(msg.contents[0], Content::TextReasoning(_)));
         assert_eq!(msg.contents[0].as_text(), Some("thinking..."));
@@ -1551,7 +1569,7 @@ mod tests {
         let value = json!({
             "promptFeedback": { "blockReason": "SAFETY" },
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value, None);
         assert_eq!(
             resp.finish_reason,
             Some(FinishReason::new(FinishReason::CONTENT_FILTER))
@@ -1620,23 +1638,78 @@ mod tests {
         assert_eq!(map_finish_reason("FINISH_REASON_UNSPECIFIED"), None);
         assert_eq!(map_finish_reason(""), None);
 
-        let resp = parse_response(&json!({
-            "candidates": [{
-                "content": { "role": "model", "parts": [{ "text": "hi" }] },
-                "finishReason": "FINISH_REASON_UNSPECIFIED",
-            }],
-        }));
+        let resp = parse_response(
+            &json!({
+                "candidates": [{
+                    "content": { "role": "model", "parts": [{ "text": "hi" }] },
+                    "finishReason": "FINISH_REASON_UNSPECIFIED",
+                }],
+            }),
+            None,
+        );
         assert_eq!(resp.finish_reason, None);
 
-        let with_call = parse_response(&json!({
-            "candidates": [{
-                "content": { "role": "model", "parts": [
-                    { "functionCall": { "name": "f", "args": {} } }
-                ]},
-                "finishReason": "FINISH_REASON_UNSPECIFIED",
-            }],
-        }));
+        let with_call = parse_response(
+            &json!({
+                "candidates": [{
+                    "content": { "role": "model", "parts": [
+                        { "functionCall": { "name": "f", "args": {} } }
+                    ]},
+                    "finishReason": "FINISH_REASON_UNSPECIFIED",
+                }],
+            }),
+            None,
+        );
         assert_eq!(with_call.finish_reason, Some(FinishReason::tool_calls()));
+    }
+
+    #[test]
+    fn parse_response_reports_the_requested_model_when_the_body_omits_one() {
+        // Gemini omits `modelVersion` from some responses. Before the
+        // fallback this left `ChatResponse::model` empty, so a per-request
+        // `ChatOptions::model` override was invisible on the response.
+        let value = json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "hi" }] } }],
+        });
+        let resp = parse_response(&value, Some("gemini-requested"));
+        assert_eq!(resp.model.as_deref(), Some("gemini-requested"));
+    }
+
+    #[test]
+    fn parse_response_prefers_the_model_the_body_reports() {
+        let value = json!({
+            "modelVersion": "gemini-served",
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "hi" }] } }],
+        });
+        let resp = parse_response(&value, Some("gemini-requested"));
+        assert_eq!(resp.model.as_deref(), Some("gemini-served"));
+    }
+
+    #[test]
+    fn parse_stream_chunk_reports_the_requested_model_when_the_chunk_omits_one() {
+        let value = json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "Hel" }] } }],
+        });
+        let update = parse_stream_chunk(&value, Some("gemini-requested")).unwrap();
+        assert_eq!(update.model.as_deref(), Some("gemini-requested"));
+    }
+
+    #[test]
+    fn parse_stream_chunk_prefers_the_model_the_chunk_reports() {
+        let value = json!({
+            "modelVersion": "gemini-served",
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "Hel" }] } }],
+        });
+        let update = parse_stream_chunk(&value, Some("gemini-requested")).unwrap();
+        assert_eq!(update.model.as_deref(), Some("gemini-served"));
+    }
+
+    #[test]
+    fn a_requested_model_alone_does_not_make_an_empty_chunk_an_update() {
+        // The fallback is applied after the "carries nothing new" test, so a
+        // keep-alive chunk still parses as `None` rather than becoming an
+        // update that carries only a model label.
+        assert!(parse_stream_chunk(&json!({}), Some("gemini-requested")).is_none());
     }
 
     #[test]
@@ -1656,7 +1729,7 @@ mod tests {
         let value = json!({
             "candidates": [{ "content": { "role": "model", "parts": [{ "text": "Hel" }] } }],
         });
-        let update = parse_stream_chunk(&value).unwrap();
+        let update = parse_stream_chunk(&value, None).unwrap();
         assert_eq!(update.text_content(), "Hel");
         assert_eq!(update.finish_reason, None);
     }
@@ -1667,7 +1740,7 @@ mod tests {
             "candidates": [{ "content": { "role": "model", "parts": [] }, "finishReason": "STOP" }],
             "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10 },
         });
-        let update = parse_stream_chunk(&value).unwrap();
+        let update = parse_stream_chunk(&value, None).unwrap();
         assert_eq!(update.finish_reason, Some(FinishReason::stop()));
         let usage_content = update
             .contents
@@ -1700,7 +1773,7 @@ mod tests {
                 "candidates": [{ "content": { "role": "model", "parts": [] }, "finishReason": raw }],
                 "usageMetadata": { "promptTokenCount": 7, "candidatesTokenCount": 3, "totalTokenCount": 10 },
             });
-            let update = parse_stream_chunk(&value).unwrap();
+            let update = parse_stream_chunk(&value, None).unwrap();
             assert_eq!(update.finish_reason, expected, "{raw}");
             let usage = update
                 .contents
@@ -1716,7 +1789,7 @@ mod tests {
 
     #[test]
     fn parse_stream_chunk_empty_returns_none() {
-        assert!(parse_stream_chunk(&json!({})).is_none());
+        assert!(parse_stream_chunk(&json!({}), None).is_none());
     }
 
     #[test]
@@ -1727,7 +1800,10 @@ mod tests {
             json!({ "candidates": [{ "content": { "parts": [{ "text": "lo!" }] }, "finishReason": "STOP" }],
                      "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2 } }),
         ];
-        let updates: Vec<_> = chunks.iter().filter_map(parse_stream_chunk).collect();
+        let updates: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| parse_stream_chunk(c, None))
+            .collect();
         let resp = ChatResponse::from_updates(updates);
         assert_eq!(resp.text(), "Hello!");
         assert_eq!(resp.finish_reason, Some(FinishReason::stop()));

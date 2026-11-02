@@ -8,6 +8,7 @@ use agent_framework_core::prelude::*;
 use agent_framework_core::types::ChatResponseUpdate;
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde_json::Value;
 
 #[derive(Clone)]
 struct MockClient {
@@ -92,6 +93,143 @@ async fn sequential_workflow_as_agent_aggregates_response() {
     assert!(
         texts.iter().any(|t| t.contains("step-B")),
         "aggregated: {texts:?}"
+    );
+}
+
+/// An executor that yields one fixed JSON value as the workflow's output,
+/// for exercising how `WorkflowAgent` maps each output shape.
+struct YieldsOutput {
+    id: String,
+    output: Value,
+}
+
+#[async_trait]
+impl Executor for YieldsOutput {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    async fn execute(&self, _message: Value, ctx: WorkflowContext) -> Result<()> {
+        ctx.yield_output(self.output.clone()).await?;
+        Ok(())
+    }
+}
+
+/// Build a one-executor workflow whose single output is `output`, exposed as
+/// an agent.
+fn agent_over_output(output: Value) -> WorkflowAgent {
+    let executor = Arc::new(YieldsOutput {
+        id: "only".to_string(),
+        output,
+    });
+    let workflow = WorkflowBuilder::new()
+        .add_executor(executor)
+        .set_start("only")
+        .build()
+        .unwrap();
+    workflow.as_agent("wrapper")
+}
+
+/// An `AgentResponse` output carries the tokens a child agent's call billed.
+/// They were spent by this run, so they must reach the caller — before this
+/// the shape was not recognised at all and `usage_details` came back `None`
+/// from every workflow-as-agent run (upstream #9720).
+#[tokio::test]
+async fn an_agent_response_output_carries_its_usage_up() {
+    let wf_agent = agent_over_output(serde_json::json!({
+        "messages": [{ "role": "assistant", "contents": [{ "type": "text", "text": "done" }] }],
+        "usage_details": { "input_token_count": 10, "output_token_count": 5, "total_token_count": 15 },
+    }));
+
+    let response = wf_agent
+        .run(vec![Message::user("start")], None)
+        .await
+        .unwrap();
+
+    let usage = response
+        .usage_details
+        .expect("an AgentResponse output's usage must reach the caller");
+    assert_eq!(usage.input_token_count, Some(10));
+    assert_eq!(usage.output_token_count, Some(5));
+    assert_eq!(usage.total_token_count, Some(15));
+    let texts: Vec<String> = response.messages.iter().map(Message::text).collect();
+    assert!(texts.iter().any(|t| t.contains("done")), "{texts:?}");
+}
+
+/// Usage merges even when every message of the response was filtered out: the
+/// tokens were billed regardless of whether anything survived the filter.
+#[tokio::test]
+async fn an_agent_response_output_carries_usage_even_with_no_caller_facing_message() {
+    let wf_agent = agent_over_output(serde_json::json!({
+        "messages": [{ "role": "user", "contents": [{ "type": "text", "text": "echoed" }] }],
+        "usage_details": { "input_token_count": 7, "total_token_count": 7 },
+    }));
+
+    let response = wf_agent
+        .run(vec![Message::user("start")], None)
+        .await
+        .unwrap();
+
+    let usage = response.usage_details.expect("usage merges regardless");
+    assert_eq!(usage.input_token_count, Some(7));
+    assert!(
+        response.messages.is_empty(),
+        "a user-role message is not caller-facing: {:?}",
+        response.messages
+    );
+}
+
+/// Non-assistant messages are internal workflow artifacts: a system prompt, a
+/// tool result, and the caller's own user turn (which a `GroupChat`
+/// orchestrator re-emits with the whole conversation). Only the assistant
+/// turns reach the caller (upstream #8729).
+#[tokio::test]
+async fn non_assistant_output_messages_are_not_returned_to_the_caller() {
+    let wf_agent = agent_over_output(serde_json::json!([
+        { "role": "system", "contents": [{ "type": "text", "text": "secret-instructions" }] },
+        { "role": "user", "contents": [{ "type": "text", "text": "echoed-user-turn" }] },
+        { "role": "assistant", "contents": [{ "type": "text", "text": "the-answer" }] },
+    ]));
+
+    let response = wf_agent
+        .run(vec![Message::user("start")], None)
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = response.messages.iter().map(Message::text).collect();
+    assert_eq!(
+        texts,
+        vec!["the-answer".to_string()],
+        "only the assistant turn is caller-facing: {texts:?}"
+    );
+}
+
+/// An assistant message carrying a function-call envelope is dropped whole.
+/// Its `tool`-role result is already excluded by the role rule, and a call
+/// without its result is an invalid transcript for the providers that
+/// validate call/result pairing on replay (upstream #8729).
+#[tokio::test]
+async fn an_assistant_message_holding_a_function_call_is_dropped_whole() {
+    let wf_agent = agent_over_output(serde_json::json!([
+        {
+            "role": "assistant",
+            "contents": [
+                { "type": "text", "text": "thinking-out-loud" },
+                { "type": "function_call", "call_id": "c1", "name": "lookup" },
+            ],
+        },
+        { "role": "assistant", "contents": [{ "type": "text", "text": "the-answer" }] },
+    ]));
+
+    let response = wf_agent
+        .run(vec![Message::user("start")], None)
+        .await
+        .unwrap();
+
+    let texts: Vec<String> = response.messages.iter().map(Message::text).collect();
+    assert_eq!(
+        texts,
+        vec!["the-answer".to_string()],
+        "the call envelope is dropped with its text: {texts:?}"
     );
 }
 

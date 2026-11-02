@@ -82,8 +82,12 @@ from the roadmap, not from this file.
 - **A framework `User-Agent` outside the Azure crates**. The Azure-facing
   crates send `agent-framework-rust/<version> (<component>)` via
   `agent_framework_azure::azure_http_client`; the other provider clients, and
-  `agent-framework-purview` and `agent-framework-foundry-local`, still build
-  bare `reqwest` clients. A framework-wide header needs the helper somewhere
+  `agent-framework-copilotstudio`, `agent-framework-purview` and
+  `agent-framework-foundry-local`, still build bare `reqwest` clients.
+  `agent-framework-copilotstudio` is the one worth calling out: it talks to a
+  Microsoft Power Platform endpoint, so it belongs with the Azure-facing
+  crates, and it was simply missed when this item was written (see the
+  2026-11-02 pass). A framework-wide header needs the helper somewhere
   every crate can reach, and `agent-framework-core` carries no `reqwest`
   dependency by design.
 - **Function-invocation pauses with mixed batches**. A declaration-only
@@ -108,6 +112,17 @@ from the roadmap, not from this file.
   session.
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
+- **Redis context scope identity** (upstream #9461, `[BREAKING]` there).
+  `agent-framework-redis`'s context provider indexes its scope `TAG` fields
+  with RediSearch's defaults — separator `,`, case-insensitive — and writes
+  the scope value to the document unescaped, so a value containing a comma is
+  indexed as two tags and can be retrieved under a different scope. Upstream
+  hashes each scope value into an opaque token instead, with a schema
+  signature check and a resumable migration. Both that and the smaller fix
+  (declaring `SEPARATOR ""` / `CASESENSITIVE`) are breaking and need a
+  migration for already-indexed data. Detailed in the 2026-11-02 pass; it is
+  the next pass's first item.
+
 - **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
   revision it was written against.
 - **`SequentialBuilder::ensure_trailing_user_turn`** (upstream #8779): an

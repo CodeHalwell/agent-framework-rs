@@ -7,6 +7,79 @@ may break APIs).
 
 ## [Unreleased]
 
+Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
+in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md).
+Five changes, three of them defects that were live in this port.
+
+### Fixed
+
+- Gemini reports which model served a run (upstream #9736).
+  `ChatResponse::model` and every streamed update came back `None` whenever
+  Gemini omitted `modelVersion` from the body, so a per-request
+  `ChatOptions::model` override was invisible on the response. Both the
+  non-streaming and streaming parsers now fall back to the model the request
+  was sent to, and prefer a `modelVersion` when the body carries one. On the
+  streaming path the fallback is applied after the "carries nothing new"
+  test, so a keep-alive chunk is still skipped rather than becoming an update
+  carrying only a model label. (Upstream fixed only its non-streaming path;
+  here neither path had a fallback.)
+- A round cap below 1 is coerced up to 1 in both Magentic and group chat
+  (upstream #9502). Both check the limit before counting the round, so a cap
+  of `0` ended the run on the loop's first pass: no ledger requested, no
+  participant spoken, and only the "round limit" placeholder returned.
+  Magentic coerces in `MagenticBuilder::build` rather than in the setter,
+  because the cap can also come from a custom `MagenticManager`.
+- A workflow exposed as an agent no longer loses its token counts
+  (upstream #9720). An `AgentResponse` output was not a recognised shape: it
+  fell through to the catch-all arm, arrived as one assistant message of raw
+  JSON, and its `usage_details` were dropped — and `AgentResponse` was built
+  with `..Default::default()` besides, so a workflow-as-agent reported no
+  usage from any run. Its caller-facing messages are now taken and its usage
+  merged and reported, including when every message of the response was
+  filtered out.
+- A workflow exposed as an agent no longer returns internal messages to its
+  caller (upstream #8729). System prompts and tool results are workflow
+  artifacts, and user messages get re-emitted — a group-chat orchestrator
+  yields the whole conversation, the caller's own turn included. Only
+  assistant messages survive, and an assistant message carrying a
+  function-call envelope is dropped whole, since a call without its result is
+  an invalid transcript for providers that validate call/result pairing on
+  replay. Pending request-info messages are appended after the filter and are
+  unaffected.
+
+### Added
+
+- `FoundryChatClient::with_timeout` bounds a single request, body included
+  (upstream #9699). `reqwest` applies no timeout by default, so a hung
+  Foundry endpoint stalled a run indefinitely with no way to say otherwise.
+  Backed by a new `agent_framework_azure::azure_http_client_with_timeout`
+  that shares a builder with `azure_http_client`, so a timed client keeps the
+  framework `User-Agent` and the whole Azure crate family can reach it. The
+  bound spans the response body, so on `get_streaming_response` it caps the
+  stream's lifetime rather than the time to first token.
+- `McpApprovalMode::PerTool` carries a `never_require` list and a `default`
+  (upstream #9828), resolved in upstream's order: always, never, `default`,
+  then no approval. `per_tool_except` expresses the policy this enables —
+  gate every tool except a known-safe set, so a tool the server adds later is
+  approved rather than let through. `with_default` and `with_never_require`
+  compose onto a `per_tool` policy and are no-ops on the whole-server
+  variants. `per_tool`'s own behaviour is unchanged. Upstream's
+  single-string name normalisation and its no-`default` warning do not apply
+  — see the pass notes.
+
+### Security
+
+- Recorded, not fixed: `agent-framework-redis`'s context provider can
+  retrieve one scope's memory under another's. Its scope `TAG` fields are
+  indexed with RediSearch's defaults (separator `,`, case-insensitive) and
+  the value is written unescaped, so `user_id = "smith,john"` is indexed as
+  two tags and matches a provider scoped to `user_id = "smith"`. Upstream's
+  fix (#9461) hashes scope values into opaque tokens and is `[BREAKING]`
+  with a migration; so is the smaller schema fix. See `SCOPE.md` and the
+  pass notes.
+
+---
+
 Upstream drift from the window ending at `67ba500e` (2026-10-24), recorded
 in [`docs/drift/2026-10-26-67ba500e.md`](docs/drift/2026-10-26-67ba500e.md).
 Five changes, three of them defects that were live in this port. One

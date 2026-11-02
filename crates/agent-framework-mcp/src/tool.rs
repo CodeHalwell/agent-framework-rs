@@ -58,14 +58,19 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`ApprovalMode::NeverRequire`]), so [`McpApprovalMode::NeverRequireAll`] is
 /// this type's default too.
 ///
-/// Note: Python's per-tool config accepts both an `always_require_approval`
-/// and a `never_require_approval` name set, because its underlying
-/// `approval_mode` can also be *unset* (`None`), which a fuller "never
-/// listed" set can be distinguished from. Rust's [`ApprovalMode`] is a plain
-/// two-value enum with no unset state, so "explicitly never" and "not
-/// listed" already collapse to the same [`ApprovalMode::NeverRequire`]
-/// result — [`McpApprovalMode::PerTool`] therefore only needs the
-/// `always_require` set.
+/// A [`PerTool`](McpApprovalMode::PerTool) policy resolves a tool's local
+/// (normalized) name in upstream's order (#9828): the `always_require` list,
+/// then `never_require`, then `default` for a tool in neither, and finally
+/// [`ApprovalMode::NeverRequire`] when no `default` is set.
+///
+/// Note on `never_require`: before `default` existed it carried no
+/// information here. Rust's [`ApprovalMode`] is a plain two-value enum with
+/// no unset state, unlike Python's (which can also be `None`), so
+/// "explicitly never" and "not listed" both collapsed to
+/// [`ApprovalMode::NeverRequire`] and the list was omitted from this type. A
+/// `default` of [`ApprovalMode::AlwaysRequire`] makes the distinction real —
+/// it is the only way to say "approve everything *except* these" — so the
+/// list is carried now.
 #[derive(Debug, Clone, Default)]
 pub enum McpApprovalMode {
     /// No tool produced by this server requires approval (default).
@@ -73,9 +78,21 @@ pub enum McpApprovalMode {
     NeverRequireAll,
     /// Every tool produced by this server requires approval before it runs.
     AlwaysRequireAll,
-    /// Approval is required only for tools whose local (normalized) name is
-    /// in this set; every other tool resolves to [`ApprovalMode::NeverRequire`].
-    PerTool { always_require: HashSet<String> },
+    /// Approval is decided per tool name, by the order documented on
+    /// [`McpApprovalMode`].
+    PerTool {
+        /// Local (normalized) names that always require approval. Checked
+        /// first, so a name in both lists requires approval.
+        always_require: HashSet<String>,
+        /// Local (normalized) names that never require approval. Only
+        /// distinguishable from "not listed" when `default` requires
+        /// approval.
+        never_require: HashSet<String>,
+        /// What a tool in neither list resolves to. `None` means
+        /// [`ApprovalMode::NeverRequire`], which is also what upstream falls
+        /// back to.
+        default: Option<ApprovalMode>,
+    },
 }
 
 impl McpApprovalMode {
@@ -89,25 +106,74 @@ impl McpApprovalMode {
         Self::NeverRequireAll
     }
 
-    /// Require approval only for the named tools (by local/normalized name).
+    /// Require approval only for the named tools (by local/normalized name);
+    /// every other tool runs without approval.
     pub fn per_tool<I>(always_require: I) -> Self
     where
         I: IntoIterator<Item = &'static str>,
     {
         Self::PerTool {
             always_require: always_require.into_iter().map(str::to_string).collect(),
+            never_require: HashSet::new(),
+            default: None,
         }
+    }
+
+    /// Require approval for every tool *except* the named ones.
+    ///
+    /// The inverse of [`per_tool`](Self::per_tool), and the configuration
+    /// `default` was added for: an unknown tool — one the server adds later,
+    /// or one a reload brings in — is gated rather than allowed through.
+    pub fn per_tool_except<I>(never_require: I) -> Self
+    where
+        I: IntoIterator<Item = &'static str>,
+    {
+        Self::PerTool {
+            always_require: HashSet::new(),
+            never_require: never_require.into_iter().map(str::to_string).collect(),
+            default: Some(ApprovalMode::AlwaysRequire),
+        }
+    }
+
+    /// Set what a tool in neither name list resolves to.
+    ///
+    /// A no-op on [`NeverRequireAll`](Self::NeverRequireAll) and
+    /// [`AlwaysRequireAll`](Self::AlwaysRequireAll), which already answer for
+    /// every tool.
+    pub fn with_default(mut self, mode: ApprovalMode) -> Self {
+        if let Self::PerTool { default, .. } = &mut self {
+            *default = Some(mode);
+        }
+        self
+    }
+
+    /// Add names that never require approval. Only has an effect alongside a
+    /// `default` that requires approval — see [`McpApprovalMode`].
+    pub fn with_never_require<I>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = &'static str>,
+    {
+        if let Self::PerTool { never_require, .. } = &mut self {
+            never_require.extend(names.into_iter().map(str::to_string));
+        }
+        self
     }
 
     fn resolve(&self, local_name: &str) -> ApprovalMode {
         match self {
             McpApprovalMode::NeverRequireAll => ApprovalMode::NeverRequire,
             McpApprovalMode::AlwaysRequireAll => ApprovalMode::AlwaysRequire,
-            McpApprovalMode::PerTool { always_require } => {
+            McpApprovalMode::PerTool {
+                always_require,
+                never_require,
+                default,
+            } => {
                 if always_require.contains(local_name) {
                     ApprovalMode::AlwaysRequire
-                } else {
+                } else if never_require.contains(local_name) {
                     ApprovalMode::NeverRequire
+                } else {
+                    default.unwrap_or(ApprovalMode::NeverRequire)
                 }
             }
         }
@@ -1158,6 +1224,55 @@ mod tests {
         assert_eq!(mode.resolve("delete_file"), ApprovalMode::AlwaysRequire);
         assert_eq!(mode.resolve("read_file"), ApprovalMode::NeverRequire);
         assert_eq!(mode.resolve("unlisted"), ApprovalMode::NeverRequire);
+    }
+
+    #[test]
+    fn a_default_decides_the_tools_in_neither_list() {
+        // The configuration `default` exists for: gate everything except a
+        // known-safe set, so a tool the server adds later is gated rather
+        // than allowed straight through.
+        let mode = McpApprovalMode::per_tool_except(["read_file"]);
+        assert_eq!(mode.resolve("read_file"), ApprovalMode::NeverRequire);
+        assert_eq!(mode.resolve("delete_file"), ApprovalMode::AlwaysRequire);
+        assert_eq!(
+            mode.resolve("a_tool_added_after_this_was_configured"),
+            ApprovalMode::AlwaysRequire
+        );
+    }
+
+    #[test]
+    fn the_always_list_is_checked_before_the_never_list() {
+        // Upstream's order is always, never, default: a name in both lists
+        // requires approval.
+        let mode = McpApprovalMode::per_tool(["overlap"]).with_never_require(["overlap"]);
+        assert_eq!(mode.resolve("overlap"), ApprovalMode::AlwaysRequire);
+    }
+
+    #[test]
+    fn the_never_list_is_checked_before_the_default() {
+        let mode = McpApprovalMode::per_tool(["delete_file"])
+            .with_never_require(["read_file"])
+            .with_default(ApprovalMode::AlwaysRequire);
+        assert_eq!(mode.resolve("delete_file"), ApprovalMode::AlwaysRequire);
+        assert_eq!(mode.resolve("read_file"), ApprovalMode::NeverRequire);
+        assert_eq!(mode.resolve("unlisted"), ApprovalMode::AlwaysRequire);
+    }
+
+    #[test]
+    fn no_default_still_falls_back_to_never_require() {
+        // The pre-`default` behaviour of `per_tool` is unchanged.
+        let mode = McpApprovalMode::per_tool(["delete_file"]);
+        assert_eq!(mode.resolve("unlisted"), ApprovalMode::NeverRequire);
+    }
+
+    #[test]
+    fn a_default_is_a_no_op_on_the_whole_server_modes() {
+        // Both already answer for every tool, so there is no "neither list"
+        // case for a default to decide.
+        let always = McpApprovalMode::always_require_all().with_default(ApprovalMode::NeverRequire);
+        assert_eq!(always.resolve("anything"), ApprovalMode::AlwaysRequire);
+        let never = McpApprovalMode::never_require_all().with_default(ApprovalMode::AlwaysRequire);
+        assert_eq!(never.resolve("anything"), ApprovalMode::NeverRequire);
     }
 
     #[test]

@@ -136,10 +136,43 @@ pub fn azure_user_agent(component: &str, version: &str) -> String {
 /// format lives in one place. A static ASCII token cannot fail to become a
 /// header, so the fallback exists only to keep the signature infallible.
 pub fn azure_http_client(component: &str, version: &str) -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(azure_user_agent(component, version))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    build_azure_http_client(component, version, None)
+}
+
+/// [`azure_http_client`] with a total per-request timeout.
+///
+/// `reqwest` applies no timeout by default, so a hung Azure endpoint
+/// otherwise stalls a run indefinitely. The bound covers the whole request,
+/// response body included — for a streaming call that is the lifetime of the
+/// stream, so a caller that streams long answers wants a generous value or
+/// none at all.
+///
+/// For reference, the OpenAI SDK upstream's Python clients build on defaults
+/// to a 5s connect and 600s total timeout; this sets only the total.
+pub fn azure_http_client_with_timeout(
+    component: &str,
+    version: &str,
+    timeout: std::time::Duration,
+) -> reqwest::Client {
+    build_azure_http_client(component, version, Some(timeout))
+}
+
+/// Shared builder behind [`azure_http_client`] and
+/// [`azure_http_client_with_timeout`].
+///
+/// The fallback drops the timeout along with the `User-Agent`, but it is only
+/// reached when `reqwest` cannot initialise its TLS backend at all, in which
+/// case no request will succeed anyway.
+fn build_azure_http_client(
+    component: &str,
+    version: &str,
+    timeout: Option<std::time::Duration>,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().user_agent(azure_user_agent(component, version));
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// This crate's own [`azure_http_client`].

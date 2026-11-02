@@ -80,6 +80,16 @@ pub(crate) fn http_client() -> reqwest::Client {
     agent_framework_azure::azure_http_client(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
+/// This crate's HTTP client with a total per-request timeout — see
+/// [`agent_framework_azure::azure_http_client_with_timeout`].
+pub(crate) fn http_client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
+    agent_framework_azure::azure_http_client_with_timeout(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        timeout,
+    )
+}
+
 pub mod embeddings;
 pub mod memory;
 mod tool_definition_wire;
@@ -235,6 +245,29 @@ impl FoundryChatClient {
     /// [`AzureOpenAIResponsesClient::with_base_url`].
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.inner = self.inner.with_base_url(base_url);
+        self
+    }
+
+    /// Bound how long a single request to this client may take, body
+    /// included (upstream #9699's `timeout`).
+    ///
+    /// Unset, `reqwest` applies no timeout at all, so a hung Foundry endpoint
+    /// stalls the run indefinitely. Upstream's equivalent leaves the OpenAI
+    /// SDK's own defaults in place (5s connect, 600s total) when the
+    /// parameter is omitted; there is no such default here, which makes
+    /// setting one worth more.
+    ///
+    /// The bound spans the whole request, so on
+    /// [`get_streaming_response`](ChatClient::get_streaming_response) it caps
+    /// the lifetime of the stream rather than the time to first token. Prefer
+    /// a generous value, or none, when streaming long answers.
+    ///
+    /// Applies to this chat client only; [`FoundryEmbeddingClient`] and
+    /// [`FoundryMemoryProvider`] build their own clients.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self
+            .inner
+            .with_http_client(http_client_with_timeout(timeout));
         self
     }
 

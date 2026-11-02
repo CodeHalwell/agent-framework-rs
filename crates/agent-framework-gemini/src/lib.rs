@@ -269,7 +269,7 @@ impl ChatClient for GeminiChatClient {
                 .to_string();
             return Err(Error::service(msg));
         }
-        Ok(convert::parse_response(&value))
+        Ok(convert::parse_response(&value, Some(&model)))
     }
 
     async fn get_streaming_response(
@@ -281,7 +281,7 @@ impl ChatClient for GeminiChatClient {
         let resp = self
             .post("streamGenerateContent", &model, &body, true)
             .await?;
-        Ok(parse_sse_stream(resp).boxed())
+        Ok(parse_sse_stream(resp, model).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -305,8 +305,14 @@ type ByteStream =
 /// [`convert::parse_response`] parses non-streaming, just with incremental
 /// `parts` per chunk — so no `event:` line, and no cross-chunk id/index
 /// bookkeeping, is needed.
+///
+/// `requested_model` is the model id the request was sent to; each chunk that
+/// carries no `modelVersion` of its own is reported against it, so a streamed
+/// run labels its updates the same way the non-streaming path labels its
+/// response.
 fn parse_sse_stream(
     resp: reqwest::Response,
+    requested_model: String,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     futures::stream::unfold(
@@ -316,6 +322,7 @@ fn parse_sse_stream(
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             done: false,
+            requested_model,
         },
         |mut state| async move {
             loop {
@@ -351,7 +358,9 @@ fn parse_sse_stream(
                                 state.done = true;
                                 return Some((Err(Error::service(msg)), state));
                             }
-                            if let Some(update) = convert::parse_stream_chunk(&value) {
+                            if let Some(update) =
+                                convert::parse_stream_chunk(&value, Some(&state.requested_model))
+                            {
                                 state.queued.push_back(update);
                             }
                         }
@@ -374,6 +383,9 @@ struct SseState {
     utf8: Utf8StreamDecoder,
     queued: VecDeque<ChatResponseUpdate>,
     done: bool,
+    /// The model id the request was sent to, reported on any chunk whose body
+    /// carries no `modelVersion`.
+    requested_model: String,
 }
 
 #[cfg(test)]
@@ -383,6 +395,11 @@ mod tests {
     fn sse_frame(data: &Value) -> String {
         format!("data: {data}\n\n")
     }
+
+    /// The model a `collect_updates` request is treated as having been sent
+    /// to, so the stream's fallback labelling is exercised by every test that
+    /// goes through this helper.
+    const STREAM_REQUESTED_MODEL: &str = "gemini-requested";
 
     async fn collect_updates(text: String) -> Vec<ChatResponseUpdate> {
         let stream =
@@ -394,6 +411,7 @@ mod tests {
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             done: false,
+            requested_model: STREAM_REQUESTED_MODEL.to_string(),
         };
         let mut updates = Vec::new();
         if let Some(Ok(bytes)) = state.byte_stream.next().await {
@@ -410,7 +428,9 @@ mod tests {
                     continue;
                 }
                 let value: Value = serde_json::from_str(data).unwrap();
-                if let Some(update) = convert::parse_stream_chunk(&value) {
+                if let Some(update) =
+                    convert::parse_stream_chunk(&value, Some(&state.requested_model))
+                {
                     updates.push(update);
                 }
             }
@@ -482,6 +502,7 @@ mod tests {
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
             done: false,
+            requested_model: STREAM_REQUESTED_MODEL.to_string(),
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
         let decoded = state.utf8.push(&bytes);

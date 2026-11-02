@@ -256,6 +256,51 @@ async fn round_limit_yields_partial_not_final() {
     assert!(!conv.is_empty(), "a partial result is yielded");
 }
 
+/// A round cap below 1 is coerced up to 1 rather than ending the run before
+/// any coordination round executes (upstream #9502: the base group-chat
+/// contract applies the same coercion, and Magentic now matches it).
+///
+/// The limit is checked *before* the round counter is incremented, so an
+/// uncoerced `0` short-circuits the loop on its first pass: no ledger is
+/// requested, no participant speaks, and the caller gets only the
+/// "Stopped due to round limit" placeholder.
+#[tokio::test]
+async fn a_round_cap_below_one_is_coerced_to_one() {
+    let final_calls = Arc::new(AtomicUsize::new(0));
+    let manager = ScriptedManager {
+        ledgers: Mutex::new(Vec::new()),
+        // Satisfied on the first ledger, so one round is all it takes to
+        // reach a synthesized final answer.
+        fixed_ledger: Some(ledger(true, true, false, "coder")),
+        plan_calls: Arc::new(AtomicUsize::new(0)),
+        replan_calls: Arc::new(AtomicUsize::new(0)),
+        final_calls: final_calls.clone(),
+        max_stall: 5,
+        max_rounds: Some(0),
+        max_resets: None,
+    };
+
+    let coder = agent("coder", vec!["turn-1"]);
+    let workflow = MagenticBuilder::new()
+        .participant("coder", coder)
+        .manager(Arc::new(manager))
+        .build()
+        .unwrap();
+
+    let run = workflow.run("coercion task").await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    assert_eq!(
+        final_calls.load(Ordering::SeqCst),
+        1,
+        "one coordination round must run before the round limit ends the workflow"
+    );
+    let conv = conversation(&run);
+    assert!(
+        conv.iter().any(|m| m.text().contains("FINAL")),
+        "the coerced run reaches a final answer, not the round-limit placeholder: {conv:?}"
+    );
+}
+
 /// `intermediate_output_from` demotes the orchestrator's single final yield
 /// (the synthesized final answer) from the workflow's terminal output to a
 /// non-terminal `Intermediate` event — useful when Magentic is composed as

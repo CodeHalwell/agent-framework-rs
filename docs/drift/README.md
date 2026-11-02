@@ -7,13 +7,14 @@ was already satisfied, and what does not apply here. Every item recorded as
 landed was verified (full workspace build, `cargo test`, clippy
 `--all-targets` and rustfmt, all green) before commit.
 
-**Current upstream baseline: `67ba500e` (2026-10-24).**
+**Current upstream baseline: `ca65085e` (2026-11-01).**
 
 > Upstream rewrote its main into a single linear history after the
 > 2026-10-19 pass, so `9d308951` (and every earlier baseline SHA) no longer
 > resolves there. Baselines from `02005995` on are on the linear main, and
-> the 2026-10-26 pass confirmed a plain `<baseline>..origin/main` range works
-> again. See the window notes in those two passes.
+> the 2026-10-26 and 2026-11-02 passes both confirmed a plain
+> `<baseline>..origin/main` range works again. See the window notes in those
+> passes.
 
 Deliberate exclusions live in [`SCOPE.md`](../../SCOPE.md); cite it rather
 than re-arguing a boundary in a new pass. The July re-baseline's catalogue
@@ -30,6 +31,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-11-02-ca65085e`](2026-11-02-ca65085e.md) | Post-`67ba500e` drift + Azure-ecosystem review (checked against `ca65085e`, 2026-11-01) |
 | [`2026-10-26-67ba500e`](2026-10-26-67ba500e.md) | Post-`02005995` drift + Azure-ecosystem review (checked against `67ba500e`, 2026-10-24) |
 | [`2026-10-21-02005995`](2026-10-21-02005995.md) | Post-`9d308951` drift + Go v0.2.0 skim (checked against `02005995`, 2026-10-21) |
 | [`2026-10-19-9d308951`](2026-10-19-9d308951.md) | Post-`a75e803e` drift + Azure-ecosystem review (checked against `9d308951`, 2026-10-19) |
