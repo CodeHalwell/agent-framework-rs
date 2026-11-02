@@ -666,12 +666,19 @@ impl Middleware<FunctionInvocationContext> for LabelTrackingFunctionMiddleware {
             // A halt is the enforcement layer's own fail-closed signal.
             Err(e) if e.is_middleware_failure() => return Err(e),
             // A failure's text bypasses `label_result`: the loop turns it into
-            // a model-visible error. From a tool whose results are untrusted
-            // it may carry external content, so it is replaced by a
-            // content-free error rather than reaching the model unmediated.
-            Err(_) if !fallback.is_trusted() => {
+            // a model-visible error without touching the context label. From a
+            // tool whose results are untrusted it may carry external content,
+            // and from one whose results are confidential it may carry private
+            // data that later policy checks would not account for; either way
+            // it is replaced by a content-free error.
+            Err(_) if !fallback.is_trusted() || !fallback.is_public() => {
                 return Err(Error::tool(format!(
-                    "tool '{function_name}' failed; details withheld (untrusted source)"
+                    "tool '{function_name}' failed; details withheld ({})",
+                    if fallback.is_trusted() {
+                        "confidential source"
+                    } else {
+                        "untrusted source"
+                    }
                 )))
             }
             Err(e) => return Err(e),

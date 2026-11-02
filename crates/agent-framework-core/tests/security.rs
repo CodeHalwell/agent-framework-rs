@@ -1377,7 +1377,14 @@ async fn embedded_label_metadata_never_reaches_the_model() {
 
 #[tokio::test]
 async fn untrusted_tool_errors_never_reach_the_model_verbatim() {
-    let tracker = Arc::new(tracker().tool_security("weather", trusted_tool()));
+    let tracker = Arc::new(
+        tracker()
+            .tool_security("weather", trusted_tool())
+            .tool_security(
+                "payroll",
+                trusted_tool().confidentiality(ConfidentialityLabel::Private),
+            ),
+    );
     let pipeline: MiddlewarePipeline<FunctionInvocationContext> =
         MiddlewarePipeline::new(vec![tracker as Arc<FunctionMiddleware>]);
     let session = AgentSession::new();
@@ -1398,7 +1405,11 @@ async fn untrusted_tool_errors_never_reach_the_model_verbatim() {
     let err = fail("fetch").await.err().expect("fails").to_string();
     assert!(!err.contains("IGNORE PREVIOUS"), "{err}");
     assert!(err.contains("details withheld"), "{err}");
-    // A trusted tool's error is passed through unchanged.
+    // A trusted but confidential tool's error could leak private data.
+    let err = fail("payroll").await.err().expect("fails").to_string();
+    assert!(!err.contains("IGNORE PREVIOUS"), "{err}");
+    assert!(err.contains("confidential source"), "{err}");
+    // A trusted, public tool's error is passed through unchanged.
     let err = fail("weather").await.err().expect("fails").to_string();
     assert!(err.contains("IGNORE PREVIOUS"), "{err}");
 }
