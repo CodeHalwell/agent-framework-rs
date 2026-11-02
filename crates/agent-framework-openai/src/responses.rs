@@ -30,11 +30,11 @@ use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, CodeInterpreterToolCallContent,
-    CodeInterpreterToolResultContent, Content, DataContent, FinishReason,
+    CodeInterpreterToolResultContent, Content, ContinuationToken, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
     McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
-    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
-    UsageContent, UsageDetails,
+    OperationState, ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion,
+    ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -44,6 +44,66 @@ use crate::convert::{
     top_level_media_type, DEFAULT_FILENAME,
 };
 use crate::{ByteStream, DEFAULT_BASE_URL};
+
+/// The continuation token of a Responses API background operation.
+///
+/// Mirrors upstream Python `OpenAIContinuationToken` (`{"response_id": ...}`),
+/// plus the stream position .NET's Responses client keeps
+/// (`sequence_number`): the last stream event the caller received, so a
+/// resumed stream continues after it (`starting_after`) instead of replaying
+/// the whole response. It travels inside the opaque core
+/// [`ContinuationToken`] as JSON; [`Self::from_token`] also accepts a bare
+/// response id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenAIContinuationToken {
+    /// The Responses API response id (`resp_...`).
+    pub response_id: String,
+    /// The `sequence_number` of the last stream event delivered, when the
+    /// token came from a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u64>,
+}
+
+impl OpenAIContinuationToken {
+    /// A token for `response_id`, with no stream position.
+    pub fn new(response_id: impl Into<String>) -> Self {
+        Self {
+            response_id: response_id.into(),
+            sequence_number: None,
+        }
+    }
+
+    /// The opaque core token carrying this one.
+    pub fn to_token(&self) -> ContinuationToken {
+        ContinuationToken::new(serde_json::to_string(self).unwrap_or_default())
+    }
+
+    /// Read a token issued by this client (or a bare response id).
+    pub fn from_token(token: &ContinuationToken) -> Result<Self> {
+        let raw = token.as_str().trim();
+        if raw.starts_with('{') {
+            return serde_json::from_str::<Self>(raw)
+                .ok()
+                .filter(|t| !t.response_id.is_empty())
+                .ok_or_else(|| {
+                    Error::Configuration(format!(
+                        "not an OpenAI Responses continuation token: {raw}"
+                    ))
+                });
+        }
+        if raw.is_empty() {
+            return Err(Error::Configuration(
+                "an OpenAI Responses continuation token needs a response id".into(),
+            ));
+        }
+        Ok(Self::new(raw))
+    }
+}
+
+/// Whether a Responses API `status` means the operation is still running.
+fn is_pending_status(status: Option<&str>) -> bool {
+    matches!(status, Some("queued" | "in_progress"))
+}
 
 /// An OpenAI Responses API chat client (`POST /v1/responses`).
 #[derive(Clone)]
@@ -153,6 +213,9 @@ impl OpenAIChatClient {
         if let Some(metadata) = &options.metadata {
             body.insert("metadata".into(), json!(metadata));
         }
+        if let Some(background) = options.background {
+            body.insert("background".into(), json!(background));
+        }
 
         if !options.tools.is_empty() {
             let tools: Vec<Value> = options.tools.iter().map(tool_to_responses_spec).collect();
@@ -194,14 +257,35 @@ impl OpenAIChatClient {
         Value::Object(body)
     }
 
+    fn responses_url(&self) -> String {
+        format!("{}/responses", self.inner.base_url.trim_end_matches('/'))
+    }
+
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
-        let url = format!("{}/responses", self.inner.base_url.trim_end_matches('/'));
-        let mut req = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&self.inner.api_key)
-            .json(body);
+        let req = self.inner.http.post(self.responses_url()).json(body);
+        self.send(req).await
+    }
+
+    /// `GET /responses/{id}`: poll a background response, or (with
+    /// `stream`) resume its event stream after `starting_after`.
+    async fn retrieve(
+        &self,
+        token: &OpenAIContinuationToken,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/{}", self.responses_url(), token.response_id);
+        let mut req = self.inner.http.get(url);
+        if stream {
+            req = req.query(&[("stream", "true")]);
+            if let Some(after) = token.sequence_number {
+                req = req.query(&[("starting_after", after)]);
+            }
+        }
+        self.send(req).await
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut req = req.bearer_auth(&self.inner.api_key);
         if let Some(org) = &self.inner.organization {
             req = req.header("OpenAI-Organization", org);
         }
@@ -233,8 +317,19 @@ impl ChatClient for OpenAIChatClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&messages, &options, false);
-        let resp = self.post(&body).await?;
+        // A continuation token polls the background response it names
+        // (upstream `responses.retrieve(response_id)`); the messages are not
+        // sent, since that response already has its input.
+        let resp = match &options.continuation_token {
+            Some(token) => {
+                let token = OpenAIContinuationToken::from_token(token)?;
+                self.retrieve(&token, false).await?
+            }
+            None => {
+                let body = self.build_body(&messages, &options, false);
+                self.post(&body).await?
+            }
+        };
         let value: Value = resp
             .json()
             .await
@@ -250,9 +345,21 @@ impl ChatClient for OpenAIChatClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
+        // A continuation token resumes the background response's event
+        // stream after the last event the caller saw.
+        if let Some(token) = &options.continuation_token {
+            let token = OpenAIContinuationToken::from_token(token)?;
+            let resp = self.retrieve(&token, true).await?;
+            let resume = BackgroundStream {
+                response_id: Some(token.response_id),
+                sequence_number: token.sequence_number,
+            };
+            return Ok(sse_stream(resp, options.store, Some(resume)).boxed());
+        }
         let body = self.build_body(&messages, &options, true);
         let resp = self.post(&body).await?;
-        Ok(parse_responses_sse_stream(resp, options.store).boxed())
+        let background = (options.background == Some(true)).then(BackgroundStream::default);
+        Ok(sse_stream(resp, options.store, background).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -1088,6 +1195,13 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     if store != Some(false) {
         response.conversation_id = response.response_id.clone();
     }
+    // A background response still queued or running hands back a token to
+    // poll it with (upstream `_parse_response_from_openai`).
+    if is_pending_status(value.get("status").and_then(Value::as_str)) {
+        if let Some(id) = &response.response_id {
+            response.continuation_token = Some(OpenAIContinuationToken::new(id).to_token());
+        }
+    }
     response
 }
 
@@ -1375,6 +1489,10 @@ fn finish_reason_from_response(value: &Value) -> Option<FinishReason> {
         return Some(FinishReason::tool_calls());
     }
     let status = value.get("status").and_then(Value::as_str)?;
+    // A background response that has not finished has no finish reason yet.
+    if is_pending_status(Some(status)) {
+        return None;
+    }
     Some(match status {
         "completed" => FinishReason::stop(),
         "incomplete" => match value
@@ -1447,6 +1565,85 @@ pub fn parse_responses_sse_stream(
     resp: reqwest::Response,
     store: Option<bool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
+    sse_stream(resp, store, None)
+}
+
+/// Where a background response's stream stands, so every update can carry
+/// a [`OpenAIContinuationToken`] to resume it from.
+#[derive(Debug, Clone, Default)]
+struct BackgroundStream {
+    /// The response id, from the token being resumed or `response.created`.
+    response_id: Option<String>,
+    /// The `sequence_number` of the latest event seen.
+    sequence_number: Option<u64>,
+}
+
+impl BackgroundStream {
+    /// Note the position of `event` (its response id and sequence number).
+    fn observe(&mut self, event: &Value) {
+        if let Some(seq) = event.get("sequence_number").and_then(Value::as_u64) {
+            self.sequence_number = Some(seq);
+        }
+        if let Some(id) = event
+            .get("response")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.response_id = Some(id.to_string());
+        }
+    }
+
+    /// Stamp `update` with where the operation stands after `event`: a
+    /// terminal event ends it (no token), anything else leaves it running,
+    /// resumable from this event on. Mirrors upstream's streaming
+    /// `operation_state` / `continuation_token` handling.
+    fn stamp(&self, event: &Value, update: &mut ChatResponseUpdate, store: Option<bool>) {
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let status = event
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(Value::as_str);
+        let terminal = matches!(
+            event_type,
+            "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.cancelled"
+                | "error"
+        ) || matches!(
+            status,
+            Some("completed" | "incomplete" | "failed" | "cancelled")
+        );
+        if terminal {
+            update.operation_state = Some(OperationState::Terminal);
+            update.continuation_token = None;
+            return;
+        }
+        let Some(response_id) = &self.response_id else {
+            return;
+        };
+        update.operation_state = Some(OperationState::InProgress);
+        update.continuation_token = Some(
+            OpenAIContinuationToken {
+                response_id: response_id.clone(),
+                sequence_number: self.sequence_number,
+            }
+            .to_token(),
+        );
+        if store != Some(false) && update.conversation_id.is_none() {
+            update.conversation_id = Some(response_id.clone());
+        }
+    }
+}
+
+/// [`parse_responses_sse_stream`], stamping continuation tokens on the
+/// updates of a background response (`background` is `Some`).
+fn sse_stream(
+    resp: reqwest::Response,
+    store: Option<bool>,
+    background: Option<BackgroundStream>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     futures::stream::unfold(
         ResponsesSseState {
@@ -1457,6 +1654,7 @@ pub fn parse_responses_sse_stream(
             call_ids: HashMap::new(),
             done: false,
             store,
+            background,
         },
         |mut state| async move {
             loop {
@@ -1483,8 +1681,16 @@ pub fn parse_responses_sse_stream(
                             let Ok(value) = serde_json::from_str::<Value>(data) else {
                                 continue;
                             };
+                            if let Some(bg) = state.background.as_mut() {
+                                bg.observe(&value);
+                            }
                             match parse_responses_event(&value, &mut state.call_ids, state.store) {
-                                EventOutcome::Update(update) => state.queued.push_back(update),
+                                EventOutcome::Update(mut update) => {
+                                    if let Some(bg) = &state.background {
+                                        bg.stamp(&value, &mut update, state.store);
+                                    }
+                                    state.queued.push_back(update)
+                                }
                                 EventOutcome::Error(e) => {
                                     state.done = true;
                                     return Some((Err(e), state));
@@ -1515,6 +1721,9 @@ struct ResponsesSseState {
     call_ids: HashMap<i64, String>,
     done: bool,
     store: Option<bool>,
+    /// Set for a background response, whose updates carry continuation
+    /// tokens.
+    background: Option<BackgroundStream>,
 }
 
 // A transient control-flow value: produced per SSE event and immediately
@@ -2861,6 +3070,7 @@ mod tests {
             call_ids: HashMap::new(),
             done: false,
             store: None,
+            background: None,
         };
         let mut updates = Vec::new();
         // Drain the single chunk manually (mirrors the real unfold body).
@@ -2999,6 +3209,7 @@ mod tests {
             call_ids: HashMap::new(),
             done: false,
             store: None,
+            background: None,
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
         let decoded = state.utf8.push(&bytes);

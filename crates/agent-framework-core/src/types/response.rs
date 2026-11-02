@@ -59,6 +59,32 @@ impl ContinuationToken {
     }
 }
 
+/// Where a resumable (background) operation stands, as reported by the
+/// update that carries it.
+///
+/// Mirrors upstream Python's framework-internal `_operation_state`
+/// (`_types.py`, serialized under the `_operation_state` key). It decides how
+/// [`ChatResponse::absorb_update`] treats an update's
+/// [`continuation_token`](ChatResponseUpdate::continuation_token):
+///
+/// * [`InProgress`](Self::InProgress) — the operation is still running; a
+///   token on the update replaces the aggregated one, and an update without
+///   one leaves it in place (a text delta does not end the operation).
+/// * [`Terminal`](Self::Terminal) — the operation has finished (completed,
+///   incomplete, failed or cancelled), so the aggregated token is cleared:
+///   there is nothing left to resume.
+///
+/// An update with no state keeps the earlier rule: a token it carries is
+/// taken, and its absence changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    /// The operation is queued or running and can be resumed.
+    InProgress,
+    /// The operation has reached a terminal status.
+    Terminal,
+}
+
 /// A full (non-streaming) response from a chat client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatResponse {
@@ -343,8 +369,15 @@ impl ChatResponse {
         if update.finish_reason.is_some() {
             self.finish_reason = update.finish_reason.clone();
         }
-        if update.continuation_token.is_some() {
-            self.continuation_token = update.continuation_token.clone();
+        match update.operation_state {
+            // A finished operation has nothing left to resume, whatever an
+            // earlier update of the same stream said.
+            Some(OperationState::Terminal) => self.continuation_token = None,
+            Some(OperationState::InProgress) | None => {
+                if update.continuation_token.is_some() {
+                    self.continuation_token = update.continuation_token.clone();
+                }
+            }
         }
 
         let role = update.role.clone().unwrap_or_else(Role::assistant);
@@ -646,6 +679,16 @@ pub struct ChatResponseUpdate {
     /// is.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub continuation_token: Option<ContinuationToken>,
+    /// Where the resumable operation this update belongs to stands, when the
+    /// provider knows. See [`OperationState`]: a
+    /// [`Terminal`](OperationState::Terminal) update clears the aggregated
+    /// [`continuation_token`](Self::continuation_token).
+    #[serde(
+        rename = "_operation_state",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub operation_state: Option<OperationState>,
     /// Provider-specific metadata for this update. Merged onto
     /// [`ChatResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -862,6 +905,14 @@ pub struct AgentResponseUpdate {
     /// [`ChatResponseUpdate::continuation_token`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub continuation_token: Option<ContinuationToken>,
+    /// Where the resumable operation stands. See
+    /// [`ChatResponseUpdate::operation_state`].
+    #[serde(
+        rename = "_operation_state",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub operation_state: Option<OperationState>,
     /// Provider-specific metadata for this update. Merged onto
     /// [`AgentResponse::additional_properties`] during aggregation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -918,6 +969,7 @@ impl AgentResponseUpdate {
             created_at: u.created_at.clone(),
             finish_reason: u.finish_reason.clone(),
             continuation_token: u.continuation_token.clone(),
+            operation_state: u.operation_state,
             additional_properties: u.additional_properties.clone(),
             raw_representation: u.raw_representation.clone(),
         }
@@ -937,6 +989,7 @@ impl AgentResponseUpdate {
             // floor, so a streamed run always reported none.
             finish_reason: self.finish_reason,
             continuation_token: self.continuation_token,
+            operation_state: self.operation_state,
             additional_properties: self.additional_properties,
             raw_representation: self.raw_representation,
             ..Default::default()

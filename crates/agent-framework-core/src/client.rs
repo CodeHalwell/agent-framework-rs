@@ -245,7 +245,9 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
         mut options: ChatOptions,
         session: Option<&crate::session::AgentSession>,
     ) -> Result<ChatResponse> {
-        let Some(session) = session else {
+        // A request that resumes a background operation sends no messages,
+        // so queued ones stay queued for the next request that does.
+        let Some(session) = session.filter(|_| options.continuation_token.is_none()) else {
             return self.inner.get_response(messages, options).await;
         };
         let mut conversation = messages;
@@ -269,7 +271,12 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
                         Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
                     )
                 });
-            if follow_up || crate::session::pending_messages(session).is_empty() {
+            // A background operation still running is resumed by the
+            // caller, not by another request here.
+            if follow_up
+                || response.continuation_token.is_some()
+                || crate::session::pending_messages(session).is_empty()
+            {
                 if !earlier.is_empty() {
                     accumulate_usage(&mut usage, response.usage_details.as_ref());
                     earlier.append(&mut response.messages);
@@ -335,6 +342,11 @@ async fn inject_streaming<C: ChatClient + 'static>(
             .collect()
     }
 
+    // A request that resumes a background operation sends no messages, so
+    // queued ones stay queued for the next request that does.
+    if options.continuation_token.is_some() {
+        return inner.get_streaming_response(messages, options).await;
+    }
     // The first call starts here, so its errors surface from this function
     // as they do without injection.
     let mut conversation = messages;
@@ -393,7 +405,10 @@ async fn inject_streaming<C: ChatClient + 'static>(
                             Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
                         )
                     });
-                if follow_up || crate::session::pending_messages(&st.session).is_empty() {
+                if follow_up
+                    || response.continuation_token.is_some()
+                    || crate::session::pending_messages(&st.session).is_empty()
+                {
                     st.done = true;
                     continue;
                 }
@@ -1532,6 +1547,23 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
                 accumulate_usage(&mut aggregated_usage, response.usage_details.as_ref());
 
+                // A background operation that is still running has nothing
+                // for the loop to act on yet: hand it back, token and all, so
+                // the caller can poll it.
+                if response.continuation_token.is_some() {
+                    let mut pending = response;
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut pending.messages);
+                    pending.messages = msgs;
+                    pending.usage_details = aggregated_usage;
+                    return Ok(pending);
+                }
+                // Once the operation has finished, the next request of this
+                // loop submits tool results; it must not retrieve the same
+                // finished operation again (upstream #5394). `background`
+                // stays, so later requests also run in the background.
+                options.continuation_token = None;
+
                 // A call whose result is already present in the same response
                 // was executed by the provider (e.g. Anthropic server-side
                 // web-search/code-execution/MCP `server_tool_use` blocks,
@@ -1974,6 +2006,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         let response_id = response.response_id.clone();
         let finish_reason = response.finish_reason.clone();
         let usage_details = response.usage_details.clone();
+        let continuation_token = response.continuation_token.clone();
         let last = response.messages.len().saturating_sub(1);
         // Keep the provider message ids only when they're all present and
         // distinct; otherwise use positional ids for every message. A service
@@ -2014,13 +2047,18 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     conversation_id: conversation_id.clone(),
                     response_id: response_id.clone(),
                     finish_reason: is_last.then(|| finish_reason.clone()).flatten(),
+                    // The resume handle belongs to the operation, so it rides
+                    // the final update like the finish reason.
+                    continuation_token: is_last.then(|| continuation_token.clone()).flatten(),
                     ..Default::default()
                 })
             })
             .collect();
         // A messageless response (unusual, but possible) still carries its
         // terminal metadata in one trailing update.
-        if updates.is_empty() && (usage_details.is_some() || finish_reason.is_some()) {
+        if updates.is_empty()
+            && (usage_details.is_some() || finish_reason.is_some() || continuation_token.is_some())
+        {
             let contents = usage_details
                 .map(|u| vec![Content::Usage(UsageContent { details: u })])
                 .unwrap_or_default();
@@ -2030,6 +2068,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 conversation_id,
                 response_id,
                 finish_reason,
+                continuation_token,
                 ..Default::default()
             }));
         }

@@ -66,6 +66,16 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   the response saved under `HistorySource::Agent`/`Service`, keeping the
   conversation's own; session saves share the response's cancel/delete lock,
   so a late write cannot recreate a deleted snapshot.
+- Background responses: `ChatOptions` and `AgentRunOptions` gain
+  `background` and `continuation_token`; updates gain `operation_state`
+  (in progress or terminal), and a terminal update clears the aggregated
+  token. `Agent` rejects a continuation token sent with new messages, needs
+  a session for background runs, skips history and context providers when
+  resuming, and records an unfinished reply only once the operation
+  completes. The OpenAI Responses client submits with `background: true`,
+  returns `OpenAIContinuationToken` while a response is queued or in
+  progress, polls with `GET /responses/{id}`, and resumes a stream with
+  `?stream=true&starting_after=N`.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

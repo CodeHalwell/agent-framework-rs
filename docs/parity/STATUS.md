@@ -11,7 +11,7 @@ Each cell counts mapped / adapted / partial / unmapped / intentional. A count is
 | `A2A` | 0 / 4 / 0 / 0 / 0 | 0 / 4 / 0 / 0 / 0 | 0 | 0 |
 | `Anthropic` | 0 / 1 / 0 / 0 / 0 | 0 / 1 / 0 / 0 / 0 | 0 | 0 |
 | `Azure.AI.Projects` | 0 / 2 / 0 / 0 / 0 | 0 / 2 / 0 / 0 / 0 | 0 | 0 |
-| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 154 / 225 / 20 / 63 / 0 | 41 | 22 |
+| `Microsoft.Agents.AI` | 147 / 179 / 12 / 21 / 81 | 156 / 225 / 20 / 61 / 0 | 41 | 22 |
 | `Microsoft.Agents.AI.A2A` | 6 / 3 / 0 / 0 / 0 | 0 / 6 / 3 / 0 / 0 | 0 | 0 |
 | `Microsoft.Agents.AI.Compaction` | 41 / 32 / 0 / 0 / 0 | 59 / 14 / 4 / 0 / 0 | 2 | 4 |
 | `Microsoft.Agents.AI.Foundry` | 7 / 7 / 0 / 3 / 0 | 7 / 8 / 0 / 2 / 0 | 0 | 0 |
@@ -60,8 +60,6 @@ Assessed declarations Rust lacks (`unmapped`) or only partly covers (`partial`).
 | `Microsoft.Agents.AI::AgentRunContext properties::RunOptions` | unmapped | adapted | AgentContext does not expose the run's AgentRunOptions. |
 | `Microsoft.Agents.AI::AgentRunContext properties::Session` | partial | adapted | Tools see the session via FunctionInvocationContext; agent middleware's AgentContext does not carry it. |
 | `Microsoft.Agents.AI::AgentRunContext` | partial | adapted | AgentContext carries messages and metadata through agent middleware but not the agent, session or run options. |
-| `Microsoft.Agents.AI::AgentRunOptions properties::AllowBackgroundResponses` | unmapped | adapted | No way to request a background run; responses only carry a continuation token through. |
-| `Microsoft.Agents.AI::AgentRunOptions properties::ContinuationToken` | unmapped | adapted | A continuation token cannot be passed back to resume or poll a background run. |
 | `Microsoft.Agents.AI::AgentSkillResource properties::Description` | unmapped | mapped | Skill resources are plain name-to-string entries with no description. |
 | `Microsoft.Agents.AI::AgentSkillResource` | partial | adapted | Resources are a name-to-string HashMap on Skill; there is no resource type, description or computed content. |
 | `Microsoft.Agents.AI::AgentSkillsProvider constructors::AgentSkillsProvider(AgentSkillsSource, AgentSkillsProviderOptions, ILoggerFactory, bool)` | partial | adapted | SkillsProvider::new takes a Vec<Skill>; there is no source, options or caching parameter. |

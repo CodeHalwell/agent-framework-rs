@@ -1440,14 +1440,20 @@
             "note": "Extra per-run properties ride on ChatOptions::additional_properties inside chat_options."
           },
           "AllowBackgroundResponses": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "No way to request a background run; responses only carry a continuation token through."
+            "rust": [
+              "agent_framework_core::agent::AgentRunOptions::background",
+              "agent_framework_core::types::options::ChatOptions::background"
+            ],
+            "status": "mapped",
+            "note": "Option<bool> field, also on ChatOptions; a background run requires a session as in .NET."
           },
           "ContinuationToken": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "A continuation token cannot be passed back to resume or poll a background run."
+            "rust": [
+              "agent_framework_core::agent::AgentRunOptions::continuation_token",
+              "agent_framework_core::types::options::ChatOptions::continuation_token"
+            ],
+            "status": "mapped",
+            "note": "Option<ContinuationToken> field, also on ChatOptions; the agent does not wrap the token with saved input and updates as .NET does."
           },
           "ResponseFormat": {
             "rust": [
