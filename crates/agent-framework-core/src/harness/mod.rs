@@ -1,7 +1,8 @@
 //! The experimental agent harness: an agent loop, a todo list, standing tool
-//! approvals, operating modes and file-based memory.
+//! approvals, operating modes, file access, file-based and durable memory,
+//! background agents, and [`create_harness_agent`] to assemble them.
 //!
-//! Rust port of six pieces of upstream's `agent_framework._harness` package
+//! Rust port of upstream's `agent_framework._harness` package
 //! (Python `ExperimentalFeature.HARNESS`, .NET `Microsoft.Agents.AI.Harness`
 //! `[Experimental]`). Everything here sits behind the `experimental-harness`
 //! cargo feature and carries no semver promise; see `docs/feature-stages.md`.
@@ -15,12 +16,9 @@
 //! | `_file_access.py` (the store half): `AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`, `FileStoreEntry`, `FileSearchResult`, `FileSearchMatch` | [`AgentFileStore`], [`InMemoryAgentFileStore`], [`FileSystemAgentFileStore`], [`FileStoreEntry`], [`FileSearchResult`], [`FileSearchMatch`] |
 //! | `_file_access.py` (the tool half): `FileAccessProvider` | [`FileAccessProvider`] |
 //! | `_file_memory.py`: `FileMemoryProvider` | [`FileMemoryProvider`] |
+//! | `_agent.py`: `create_harness_agent` | [`create_harness_agent`], [`HarnessAgent`] |
 //! | `_memory.py`: `MemoryContextProvider`, `MemoryStore`, `MemoryFileStore`, `MemoryTopicRecord`, `MemoryIndexEntry` | [`MemoryContextProvider`], [`MemoryStore`], [`MemoryFileStore`], [`MemoryTopicRecord`], [`MemoryIndexEntry`] |
 //! | `_background_agents.py`: `BackgroundAgentsProvider`, `BackgroundTaskInfo`, `BackgroundTaskStatus`; `_loop.py`: `background_tasks_running`, `background_tasks_running_message` | [`BackgroundAgentsProvider`], [`BackgroundTaskInfo`], [`BackgroundTaskStatus`], [`background_tasks_running`], [`background_tasks_running_message`] |
-//!
-//! # Not ported here
-//!
-//! - The full `create_harness_agent` assembly is out of scope for now.
 //!
 //! # Divergences from upstream
 //!
@@ -55,6 +53,7 @@ pub mod background_agents;
 pub mod file_access;
 pub mod file_memory;
 pub mod file_store;
+pub mod harness_agent;
 pub mod memory;
 pub mod mode;
 pub mod todo;
@@ -89,6 +88,9 @@ pub use file_store::{
     normalize_relative_path, scan_content, slice_lines, split_lines, AgentFileStore, FileLineEdit,
     FileSearchMatch, FileSearchResult, FileStoreEntry, FileStoreEntryType,
     FileSystemAgentFileStore, InMemoryAgentFileStore, MAX_SEARCH_PATTERN_LENGTH, SEARCH_TIMEOUT,
+};
+pub use harness_agent::{
+    create_harness_agent, HarnessAgent, HarnessAgentBuilder, DEFAULT_HARNESS_INSTRUCTIONS,
 };
 pub use memory::{
     format_memory_timestamp, parse_memory_timestamp, slugify_topic, HistoryMessageFilter,
