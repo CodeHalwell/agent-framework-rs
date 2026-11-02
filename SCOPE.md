@@ -82,7 +82,8 @@ from the roadmap, not from this file.
   skills beyond inline skills (scripts, file-based sources, source
   pipelines); compaction's message-group model, triggers and summarization;
   workflow telemetry, run cancellation and graph reflection; message source
-  attribution and message injection; history persisted after every model
+  attribution; message injection while streaming (it is ported for
+  non-streaming calls); history persisted after every model
   call rather than every run (upstream's
   `require_per_service_call_history_persistence`, which
   `create_harness_agent` turns on); context providers seeing the agent

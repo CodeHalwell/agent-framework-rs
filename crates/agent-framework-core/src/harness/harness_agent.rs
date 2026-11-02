@@ -30,8 +30,9 @@
 //! - **Wrappers, not middleware.** Tool approval and the loop are agent
 //!   wrappers in this port (see the [harness docs](super)), so the result
 //!   nests `LoopAgent(ToolApprovalAgent(Agent))` instead of one agent with
-//!   middleware. Message injection (`MessageInjectionMiddleware`) is not
-//!   ported, so it is not wired.
+//!   middleware. Message injection needs no wiring: it is built into every
+//!   agent's function-invocation loop (see
+//!   [`enqueue_messages`](crate::session::enqueue_messages)).
 //! - **History.** History stays on the session, as everywhere in this
 //!   port: a session from [`HarnessAgent::create_session`] gets an
 //!   in-memory history provider. Attach another history provider to the

@@ -613,6 +613,9 @@ impl Agent {
             });
         }
         let mut history = ctx.messages;
+        // A provider may rewrite the run's input (for example to strip an
+        // attachment it has analyzed and summarized), as upstream allows.
+        let input_for_model = ctx.input_messages;
 
         // Deduplicate by name: a tool may be defined on the agent and also
         // injected by a context provider. Providers rejecting duplicate
@@ -656,7 +659,7 @@ impl Agent {
             }
         }
 
-        history.extend(input.iter().cloned());
+        history.extend(input_for_model);
         let instructions = options.instructions.take();
         let final_messages = prepare_messages(history, instructions.as_deref());
 

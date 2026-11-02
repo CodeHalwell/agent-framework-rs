@@ -196,12 +196,63 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
         &self.inner
     }
 
+    /// One model call, with message injection: messages queued on the
+    /// session ([`enqueue_messages`](crate::session::enqueue_messages)) are
+    /// appended first, and while the reply asks for nothing more (no
+    /// function call or approval) and messages are still queued, another
+    /// call answers them. The injected messages and the replies of those
+    /// extra calls are returned, in order, ahead of the last reply, so the
+    /// tool loop's later requests and the session history both carry them.
     async fn inner_get_response(
         &self,
         messages: Vec<Message>,
-        options: ChatOptions,
+        mut options: ChatOptions,
+        session: Option<&crate::session::AgentSession>,
     ) -> Result<ChatResponse> {
-        self.inner.get_response(messages, options).await
+        let Some(session) = session else {
+            return self.inner.get_response(messages, options).await;
+        };
+        let mut conversation = messages;
+        let mut earlier: Vec<Message> = Vec::new();
+        let mut usage: Option<UsageDetails> = None;
+        loop {
+            let injected = crate::session::drain_pending_messages(session);
+            earlier.extend(injected.iter().cloned());
+            conversation.extend(injected);
+            let mut response = self
+                .inner
+                .get_response(conversation.clone(), options.clone())
+                .await?;
+            let follow_up = response
+                .messages
+                .iter()
+                .flat_map(|m| m.contents.iter())
+                .any(|c| {
+                    matches!(
+                        c,
+                        Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
+                    )
+                });
+            if follow_up || crate::session::pending_messages(session).is_empty() {
+                if !earlier.is_empty() {
+                    accumulate_usage(&mut usage, response.usage_details.as_ref());
+                    earlier.append(&mut response.messages);
+                    response.messages = earlier;
+                    response.usage_details = usage;
+                }
+                return Ok(response);
+            }
+            accumulate_usage(&mut usage, response.usage_details.as_ref());
+            match response.conversation_id.clone() {
+                // The service holds the history: send only what is new.
+                Some(cid) => {
+                    options.conversation_id = Some(cid);
+                    conversation.clear();
+                }
+                None => conversation.extend(response.messages.iter().cloned()),
+            }
+            earlier.extend(response.messages);
+        }
     }
 }
 
@@ -1017,7 +1068,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             let mut messages = messages;
             drop_settled_approval_responses(&mut messages);
             if executable_tools(&options).is_empty() || !self.config.enabled {
-                return self.inner_get_response(messages, options).await;
+                return self
+                    .inner_get_response(messages, options, session.as_ref())
+                    .await;
             }
 
             // The run's live tool list (progressive tool exposure): handed to
@@ -1179,7 +1232,7 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
                 }
 
                 let response = self
-                    .inner_get_response(conversation.clone(), options.clone())
+                    .inner_get_response(conversation.clone(), options.clone(), session.as_ref())
                     .await
                     // An error ends the run, so a budget parked by an earlier
                     // approval must not outlive it: the next, unrelated run on
@@ -1540,7 +1593,9 @@ impl<C: ChatClient> ChatClient for FunctionInvokingChatClient<C> {
             // Failsafe: one final call with tools disabled.
             InvocationBudget::clear(session.as_ref());
             options.tool_choice = Some(ToolMode::None);
-            let mut final_resp = self.inner_get_response(conversation, options).await?;
+            let mut final_resp = self
+                .inner_get_response(conversation, options, session.as_ref())
+                .await?;
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);
             msgs.append(&mut final_resp.messages);

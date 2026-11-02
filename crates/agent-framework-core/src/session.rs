@@ -290,6 +290,75 @@ impl AgentSession {
     }
 }
 
+/// The session-state key holding messages queued for injection; see
+/// [`enqueue_messages`]. Upstream's
+/// `MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY`.
+pub const MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY: &str = "message_injection.pending_messages";
+
+/// Serializes queue edits across clones of one session's state bag.
+static MESSAGE_INJECTION_LOCK: Mutex<()> = Mutex::new(());
+
+fn queued(session: &AgentSession) -> Vec<crate::types::Message> {
+    session
+        .state
+        .get(MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY)
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Queue `messages` for the next model call of a run on `session`.
+///
+/// Port of upstream's `enqueue_messages` / `MessageInjectionMiddleware`.
+/// Messages can be queued before a run or while one is in progress (for
+/// example from a tool, through `FunctionInvocationContext::session`). The
+/// function-invocation loop appends them to the next request it sends, and
+/// when a model call would end the run while messages are still queued, it
+/// makes another call so they are answered. The injected messages are part
+/// of the run's response, so session history records them.
+///
+/// Injection is built into the function-invocation loop (always on, and a
+/// no-op while nothing is queued) rather than being a middleware the caller
+/// adds. It applies to non-streaming model calls; a token-streaming run
+/// leaves the queue for its next non-streaming call.
+pub fn enqueue_messages(session: &AgentSession, messages: impl crate::types::IntoMessages) {
+    let messages = messages.into_messages();
+    if messages.is_empty() {
+        return;
+    }
+    let _guard = MESSAGE_INJECTION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut queue = queued(session);
+    queue.extend(messages);
+    session.state.insert(
+        MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY,
+        serde_json::to_value(queue).unwrap_or(Value::Null),
+    );
+}
+
+/// A snapshot of the messages queued on `session`.
+pub fn pending_messages(session: &AgentSession) -> Vec<crate::types::Message> {
+    let _guard = MESSAGE_INJECTION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queued(session)
+}
+
+/// Take every queued message off `session`.
+pub(crate) fn drain_pending_messages(session: &AgentSession) -> Vec<crate::types::Message> {
+    let _guard = MESSAGE_INJECTION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let queue = queued(session);
+    if !queue.is_empty() {
+        session.state.insert(
+            MESSAGE_INJECTION_PENDING_MESSAGES_STATE_KEY,
+            Value::Array(Vec::new()),
+        );
+    }
+    queue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

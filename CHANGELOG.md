@@ -48,6 +48,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - **Cloud streaming**: Anthropic on Foundry, Vertex and Bedrock now stream
   (Bedrock via a new AWS event-stream decoder), and the Bedrock Converse
   client streams through `converse-stream` instead of buffering.
+- Message injection: `session::enqueue_messages` / `pending_messages`
+  queue messages for a run's next model call, including from a tool
+  mid-run; a queue left at the end of a turn earns another call. Built into
+  the function-invocation loop for non-streaming calls.
+- Context providers can rewrite `SessionContext::input_messages`; the model
+  receives the rewritten input, as upstream allows.
 - `ContextProvider::after_run_in_session`: the completion hook with the
   run's session. It defaults to `after_run`, and agents now call it.
 - `SupportsAgentRun::description()` (defaulted), reported by `Agent`,

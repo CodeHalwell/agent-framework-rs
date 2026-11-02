@@ -30,7 +30,9 @@ pub struct SessionContext {
     /// per-session state through it. Mirrors the `session` argument of
     /// upstream's `before_run`.
     pub session: Option<crate::session::AgentSession>,
-    /// The run's input messages (read-only for providers).
+    /// The run's input messages. A provider may rewrite them (for example
+    /// to strip an attachment it has analyzed); the model receives the
+    /// rewritten input, while `after_run` still sees the caller's original.
     pub input_messages: Vec<Message>,
     /// Extra system instructions to inject (providers append via add_instructions).
     pub instructions: Option<String>,
