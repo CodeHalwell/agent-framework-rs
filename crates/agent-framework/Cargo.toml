@@ -32,6 +32,9 @@ mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
+# The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it
+# implies `experimental-vector-stores` and is not part of `full`.
+qdrant = ["dep:agent-framework-qdrant", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -71,6 +74,7 @@ experimental = [
     "experimental-harness",
     "experimental-session-store",
     "experimental-declarative-agents",
+    "qdrant",
 ]
 full = [
     "openai",
@@ -116,6 +120,7 @@ agent-framework-mem0 = { workspace = true, optional = true }
 agent-framework-foundry = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
+agent-framework-qdrant = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }
 agent-framework-purview = { workspace = true, optional = true }
 agent-framework-tools = { workspace = true, optional = true }

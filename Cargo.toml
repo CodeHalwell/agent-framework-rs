@@ -19,6 +19,7 @@ members = [
     "crates/agent-framework-mem0",
     "crates/agent-framework-foundry",
     "crates/agent-framework-azure-ai-search",
+    "crates/agent-framework-qdrant",
     "crates/agent-framework-cosmos",
     "crates/agent-framework-copilotstudio",
     "crates/agent-framework-purview",
@@ -135,6 +136,7 @@ agent-framework-redis = { path = "crates/agent-framework-redis", version = "0.14
 agent-framework-mem0 = { path = "crates/agent-framework-mem0", version = "0.14.0" }
 agent-framework-foundry = { path = "crates/agent-framework-foundry", version = "0.14.0" }
 agent-framework-azure-ai-search = { path = "crates/agent-framework-azure-ai-search", version = "0.14.0" }
+agent-framework-qdrant = { path = "crates/agent-framework-qdrant", version = "0.14.0" }
 agent-framework-cosmos = { path = "crates/agent-framework-cosmos", version = "0.14.0" }
 agent-framework-copilotstudio = { path = "crates/agent-framework-copilotstudio", version = "0.14.0" }
 agent-framework-purview = { path = "crates/agent-framework-purview", version = "0.14.0" }

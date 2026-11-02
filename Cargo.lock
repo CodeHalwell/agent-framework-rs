@@ -26,6 +26,7 @@ dependencies = [
  "agent-framework-ollama",
  "agent-framework-openai",
  "agent-framework-purview",
+ "agent-framework-qdrant",
  "agent-framework-redis",
  "agent-framework-tools",
  "async-trait",
@@ -427,6 +428,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agent-framework-qdrant"
+version = "0.14.0"
+dependencies = [
+ "agent-framework-core",
+ "async-trait",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
