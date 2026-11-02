@@ -1334,3 +1334,35 @@ async fn cancelling_a_finished_background_turn_keeps_it_completed() {
         );
     }
 }
+
+#[tokio::test]
+async fn sibling_continuations_do_not_share_history() {
+    use agent_framework_foundry_hosting::HistorySource;
+    let echo = Echo::default();
+    let router = ResponsesHostServer::agent(agent(echo.clone()))
+        .with_history_source(HistorySource::Agent)
+        .into_router();
+    let (_, a) = json(&router, post("/responses", json!({"input": "a"}))).await;
+    let (status, _) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "b", "previous_response_id": a["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "c", "previous_response_id": a["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let seen = echo.seen.lock().unwrap();
+    let c: Vec<String> = seen.last().unwrap().iter().map(|m| m.text()).collect();
+    assert_eq!(c.len(), 3, "a, its reply, and c: {c:?}");
+    assert!(!c.iter().any(|t| t == "b"), "C must not see B: {c:?}");
+}

@@ -242,7 +242,7 @@ pub struct ResponsesHostServer {
     #[cfg(feature = "session-store")]
     sessions: Arc<dyn crate::sessions::SessionStoreProvider>,
     #[cfg(not(feature = "session-store"))]
-    sessions: Arc<Mutex<HashMap<String, agent_framework_core::session::AgentSession>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionSnapshot>>>,
 }
 
 impl std::fmt::Debug for ResponsesHostServer {
@@ -1270,9 +1270,13 @@ async fn execute(
     } else {
         Some(server.host_sessions(&request.context)?)
     };
-    let mut session = match &sessions {
-        None => agent.create_session(),
-        Some(sessions) => load_session(sessions, request, agent.as_ref()).await?,
+    let (mut session, local_history) = match &sessions {
+        None => (agent.create_session(), None),
+        Some(sessions) => {
+            let (mut session, prior) = load_session(sessions, request, agent.as_ref()).await?;
+            let history = attach_local_history(&mut session, prior);
+            (session, history)
+        }
     };
     let response = match events {
         None => {
@@ -1313,6 +1317,7 @@ async fn execute(
                     agent.as_ref(),
                     &response_session_key(&request.response_id),
                     &session,
+                    local_history.as_ref(),
                 )
                 .await?;
             if let Some(conversation) = &request.conversation_id {
@@ -1321,6 +1326,7 @@ async fn execute(
                         agent.as_ref(),
                         &conversation_session_key(conversation),
                         &session,
+                        local_history.as_ref(),
                     )
                     .await?;
             }
@@ -1343,23 +1349,72 @@ fn conversation_session_key(conversation_id: &str) -> String {
 #[cfg(feature = "session-store")]
 struct HostSessions(Arc<dyn agent_framework_core::session_store::AgentSessionStore>);
 #[cfg(not(feature = "session-store"))]
-struct HostSessions(Arc<Mutex<HashMap<String, agent_framework_core::session::AgentSession>>>);
+struct HostSessions(Arc<Mutex<HashMap<String, SessionSnapshot>>>);
+
+/// A detached copy of a session (its `to_dict` state and the messages of the
+/// history provider the host attached), so each response keeps its own
+/// continuation state: live clones would share the state bag and history.
+#[cfg(not(feature = "session-store"))]
+#[derive(Clone)]
+struct SessionSnapshot {
+    state: Value,
+    history: Option<Vec<Message>>,
+}
+
+/// Without the `session-store` feature the host owns the local history: it
+/// attaches an in-memory history provider (seeded from the snapshot) to a
+/// session the service does not manage, and keeps its handle to snapshot it.
+#[cfg(not(feature = "session-store"))]
+fn attach_local_history(
+    session: &mut agent_framework_core::session::AgentSession,
+    prior: Option<Vec<Message>>,
+) -> Option<agent_framework_core::history::InMemoryHistoryProvider> {
+    if session.service_session_id().is_some() {
+        return None;
+    }
+    let provider = agent_framework_core::history::InMemoryHistoryProvider::with_messages(
+        prior.unwrap_or_default(),
+    );
+    session
+        .context_providers
+        .insert(0, Arc::new(provider.clone()));
+    Some(provider)
+}
+
+#[cfg(feature = "session-store")]
+fn attach_local_history(
+    _session: &mut agent_framework_core::session::AgentSession,
+    _prior: Option<Vec<Message>>,
+) -> Option<agent_framework_core::history::InMemoryHistoryProvider> {
+    None
+}
+
+/// What [`HostSessions::load`] returns: the session and, without the
+/// `session-store` feature, its detached history.
+type LoadedSession = (
+    agent_framework_core::session::AgentSession,
+    Option<Vec<Message>>,
+);
 
 impl HostSessions {
-    async fn load(
-        &self,
-        agent: &dyn SupportsAgentRun,
-        key: &str,
-    ) -> Result<Option<agent_framework_core::session::AgentSession>> {
+    async fn load(&self, agent: &dyn SupportsAgentRun, key: &str) -> Result<Option<LoadedSession>> {
         #[cfg(feature = "session-store")]
         {
             let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
-            self.0.get_session(agent, &key).await
+            Ok(self.0.get_session(agent, &key).await?.map(|s| (s, None)))
         }
         #[cfg(not(feature = "session-store"))]
         {
             let _ = agent;
-            Ok(self.0.lock().unwrap().get(key).cloned())
+            let snapshot = self.0.lock().unwrap().get(key).cloned();
+            snapshot
+                .map(|snapshot| {
+                    Ok((
+                        agent_framework_core::session::AgentSession::from_dict(&snapshot.state)?,
+                        snapshot.history,
+                    ))
+                })
+                .transpose()
         }
     }
 
@@ -1368,19 +1423,22 @@ impl HostSessions {
         agent: &dyn SupportsAgentRun,
         key: &str,
         session: &agent_framework_core::session::AgentSession,
+        history: Option<&agent_framework_core::history::InMemoryHistoryProvider>,
     ) -> Result<()> {
         #[cfg(feature = "session-store")]
         {
+            let _ = history;
             let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
             self.0.save_session(agent, &key, session).await
         }
         #[cfg(not(feature = "session-store"))]
         {
             let _ = agent;
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), session.clone());
+            let snapshot = SessionSnapshot {
+                state: session.to_dict(),
+                history: history.map(|h| h.list_messages()),
+            };
+            self.0.lock().unwrap().insert(key.to_string(), snapshot);
             Ok(())
         }
     }
@@ -1390,7 +1448,7 @@ async fn load_session(
     sessions: &HostSessions,
     request: &HostedResponseRequest,
     agent: &dyn SupportsAgentRun,
-) -> std::result::Result<agent_framework_core::session::AgentSession, TurnError> {
+) -> std::result::Result<LoadedSession, TurnError> {
     let key = match (&request.conversation_id, &request.previous_response_id) {
         (Some(conversation), _) => Some(conversation_session_key(conversation)),
         (None, Some(previous)) => Some(response_session_key(previous)),
@@ -1405,11 +1463,11 @@ async fn load_session(
         &request.previous_response_id,
         &request.conversation_id,
     ) {
-        (Some(session), _, _) => Ok(session),
+        (Some(loaded), _, _) => Ok(loaded),
         (None, Some(previous), None) => Err(TurnError::Public(format!(
             "Cannot find an existing agent session for previous_response_id={previous}."
         ))),
-        _ => Ok(agent.create_session()),
+        _ => Ok((agent.create_session(), None)),
     }
 }
 
