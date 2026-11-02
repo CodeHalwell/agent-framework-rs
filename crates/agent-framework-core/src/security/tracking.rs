@@ -231,8 +231,7 @@ impl LabelTrackingFunctionMiddleware {
     }
 
     fn update_context_label(&self, session: Option<&AgentSession>, new: &ContentLabel) {
-        let old = self.scope.context_label(session);
-        let updated = combine_labels([&old, new]);
+        let (old, updated) = self.scope.join_context_label(session, new);
         if updated != old {
             tracing::info!(
                 from = %old,
@@ -240,7 +239,6 @@ impl LabelTrackingFunctionMiddleware {
                 "security context label tainted"
             );
         }
-        self.scope.set_context_label(session, &updated);
     }
 
     fn should_hide(

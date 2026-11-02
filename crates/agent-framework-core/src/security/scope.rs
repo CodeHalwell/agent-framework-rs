@@ -99,6 +99,25 @@ impl SecurityScope {
         })
     }
 
+    /// Join `new` into the context label in one locked read-modify-write,
+    /// so concurrent runs sharing a session's state can only add
+    /// restrictions, never drop one another's. Returns `(old, updated)`.
+    pub(crate) fn join_context_label(
+        &self,
+        session: Option<&AgentSession>,
+        new: &ContentLabel,
+    ) -> (ContentLabel, ContentLabel) {
+        self.with_state(session, |s| {
+            let old = s
+                .get(STATE_CONTEXT_LABEL)
+                .and_then(|v| ContentLabel::from_value(v).ok())
+                .unwrap_or_default();
+            let updated = super::combine_labels([&old, new]);
+            s.insert(STATE_CONTEXT_LABEL.into(), updated.to_value());
+            (old, updated)
+        })
+    }
+
     pub(crate) fn set_context_label(&self, session: Option<&AgentSession>, label: &ContentLabel) {
         self.with_state(session, |s| {
             s.insert(STATE_CONTEXT_LABEL.into(), label.to_value());

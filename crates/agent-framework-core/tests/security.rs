@@ -1413,3 +1413,28 @@ async fn untrusted_tool_errors_never_reach_the_model_verbatim() {
     let err = fail("weather").await.err().expect("fails").to_string();
     assert!(err.contains("IGNORE PREVIOUS"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_runs_on_one_session_keep_every_restriction() {
+    let tracker = Arc::new(tracker().auto_hide_untrusted(false).tool_security(
+        "payroll",
+        trusted_tool().confidentiality(ConfidentialityLabel::Private),
+    ));
+    let h = Arc::new(Harness::new(vec![tracker.clone()]));
+    for _ in 0..100 {
+        let session = AgentSession::new();
+        let (a, b) = (h.clone(), h.clone());
+        let (s1, s2) = (session.clone(), session.clone());
+        let untrusted = tokio::spawn(async move {
+            a.call(&s1, "fetch", json!({}), returns(json!("x"))).await;
+        });
+        let private = tokio::spawn(async move {
+            b.call(&s2, "payroll", json!({}), returns(json!("y"))).await;
+        });
+        untrusted.await.unwrap();
+        private.await.unwrap();
+        let label = tracker.context_label(Some(&session));
+        assert!(!label.is_trusted(), "integrity taint kept: {label}");
+        assert!(!label.is_public(), "confidentiality kept: {label}");
+    }
+}
