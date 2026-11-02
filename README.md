@@ -226,8 +226,9 @@ features and carry no semver promise. `full` leaves them out, and
 | `experimental-progressive-tools` | `LiveToolList`, and adding or removing tools mid-run from `FunctionInvocationContext` |
 | `experimental-agent-hooks` | `agent_framework_core::agent_hooks`: AGENT-HOOKS-0.1 interception (allow / deny / transform verdicts at the agent, model-call and tool-call seams), enforced fail-closed |
 | `experimental-harness` | `agent_framework_core::harness`: the agent loop (`LoopAgent`, `Judge`, `todos_remaining`), `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`, the file store, `FileAccessProvider`, `FileMemoryProvider`, `BackgroundAgentsProvider`, `MemoryContextProvider` and `create_harness_agent` |
+| `experimental-evals` | `agent_framework_core::evaluation`: `evaluate_agent`, `evaluate_workflow`, `LocalEvaluator` with keyword / tool-call / function checks, and CI assertions on the results |
 | `experimental-declarative-agents` | [`agent-framework-declarative`](crates/agent-framework-declarative): YAML/JSON agents and workflows |
-| `experimental` | all six |
+| `experimental` | all of them |
 
 ```toml
 # Every stable integration (no experimental APIs):

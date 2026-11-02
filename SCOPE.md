@@ -51,9 +51,10 @@ from the roadmap, not from this file.
   result-label flow (labels reach the combined verdict and the record but
   are not persisted with the produced data or resurfaced as
   `source_labels`; upstream's framework layer does not do this either).
-- **Evaluation** and **security (FIDES)**: both marked experimental
-  upstream; when ported they go behind `experimental-*` features (see
-  `docs/feature-stages.md`).
+- **Security (FIDES)**: marked experimental upstream; when ported it goes
+  behind an `experimental-*` feature (see `docs/feature-stages.md`).
+  Evaluation is ported (`experimental-evals`); Foundry's cloud evaluator
+  (`FoundryEvals`) is not.
 - **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
 - **Foundry server-hosted agents**: `FoundryAgent` realises a Prompt Agent
   client-side and cannot yet bind to an agent hosted on the Foundry control

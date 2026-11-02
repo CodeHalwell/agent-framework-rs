@@ -275,6 +275,7 @@ pub(crate) async fn run_agent_and_emit(
     author: &str,
     ctx: &WorkflowContext,
 ) -> Result<AgentResponse> {
+    let input = serde_json::to_value(&conversation).unwrap_or(Value::Null);
     let mut stream = agent.run_stream(conversation, None, None).await?;
     let mut updates: Vec<AgentResponseUpdate> = Vec::new();
     while let Some(item) = stream.next().await {
@@ -301,6 +302,7 @@ pub(crate) async fn run_agent_and_emit(
         ctx.add_event(WorkflowEvent::AgentRun {
             executor_id: executor_id.to_string(),
             response: resp_value,
+            input,
         });
     }
     Ok(response)

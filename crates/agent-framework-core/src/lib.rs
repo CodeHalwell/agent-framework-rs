@@ -82,6 +82,9 @@ pub mod agent_hooks;
 pub mod client;
 pub mod compaction;
 pub mod error;
+#[cfg(feature = "experimental-evals")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-evals")))]
+pub mod evaluation;
 #[cfg(feature = "experimental-harness")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-harness")))]
 pub mod harness;

@@ -1390,6 +1390,11 @@ impl AgentBuilder {
 }
 
 impl Agent {
+    /// The tool definitions the agent offers on every run.
+    pub fn tools(&self) -> &[ToolDefinition] {
+        &self.chat_options.tools
+    }
+
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()

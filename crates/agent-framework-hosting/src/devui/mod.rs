@@ -808,6 +808,7 @@ fn workflow_event_data(ev: &WorkflowEvent) -> Value {
         WorkflowEvent::AgentRun {
             executor_id,
             response,
+            ..
         } => json!({
             "event_type": "AgentRunEvent",
             "executor_id": executor_id,

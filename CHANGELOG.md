@@ -17,6 +17,37 @@ Round four takes the two security items earlier rounds had left for a
 decision, and clears the rest of the queue. A review of the official Azure
 SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
+### Added (parity push)
+
+Closing items from `SCOPE.md`'s "Not yet ported" list:
+
+- **Harness complete** (`experimental-harness`): `FileAccessProvider`,
+  `TodoFileStore`, `BackgroundAgentsProvider` with the
+  `background_tasks_running` loop callbacks, `MemoryContextProvider` with
+  `MemoryStore` / `MemoryFileStore`, and `create_harness_agent`
+  (`HarnessAgent`). File-access and file-memory edits now share one lock
+  per store and folder, as upstream.
+- **Evaluation** (`experimental-evals`): `evaluate_agent`,
+  `evaluate_workflow`, `LocalEvaluator`, the keyword / tool-call /
+  function checks and `EvalResults` CI assertions.
+- **`agent-framework-qdrant`**: the Qdrant vector store (umbrella feature
+  `qdrant`, experimental).
+- **Cloud streaming**: Anthropic on Foundry, Vertex and Bedrock now stream
+  (Bedrock via a new AWS event-stream decoder), and the Bedrock Converse
+  client streams through `converse-stream` instead of buffering.
+- `ContextProvider::after_run_in_session`: the completion hook with the
+  run's session. It defaults to `after_run`, and agents now call it.
+- `SupportsAgentRun::description()` (defaulted), reported by `Agent`,
+  `WorkflowAgent`, `A2AAgent` and `CopilotStudioAgent`; `Agent::tools()`.
+
+### Changed (parity push)
+
+- **Breaking:** `WorkflowEvent::AgentRun` gains an `input` field (the
+  conversation the agent ran over), which evaluation needs. Patterns that
+  name every field need a `..`.
+- `Message::text()` and the update text accessors join only plain text, as
+  upstream does, so model reasoning no longer leaks into the answer text.
+
 ### Security (round four)
 
 - `agent-framework-redis` no longer returns one scope's memories under

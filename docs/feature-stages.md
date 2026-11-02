@@ -43,11 +43,12 @@ can upstream.
 <!-- feature-table: kept in sync by `cargo xtask features check` -->
 | Feature | Upstream id | Crates | What it gates |
 |---|---|---|---|
-| `experimental-vector-stores` | `VECTOR_STORES` | `agent-framework-core`, `agent-framework-cosmos`, `agent-framework-azure-ai-search` | `agent_framework_core::vectors` (stores, collections, portable filters, the vector-collection tools provider), `CosmosVectorStore`, `AzureAISearchStore` |
+| `experimental-vector-stores` | `VECTOR_STORES` | `agent-framework-core`, `agent-framework-cosmos`, `agent-framework-azure-ai-search` | `agent_framework_core::vectors` (stores, collections, portable filters, the vector-collection tools provider), `CosmosVectorStore`, `AzureAISearchStore`, `agent-framework-qdrant` (the whole crate) |
 | `experimental-file-history` | `FILE_HISTORY` | `agent-framework-core` | `history::FileHistoryProvider` |
 | `experimental-progressive-tools` | `PROGRESSIVE_TOOLS` | `agent-framework-core` | `middleware::LiveToolList` and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}`. The function-calling loop still uses the live list internally, so behaviour is unchanged; only the public handle is gated. |
 | `experimental-agent-hooks` | `AGENT_HOOKS` | `agent-framework-core` | `agent_framework_core::agent_hooks` (the AGENT-HOOKS-0.1 interception types, emitter and the `AgentHooks` enforcement bundle), `AgentBuilder::build_with_agent_hooks` and `Error::InterceptionBlocked` |
 | `experimental-harness` | `HARNESS` | `agent-framework-core` | `agent_framework_core::harness`: `LoopAgent` (with `Judge` and `todos_remaining`), `TodoProvider`, `ToolApprovalAgent`, `AgentModeProvider`, the file store (`AgentFileStore`, `InMemoryAgentFileStore`, `FileSystemAgentFileStore`), `FileAccessProvider`, `FileMemoryProvider`, `TodoFileStore`, `BackgroundAgentsProvider`, `MemoryContextProvider` (with `MemoryFileStore`) and `create_harness_agent` (`HarnessAgent`). |
+| `experimental-evals` | `EVALS` | `agent-framework-core` | `agent_framework_core::evaluation`: `EvalItem`, `Evaluator`, `LocalEvaluator` and its checks, `EvalResults` with the CI assertions, `evaluate_agent` and `evaluate_workflow` |
 | `experimental-session-store` | `SESSION_STORE` | `agent-framework-core` | `agent_framework_core::session_store` (`AgentSessionStore`, `AgentSessionStoreKey`, `InMemoryAgentSessionStore`, `FileAgentSessionStore`, `serialize_session`, `deserialize_session`) and `ContextProvider::snapshot_history` |
 | `experimental-declarative-agents` | `DECLARATIVE_AGENTS` | `agent-framework-declarative` | The whole crate, which is empty without it |
 <!-- /feature-table -->

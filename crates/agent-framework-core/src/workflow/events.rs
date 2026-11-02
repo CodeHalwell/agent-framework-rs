@@ -54,6 +54,11 @@ pub enum WorkflowEvent {
     AgentRun {
         executor_id: String,
         response: Value,
+        /// The conversation the agent was run over (a JSON array of
+        /// messages), as upstream's `AgentExecutorResponse.full_conversation`
+        /// carries it. `null` from producers that do not record it.
+        #[serde(default)]
+        input: Value,
     },
     /// A workflow-level output was yielded (`WorkflowOutputEvent`).
     ///
