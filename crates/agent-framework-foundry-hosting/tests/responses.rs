@@ -2336,3 +2336,150 @@ async fn unstored_turns_keep_no_approval_state() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("store=true"), "{body}");
 }
+
+/// Asks for two computer actions, then reports the results it got.
+#[cfg(feature = "experimental-computer-use")]
+struct Operator;
+
+#[cfg(feature = "experimental-computer-use")]
+#[async_trait::async_trait]
+impl ChatClient for Operator {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        _: ChatOptions,
+    ) -> agent_framework_core::error::Result<ChatResponse> {
+        use agent_framework_core::types::ComputerToolCallContent;
+        let results: Vec<String> = messages
+            .iter()
+            .flat_map(|m| &m.contents)
+            .filter_map(|c| match c {
+                Content::ComputerToolResult(r) => Some(r.call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let contents = if results.is_empty() {
+            ["call_a", "call_b"]
+                .into_iter()
+                .map(|call_id| {
+                    Content::ComputerToolCall(ComputerToolCallContent {
+                        id: format!("cu_{call_id}"),
+                        call_id: call_id.into(),
+                        actions: vec![json!({"type": "click", "x": 1, "y": 2})],
+                        status: Some("completed".into()),
+                        pending_safety_checks: None,
+                        user_input_request: true,
+                        additional_properties: Default::default(),
+                    })
+                })
+                .collect()
+        } else {
+            vec![Content::text(format!("results for {}", results.join(",")))]
+        };
+        Ok(ChatResponse {
+            messages: vec![agent_framework_core::types::Message::with_contents(
+                Role::assistant(),
+                contents,
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let response = self.get_response(messages, options).await?;
+        let update = agent_framework_core::types::ChatResponseUpdate {
+            contents: response.messages[0].contents.clone(),
+            role: Some(Role::assistant()),
+            ..Default::default()
+        };
+        Ok(futures::stream::iter(vec![Ok(update)]).boxed())
+    }
+}
+
+/// A built-in `AgentExecutor` pauses with a `ComputerUseRequest` envelope:
+/// each pending call is a `computer_call` item, and the `computer_call_output`
+/// replies together resume the workflow.
+#[cfg(feature = "experimental-computer-use")]
+#[tokio::test]
+async fn an_agent_executor_computer_pause_round_trips() {
+    use agent_framework_core::workflow::{
+        AgentExecutor, CheckpointStorage, InMemoryCheckpointStorage,
+    };
+    let storage: Arc<dyn CheckpointStorage> = Arc::new(InMemoryCheckpointStorage::new());
+    let router = ResponsesHostServer::workflow(|req| {
+        let agent: Arc<dyn SupportsAgentRun> =
+            Arc::new(Agent::builder(Operator).name("operator").build());
+        let mut builder = WorkflowBuilder::new()
+            .add_executor(Arc::new(
+                AgentExecutor::new("operator", agent).with_output(true),
+            ))
+            .set_start("operator");
+        if let Some(storage) = req.checkpoint_storage.clone() {
+            builder = builder.with_checkpointing(storage);
+        }
+        builder.build()
+    })
+    .with_checkpoint_store(storage)
+    .into_router();
+    let (status, first) = json(&router, post("/responses", json!({"input": "click twice"}))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let calls: Vec<&serde_json::Value> = first["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "computer_call")
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one computer_call item per pending call: {first}"
+    );
+    assert!(
+        first["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["name"] != "request_info"),
+        "{first}"
+    );
+    let reply = |call: &serde_json::Value| {
+        json!({
+            "type": "computer_call_output",
+            "call_id": call["call_id"],
+            "output": {"type": "computer_screenshot", "image_url": "https://x/after.png"},
+        })
+    };
+    // Every pending call must be answered.
+    let (status, partial) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"previous_response_id": first["id"], "input": [reply(calls[0])]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{partial}");
+    // Answered in either order, the workflow resumes with both results.
+    let (status, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"previous_response_id": first["id"], "input": [reply(calls[1]), reply(calls[0])]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"], "completed", "{second}");
+    assert!(
+        second["output_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("results for call_a,call_b"),
+        "{second}"
+    );
+}

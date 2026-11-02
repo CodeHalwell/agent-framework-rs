@@ -1655,6 +1655,20 @@ async fn execute(
                     let mut requests = Vec::new();
                     let mut request_data = Vec::new();
                     for request in &pending {
+                        // A built-in `AgentExecutor` computer-use pause: each
+                        // pending call is its own `computer_call`, all
+                        // answering the one request.
+                        if let Some(calls) = computer_use_calls(&request.request_data) {
+                            for mut call in calls {
+                                let wire_id =
+                                    ids::new_id("call", Some(&prepared.request.response_id));
+                                call.call_id = wire_id.clone();
+                                tracker.handle(&Content::ComputerToolCall(call), None, false)?;
+                                requests.push((wire_id, request.request_id.clone()));
+                                request_data.push(request.request_data.clone());
+                            }
+                            continue;
+                        }
                         let wire_id =
                             match serde_json::from_value::<Content>(request.request_data.clone()) {
                                 // An approval surfaces as `mcp_approval_request`;
@@ -2395,17 +2409,35 @@ fn workflow_replies(
     if items.is_empty() {
         return Err("Workflow replies require an exact pending stored checkpoint.".into());
     }
+    // `(request id, pending content, part of a computer-use envelope)`.
     let pending = |wire: &str| {
         pause.requests.iter().position(|(w, _)| w == wire).map(|i| {
             let data = pause.request_data.get(i).cloned().unwrap_or(Value::Null);
+            let request_id = pause.requests[i].1.clone();
+            if let Some(calls) = computer_use_calls(&data) {
+                // The envelope's calls were projected in order.
+                let k = pause.requests[..i]
+                    .iter()
+                    .filter(|(_, r)| *r == request_id)
+                    .count();
+                let call = calls.into_iter().nth(k).map(Content::ComputerToolCall);
+                return (request_id, call, true);
+            }
             (
-                pause.requests[i].1.clone(),
+                request_id,
                 serde_json::from_value::<Content>(data).ok(),
+                false,
             )
         })
     };
-    let mut replies = HashMap::new();
+    let mut replies: HashMap<String, Value> = HashMap::new();
+    let mut answered = std::collections::HashSet::new();
     for item in items {
+        let wire = item
+            .get("call_id")
+            .or_else(|| item.get("approval_request_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let (request_id, reply) = match item.get("type").and_then(Value::as_str) {
             Some("mcp_approval_response") => {
                 let (Some(wire), Some(approve)) = (
@@ -2416,7 +2448,7 @@ fn workflow_replies(
                         "An approval reply requires its exact ID and a boolean decision.".into(),
                     );
                 };
-                let Some((request_id, Some(Content::FunctionApprovalRequest(request)))) =
+                let Some((request_id, Some(Content::FunctionApprovalRequest(request)), _)) =
                     pending(wire)
                 else {
                     return Err(
@@ -2433,7 +2465,7 @@ fn workflow_replies(
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
                     return Err("A workflow reply requires its pending call ID.".into());
                 };
-                let Some((request_id, content)) = pending(call_id) else {
+                let Some((request_id, content, envelope)) = pending(call_id) else {
                     return Err(
                         "A reply must match its wire ID in the exact pending workflow checkpoint."
                             .into(),
@@ -2441,6 +2473,26 @@ fn workflow_replies(
                 };
                 if matches!(content, Some(Content::FunctionApprovalRequest(_))) {
                     return Err("An approval cannot be replaced by a function result.".into());
+                }
+                if envelope {
+                    // One result per call; the request is answered with all
+                    // of them (core's computer-use resumption).
+                    if kind != "computer_call_output" {
+                        return Err(
+                            "A pending computer call must be answered with a computer_call_output."
+                                .into(),
+                        );
+                    }
+                    let result = computer_reply(&item, content)?;
+                    if !answered.insert(call_id.to_string()) {
+                        return Err("Duplicate workflow replies are not allowed.".into());
+                    }
+                    if let Value::Array(results) =
+                        replies.entry(request_id).or_insert_with(|| json!([]))
+                    {
+                        results.push(result);
+                    }
+                    continue;
                 }
                 if kind == "computer_call_output" {
                     (request_id, computer_reply(&item, content)?)
@@ -2456,14 +2508,35 @@ fn workflow_replies(
             }
             _ => return Err("Pending workflow replies cannot be mixed with new input.".into()),
         };
-        if replies.insert(request_id, reply).is_some() {
+        if replies.insert(request_id, reply).is_some() || !wire.is_some_and(|w| answered.insert(w))
+        {
             return Err("Duplicate workflow replies are not allowed.".into());
         }
     }
-    if replies.len() != pause.requests.len() {
+    if answered.len() != pause.requests.len() {
         return Err("Answer exactly the complete pending workflow request batch.".into());
     }
     Ok(replies)
+}
+
+/// The pending calls of a built-in `AgentExecutor` computer-use pause (a
+/// [`ComputerUseRequest`](agent_framework_core::workflow::ComputerUseRequest)
+/// envelope); `None` for any other request.
+#[cfg(feature = "experimental-computer-use")]
+fn computer_use_calls(
+    data: &Value,
+) -> Option<Vec<agent_framework_core::types::ComputerToolCallContent>> {
+    serde_json::from_value::<agent_framework_core::workflow::ComputerUseRequest>(data.clone())
+        .ok()
+        .map(|request| request.computer_calls)
+        .filter(|calls| !calls.is_empty())
+}
+
+#[cfg(not(feature = "experimental-computer-use"))]
+fn computer_use_calls(
+    _: &Value,
+) -> Option<Vec<agent_framework_core::types::ComputerToolCallContent>> {
+    None
 }
 
 /// A `computer_call_output` answering a paused workflow's computer call: the

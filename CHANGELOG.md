@@ -162,6 +162,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   With `otel`, `agentserver.connection`, `voice.callback` and `invoke_agent`
   (`TargetTurn`) spans join the caller's trace and allow-listed baggage and
   record upstream's voice metrics.
+- Foundry hosting (`experimental-computer-use`, review fix): a hosted
+  workflow whose built-in `AgentExecutor` pauses on pending computer calls
+  (a `ComputerUseRequest`) now shows each call as a `computer_call` item,
+  and `computer_call_output` replies (one per call, any order) resume it with
+  all the results, instead of a generic `request_info` call that rejected
+  computer replies.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
