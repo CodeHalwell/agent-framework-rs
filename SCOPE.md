@@ -72,11 +72,6 @@ from the roadmap, not from this file.
   until the caller answers whenever a session is present (#9050). An
   approval batch also defers a declaration-only sibling as an approval,
   where upstream pauses it as Host input (#9203).
-- **Responses per-item message identity** (upstream #9768). The Responses
-  parser returns one assistant message whose id is the *response* id;
-  upstream now returns one message per `message` output item with that
-  item's id, and attributes logprobs per message. A fidelity change that
-  alters a value existing consumers read, so not made silently.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline and file-based skills (scripts and script

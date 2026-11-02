@@ -1023,16 +1023,36 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
         ..Default::default()
     };
 
-    let mut contents: Vec<Content> = Vec::new();
+    // One assistant message per `message` output item, carrying that item's
+    // id (upstream #9768). Other items (reasoning, tool calls) join the
+    // message being built; a message item with a new id starts the next one,
+    // and the first message item names a message that has no id yet.
+    let mut messages: Vec<Message> = Vec::new();
     if let Some(items) = value.get("output").and_then(Value::as_array) {
         for item in items {
-            parse_output_item(item, &mut contents);
+            let item_id = (item.get("type").and_then(Value::as_str) == Some("message"))
+                .then(|| item.get("id").and_then(Value::as_str))
+                .flatten()
+                .filter(|id| !id.is_empty());
+            let starts_new = match (messages.last(), item_id) {
+                (None, _) => true,
+                (Some(last), Some(id)) => last.message_id.as_deref().is_some_and(|m| m != id),
+                _ => false,
+            };
+            if starts_new {
+                messages.push(Message::with_contents(Role::assistant(), Vec::new()));
+            }
+            let current = messages.last_mut().expect("pushed above");
+            if let Some(id) = item_id {
+                current.message_id = Some(id.to_string());
+            }
+            parse_output_item(item, &mut current.contents);
         }
     }
-
-    let mut message = Message::with_contents(Role::assistant(), contents);
-    message.message_id = response.response_id.clone();
-    response.messages.push(message);
+    if messages.is_empty() {
+        messages.push(Message::with_contents(Role::assistant(), Vec::new()));
+    }
+    response.messages = messages;
 
     response.finish_reason = finish_reason_from_response(value);
 
@@ -1488,6 +1508,16 @@ fn reasoning_update(text: &str) -> EventOutcome {
     })
 }
 
+/// The output item a streamed text or refusal delta belongs to, so the
+/// aggregated response keeps one message per `message` item (upstream #9768).
+fn stream_item_id(value: &Value) -> Option<String> {
+    value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// Parse one Responses API SSE event (already-decoded JSON `data:` payload).
 fn parse_responses_event(
     value: &Value,
@@ -1524,6 +1554,7 @@ fn parse_responses_event(
             EventOutcome::Update(ChatResponseUpdate {
                 contents: vec![Content::Text(TextContent::new(text))],
                 role: Some(Role::assistant()),
+                message_id: stream_item_id(value),
                 ..Default::default()
             })
         }
@@ -1542,6 +1573,7 @@ fn parse_responses_event(
             EventOutcome::Update(ChatResponseUpdate {
                 contents: vec![Content::Text(TextContent::refusal(text))],
                 role: Some(Role::assistant()),
+                message_id: stream_item_id(value),
                 ..Default::default()
             })
         }
@@ -2118,6 +2150,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_keeps_one_message_per_message_item() {
+        let value = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": "rs_1", "summary": [{ "type": "summary_text", "text": "think" }] },
+                { "type": "message", "id": "msg_1", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "Checking the refund policy." }
+                ]},
+                { "type": "message", "id": "msg_2", "role": "assistant", "content": [
+                    { "type": "output_text", "text": "The refund requires approval." }
+                ]},
+                { "type": "function_call", "call_id": "c1", "name": "approve", "arguments": "{}" }
+            ],
+        });
+        let resp = parse_response(&value, None);
+        let ids: Vec<_> = resp
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_deref())
+            .collect();
+        assert_eq!(ids, [Some("msg_1"), Some("msg_2")]);
+        assert_eq!(resp.messages[0].text(), "Checking the refund policy.");
+        assert!(matches!(
+            resp.messages[0].contents[0],
+            Content::TextReasoning(_)
+        ));
+        assert_eq!(resp.messages[1].text(), "The refund requires approval.");
+        assert!(matches!(
+            resp.messages[1].contents[1],
+            Content::FunctionCall(_)
+        ));
+        assert_eq!(resp.response_id.as_deref(), Some("resp_1"));
+    }
+
+    #[test]
+    fn parse_response_without_message_items_has_one_unnamed_message() {
+        let value = json!({"id": "resp_1", "output": [
+            { "type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}" }
+        ]});
+        let resp = parse_response(&value, None);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].message_id, None);
+    }
+
+    #[test]
     fn parse_response_store_false_omits_conversation_id() {
         let value = json!({
             "id": "resp_123",
@@ -2359,6 +2437,37 @@ mod tests {
             }
         }
         updates
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_one_message_per_output_item() {
+        let mut events = vec![(
+            "response.created",
+            json!({ "type": "response.created", "response": { "id": "resp_1" } }),
+        )];
+        for (i, text) in [
+            "Checking the refund policy.",
+            "The refund requires approval.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            events.push((
+                "response.output_text.delta",
+                json!({ "type": "response.output_text.delta", "item_id": format!("msg_{i}"), "delta": text }),
+            ));
+        }
+        let resp = ChatResponse::from_updates(collect_updates(sse_body(&events)).await);
+        let texts: Vec<_> = resp.messages.iter().map(|m| m.text()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Checking the refund policy.",
+                "The refund requires approval."
+            ]
+        );
+        assert_eq!(resp.messages[0].message_id.as_deref(), Some("msg_0"));
+        assert_eq!(resp.messages[1].message_id.as_deref(), Some("msg_1"));
     }
 
     #[tokio::test]

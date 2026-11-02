@@ -71,6 +71,14 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- **Behavior change:** the Responses parsers (OpenAI, Azure OpenAI,
+  Foundry) return one assistant message per `message` output item, with the
+  item's id as `message_id`, instead of a single message whose id was the
+  response id (upstream #9768). Streamed text and refusal deltas carry their
+  `item_id`, and `ChatResponse::from_updates` names an id-less trailing
+  message with the first id it sees, so streamed and non-streamed responses
+  agree. `response_id` is unchanged; read it instead of
+  `messages[0].message_id`.
 - **Breaking:** `WorkflowEvent::AgentRun` gains an `input` field (the
   conversation the agent ran over), which evaluation needs. Patterns that
   name every field need a `..`.
