@@ -43,7 +43,7 @@ can upstream.
 <!-- feature-table: kept in sync by `cargo xtask features check` -->
 | Feature | Upstream id | Crates | What it gates |
 |---|---|---|---|
-| `experimental-vector-stores` | `VECTOR_STORES` | `agent-framework-core`, `agent-framework-cosmos`, `agent-framework-azure-ai-search` | `agent_framework_core::vectors` (stores, collections, portable filters, the vector-collection tools provider), `CosmosVectorStore`, `AzureAISearchStore`, `agent-framework-qdrant` (the whole crate) |
+| `experimental-vector-stores` | `VECTOR_STORES` | `agent-framework-core`, `agent-framework-cosmos`, `agent-framework-azure-ai-search` | `agent_framework_core::vectors` (stores, collections, portable filters, the vector-collection tools provider), `CosmosVectorStore`, `AzureAISearchStore`, `agent-framework-qdrant` and `agent-framework-postgres` (the whole crates) |
 | `experimental-file-history` | `FILE_HISTORY` | `agent-framework-core` | `history::FileHistoryProvider` |
 | `experimental-progressive-tools` | `PROGRESSIVE_TOOLS` | `agent-framework-core` | `middleware::LiveToolList` and `FunctionInvocationContext::{tools, with_tools, add_tools, remove_tools}`. The function-calling loop still uses the live list internally, so behaviour is unchanged; only the public handle is gated. |
 | `experimental-agent-hooks` | `AGENT_HOOKS` | `agent-framework-core` | `agent_framework_core::agent_hooks` (the AGENT-HOOKS-0.1 interception types, emitter and the `AgentHooks` enforcement bundle), `AgentBuilder::build_with_agent_hooks` and `Error::InterceptionBlocked` |

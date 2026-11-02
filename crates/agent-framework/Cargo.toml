@@ -35,6 +35,8 @@ cosmos = ["dep:agent-framework-cosmos"]
 # The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it
 # implies `experimental-vector-stores` and is not part of `full`.
 qdrant = ["dep:agent-framework-qdrant", "experimental-vector-stores"]
+# The PostgreSQL + pgvector vector store (experimental, like `qdrant`).
+postgres = ["dep:agent-framework-postgres", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -77,6 +79,7 @@ experimental = [
     "experimental-session-store",
     "experimental-declarative-agents",
     "qdrant",
+    "postgres",
 ]
 full = [
     "openai",
@@ -123,6 +126,7 @@ agent-framework-foundry = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-qdrant = { workspace = true, optional = true }
+agent-framework-postgres = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }
 agent-framework-purview = { workspace = true, optional = true }
 agent-framework-tools = { workspace = true, optional = true }

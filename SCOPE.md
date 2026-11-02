@@ -90,7 +90,7 @@ from the roadmap, not from this file.
   `create_harness_agent` turns on); context providers seeing the agent
   (they see the session in `before_run` and, through
   `after_run_in_session`, after the run).
-- **Vector stores**: Postgres, MongoDB, DuckDB, SQL Server, Azure
+- **Vector stores**: MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
   optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
