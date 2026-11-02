@@ -104,7 +104,9 @@
 //! the approval seam ([`ApprovalResolver`], with an optional
 //! [`ApprovalRedactor`], §9), the `jcs-sha256` and custom identity providers
 //! ([`IdentityProvider`], §10), `enforce` and `evaluate_only` modes (§8), the
-//! §6.3 failure mapping, and payload-free records (§10.3).
+//! §6.3 failure mapping, payload-free records (§10.3), and host
+//! declaration documents (§7.7: [`HostDeclaration`], resolved against a
+//! [`HostRegistry`] by [`AgentHooks::from_declaration`]).
 //!
 //! # Not ported
 //!
@@ -116,8 +118,10 @@
 //!   emits `agent_shutdown` (`cancelled`) from a spawned task, since there
 //!   is no async drop; with no Tokio runtime at drop time the trail stays
 //!   open.
-//! - **Declarations** (the SDK's declaration documents and registry): the
-//!   bundle is configured in code.
+//! - **Declaration migration and the CTK surface.** Host declarations are
+//!   loaded ([`HostDeclaration`], [`HostRegistry`],
+//!   [`AgentHooks::from_declaration`]), but the SDK's `migrate`, builder,
+//!   FFI host description and conformance-kit hooks are not ported.
 //! - **Per-service-call history persistence** does not exist in the Rust
 //!   agent, so there is nothing to gate there; history is persisted once per
 //!   run, after `output`.
@@ -136,6 +140,7 @@
 
 mod codecs;
 mod composition;
+mod declaration;
 mod identity;
 mod protocol;
 mod seams;
@@ -144,6 +149,14 @@ pub use composition::{
     approval_resolver_fn, ApprovalOutcome, ApprovalRedactor, ApprovalRequest, ApprovalResolution,
     ApprovalResolver, Composition, CompositionProfile, FnApprovalResolver, OnApproval,
     SynthesisPolicy,
+};
+pub use declaration::{
+    BindingContext, DeclarationError, DeclarationErrorClass, Finding, HostDeclaration, HostInfo,
+    HostRegistry, HostSurface, KindResolver, KnobSupport, RegistryError, ResolvedApproval,
+    ResolvedBinding, ResolvedConfiguration, ResolvedDeclaration, ResolvedSurface, ToolSeamPosture,
+    CAPABILITIES, DECLARATION_VERSION, FLOOR_POINTS, INTERCEPTOR_KIND, MAX_BINDINGS,
+    MAX_BUFFERED_RECORDS, MAX_DEPTH, MAX_DETAIL_LEN, MAX_DOCUMENT_BYTES, MAX_ID_LEN, MAX_KIND_LEN,
+    MAX_TIMEOUT_MS, SUPPORTED_DECLARATION_VERSIONS,
 };
 pub use identity::{canonical_json, context_identity, IdentityFn, IdentityProvider, JCS_SHA256};
 pub use protocol::{

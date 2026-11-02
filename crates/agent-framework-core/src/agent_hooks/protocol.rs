@@ -80,7 +80,7 @@ pub mod host_error {
 }
 
 /// One of the eight interception points of the control contract (§3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterceptionPoint {
     /// Once, before the first `input` of a session. Target: `agent_init`.
@@ -799,6 +799,10 @@ pub struct InterceptionRecord {
     pub decided_by: Option<usize>,
     /// The composition profile in effect.
     pub composition: CompositionRecord,
+    /// The host declaration contract version the emitter was built from
+    /// (§7.7.8); absent for an emitter configured in code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<String>,
     /// Per-interceptor summaries, in registration order.
     pub verdicts: Vec<VerdictSummary>,
     /// Whether registered interceptors were left uninvoked; defined for the
@@ -893,8 +897,25 @@ pub struct EmitOutcome {
 /// A callback receiving every interception record.
 pub type RecordSink = Arc<dyn Fn(&InterceptionRecord) + Send + Sync>;
 
-/// One registered interceptor and its optional, payload-free name.
-type Registration = (Option<String>, Arc<dyn Interceptor>);
+/// How long one registered interceptor may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingTimeout {
+    /// The emitter-wide timeout.
+    Inherit,
+    /// No bound (`timeout_ms: null` in a declaration).
+    Unbounded,
+    /// A per-binding bound.
+    Bounded(Duration),
+}
+
+/// One registered interceptor: its payload-free name, the points it runs at
+/// (`None` = every point) and its timeout.
+struct Registration {
+    name: Option<String>,
+    interceptor: Arc<dyn Interceptor>,
+    at: Option<std::collections::BTreeSet<InterceptionPoint>>,
+    timeout: BindingTimeout,
+}
 
 /// Dispatches contexts to interceptors and composes their verdicts under
 /// the configured [`Composition`], consulting the approval seam for
@@ -908,8 +929,10 @@ pub struct InterceptionEmitter {
     interceptors: Vec<Registration>,
     mode: EnforcementMode,
     timeout: Option<Duration>,
+    resolver_timeout: Option<Option<Duration>>,
     record_sink: Option<RecordSink>,
     composition: Composition,
+    declaration: Option<String>,
     identity: IdentityProvider,
     resolver: Option<Arc<dyn ApprovalResolver>>,
     redactor: Option<ApprovalRedactor>,
@@ -988,8 +1011,10 @@ impl InterceptionEmitter {
             interceptors: Vec::new(),
             mode: EnforcementMode::Enforce,
             timeout: Some(DEFAULT_TIMEOUT),
+            resolver_timeout: None,
             record_sink: None,
             composition: Composition::default(),
+            declaration: None,
             identity: IdentityProvider::default(),
             resolver: None,
             redactor: None,
@@ -1043,8 +1068,58 @@ impl InterceptionEmitter {
     /// Builder: register an interceptor, optionally with a payload-free name
     /// recorded on the record's verdict summaries.
     pub fn register(mut self, interceptor: Arc<dyn Interceptor>, name: Option<String>) -> Self {
-        self.interceptors.push((name, interceptor));
+        self.interceptors.push(Registration {
+            name,
+            interceptor,
+            at: None,
+            timeout: BindingTimeout::Inherit,
+        });
         self
+    }
+
+    /// Builder: register an interceptor bound to `at` only (a declaration
+    /// binding's `at`), with its own timeout: `Some(None)` is unbounded,
+    /// `None` inherits the emitter's.
+    pub fn register_at(
+        mut self,
+        interceptor: Arc<dyn Interceptor>,
+        name: Option<String>,
+        at: impl IntoIterator<Item = InterceptionPoint>,
+        timeout: Option<Option<Duration>>,
+    ) -> Self {
+        self.interceptors.push(Registration {
+            name,
+            interceptor,
+            at: Some(at.into_iter().collect()),
+            timeout: match timeout {
+                None => BindingTimeout::Inherit,
+                Some(None) => BindingTimeout::Unbounded,
+                Some(Some(d)) => BindingTimeout::Bounded(d),
+            },
+        });
+        self
+    }
+
+    /// Builder: the approval resolver's own timeout (`None` disables it);
+    /// unset, it is the interceptor timeout.
+    pub fn with_approval_resolver_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.resolver_timeout = Some(timeout);
+        self
+    }
+
+    /// Builder: the host declaration contract version this emitter was
+    /// built from, stamped on every record (§7.7.8).
+    pub fn with_declaration(mut self, version: impl Into<String>) -> Self {
+        self.declaration = Some(version.into());
+        self
+    }
+
+    /// The registrations that run at `point`.
+    fn active(&self, point: InterceptionPoint) -> Vec<&Registration> {
+        self.interceptors
+            .iter()
+            .filter(|r| r.at.as_ref().is_none_or(|at| at.contains(&point)))
+            .collect()
     }
 
     /// The enforcement mode.
@@ -1081,7 +1156,7 @@ impl InterceptionEmitter {
     pub async fn emit_unchecked(&self, mut context: InterceptionContext) -> EmitOutcome {
         let original_target = context.target().clone();
         let mut input_identity = None;
-        let dispatch = match check_envelope(&context) {
+        let mut dispatch = match check_envelope(&context) {
             Err(message) => Dispatch::synthesized(host_error::CONTEXT_INVALID, Some(message)),
             // §10.2: an identity the provider cannot compute fails the
             // emission closed before any interceptor sees it.
@@ -1093,8 +1168,21 @@ impl InterceptionEmitter {
                 }
             },
         };
+        // The post-composition identity: a transform can make the target
+        // unrepresentable to the provider (an integer beyond 2^53 under
+        // jcs-sha256), and then the emission fails closed rather than
+        // proceeding unbound.
         let enforced_identity = if input_identity.is_some() {
-            self.identity.compute(&context).ok().flatten()
+            match self.identity.compute(&context) {
+                Ok(identity) => identity,
+                Err((reason, detail)) => {
+                    if dispatch.combined.is_permit() {
+                        dispatch.combined = Verdict::host_error(reason, Some(detail));
+                        dispatch.decided_by = None;
+                    }
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1119,6 +1207,7 @@ impl InterceptionEmitter {
                 .map(str::to_string),
             decided_by: dispatch.decided_by,
             composition: self.composition,
+            declaration: self.declaration.clone(),
             verdicts: dispatch.verdicts,
             fold_truncated: dispatch.fold_truncated,
             resolved_by: dispatch.resolved_by,
@@ -1156,6 +1245,7 @@ impl InterceptionEmitter {
             timestamp: Some(now_rfc3339()),
             decided_by: None,
             composition: self.composition,
+            declaration: self.declaration.clone(),
             verdicts: Vec::new(),
             fold_truncated: None,
             resolved_by: None,
@@ -1173,22 +1263,25 @@ impl InterceptionEmitter {
         }
     }
 
-    fn summaries(&self, verdicts: &[Verdict]) -> Vec<VerdictSummary> {
+    fn summaries(verdicts: &[Verdict], active: &[&Registration]) -> Vec<VerdictSummary> {
         verdicts
             .iter()
-            .zip(&self.interceptors)
+            .zip(active)
             .enumerate()
-            .map(|(index, (v, (name, _)))| VerdictSummary {
+            .map(|(index, (v, r))| VerdictSummary {
                 index,
                 decision: v.decision,
                 reason: v.reason.clone(),
-                name: name.clone(),
+                name: r.name.clone(),
             })
             .collect()
     }
 
     async fn dispatch(&self, context: &mut InterceptionContext) -> Dispatch {
-        if self.interceptors.is_empty() {
+        // Zero interceptors at this point fails closed (§7), per point
+        // when bindings name their points (§7.7.5).
+        let active = self.active(context.point);
+        if active.is_empty() {
             if self.mode == EnforcementMode::Enforce {
                 return Dispatch::synthesized(host_error::NO_INTERCEPTOR, None);
             }
@@ -1201,10 +1294,12 @@ impl InterceptionEmitter {
             };
         }
         match self.composition.profile {
-            CompositionProfile::SequentialFirstDeny => self.dispatch_first_deny(context).await,
-            CompositionProfile::SequentialRunAll => self.dispatch_run_all(context).await,
+            CompositionProfile::SequentialFirstDeny => {
+                self.dispatch_first_deny(context, &active).await
+            }
+            CompositionProfile::SequentialRunAll => self.dispatch_run_all(context, &active).await,
             CompositionProfile::ParallelStrictest | CompositionProfile::ParallelUnanimous => {
-                self.dispatch_parallel(context).await
+                self.dispatch_parallel(context, &active).await
             }
         }
     }
@@ -1221,16 +1316,20 @@ impl InterceptionEmitter {
     /// `sequential/first_deny` (§7.4): fold through; the first deny
     /// short-circuits, unless the resolver approves it, in which case
     /// `on_approval` stops the fold with the resolution or resumes it.
-    async fn dispatch_first_deny(&self, context: &mut InterceptionContext) -> Dispatch {
-        let n = self.interceptors.len();
+    async fn dispatch_first_deny(
+        &self,
+        context: &mut InterceptionContext,
+        active: &[&Registration],
+    ) -> Dispatch {
+        let n = active.len();
         let on_approval = self.composition.on_approval.unwrap_or(OnApproval::Stop);
         let mut per: Vec<Verdict> = Vec::with_capacity(n);
         let mut pool: Vec<Verdict> = Vec::with_capacity(n);
         let mut last_transform: Option<(usize, Verdict)> = None;
         let mut resolved_by = None;
-        for (i, (_, interceptor)) in self.interceptors.iter().enumerate() {
+        for (i, registration) in active.iter().enumerate() {
             let truncated = Some(i + 1 < n);
-            let mut verdict = self.invoke(interceptor.as_ref(), context.clone()).await;
+            let mut verdict = self.invoke(registration, context.clone()).await;
             if verdict.decision == Decision::Transform {
                 // An unappliable transform is the interceptor's failure: the
                 // synthesized deny takes its slot (§6.3, §7.4).
@@ -1246,7 +1345,7 @@ impl InterceptionEmitter {
                         return Dispatch {
                             combined: with_unions(verdict, &pool),
                             decided_by: Some(i),
-                            verdicts: self.summaries(&per),
+                            verdicts: Self::summaries(&per, active),
                             fold_truncated: truncated,
                             resolved_by,
                         };
@@ -1259,7 +1358,7 @@ impl InterceptionEmitter {
                         return Dispatch {
                             combined: with_unions(*resolution, &pool),
                             decided_by: if synthesized { None } else { Some(i) },
-                            verdicts: self.summaries(&per),
+                            verdicts: Self::summaries(&per, active),
                             fold_truncated: truncated,
                             resolved_by: Some("rejection"),
                         };
@@ -1278,7 +1377,7 @@ impl InterceptionEmitter {
                             return Dispatch {
                                 combined: sub,
                                 decided_by: None,
-                                verdicts: self.summaries(&per),
+                                verdicts: Self::summaries(&per, active),
                                 fold_truncated: truncated,
                                 resolved_by,
                             };
@@ -1289,7 +1388,7 @@ impl InterceptionEmitter {
                                 return Dispatch {
                                     combined: with_unions(sub, &pool),
                                     decided_by: Some(i),
-                                    verdicts: self.summaries(&per),
+                                    verdicts: Self::summaries(&per, active),
                                     fold_truncated: truncated,
                                     resolved_by,
                                 };
@@ -1311,7 +1410,7 @@ impl InterceptionEmitter {
         Dispatch {
             combined: with_unions(combined, &pool),
             decided_by,
-            verdicts: self.summaries(&per),
+            verdicts: Self::summaries(&per, active),
             fold_truncated: Some(false),
             resolved_by,
         }
@@ -1320,11 +1419,15 @@ impl InterceptionEmitter {
     /// `sequential/run_all` (§7.4): every interceptor runs and transforms
     /// fold through; the most severe verdict wins. An unappliable transform
     /// still short-circuits.
-    async fn dispatch_run_all(&self, context: &mut InterceptionContext) -> Dispatch {
-        let n = self.interceptors.len();
+    async fn dispatch_run_all(
+        &self,
+        context: &mut InterceptionContext,
+        active: &[&Registration],
+    ) -> Dispatch {
+        let n = active.len();
         let mut all: Vec<Verdict> = Vec::with_capacity(n);
-        for (i, (_, interceptor)) in self.interceptors.iter().enumerate() {
-            let mut verdict = self.invoke(interceptor.as_ref(), context.clone()).await;
+        for (i, registration) in active.iter().enumerate() {
+            let mut verdict = self.invoke(registration, context.clone()).await;
             if verdict.decision == Decision::Transform {
                 verdict = self.fold_verdict(context, verdict);
                 if !verdict.is_permit() {
@@ -1332,7 +1435,7 @@ impl InterceptionEmitter {
                     return Dispatch {
                         combined: with_unions(verdict, &all),
                         decided_by: Some(i),
-                        verdicts: self.summaries(&all),
+                        verdicts: Self::summaries(&all, active),
                         fold_truncated: Some(i + 1 < n),
                         resolved_by: None,
                     };
@@ -1340,23 +1443,27 @@ impl InterceptionEmitter {
             }
             all.push(verdict);
         }
-        let mut dispatch = self.aggregate(context, all, true).await;
+        let mut dispatch = self.aggregate(context, all, true, active).await;
         dispatch.fold_truncated = Some(false);
         dispatch
     }
 
     /// The parallel profiles (§7.5): every interceptor sees the same
     /// snapshot, concurrently; nothing folds until aggregation.
-    async fn dispatch_parallel(&self, context: &mut InterceptionContext) -> Dispatch {
+    async fn dispatch_parallel(
+        &self,
+        context: &mut InterceptionContext,
+        active: &[&Registration],
+    ) -> Dispatch {
         let snapshot = context.clone();
         let all: Vec<Verdict> = futures::future::join_all(
-            self.interceptors
+            active
                 .iter()
-                .map(|(_, interceptor)| self.invoke(interceptor.as_ref(), snapshot.clone())),
+                .map(|registration| self.invoke(registration, snapshot.clone())),
         )
         .await;
         if self.composition.profile == CompositionProfile::ParallelUnanimous {
-            let verdicts = self.summaries(&all);
+            let verdicts = Self::summaries(&all, active);
             if all.iter().all(|v| v.decision == Decision::Allow) {
                 return Dispatch {
                     combined: with_unions(Verdict::allow(), &all),
@@ -1387,7 +1494,7 @@ impl InterceptionEmitter {
                 resolved_by,
             };
         }
-        self.aggregate(context, all, false).await
+        self.aggregate(context, all, false, active).await
     }
 
     /// Severity-max aggregation and winner handling, shared by `run_all`
@@ -1397,8 +1504,9 @@ impl InterceptionEmitter {
         context: &mut InterceptionContext,
         all: Vec<Verdict>,
         sequential: bool,
+        active: &[&Registration],
     ) -> Dispatch {
-        let verdicts = self.summaries(&all);
+        let verdicts = Self::summaries(&all, active);
         let mut resolved_by = None;
         match aggregate_strictest(&all, sequential) {
             Aggregate::TransformConflict(indices) => {
@@ -1577,7 +1685,7 @@ impl InterceptionEmitter {
             context: presented,
         };
         let call = AssertUnwindSafe(resolver.resolve(request)).catch_unwind();
-        let result = match self.timeout {
+        let result = match self.resolver_timeout.unwrap_or(self.timeout) {
             Some(limit) => match tokio::time::timeout(limit, call).await {
                 Ok(r) => r,
                 Err(_) => {
@@ -1651,9 +1759,14 @@ impl InterceptionEmitter {
 
     /// Invoke one interceptor on its own copy and normalize every failure to
     /// the §6.3 deny.
-    async fn invoke(&self, interceptor: &dyn Interceptor, context: InterceptionContext) -> Verdict {
-        let call = AssertUnwindSafe(interceptor.intercept(context)).catch_unwind();
-        let result = match self.timeout {
+    async fn invoke(&self, registration: &Registration, context: InterceptionContext) -> Verdict {
+        let call = AssertUnwindSafe(registration.interceptor.intercept(context)).catch_unwind();
+        let limit = match registration.timeout {
+            BindingTimeout::Inherit => self.timeout,
+            BindingTimeout::Unbounded => None,
+            BindingTimeout::Bounded(d) => Some(d),
+        };
+        let result = match limit {
             Some(timeout) => match tokio::time::timeout(timeout, call).await {
                 Ok(r) => r,
                 Err(_) => return Verdict::host_error(host_error::INTERCEPTOR_TIMEOUT, None),

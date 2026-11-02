@@ -43,12 +43,10 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Agent hooks, remainder** (`experimental-agent-hooks`): declaration
-  documents (the SDK's declaration loader and registry; the bundle is
-  configured in code), and §5.4 result-label flow (labels reach the
-  combined verdict and the record but are not persisted with the produced
-  data or resurfaced as `source_labels`; upstream's framework layer does
-  not do this either).
+- **Agent hooks, remainder** (`experimental-agent-hooks`): §5.4
+  result-label flow (labels reach the combined verdict and the record but
+  are not persisted with the produced data or resurfaced as
+  `source_labels`; upstream's framework layer does not do this either).
 - **Evaluation, remainder**:
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's

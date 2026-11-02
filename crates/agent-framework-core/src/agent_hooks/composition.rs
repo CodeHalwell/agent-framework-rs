@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use super::protocol::{Decision, InterceptionContext, InterceptionPoint, Verdict};
 
 /// The closed profile set (§7.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub enum CompositionProfile {
     /// Fold in order; the first deny short-circuits.
     #[default]
@@ -599,6 +601,21 @@ mod tests {
         let record = e.emit(builder().output(json!("x"))).await.unwrap().record;
         assert_eq!(record.identity_provider.as_deref(), Some("seq"));
         assert_eq!(record.input_identity.as_deref(), Some("0"));
+
+        // A transform that makes the target unrepresentable fails closed
+        // after dispatch: no unbound enforced identity.
+        let e = emitter(
+            Composition::default(),
+            vec![Verdict::transform(
+                "$target.content",
+                json!(9_007_199_254_740_993_u64),
+            )],
+        );
+        let blocked = e.emit(builder().output(json!("x"))).await.unwrap_err();
+        assert_eq!(blocked.reason(), Some(host_error::CONTEXT_INVALID));
+        assert_eq!(blocked.record.decided_by, None);
+        assert!(blocked.record.input_identity.is_some());
+        assert_eq!(blocked.record.enforced_identity, None);
 
         // Integers beyond 2^53 fail closed before any interceptor runs.
         let calls = Arc::new(AtomicUsize::new(0));

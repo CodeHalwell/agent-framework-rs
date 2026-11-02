@@ -35,6 +35,18 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- Agent hooks host declarations (`experimental-agent-hooks`, upstream
+  `create_agent_hooks_middleware_from_declaration`): `HostDeclaration`
+  (JSON documents `agent-hooks-declaration/1.0`, from text, value or file)
+  validated through the SDK's pipeline with its refusal classes
+  (`DeclarationError`), resolved against a `HostRegistry` of kinds,
+  identity providers, approval resolvers and redactors, and built with
+  `AgentHooksOptions::from_declaration` / `AgentHooks::from_declaration`.
+  Bindings run only at their `at` points with their own timeouts
+  (`InterceptionEmitter::register_at`), the approval resolver has its own
+  timeout, and records carry `declaration`. Also (review finding): an
+  enforced identity the provider cannot compute after a transform now
+  fails the emission closed (`host_error:context_invalid`).
 - `agent-framework-mcp` feature `fides` (`security` module), forwarded by
   the umbrella's `experimental-fides`: `SecureMcpToolProxy` /
   `secure_tool_definitions` declare every listed MCP tool in a

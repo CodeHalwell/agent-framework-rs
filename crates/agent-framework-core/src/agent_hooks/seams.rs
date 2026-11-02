@@ -40,14 +40,26 @@ tokio::task_local! {
 /// Mirrors .NET's `AgentHooksOptions`. At least one interceptor is required.
 #[derive(Clone, Default)]
 pub struct AgentHooksOptions {
-    interceptors: Vec<(Option<String>, Arc<dyn Interceptor>)>,
+    interceptors: Vec<OptionBinding>,
     mode: EnforcementMode,
     timeout: Option<Option<Duration>>,
     record_sink: Option<RecordSink>,
     composition: Composition,
     identity: IdentityProvider,
     resolver: Option<Arc<dyn ApprovalResolver>>,
+    resolver_timeout: Option<Option<Duration>>,
     redactor: Option<ApprovalRedactor>,
+    declaration: Option<String>,
+}
+
+/// One interceptor in [`AgentHooksOptions`]: its name and, for a
+/// declaration binding, the points it runs at and its own timeout.
+#[derive(Clone)]
+struct OptionBinding {
+    name: Option<String>,
+    interceptor: Arc<dyn Interceptor>,
+    at: Option<Vec<InterceptionPoint>>,
+    timeout: Option<Option<Duration>>,
 }
 
 impl std::fmt::Debug for AgentHooksOptions {
@@ -73,7 +85,12 @@ impl AgentHooksOptions {
 
     /// Register an interceptor. Interceptors run in registration order.
     pub fn interceptor(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
-        self.interceptors.push((None, interceptor));
+        self.interceptors.push(OptionBinding {
+            name: None,
+            interceptor,
+            at: None,
+            timeout: None,
+        });
         self
     }
 
@@ -84,7 +101,12 @@ impl AgentHooksOptions {
         name: impl Into<String>,
         interceptor: Arc<dyn Interceptor>,
     ) -> Self {
-        self.interceptors.push((Some(name.into()), interceptor));
+        self.interceptors.push(OptionBinding {
+            name: Some(name.into()),
+            interceptor,
+            at: None,
+            timeout: None,
+        });
         self
     }
 
@@ -123,6 +145,38 @@ impl AgentHooksOptions {
     /// liftable deny stands.
     pub fn approval_resolver(mut self, resolver: Arc<dyn ApprovalResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Register an interceptor that runs only at `at`, with its own timeout
+    /// (`None` unbounded): a declaration binding.
+    pub fn bound_interceptor(
+        mut self,
+        name: impl Into<String>,
+        interceptor: Arc<dyn Interceptor>,
+        at: impl IntoIterator<Item = InterceptionPoint>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.interceptors.push(OptionBinding {
+            name: Some(name.into()),
+            interceptor,
+            at: Some(at.into_iter().collect()),
+            timeout: Some(timeout),
+        });
+        self
+    }
+
+    /// The approval resolver's own timeout (`None` disables it); unset, it
+    /// is the interceptor timeout.
+    pub fn approval_resolver_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.resolver_timeout = Some(timeout);
+        self
+    }
+
+    /// Record the host declaration contract version these options were
+    /// loaded from on every interception record.
+    pub fn declaration_version(mut self, version: impl Into<String>) -> Self {
+        self.declaration = Some(version.into());
         self
     }
 
@@ -428,8 +482,22 @@ impl AgentHooksAgent {
                 if let Some(sink) = &options.record_sink {
                     emitter = emitter.with_record_sink(sink.clone());
                 }
-                for (name, interceptor) in &options.interceptors {
-                    emitter = emitter.register(interceptor.clone(), name.clone());
+                if let Some(timeout) = options.resolver_timeout {
+                    emitter = emitter.with_approval_resolver_timeout(timeout);
+                }
+                if let Some(version) = &options.declaration {
+                    emitter = emitter.with_declaration(version.clone());
+                }
+                for b in &options.interceptors {
+                    emitter = match &b.at {
+                        None => emitter.register(b.interceptor.clone(), b.name.clone()),
+                        Some(at) => emitter.register_at(
+                            b.interceptor.clone(),
+                            b.name.clone(),
+                            at.iter().copied(),
+                            b.timeout,
+                        ),
+                    };
                 }
                 let mut builder = InterceptionContextBuilder::new(
                     self.inner.id(),
