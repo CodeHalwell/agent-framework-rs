@@ -37,6 +37,8 @@ TOOLS = [
     {"name": "labeled_text", "inputSchema": {"type": "object"}},
     {"name": "bad_meta", "inputSchema": {"type": "object"}},
     {"name": "local_only", "inputSchema": {"type": "object"}, "annotations": {"openWorldHint": False, "readOnlyHint": True}},
+    {"name": "private_error", "inputSchema": {"type": "object"}},
+    {"name": "plain_error", "inputSchema": {"type": "object"}},
 ]
 
 RESULTS = {
@@ -47,6 +49,9 @@ RESULTS = {
                      "_meta": {"ifc": {"integrity": "untrusted", "confidentiality": "public"}}},
     "bad_meta": {"content": [{"type": "text", "text": "x"}], "_meta": {"ifc": {"integrity": "trusted"}}},
     "local_only": {"content": [{"type": "text", "text": "local"}]},
+    "private_error": {"isError": True, "content": [{"type": "text", "text": "secret row 42 not found"}],
+                      "_meta": {"ifc": {"integrity": "trusted", "confidentiality": "private"}}},
+    "plain_error": {"isError": True, "content": [{"type": "text", "text": "bad input"}]},
 }
 
 for line in sys.stdin:
@@ -141,7 +146,7 @@ async fn annotations_declare_restriction_only_labels() {
     )
     .await
     .unwrap();
-    assert_eq!(defs.len(), 5);
+    assert_eq!(defs.len(), 7);
 
     // openWorldHint makes results untrusted even with a trusted default.
     let page = registry.get("read_page").unwrap();
@@ -280,4 +285,38 @@ fn meta_parsing_and_stamping() {
         stamp_mcp_result(json!("x"), &local, Some(ContentLabel::untrusted()), true),
         json!("x")
     );
+}
+
+#[tokio::test]
+async fn server_labeled_error_details_are_withheld() {
+    // Locally trusted/public, so core would pass an error's text through;
+    // the server's private label on the error must still withhold it.
+    for trust_server_ifc in [false, true] {
+        let registry = ToolSecurityRegistry::new();
+        let defs = secure_tool_definitions(
+            server(),
+            &registry,
+            McpSecurityPolicy::new()
+                .default_integrity(IntegrityLabel::Trusted)
+                .trust_server_ifc(trust_server_ifc),
+        )
+        .await
+        .unwrap();
+        let call = |name: &str| definition(&defs, name).executor.clone().unwrap();
+        let err = call("private_error")
+            .invoke(json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("secret"), "{err}");
+        assert!(err.contains("details withheld"), "{err}");
+
+        // An unlabeled error keeps its details.
+        let err = call("plain_error")
+            .invoke(json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bad input"), "{err}");
+    }
 }

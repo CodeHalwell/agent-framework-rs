@@ -35,6 +35,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   is `Option<bool>` (defined for the sequential profiles only), records
   gain `resolved_by`, and records carry identities by default (use
   `IdentityProvider::Null` for the previous identity-unbound records).
+- FIDES for MCP (review fix): an MCP error result whose server `_meta.ifc`
+  label is untrusted or confidential has its details withheld, instead of
+  its text reaching the model unlabeled through a locally trusted/public tool.
 - Foundry hosting: with `HistorySource::Agent`/`Service`, a cancelled or
   failed response can be continued, inheriting its predecessor's session (or
   its conversation's, or a fresh one). Cancel/delete coordination entries are

@@ -219,6 +219,39 @@ pub fn stamp_mcp_result(
     }
 }
 
+/// The text of an MCP error result. An error's text reaches the model
+/// without passing through result labeling, so when the server labels the
+/// error untrusted or confidential (trusted as is under `trust_server_ifc`,
+/// otherwise combined with `local` so it can only restrict) the details are
+/// withheld rather than returned unlabeled.
+pub fn mcp_error_text(
+    tool: &str,
+    message: String,
+    local: &ContentLabel,
+    server: Option<&ContentLabel>,
+    trust_server_ifc: bool,
+) -> String {
+    let Some(server) = server else {
+        return message;
+    };
+    let effective = if trust_server_ifc {
+        server.clone()
+    } else {
+        combine_labels([local, server])
+    };
+    if effective.is_trusted() && effective.is_public() {
+        return message;
+    }
+    format!(
+        "tool '{tool}' failed; details withheld ({})",
+        if effective.is_trusted() {
+            "confidential source"
+        } else {
+            "untrusted source"
+        }
+    )
+}
+
 /// Calls a remote tool and stamps its result's IFC label.
 struct SecureMcpExecutor {
     local_name: String,
@@ -257,10 +290,16 @@ impl Tool for SecureMcpExecutor {
     }
     async fn invoke(&self, arguments: Value) -> Result<Value> {
         let result = self.client.call_tool(&self.remote_name, arguments).await?;
-        if result.is_error {
-            return Err(Error::tool(result.error_message()));
-        }
         let server = label_from_mcp_meta(result.meta.as_ref());
+        if result.is_error {
+            return Err(Error::tool(mcp_error_text(
+                &self.local_name,
+                result.error_message(),
+                &self.local_label(),
+                server.as_ref(),
+                self.trust_server_ifc,
+            )));
+        }
         Ok(stamp_mcp_result(
             result.to_value(),
             &self.local_label(),
