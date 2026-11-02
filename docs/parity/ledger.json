@@ -108,10 +108,10 @@
           },
           "Description": {
             "rust": [
-              "agent_framework_core::agent::Agent::description"
+              "agent_framework_core::agent::SupportsAgentRun::description"
             ],
-            "status": "partial",
-            "note": "Description exists on Agent only; the SupportsAgentRun trait has no description accessor."
+            "status": "mapped",
+            "note": "Property becomes a trait accessor (defaulted to None), overridden by Agent and the provider agents."
           },
           "Id": {
             "rust": [
@@ -435,7 +435,7 @@
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "after_run receives no agent reference."
+            "note": "after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent)."
           },
           "InvokeException": {
             "rust": [
@@ -459,9 +459,11 @@
             "note": "Response messages arrive as the second after_run argument; empty on failure."
           },
           "Session": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "after_run receives no session, so a provider cannot read the session or its state bag after a run."
+            "rust": [
+              "agent_framework_core::memory::ContextProvider::after_run_in_session"
+            ],
+            "status": "adapted",
+            "note": "after_run_in_session receives the run's session (its default forwards to after_run)."
           }
         }
       },
@@ -483,9 +485,12 @@
             "note": "The SessionContext itself carries the contributed instructions, messages and tools."
           },
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "Session": {
             "rust": [
@@ -611,22 +616,31 @@
       },
       "AgentFileSkill": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No file-backed skill type; Rust has no file-based skill discovery; skills are built in code only."
+          "rust": [
+            "agent_framework_core::skills::Skill",
+            "agent_framework_core::skills_files::FileSkillsSource::load"
+          ],
+          "status": "adapted",
+          "note": "File-based skills load into Skill values carrying their directory, resources and file scripts; there is no separate type."
         },
         "properties": {
           "Path": {
-            "status": "unmapped",
-            "note": "File skills load into plain Skill values (instructions + resources); the directory path is not kept."
+            "rust": [
+              "agent_framework_core::skills::Skill::path"
+            ],
+            "status": "mapped",
+            "note": "The absolute skill directory, set for file-based skills."
           }
         }
       },
       "AgentFileSkillFilterContext": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "No resource/script filter context because rust has no file-based skill discovery; skills are built in code only."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource::with_resource_filter",
+            "agent_framework_core::skills_files::FileSkillsSource::with_script_filter"
+          ],
+          "status": "adapted",
+          "note": "Resource and script filters are closures called with (skill name, relative path); there is no context type."
         },
         "properties": {
           "RelativeFilePath": {
@@ -647,42 +661,56 @@
       },
       "AgentFileSkillScript": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScript",
+            "agent_framework_core::skills::SkillScriptSource"
+          ],
+          "status": "adapted",
+          "note": "A file script is a SkillScript with a File source, run by the provider's SkillScriptRunner."
         },
         "properties": {
           "FullPath": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::full_path"
+            ],
+            "status": "mapped",
+            "note": "The script's absolute path."
           },
           "ParametersSchema": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::parameters_schema"
+            ],
+            "status": "mapped",
+            "note": "File scripts advertise an array of strings, as upstream."
           }
         },
         "methods": {
           "RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "run_skill_script delegates a file script to the provider's runner after rechecking the file."
           }
         }
       },
       "AgentFileSkillScriptRunner": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScriptRunner",
+            "agent_framework_core::skills::SkillsProvider::with_script_runner"
+          ],
+          "status": "adapted",
+          "note": "A closure (skill, script, args) -> future; the application supplies it, there is no default runner."
         }
       },
       "AgentFileSkillsSource": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource"
+          ],
+          "status": "adapted",
+          "note": "Behind the file-skills feature; options are builder methods."
         },
         "constructors": {
           "AgentFileSkillsSource(string, AgentFileSkillScriptRunner, AgentFileSkillsSourceOptions, ILoggerFactory)": {
@@ -705,9 +733,11 @@
       },
       "AgentFileSkillsSourceOptions": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust has no file-based skill discovery; skills are built in code only. No directory source or its options exist."
+          "rust": [
+            "agent_framework_core::skills_files::FileSkillsSource"
+          ],
+          "status": "adapted",
+          "note": "The options are builder methods on FileSkillsSource."
         },
         "properties": {
           "AllowedResourceExtensions": {
@@ -718,8 +748,11 @@
             "note": "Builder method on the source."
           },
           "AllowedScriptExtensions": {
-            "status": "unmapped",
-            "note": "Skill scripts are not ported, so there is nothing to filter."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_script_extensions"
+            ],
+            "status": "adapted",
+            "note": "Builder method; .py by default, as upstream."
           },
           "ResourceFilter": {
             "rust": [
@@ -729,8 +762,11 @@
             "note": "Builder method taking a (skill name, relative path) closure."
           },
           "ScriptFilter": {
-            "status": "unmapped",
-            "note": "Skill scripts are not ported, so there is nothing to filter."
+            "rust": [
+              "agent_framework_core::skills_files::FileSkillsSource::with_script_filter"
+            ],
+            "status": "adapted",
+            "note": "Builder method taking a (skill name, relative path) closure."
           },
           "SearchDepth": {
             "rust": [
@@ -855,11 +891,10 @@
         "properties": {
           "Frontmatter": {
             "rust": [
-              "agent_framework_core::skills::Skill::name",
-              "agent_framework_core::skills::Skill::description"
+              "agent_framework_core::skills::Skill"
             ],
-            "status": "partial",
-            "note": "Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing."
+            "status": "adapted",
+            "note": "Frontmatter fields live on Skill (license, compatibility, allowed_tools, metadata); file skills fill them from SKILL.md."
           }
         },
         "methods": {
@@ -878,9 +913,12 @@
             "note": "with_resource takes name and string content but no resource description."
           },
           "AddScript(string, Delegate, string, JsonSerializerOptions)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::with_script",
+              "agent_framework_core::skills::SkillScript::inline"
+            ],
+            "status": "adapted",
+            "note": "with_script(SkillScript::inline(name, closure)); the closure takes the model's args as JSON."
           },
           "GetContentAsync(CancellationToken)": {
             "rust": [
@@ -897,9 +935,11 @@
             "note": "Resources are looked up by name in the resources HashMap."
           },
           "GetScriptAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::script"
+            ],
+            "status": "adapted",
+            "note": "Synchronous, case-insensitive lookup."
           }
         }
       },
@@ -1463,11 +1503,10 @@
         "properties": {
           "Frontmatter": {
             "rust": [
-              "agent_framework_core::skills::Skill::name",
-              "agent_framework_core::skills::Skill::description"
+              "agent_framework_core::skills::Skill"
             ],
-            "status": "partial",
-            "note": "Only name and description are carried as fields on Skill; license, compatibility, allowed-tools and metadata are missing."
+            "status": "adapted",
+            "note": "Frontmatter fields live on Skill (license, compatibility, allowed_tools, metadata); file skills fill them from SKILL.md."
           }
         },
         "methods": {
@@ -1486,39 +1525,47 @@
             "note": "Resources are looked up by name in the resources HashMap."
           },
           "GetScriptAsync(string, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::Skill::script"
+            ],
+            "status": "adapted",
+            "note": "Synchronous, case-insensitive lookup."
           }
         }
       },
       "AgentSkillFrontmatter": {
         "mapping": {
           "rust": [
+            "agent_framework_core::skills_files::SkillFrontmatter",
             "agent_framework_core::skills::Skill"
           ],
-          "status": "partial",
-          "note": "Frontmatter is flattened into Skill name/description fields; there is no separate type and no name validation."
+          "status": "adapted",
+          "note": "SkillFrontmatter (file-skills feature) is parsed and validated from SKILL.md; its fields are copied onto Skill."
         },
         "constructors": {
           "AgentSkillFrontmatter(string, string, string)": {
             "rust": [
-              "agent_framework_core::skills::Skill::new"
+              "agent_framework_core::skills::Skill::new",
+              "agent_framework_core::skills_files::validate_skill_name"
             ],
-            "status": "partial",
-            "note": "Skill::new takes name and description; compatibility and spec validation of the name are missing."
+            "status": "adapted",
+            "note": "Skill::new takes name and description; validate_skill_name applies the specification's name rules."
           }
         },
         "properties": {
           "AllowedTools": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no AllowedTools field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::allowed_tools"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Compatibility": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no Compatibility field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::compatibility"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Description": {
             "rust": [
@@ -1528,14 +1575,18 @@
             "note": "Skill::description field."
           },
           "License": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no License field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::license"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Metadata": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Skill has no Metadata field; only name, description, instructions and resources exist."
+            "rust": [
+              "agent_framework_core::skills::Skill::metadata"
+            ],
+            "status": "mapped",
+            "note": "Field on Skill, filled from SKILL.md for file skills."
           },
           "Name": {
             "rust": [
@@ -1580,32 +1631,42 @@
       },
       "AgentSkillScript": {
         "mapping": {
-          "rust": [],
-          "status": "unmapped",
-          "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+          "rust": [
+            "agent_framework_core::skills::SkillScript"
+          ],
+          "status": "adapted",
+          "note": "A struct with an Inline or File source rather than an abstract class."
         },
         "properties": {
           "Description": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::description"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "Name": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::name"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           },
           "ParametersSchema": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillScript::parameters_schema"
+            ],
+            "status": "mapped",
+            "note": "Public field."
           }
         },
         "methods": {
           "RunAsync(AgentSkill, JsonElement?, IServiceProvider, CancellationToken)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider"
+            ],
+            "status": "adapted",
+            "note": "Scripts run through the provider's run_skill_script tool: inline in-process, file scripts via the runner."
           }
         }
       },
@@ -1649,19 +1710,27 @@
             "note": "No source caching layer exists because skills are a fixed in-memory list."
           },
           "UseFileScriptRunner(AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "Builder method on the provider."
           },
           "UseFileSkill(string, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::from_paths",
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "from_paths discovers the skills; options come from FileSkillsSource and the runner from with_script_runner."
           },
           "UseFileSkills(IEnumerable<string>, AgentFileSkillsSourceOptions, AgentFileSkillScriptRunner)": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Rust skills carry no scripts and SkillsProvider generates no run_skill_script tool."
+            "rust": [
+              "agent_framework_core::skills::SkillsProvider::from_paths",
+              "agent_framework_core::skills::SkillsProvider::with_script_runner"
+            ],
+            "status": "adapted",
+            "note": "from_paths discovers the skills; options come from FileSkillsSource and the runner from with_script_runner."
           },
           "UseFilter(Func<AgentSkill, AgentSkillsSourceContext, bool>)": {
             "rust": [],
@@ -1929,9 +1998,11 @@
         },
         "properties": {
           "AIContextProviders": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "Agent has no accessor for its configured context providers."
+            "rust": [
+              "agent_framework_core::agent::Agent::context_providers"
+            ],
+            "status": "mapped",
+            "note": "Accessor for the agent's configured providers."
           },
           "ChatClient": {
             "rust": [],
@@ -2186,7 +2257,7 @@
           "Agent": {
             "rust": [],
             "status": "unmapped",
-            "note": "after_run receives no agent reference."
+            "note": "after_run and after_run_in_session receive no agent reference; before_run sees its identity (SessionContext::agent)."
           },
           "InvokeException": {
             "rust": [
@@ -2210,18 +2281,23 @@
             "note": "Response messages arrive as the second after_run argument; empty on failure."
           },
           "Session": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "after_run receives no session, so a provider cannot read the session or its state bag after a run."
+            "rust": [
+              "agent_framework_core::memory::ContextProvider::after_run_in_session"
+            ],
+            "status": "adapted",
+            "note": "after_run_in_session receives the run's session (its default forwards to after_run)."
           }
         }
       },
       "ChatHistoryProvider.InvokingContext": {
         "properties": {
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "RequestMessages": {
             "rust": [
@@ -3058,9 +3134,12 @@
       "MessageAIContextProvider.InvokingContext": {
         "properties": {
           "Agent": {
-            "rust": [],
-            "status": "unmapped",
-            "note": "before_run receives no agent reference."
+            "rust": [
+              "agent_framework_core::memory::SessionContext::agent",
+              "agent_framework_core::memory::AgentInfo"
+            ],
+            "status": "adapted",
+            "note": "before_run sees the agent as SessionContext::agent, its identity (id, name, description) rather than the agent object."
           },
           "RequestMessages": {
             "rust": [

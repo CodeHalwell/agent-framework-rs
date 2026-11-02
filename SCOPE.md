@@ -69,8 +69,8 @@ from the roadmap, not from this file.
   store is ported (`agent-framework-azure`'s `session-store` feature).
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
-  skills beyond inline and file-based skills (scripts and script
-  runners, class-based and MCP skills, source pipelines); compaction's message-group model, triggers and summarization;
+  skills beyond inline and file-based skills with scripts (class-based and
+  MCP skills, source pipelines); compaction's message-group model, triggers and summarization;
   workflow telemetry, run cancellation and graph reflection; context
   providers seeing the agent object (they see its
   identity, `SessionContext::agent`, and the session in `before_run`, and

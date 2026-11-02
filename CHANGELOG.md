@@ -21,6 +21,15 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Skill scripts: `SkillScript` (inline closures run in-process, or files
+  discovered in a skill's directory, `.py` by default) and the
+  `run_skill_script` tool, which requires approval by default
+  (`SkillsProvider::with_script_approval`). File scripts run through the
+  application's `SkillsProvider::with_script_runner`; there is no default
+  runner. `Skill` gains `scripts`, `path` and the frontmatter fields
+  (`license`, `compatibility`, `allowed_tools`, `metadata`);
+  `FileSkillsSource` gains `with_script_extensions` and `with_script_filter`.
+  `Agent::context_providers` exposes the configured providers.
 - Azure Monitor export: `agent-framework-core`'s `azure-monitor` feature
   (umbrella `azure-monitor`) adds `OtelExport::with_azure_monitor` and
   `OtelExport::azure_monitor_from_env` (`APPLICATIONINSIGHTS_CONNECTION_STRING`),

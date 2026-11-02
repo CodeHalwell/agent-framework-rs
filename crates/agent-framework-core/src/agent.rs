@@ -1588,6 +1588,12 @@ impl Agent {
         &self.chat_options.tools
     }
 
+    /// The context providers configured on the agent (a session's own
+    /// providers run alongside them).
+    pub fn context_providers(&self) -> &[Arc<dyn ContextProvider>] {
+        &self.context_providers
+    }
+
     /// The agent description, if any.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()

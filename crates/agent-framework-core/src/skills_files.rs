@@ -36,8 +36,10 @@
 //! - Resources are read when the skills are loaded rather than on each
 //!   `read_skill_resource` call; reload to pick up changes. Files over 1 MiB
 //!   or not valid UTF-8 are skipped.
-//! - Scripts (and upstream's `run_skill_script` tool and script runners)
-//!   are not ported; script files are neither resources nor runnable.
+//! - Script files (`.py` by default, [`FileSkillsSource::with_script_extensions`])
+//!   become [`SkillScript::file`]s named by their relative path, run through
+//!   `run_skill_script` by the runner given to
+//!   [`SkillsProvider::with_script_runner`]; there is no default runner.
 //! - Frontmatter is parsed with `serde_yaml`, which rejects duplicate keys
 //!   anywhere, including inside `metadata` (upstream keeps the first and
 //!   warns there).
@@ -48,7 +50,7 @@ use std::path::{Path, PathBuf};
 use serde_yaml::Value as Yaml;
 
 use crate::error::{Error, Result};
-use crate::skills::{Skill, SkillsProvider};
+use crate::skills::{available_scripts_block, Skill, SkillScript, SkillsProvider};
 
 /// The skill file name.
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -63,6 +65,8 @@ pub const MAX_COMPATIBILITY_LENGTH: usize = 500;
 /// The default resource extensions.
 pub const DEFAULT_RESOURCE_EXTENSIONS: &[&str] =
     &[".md", ".json", ".yaml", ".yml", ".csv", ".xml", ".txt"];
+/// The default script extensions, as upstream.
+pub const DEFAULT_SCRIPT_EXTENSIONS: &[&str] = &[".py"];
 /// The default resource search depth (the root plus one level).
 pub const DEFAULT_SEARCH_DEPTH: usize = 2;
 const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
@@ -222,8 +226,10 @@ pub type ResourceFilter = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Syn
 pub struct FileSkillsSource {
     paths: Vec<PathBuf>,
     resource_extensions: Vec<String>,
+    script_extensions: Vec<String>,
     search_depth: usize,
     resource_filter: Option<ResourceFilter>,
+    script_filter: Option<ResourceFilter>,
 }
 
 impl std::fmt::Debug for FileSkillsSource {
@@ -248,9 +254,36 @@ impl FileSkillsSource {
                 .iter()
                 .map(|e| e.to_string())
                 .collect(),
+            script_extensions: DEFAULT_SCRIPT_EXTENSIONS
+                .iter()
+                .map(|e| e.to_string())
+                .collect(),
             search_depth: DEFAULT_SEARCH_DEPTH,
             resource_filter: None,
+            script_filter: None,
         }
+    }
+
+    /// The extensions (with the dot) that make a file a script. Empty
+    /// discovers none.
+    pub fn with_script_extensions<S: Into<String>>(
+        mut self,
+        extensions: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.script_extensions = extensions
+            .into_iter()
+            .map(|e| e.into().to_lowercase())
+            .collect();
+        self
+    }
+
+    /// Keep only the scripts `filter(skill_name, relative_path)` accepts.
+    pub fn with_script_filter(
+        mut self,
+        filter: impl Fn(&str, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.script_filter = Some(std::sync::Arc::new(filter));
+        self
     }
 
     /// The extensions (with the dot) that make a file a resource. Empty
@@ -324,6 +357,33 @@ impl FileSkillsSource {
 
     /// `(relative name, path)` of each resource file of a skill.
     fn resource_files(&self, skill_dir: &Path, skill_name: &str) -> Vec<(String, PathBuf)> {
+        self.files(
+            skill_dir,
+            skill_name,
+            &self.resource_extensions,
+            self.resource_filter.as_ref(),
+        )
+    }
+
+    /// `(relative name, path)` of each script file of a skill.
+    fn script_files(&self, skill_dir: &Path, skill_name: &str) -> Vec<(String, PathBuf)> {
+        self.files(
+            skill_dir,
+            skill_name,
+            &self.script_extensions,
+            self.script_filter.as_ref(),
+        )
+    }
+
+    /// `(relative name, path)` of each file of a skill with one of
+    /// `extensions` that `filter` keeps, never through a link.
+    fn files(
+        &self,
+        skill_dir: &Path,
+        skill_name: &str,
+        extensions: &[String],
+        filter: Option<&ResourceFilter>,
+    ) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
         let mut pending = vec![(skill_dir.to_path_buf(), 1usize)];
         while let Some((dir, depth)) = pending.pop() {
@@ -359,18 +419,10 @@ impl FileSkillsSource {
                     continue;
                 }
                 let lower = name.to_lowercase();
-                if !self
-                    .resource_extensions
-                    .iter()
-                    .any(|e| lower.ends_with(e.as_str()))
-                {
+                if !extensions.iter().any(|e| lower.ends_with(e.as_str())) {
                     continue;
                 }
-                if self
-                    .resource_filter
-                    .as_ref()
-                    .is_some_and(|f| !f(skill_name, &name))
-                {
+                if filter.is_some_and(|f| !f(skill_name, &name)) {
                     continue;
                 }
                 out.push((name, path));
@@ -405,6 +457,15 @@ impl FileSkillsSource {
                 continue;
             }
             let mut skill = Skill::new(fm.name.clone(), fm.description.clone());
+            skill.path = Some(std::path::absolute(&dir).unwrap_or_else(|_| dir.clone()));
+            skill.license = fm.license.clone();
+            skill.compatibility = fm.compatibility.clone();
+            skill.allowed_tools = fm.allowed_tools.clone();
+            skill.metadata = fm.metadata.clone().unwrap_or_default();
+            for (name, path) in self.script_files(&dir, &fm.name) {
+                let full_path = std::path::absolute(&path).unwrap_or(path);
+                skill = skill.with_script(SkillScript::file(name, full_path));
+            }
             let mut listed = Vec::new();
             for (name, path) in self.resource_files(&dir, &fm.name) {
                 let too_big =
@@ -431,7 +492,11 @@ impl FileSkillsSource {
                     listed.join("\n")
                 )
             };
-            skill = skill.with_instructions(format!("{}\n\n{resources_block}", body.trim()));
+            let scripts_block = available_scripts_block(&skill.scripts);
+            skill = skill.with_instructions(format!(
+                "{}\n\n{resources_block}\n\n{scripts_block}",
+                body.trim()
+            ));
             skills.push(skill);
         }
         skills
