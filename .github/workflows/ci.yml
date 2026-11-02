@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Every example links the umbrella crate with all features; with debug info
+  # the --all-features build and test binaries exhaust the runner's disk
+  # (the linker dies with SIGBUS). Tests do not need debug info.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   test:
@@ -15,6 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The all-features build needs more than the runner's free disk:
+      # drop preinstalled SDKs this workspace never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
