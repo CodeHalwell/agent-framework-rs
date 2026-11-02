@@ -39,7 +39,7 @@ use super::events::WorkflowEvent;
 use super::executor::Executor;
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
-use crate::types::{AgentResponse, AgentResponseUpdate, Message};
+use crate::types::{AgentResponse, AgentResponseUpdate, Message, Role};
 
 mod approval;
 mod concurrent;
@@ -57,8 +57,9 @@ pub use group_chat::{
     DEFAULT_MANAGER_INSTRUCTIONS, DEFAULT_MANAGER_STRUCTURED_OUTPUT_PROMPT,
 };
 pub use handoff::{
-    handoff_tool_name, handoff_tool_spec, HandoffBuilder, HandoffEdgeBuilder,
-    HandoffInteractionMode, HandoffUserInputRequest,
+    handoff_tool_name, handoff_tool_spec, AutonomousMode, HandoffBuilder, HandoffEdgeBuilder,
+    HandoffInteractionMode, HandoffUserInputRequest, DEFAULT_AUTONOMOUS_PROMPT,
+    DEFAULT_AUTONOMOUS_TURN_LIMIT,
 };
 pub use magentic::{
     MagenticBuilder, MagenticContext, MagenticManager, MagenticPlanReviewDecision,
@@ -233,6 +234,30 @@ pub(crate) fn ensure_author(mut message: Message, name: &str) -> Message {
     message
 }
 
+/// The synthetic user turn [`invocation_messages`] appends. Upstream's text.
+pub(crate) const CONTINUATION_TURN: &str = "please continue.";
+
+/// The messages to actually run an agent over: `conversation`, plus a
+/// synthetic [`CONTINUATION_TURN`] user message when
+/// `ensure_trailing_user_turn` is set and the conversation ends on an
+/// assistant turn (upstream #8779).
+///
+/// Chaining agents hands each one a conversation ending on the previous
+/// agent's reply, and some chat-completions providers answer a prompt that
+/// ends on `assistant` with empty text. The continuation goes on this
+/// invocation-only copy, never on the conversation itself, so it is not
+/// forwarded downstream, yielded as output or seen by any other participant.
+pub(crate) fn invocation_messages(
+    conversation: &[Message],
+    ensure_trailing_user_turn: bool,
+) -> Vec<Message> {
+    let mut messages = conversation.to_vec();
+    if ensure_trailing_user_turn && messages.last().is_some_and(|m| m.role == Role::assistant()) {
+        messages.push(Message::user(CONTINUATION_TURN));
+    }
+    messages
+}
+
 /// Run an agent over a conversation and surface its activity on the event
 /// stream incrementally: an [`AgentRunUpdate`](WorkflowEvent::AgentRunUpdate)
 /// per streamed [`AgentResponseUpdate`] as it arrives, then a final
@@ -295,6 +320,8 @@ pub struct AgentExecutor {
     /// source — see [`SequentialBuilder::output_from`](super::SequentialBuilder::output_from)
     /// and [`ConcurrentBuilder::output_from`](super::ConcurrentBuilder::output_from).
     also_send: bool,
+    /// See [`Self::with_trailing_user_turn`].
+    ensure_trailing_user_turn: bool,
 }
 
 impl AgentExecutor {
@@ -305,7 +332,18 @@ impl AgentExecutor {
             agent,
             emit_output: false,
             also_send: false,
+            ensure_trailing_user_turn: false,
         }
+    }
+
+    /// When set, a conversation ending on an assistant message is run with a
+    /// synthetic user continuation turn appended, for providers that answer
+    /// such a prompt with empty text. The turn is invocation-only: it is
+    /// never added to the conversation passed on. Off by default. See
+    /// [`SequentialBuilder::ensure_trailing_user_turn`](super::SequentialBuilder::ensure_trailing_user_turn).
+    pub fn with_trailing_user_turn(mut self, ensure: bool) -> Self {
+        self.ensure_trailing_user_turn = ensure;
+        self
     }
 
     /// When set, the executor yields the running conversation as a workflow
@@ -338,8 +376,9 @@ impl Executor for AgentExecutor {
 
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         let mut conversation = parse_conversation(&message)?;
+        let invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
         let response =
-            run_agent_and_emit(&self.agent, conversation.clone(), &self.id, &self.id, &ctx).await?;
+            run_agent_and_emit(&self.agent, invocation, &self.id, &self.id, &ctx).await?;
 
         conversation.extend(response.messages);
         let payload = serde_json::to_value(&conversation)

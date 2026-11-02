@@ -658,10 +658,12 @@ impl FoundryEmbeddingClient {
             }
         };
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

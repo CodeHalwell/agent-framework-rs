@@ -322,7 +322,12 @@ impl ClientSecretCredential {
             .form(&params)
             .send()
             .await
-            .map_err(|e| Error::service(format!("client-secret token request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "client-secret token request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -516,10 +521,12 @@ impl ManagedIdentityCredential {
         if let Some(h) = &self.identity_header {
             req = req.header("X-IDENTITY-HEADER", h);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("managed-identity token request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            Error::service(format!(
+                "managed-identity token request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -688,7 +695,12 @@ impl WorkloadIdentityCredential {
             .form(&params)
             .send()
             .await
-            .map_err(|e| Error::service(format!("workload-identity token request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "workload-identity token request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {

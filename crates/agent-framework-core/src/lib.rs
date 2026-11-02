@@ -100,6 +100,7 @@ pub mod streaming;
 pub mod text_search;
 pub mod tools;
 pub mod types;
+pub mod user_agent;
 #[cfg(feature = "experimental-vector-stores")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-vector-stores")))]
 pub mod vectors;
@@ -148,8 +149,8 @@ pub mod prelude {
         ToolMode, UsageDetails,
     };
     pub use crate::workflow::{
-        CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage, GroupChatBuilder,
-        GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
+        AutonomousMode, CheckpointStorage, ConcurrentBuilder, Executor, FileCheckpointStorage,
+        GroupChatBuilder, GroupChatDirective, GroupChatManager, GroupChatState, HandoffBuilder,
         HandoffInteractionMode, InMemoryCheckpointStorage, MagenticBuilder, MagenticContext,
         MagenticManager, MagenticPlanReviewDecision, MagenticPlanReviewRequest,
         MagenticStallInterventionDecision, MagenticStallInterventionRequest, RequestInfoExecutor,

@@ -6,9 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 use agent_framework_core::tools::{ToolDefinition, ToolKind};
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, Content, DataContent, FinishReason, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, HostedFileContent, Message, ResponseFormat, Role,
-    TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent, UsageContent,
-    UsageDetails,
+    FunctionCallContent, FunctionResultContent, HostedFileContent, Message, RegionCoordinateSpace,
+    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
+    UsageContent, UsageDetails,
 };
 use serde_json::{json, Map, Value};
 
@@ -1049,6 +1049,8 @@ pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
                     start_index: citation.get("start_char_index").and_then(Value::as_i64),
                     end_index: citation.get("end_char_index").and_then(Value::as_i64),
                 }]);
+                // Offsets into the cited source, not the generated text.
+                cit.annotated_regions_coordinate_space = Some(RegionCoordinateSpace::Source);
             }
             Some("page_location") => {
                 cit.title = str_field("document_title");
@@ -1058,6 +1060,8 @@ pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
                     start_index: citation.get("start_page_number").and_then(Value::as_i64),
                     end_index: citation.get("end_page_number").and_then(Value::as_i64),
                 }]);
+                // Offsets into the cited source, not the generated text.
+                cit.annotated_regions_coordinate_space = Some(RegionCoordinateSpace::Source);
             }
             Some("content_block_location") => {
                 cit.title = str_field("document_title");
@@ -1067,6 +1071,8 @@ pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
                     start_index: citation.get("start_block_index").and_then(Value::as_i64),
                     end_index: citation.get("end_block_index").and_then(Value::as_i64),
                 }]);
+                // Offsets into the cited source, not the generated text.
+                cit.annotated_regions_coordinate_space = Some(RegionCoordinateSpace::Source);
             }
             Some("web_search_result_location") => {
                 cit.title = str_field("title");
@@ -1081,6 +1087,8 @@ pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
                     start_index: citation.get("start_block_index").and_then(Value::as_i64),
                     end_index: citation.get("end_block_index").and_then(Value::as_i64),
                 }]);
+                // Offsets into the cited source, not the generated text.
+                cit.annotated_regions_coordinate_space = Some(RegionCoordinateSpace::Source);
             }
             other => {
                 tracing::debug!(
@@ -2703,6 +2711,36 @@ mod tests {
         let annotations = parse_citations(&block).unwrap();
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0], Annotation::default());
+    }
+
+    #[test]
+    fn document_citation_regions_are_marked_as_source_coordinates() {
+        // `start_char_index` / page numbers / block indices locate the quote
+        // in the *cited document*; read as offsets into the answer they
+        // highlight the wrong text, or run past its end (upstream #9436).
+        for citation in [
+            json!({ "type": "char_location", "cited_text": "x", "start_char_index": 500, "end_char_index": 900 }),
+            json!({ "type": "page_location", "cited_text": "x", "start_page_number": 3, "end_page_number": 4 }),
+            json!({ "type": "content_block_location", "cited_text": "x", "start_block_index": 1, "end_block_index": 2 }),
+            json!({ "type": "search_result_location", "cited_text": "x", "source": "s", "start_block_index": 0, "end_block_index": 1 }),
+        ] {
+            let block =
+                json!({ "type": "text", "text": "short answer", "citations": [citation.clone()] });
+            let cit = &parse_citations(&block).unwrap()[0];
+            assert_eq!(
+                cit.annotated_regions_coordinate_space,
+                Some(RegionCoordinateSpace::Source),
+                "{citation}"
+            );
+            assert!(
+                cit.annotated_regions.is_some(),
+                "the source location is kept: {citation}"
+            );
+            assert!(
+                cit.content_regions().is_empty(),
+                "but is not a span of the answer: {citation}"
+            );
+        }
     }
 
     #[test]

@@ -13,8 +13,8 @@ pub use content::{
     FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
     FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
     McpServerToolCallContent, McpServerToolResultContent, OauthConsentRequestContent,
-    ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
-    TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
+    RegionCoordinateSpace, ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent,
+    TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
     FUNCTION_INVOCATION_ERROR_MARKER,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};

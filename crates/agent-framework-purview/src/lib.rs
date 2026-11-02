@@ -203,3 +203,26 @@ pub use models::{
 };
 pub use processor::ContentProcessor;
 pub use settings::{PurviewAppLocation, PurviewLocationType, PurviewSettings};
+
+/// This crate's HTTP client, sending the framework `User-Agent`
+/// ([`agent_framework_core::user_agent::user_agent`]) so providers can
+/// attribute the traffic. A static ASCII token cannot fail to become a
+/// header; the fallback only keeps this infallible.
+/// The framework `User-Agent` this crate sends, in the shared format every
+/// other crate uses (upstream's Purview client calls the framework's one
+/// `get_user_agent()` too). It replaces a one-off
+/// `agent-framework-rs-<crate>/<version>` string this crate used to set per
+/// request, which no other crate shared.
+pub(crate) fn user_agent() -> String {
+    agent_framework_core::user_agent::user_agent(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(agent_framework_core::user_agent::user_agent(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}

@@ -49,6 +49,20 @@ use agent_framework_core::types::{ChatOptions, ChatResponse, ChatResponseUpdate,
 use futures::StreamExt;
 use serde_json::Value;
 
+/// This crate's HTTP client, sending the framework `User-Agent`
+/// ([`agent_framework_core::user_agent::user_agent`]) so providers can
+/// attribute the traffic. A static ASCII token cannot fail to become a
+/// header; the fallback only keeps this infallible.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(agent_framework_core::user_agent::user_agent(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 const API_VERSION: &str = "v1beta";
 
@@ -144,7 +158,7 @@ impl GeminiChatClient {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 api_key: api_key.into(),
                 base_url: DEFAULT_BASE_URL.to_string(),
                 model: model.into(),
@@ -232,7 +246,12 @@ impl GeminiChatClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());

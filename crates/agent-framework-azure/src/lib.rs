@@ -117,7 +117,7 @@ pub const DEFAULT_EMBEDDING_API_VERSION: &str = "2024-10-21";
 /// supportability, so a request that sends none is traffic the platform — and
 /// anyone reading a support case — cannot attribute. Upstream identifies
 /// itself the same way, per package (#9223).
-pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
+pub const USER_AGENT_PRODUCT: &str = agent_framework_core::user_agent::USER_AGENT_PRODUCT;
 
 /// The `User-Agent` value for an Azure call made by `component` at `version`.
 ///
@@ -125,8 +125,12 @@ pub const USER_AGENT_PRODUCT: &str = "agent-framework-rust";
 /// `CARGO_PKG_VERSION`, so a request names both the framework and the
 /// connector inside it: `agent-framework-rust/0.11.0
 /// (agent-framework-azure-cosmos)`.
+///
+/// The format is [`agent_framework_core::user_agent::user_agent`]'s, which
+/// every other crate in the workspace sends too; this name is kept for the
+/// Azure crates that already call it.
 pub fn azure_user_agent(component: &str, version: &str) -> String {
-    format!("{USER_AGENT_PRODUCT}/{version} ({component})")
+    agent_framework_core::user_agent::user_agent(component, version)
 }
 
 /// A [`reqwest::Client`] whose requests carry [`azure_user_agent`].
@@ -395,7 +399,12 @@ impl AzureOpenAIClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());

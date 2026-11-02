@@ -522,9 +522,7 @@ async fn run_agent(
                             // place of RUN_FINISHED (still a 200 SSE stream;
                             // error in-band).
                             Err(e) => {
-                                let _ = tx
-                                    .send(json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }))
-                                    .await;
+                                let _ = tx.send(run_error_event(&run_id, &e)).await;
                                 return;
                             }
                         }
@@ -540,9 +538,7 @@ async fn run_agent(
                 }
                 // Failure before the stream even opens.
                 Err(e) => {
-                    let _ = tx
-                        .send(json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }))
-                        .await;
+                    let _ = tx.send(run_error_event(&run_id, &e)).await;
                 }
             }
         };
@@ -814,9 +810,7 @@ async fn run_with_snapshots(
             let mut stream = match agent.run_stream(messages, Some(session), run_options).await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    let _ = tx
-                        .send(json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }))
-                        .await;
+                    let _ = tx.send(run_error_event(&run_id, &e)).await;
                     return;
                 }
             };
@@ -835,11 +829,7 @@ async fn run_with_snapshots(
                     // A failed run is not saved: the previous snapshot stays
                     // authoritative (minus any interrupts this run spent).
                     Err(e) => {
-                        let _ = tx
-                            .send(
-                                json!({ "type": event_type::RUN_ERROR, "message": e.to_string() }),
-                            )
-                            .await;
+                        let _ = tx.send(run_error_event(&run_id, &e)).await;
                         return;
                     }
                 }
@@ -950,6 +940,24 @@ fn parse_client_tools(tools: &[Value]) -> Vec<ToolDefinition> {
 
 fn run_started(thread_id: &str, run_id: &str) -> Value {
     json!({ "type": event_type::RUN_STARTED, "threadId": thread_id, "runId": run_id })
+}
+
+/// The `RUN_ERROR` event for a run that failed.
+///
+/// The caller gets a fixed message and the detail goes to the server log,
+/// correlated by `run_id`, through the same [`log_run_failure`] the DevUI
+/// surface uses. These events used to carry `e.to_string()` — a provider's
+/// raw HTTP error body, a tool's own error text, internal type names or a
+/// filesystem path — to whatever client was on the other end of the stream,
+/// which is the disclosure upstream #9460 closed on its Responses surface.
+/// The hosting layer's own `RUN_ERROR`s (a missing resume entry, an
+/// unavailable snapshot store) are contract messages with codes and are not
+/// routed through here.
+///
+/// [`log_run_failure`]: crate::devui::log_run_failure
+fn run_error_event(run_id: &str, err: &agent_framework_core::error::Error) -> Value {
+    let message = crate::devui::log_run_failure("agui", Some(run_id), err);
+    json!({ "type": event_type::RUN_ERROR, "message": message })
 }
 
 fn run_finished(thread_id: &str, run_id: &str) -> Value {

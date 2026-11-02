@@ -49,6 +49,20 @@ use futures::stream::{self, StreamExt};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::Value;
 
+/// This crate's HTTP client, sending the framework `User-Agent`
+/// ([`agent_framework_core::user_agent::user_agent`]) so providers can
+/// attribute the traffic. A static ASCII token cannot fail to become a
+/// header; the fallback only keeps this infallible.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(agent_framework_core::user_agent::user_agent(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// The environment variable read for the AWS region (e.g. `us-east-1`).
 const AWS_REGION_ENV: &str = "AWS_REGION";
 
@@ -195,7 +209,7 @@ impl BedrockChatClient {
         let region = region.into();
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 host: bedrock_host(&region),
                 region,
                 model: model.into(),
@@ -298,10 +312,12 @@ impl BedrockChatClient {
             request = request.header(name, value);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

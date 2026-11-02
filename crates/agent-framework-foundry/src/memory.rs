@@ -359,7 +359,12 @@ impl FoundryMemoryProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("Foundry memory request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "Foundry memory request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

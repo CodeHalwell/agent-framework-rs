@@ -85,30 +85,24 @@ from the roadmap, not from this file.
   credential chain and `azure_http_client` already have what is needed to
   reach — or `azure_storage_blob` 1.1, which shares the `azure_core` 1.x
   line the optional `entra-sdk` feature already pulls.
-- **A framework `User-Agent` outside the Azure crates**. The Azure-facing
-  crates send `agent-framework-rust/<version> (<component>)` via
-  `agent_framework_azure::azure_http_client`; the other provider clients, and
-  `agent-framework-copilotstudio`, `agent-framework-purview` and
-  `agent-framework-foundry-local`, still build bare `reqwest` clients.
-  `agent-framework-copilotstudio` is the one worth calling out: it talks to a
-  Microsoft Power Platform endpoint, so it belongs with the Azure-facing
-  crates, and it was simply missed when this item was written (see the
-  2026-11-02 pass). A framework-wide header needs the helper somewhere
-  every crate can reach, and `agent-framework-core` carries no `reqwest`
-  dependency by design.
 - **Function-invocation pauses with mixed batches**. A declaration-only
   call's local siblings run on the same turn. Upstream instead holds them
   until the caller answers whenever a session is present (#9050). An
   approval batch also defers a declaration-only sibling as an approval,
   where upstream pauses it as Host input (#9203).
+- **Anthropic MCP-connector replay**. `mcp_tool_use` / `mcp_tool_result`
+  blocks replay as client `tool_use` / `tool_result`, the same shape problem
+  the 2026-11-02 round three fixed for web search and web fetch. Fixing it
+  needs `parse_content_blocks` to keep `mcp_tool_result` content verbatim
+  rather than parsing it recursively; upstream has not addressed it either.
+- **Responses per-item message identity** (upstream #9768). The Responses
+  parser returns one assistant message whose id is the *response* id;
+  upstream now returns one message per `message` output item with that
+  item's id, and attributes logprobs per message. A fidelity change that
+  alters a value existing consumers read, so not made silently.
 - **Streamed code-interpreter content**. The OpenAI Responses client
   produces no `CodeInterpreterToolCallContent`, so there is nothing to
   stream or merge.
-- **Per-agent handoff autonomous turn limits**. Upstream's
-  `with_autonomous_mode(agents=[...], turn_limits={...})` is per participant.
-  Here there is one `HandoffBuilder::max_iterations` cap plus a global
-  `HandoffInteractionMode`, whose `Autonomous` variant already expresses
-  upstream's zero-continuation case.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline skills (scripts, file-based sources, source
@@ -118,17 +112,6 @@ from the roadmap, not from this file.
   session.
 - **Vector stores**: Postgres, Qdrant, MongoDB, DuckDB, SQL Server, Azure
   DocumentDB (blocked on the MongoDB wire protocol), Valkey.
-- **Redis context scope identity** (upstream #9461, `[BREAKING]` there).
-  `agent-framework-redis`'s context provider indexes its scope `TAG` fields
-  with RediSearch's defaults — separator `,`, case-insensitive — and writes
-  the scope value to the document unescaped, so a value containing a comma is
-  indexed as two tags and can be retrieved under a different scope. Upstream
-  hashes each scope value into an opaque token instead, with a schema
-  signature check and a resumable migration. Both that and the smaller fix
-  (declaring `SEPARATOR ""` / `CASESENSITIVE`) are breaking and need a
-  migration for already-indexed data. Detailed in the 2026-11-02 pass; it is
-  the next pass's first item.
-
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
   optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
   `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
@@ -140,10 +123,6 @@ from the roadmap, not from this file.
 
 - **MCP 2.x protocol negotiation** (upstream #9236). This port speaks the
   revision it was written against.
-- **`SequentialBuilder::ensure_trailing_user_turn`** (upstream #8779): an
-  opt-in that appends a synthetic user continuation message when the
-  conversation handed to the next participant ends on an assistant turn,
-  for providers that answer an assistant-ending prompt with empty text.
 - **Workflow pause/restore bookkeeping** (upstream #9291, #9289):
   preserving concurrent steps across a pause, and restored sub-workflow
   sibling requests. Both land on upstream's `WorkflowExecutor`; this

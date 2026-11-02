@@ -338,7 +338,12 @@ async fn run_error_is_returned_in_band() {
         })
         .expect("an error content");
     assert_eq!(error.error_code.as_deref(), Some("RUN_ERROR"));
-    assert!(error.message.unwrap().contains("model unavailable"));
+    // The server reports the failure but keeps the model's own error text to
+    // itself (it is logged against the run id), so the client is told the
+    // run failed without being handed provider internals.
+    let message = error.message.unwrap();
+    assert!(!message.is_empty());
+    assert!(!message.contains("model unavailable"), "leaked: {message}");
 }
 
 // ---------------------------------------------------------------------------

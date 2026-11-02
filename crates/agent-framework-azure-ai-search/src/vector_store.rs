@@ -144,9 +144,12 @@ impl AzureAISearchStore {
                 req.bearer_auth(cred.get_token_for_scope(&self.scope).await?)
             }
         };
-        req.send()
-            .await
-            .map_err(|e| Error::service(format!("Azure AI Search request failed: {e}")))
+        req.send().await.map_err(|e| {
+            Error::service(format!(
+                "Azure AI Search request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })
     }
 
     /// Open a collection as the concrete [`AzureAISearchCollection`].

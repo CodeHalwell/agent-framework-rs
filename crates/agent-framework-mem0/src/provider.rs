@@ -284,7 +284,7 @@ impl Mem0Provider {
     /// before `invoking`/`invoked` are called).
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             api_key: api_key.into(),
             api_base: DEFAULT_API_BASE.to_string(),
             application_id: None,

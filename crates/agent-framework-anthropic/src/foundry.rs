@@ -151,7 +151,7 @@ impl AnthropicFoundryClient {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 base_url: base_url.into(),
                 path: DEFAULT_PATH.to_string(),
                 model: model.into(),
@@ -227,7 +227,12 @@ impl AnthropicFoundryClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();

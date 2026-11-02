@@ -7,6 +7,7 @@ use agent_framework_core::prelude::*;
 use agent_framework_core::types::{
     ChatResponseUpdate, Content, FinishReason, FunctionArguments, FunctionCallContent, Role,
 };
+use agent_framework_core::workflow::DEFAULT_AUTONOMOUS_PROMPT;
 use agent_framework_core::workflow::{handoff_tool_name, HandoffUserInputRequest};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -469,4 +470,121 @@ async fn participants_colliding_once_cut_are_rejected() {
         message.contains("handoff tool name"),
         "the error should name the collision: {message}"
     );
+}
+
+/// Per-agent autonomous continuation (upstream's `with_autonomous_mode`): an
+/// agent that answers without handing off is re-run with the continuation
+/// prompt until its turn limit, and only then is the user asked.
+#[tokio::test]
+async fn an_autonomous_agent_continues_until_its_turn_limit_then_asks_the_user() {
+    let a = agent_with(
+        "A",
+        vec![
+            ChatResponse::from_text("step 1"),
+            ChatResponse::from_text("step 2"),
+            ChatResponse::from_text("step 3"),
+        ],
+    );
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .initial_agent("A")
+        .with_autonomous_mode(AutonomousMode::new().turn_limit("A", 2))
+        .build()
+        .unwrap();
+
+    let run = workflow.run("do the task").await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::IdleWithPendingRequests);
+    let request: HandoffUserInputRequest =
+        serde_json::from_value(run.pending_requests()[0].request_data.clone()).unwrap();
+    let texts: Vec<String> = request.conversation.iter().map(Message::text).collect();
+    // One initial turn plus two autonomous continuations, then the user.
+    for step in ["step 1", "step 2", "step 3"] {
+        assert!(texts.iter().any(|t| t == step), "{step} missing: {texts:?}");
+    }
+    let prompts = texts
+        .iter()
+        .filter(|t| t.as_str() == DEFAULT_AUTONOMOUS_PROMPT)
+        .count();
+    assert_eq!(
+        prompts, 2,
+        "exactly the turn limit's continuations: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_limit_of_zero_disables_continuation_for_that_agent() {
+    let a = agent_with("A", vec![ChatResponse::from_text("only answer")]);
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .initial_agent("A")
+        .with_autonomous_mode(AutonomousMode::new().turn_limit("A", 0))
+        .build()
+        .unwrap();
+
+    let run = workflow.run("q").await.unwrap();
+    let request: HandoffUserInputRequest =
+        serde_json::from_value(run.pending_requests()[0].request_data.clone()).unwrap();
+    assert!(request
+        .conversation
+        .iter()
+        .all(|m| m.text() != DEFAULT_AUTONOMOUS_PROMPT));
+}
+
+#[tokio::test]
+async fn only_the_named_agents_continue_autonomously_with_their_own_prompt() {
+    // A hands off to B; only B is autonomous, with a custom prompt.
+    let a = agent_with("A", vec![handoff_response("c1", "B")]);
+    let b = agent_with(
+        "B",
+        vec![
+            ChatResponse::from_text("b first"),
+            ChatResponse::from_text("b second"),
+        ],
+    );
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .participant("B", b)
+        .initial_agent("A")
+        .add_handoff("A")
+        .to(["B"])
+        .with_autonomous_mode(
+            AutonomousMode::new()
+                .for_agents(["B"])
+                .prompt("B", "keep going, B")
+                .turn_limit("B", 1),
+        )
+        .build()
+        .unwrap();
+
+    let run = workflow.run("q").await.unwrap();
+    let request: HandoffUserInputRequest =
+        serde_json::from_value(run.pending_requests()[0].request_data.clone()).unwrap();
+    assert_eq!(request.awaiting_agent, "B");
+    let texts: Vec<String> = request.conversation.iter().map(Message::text).collect();
+    assert!(texts.iter().any(|t| t == "keep going, B"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "b second"), "{texts:?}");
+}
+
+#[tokio::test]
+async fn single_shot_autonomous_mode_completes_after_the_continuations() {
+    // Composes with `.autonomous()`: continue, then complete instead of asking.
+    let a = agent_with(
+        "A",
+        vec![
+            ChatResponse::from_text("draft"),
+            ChatResponse::from_text("done"),
+        ],
+    );
+    let workflow = HandoffBuilder::new()
+        .participant("A", a)
+        .initial_agent("A")
+        .autonomous()
+        .with_autonomous_mode(AutonomousMode::new().turn_limit("A", 1))
+        .build()
+        .unwrap();
+
+    let run = workflow.run("q").await.unwrap();
+    assert_eq!(run.state(), WorkflowRunState::Idle);
+    let conv = conversation(run.last_output().expect("completes"));
+    assert!(conv.iter().any(|m| m.text() == "done"));
 }

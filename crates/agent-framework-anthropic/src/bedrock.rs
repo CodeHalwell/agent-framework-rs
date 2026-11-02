@@ -162,7 +162,7 @@ impl AnthropicBedrockClient {
         let region = region.into();
         Self {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                http: crate::http_client(),
                 host: bedrock_host(&region),
                 region,
                 model: model.into(),
@@ -278,10 +278,12 @@ impl AnthropicBedrockClient {
             request = request.header(name, value);
         }
 
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = request.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();

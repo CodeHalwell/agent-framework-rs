@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{parse_conversation, run_agent_and_emit};
+use super::{invocation_messages, parse_conversation, run_agent_and_emit};
 use crate::agent::SupportsAgentRun;
 use crate::error::{Error, Result};
 use crate::types::Message;
@@ -94,6 +94,8 @@ pub struct AgentApprovalExecutor {
     /// `emit_output` is also set. Mirrors
     /// [`AgentExecutor::with_also_send`](super::AgentExecutor::with_also_send).
     also_send: bool,
+    /// See [`Self::with_trailing_user_turn`].
+    ensure_trailing_user_turn: bool,
 }
 
 impl AgentApprovalExecutor {
@@ -104,7 +106,14 @@ impl AgentApprovalExecutor {
             agent,
             emit_output: false,
             also_send: false,
+            ensure_trailing_user_turn: false,
         }
+    }
+
+    /// See [`AgentExecutor::with_trailing_user_turn`](super::AgentExecutor::with_trailing_user_turn).
+    pub fn with_trailing_user_turn(mut self, ensure: bool) -> Self {
+        self.ensure_trailing_user_turn = ensure;
+        self
     }
 
     /// When set, yield the approved conversation as a workflow output. See
@@ -129,8 +138,8 @@ impl AgentApprovalExecutor {
         conversation: Vec<Message>,
         ctx: &WorkflowContext,
     ) -> Result<()> {
-        let response =
-            run_agent_and_emit(&self.agent, conversation.clone(), &self.id, &self.id, ctx).await?;
+        let invocation = invocation_messages(&conversation, self.ensure_trailing_user_turn);
+        let response = run_agent_and_emit(&self.agent, invocation, &self.id, &self.id, ctx).await?;
         let request = ApprovalRequest {
             conversation,
             reply: response.messages,

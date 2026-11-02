@@ -9,12 +9,55 @@ may break APIs).
 
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
 in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
-and two further rounds against the same baseline in
-[`docs/drift/2026-11-02-ca65085e-round-2.md`](docs/drift/2026-11-02-ca65085e-round-2.md) and
-[`docs/drift/2026-11-02-ca65085e-round-3.md`](docs/drift/2026-11-02-ca65085e-round-3.md).
-Nine changes fixing seven defects that were live in this port (round
-three's single change fixes two). A review of the official Azure SDK for
-Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+and three further rounds against the same baseline in
+[`round-2`](docs/drift/2026-11-02-ca65085e-round-2.md),
+[`round-3`](docs/drift/2026-11-02-ca65085e-round-3.md) and
+[`round-4`](docs/drift/2026-11-02-ca65085e-round-4.md).
+Round four takes the two security items earlier rounds had left for a
+decision, and clears the rest of the queue. A review of the official Azure
+SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+### Security (round four)
+
+- `agent-framework-redis` no longer returns one scope's memories under
+  another's. The `FT.SEARCH` path's scope `TAG` query over-matched — a value
+  containing a comma is indexed as several tags, and matching is
+  case-insensitive — so `user_id = "smith"` received `"smith,john"`'s
+  memories. Every hit is now re-checked against the exact scope, and the
+  query requires each comma-separated part, which also lets a provider whose
+  own id contains a comma find its memories at all. No schema change or data
+  migration (upstream's #9461 needed both).
+- AG-UI `RUN_ERROR` events no longer carry a failed run's internal error
+  text to the client; it is logged against the run id instead, as DevUI's
+  were in round one.
+
+### Fixed (round four)
+
+- Transport errors now say what went wrong. A `reqwest` failure's own
+  message reads the same for a timeout, a refused connection and a DNS
+  failure; every provider crate now includes the error's cause chain, via a
+  new `agent_framework_core::error::error_chain`.
+- An MCP tool configured with a zero request timeout is refused at
+  `connect` instead of failing every call (upstream #9314).
+- MCP tools that require the Tasks extension, which this client does not
+  implement, are no longer offered to the model (upstream #9746).
+
+### Added (round four)
+
+- Every HTTP-backed crate sends the framework `User-Agent`
+  (`agent-framework-rust/<version> (<crate>)`). The format moves to
+  `agent_framework_core::user_agent`; the provider crates that sent none,
+  and the two that sent a one-off format (Copilot Studio, Purview), now use
+  it.
+- `Annotation::annotated_regions_coordinate_space` and
+  `Annotation::content_regions()`: Anthropic document citations locate the
+  quote in the *source*, and are now marked so, so they are not mistaken
+  for spans of the answer (upstream #9436).
+- `SequentialBuilder::ensure_trailing_user_turn` (upstream #8779), and
+  `with_trailing_user_turn` on `AgentExecutor` / `AgentApprovalExecutor`.
+- `HandoffBuilder::with_autonomous_mode(AutonomousMode)`: per-agent
+  autonomous continuation with per-agent prompts and turn limits, as
+  upstream's `with_autonomous_mode`.
 
 ### Fixed (round three)
 

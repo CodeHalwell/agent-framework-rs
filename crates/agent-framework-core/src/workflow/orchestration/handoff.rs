@@ -17,9 +17,11 @@
 //! **inspecting** the agent's response for a handoff-shaped function call
 //! (matching Python's `_resolve_handoff_target`) rather than injecting an
 //! auto-handoff middleware; [`handoff_tool_spec`] generates the marker tool
-//! specs so callers can attach them to their agents. (2) Autonomous mode
-//! completes on the first non-handoff answer (a true single-shot) rather than
-//! re-prompting the same agent until a turn limit as Python does.
+//! specs so callers can attach them to their agents. (2)
+//! [`HandoffInteractionMode::Autonomous`] completes on the first non-handoff
+//! answer (a true single-shot). Upstream's re-prompting of the same agent
+//! until a per-agent turn limit is [`HandoffBuilder::with_autonomous_mode`],
+//! which composes with either interaction mode.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +47,84 @@ pub enum HandoffInteractionMode {
     HumanInLoop,
     /// Complete the workflow on the first non-handoff answer (single-shot).
     Autonomous,
+}
+
+/// The prompt an autonomous agent is re-run with when it answers without
+/// handing off. Upstream's default.
+pub const DEFAULT_AUTONOMOUS_PROMPT: &str =
+    "User did not respond. Continue assisting autonomously.";
+
+/// How many autonomous continuations an agent gets by default before control
+/// returns to the user. Upstream's default.
+pub const DEFAULT_AUTONOMOUS_TURN_LIMIT: usize = 50;
+
+/// Per-agent autonomous continuation for a handoff workflow — upstream's
+/// `with_autonomous_mode(agents=..., prompts=..., turn_limits=...)`. Set with
+/// [`HandoffBuilder::with_autonomous_mode`].
+///
+/// When an enabled agent answers without handing off, it is re-run with a
+/// continuation prompt as a user turn instead of the workflow stopping there,
+/// up to its turn limit; only then does the interaction mode's own step run
+/// (asking the user, or completing). A handoff resets the agent's count.
+/// This lets an agent work through a long task on its own while still
+/// handing back to a person eventually.
+#[derive(Debug, Clone, Default)]
+pub struct AutonomousMode {
+    agents: Vec<String>,
+    prompts: HashMap<String, String>,
+    turn_limits: HashMap<String, usize>,
+}
+
+impl AutonomousMode {
+    /// Autonomous continuation for every participant.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict autonomous continuation to the named participants. Without
+    /// this every participant continues autonomously.
+    pub fn for_agents<I, S>(mut self, agents: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.agents = agents.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The continuation prompt for one participant (default
+    /// [`DEFAULT_AUTONOMOUS_PROMPT`]).
+    pub fn prompt(mut self, agent: impl Into<String>, prompt: impl Into<String>) -> Self {
+        self.prompts.insert(agent.into(), prompt.into());
+        self
+    }
+
+    /// How many autonomous continuations one participant gets before control
+    /// returns to the user (default [`DEFAULT_AUTONOMOUS_TURN_LIMIT`]). `0`
+    /// disables continuation for that participant rather than falling back
+    /// to the default, as upstream.
+    pub fn turn_limit(mut self, agent: impl Into<String>, limit: usize) -> Self {
+        self.turn_limits.insert(agent.into(), limit);
+        self
+    }
+
+    fn enabled_for(&self, agent: &str) -> bool {
+        self.agents.is_empty() || self.agents.iter().any(|a| a == agent)
+    }
+
+    fn limit_for(&self, agent: &str) -> usize {
+        self.turn_limits
+            .get(agent)
+            .copied()
+            .unwrap_or(DEFAULT_AUTONOMOUS_TURN_LIMIT)
+    }
+
+    fn prompt_for(&self, agent: &str) -> &str {
+        self.prompts
+            .get(agent)
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_AUTONOMOUS_PROMPT)
+    }
 }
 
 /// The payload of the request-info event emitted when the workflow needs fresh
@@ -414,6 +494,7 @@ struct HandoffCoordinator {
     turn_limit: usize,
     termination: TerminationCondition,
     prompt: String,
+    autonomous: Option<AutonomousMode>,
 }
 
 impl HandoffCoordinator {
@@ -476,6 +557,9 @@ impl HandoffCoordinator {
         ctx: &WorkflowContext,
     ) -> Result<()> {
         let mut turns = 0usize;
+        // Autonomous continuations the current agent has used since it last
+        // took over; reset on every handoff, as upstream.
+        let mut autonomous_turns = 0usize;
         loop {
             turns += 1;
             if turns > self.turn_limit {
@@ -500,6 +584,7 @@ impl HandoffCoordinator {
                 HandoffResolution::Known { target, call } => {
                     Self::append_tool_ack(&mut conversation, &call, &target);
                     current = target;
+                    autonomous_turns = 0;
                     continue;
                 }
                 HandoffResolution::Unknown { name, call } => {
@@ -511,6 +596,18 @@ impl HandoffCoordinator {
                         let out = clean_conversation(&conversation);
                         ctx.yield_output(serialize(&out)?).await?;
                         return Ok(());
+                    }
+                    // Autonomous continuation: re-run the same agent with its
+                    // prompt instead of stopping, until its turn limit. These
+                    // runs still count against `max_iterations`, which bounds
+                    // the whole workflow.
+                    if let Some(auto) = &self.autonomous {
+                        if auto.enabled_for(&current) && autonomous_turns < auto.limit_for(&current)
+                        {
+                            autonomous_turns += 1;
+                            conversation.push(Message::user(auto.prompt_for(&current)));
+                            continue;
+                        }
                     }
                     match self.interaction_mode {
                         HandoffInteractionMode::Autonomous => {
@@ -633,6 +730,7 @@ pub struct HandoffBuilder {
     termination: Option<TerminationCondition>,
     prompt: Option<String>,
     name: Option<String>,
+    autonomous: Option<AutonomousMode>,
 }
 
 impl Default for HandoffBuilder {
@@ -646,6 +744,7 @@ impl Default for HandoffBuilder {
             termination: None,
             prompt: None,
             name: None,
+            autonomous: None,
         }
     }
 }
@@ -704,6 +803,17 @@ impl HandoffBuilder {
     /// Run autonomously (single-shot): complete on the first non-handoff answer.
     pub fn autonomous(mut self) -> Self {
         self.interaction_mode = HandoffInteractionMode::Autonomous;
+        self
+    }
+
+    /// Let agents continue on their own when they answer without handing
+    /// off, per participant — upstream's `with_autonomous_mode` (see
+    /// [`AutonomousMode`]). Composes with either interaction mode: once an
+    /// agent's autonomous turns are used up, the mode's own step follows
+    /// (asking the user in [`HandoffInteractionMode::HumanInLoop`],
+    /// completing in [`HandoffInteractionMode::Autonomous`]).
+    pub fn with_autonomous_mode(mut self, mode: AutonomousMode) -> Self {
+        self.autonomous = Some(mode);
         self
     }
 
@@ -845,6 +955,7 @@ impl HandoffBuilder {
             prompt: self
                 .prompt
                 .unwrap_or_else(|| "Provide your next input for the conversation.".to_string()),
+            autonomous: self.autonomous,
         };
 
         let mut builder = WorkflowBuilder::new()

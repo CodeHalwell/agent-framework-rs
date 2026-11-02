@@ -135,3 +135,17 @@ pub use types::{
     PushNotificationConfig, SendMessageResult, Task, TaskArtifactUpdateEvent,
     TaskPushNotificationConfig, TaskState, TaskStatus, TaskStatusUpdateEvent, TextPart,
 };
+
+/// This crate's HTTP client, sending the framework `User-Agent`
+/// ([`agent_framework_core::user_agent::user_agent`]) so providers can
+/// attribute the traffic. A static ASCII token cannot fail to become a
+/// header; the fallback only keeps this infallible.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(agent_framework_core::user_agent::user_agent(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}

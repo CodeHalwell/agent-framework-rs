@@ -1896,6 +1896,10 @@ impl AgUiChatClient {
     /// as long as the server keeps sending.
     pub fn with_timeout(endpoint: impl Into<String>, timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
+            .user_agent(agent_framework_core::user_agent::user_agent(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
             .connect_timeout(timeout)
             .read_timeout(timeout)
             .build()
@@ -1996,7 +2000,12 @@ impl AgUiChatClient {
             .json(&run.input)
             .send()
             .await
-            .map_err(|e| Error::service(format!("AG-UI request failed: {e}")))?;
+            .map_err(|e| {
+                Error::service(format!(
+                    "AG-UI request failed: {}",
+                    agent_framework_core::error::error_chain(&e)
+                ))
+            })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();

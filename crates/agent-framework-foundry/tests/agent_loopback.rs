@@ -204,15 +204,22 @@ async fn a_request_that_outlives_the_timeout_fails_instead_of_hanging() {
         .expect_err("the request must not outlive its timeout");
     let elapsed = started.elapsed();
 
-    // The claim is about *when* it gave up, not the wording: the bound has to
-    // end the request before the server would have answered. The error text
-    // itself is `reqwest`'s opaque "error sending request for url (...)",
-    // which does not distinguish a timeout from a refused connection.
+    // The bound has to end the request before the server would have
+    // answered...
     assert!(
         elapsed < SLOW_SERVER_DELAY,
         "gave up after {elapsed:?}, which is not sooner than the server's \
          {SLOW_SERVER_DELAY:?} delay — the timeout did not bound the request \
          (error: {err})"
+    );
+    // ...and the error has to say it was a timeout. `reqwest`'s own Display
+    // is only "error sending request for url (...)", identical for a timeout
+    // and a refused connection; the cause is in its source chain, which the
+    // provider crates now include (`agent_framework_core::error::error_chain`).
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(
+        text.contains("timed out") || text.contains("timeout"),
+        "the error should name the timeout: {err}"
     );
 }
 

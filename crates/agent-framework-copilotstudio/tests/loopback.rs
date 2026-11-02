@@ -319,3 +319,28 @@ async fn non_success_status_surfaces_as_service_error() {
     let err = agent.run_once("hi").await.unwrap_err();
     assert_eq!(err.status(), Some(401));
 }
+
+/// Copilot Studio is a Microsoft service, and its traffic now names the
+/// framework and this connector like every other crate's (`SCOPE.md`'s
+/// standing User-Agent item). It used to go out from a bare
+/// `reqwest::Client::new()` with no `User-Agent` at all.
+#[tokio::test]
+async fn requests_carry_the_framework_user_agent() {
+    let (base_url, handle) = serve_sequence(vec![Box::new(|stream| {
+        write_sse_activity_response(stream, &serde_json::json!({"type": "event"}));
+    })]);
+
+    let connection =
+        CopilotStudioConnectionSettings::new("unused", "unused").with_direct_connect_url(base_url);
+    let agent = CopilotStudioAgent::new(connection, StaticTokenProvider::new("tok"));
+    let _ = agent.run_once("hi").await;
+
+    let requests = handle.join().expect("server thread");
+    let ua = requests[0]
+        .header("user-agent")
+        .expect("a User-Agent header");
+    assert!(
+        ua.starts_with("agent-framework-rust/") && ua.contains("(agent-framework-copilotstudio)"),
+        "unexpected User-Agent: {ua}"
+    );
+}

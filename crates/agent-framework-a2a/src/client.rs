@@ -61,7 +61,7 @@ impl A2AClient {
     pub fn from_url(url: impl Into<String>) -> Self {
         let url = url.into();
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             rpc_url: RwLock::new(url.clone()),
             discovery_base: url,
             headers: HeaderMap::new(),
@@ -74,7 +74,7 @@ impl A2AClient {
     /// without ever fetching anything.
     pub fn from_card(card: AgentCard) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             rpc_url: RwLock::new(card.url.clone()),
             discovery_base: card.url.clone(),
             headers: HeaderMap::new(),
@@ -100,7 +100,13 @@ impl A2AClient {
 
     /// Override the request timeout (reqwest's default is no timeout).
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
+        // Rebuilt from scratch, so the framework `User-Agent` `http_client`
+        // sets has to be set again or a timed client would drop it.
         self.http = reqwest::Client::builder()
+            .user_agent(agent_framework_core::user_agent::user_agent(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
             .timeout(timeout)
             .build()
             .map_err(|e| Error::Configuration(format!("failed to build A2A http client: {e}")))?;

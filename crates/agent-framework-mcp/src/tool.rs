@@ -180,6 +180,26 @@ impl McpApprovalMode {
     }
 }
 
+/// Refuse a zero request timeout before anything is spawned or opened
+/// (upstream #9314).
+///
+/// A `Duration` cannot be negative, so zero is the only non-positive value.
+/// It does not mean "no timeout" here — leaving the timeout unset does that
+/// — it means every request times out the instant it is sent, so the tool
+/// connects and then fails on its first call with an error that names the
+/// method, not the misconfiguration. Upstream rejected the same value
+/// because there it silently *disabled* the bound. The builder setters stay
+/// infallible; `connect` is where a server is first touched, so it is where
+/// the value is checked, as upstream does too.
+fn validate_request_timeout(timeout: Option<Duration>) -> Result<()> {
+    if timeout == Some(Duration::ZERO) {
+        return Err(Error::Configuration(
+            "MCP request timeout must be greater than zero; leave it unset for no timeout".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// An executable [`Tool`] that forwards `invoke` to `tools/call` on a shared
 /// [`McpClient`], using the server's original (un-normalized) tool name.
 struct McpToolExecutor {
@@ -229,6 +249,19 @@ fn build_tool_definitions(
             if !allowed.contains(local_name.as_str()) {
                 continue;
             }
+        }
+        if descriptor.requires_tasks() {
+            // Offering it to the model would only produce a failed call each
+            // time it is chosen: the server refuses a plain `tools/call` for
+            // a tool that requires the Tasks extension, which this client
+            // does not implement. Upstream skips these with a warning too;
+            // `"optional"` Tasks support is an ordinary tool (#9746).
+            tracing::warn!(
+                tool = %descriptor.name,
+                "skipping MCP tool that requires the Tasks extension, which this client \
+                 does not support"
+            );
+            continue;
         }
         if !seen_names.insert(local_name.clone()) {
             tracing::warn!(
@@ -482,6 +515,7 @@ impl McpStdioTool {
     /// Idempotent and safe to call concurrently: the first caller performs
     /// the handshake, later/concurrent callers await and reuse its result.
     pub async fn connect(&self) -> Result<()> {
+        validate_request_timeout(self.request_timeout)?;
         self.session
             .get_or_try_init(|| async {
                 let mut stdio_env = StdioEnv::new()
@@ -758,6 +792,7 @@ impl McpStreamableHttpTool {
     /// Idempotent and safe to call concurrently: the first caller performs
     /// the handshake, later/concurrent callers await and reuse its result.
     pub async fn connect(&self) -> Result<()> {
+        validate_request_timeout(self.timeout)?;
         self.session
             .get_or_try_init(|| async {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
@@ -1028,6 +1063,7 @@ impl McpWebsocketTool {
     /// Idempotent and safe to call concurrently: the first caller performs
     /// the handshake, later/concurrent callers await and reuse its result.
     pub async fn connect(&self) -> Result<()> {
+        validate_request_timeout(self.request_timeout)?;
         self.session
             .get_or_try_init(|| async {
                 let mut transport =
@@ -1175,7 +1211,47 @@ mod tests {
             description: Some(format!("{name} tool")),
             input_schema: json!({"type": "object", "properties": {}}),
             output_schema: None,
+            execution: None,
         }
+    }
+
+    fn descriptor_with_task_support(name: &str, support: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            execution: Some(json!({ "taskSupport": support })),
+            ..descriptor(name)
+        }
+    }
+
+    #[test]
+    fn a_tool_that_requires_tasks_is_not_offered() {
+        // This client cannot call it: the server refuses a plain
+        // `tools/call` for it, so every time the model chose it the call
+        // would fail.
+        let tools = vec![
+            descriptor("plain"),
+            descriptor_with_task_support("optional_tasks", "optional"),
+            descriptor_with_task_support("forbidden_tasks", "forbidden"),
+            descriptor_with_task_support("needs_tasks", "required"),
+        ];
+        let defs =
+            build_tool_definitions(dummy_client(), &tools, None, &McpApprovalMode::default());
+        let names: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["plain", "optional_tasks", "forbidden_tasks"]),
+            "optional Tasks support is an ordinary tool; only required is skipped (#9746)"
+        );
+    }
+
+    #[test]
+    fn task_support_is_read_from_the_tools_list_wire_shape() {
+        let d: ToolDescriptor = serde_json::from_value(json!({
+            "name": "t",
+            "inputSchema": { "type": "object" },
+            "execution": { "taskSupport": "required" }
+        }))
+        .unwrap();
+        assert!(d.requires_tasks());
     }
 
     fn prompt_descriptor(name: &str) -> PromptDescriptor {
@@ -1446,6 +1522,51 @@ mod tests {
         assert!(!tool.load_tools);
         assert!(!tool.load_prompts);
         assert_eq!(tool.request_timeout, Some(Duration::from_secs(7)));
+    }
+
+    // -- a zero request timeout is refused before connecting (#9314) -----
+
+    fn assert_zero_timeout_refused(result: Result<()>) {
+        match result {
+            Err(Error::Configuration(msg)) => {
+                assert!(msg.contains("greater than zero"), "{msg}");
+            }
+            other => panic!(
+                "a zero timeout must be refused as configuration before any \
+                 connection is attempted, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stdio_tool_with_a_zero_request_timeout_is_refused_before_spawning() {
+        // The command does not exist: reaching the spawn would fail with a
+        // different error, so this also proves nothing was spawned.
+        let tool = McpStdioTool::new("s", "definitely-not-a-real-mcp-server-binary")
+            .request_timeout(Duration::ZERO);
+        assert_zero_timeout_refused(tool.connect().await);
+    }
+
+    #[tokio::test]
+    async fn an_http_tool_with_a_zero_timeout_is_refused_before_connecting() {
+        // Port 9 on loopback has nothing listening; a connection attempt would
+        // fail with a transport error instead.
+        let tool =
+            McpStreamableHttpTool::new("h", "http://127.0.0.1:9/mcp").timeout(Duration::ZERO);
+        assert_zero_timeout_refused(tool.connect().await);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_tool_with_a_zero_request_timeout_is_refused_before_connecting() {
+        let tool =
+            McpWebsocketTool::new("w", "ws://127.0.0.1:9/mcp").request_timeout(Duration::ZERO);
+        assert_zero_timeout_refused(tool.connect().await);
+    }
+
+    #[test]
+    fn an_unset_or_positive_timeout_passes_validation() {
+        assert!(validate_request_timeout(None).is_ok());
+        assert!(validate_request_timeout(Some(Duration::from_millis(1))).is_ok());
     }
 
     // -- load_tools=false / load_prompts=false short-circuit (no connect) -

@@ -426,3 +426,72 @@ pub struct ContentFilterCategory {
     /// verbatim. `None` for a detection-only category, which carries none.
     pub severity: Option<String>,
 }
+
+/// Render an error together with its whole `source()` chain, outermost
+/// first: `"error sending request for url (…): operation timed out"`.
+///
+/// Transport errors hide their cause in the chain. `reqwest::Error`'s own
+/// `Display` prints only the outermost layer — "error sending request for
+/// url (…)" — which reads the same for a timeout, a refused connection, a
+/// DNS failure and a TLS handshake error. The detail that says which one it
+/// was is in `source()`. Every provider crate wraps send failures through
+/// this, so a hung endpoint is diagnosable from the error text alone.
+///
+/// A layer whose text the previous one already includes is skipped, so a
+/// wrapper that formats its source into its own message is not printed
+/// twice.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn includes_every_cause_outermost_first() {
+        let err = Layer(
+            "error sending request for url (http://x/)",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer("operation timed out", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (http://x/): client error (Connect): operation timed out"
+        );
+    }
+
+    #[test]
+    fn skips_a_cause_the_outer_message_already_contains() {
+        let err = Layer(
+            "read failed: broken pipe",
+            Some(Box::new(Layer("broken pipe", None))),
+        );
+        assert_eq!(error_chain(&err), "read failed: broken pipe");
+    }
+}

@@ -586,10 +586,12 @@ impl AzureOpenAIResponsesClient {
         for (name, value) in client_headers {
             req = req.header(name, value);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            Error::service(format!(
+                "request failed: {}",
+                agent_framework_core::error::error_chain(&e)
+            ))
+        })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = crate::parse_retry_after(resp.headers());

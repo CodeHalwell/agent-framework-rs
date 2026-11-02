@@ -19,6 +19,7 @@ pub struct SequentialBuilder {
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
     request_info: bool,
+    ensure_trailing_user_turn: bool,
 }
 
 impl SequentialBuilder {
@@ -98,6 +99,21 @@ impl SequentialBuilder {
         self
     }
 
+    /// When set, a participant whose input conversation ends on an assistant
+    /// message — every participant after the first, since each is handed the
+    /// previous one's reply — is run with a synthetic `"please continue."`
+    /// user turn appended (upstream #8779). Some chat-completions providers
+    /// answer a prompt ending on `assistant` with empty text.
+    ///
+    /// The turn exists only for that invocation: it is not added to the
+    /// running conversation, so it is never forwarded to the next
+    /// participant or included in the workflow's output. Off by default,
+    /// which keeps the existing behaviour.
+    pub fn ensure_trailing_user_turn(mut self, ensure: bool) -> Self {
+        self.ensure_trailing_user_turn = ensure;
+        self
+    }
+
     /// Validate and build the sequential workflow.
     pub fn build(self) -> Result<Workflow> {
         if self.participants.is_empty() {
@@ -150,13 +166,15 @@ impl SequentialBuilder {
                 Arc::new(
                     AgentApprovalExecutor::new(exec_id.clone(), agent)
                         .with_output(emit)
-                        .with_also_send(has_designation),
+                        .with_also_send(has_designation)
+                        .with_trailing_user_turn(self.ensure_trailing_user_turn),
                 )
             } else {
                 Arc::new(
                     AgentExecutor::new(exec_id.clone(), agent)
                         .with_output(emit)
-                        .with_also_send(has_designation),
+                        .with_also_send(has_designation)
+                        .with_trailing_user_turn(self.ensure_trailing_user_turn),
                 )
             };
             builder = builder.add_executor(exec);

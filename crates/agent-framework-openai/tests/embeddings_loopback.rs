@@ -124,3 +124,29 @@ async fn embeddings_service_error_maps_to_service_status() {
         "got: {err:?}"
     );
 }
+
+/// Requests name the framework and this crate (`agent-framework-rust/<v>
+/// (agent-framework-openai)`). This crate used to send no `User-Agent` at all
+/// (a bare `reqwest::Client::new()`), so its traffic was unattributable — the
+/// open framework-wide item in `SCOPE.md`.
+#[tokio::test]
+async fn requests_carry_the_framework_user_agent() {
+    let body = serde_json::json!({
+        "object": "list", "model": "m",
+        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+    })
+    .to_string();
+    let (base_url, seen) = one_shot_server((200, body));
+    OpenAIEmbeddingClient::new("sk-test", "m")
+        .with_base_url(base_url)
+        .get_embeddings(vec!["a".into()], None)
+        .await
+        .expect("round trip");
+
+    let request = seen.lock().unwrap().to_ascii_lowercase();
+    assert!(
+        request.contains("user-agent: agent-framework-rust/")
+            && request.contains("(agent-framework-openai)"),
+        "{request}"
+    );
+}

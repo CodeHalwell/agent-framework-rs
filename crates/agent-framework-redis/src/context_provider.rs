@@ -361,6 +361,50 @@ fn ft_create_args(key_prefix: &str, index_name: &str) -> Vec<String> {
     args
 }
 
+/// RediSearch's default `TAG` separator. The scope fields are declared with
+/// it (see [`ft_create_args`]), so a stored value is split on it at index
+/// time.
+const TAG_SEPARATOR: char = ',';
+
+/// Push the `TAG` clauses that select `value` for `field`.
+///
+/// The scope `TAG` fields use RediSearch's defaults: values are split on
+/// [`TAG_SEPARATOR`], each part trimmed, and matched case-insensitively.
+/// That happens at *index* time, on the stored value, so query escaping
+/// cannot undo it. Two consequences, both handled here and in
+/// [`RedisContextProvider::ft_search`]:
+///
+/// * **Under-match.** A stored `user_id = "smith,john"` is indexed as the
+///   two tags `smith` and `john`. A single clause `@user_id:{smith\,john}`
+///   asks for one tag spelled `smith,john`, which does not exist, so a
+///   provider could never retrieve its own memories. The value is split the
+///   way the index split it and every part is required (`@user_id:{smith}
+///   @user_id:{john}`).
+/// * **Over-match.** Those clauses — and case-insensitive matching — also
+///   select entries of *other* scopes: `@user_id:{smith}` matches the
+///   `"smith,john"` entry, and `Alice` matches `alice`. The query is
+///   therefore only a candidate filter; `ft_search` re-checks every hit
+///   against the exact scope before returning it.
+///
+/// A value with no non-empty part (`","`) adds no clause; the exact re-check
+/// still applies.
+fn push_scope_tag_clauses(clauses: &mut Vec<String>, field: &str, value: &str) {
+    for part in value.split(TAG_SEPARATOR) {
+        let part = part.trim();
+        if !part.is_empty() {
+            clauses.push(format!("@{field}:{{{}}}", escape_redisearch(part)));
+        }
+    }
+}
+
+/// How many candidates `FT.SEARCH` is asked for per result wanted. The query
+/// can return entries of other scopes that the exact re-check then drops
+/// (see [`push_scope_tag_clauses`]); asking for only `limit` would let those
+/// crowd genuine hits out of the page. Collisions need a value that shares a
+/// comma-separated part, or differs only by case, with another scope's, so a
+/// small factor is plenty.
+const FT_SEARCH_OVERFETCH: usize = 4;
+
 /// Build the `FT.SEARCH` query-string argument (everything the caller
 /// supplies after `FT.SEARCH {index}`) for `scope` (ANDed exact-match
 /// `TAG` filters, mirroring [`Scope::matches`]) combined with an OR of
@@ -373,17 +417,15 @@ fn ft_create_args(key_prefix: &str, index_name: &str) -> Vec<String> {
 /// ever called, but kept total rather than partial.
 fn build_ft_search_query(scope: &Scope, tokens: &[String]) -> String {
     let mut clauses = Vec::new();
-    if let Some(v) = &scope.application_id {
-        clauses.push(format!("@application_id:{{{}}}", escape_redisearch(v)));
-    }
-    if let Some(v) = &scope.agent_id {
-        clauses.push(format!("@agent_id:{{{}}}", escape_redisearch(v)));
-    }
-    if let Some(v) = &scope.user_id {
-        clauses.push(format!("@user_id:{{{}}}", escape_redisearch(v)));
-    }
-    if let Some(v) = &scope.thread_id {
-        clauses.push(format!("@thread_id:{{{}}}", escape_redisearch(v)));
+    for (field, value) in [
+        ("application_id", &scope.application_id),
+        ("agent_id", &scope.agent_id),
+        ("user_id", &scope.user_id),
+        ("thread_id", &scope.thread_id),
+    ] {
+        if let Some(v) = value {
+            push_scope_tag_clauses(&mut clauses, field, v);
+        }
     }
     if !tokens.is_empty() {
         let ored = tokens
@@ -398,6 +440,23 @@ fn build_ft_search_query(scope: &Scope, tokens: &[String]) -> String {
     } else {
         clauses.join(" ")
     }
+}
+
+/// Keep only the `FT.SEARCH` candidates whose scope matches `scope` exactly,
+/// in the order RediSearch ranked them, up to `limit`.
+///
+/// This is what stops one scope's memories reaching another. The `TAG`
+/// query over-matches by construction (see [`push_scope_tag_clauses`]):
+/// before this check, a provider scoped to `user_id = "smith"` was handed
+/// memories stored under `user_id = "smith,john"`, and `"Alice"` was handed
+/// `"alice"`'s. [`Scope::matches`] is the same exact comparison the SCAN
+/// fallback has always applied, so both paths now agree on what a scope is.
+fn exact_scope_hits(candidates: Vec<MemoryEntry>, scope: &Scope, limit: usize) -> Vec<MemoryEntry> {
+    candidates
+        .into_iter()
+        .filter(|entry| scope.matches(entry))
+        .take(limit)
+        .collect()
 }
 
 /// Parse a raw `FT.SEARCH ... RETURN 1 $` reply into [`MemoryEntry`]
@@ -791,12 +850,16 @@ impl RedisContextProvider {
             .arg("$")
             .arg("LIMIT")
             .arg(0)
-            .arg(limit);
+            .arg(limit.saturating_mul(FT_SEARCH_OVERFETCH));
         let reply = cmd
             .query_async::<redis::Value>(conn)
             .await
             .map_err(map_redis_err)?;
-        Ok(parse_ft_search_reply(&reply))
+        Ok(exact_scope_hits(
+            parse_ft_search_reply(&reply),
+            scope,
+            limit,
+        ))
     }
 }
 
@@ -1323,6 +1386,73 @@ mod tests {
         };
         let query = build_ft_search_query(&scope, &[]);
         assert_eq!(query, "@user_id:{user\\@example\\.com}");
+    }
+
+    #[test]
+    fn a_scope_value_containing_the_tag_separator_queries_every_part() {
+        // The index split the stored "smith,john" into the tags `smith` and
+        // `john`; a single clause for the tag `smith,john` matches nothing,
+        // so a provider could never retrieve its own memories.
+        let scope = Scope {
+            user_id: Some("smith, john".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_ft_search_query(&scope, &[]),
+            "@user_id:{smith} @user_id:{john}"
+        );
+    }
+
+    #[test]
+    fn a_scope_value_of_only_separators_adds_no_clause() {
+        let scope = Scope {
+            user_id: Some(" , ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(build_ft_search_query(&scope, &[]), "*");
+    }
+
+    fn scoped(content: &str, user_id: &str) -> MemoryEntry {
+        MemoryEntry {
+            user_id: Some(user_id.to_string()),
+            ..entry(content, 0)
+        }
+    }
+
+    #[test]
+    fn another_scopes_memory_matched_by_the_tag_query_is_not_returned() {
+        // The leak: `@user_id:{smith}` also selects an entry stored under
+        // "smith,john" (indexed as tags smith + john), and TAG matching is
+        // case-insensitive. Only the exact scope may come back.
+        let scope = Scope {
+            user_id: Some("smith".to_string()),
+            ..Default::default()
+        };
+        let candidates = vec![
+            scoped("someone else's secret", "smith,john"),
+            scoped("a different user's secret", "SMITH"),
+            scoped("mine", "smith"),
+        ];
+        let hits = exact_scope_hits(candidates, &scope, 10);
+        let contents: Vec<&str> = hits.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, vec!["mine"]);
+    }
+
+    #[test]
+    fn exact_scope_hits_keeps_rank_order_and_the_limit() {
+        let scope = Scope {
+            user_id: Some("u1".to_string()),
+            ..Default::default()
+        };
+        let candidates = vec![
+            scoped("first", "u1"),
+            scoped("leak", "U1"),
+            scoped("second", "u1"),
+            scoped("third", "u1"),
+        ];
+        let hits = exact_scope_hits(candidates, &scope, 2);
+        let contents: Vec<&str> = hits.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, vec!["first", "second"]);
     }
 
     #[test]
