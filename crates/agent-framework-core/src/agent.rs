@@ -606,8 +606,24 @@ impl Agent {
         ctx.session_id = Some(session.session_id().to_string());
         ctx.service_session_id = service_session_id.clone();
         ctx.session = Some(session.clone());
+        ctx.agent = Some(crate::memory::AgentInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        });
         for provider in &providers {
             provider.before_run(&mut ctx).await?;
+            // Attribute the messages this provider added (wherever it put
+            // them; a history provider prepends) to it.
+            let source = provider.source_id();
+            for message in &mut ctx.messages {
+                if !message
+                    .additional_properties
+                    .contains_key(crate::memory::ATTRIBUTION_KEY)
+                {
+                    crate::memory::attribute_message(message, &source, Some(&source), &[]);
+                }
+            }
         }
         if let Some(instr) = ctx.instructions {
             options.instructions = Some(match options.instructions.take() {

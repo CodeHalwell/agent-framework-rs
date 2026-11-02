@@ -21,6 +21,15 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Message source attribution (upstream `_attribution`): context messages
+  carry `additional_properties["_attribution"]` with their `source_id`
+  (`ContextProvider::source_id`, defaulting to the provider's type name),
+  `source_type` and any `origin_session_ids`. `SessionContext` gains
+  `extend_messages`, `extend_messages_from` and `get_messages`; the agent
+  attributes whatever a provider adds.
+- `SessionContext::agent` (`AgentInfo`: id, name, description): context
+  providers see the agent they run for in `before_run`, as upstream's
+  `agent` argument.
 - `AgentBuilder::require_per_service_call_history_persistence` (upstream's
   option of the same name): with a local history provider, each model call
   of the tool loop records what it added, so a run that fails midway keeps

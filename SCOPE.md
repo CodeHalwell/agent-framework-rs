@@ -76,10 +76,10 @@ from the roadmap, not from this file.
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline and file-based skills (scripts and script
   runners, class-based and MCP skills, source pipelines); compaction's message-group model, triggers and summarization;
-  workflow telemetry, run cancellation and graph reflection; message source
-  attribution; context providers seeing the agent
-  (they see the session in `before_run` and, through
-  `after_run_in_session`, after the run).
+  workflow telemetry, run cancellation and graph reflection; context
+  providers seeing the agent object (they see its
+  identity, `SessionContext::agent`, and the session in `before_run`, and
+  the session after the run, but not the agent itself).
 - **Vector stores**: MongoDB, DuckDB, SQL Server and Azure DocumentDB
   (blocked on the MongoDB wire protocol). The Redis vector store is ported
   (`agent-framework-redis`'s `experimental-vector-stores` feature); its
