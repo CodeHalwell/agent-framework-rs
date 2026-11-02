@@ -147,6 +147,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   binds as `DOUBLE` only when a double holds it exactly; beyond that
   (above 2^53) it equals nothing and is refused for ordered filters, instead
   of rounding onto a neighbouring stored value.
+- SQL Server vector store: an integer operand on a `float` field binds as
+  `FLOAT` only when a double holds it exactly; beyond that it equals nothing
+  and is refused for ordered filters (as the DuckDB store), instead of
+  rounding onto a neighbouring stored value.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

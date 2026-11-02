@@ -409,6 +409,16 @@ fn value_param(field: &VectorStoreField, value: &Value) -> Result<Param> {
 /// `FLOAT`. A float column accepts integral operands outside the bigint
 /// range; an int column refuses them.
 fn numeric_operand(field: &VectorStoreField, n: &serde_json::Number) -> Result<Param> {
+    if field.type_.as_deref() == Some("float") && (n.is_i64() || n.is_u64()) {
+        // An integer against a FLOAT column is compared as a float, so it
+        // binds as one only when a double holds it exactly; beyond 2^53 it
+        // would round onto a neighbouring stored value.
+        return exact_float(n).map(Param::Float).ok_or_else(|| {
+            config_err(
+                "Integer filter values on float fields must be exactly representable as a float.",
+            )
+        });
+    }
     if let Some(i) = n.as_i64() {
         return Ok(Param::BigInt(i));
     }
@@ -432,6 +442,18 @@ fn numeric_operand(field: &VectorStoreField, n: &serde_json::Number) -> Result<P
         ));
     }
     Ok(Param::Float(f))
+}
+
+/// The integer `n` as an `f64`, when a double holds it exactly.
+fn exact_float(n: &serde_json::Number) -> Option<f64> {
+    if let Some(i) = n.as_i64() {
+        let f = i as f64;
+        // 2^63 saturates on the way back, so it is excluded too.
+        return (f < i64::MAX as f64 && f as i64 == i).then_some(f);
+    }
+    let u = n.as_u64()?;
+    let f = u as f64;
+    (f < u64::MAX as f64 && f as u64 == u).then_some(f)
 }
 
 /// Compiles portable filters into a parameterized two-valued predicate.
@@ -465,6 +487,12 @@ impl FilterCompiler<'_> {
             ));
         }
         let param = match (kind, value) {
+            // An integer no double can hold equals no FLOAT value.
+            ("float", Value::Number(n))
+                if (n.is_i64() || n.is_u64()) && exact_float(n).is_none() =>
+            {
+                return Ok("1 = 0".into())
+            }
             ("int" | "float", Value::Number(n)) => numeric_operand(field, n)?,
             ("str", Value::String(_))
             | ("bool", Value::Bool(_))
@@ -1435,6 +1463,26 @@ mod operand_tests {
         assert_eq!(
             numeric_operand(&float, &number(1e19)).unwrap(),
             Param::Float(1e19)
+        );
+    }
+
+    #[test]
+    fn integers_bind_exactly_on_float_fields() {
+        let float = VectorStoreField::data("score").with_type("float");
+        let int = |i: i64| serde_json::Number::from(i);
+        // Representable integers compare as floats.
+        assert_eq!(numeric_operand(&float, &int(2)).unwrap(), Param::Float(2.0));
+        assert_eq!(
+            numeric_operand(&float, &int(9_007_199_254_740_992)).unwrap(),
+            Param::Float(9_007_199_254_740_992.0)
+        );
+        // 2^53 + 1 is no double: a FLOAT comparison would round it.
+        assert!(numeric_operand(&float, &int(9_007_199_254_740_993)).is_err());
+        // An int field still binds integers as BIGINT.
+        let int_field = VectorStoreField::data("year").with_type("int");
+        assert_eq!(
+            numeric_operand(&int_field, &int(9_007_199_254_740_993)).unwrap(),
+            Param::BigInt(9_007_199_254_740_993)
         );
     }
 }
