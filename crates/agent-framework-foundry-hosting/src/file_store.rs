@@ -99,6 +99,7 @@ fn to_json(stored: &StoredResponse) -> Value {
             "checkpoint_id": p.checkpoint_id,
             "requests": p.requests,
         })),
+        "session_state": stored.session_state,
     })
 }
 
@@ -117,6 +118,10 @@ fn from_json(value: Value) -> Result<StoredResponse> {
         input_items,
         transcript,
         pause,
+        session_state: match &value["session_state"] {
+            Value::Null => None,
+            state => Some(state.clone()),
+        },
     })
 }
 
@@ -158,5 +163,15 @@ impl ResponseStore for FileResponseStore {
             &serde_json::to_value(transcript)?,
         )
         .await
+    }
+
+    async fn conversation_state(&self, id: &str) -> Result<Option<Value>> {
+        self.read(&self.path("conversation_states", id)).await
+    }
+
+    async fn set_conversation_state(&self, id: &str, state: Value) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        self.write(&self.path("conversation_states", id), &state)
+            .await
     }
 }

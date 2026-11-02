@@ -1366,3 +1366,110 @@ async fn sibling_continuations_do_not_share_history() {
     assert_eq!(c.len(), 3, "a, its reply, and c: {c:?}");
     assert!(!c.iter().any(|t| t == "b"), "C must not see B: {c:?}");
 }
+
+/// Counts its turns in session state and replies with the count.
+struct Counter;
+
+#[async_trait::async_trait]
+impl SupportsAgentRun for Counter {
+    async fn run(
+        &self,
+        _messages: Vec<agent_framework_core::prelude::Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::AgentResponse> {
+        let session = session.expect("a session");
+        let n = session
+            .state
+            .get("turns")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + 1;
+        session.state.insert("turns", json!(n));
+        Ok(agent_framework_core::types::AgentResponse {
+            messages: vec![agent_framework_core::prelude::Message::assistant(format!(
+                "turn {n}"
+            ))],
+            ..Default::default()
+        })
+    }
+
+    fn id(&self) -> &str {
+        "counter"
+    }
+}
+
+#[tokio::test]
+async fn agent_server_continuations_keep_session_state() {
+    let router = ResponsesHostServer::agent(Arc::new(Counter)).into_router();
+    let text = |r: &serde_json::Value| {
+        r["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (_, first) = json(&router, post("/responses", json!({"input": "a"}))).await;
+    assert_eq!(text(&first), "turn 1");
+    let (_, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "b", "previous_response_id": first["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(text(&second), "turn 2", "{second}");
+    // Conversations carry it too.
+    let (_, c1) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "a", "conversation": "conv_s"}),
+        ),
+    )
+    .await;
+    assert_eq!(text(&c1), "turn 1");
+    let (_, c2) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "b", "conversation": "conv_s"}),
+        ),
+    )
+    .await;
+    assert_eq!(text(&c2), "turn 2", "{c2}");
+}
+
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn factory_agents_with_fresh_ids_resume_their_sessions() {
+    use agent_framework_foundry_hosting::HistorySource;
+    let echo = Echo::default();
+    let factory_echo = echo.clone();
+    let router = ResponsesHostServer::agent_factory(move || {
+        let echo = factory_echo.clone();
+        async move {
+            // No explicit id: every instance gets a fresh one.
+            let agent: Arc<dyn SupportsAgentRun> =
+                Arc::new(Agent::builder(echo).name("echo").build());
+            Ok(agent)
+        }
+    })
+    .with_history_source(HistorySource::Agent)
+    .into_router();
+    let (_, first) = json(&router, post("/responses", json!({"input": "one"}))).await;
+    let (status, second) = json(
+        &router,
+        post(
+            "/responses",
+            json!({"input": "two", "previous_response_id": first["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = echo.seen.lock().unwrap();
+    assert_eq!(
+        seen.last().unwrap().len(),
+        3,
+        "prior user + assistant + new input"
+    );
+}

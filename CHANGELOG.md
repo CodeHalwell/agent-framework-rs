@@ -52,7 +52,14 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   OpenAI Responses client now keeps `index` and `container_id`). Review
   fixes: cancelling a background response that already finished no longer
   overwrites it with `cancelled`; Foundry approval round trip; unfinished
-  predecessors are refused.
+  predecessors are refused; continuations restore the predecessor's
+  session state (so FIDES context labels and hidden variables carry across
+  turns) via **breaking** `StoredResponse::session_state` and new
+  `ResponseStore::conversation_state` / `set_conversation_state` (no-op
+  defaults: custom stores must implement them to keep conversation state);
+  host-kept sessions are stored under a stable namespace
+  (`foundry-responses/{agent name}`), so factory-built agents resume them
+  (sessions saved under the old per-agent-id key are not found).
 - `agent-framework-foundry-hosting`: rich Responses output (reasoning,
   refusals, function calls and outputs streamed in order, MCP calls, image
   generation, shell calls, approval and OAuth consent requests, URL

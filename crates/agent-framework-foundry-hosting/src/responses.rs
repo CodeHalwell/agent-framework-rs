@@ -151,6 +151,11 @@ pub struct StoredResponse {
     pub transcript: Vec<Message>,
     /// The workflow pause this response ended on, if any.
     pub pause: Option<WorkflowPause>,
+    /// The agent session's state bag after this turn (`AgentSession::to_dict`
+    /// without history), restored into a `HistorySource::AgentServer`
+    /// continuation so session-scoped state (e.g. FIDES labels and hidden
+    /// variables) carries over while the transcript is replayed.
+    pub session_state: Option<Value>,
 }
 
 /// Where responses (and conversation transcripts) are kept.
@@ -166,6 +171,16 @@ pub trait ResponseStore: Send + Sync {
     async fn conversation(&self, id: &str) -> Result<Option<Vec<Message>>>;
     /// Replace a conversation's transcript.
     async fn set_conversation(&self, id: &str, transcript: Vec<Message>) -> Result<()>;
+    /// A conversation's agent-session state (see
+    /// [`StoredResponse::session_state`]). The default keeps none, so a
+    /// store that does not override it loses session state across turns.
+    async fn conversation_state(&self, _id: &str) -> Result<Option<Value>> {
+        Ok(None)
+    }
+    /// Replace a conversation's agent-session state.
+    async fn set_conversation_state(&self, _id: &str, _state: Value) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A process-local [`ResponseStore`].
@@ -173,6 +188,7 @@ pub trait ResponseStore: Send + Sync {
 pub struct InMemoryResponseStore {
     responses: Arc<Mutex<HashMap<String, StoredResponse>>>,
     conversations: Arc<Mutex<HashMap<String, Vec<Message>>>>,
+    conversation_states: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 #[async_trait]
@@ -198,6 +214,16 @@ impl ResponseStore for InMemoryResponseStore {
             .lock()
             .unwrap()
             .insert(id.to_string(), transcript);
+        Ok(())
+    }
+    async fn conversation_state(&self, id: &str) -> Result<Option<Value>> {
+        Ok(self.conversation_states.lock().unwrap().get(id).cloned())
+    }
+    async fn set_conversation_state(&self, id: &str, state: Value) -> Result<()> {
+        self.conversation_states
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), state);
         Ok(())
     }
 }
@@ -390,6 +416,7 @@ impl ResponsesHostServer {
         {
             Ok(HostSessions(
                 self.sessions.session_store(&self.config, context)?,
+                self.config.agent_name.clone(),
             ))
         }
         #[cfg(not(feature = "session-store"))]
@@ -619,6 +646,10 @@ struct Prepared {
     /// Held for the turn's whole life (it travels with the turn into
     /// streaming and background tasks).
     _conversation_turn: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    /// The predecessor's session state (`HistorySource::AgentServer`).
+    session_state: Option<Value>,
+    /// This turn's session state after the run, for persistence.
+    session_out: Arc<Mutex<Option<Value>>>,
 }
 
 /// Replies resuming a paused workflow.
@@ -726,6 +757,7 @@ async fn create(
         None => None,
     };
     let mut pause = None;
+    let mut session_state = None;
     let history = if let Some(previous) = &create.previous_response_id {
         match server.store.get(previous).await {
             Ok(Some(stored)) => {
@@ -739,6 +771,7 @@ async fn create(
                     ));
                 }
                 pause = stored.pause;
+                session_state = stored.session_state;
                 stored.transcript
             }
             Ok(None) => {
@@ -747,6 +780,10 @@ async fn create(
             Err(e) => return server_error(e.to_string()),
         }
     } else if let Some(conversation) = &conversation {
+        match server.store.conversation_state(conversation).await {
+            Ok(state) => session_state = state,
+            Err(e) => return server_error(e.to_string()),
+        }
         match server.store.conversation(conversation).await {
             Ok(t) => t.unwrap_or_default(),
             Err(e) => return server_error(e.to_string()),
@@ -791,6 +828,8 @@ async fn create(
         },
         resume,
         _conversation_turn: conversation_turn,
+        session_state,
+        session_out: Arc::default(),
         input_items: input_items_of(&create.input, &response_id),
         model: create
             .model
@@ -883,6 +922,7 @@ async fn start_background(inner: Arc<Inner>, prepared: Prepared) -> Response {
             .cloned()
             .collect(),
         pause: None,
+        session_state: None,
     };
     if let Err(e) = inner.server.store.put(&id, stored).await {
         return server_error(e.to_string());
@@ -1046,6 +1086,7 @@ async fn run_turn(
                         .cloned()
                         .collect(),
                     pause: None,
+                    session_state: None,
                 };
                 if let Err(e) = server
                     .store
@@ -1088,11 +1129,13 @@ async fn persist(
             store.save_approval_request(id, request).await?;
         }
     }
+    let session_state = prepared.session_out.lock().unwrap().take();
     let stored = StoredResponse {
         response: response.clone(),
         input_items: prepared.input_items.clone(),
         transcript: transcript.clone(),
         pause,
+        session_state: session_state.clone(),
     };
     server
         .store
@@ -1103,6 +1146,12 @@ async fn persist(
             .store
             .set_conversation(conversation, transcript)
             .await?;
+        if let Some(state) = session_state {
+            server
+                .store
+                .set_conversation_state(conversation, state)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -1271,7 +1320,14 @@ async fn execute(
         Some(server.host_sessions(&request.context)?)
     };
     let (mut session, local_history) = match &sessions {
-        None => (agent.create_session(), None),
+        // The transcript is replayed; only the state bag carries over.
+        None => match &prepared.session_state {
+            Some(state) => (
+                agent_framework_core::session::AgentSession::from_dict(state)?,
+                None,
+            ),
+            None => (agent.create_session(), None),
+        },
         Some(sessions) => {
             let (mut session, prior) = load_session(sessions, request, agent.as_ref()).await?;
             let history = attach_local_history(&mut session, prior);
@@ -1308,6 +1364,14 @@ async fn execute(
             AgentResponse::from_updates(updates)
         }
     };
+    if host_history {
+        // Detached, without history: the next turn replays the transcript.
+        let mut state = session.to_dict();
+        if let Some(map) = state.as_object_mut() {
+            map.remove("service_session_id");
+        }
+        *prepared.session_out.lock().unwrap() = Some(state);
+    }
     if !host_history && prepared.store {
         // Part of persistence: a session that cannot be saved fails the
         // turn rather than leaving its continuation unresumable.
@@ -1347,7 +1411,71 @@ fn conversation_session_key(conversation_id: &str) -> String {
 
 /// One turn's view of the host-kept agent sessions.
 #[cfg(feature = "session-store")]
-struct HostSessions(Arc<dyn agent_framework_core::session_store::AgentSessionStore>);
+struct HostSessions(
+    Arc<dyn agent_framework_core::session_store::AgentSessionStore>,
+    /// The configured agent name, the stable namespace sessions are stored
+    /// under (see [`Namespaced`]).
+    String,
+);
+
+/// An agent presented to the session store under a stable, host-level id,
+/// so sessions resume across agent instances: an `agent_factory` may build
+/// each request's agent with a fresh id, and session stores key by agent id.
+#[cfg(feature = "session-store")]
+struct Namespaced<'a> {
+    inner: &'a dyn SupportsAgentRun,
+    id: String,
+}
+
+#[cfg(feature = "session-store")]
+impl<'a> Namespaced<'a> {
+    fn new(inner: &'a dyn SupportsAgentRun, configured: &str) -> Self {
+        let name = if configured.is_empty() {
+            inner.name().unwrap_or("agent")
+        } else {
+            configured
+        };
+        Self {
+            inner,
+            id: format!("foundry-responses/{name}"),
+        }
+    }
+}
+
+#[cfg(feature = "session-store")]
+#[async_trait]
+impl SupportsAgentRun for Namespaced<'_> {
+    async fn run(
+        &self,
+        messages: Vec<Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+    ) -> Result<AgentResponse> {
+        self.inner.run(messages, session).await
+    }
+
+    async fn run_with_options(
+        &self,
+        messages: Vec<Message>,
+        session: Option<&mut agent_framework_core::session::AgentSession>,
+        options: AgentRunOptions,
+    ) -> Result<AgentResponse> {
+        self.inner
+            .run_with_options(messages, session, options)
+            .await
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.inner.name()
+    }
+
+    fn create_session(&self) -> agent_framework_core::session::AgentSession {
+        self.inner.create_session()
+    }
+}
 #[cfg(not(feature = "session-store"))]
 struct HostSessions(Arc<Mutex<HashMap<String, SessionSnapshot>>>);
 
@@ -1401,7 +1529,8 @@ impl HostSessions {
         #[cfg(feature = "session-store")]
         {
             let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
-            Ok(self.0.get_session(agent, &key).await?.map(|s| (s, None)))
+            let agent = Namespaced::new(agent, &self.1);
+            Ok(self.0.get_session(&agent, &key).await?.map(|s| (s, None)))
         }
         #[cfg(not(feature = "session-store"))]
         {
@@ -1429,7 +1558,8 @@ impl HostSessions {
         {
             let _ = history;
             let key = agent_framework_core::session_store::AgentSessionStoreKey::new(key)?;
-            self.0.save_session(agent, &key, session).await
+            let agent = Namespaced::new(agent, &self.1);
+            self.0.save_session(&agent, &key, session).await
         }
         #[cfg(not(feature = "session-store"))]
         {
