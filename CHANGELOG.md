@@ -76,6 +76,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   returns `OpenAIContinuationToken` while a response is queued or in
   progress, polls with `GET /responses/{id}`, and resumes a stream with
   `?stream=true&starting_after=N`.
+- Foundry hosting: as upstream, `store=false` turns keep no approval state.
+  An `mcp_approval_response` sent with `store=false` is rejected with a 400
+  that says it needs `store=true` (it was previously resolved from the
+  approval store), and the 400 for an unknown approval id says that approval
+  requests from `store=false` responses are not kept.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

@@ -1065,7 +1065,7 @@ async fn create(
     let messages = if resume.is_some() {
         Vec::new()
     } else {
-        match turn_messages(server, &context, &create.input).await {
+        match turn_messages(server, &context, &create.input, store).await {
             Ok(messages) => messages,
             Err(e) => return bad_request(e),
         }
@@ -2114,11 +2114,14 @@ async fn inherited_session(
 
 /// This turn's input as messages, with each `mcp_approval_response` item
 /// resolved through the approval store into the original request's
-/// function-approval response (upstream `_item_to_message`).
+/// function-approval response (upstream `_item_to_message`). As upstream,
+/// an unstored (`store=false`) turn keeps no approval state: its approval
+/// requests are not saved, and it cannot resolve an `mcp_approval_response`.
 async fn turn_messages(
     server: &ResponsesHostServer,
     context: &FoundryRequestContext,
     input: &Value,
+    stored: bool,
 ) -> std::result::Result<Vec<Message>, String> {
     let items = match input {
         Value::Array(items) => items.clone(),
@@ -2160,11 +2163,18 @@ async fn turn_messages(
                     .into(),
             );
         };
+        if !stored {
+            return Err(
+                "An mcp_approval_response needs store=true: unstored turns keep no approval state."
+                    .into(),
+            );
+        }
         let store = server.approval_store(context).map_err(|e| e.to_string())?;
-        let request = store
-            .load_approval_request(id)
-            .await
-            .map_err(|_| format!("Approval request with ID '{id}' does not exist."))?;
+        let request = store.load_approval_request(id).await.map_err(|_| {
+            format!(
+                "Approval request with ID '{id}' does not exist (approval requests of store=false responses are not kept)."
+            )
+        })?;
         let Content::FunctionApprovalRequest(request) = request else {
             return Err(format!(
                 "Approval request with ID '{id}' is not a function approval request."

@@ -2281,3 +2281,58 @@ async fn a_restart_fails_interrupted_background_responses() {
     assert_eq!(fresh.fail_interrupted_responses().await.unwrap(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// As upstream, `store=false` keeps no host-managed approval state: its
+/// approval requests are not saved, and it cannot resolve an
+/// `mcp_approval_response` (both say so).
+#[tokio::test]
+async fn unstored_turns_keep_no_approval_state() {
+    let tool = agent_framework_core::tools::FunctionTool::new(
+        "danger",
+        "Needs approval",
+        json!({"type": "object"}),
+        |_args: serde_json::Value| async move { Ok(json!("ran")) },
+    )
+    .into_definition()
+    .require_approval();
+    let agent: Arc<dyn SupportsAgentRun> = Arc::new(
+        Agent::builder(WantsDanger)
+            .name("careful")
+            .tool(tool)
+            .build(),
+    );
+    let router = ResponsesHostServer::agent(agent).into_router();
+    let approval_id = |response: &serde_json::Value| {
+        response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "mcp_approval_request")
+            .unwrap_or_else(|| panic!("an approval request: {response}"))["id"]
+            .clone()
+    };
+    let answer = |id: &serde_json::Value, store: bool| {
+        post(
+            "/responses",
+            json!({
+                "store": store,
+                "input": [{"type": "mcp_approval_response", "approval_request_id": id, "approve": true}],
+            }),
+        )
+    };
+    // An unstored turn's approval request is not kept.
+    let (status, unstored) = json(
+        &router,
+        post("/responses", json!({"input": "do it", "store": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unstored}");
+    let (status, body) = json(&router, answer(&approval_id(&unstored), true)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("store=false"), "{body}");
+    // An unstored turn cannot resolve a kept approval request either.
+    let (_, stored) = json(&router, post("/responses", json!({"input": "do it"}))).await;
+    let (status, body) = json(&router, answer(&approval_id(&stored), false)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("store=true"), "{body}");
+}
