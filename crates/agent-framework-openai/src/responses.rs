@@ -2151,7 +2151,8 @@ fn parse_responses_event(
 
 /// Computer use (experimental `COMPUTER_USE`): `computer_call` /
 /// `computer_call_output` items to and from
-/// [`ComputerToolCallContent`] / [`ComputerToolResultContent`]
+/// [`ComputerToolCallContent`](agent_framework_core::types::ComputerToolCallContent) /
+/// [`ComputerToolResultContent`](agent_framework_core::types::ComputerToolResultContent)
 /// (upstream `_chat_client.py`). Malformed provider items are skipped with a
 /// warning; upstream raises.
 #[cfg(feature = "experimental-computer-use")]

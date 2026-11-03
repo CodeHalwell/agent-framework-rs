@@ -359,7 +359,7 @@ impl AnthropicClient {
 #[async_trait::async_trait]
 impl ChatClient for AnthropicClient {
     /// Continues the turn while the API pauses it — see
-    /// [`continue_paused_turns`].
+    /// `continue_paused_turns`.
     async fn get_response(
         &self,
         messages: Vec<Message>,
@@ -388,7 +388,7 @@ impl ChatClient for AnthropicClient {
 
     /// Continues the turn while the API pauses it, as
     /// [`get_response`](Self::get_response) does — see
-    /// [`continue_paused_stream`].
+    /// `continue_paused_stream`.
     async fn get_streaming_response(
         &self,
         messages: Vec<Message>,
