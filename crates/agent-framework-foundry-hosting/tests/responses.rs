@@ -2770,3 +2770,38 @@ async fn a_finished_response_is_continuable_at_once() {
         );
     }
 }
+
+/// Rolling back a turn whose persistence failed restores the inherited
+/// session whole, its history included (with `session-store`, part of the
+/// stored snapshot).
+#[tokio::test]
+async fn a_rolled_back_turn_keeps_the_inherited_history() {
+    use agent_framework_foundry_hosting::HistorySource;
+    let store = Arc::new(FlakyStore::default());
+    let router = ResponsesHostServer::agent(agent(Echo::default()))
+        .with_history_source(HistorySource::Agent)
+        .with_response_store(store.clone())
+        .into_router();
+    let in_conversation = |input: &str| {
+        post(
+            "/responses",
+            json!({"input": input, "conversation": "conv_h"}),
+        )
+    };
+    let (_, first) = json(&router, in_conversation("one")).await;
+    assert_eq!(first["output_text"], "1 messages, last: one");
+    let (_, second) = json(&router, in_conversation("two")).await;
+    assert_eq!(second["output_text"], "3 messages, last: two");
+    // The third turn runs, but its response cannot be stored: rolled back.
+    store
+        .failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = failed_turn(&router, json!({"input": "three", "conversation": "conv_h"})).await;
+    assert_eq!(failed["status"], "failed");
+    store
+        .failing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // The conversation still has turns one and two (and not three).
+    let (_, next) = json(&router, in_conversation("four")).await;
+    assert_eq!(next["output_text"], "5 messages, last: four", "{next}");
+}

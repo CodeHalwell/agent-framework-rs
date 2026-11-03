@@ -1823,7 +1823,7 @@ async fn execute(
         Some(sessions) => {
             let (mut session, prior) =
                 load_session(server, sessions, request, agent.as_ref()).await?;
-            inherited = Some((session.to_dict(), prior.clone()));
+            inherited = Some((session_snapshot(&session), prior.clone()));
             let history = attach_local_history(&mut session, prior);
             (session, history)
         }
@@ -1901,6 +1901,37 @@ async fn execute(
     Ok((response, None))
 }
 
+/// A session's full snapshot, to restore it exactly as stored: with
+/// `session-store`, the store's serialized form (its history provider's
+/// messages included); without, its state (the host keeps the history
+/// apart).
+fn session_snapshot(session: &agent_framework_core::session::AgentSession) -> Value {
+    #[cfg(feature = "session-store")]
+    {
+        agent_framework_core::session_store::serialize_session(session)
+    }
+    #[cfg(not(feature = "session-store"))]
+    {
+        session.to_dict()
+    }
+}
+
+/// The session a [`session_snapshot`] describes.
+fn restore_session_snapshot(
+    agent: &dyn SupportsAgentRun,
+    snapshot: &Value,
+) -> Result<agent_framework_core::session::AgentSession> {
+    #[cfg(feature = "session-store")]
+    {
+        agent_framework_core::session_store::deserialize_session(agent, snapshot)
+    }
+    #[cfg(not(feature = "session-store"))]
+    {
+        let _ = agent;
+        agent_framework_core::session::AgentSession::from_dict(snapshot)
+    }
+}
+
 /// A turn's completed host sessions, waiting for [`persist`].
 struct StagedSessions {
     sessions: Arc<HostSessions>,
@@ -1939,7 +1970,7 @@ impl StagedSessions {
         let Some((state, prior)) = &self.inherited else {
             return;
         };
-        let session = match agent_framework_core::session::AgentSession::from_dict(state) {
+        let session = match restore_session_snapshot(self.agent.as_ref(), state) {
             Ok(session) => session,
             Err(e) => {
                 tracing::error!(error = %e, "failed to rebuild an inherited session");

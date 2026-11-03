@@ -205,6 +205,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   so each agent's sessions are its own (as `AgentSessionStore` requires) and a
   partitioned key can no longer collide with a look-alike unpartitioned id.
   (The crate is new in this release, so no earlier keys exist.)
+- Foundry hosting (`session-store`, review fix): rolling back a turn whose
+  persistence fails or is cancelled restores the inherited session's full
+  stored snapshot, local history included, so earlier turns of the
+  conversation are no longer erased.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
