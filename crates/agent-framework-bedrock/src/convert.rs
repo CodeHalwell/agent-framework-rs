@@ -571,7 +571,7 @@ pub struct ConverseStreamState {
 /// Streamed reasoning follows the same fragment shape the Anthropic client
 /// uses: text fragments, then the signature as an empty-text fragment that
 /// coalesces onto them, so the aggregated reasoning replays through
-/// [`reasoning_to_block`] exactly as a non-streamed one does.
+/// `reasoning_to_block` exactly as a non-streamed one does.
 pub fn parse_stream_event(
     event_type: &str,
     payload: &Value,

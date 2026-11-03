@@ -297,7 +297,7 @@ impl BearerToken {
 ///
 /// The scheme is matched case-insensitively and the credential trimmed, per
 /// RFC 7235 and upstream, and the token itself is compared in constant time
-/// (see [`fixed_time_eq`]).
+/// (see `fixed_time_eq`).
 pub async fn bearer_auth(
     State(expected): State<BearerToken>,
     request: Request,

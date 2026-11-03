@@ -38,9 +38,9 @@
 //!   in-memory history provider. Attach another history provider to the
 //!   session to persist elsewhere. As upstream, history is persisted after
 //!   every model call
-//!   ([`AgentBuilder::require_per_service_call_history_persistence`]).
+//!   ([`AgentBuilder::require_per_service_call_history_persistence`](crate::agent::AgentBuilder::require_per_service_call_history_persistence)).
 //! - **Compaction** runs before each run, over the history-prepended
-//!   messages ([`AgentBuilder::with_compaction`]); there is no after-run
+//!   messages ([`AgentBuilder::with_compaction`](crate::agent::AgentBuilder::with_compaction)); there is no after-run
 //!   compaction of the stored history.
 //! - **Web search and shell are explicit.** Upstream adds the client's web
 //!   search tool when the client advertises one and wires the shell tool

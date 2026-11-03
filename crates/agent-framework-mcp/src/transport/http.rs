@@ -74,12 +74,12 @@ pub(crate) fn parse_endpoint(url: &str) -> Result<reqwest::Url> {
 /// Captures the `Mcp-Session-Id` response header (typically returned from
 /// `initialize`) and replays it on subsequent requests. A server-initiated
 /// request embedded in the SSE response to an active `call()` is routed to
-/// whatever handler [`Self::set_server_request_handler`] installed, and
+/// whatever handler [`McpTransport::set_server_request_handler`](super::McpTransport::set_server_request_handler) installed, and
 /// answered with a best-effort follow-up POST to the same endpoint (there is
 /// no persistent duplex connection to write a response over directly, unlike
 /// the stdio/websocket transports). A notification (e.g.
 /// `notifications/tools/list_changed`) embedded the same way is routed to
-/// whatever handler [`Self::set_notification_handler`] installed; unlike a
+/// whatever handler [`McpTransport::set_notification_handler`](super::McpTransport::set_notification_handler) installed; unlike a
 /// request, nothing is written back. Standalone GET-based SSE listening (for
 /// server-initiated messages outside of any request/response cycle) is not
 /// implemented — see the crate docs. This means an HTTP-transported MCP

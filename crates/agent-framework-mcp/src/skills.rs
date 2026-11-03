@@ -5,7 +5,7 @@
 //! dispatches each entry by its `type` (case-insensitive):
 //!
 //! - `skill-md` (`name`, `description`, `url`) becomes a
-//!   [`Skill`](agent_framework_core::skills::Skill) whose instructions are
+//!   [`Skill`] whose instructions are
 //!   the body of the `SKILL.md` resource at `url`.
 //! - `archive`: `url` is a ZIP resource, downloaded and unpacked **in
 //!   memory** (nothing touches disk). Its shallowest `SKILL.md` drives the
@@ -26,7 +26,7 @@
 //! # Divergences
 //!
 //! - `SKILL.md` bodies are read at discovery rather than on first
-//!   `load_skill`: the Rust [`Skill`](agent_framework_core::skills::Skill)
+//!   `load_skill`: the Rust [`Skill`]
 //!   carries its instructions. Resources referenced inside a `SKILL.md` are
 //!   not prefetched.
 //! - Entry types with no handler are skipped (as upstream).
@@ -99,11 +99,11 @@ struct SkillIndex {
 pub struct ArchiveOptions {
     /// Extensions (with the dot, case-insensitive) of the files that become
     /// resources. Default
-    /// [`DEFAULT_RESOURCE_EXTENSIONS`](agent_framework_core::skills_files::DEFAULT_RESOURCE_EXTENSIONS).
+    /// [`DEFAULT_RESOURCE_EXTENSIONS`].
     pub resource_extensions: Vec<String>,
     /// How deep under the `SKILL.md` directory resources are found (that
     /// directory is depth 1). Default
-    /// [`DEFAULT_SEARCH_DEPTH`](agent_framework_core::skills_files::DEFAULT_SEARCH_DEPTH).
+    /// [`DEFAULT_SEARCH_DEPTH`].
     pub resource_search_depth: usize,
     /// The most files one archive may hold.
     pub max_file_count: usize,
