@@ -2645,3 +2645,128 @@ async fn a_cancel_before_persistence_leaves_the_sessions_as_inherited() {
         );
     }
 }
+
+/// A process-local session store that holds the first save of a response's
+/// session (while `armed`) until released.
+#[cfg(feature = "session-store")]
+#[derive(Default)]
+struct HeldSessions {
+    inner: agent_framework_core::session_store::InMemoryAgentSessionStore,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "session-store")]
+#[async_trait::async_trait]
+impl agent_framework_core::session_store::AgentSessionStore for HeldSessions {
+    async fn save_session(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        key: &agent_framework_core::session_store::AgentSessionStoreKey,
+        session: &agent_framework_core::session::AgentSession,
+    ) -> agent_framework_core::error::Result<()> {
+        if key.session_id().starts_with("response-")
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.save_session(agent, key, session).await
+    }
+    async fn get_session(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        key: &agent_framework_core::session_store::AgentSessionStoreKey,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_core::session::AgentSession>>
+    {
+        self.inner.get_session(agent, key).await
+    }
+    async fn delete_session(
+        &self,
+        agent: &dyn SupportsAgentRun,
+        key: &agent_framework_core::session_store::AgentSessionStoreKey,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.delete_session(agent, key).await
+    }
+}
+
+#[cfg(feature = "session-store")]
+struct HeldSessionsProvider(Arc<HeldSessions>);
+
+#[cfg(feature = "session-store")]
+impl agent_framework_foundry_hosting::SessionStoreProvider for HeldSessionsProvider {
+    fn session_store(
+        &self,
+        _: &FoundryHostConfig,
+        _: &agent_framework_foundry_hosting::FoundryRequestContext,
+    ) -> agent_framework_core::error::Result<
+        Arc<dyn agent_framework_core::session_store::AgentSessionStore>,
+    > {
+        Ok(self.0.clone())
+    }
+}
+
+/// A background response reads as finished only once its session is saved,
+/// so continuing from it as soon as it is `completed` sees the turn.
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn a_finished_response_is_continuable_at_once() {
+    use agent_framework_foundry_hosting::HistorySource;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let sessions = Arc::new(HeldSessions::default());
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .with_session_store_provider(Arc::new(HeldSessionsProvider(sessions.clone())))
+            .into_router();
+        sessions
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, queued) = json(
+            &router,
+            post("/responses", json!({"input": "a", "background": true})),
+        )
+        .await;
+        let id = queued["id"].as_str().unwrap().to_string();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sessions.entered.notified(),
+        )
+        .await
+        .expect("the turn saves its session");
+        // A client continues the moment it sees the response finished.
+        let client = tokio::spawn({
+            let router = router.clone();
+            let id = id.clone();
+            async move {
+                loop {
+                    let (_, polled) = json(&router, get(&format!("/responses/{id}"))).await;
+                    if polled["status"] == "completed" {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                json(
+                    &router,
+                    post(
+                        "/responses",
+                        json!({"input": "b", "previous_response_id": id}),
+                    ),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sessions.release.notify_one();
+        let (status, next) = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("the response finishes")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{history:?}: {next}");
+        assert_eq!(
+            turn_text(&next),
+            "turn 2",
+            "{history:?}: the finished turn is seen"
+        );
+    }
+}

@@ -1534,18 +1534,12 @@ async fn persist(
     if terminal.stopping() {
         return Ok(false);
     }
-    server
-        .store
-        .put(&prepared.request.response_id, stored)
-        .await?;
-    // A cancel or delete that arrived during the response write keeps the
-    // conversation and every session as they were.
-    if terminal.stopping() {
-        return Ok(false);
-    }
     // The turn's completed sessions (a part of persistence: a session that
-    // cannot be saved fails the turn). Written here, under the response's
-    // terminal lock, so a deleted response's snapshot is never recreated.
+    // cannot be saved fails the turn), written before the response record so
+    // a client that sees it finished can continue from it at once. Under the
+    // response's terminal lock, so a deleted response's snapshot is never
+    // recreated; put back to the inherited session when the record cannot
+    // be written or a cancel or delete wins.
     let staged = prepared.staged_sessions.lock().unwrap().take();
     let session_keys: Vec<String> = match &staged {
         Some(_) => std::iter::once(response_session_key(&prepared.request.response_id))
@@ -1559,8 +1553,27 @@ async fn persist(
             .collect(),
         None => Vec::new(),
     };
+    let restore = || async {
+        if let Some(staged) = &staged {
+            staged.restore(&session_keys).await;
+        }
+    };
     if let Some(staged) = &staged {
         staged.save(&session_keys).await?;
+    }
+    if let Err(e) = server
+        .store
+        .put(&prepared.request.response_id, stored)
+        .await
+    {
+        restore().await;
+        return Err(e);
+    }
+    // A cancel or delete that arrived during these writes keeps the
+    // conversation and every session as they were.
+    if terminal.stopping() {
+        restore().await;
+        return Ok(false);
     }
     if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
         // Transcript and state move together. The previous pair is read
@@ -1584,9 +1597,7 @@ async fn persist(
             {
                 tracing::error!(error = %restore, "failed to restore a conversation after a failed update");
             }
-            if let Some(staged) = &staged {
-                staged.restore(&session_keys).await;
-            }
+            restore().await;
             return Err(e);
         }
     }

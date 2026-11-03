@@ -195,6 +195,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - FIDES for MCP (review fix): `SecureMcpToolProxy` tools keep the raw
   `tools/call` result for the host (as plain MCP tools do), so Foundry
   container-file citations work through the secure proxy too.
+- Foundry hosting (review fix): with `HistorySource::Agent`/`Service`, a
+  turn's agent sessions are saved before its final response record, both
+  under the response's cancel/delete lock, so a response is continuable as
+  soon as it reads as finished; a failed record write, transcript update or
+  late cancel puts the sessions back to the inherited ones.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
