@@ -2805,3 +2805,102 @@ async fn a_rolled_back_turn_keeps_the_inherited_history() {
     let (_, next) = json(&router, in_conversation("four")).await;
     assert_eq!(next["output_text"], "5 messages, last: four", "{next}");
 }
+
+/// Fails conversation transcript reads once armed, after letting `allowed`
+/// more through (a turn reads its conversation when created, then again
+/// when it persists).
+#[derive(Default)]
+struct ConversationReadFails {
+    inner: agent_framework_foundry_hosting::InMemoryResponseStore,
+    armed: std::sync::atomic::AtomicBool,
+    allowed: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for ConversationReadFails {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.inner.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.inner.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.armed.load(SeqCst)
+            && self
+                .allowed
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_err()
+        {
+            return Err(agent_framework_core::error::Error::Other(
+                "read failed".into(),
+            ));
+        }
+        self.inner.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<agent_framework_core::types::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.set_conversation(id, transcript).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_conversation_read_in_persistence_leaves_the_sessions_as_inherited() {
+    use agent_framework_foundry_hosting::HistorySource;
+    use std::sync::atomic::Ordering::SeqCst;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let store = Arc::new(ConversationReadFails::default());
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .with_response_store(store.clone())
+            .into_router();
+        let in_conversation = |input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "conversation": "conv_r"}),
+            )
+        };
+        let (_, first) = json(&router, in_conversation("a")).await;
+        assert_eq!(turn_text(&first), "turn 1", "{history:?}");
+        // The turn is created, runs, then cannot read its conversation while
+        // persisting.
+        store.allowed.store(1, SeqCst);
+        store.armed.store(true, SeqCst);
+        let failed = failed_turn(&router, json!({"input": "b", "conversation": "conv_r"})).await;
+        store.armed.store(false, SeqCst);
+        let (_, next) = json(&router, in_conversation("c")).await;
+        assert_eq!(turn_text(&next), "turn 2", "{history:?}: the conversation");
+        let (status, from_failed) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "d", "previous_response_id": failed["id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{from_failed}");
+        assert_eq!(
+            turn_text(&from_failed),
+            "turn 2",
+            "{history:?}: the failed response"
+        );
+    }
+}

@@ -213,6 +213,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   stream (the tool loop's or agent middleware's replay), the final update
   carries the operation state, so aggregating a pending stream with its
   completed continuation ends the operation instead of keeping the token.
+- Foundry hosting (review fix): a turn reads its conversation transcript and
+  state before advancing any session while persisting, so a failed read
+  leaves the sessions as inherited instead of keeping the failed turn.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

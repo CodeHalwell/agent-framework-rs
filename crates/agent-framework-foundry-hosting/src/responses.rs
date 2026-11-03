@@ -1558,6 +1558,19 @@ async fn persist(
             staged.restore(&session_keys).await;
         }
     };
+    // The conversation's transcript and state move together. The previous
+    // pair is read first (under the conversation's turn lock), before any
+    // session advances, so a failed update can put it back rather than leave
+    // a new transcript with an old state, and a failed read leaves every
+    // session as inherited.
+    let conversation_update = match (&prepared.request.conversation_id, status == "failed") {
+        (Some(conversation), false) => Some((
+            conversation,
+            server.store.conversation(conversation).await?,
+            server.store.conversation_state(conversation).await?,
+        )),
+        _ => None,
+    };
     if let Some(staged) = &staged {
         staged.save(&session_keys).await?;
     }
@@ -1575,12 +1588,8 @@ async fn persist(
         restore().await;
         return Ok(false);
     }
-    if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
-        // Transcript and state move together. The previous pair is read
-        // first (under the conversation's turn lock) so a failed update can
-        // put it back rather than leave a new transcript with an old state.
-        let previous_transcript = server.store.conversation(conversation).await?;
-        let previous_state = server.store.conversation_state(conversation).await?;
+    // From here every failure restores the sessions it advanced.
+    if let Some((conversation, previous_transcript, previous_state)) = conversation_update {
         if let Err(e) = server
             .store
             .update_conversation(conversation, transcript, session_state)
