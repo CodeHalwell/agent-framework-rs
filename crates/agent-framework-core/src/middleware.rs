@@ -232,6 +232,11 @@ pub struct FunctionInvocationContext {
     pub(crate) tools: Option<LiveToolList>,
     pub metadata: HashMap<String, serde_json::Value>,
     pub result: Option<serde_json::Value>,
+    /// Host-side extras for the result (see
+    /// [`Tool::invoke_with_properties`](crate::tools::Tool::invoke_with_properties)),
+    /// copied onto the
+    /// [`FunctionResultContent`](crate::types::FunctionResultContent).
+    pub result_properties: serde_json::Map<String, serde_json::Value>,
     pub terminate: bool,
     /// The name of the tool definition the function loop selected (and
     /// whose executor the terminal runs). Unlike `function_name`, which
@@ -254,6 +259,7 @@ impl FunctionInvocationContext {
             tools: None,
             metadata: HashMap::new(),
             result: None,
+            result_properties: serde_json::Map::new(),
             terminate: false,
             tool_name: None,
             include_detailed_errors: false,

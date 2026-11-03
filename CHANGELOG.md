@@ -7,6 +7,8 @@ may break APIs).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-02
+
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded
 in [`docs/drift/2026-11-02-ca65085e.md`](docs/drift/2026-11-02-ca65085e.md)
 and three further rounds against the same baseline in
@@ -21,6 +23,406 @@ SDK for Rust crates is in [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 Closing items from `SCOPE.md`'s "Not yet ported" list:
 
+- Agent hooks (`experimental-agent-hooks`), the rest of the control
+  contract: the `sequential/run_all`, `parallel/strictest` and
+  `parallel/unanimous` composition profiles (`Composition`,
+  `AgentHooksOptions::composition`), the approval seam
+  (`ApprovalResolver`, `approval_resolver_fn`, `ApprovalRedactor`; a
+  liftable deny is consulted, the echo rule enforced, and `on_approval`
+  stops or resumes the fold), the `jcs-sha256` identity provider (RFC 8785
+  + SHA-256 over the closed projection, now the default, as upstream) and
+  custom providers (`IdentityProvider`), and `agent_shutdown` with reason
+  `cancelled` when a run's future is dropped. **Breaking (experimental):**
+  `CompositionRecord` is now `Composition`, `InterceptionRecord::fold_truncated`
+  is `Option<bool>` (defined for the sequential profiles only), records
+  gain `resolved_by`, and records carry identities by default (use
+  `IdentityProvider::Null` for the previous identity-unbound records).
+- Foundry hosting: `/invocations_ws` WebSocket invocations (feature
+  `websocket`): the host runs the handler with a session and the request
+  context, closes with 1000 or 1011, logs the close, and sends keepalive
+  pings when `WS_KEEPALIVE_INTERVAL` is set.
+- Core: `OtelExport::with_span_processor` adds span processors to the export
+  pipeline. Foundry hosting (`otel`): `FoundryEnrichmentSpanProcessor`,
+  installed by `configure_observability`, stamps the agentserver's Foundry
+  identity and baggage ids on every span; request spans join the caller's
+  W3C baggage.
+- Foundry hosting: `ResponsesHostServer::serve` first fails background
+  responses a previous process left `queued`/`in_progress`
+  (`fail_interrupted_responses`, with upstream's recovery error);
+  `ResponseStore::response_ids` lists stored responses (implemented by the
+  in-memory and file stores).
+- Foundry hosting: with `session-store` and a hosted
+  `FoundrySessionStoreProvider`, stored conversation turns under
+  `HistorySource::Agent`/`Service` no longer fail with a storage conflict
+  when saving their session: the turn keeps one request-scoped store from
+  snapshotting its inherited session through the run.
+- Foundry hosting (`websocket`): `/invocations_ws` reads client frames on
+  a separate task, so a handler that isn't reading no longer blocks its own
+  output, keepalive pings or the close frame.
+- Foundry hosting: a cancel that arrives after a background turn has stored
+  its final response still closes the turn's replay on that response's final
+  event and schedules its eviction, so replay streams no longer hang.
+- Foundry hosting: `DELETE /responses/{id}` also deletes the agent session
+  the response saved under `HistorySource::Agent`/`Service`, keeping the
+  conversation's own; session saves share the response's cancel/delete lock,
+  so a late write cannot recreate a deleted snapshot.
+- Background responses: `ChatOptions` and `AgentRunOptions` gain
+  `background` and `continuation_token`; updates gain `operation_state`
+  (in progress or terminal), and a terminal update clears the aggregated
+  token. `Agent` rejects a continuation token sent with new messages, needs
+  a session for background runs, skips history and context providers when
+  resuming, and records an unfinished reply only once the operation
+  completes. The OpenAI Responses client submits with `background: true`,
+  returns `OpenAIContinuationToken` while a response is queued or in
+  progress, polls with `GET /responses/{id}`, and resumes a stream with
+  `?stream=true&starting_after=N`.
+- Foundry hosting: as upstream, `store=false` turns keep no approval state.
+  An `mcp_approval_response` sent with `store=false` is rejected with a 400
+  that says it needs `store=true` (it was previously resolved from the
+  approval store), and the 400 for an unknown approval id says that approval
+  requests from `store=false` responses are not kept.
+- OpenAI Responses: resuming an interrupted background stream no longer
+  truncates function-call arguments. `OpenAIContinuationToken` gains
+  `function_calls` (output index → call id), so argument fragments after the
+  cut reach their call, and a function call the resumed stream never saw
+  announced is taken whole from its `response.output_item.done`.
+- Foundry hosting: `ResponsesHostServer::with_background_source(BackgroundSource::Provider)`
+  hands a `background: true` response to the agent's provider and polls it
+  with the continuation token until it completes, as upstream's
+  `background_source="provider"` (requires `HistorySource::Service`;
+  `with_background_poll_interval` defaults to 2s).
+- Azure OpenAI Responses: background responses, as the OpenAI client —
+  `background: true` is sent, a continuation token polls
+  `GET {base}/responses/{id}` (with the api-version) or resumes the stream
+  with `starting_after`, and background stream updates carry tokens
+  (`parse_background_responses_sse_stream` is shared from
+  `agent-framework-openai`).
+- OpenAI Responses (review fix): a streamed `response.cancelled` ends the
+  stream with a final update, so a cancelled background operation is
+  terminal (its continuation token is cleared) instead of appearing pending.
+- Core (review fix): the tool loop's call and time budget carries across
+  background continuations — it is parked when a pending operation is handed
+  back and resumed by the continuation-token request — so polling through
+  continuations cannot exceed `max_function_calls` or
+  `max_duration_seconds`.
+- Core (review fixes): background continuations keep the tool loop's
+  iteration count, so polling through continuations still reaches
+  `max_iterations`'s tools-disabled failsafe; and a continuation still offers
+  the tools context providers inject (consulting non-history providers for
+  their tools only, dropping their messages and instructions), so a resumed
+  operation's call to such a tool runs.
+- Foundry hosting: container files an MCP tool result announces in its
+  `_meta` (`container_file_citations`) become `container_file_citation`
+  annotations on later output text that names them, as upstream. MCP tools
+  now keep their full `tools/call` result on the function result for the
+  host: new `FunctionResultContent::additional_properties`,
+  `MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`, `Tool::invoke_with_properties` and
+  `McpClient::call_tool_raw`.
+- Core (review fix): polling a background operation with its continuation
+  token no longer counts as a model iteration — the operation was charged
+  once when submitted — so a slow provider cannot spend `max_iterations` on
+  polls before its tool calls run.
+- Foundry hosting (`websocket`, review fix): when the client disconnects,
+  the handler's outbound channel is closed, so an output-only handler's next
+  `WsSession::send` fails and it can stop instead of streaming forever.
+- SQL Server vector store (review fix): an integral float operand on an
+  `int` field (`Filter::eq("year", 2020.0)`) binds as `BIGINT` when it
+  fits, instead of being refused; out-of-range integral floats are still
+  refused.
+- Core (review fix): when a background tool loop hands back a pending
+  operation, the tool interactions it already completed (each function call
+  with its result) are recorded in local history right away; only the
+  pending operation's own output waits for completion.
+- DuckDB vector store (review fix): an integral float operand on an `int`
+  column binds as `BIGINT`, so DuckDB compares exactly instead of promoting
+  the column to floating point (where `9007199254740992.0` matched
+  `9007199254740993`); beyond the `BIGINT` range it equals nothing and is
+  refused for ordered filters.
+- Core (review fix): with `experimental-progressive-tools`, the live tool
+  list (tools added or removed mid-run) is parked when a background
+  operation goes pending and restored for its continuation, so the resumed
+  operation can execute the tools it was submitted with. The parking is
+  process-local (executors cannot live in session JSON state).
+- DuckDB vector store (review fix): an integer operand on a `float` column
+  binds as `DOUBLE` only when a double holds it exactly; beyond that
+  (above 2^53) it equals nothing and is refused for ordered filters, instead
+  of rounding onto a neighbouring stored value.
+- SQL Server vector store: an integer operand on a `float` field binds as
+  `FLOAT` only when a double holds it exactly; beyond that it equals nothing
+  and is refused for ordered filters (as the DuckDB store), instead of
+  rounding onto a neighbouring stored value.
+- Foundry hosting: voice invocations (feature `voice`, implies `websocket`;
+  upstream's experimental `VoiceAgentServerHost`).
+  `voice::VoiceAgentServerHost` serves the typed Voice Live Bridge relay on
+  `/voice_conversation_engine` and `/invocations_ws`; `VoiceHandler` has one
+  async callback per inbound event plus `on_disconnect` and
+  `on_connection_terminating`; outbound events go through a send-only
+  `Session`. The codec applies upstream's validation, messages and close
+  codes (1002/1003/1009; 1000 on `session.end`; 1011 on callback failure).
+  With `otel`, `agentserver.connection`, `voice.callback` and `invoke_agent`
+  (`TargetTurn`) spans join the caller's trace and allow-listed baggage and
+  record upstream's voice metrics.
+- Foundry hosting (`experimental-computer-use`, review fix): a hosted
+  workflow whose built-in `AgentExecutor` pauses on pending computer calls
+  (a `ComputerUseRequest`) now shows each call as a `computer_call` item,
+  and `computer_call_output` replies (one per call, any order) resume it with
+  all the results, instead of a generic `request_info` call that rejected
+  computer replies.
+- Workflows: `SequentialBuilder`, `ConcurrentBuilder`, `GroupChatBuilder`,
+  `HandoffBuilder` and `MagenticBuilder` gain `with_checkpointing`, as
+  upstream's `checkpoint_storage`, so orchestrations can checkpoint (and a
+  hosted orchestration can pause and resume).
+- Foundry hosting (`voice`, review fix): once the client is gone and the
+  outbound channel is drained, the connection loop stops polling it instead
+  of spinning while a callback is still running.
+- Foundry hosting: the platform's `x-ms-original-subject` header
+  (experimental upstream) is parsed into
+  `FoundryRequestContext::original_subject` (`FoundryOriginalSubject`:
+  `oid`/`tid`/`idtype`, values hidden from `Debug`), and
+  `FoundryRequestContext::model_attribution_headers` builds the per-call
+  `x-ms-foundry-baggage` for a model endpoint. A malformed header is rejected
+  before any handler runs, as upstream: Invocations invoke/get/cancel answer
+  400 (`x-platform-error-detail: invalid_original_subject`), `POST /responses`
+  answers a platform-classified 400, and `/invocations_ws` and both voice
+  routes close with 1011. **Breaking:** `FoundryRequestContext::from_headers`
+  returns `Result<_, InvalidOriginalSubject>`.
+- Foundry hosting (review fix): with `HistorySource::Agent`/`Service`, a
+  turn's completed agent sessions are written only together with its stored
+  response, under the response's cancel/delete lock. A turn whose response
+  cannot be stored, or that is cancelled before persistence, leaves the
+  conversation's and the response's sessions as inherited, so continuing it
+  no longer picks up the failed or cancelled turn's output.
+- FIDES for MCP (review fix): `SecureMcpToolProxy` tools keep the raw
+  `tools/call` result for the host (as plain MCP tools do), so Foundry
+  container-file citations work through the secure proxy too.
+- Foundry hosting (review fix): with `HistorySource::Agent`/`Service`, a
+  turn's agent sessions are saved before its final response record, both
+  under the response's cancel/delete lock, so a response is continuable as
+  soon as it reads as finished; a failed record write, transcript update or
+  late cancel puts the sessions back to the inherited ones.
+- Foundry hosting (`session-store`, review fix): `FoundryAgentSessionStore`
+  keys each session by the JSON array `[agent id, session id, {partitions}]`,
+  so each agent's sessions are its own (as `AgentSessionStore` requires) and a
+  partitioned key can no longer collide with a look-alike unpartitioned id.
+  (The crate is new in this release, so no earlier keys exist.)
+- Foundry hosting (`session-store`, review fix): rolling back a turn whose
+  persistence fails or is cancelled restores the inherited session's full
+  stored snapshot, local history included, so earlier turns of the
+  conversation are no longer erased.
+- Core (review fix): when a background request's response is replayed as a
+  stream (the tool loop's or agent middleware's replay), the final update
+  carries the operation state, so aggregating a pending stream with its
+  completed continuation ends the operation instead of keeping the token.
+- Foundry hosting (review fix): a turn reads its conversation transcript and
+  state before advancing any session while persisting, so a failed read
+  leaves the sessions as inherited instead of keeping the failed turn.
+- Claude agent (review fix): control handlers the CLI started (tool calls,
+  approval and hook callbacks) are aborted when the run is dropped or
+  cancelled, and a `control_cancel_request` aborts the matching handler, so
+  no tool side effect starts or continues after cancellation.
+- MCP/Foundry hosting: Agent Skills `archive` (ZIP) entries are loaded in
+  memory with upstream's safety limits and digest checks (`ArchiveOptions`,
+  `load_skills_with`). `FoundryToolbox::skills_options` passes them through,
+  and `ToolboxSkillsProvider` discovers lazily, caches, refreshes on an
+  interval (or every run), and keeps its previous skills when a refresh fails.
+- Foundry hosting: with `HistorySource::Agent`/`Service`, each stored
+  conversation turn records the session it inherited before it runs, so
+  continuing from a cancelled or failed conversation turn with
+  `previous_response_id` restores that exact session rather than the
+  conversation's later state.
+- FIDES for MCP (review fix): an MCP error result whose server `_meta.ifc`
+  label is untrusted or confidential has its details withheld, instead of
+  its text reaching the model unlabeled through a locally trusted/public tool.
+- Foundry hosting: with `HistorySource::Agent`/`Service`, a cancelled or
+  failed response can be continued, inheriting its predecessor's session (or
+  its conversation's, or a fresh one). Cancel/delete coordination entries are
+  released once no turn, cancel or delete holds them, instead of being kept
+  per cancelled or deleted response.
+- Foundry hosting: paused hosted workflows accept `mcp_approval_response`
+  replies to approval requests and, with `experimental-computer-use`,
+  `computer_call_output` replies to computer calls. Review fix: a cancel or
+  delete racing a background turn's persistence now wins deterministically
+  (per-response serialization), so a late write can no longer overwrite
+  `cancelled`, recreate a deleted response, or update the conversation.
+- Workflows (`experimental-computer-use`): a pending computer call can be
+  cancelled by replying `{"call_id": …, "cancelled": true}` (alone or in an
+  array) or `{"cancelled": true}` to cancel all; cancelled calls become
+  `ErrorContent` (`CANCELLED_COMPUTER_CALL`) and the turn ends with the
+  conversation as output instead of re-running the agent. `AgentExecutor`
+  defers streamed updates while a computer call is pending.
+- OpenAI Responses (`experimental-computer-use`): screenshot `detail` and a
+  secondary `file_id` / `image_url` survive the round trip
+  (`SCREENSHOT_DETAIL_KEY`, `SCREENSHOT_FILE_ID_KEY`,
+  `SCREENSHOT_IMAGE_URL_KEY`).
+- Foundry hosting (review fixes): a conversation's transcript and session
+  state are written together through `ResponseStore::update_conversation`
+  (in-memory: one record under one lock; `FileResponseStore`: one file by
+  atomic rename, still reading the earlier two-file layout), persistence runs
+  in a spawned task so a client disconnect cannot interrupt it, and a failed
+  update puts the previous transcript and state back. A turn that produces
+  no new session snapshot (a failed run, a workflow) keeps the state it
+  inherited, so continuing from a failed response keeps session-scoped state
+  such as FIDES labels. Custom `ResponseStore`s should override
+  `update_conversation` to write atomically; the default writes the two
+  halves in sequence.
+- Computer use (`experimental-computer-use`, upstream `COMPUTER_USE`;
+  umbrella `experimental-computer-use`, in `experimental`):
+  `ComputerToolCallContent` / `ComputerToolResultContent` /
+  `ComputerSafetyCheck` (new `Content::ComputerToolCall` /
+  `ComputerToolResult` variants and `ToolKind::HostedComputer`, always
+  present; **breaking** for exhaustive matches), validated constructors and
+  `validate_result`, `tools::hosted_computer()`; the tool loop returns to
+  the caller on a pending computer call; `AgentExecutor` pauses with a
+  `ComputerUseRequest` and resumes with validated results; the OpenAI
+  Responses client maps `computer_call` / `computer_call_output`; the
+  Foundry Responses host emits and accepts computer items.
+- Foundry hosting and MCP: `FoundryToolbox` fetches its bearer token for
+  every request through a new per-request header hook
+  (`McpStreamableHttpTool::header_provider`, `HeaderProvider`); with the
+  `session-store` feature the `Agent`/`Service` history sources keep their
+  agent sessions (history included) in a session store
+  (`ResponsesHostServer::with_session_store_provider`) so continuations
+  survive a restart, and without it the `Agent` source no longer drops local
+  history between turns; Agent Skills served over MCP (SEP-2640:
+  `agent-framework-mcp` feature `skills`, `McpClient::read_resource`,
+  `skills::load_skills`, and `FoundryToolbox::skills_provider` behind
+  foundry-hosting's `skills` feature; umbrella `mcp-skills` /
+  `foundry-hosting-skills`); container-file, file and file-path citations in
+  Responses output (core `Annotation` gains `additional_properties`,
+  **breaking** for struct literals without `..Default::default()`; the
+  OpenAI Responses client now keeps `index` and `container_id`). Review
+  fixes: cancelling a background response that already finished no longer
+  overwrites it with `cancelled`; Foundry approval round trip; unfinished
+  predecessors are refused; continuations restore the predecessor's
+  session state (so FIDES context labels and hidden variables carry across
+  turns) via **breaking** `StoredResponse::session_state` and new
+  `ResponseStore::conversation_state` / `set_conversation_state` (no-op
+  defaults: custom stores must implement them to keep conversation state);
+  host-kept sessions are stored under a stable namespace
+  (`foundry-responses/{agent name}`), so factory-built agents resume them
+  (sessions saved under the old per-agent-id key are not found).
+- `agent-framework-foundry-hosting`: rich Responses output (reasoning,
+  refusals, function calls and outputs streamed in order, MCP calls, image
+  generation, shell calls, approval and OAuth consent requests, URL
+  citations, usage, `incomplete` finishes), checkpoint-resumed workflow
+  `request_info` pauses (`with_checkpoint_store`),
+  `HistorySource::{AgentServer, Agent, Service}` and `with_prepare_options`,
+  background stream replay (`GET /responses/{id}?stream=true&starting_after=N`),
+  `FileResponseStore`, after-restore session binding and environment
+  overrides (`after_restore_with_context`), Invocations OpenAPI/AsyncAPI
+  document routes, and request spans joining the caller's `traceparent`
+  (feature `otel`, forwarded by the umbrella's `foundry-hosting-otel`, adds
+  OpenTelemetry parenting and `configure_observability`). Review fixes:
+  Invocations keeps a service conversation id across turns, responses are
+  persisted before their terminal event, and turns on one conversation are
+  serialized.
+- Agent hooks host declarations (`experimental-agent-hooks`, upstream
+  `create_agent_hooks_middleware_from_declaration`): `HostDeclaration`
+  (JSON documents `agent-hooks-declaration/1.0`, from text, value or file)
+  validated through the SDK's pipeline with its refusal classes
+  (`DeclarationError`), resolved against a `HostRegistry` of kinds,
+  identity providers, approval resolvers and redactors, and built with
+  `AgentHooksOptions::from_declaration` / `AgentHooks::from_declaration`.
+  Bindings run only at their `at` points with their own timeouts
+  (`InterceptionEmitter::register_at`), the approval resolver has its own
+  timeout, and records carry `declaration`. Also (review finding): an
+  enforced identity the provider cannot compute after a transform now
+  fails the emission closed (`host_error:context_invalid`).
+- `agent-framework-mcp` feature `fides` (`security` module), forwarded by
+  the umbrella's `experimental-fides`: `SecureMcpToolProxy` /
+  `secure_tool_definitions` declare every listed MCP tool in a
+  `ToolSecurityRegistry` from restriction-only `ToolAnnotations` hints
+  (`openWorldHint`, PUBLIC sink cap, local `annotation_override`s),
+  re-declared as the server's tool list changes, and stamp IFC labels a
+  server returns in `_meta.ifc` (combined with the local label, or
+  authoritative with `trust_server_ifc`). `ToolDescriptor` gains
+  `annotations` and `CallToolResult` gains `meta` (**breaking** for struct
+  literals); core gains `security::set_authoritative_result_label`.
+- FIDES security fix: a hidden result's model-visible variable reference
+  carries only the label's integrity and confidentiality, and a tool
+  result's embedded `security_label` contributes only its levels; its
+  attacker-controlled metadata never reaches the model or the result label.
+- `agent-framework-foundry-hosting` (umbrella feature `foundry-hosting`, in
+  `full`): host agents and workflows as Azure AI Foundry hosted agents,
+  ported from upstream `foundry_hosting` and the agentserver container
+  protocol it builds on. `ResponsesHostServer` (sync, streamed and
+  background responses, `previous_response_id` / `conversation`
+  continuation, get/delete/cancel/input items), `InvocationsHostServer`
+  (feature `session-store`: durable per-session agent state, scoped per
+  platform user when hosted), `GET /readiness`, the snapshot lifecycle
+  routes, Foundry state-store clients with session (ETag-checked),
+  checkpoint and function-approval stores, and `FoundryToolbox`. Tested
+  in-process against storage and MCP doubles.
+- FIDES information-flow control (`experimental-fides`, upstream
+  `ExperimentalFeature.FIDES`): `agent_framework_core::security` with
+  integrity/confidentiality labels (`ContentLabel`, `combine_labels`,
+  `check_confidentiality_allowed`), `LabelTrackingFunctionMiddleware`
+  (tiered result labels, hiding untrusted results behind variable
+  references, `[var_<id>]` expansion, context-label tracking, standing
+  guidance), `PolicyEnforcementFunctionMiddleware` (untrusted-context,
+  untrusted-argument, confidentiality and principal checks with an audit
+  log; block, warn, inline approval handler, or session-bound pending
+  approvals), the `quarantined_llm` and `inspect_variable` tools,
+  `SecureAgentConfig`, and MCP annotation mapping. Tool declarations are
+  registered by name (`ToolSecurityRegistry`). The umbrella `experimental` feature now also enables
+  `experimental-fides` and the `sql-server`, `mongodb` and
+  `azure-documentdb` stores.
+- `agent-framework-claude` (umbrella feature `claude`, in `full`): the
+  Claude Code CLI as an agent (`ClaudeAgent`), ported from upstream's
+  `agent_framework_claude`. With no Rust Claude Agent SDK, it drives the
+  CLI directly over the SDK's stream-json control protocol: one process per
+  run, resuming the session's CLI conversation, streaming text and thinking
+  deltas, usage, finish reason, cost and structured output. Function tools
+  are served from an in-process MCP server (approval-gated via
+  `on_function_approval`), and `can_use_tool` permission prompts, hooks and
+  per-run model and permission-mode switches are supported. Tested against
+  a scripted fake CLI (Unix); a live test needs `AF_CLAUDE_CLI_TEST`.
+- `agent-framework-mongodb` (experimental, `VECTOR_STORES`; umbrella feature
+  `mongodb`): a MongoDB Atlas vector store ported from upstream's
+  `agent_framework_mongodb` over the `mongodb` 3.9 driver. BSON documents
+  keyed by `_id`, one Atlas Vector Search index per vector field (a
+  mismatched existing index is refused), `$vectorSearch` approximate or
+  exact search, normalized scores, and portable filters compiled to MQL
+  prefilters (anything inexpressible is refused, not dropped).
+- `agent-framework-azure-documentdb` (experimental, `VECTOR_STORES`;
+  umbrella feature `azure-documentdb`): an Azure DocumentDB (MongoDB vCore)
+  vector store ported from `agent_framework_azure_documentdb`:
+  `cosmosSearch` IVF / HNSW / DiskANN indexes (`IndexParameters`),
+  `$search` with `k`, `nProbes`, `efSearch`, `lSearch`, MQL filters
+  including list containment, TLS on and retryable writes off.
+- `agent-framework-sql-server` (experimental, `VECTOR_STORES`; umbrella
+  feature `sql-server`): a SQL Server 2025 vector store ported from
+  upstream's `agent_framework_sql_server`, over `tiberius` (rustls). Native
+  `VECTOR(n)` columns with exact `VECTOR_DISTANCE` search (cosine,
+  Euclidean, dot), typed columns in an existing schema, scalar indexes,
+  parameterized two-valued portable filters, one transaction per
+  operation. Bytes fields and generated keys are not supported. Tested
+  offline (statement building); live tests need `AF_SQL_SERVER_TEST_URL`.
+
+- `agent-framework-duckdb` (experimental, `VECTOR_STORES`; depend on it
+  directly: it is not re-exported by the umbrella crate, whose
+  `--all-features` builds would otherwise link the bundled DuckDB library
+  into every example binary): an embedded DuckDB vector store ported from upstream's
+  `agent_framework_duckdb`. Typed columns, `FLOAT[n]`/`DOUBLE[n]` vectors,
+  cosine distance/similarity, dot product and Euclidean search, upserts
+  with `ON CONFLICT`, and parameterized portable filters (equality, `in`,
+  ordered, text). List containment and explicit data indexes are refused,
+  as upstream. DuckDB is bundled, so the crate builds without a system
+  library.
+
+- Typed workflow protocols: `workflow::protocol` (`ProtocolDescriptor`,
+  `ProtocolBuilder`, `RequestPortInfo`), a defaulted
+  `Executor::describe_protocol`, `FunctionExecutor::with_protocol`,
+  `RequestInfoExecutor::with_types`, build-time refusal of an edge whose
+  declared types do not meet (`ValidationType::TypeCompatibility`), and
+  `Workflow::describe_protocol`, `reflect_executors`, `reflect_edges` and
+  `reflect_ports`. Types are names, since payloads are JSON.
+- MCP `2026-07-28` (upstream #9236): `McpProtocolMode` (`Auto` by default,
+  `Legacy`, `Modern`) on `McpClient` and the MCP tools. `Auto` probes with
+  `server/discover` and, when the server offers the modern era, sends
+  version, client info and capabilities in every request's `_meta` (and
+  `MCP-Protocol-Version` over HTTP) instead of the `initialize` handshake;
+  otherwise it falls back to the handshake.
 - `FoundryMemoryProvider`: `with_max_memories`, search and storage message
   filters, `ensure_stored_memories_deleted` and
   `ensure_memory_store_created`.
@@ -136,6 +538,7 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 
 ### Changed (parity push)
 
+- **Breaking:** `ValidationType` gains `TypeCompatibility`.
 - **Breaking:** `WorkflowEvent` gains `Warning` and `SubworkflowWarning`
   variants; exhaustive matches need arms for them.
 - **Behavior change:** mixed declaration-only batches follow upstream

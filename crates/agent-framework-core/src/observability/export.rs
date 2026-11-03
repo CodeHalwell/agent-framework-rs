@@ -208,6 +208,27 @@ pub struct OtelExport {
     traces: bool,
     metrics: bool,
     metric_interval: Duration,
+    /// Extra span processors, run on every span ahead of the exporter.
+    span_processors: Vec<SharedSpanProcessor>,
+}
+
+/// A span processor shared between clones of an [`OtelExport`].
+#[derive(Debug, Clone)]
+struct SharedSpanProcessor(std::sync::Arc<dyn opentelemetry_sdk::trace::SpanProcessor>);
+
+impl opentelemetry_sdk::trace::SpanProcessor for SharedSpanProcessor {
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &opentelemetry::Context) {
+        self.0.on_start(span, cx);
+    }
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        self.0.on_end(span);
+    }
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.force_flush()
+    }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
 }
 
 impl OtelExport {
@@ -225,7 +246,19 @@ impl OtelExport {
             traces: true,
             metrics: true,
             metric_interval: Duration::from_secs(60),
+            span_processors: Vec::new(),
         }
+    }
+
+    /// Run `processor` on every span, ahead of the exporter (e.g. to enrich
+    /// spans with deployment attributes). Processors run in the order added.
+    pub fn with_span_processor(
+        mut self,
+        processor: impl opentelemetry_sdk::trace::SpanProcessor + 'static,
+    ) -> Self {
+        self.span_processors
+            .push(SharedSpanProcessor(std::sync::Arc::new(processor)));
+        self
     }
 
     /// Override the OTLP/HTTP endpoint (e.g. `http://collector:4318`).
@@ -313,7 +346,10 @@ impl OtelExport {
             .transpose()?;
 
         let tracer_provider = if self.traces {
-            let builder = SdkTracerProvider::builder().with_resource(resource.clone());
+            let mut builder = SdkTracerProvider::builder().with_resource(resource.clone());
+            for processor in &self.span_processors {
+                builder = builder.with_span_processor(processor.clone());
+            }
             #[cfg(feature = "azure-monitor")]
             let builder = match &azure {
                 Some(exporter) => builder.with_batch_exporter(exporter.clone()),
@@ -515,6 +551,48 @@ impl OtelPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct Stamp(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl opentelemetry_sdk::trace::SpanProcessor for Stamp {
+        fn on_start(
+            &self,
+            span: &mut opentelemetry_sdk::trace::Span,
+            _cx: &opentelemetry::Context,
+        ) {
+            use opentelemetry::trace::Span as _;
+            span.set_attribute(KeyValue::new("stamped", true));
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_end(&self, _span: opentelemetry_sdk::trace::SpanData) {}
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+        fn shutdown_with_timeout(
+            &self,
+            _timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn added_span_processors_see_every_span() {
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = OtelExport::new("svc")
+            .with_endpoint("http://127.0.0.1:9")
+            .with_metrics(false)
+            .with_span_processor(Stamp(count.clone()))
+            .build()
+            .unwrap();
+        let tracer = pipeline.tracer_provider.as_ref().unwrap().tracer("t");
+        drop(tracer.start("one"));
+        drop(tracer.start("two"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = pipeline.shutdown();
+    }
 
     #[test]
     fn the_resource_marks_telemetry_as_agent_framework() {

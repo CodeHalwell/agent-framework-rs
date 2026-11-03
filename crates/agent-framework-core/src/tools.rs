@@ -58,6 +58,25 @@ pub trait Tool: Send + Sync {
     ) -> Result<Value> {
         self.invoke(arguments).await
     }
+
+    /// Execute the tool and return, with its result, host-side extras for
+    /// the result's
+    /// [`FunctionResultContent::additional_properties`](crate::types::FunctionResultContent::additional_properties)
+    /// (never shown to the model; e.g. an MCP tool's full result under
+    /// [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`](crate::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY)).
+    ///
+    /// The function-invocation loop calls **this** method; the default
+    /// delegates to [`Tool::invoke_in_context`] and attaches nothing.
+    async fn invoke_with_properties(
+        &self,
+        arguments: Value,
+        ctx: &crate::middleware::FunctionInvocationContext,
+    ) -> Result<(Value, serde_json::Map<String, Value>)> {
+        Ok((
+            self.invoke_in_context(arguments, ctx).await?,
+            serde_json::Map::new(),
+        ))
+    }
 }
 
 /// A dynamic source of tools, resolved fresh on every agent run instead of
@@ -119,6 +138,10 @@ pub enum ToolKind {
         url: String,
         allowed_tools: Option<Vec<String>>,
     },
+    /// Service-side computer use (experimental `COMPUTER_USE`): the model
+    /// emits [`ComputerToolCall`](crate::types::Content::ComputerToolCall)
+    /// requests that the application performs and answers.
+    HostedComputer,
 }
 
 /// Whether a call to a tool must be approved by a human before it runs.
@@ -747,6 +770,26 @@ pub fn hosted_image_generation() -> ToolDefinition {
         description: String::new(),
         parameters: empty_schema(),
         kind: ToolKind::HostedImageGeneration,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    }
+}
+
+/// Construct a hosted computer-use tool marker (experimental
+/// `COMPUTER_USE`; upstream `get_computer_tool()`). The model answers with
+/// [`ComputerToolCallContent`](crate::types::ComputerToolCallContent)
+/// requests: run their actions and reply with a
+/// [`ComputerToolResultContent`](crate::types::ComputerToolResultContent)
+/// carrying a screenshot. Safety checks are never acknowledged
+/// automatically.
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub fn hosted_computer() -> ToolDefinition {
+    ToolDefinition {
+        name: "computer".into(),
+        description: String::new(),
+        parameters: empty_schema(),
+        kind: ToolKind::HostedComputer,
         approval_mode: ApprovalMode::NeverRequire,
         executor: None,
     }

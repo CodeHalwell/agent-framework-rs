@@ -85,6 +85,14 @@ pub(crate) fn parse_endpoint(url: &str) -> Result<reqwest::Url> {
 /// implemented — see the crate docs. This means an HTTP-transported MCP
 /// server's `list_changed` notification is only ever noticed if it happens
 /// to arrive embedded in the SSE response to a call already in flight.
+/// Supplies headers per request, e.g. a bearer token fetched (and refreshed)
+/// from a credential each time rather than fixed when the transport is built.
+/// Called once per HTTP request; its headers replace same-named static ones
+/// and, like them, are only sent to the configured origin.
+pub type HeaderProvider = std::sync::Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<Vec<(String, String)>>> + Send + Sync,
+>;
+
 pub struct McpStreamableHttpTransport {
     http: reqwest::Client,
     url: reqwest::Url,
@@ -92,8 +100,11 @@ pub struct McpStreamableHttpTransport {
     /// to it — see [`Self::post`].
     origin: Origin,
     headers: HeaderMap,
+    header_provider: Option<HeaderProvider>,
     timeout: Option<Duration>,
     session_id: RwLock<Option<String>>,
+    /// The negotiated protocol version, sent as `MCP-Protocol-Version`.
+    protocol_version: StdMutex<Option<String>>,
     next_id: IdGenerator,
     server_request_handler: StdMutex<Option<BoxedServerRequestHandler>>,
     /// Handler for server notifications (e.g. `notifications/tools/list_changed`),
@@ -135,12 +146,20 @@ impl McpStreamableHttpTransport {
             url,
             origin,
             headers,
+            header_provider: None,
             timeout,
             session_id: RwLock::new(None),
+            protocol_version: StdMutex::new(None),
             next_id: IdGenerator::new(),
             server_request_handler: StdMutex::new(None),
             notification_handler: StdMutex::new(None),
         })
+    }
+
+    /// Builder: headers computed per request (see [`HeaderProvider`]).
+    pub fn with_header_provider(mut self, provider: HeaderProvider) -> Self {
+        self.header_provider = Some(provider);
+        self
     }
 
     /// Build a [`HeaderMap`] from `(name, value)` pairs, for use with [`Self::new`].
@@ -201,14 +220,25 @@ impl McpStreamableHttpTransport {
     where
         F: Fn(&reqwest::Client, reqwest::Url) -> reqwest::RequestBuilder,
     {
+        let dynamic = match &self.header_provider {
+            Some(provider) => Some(Self::header_map(&provider().await?)?),
+            None => None,
+        };
         let mut url = self.url.clone();
         let mut same_origin = true;
         for _ in 0..=MAX_REDIRECTS {
             let mut req = build(&self.http, url.clone());
             if same_origin {
                 req = req.headers(self.headers.clone());
+                if let Some(dynamic) = &dynamic {
+                    req = req.headers(dynamic.clone());
+                }
                 if let Some(session_id) = self.session_id.read().await.clone() {
                     req = req.header(SESSION_ID_HEADER, session_id);
+                }
+                let version = self.protocol_version.lock().unwrap().clone();
+                if let Some(version) = version {
+                    req = req.header("mcp-protocol-version", version);
                 }
             }
             if let Some(timeout) = self.timeout {
@@ -274,6 +304,10 @@ impl McpStreamableHttpTransport {
 
 #[async_trait]
 impl McpTransport for McpStreamableHttpTransport {
+    fn set_protocol_version(&self, version: Option<String>) {
+        *self.protocol_version.lock().unwrap() = version;
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_request_id();
         let body = protocol::build_request(id, method, params);

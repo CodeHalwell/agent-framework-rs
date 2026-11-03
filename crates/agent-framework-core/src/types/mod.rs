@@ -10,18 +10,19 @@ mod response;
 
 pub use content::{
     prepare_function_call_results, Annotation, AnnotationKind, CodeInterpreterToolCallContent,
-    CodeInterpreterToolResultContent, Content, DataContent, ErrorContent,
-    FunctionApprovalRequestContent, FunctionApprovalResponseContent, FunctionArguments,
-    FunctionCallContent, FunctionResultContent, HostedFileContent, HostedVectorStoreContent,
-    McpServerToolCallContent, McpServerToolResultContent, OauthConsentRequestContent,
-    RegionCoordinateSpace, ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent,
-    TextContent, TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
-    FUNCTION_INVOCATION_ERROR_MARKER,
+    CodeInterpreterToolResultContent, ComputerSafetyCheck, ComputerToolCallContent,
+    ComputerToolResultContent, Content, DataContent, ErrorContent, FunctionApprovalRequestContent,
+    FunctionApprovalResponseContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
+    HostedFileContent, HostedVectorStoreContent, McpServerToolCallContent,
+    McpServerToolResultContent, OauthConsentRequestContent, RegionCoordinateSpace,
+    ShellCommandOutputContent, ShellToolCallContent, ShellToolResultContent, TextContent,
+    TextReasoningContent, TextSpanRegion, UriContent, UsageContent, UsageDetails,
+    FUNCTION_INVOCATION_ERROR_MARKER, MCP_TOOL_RESULT_HOST_PAYLOAD_KEY,
 };
 pub use embedding::{Embedding, EmbeddingGenerationOptions, EmbeddingInput, GeneratedEmbeddings};
 pub use message::{prepare_messages, IntoMessages, Message, Role};
 pub use options::{ChatOptions, ResponseFormat, ToolMode};
 pub use response::{
     AgentResponse, AgentResponseUpdate, ChatResponse, ChatResponseUpdate, ContinuationToken,
-    FinishReason,
+    FinishReason, OperationState,
 };

@@ -62,11 +62,16 @@ pub trait McpTransport: Send + Sync {
     ///
     /// The default implementation does nothing, for transports (e.g. test
     /// mocks) that never see server-initiated notifications.
+    /// Record the negotiated protocol version, for transports that carry it
+    /// out of band (Streamable HTTP's `MCP-Protocol-Version` header). `None`
+    /// clears it. The default does nothing.
+    fn set_protocol_version(&self, _version: Option<String>) {}
+
     fn set_notification_handler(&self, handler: BoxedNotificationHandler) {
         let _ = handler;
     }
 }
 
-pub use http::McpStreamableHttpTransport;
+pub use http::{HeaderProvider, McpStreamableHttpTransport};
 pub use stdio::{McpStdioTransport, StdioEnv};
 pub use websocket::McpWebsocketTransport;

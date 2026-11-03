@@ -1438,3 +1438,42 @@ async fn post_tool_call_host_error_on_a_halting_call_still_halts_the_run() {
     assert_eq!(blocked_reason(&err), Some(host_error::INTERCEPTOR_FAILED));
     assert!(!points(&seen).contains(&"output"));
 }
+
+/// Never answers.
+struct Hanging;
+
+#[async_trait]
+impl ChatClient for Hanging {
+    async fn get_response(&self, _: Vec<Message>, _: ChatOptions) -> Result<ChatResponse> {
+        std::future::pending().await
+    }
+
+    async fn get_streaming_response(&self, _: Vec<Message>, _: ChatOptions) -> Result<ChatStream> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_run_closes_its_trail_with_agent_shutdown() {
+    let (interceptor, seen) = recorder(|_| Verdict::allow());
+    let agent = hooks(interceptor).build_agent(Agent::builder(Hanging));
+    let run = agent.run(vec![Message::user("hello")], None);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), run)
+            .await
+            .is_err(),
+        "the run is cancelled by dropping it"
+    );
+    for _ in 0..100 {
+        if points(&seen).last() == Some(&"agent_shutdown") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        points(&seen),
+        vec!["agent_startup", "input", "pre_model_call", "agent_shutdown"]
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[3].target()["reason"], "cancelled");
+}

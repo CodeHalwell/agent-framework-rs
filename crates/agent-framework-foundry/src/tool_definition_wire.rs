@@ -50,6 +50,7 @@ enum ToolKindWire {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allowed_tools: Option<Vec<String>>,
     },
+    HostedComputer,
 }
 
 impl From<&ToolKind> for ToolKindWire {
@@ -66,6 +67,7 @@ impl From<&ToolKind> for ToolKindWire {
                 url: url.clone(),
                 allowed_tools: allowed_tools.clone(),
             },
+            ToolKind::HostedComputer => ToolKindWire::HostedComputer,
         }
     }
 }
@@ -83,6 +85,7 @@ impl From<ToolKindWire> for ToolKind {
             ToolKindWire::HostedMcp { url, allowed_tools } => {
                 ToolKind::HostedMcp { url, allowed_tools }
             }
+            ToolKindWire::HostedComputer => ToolKind::HostedComputer,
         }
     }
 }

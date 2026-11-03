@@ -65,12 +65,27 @@ impl RequestResponse {
 /// requesting (upstream) executor.
 pub struct RequestInfoExecutor {
     id: String,
+    request_type: Option<String>,
+    response_type: Option<String>,
 }
 
 impl RequestInfoExecutor {
     /// Create a request-info node with the given id.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            request_type: None,
+            response_type: None,
+        }
+    }
+
+    /// Name the request and response types (upstream `RequestPort`'s
+    /// `Request` / `Response`): the port accepts the request type and sends
+    /// the response type.
+    pub fn with_types(mut self, request: impl Into<String>, response: impl Into<String>) -> Self {
+        self.request_type = Some(request.into());
+        self.response_type = Some(response.into());
+        self
     }
 }
 
@@ -89,5 +104,23 @@ impl Executor for RequestInfoExecutor {
             .unwrap_or_else(|| ctx.executor_id().to_string());
         ctx.record_request(reply_to, message);
         Ok(())
+    }
+
+    fn describe_protocol(&self) -> super::protocol::ProtocolDescriptor {
+        match (&self.request_type, &self.response_type) {
+            (Some(request), Some(response)) => super::protocol::ProtocolDescriptor::builder()
+                .accepts(request.clone())
+                .sends_message_type(response.clone())
+                .build(),
+            _ => super::protocol::ProtocolDescriptor::accepts_all(),
+        }
+    }
+
+    fn request_port(&self) -> Option<super::protocol::RequestPortInfo> {
+        Some(super::protocol::RequestPortInfo {
+            port_id: self.id.clone(),
+            request: self.request_type.clone(),
+            response: self.response_type.clone(),
+        })
     }
 }

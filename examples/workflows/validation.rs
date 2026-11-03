@@ -146,6 +146,9 @@ async fn main() -> Result<()> {
                 ValidationType::OutputValidation => {
                     "pick one of output_from / intermediate_output_from"
                 }
+                ValidationType::TypeCompatibility => {
+                    "make the source send a type its target accepts"
+                }
             };
             println!("  category: {:?}", e.validation_type);
             println!("  wire name: {}", e.validation_type);

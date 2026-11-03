@@ -34,6 +34,10 @@ pub trait Executor: Send + Sync {
     ///
     /// The default implementation ignores the state. Only executors that
     /// snapshot state need to implement this.
+    async fn restore_state(&self, _state: Value) -> Result<()> {
+        Ok(())
+    }
+
     /// Reset per-run state before a fresh run (upstream `IResettableExecutor`):
     /// an executor instance is shared by every run of its workflow, so one
     /// that keeps per-run state clears it here. Called on every executor at
@@ -43,8 +47,18 @@ pub trait Executor: Send + Sync {
         Ok(())
     }
 
-    async fn restore_state(&self, _state: Value) -> Result<()> {
-        Ok(())
+    /// The message types this executor accepts, sends and yields (upstream
+    /// `DescribeProtocol`). Payloads here are JSON, so types are names the
+    /// workflow's author chooses (or JSON type names). The default accepts
+    /// anything and declares nothing.
+    fn describe_protocol(&self) -> super::protocol::ProtocolDescriptor {
+        super::protocol::ProtocolDescriptor::accepts_all()
+    }
+
+    /// For a request port (a node that hands requests to the caller), its
+    /// request and response type names; `None` for other executors.
+    fn request_port(&self) -> Option<super::protocol::RequestPortInfo> {
+        None
     }
 }
 
@@ -56,6 +70,7 @@ type ExecFn =
 pub struct FunctionExecutor {
     id: String,
     func: ExecFn,
+    protocol: Option<super::protocol::ProtocolDescriptor>,
 }
 
 impl FunctionExecutor {
@@ -71,7 +86,14 @@ impl FunctionExecutor {
         Self {
             id: id.into(),
             func: Arc::new(move |value, ctx| Box::pin(func(value, ctx))),
+            protocol: None,
         }
+    }
+
+    /// Declare what this executor accepts, sends and yields.
+    pub fn with_protocol(mut self, protocol: super::protocol::ProtocolDescriptor) -> Self {
+        self.protocol = Some(protocol);
+        self
     }
 }
 
@@ -82,5 +104,10 @@ impl Executor for FunctionExecutor {
     }
     async fn execute(&self, message: Value, ctx: WorkflowContext) -> Result<()> {
         (self.func)(message, ctx).await
+    }
+    fn describe_protocol(&self) -> super::protocol::ProtocolDescriptor {
+        self.protocol
+            .clone()
+            .unwrap_or_else(super::protocol::ProtocolDescriptor::accepts_all)
     }
 }

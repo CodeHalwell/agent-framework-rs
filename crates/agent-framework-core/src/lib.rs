@@ -37,8 +37,8 @@
 //! (the `vectors` module), `experimental-file-history`
 //! (`history::FileHistoryProvider`), `experimental-progressive-tools`
 //! (`middleware::LiveToolList`), `experimental-agent-hooks` (the
-//! `agent_hooks` module) and `experimental-harness` (the `harness`
-//! module). See `docs/feature-stages.md` in the repository.
+//! `agent_hooks` module), `experimental-fides` (the `security` module) and
+//! `experimental-harness` (the `harness` module). See `docs/feature-stages.md` in the repository.
 //!
 //! ## Example
 //!
@@ -92,6 +92,9 @@ pub mod history;
 pub mod memory;
 pub mod middleware;
 pub mod observability;
+#[cfg(feature = "experimental-fides")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-fides")))]
+pub mod security;
 pub mod session;
 #[cfg(feature = "experimental-session-store")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-session-store")))]

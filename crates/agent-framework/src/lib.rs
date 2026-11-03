@@ -16,6 +16,7 @@
 //! | `foundry-local` | [`agent_framework_foundry_local`] — Microsoft Foundry Local (OpenAI-compatible localhost endpoint) | no |
 //! | `bedrock` | [`agent_framework_bedrock`] — AWS Bedrock Converse API (SigV4-signed) | no |
 //! | `github-copilot` | [`agent_framework_github_copilot`] — GitHub Copilot chat API | no |
+//! | `claude` | [`agent_framework_claude`] — the Claude Code CLI as an agent (Claude Agent SDK protocol) | no |
 //! | `azure` | [`agent_framework_azure`] — Azure OpenAI (api-key / Entra ID) | no |
 //! | `mcp` | [`agent_framework_mcp`] — Model Context Protocol tools (stdio, HTTP, websocket) | no |
 //! | `a2a` | [`agent_framework_a2a`] — Agent2Agent protocol client | no |
@@ -25,9 +26,13 @@
 //! | `redis` | [`agent_framework_redis`] — Redis chat-message store & context provider | no |
 //! | `mem0` | [`agent_framework_mem0`] — Mem0 long-term memory provider | no |
 //! | `foundry` | [`agent_framework_foundry`] — Azure AI Foundry Responses API chat client + Prompt Agents | no |
+//! | `foundry-hosting` | [`agent_framework_foundry_hosting`] — host agents and workflows as Azure AI Foundry hosted agents | no |
 //! | `azure-ai-search` | [`agent_framework_azure_ai_search`] — Azure AI Search memory + vector store | no |
 //! | `qdrant` | [`agent_framework_qdrant`] — Qdrant vector store (experimental) | no |
 //! | `postgres` | [`agent_framework_postgres`] — PostgreSQL + pgvector vector store (experimental) | no |
+//! | `sql-server` | [`agent_framework_sql_server`] — SQL Server vector store (experimental) | no |
+//! | `mongodb` | [`agent_framework_mongodb`] — MongoDB Atlas vector store (experimental) | no |
+//! | `azure-documentdb` | [`agent_framework_azure_documentdb`] — Azure DocumentDB (MongoDB vCore) vector store (experimental) | no |
 //! | `cosmos` | [`agent_framework_cosmos`] — Cosmos DB NoSQL message store, workflow checkpoints, and vector store | no |
 //! | `copilotstudio` | [`agent_framework_copilotstudio`] — Copilot Studio agents | no |
 //! | `purview` | [`agent_framework_purview`] — Purview compliance middleware | no |
@@ -37,7 +42,9 @@
 //! experimental sit behind `experimental-*` features with no semver promise:
 //! `experimental-vector-stores`, `experimental-file-history`,
 //! `experimental-progressive-tools`, `experimental-agent-hooks` (the
-//! `agent_hooks` module of [`agent_framework_core`]), `experimental-harness` and
+//! `agent_hooks` module of [`agent_framework_core`]), `experimental-fides`
+//! (its `security` module), `experimental-computer-use` (computer-use content,
+//! the OpenAI and Foundry mappings), `experimental-harness` and
 //! `experimental-declarative-agents`.
 //! `experimental` turns them all on.
 //!
@@ -89,6 +96,9 @@ pub use agent_framework_foundry_local as foundry_local;
 #[cfg(feature = "bedrock")]
 pub use agent_framework_bedrock as bedrock;
 
+/// The Claude Code CLI as an agent (enable the `claude` feature).
+#[cfg(feature = "claude")]
+pub use agent_framework_claude as claude;
 /// The GitHub Copilot provider (enable the `github-copilot` feature).
 #[cfg(feature = "github-copilot")]
 pub use agent_framework_github_copilot as github_copilot;
@@ -125,17 +135,29 @@ pub use agent_framework_mem0 as mem0;
 /// `foundry` feature).
 #[cfg(feature = "foundry")]
 pub use agent_framework_foundry as foundry;
+/// Azure AI Foundry hosted agents (the `foundry-hosting` feature).
+#[cfg(feature = "foundry-hosting")]
+pub use agent_framework_foundry_hosting as foundry_hosting;
 
 /// Azure AI Search context provider and vector store (enable the
 /// `azure-ai-search` feature).
 #[cfg(feature = "azure-ai-search")]
 pub use agent_framework_azure_ai_search as azure_ai_search;
+/// The Azure DocumentDB (MongoDB vCore) vector store (the experimental `azure-documentdb` feature).
+#[cfg(feature = "azure-documentdb")]
+pub use agent_framework_azure_documentdb as azure_documentdb;
+/// The MongoDB Atlas vector store (the experimental `mongodb` feature).
+#[cfg(feature = "mongodb")]
+pub use agent_framework_mongodb as mongodb;
 /// The PostgreSQL + pgvector vector store (the experimental `postgres` feature).
 #[cfg(feature = "postgres")]
 pub use agent_framework_postgres as postgres;
 /// The Qdrant vector store (the experimental `qdrant` feature).
 #[cfg(feature = "qdrant")]
 pub use agent_framework_qdrant as qdrant;
+/// The SQL Server vector store (the experimental `sql-server` feature).
+#[cfg(feature = "sql-server")]
+pub use agent_framework_sql_server as sql_server;
 
 /// Azure Cosmos DB NoSQL chat-message store, checkpoint storage, and
 /// vector store (enable the `cosmos` feature).

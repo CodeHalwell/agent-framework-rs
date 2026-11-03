@@ -45,6 +45,23 @@ pub struct AgentRunOptions {
     /// caller instead of being executed locally — this is how a hosting
     /// frontend injects client-side tools (see the AG-UI router).
     pub additional_tools: Vec<ToolDefinition>,
+    /// Run as a background (long-running) operation, overriding
+    /// [`ChatOptions::background`] for this run.
+    ///
+    /// Mirrors .NET `AgentRunOptions.AllowBackgroundResponses` (Python
+    /// passes `background` in the run options). When the service accepts
+    /// the request without finishing it, the response carries a
+    /// [`continuation_token`](AgentResponse::continuation_token) to poll or
+    /// resume with. A background run needs a session, so that the follow-up
+    /// runs share its conversation.
+    pub background: Option<bool>,
+    /// Poll or resume the background run that issued this token, overriding
+    /// [`ChatOptions::continuation_token`] for this run.
+    ///
+    /// Mirrors .NET `AgentRunOptions.ContinuationToken`. A run that carries
+    /// one continues an existing operation, so it takes no new messages, and
+    /// neither history nor context providers are consulted for the request.
+    pub continuation_token: Option<crate::types::ContinuationToken>,
 }
 
 impl AgentRunOptions {
@@ -72,12 +89,122 @@ impl AgentRunOptions {
         self
     }
 
+    /// Ask for a background (long-running) run. See [`Self::background`].
+    pub fn with_background(mut self, background: bool) -> Self {
+        self.background = Some(background);
+        self
+    }
+
+    /// Poll or resume a background run. See [`Self::continuation_token`].
+    pub fn with_continuation_token(mut self, token: crate::types::ContinuationToken) -> Self {
+        self.continuation_token = Some(token);
+        self
+    }
+
     /// Whether these options carry no overrides at all. Used by the default
     /// [`SupportsAgentRun::run_with_options`] to decide whether to warn about ignoring
     /// options it cannot honor.
     pub fn is_empty(&self) -> bool {
-        self.chat_options.is_none() && self.additional_tools.is_empty()
+        self.chat_options.is_none()
+            && self.additional_tools.is_empty()
+            && self.background.is_none()
+            && self.continuation_token.is_none()
     }
+
+    /// The effective chat options for a run: `base` (the agent's defaults)
+    /// merged with [`Self::chat_options`], then [`Self::background`] and
+    /// [`Self::continuation_token`] applied on top, as .NET's
+    /// `ApplyAgentRunOptionsOverrides` does.
+    fn effective_chat_options(&self, base: &ChatOptions) -> ChatOptions {
+        let mut options = match &self.chat_options {
+            Some(overrides) => base.clone().merge(overrides.clone()),
+            None => base.clone(),
+        };
+        if self.background.is_some() {
+            options.background = self.background;
+        }
+        if self.continuation_token.is_some() {
+            options.continuation_token = self.continuation_token.clone();
+        }
+        options
+    }
+}
+
+/// Reject a run whose background options cannot be honored, as .NET's
+/// `ChatClientAgent.PrepareSessionAndMessagesAsync` does: a continuation
+/// token resumes an operation that already has its input, so new messages
+/// alongside one are an error, and a background run must be given a session
+/// so that the follow-up run that polls it continues the same conversation.
+fn validate_background_run(
+    options: &ChatOptions,
+    input: &[Message],
+    has_session: bool,
+) -> Result<()> {
+    if options.continuation_token.is_some() && !input.is_empty() {
+        return Err(Error::AgentExecution(
+            "Input messages are not allowed when continuing a background response using a \
+             continuation token."
+                .into(),
+        ));
+    }
+    if options.background == Some(true) && !has_session {
+        return Err(Error::AgentExecution(
+            "A session must be provided when running with background responses enabled.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a run's options make it part of a background operation: one that
+/// asks for background responses or resumes one with a continuation token.
+fn is_background_run(options: &ChatOptions) -> bool {
+    options.background == Some(true) || options.continuation_token.is_some()
+}
+
+/// The messages a run's completion hooks record as the response. While a
+/// background operation is still running ([`AgentResponse::continuation_token`]
+/// is set) its own reply is incomplete, so it is not recorded yet: the run
+/// that finally completes the operation records it. Tool interactions the
+/// run already completed before the operation went pending (a function call
+/// together with its result) are final, though, and the next run will not
+/// see them again, so those are recorded now. The run's input is recorded
+/// either way, by the run that sent it.
+fn persistable_response(messages: &[Message], continuation_pending: bool) -> Vec<Message> {
+    if !continuation_pending {
+        return messages.to_vec();
+    }
+    let contents = || messages.iter().flat_map(|m| m.contents.iter());
+    let answered: std::collections::HashSet<&str> = contents()
+        .filter_map(crate::types::Content::as_function_result)
+        .map(|r| r.call_id.as_str())
+        .collect();
+    let called: std::collections::HashSet<&str> = contents()
+        .filter_map(crate::types::Content::as_function_call)
+        .map(|c| c.call_id.as_str())
+        .collect();
+    messages
+        .iter()
+        .filter_map(|message| {
+            let completed: Vec<crate::types::Content> = message
+                .contents
+                .iter()
+                .filter(|content| match content {
+                    crate::types::Content::FunctionCall(call) => {
+                        answered.contains(call.call_id.as_str())
+                    }
+                    crate::types::Content::FunctionResult(result) => {
+                        called.contains(result.call_id.as_str())
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            (!completed.is_empty()).then(|| Message {
+                contents: completed,
+                ..message.clone()
+            })
+        })
+        .collect()
 }
 
 /// Map a completed run into buffered agent updates — one update per message,
@@ -91,7 +218,14 @@ impl AgentRunOptions {
 /// final update as a [`Content::Usage`] item (aggregation folds it back into
 /// [`AgentResponse::usage_details`], never into message contents) — the
 /// same contract as the tool-loop replay in `FunctionInvokingChatClient`.
-pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentResponseUpdate>> {
+/// `background` says whether the run was a background one (it asked for
+/// background responses or resumed one with a continuation token): its final
+/// update then carries the operation state, so aggregating an earlier pending
+/// stream with this one ends (or keeps) the operation correctly.
+pub(crate) fn response_to_updates(
+    response: AgentResponse,
+    background: bool,
+) -> Vec<Result<AgentResponseUpdate>> {
     let AgentResponse {
         messages,
         response_id,
@@ -102,6 +236,13 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         ..
     } = response;
     let last = messages.len().saturating_sub(1);
+    let operation_state = background.then(|| {
+        if continuation_token.is_some() {
+            crate::types::OperationState::InProgress
+        } else {
+            crate::types::OperationState::Terminal
+        }
+    });
     // Keep provider message ids only when all present and distinct; otherwise
     // positional ids for every message. A service (e.g. Assistants) can reuse
     // one run id across the tool-call and final assistant messages, and
@@ -152,6 +293,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
                 // response a policy check produces, which is the one a caller
                 // most needs to be able to resume.
                 continuation_token: (i == last).then(|| continuation_token.clone()).flatten(),
+                operation_state: (i == last).then_some(operation_state).flatten(),
                 ..Default::default()
             })
         })
@@ -162,7 +304,8 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         && (usage_details.is_some()
             || response_id.is_some()
             || finish_reason.is_some()
-            || continuation_token.is_some())
+            || continuation_token.is_some()
+            || operation_state.is_some())
     {
         let contents = usage_details
             .map(|u| {
@@ -178,6 +321,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
             conversation_id,
             finish_reason,
             continuation_token,
+            operation_state,
             ..Default::default()
         }));
     }
@@ -282,10 +426,12 @@ pub trait SupportsAgentRun: Send + Sync {
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         let mut owned = session;
+        let options = options.unwrap_or_default();
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let response = self
-            .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
+            .run_with_options(messages, owned.as_mut(), options)
             .await?;
-        Ok(futures::stream::iter(response_to_updates(response)).boxed())
+        Ok(futures::stream::iter(response_to_updates(response, background)).boxed())
     }
 
     /// A stable identifier for this agent.
@@ -490,11 +636,17 @@ impl Agent {
         session: Option<AgentSession>,
         run_options: AgentRunOptions,
     ) -> Result<AgentRunStream> {
+        validate_background_run(
+            &run_options.effective_chat_options(&self.chat_options),
+            &input,
+            session.is_some(),
+        )?;
         let mut session = session.unwrap_or_else(|| self.create_session());
         let (final_messages, mut options) = self
             .prepare_request(&input, &mut session, &run_options)
             .await?;
         let service_history = options.conversation_id.is_some();
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let per_call = self.per_call_history(&session, service_history, &input, &mut options);
 
         // When agent middleware is configured, route the run through the same
@@ -514,14 +666,16 @@ impl Agent {
                 }
             };
             self.update_session_conversation_id(&mut session, response.conversation_id.as_deref())?;
+            let reply =
+                persistable_response(&response.messages, response.continuation_token.is_some());
             for cp in self.finish_providers(&session, service_history, per_call.as_ref()) {
-                cp.after_run_in_session(&session, &input, &response.messages, None)
+                cp.after_run_in_session(&session, &input, &reply, None)
                     .await?;
             }
             // Distinct message ids keep boundaries when re-aggregated; the
             // response's conversation/response ids and usage ride along so
             // service-managed continuity survives the middleware replay.
-            return Ok(futures::stream::iter(response_to_updates(response)).boxed());
+            return Ok(futures::stream::iter(response_to_updates(response, background)).boxed());
         }
 
         let (final_messages, options) = self
@@ -580,10 +734,7 @@ impl Agent {
         // the per-run side winning (mirrors Python's `run_chat_options &
         // ChatOptions(...)`, whose right-hand side takes precedence — see
         // `ChatOptions::merge`).
-        let mut options = match &run_options.chat_options {
-            Some(overrides) => self.chat_options.clone().merge(overrides.clone()),
-            None => self.chat_options.clone(),
-        };
+        let mut options = run_options.effective_chat_options(&self.chat_options);
         // A service-managed session's id drives continuity and wins; on a
         // local session, a per-run / agent-default `conversation_id` override
         // survives (previously it was unconditionally cleared here, silently
@@ -601,7 +752,17 @@ impl Agent {
         // appended, deduplicated by name).
         // A conversation id from the options (an agent default or a per-run
         // override) means the service stores history too.
-        let providers = self.providers_for(session, options.conversation_id.is_some());
+        //
+        // A run that resumes a background operation consults none of them:
+        // the operation already has its input, history included, so loading
+        // history or context again would have nothing to send it to (.NET
+        // skips both for a continuation token the same way).
+        let continuing = options.continuation_token.is_some();
+        let providers = if continuing {
+            Vec::new()
+        } else {
+            self.providers_for(session, options.conversation_id.is_some())
+        };
         let mut ctx = SessionContext::new(input.to_vec());
         ctx.session_id = Some(session.session_id().to_string());
         ctx.service_session_id = service_session_id.clone();
@@ -635,6 +796,29 @@ impl Agent {
         // A provider may rewrite the run's input (for example to strip an
         // attachment it has analyzed and summarized), as upstream allows.
         let input_for_model = ctx.input_messages;
+
+        // A continuation still needs the tools the providers inject: the
+        // operation may come back with a call to one of them (a FIDES
+        // `inspect_variable`, a skill's `load_skill`), and without its
+        // executor the call could not run. So the non-history providers are
+        // consulted on a scratch context for their tools only; whatever
+        // messages or instructions they would add are dropped, since the
+        // operation already has its input.
+        if continuing {
+            let mut scratch = SessionContext::new(Vec::new());
+            scratch.session_id = ctx.session_id.clone();
+            scratch.service_session_id = ctx.service_session_id.clone();
+            scratch.session = ctx.session.clone();
+            scratch.agent = ctx.agent.clone();
+            for provider in self
+                .providers_for(session, options.conversation_id.is_some())
+                .into_iter()
+                .filter(|p| !p.is_history_provider())
+            {
+                provider.before_run(&mut scratch).await?;
+            }
+            ctx.tools.append(&mut scratch.tools);
+        }
 
         // Deduplicate by name: a tool may be defined on the agent and also
         // injected by a context provider. Providers rejecting duplicate
@@ -680,7 +864,13 @@ impl Agent {
 
         history.extend(input_for_model);
         let instructions = options.instructions.take();
-        let final_messages = prepare_messages(history, instructions.as_deref());
+        // A continuation request sends no messages — not even the system
+        // instructions — since the operation it resumes already has them.
+        let final_messages = if continuing {
+            Vec::new()
+        } else {
+            prepare_messages(history, instructions.as_deref())
+        };
 
         // Hand the run's session to the function-invocation loop (which pops
         // it before the wire client sees the options), so invoked tools can
@@ -881,6 +1071,19 @@ impl Agent {
         options: &mut ChatOptions,
     ) -> Option<Arc<PerCallHistory>> {
         if !self.per_service_call_history {
+            return None;
+        }
+        // A background run's reply arrives over several runs, and a caller
+        // may stop consuming a stream before a per-call hook could fire, so
+        // such a run is recorded at its end instead — as .NET's
+        // `PerServiceCallChatHistoryPersistingChatClient` falls back for
+        // `AllowBackgroundResponses` / a continuation token.
+        if is_background_run(options) {
+            tracing::warn!(
+                agent = self.name.as_deref().unwrap_or(self.id.as_str()),
+                "per-service-call history persistence is not used for background responses; \
+                 history is recorded at the end of the run instead"
+            );
             return None;
         }
         let providers: Vec<_> = self
@@ -1158,17 +1361,16 @@ fn async_stream_forward(
                             // service has this turn, so history providers
                             // must not record it too.
                             let service_history = response.conversation_id.is_some();
+                            let reply = persistable_response(
+                                &response.messages,
+                                response.continuation_token.is_some(),
+                            );
                             for cp in providers
                                 .into_iter()
                                 .filter(|p| !(service_history && p.is_history_provider()))
                             {
                                 if let Err(e) = cp
-                                    .after_run_in_session(
-                                        &session,
-                                        &input,
-                                        &response.messages,
-                                        None,
-                                    )
+                                    .after_run_in_session(&session, &input, &reply, None)
                                     .await
                                 {
                                     return Some((Err(e), (inner, collected, true, None)));
@@ -1200,6 +1402,11 @@ impl SupportsAgentRun for Agent {
         session: Option<&mut AgentSession>,
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
+        validate_background_run(
+            &options.effective_chat_options(&self.chat_options),
+            &messages,
+            session.is_some(),
+        )?;
         let mut owned_session;
         let session: &mut AgentSession = match session {
             Some(s) => s,
@@ -1236,8 +1443,9 @@ impl SupportsAgentRun for Agent {
 
         // Fire the context providers' success completion hook (this is what
         // records history, for any attached `HistoryProvider`).
+        let reply = persistable_response(&response.messages, response.continuation_token.is_some());
         for cp in self.finish_providers(session, service_history, per_call.as_ref()) {
-            cp.after_run_in_session(session, &messages, &response.messages, None)
+            cp.after_run_in_session(session, &messages, &reply, None)
                 .await?;
         }
 
@@ -1829,7 +2037,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let updates: Vec<_> = super::response_to_updates(response)
+        let updates: Vec<_> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.expect("update"))
             .collect();
@@ -1866,7 +2074,7 @@ mod tests {
             continuation_token: Some(token.clone()),
             ..Default::default()
         };
-        let updates: Vec<AgentResponseUpdate> = super::response_to_updates(response)
+        let updates: Vec<AgentResponseUpdate> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.unwrap())
             .collect();
@@ -1891,7 +2099,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let updates: Vec<_> = super::response_to_updates(response)
+        let updates: Vec<_> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.expect("update"))
             .collect();

@@ -21,7 +21,7 @@
 //! # }
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use agent_framework_core::client::{ChatClient, ChatStream};
@@ -30,11 +30,11 @@ use agent_framework_core::streaming::Utf8StreamDecoder;
 use agent_framework_core::tools::ToolDefinition;
 use agent_framework_core::types::{
     Annotation, ChatOptions, ChatResponse, ChatResponseUpdate, CodeInterpreterToolCallContent,
-    CodeInterpreterToolResultContent, Content, DataContent, FinishReason,
+    CodeInterpreterToolResultContent, Content, ContinuationToken, DataContent, FinishReason,
     FunctionApprovalRequestContent, FunctionArguments, FunctionCallContent, FunctionResultContent,
     McpServerToolCallContent, McpServerToolResultContent, Message, OauthConsentRequestContent,
-    ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion, ToolMode, UriContent,
-    UsageContent, UsageDetails,
+    OperationState, ResponseFormat, Role, TextContent, TextReasoningContent, TextSpanRegion,
+    ToolMode, UriContent, UsageContent, UsageDetails,
 };
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
@@ -44,6 +44,74 @@ use crate::convert::{
     top_level_media_type, DEFAULT_FILENAME,
 };
 use crate::{ByteStream, DEFAULT_BASE_URL};
+
+/// The continuation token of a Responses API background operation.
+///
+/// Mirrors upstream Python `OpenAIContinuationToken` (`{"response_id": ...}`),
+/// plus the stream position .NET's Responses client keeps
+/// (`sequence_number`): the last stream event the caller received, so a
+/// resumed stream continues after it (`starting_after`) instead of replaying
+/// the whole response. It travels inside the opaque core
+/// [`ContinuationToken`] as JSON; [`Self::from_token`] also accepts a bare
+/// response id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenAIContinuationToken {
+    /// The Responses API response id (`resp_...`).
+    pub response_id: String,
+    /// The `sequence_number` of the last stream event delivered, when the
+    /// token came from a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u64>,
+    /// The function calls the stream announced before this position, as
+    /// `output_index` → `call_id`. A resumed stream starts after the
+    /// `response.output_item.added` event that announced a call, so without
+    /// these its later `response.function_call_arguments.delta` fragments
+    /// could not be routed to the call they belong to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub function_calls: BTreeMap<i64, String>,
+}
+
+impl OpenAIContinuationToken {
+    /// A token for `response_id`, with no stream position.
+    pub fn new(response_id: impl Into<String>) -> Self {
+        Self {
+            response_id: response_id.into(),
+            sequence_number: None,
+            function_calls: BTreeMap::new(),
+        }
+    }
+
+    /// The opaque core token carrying this one.
+    pub fn to_token(&self) -> ContinuationToken {
+        ContinuationToken::new(serde_json::to_string(self).unwrap_or_default())
+    }
+
+    /// Read a token issued by this client (or a bare response id).
+    pub fn from_token(token: &ContinuationToken) -> Result<Self> {
+        let raw = token.as_str().trim();
+        if raw.starts_with('{') {
+            return serde_json::from_str::<Self>(raw)
+                .ok()
+                .filter(|t| !t.response_id.is_empty())
+                .ok_or_else(|| {
+                    Error::Configuration(format!(
+                        "not an OpenAI Responses continuation token: {raw}"
+                    ))
+                });
+        }
+        if raw.is_empty() {
+            return Err(Error::Configuration(
+                "an OpenAI Responses continuation token needs a response id".into(),
+            ));
+        }
+        Ok(Self::new(raw))
+    }
+}
+
+/// Whether a Responses API `status` means the operation is still running.
+fn is_pending_status(status: Option<&str>) -> bool {
+    matches!(status, Some("queued" | "in_progress"))
+}
 
 /// An OpenAI Responses API chat client (`POST /v1/responses`).
 #[derive(Clone)]
@@ -153,6 +221,9 @@ impl OpenAIChatClient {
         if let Some(metadata) = &options.metadata {
             body.insert("metadata".into(), json!(metadata));
         }
+        if let Some(background) = options.background {
+            body.insert("background".into(), json!(background));
+        }
 
         if !options.tools.is_empty() {
             let tools: Vec<Value> = options.tools.iter().map(tool_to_responses_spec).collect();
@@ -194,14 +265,35 @@ impl OpenAIChatClient {
         Value::Object(body)
     }
 
+    fn responses_url(&self) -> String {
+        format!("{}/responses", self.inner.base_url.trim_end_matches('/'))
+    }
+
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
-        let url = format!("{}/responses", self.inner.base_url.trim_end_matches('/'));
-        let mut req = self
-            .inner
-            .http
-            .post(&url)
-            .bearer_auth(&self.inner.api_key)
-            .json(body);
+        let req = self.inner.http.post(self.responses_url()).json(body);
+        self.send(req).await
+    }
+
+    /// `GET /responses/{id}`: poll a background response, or (with
+    /// `stream`) resume its event stream after `starting_after`.
+    async fn retrieve(
+        &self,
+        token: &OpenAIContinuationToken,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/{}", self.responses_url(), token.response_id);
+        let mut req = self.inner.http.get(url);
+        if stream {
+            req = req.query(&[("stream", "true")]);
+            if let Some(after) = token.sequence_number {
+                req = req.query(&[("starting_after", after)]);
+            }
+        }
+        self.send(req).await
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut req = req.bearer_auth(&self.inner.api_key);
         if let Some(org) = &self.inner.organization {
             req = req.header("OpenAI-Organization", org);
         }
@@ -233,8 +325,19 @@ impl ChatClient for OpenAIChatClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatResponse> {
-        let body = self.build_body(&messages, &options, false);
-        let resp = self.post(&body).await?;
+        // A continuation token polls the background response it names
+        // (upstream `responses.retrieve(response_id)`); the messages are not
+        // sent, since that response already has its input.
+        let resp = match &options.continuation_token {
+            Some(token) => {
+                let token = OpenAIContinuationToken::from_token(token)?;
+                self.retrieve(&token, false).await?
+            }
+            None => {
+                let body = self.build_body(&messages, &options, false);
+                self.post(&body).await?
+            }
+        };
         let value: Value = resp
             .json()
             .await
@@ -250,9 +353,21 @@ impl ChatClient for OpenAIChatClient {
         messages: Vec<Message>,
         options: ChatOptions,
     ) -> Result<ChatStream> {
+        // A continuation token resumes the background response's event
+        // stream after the last event the caller saw.
+        if let Some(token) = &options.continuation_token {
+            let token = OpenAIContinuationToken::from_token(token)?;
+            let resp = self.retrieve(&token, true).await?;
+            return Ok(
+                parse_background_responses_sse_stream(resp, options.store, Some(token)).boxed(),
+            );
+        }
         let body = self.build_body(&messages, &options, true);
         let resp = self.post(&body).await?;
-        Ok(parse_responses_sse_stream(resp, options.store).boxed())
+        if options.background == Some(true) {
+            return Ok(parse_background_responses_sse_stream(resp, options.store, None).boxed());
+        }
+        Ok(sse_stream(resp, options.store, None, HashMap::new()).boxed())
     }
 
     fn model(&self) -> Option<&str> {
@@ -399,6 +514,12 @@ fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> 
                 match content {
                     Content::FunctionResult(fr) => out.push(function_result_to_item(fr)),
                     Content::McpServerToolResult(r) => attach_mcp_output(&mut out, r),
+                    #[cfg(feature = "experimental-computer-use")]
+                    Content::ComputerToolResult(r) => {
+                        if let Some(item) = computer::result_to_item(r) {
+                            out.push(item);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -507,6 +628,22 @@ fn convert_messages(messages: &[Message], continues_stored: bool) -> Vec<Value> 
                 Content::McpServerToolResult(result) => {
                     flush_text(&mut out, &mut buffered, role);
                     attach_mcp_output(&mut out, result);
+                }
+                // Under service-side storage the call is already stored; only
+                // its output is sent (upstream skips outbound replay there).
+                #[cfg(feature = "experimental-computer-use")]
+                Content::ComputerToolCall(call) => {
+                    if !continues_stored {
+                        flush_text(&mut out, &mut buffered, role);
+                        out.push(computer::call_to_item(call));
+                    }
+                }
+                #[cfg(feature = "experimental-computer-use")]
+                Content::ComputerToolResult(result) => {
+                    flush_text(&mut out, &mut buffered, role);
+                    if let Some(item) = computer::result_to_item(result) {
+                        out.push(item);
+                    }
                 }
                 Content::TextReasoning(tr) => {
                     // Re-emit the original reasoning item verbatim (store:false
@@ -817,6 +954,8 @@ pub fn tool_to_responses_spec(tool: &ToolDefinition) -> Value {
             }
             Value::Object(spec)
         }
+        // Upstream `get_computer_tool()`.
+        ToolKind::HostedComputer => json!({ "type": "computer" }),
         ToolKind::Function => json!({
             "type": "function",
             "name": tool.name,
@@ -1052,6 +1191,8 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     if messages.is_empty() {
         messages.push(Message::with_contents(Role::assistant(), Vec::new()));
     }
+    #[cfg(feature = "experimental-computer-use")]
+    computer::mark_completed_calls(&mut messages);
     response.messages = messages;
 
     response.finish_reason = finish_reason_from_response(value);
@@ -1061,6 +1202,13 @@ pub fn parse_response(value: &Value, store: Option<bool>) -> ChatResponse {
     }
     if store != Some(false) {
         response.conversation_id = response.response_id.clone();
+    }
+    // A background response still queued or running hands back a token to
+    // poll it with (upstream `_parse_response_from_openai`).
+    if is_pending_status(value.get("status").and_then(Value::as_str)) {
+        if let Some(id) = &response.response_id {
+            response.continuation_token = Some(OpenAIContinuationToken::new(id).to_token());
+        }
     }
     response
 }
@@ -1246,6 +1394,10 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
         // later `FunctionApprovalResponse` refers back to it
         // (`_create_response_content:775-787`).
         Some("mcp_call") => contents.extend(mcp_call_item_contents(item)),
+        #[cfg(feature = "experimental-computer-use")]
+        Some("computer_call") => contents.extend(computer::parse_call(item)),
+        #[cfg(feature = "experimental-computer-use")]
+        Some("computer_call_output") => contents.extend(computer::parse_result(item)),
         Some("mcp_approval_request") => {
             let id = item
                 .get("id")
@@ -1278,14 +1430,18 @@ fn parse_output_item(item: &Value, contents: &mut Vec<Content>) {
 }
 
 /// Parse the `annotations` on an `output_text` part into [`Annotation`]s
-/// (`_create_response_content:667-724`). The core annotation type has no free
-/// `additional_properties`, so upstream's `index`/`container_id` extras are
-/// dropped.
+/// (`_create_response_content:667-724`), keeping upstream's `index` and
+/// `container_id` extras in `additional_properties`.
 fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
     let arr = part.get("annotations").and_then(Value::as_array)?;
     let mut out = Vec::new();
     for ann in arr {
         let str_field = |k: &str| ann.get(k).and_then(Value::as_str).map(String::from);
+        let extras = |keys: &[&str]| {
+            keys.iter()
+                .filter_map(|k| ann.get(*k).map(|v| (k.to_string(), v.clone())))
+                .collect::<serde_json::Map<String, Value>>()
+        };
         let regions = || {
             Some(vec![TextSpanRegion {
                 start_index: ann.get("start_index").and_then(Value::as_i64),
@@ -1295,11 +1451,13 @@ fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
         match ann.get("type").and_then(Value::as_str) {
             Some("file_path") => out.push(Annotation {
                 file_id: str_field("file_id"),
+                additional_properties: extras(&["index"]),
                 ..Default::default()
             }),
             Some("file_citation") => out.push(Annotation {
                 url: str_field("filename"),
                 file_id: str_field("file_id"),
+                additional_properties: extras(&["index"]),
                 ..Default::default()
             }),
             Some("url_citation") => out.push(Annotation {
@@ -1312,6 +1470,7 @@ fn parse_annotations(part: &Value) -> Option<Vec<Annotation>> {
                 file_id: str_field("file_id"),
                 url: str_field("filename"),
                 annotated_regions: regions(),
+                additional_properties: extras(&["container_id"]),
                 ..Default::default()
             }),
             _ => {}
@@ -1338,6 +1497,10 @@ fn finish_reason_from_response(value: &Value) -> Option<FinishReason> {
         return Some(FinishReason::tool_calls());
     }
     let status = value.get("status").and_then(Value::as_str)?;
+    // A background response that has not finished has no finish reason yet.
+    if is_pending_status(Some(status)) {
+        return None;
+    }
     Some(match status {
         "completed" => FinishReason::stop(),
         "incomplete" => match value
@@ -1410,6 +1573,129 @@ pub fn parse_responses_sse_stream(
     resp: reqwest::Response,
     store: Option<bool>,
 ) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
+    sse_stream(resp, store, None, HashMap::new())
+}
+
+/// [`parse_responses_sse_stream`] for a background response: every update
+/// carries an [`OpenAIContinuationToken`] while the response is still
+/// running. `resume` is the token a resumed stream continues from (`None`
+/// for a fresh `background: true` submission). `pub` so
+/// `agent-framework-azure`'s Responses client can reuse it.
+pub fn parse_background_responses_sse_stream(
+    resp: reqwest::Response,
+    store: Option<bool>,
+    resume: Option<OpenAIContinuationToken>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
+    match resume {
+        Some(token) => {
+            let state = BackgroundStream {
+                response_id: Some(token.response_id),
+                sequence_number: token.sequence_number,
+            };
+            sse_stream(
+                resp,
+                store,
+                Some(state),
+                token.function_calls.into_iter().collect(),
+            )
+        }
+        None => sse_stream(
+            resp,
+            store,
+            Some(BackgroundStream::default()),
+            HashMap::new(),
+        ),
+    }
+}
+
+/// Where a background response's stream stands, so every update can carry
+/// a [`OpenAIContinuationToken`] to resume it from.
+#[derive(Debug, Clone, Default)]
+struct BackgroundStream {
+    /// The response id, from the token being resumed or `response.created`.
+    response_id: Option<String>,
+    /// The `sequence_number` of the latest event seen.
+    sequence_number: Option<u64>,
+}
+
+impl BackgroundStream {
+    /// Note the position of `event` (its response id and sequence number).
+    fn observe(&mut self, event: &Value) {
+        if let Some(seq) = event.get("sequence_number").and_then(Value::as_u64) {
+            self.sequence_number = Some(seq);
+        }
+        if let Some(id) = event
+            .get("response")
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.response_id = Some(id.to_string());
+        }
+    }
+
+    /// Stamp `update` with where the operation stands after `event`: a
+    /// terminal event ends it (no token), anything else leaves it running,
+    /// resumable from this event on. Mirrors upstream's streaming
+    /// `operation_state` / `continuation_token` handling.
+    fn stamp(
+        &self,
+        event: &Value,
+        update: &mut ChatResponseUpdate,
+        store: Option<bool>,
+        call_ids: &HashMap<i64, String>,
+    ) {
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let status = event
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(Value::as_str);
+        let terminal = matches!(
+            event_type,
+            "response.completed"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.cancelled"
+                | "error"
+        ) || matches!(
+            status,
+            Some("completed" | "incomplete" | "failed" | "cancelled")
+        );
+        if terminal {
+            update.operation_state = Some(OperationState::Terminal);
+            update.continuation_token = None;
+            return;
+        }
+        let Some(response_id) = &self.response_id else {
+            return;
+        };
+        update.operation_state = Some(OperationState::InProgress);
+        update.continuation_token = Some(
+            OpenAIContinuationToken {
+                response_id: response_id.clone(),
+                sequence_number: self.sequence_number,
+                function_calls: call_ids
+                    .iter()
+                    .map(|(index, id)| (*index, id.clone()))
+                    .collect(),
+            }
+            .to_token(),
+        );
+        if store != Some(false) && update.conversation_id.is_none() {
+            update.conversation_id = Some(response_id.clone());
+        }
+    }
+}
+
+/// [`parse_responses_sse_stream`], stamping continuation tokens on the
+/// updates of a background response (`background` is `Some`). `call_ids`
+/// are the function calls a resumed stream's earlier events announced.
+fn sse_stream(
+    resp: reqwest::Response,
+    store: Option<bool>,
+    background: Option<BackgroundStream>,
+    call_ids: HashMap<i64, String>,
+) -> impl futures::Stream<Item = Result<ChatResponseUpdate>> + Send {
     let byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     futures::stream::unfold(
         ResponsesSseState {
@@ -1417,9 +1703,10 @@ pub fn parse_responses_sse_stream(
             buffer: String::new(),
             utf8: Utf8StreamDecoder::new(),
             queued: VecDeque::new(),
-            call_ids: HashMap::new(),
+            call_ids,
             done: false,
             store,
+            background,
         },
         |mut state| async move {
             loop {
@@ -1446,8 +1733,16 @@ pub fn parse_responses_sse_stream(
                             let Ok(value) = serde_json::from_str::<Value>(data) else {
                                 continue;
                             };
+                            if let Some(bg) = state.background.as_mut() {
+                                bg.observe(&value);
+                            }
                             match parse_responses_event(&value, &mut state.call_ids, state.store) {
-                                EventOutcome::Update(update) => state.queued.push_back(update),
+                                EventOutcome::Update(mut update) => {
+                                    if let Some(bg) = &state.background {
+                                        bg.stamp(&value, &mut update, state.store, &state.call_ids);
+                                    }
+                                    state.queued.push_back(update)
+                                }
                                 EventOutcome::Error(e) => {
                                     state.done = true;
                                     return Some((Err(e), state));
@@ -1478,6 +1773,9 @@ struct ResponsesSseState {
     call_ids: HashMap<i64, String>,
     done: bool,
     store: Option<bool>,
+    /// Set for a background response, whose updates carry continuation
+    /// tokens.
+    background: Option<BackgroundStream>,
 }
 
 // A transient control-flow value: produced per SSE event and immediately
@@ -1676,7 +1974,11 @@ fn parse_responses_event(
         // stream would lose its finish reason, usage and response id
         // entirely, which is exactly the information the distinct event
         // name exists to deliver.
-        "response.completed" | "response.incomplete" => {
+        // `response.cancelled` (a background response cancelled mid-stream)
+        // ends the stream the same way: a final update with the response's
+        // metadata, which a background stream stamps as terminal so the
+        // aggregated continuation token is cleared.
+        "response.completed" | "response.incomplete" | "response.cancelled" => {
             let resp = value.get("response");
             let response_id = resp
                 .and_then(|r| r.get("id"))
@@ -1768,6 +2070,56 @@ fn parse_responses_event(
                     ..Default::default()
                 });
             }
+            #[cfg(feature = "experimental-computer-use")]
+            if let Some(item) = value.get("item").filter(|i| {
+                matches!(
+                    i.get("type").and_then(Value::as_str),
+                    Some("computer_call" | "computer_call_output")
+                )
+            }) {
+                let mut contents = Vec::new();
+                parse_output_item(item, &mut contents);
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents,
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
+            // A function call this stream never announced — a resumed
+            // stream that started after its `output_item.added` and had no
+            // routing for it — arrives whole here: the done item carries
+            // the call id, name and complete arguments, as .NET builds its
+            // calls. A call that was announced streamed its arguments
+            // already, so it is not repeated.
+            if let Some(item) = value
+                .get("item")
+                .filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if call_ids.contains_key(&output_index) {
+                    return EventOutcome::None;
+                }
+                let field = |name: &str| {
+                    item.get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let call_id = field("call_id");
+                call_ids.insert(output_index, call_id.clone());
+                return EventOutcome::Update(ChatResponseUpdate {
+                    contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                        call_id,
+                        field("name"),
+                        Some(FunctionArguments::Raw(field("arguments"))),
+                    ))],
+                    role: Some(Role::assistant()),
+                    ..Default::default()
+                });
+            }
             let Some(item) = value
                 .get("item")
                 .filter(|i| i.get("type").and_then(Value::as_str) == Some("mcp_call"))
@@ -1796,6 +2148,403 @@ fn parse_responses_event(
 }
 
 // endregion
+
+/// Computer use (experimental `COMPUTER_USE`): `computer_call` /
+/// `computer_call_output` items to and from
+/// [`ComputerToolCallContent`] / [`ComputerToolResultContent`]
+/// (upstream `_chat_client.py`). Malformed provider items are skipped with a
+/// warning; upstream raises.
+#[cfg(feature = "experimental-computer-use")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental-computer-use")))]
+pub use computer::{SCREENSHOT_DETAIL_KEY, SCREENSHOT_FILE_ID_KEY, SCREENSHOT_IMAGE_URL_KEY};
+
+#[cfg(feature = "experimental-computer-use")]
+mod computer {
+    use agent_framework_core::types::{
+        ComputerSafetyCheck, ComputerToolCallContent, ComputerToolResultContent, Content,
+        DataContent, HostedFileContent, Message, UriContent,
+    };
+    use serde_json::{json, Map, Value};
+
+    /// Marks a call parsed from the preview single-`action` form, so it is
+    /// replayed in that form.
+    const ACTION_FORMAT_KEY: &str = "computer_action_format";
+
+    fn safety_checks(value: Option<&Value>) -> Option<Vec<ComputerSafetyCheck>> {
+        let items = value?.as_array()?;
+        Some(
+            items
+                .iter()
+                .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                .collect(),
+        )
+    }
+
+    pub(super) fn parse_call(item: &Value) -> Option<Content> {
+        let (actions, single) = match (item.get("actions"), item.get("action")) {
+            (Some(Value::Array(actions)), _) => (actions.clone(), false),
+            (None, Some(action)) => (vec![action.clone()], true),
+            _ => (Vec::new(), false),
+        };
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if id.is_empty() || call_id.is_empty() || actions.is_empty() {
+            tracing::warn!("Responses: skipping a computer_call without an id, call_id or actions");
+            return None;
+        }
+        if actions.iter().any(|a| !a.is_object()) {
+            tracing::warn!("Responses: skipping a computer_call whose actions are not objects");
+            return None;
+        }
+        let mut additional_properties = Map::new();
+        if single {
+            additional_properties.insert(ACTION_FORMAT_KEY.into(), json!("single"));
+        }
+        Some(Content::ComputerToolCall(ComputerToolCallContent {
+            id: id.into(),
+            call_id: call_id.into(),
+            actions,
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            pending_safety_checks: safety_checks(item.get("pending_safety_checks")),
+            user_input_request: true,
+            additional_properties,
+        }))
+    }
+
+    /// Result `additional_properties` keys carrying the screenshot metadata
+    /// the screenshot content cannot hold: OpenAI's image `detail`, and the
+    /// secondary reference when a screenshot has both an image URL and a
+    /// file id (upstream keeps these on the screenshot content).
+    pub const SCREENSHOT_DETAIL_KEY: &str = "screenshot_detail";
+    /// See [`SCREENSHOT_DETAIL_KEY`]: the file id alongside an image URL.
+    pub const SCREENSHOT_FILE_ID_KEY: &str = "screenshot_file_id";
+    /// See [`SCREENSHOT_DETAIL_KEY`]: the image URL alongside a file id.
+    pub const SCREENSHOT_IMAGE_URL_KEY: &str = "screenshot_image_url";
+
+    pub(super) fn parse_result(item: &Value) -> Option<Content> {
+        let output = item
+            .get("output")
+            .filter(|o| o.get("type").and_then(Value::as_str) == Some("computer_screenshot"));
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (Some(output), false) = (output, call_id.is_empty()) else {
+            tracing::warn!(
+                "Responses: skipping a computer_call_output without a call_id or computer screenshot"
+            );
+            return None;
+        };
+        let image_url = output
+            .get("image_url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty());
+        let file_id = output
+            .get("file_id")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty());
+        let screenshot = match (image_url, file_id) {
+            (Some(url), _) if url.starts_with("data:") => Content::Data(DataContent {
+                uri: url.into(),
+                media_type: DataContent::media_type_from_uri(url).ok(),
+            }),
+            (Some(url), _) => Content::Uri(UriContent {
+                uri: url.into(),
+                media_type: "image/png".into(),
+            }),
+            (None, Some(file_id)) => Content::HostedFile(HostedFileContent {
+                file_id: file_id.into(),
+            }),
+            (None, None) => {
+                tracing::warn!(
+                    "Responses: skipping a computer screenshot without an image URL or file id"
+                );
+                return None;
+            }
+        };
+        let mut additional_properties = Map::new();
+        if let Some(detail) = output.get("detail").filter(|d| !d.is_null()) {
+            additional_properties.insert(SCREENSHOT_DETAIL_KEY.into(), detail.clone());
+        }
+        match (image_url, file_id) {
+            (Some(_), Some(file_id)) => {
+                additional_properties.insert(SCREENSHOT_FILE_ID_KEY.into(), json!(file_id));
+            }
+            (None, Some(_)) => {}
+            _ => {}
+        }
+        Some(Content::ComputerToolResult(ComputerToolResultContent {
+            call_id: call_id.into(),
+            id: item.get("id").and_then(Value::as_str).map(str::to_string),
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            screenshot: Some(Box::new(screenshot)),
+            acknowledged_safety_checks: safety_checks(item.get("acknowledged_safety_checks")),
+            additional_properties,
+        }))
+    }
+
+    pub(super) fn call_to_item(call: &ComputerToolCallContent) -> Value {
+        let mut item = Map::new();
+        item.insert("type".into(), json!("computer_call"));
+        item.insert("id".into(), json!(call.id));
+        item.insert("call_id".into(), json!(call.call_id));
+        let single = call.additional_properties.get(ACTION_FORMAT_KEY) == Some(&json!("single"))
+            && call.actions.len() == 1;
+        if single {
+            item.insert("action".into(), call.actions[0].clone());
+        } else {
+            item.insert("actions".into(), json!(call.actions));
+        }
+        if let Some(status) = &call.status {
+            item.insert("status".into(), json!(status));
+        }
+        if let Some(checks) = &call.pending_safety_checks {
+            item.insert("pending_safety_checks".into(), json!(checks));
+        }
+        Value::Object(item)
+    }
+
+    /// `None` (with a warning) when the result has no screenshot the
+    /// Responses API can take; upstream raises.
+    pub(super) fn result_to_item(result: &ComputerToolResultContent) -> Option<Value> {
+        let mut output = Map::new();
+        output.insert("type".into(), json!("computer_screenshot"));
+        match result.screenshot.as_deref() {
+            Some(Content::Uri(u)) => {
+                output.insert("image_url".into(), json!(u.uri));
+            }
+            Some(Content::Data(d)) => {
+                output.insert("image_url".into(), json!(d.uri));
+            }
+            Some(Content::HostedFile(f)) => {
+                output.insert("file_id".into(), json!(f.file_id));
+            }
+            _ => {
+                tracing::warn!(
+                    call_id = %result.call_id,
+                    "Responses: a computer result needs a screenshot (image URL or file id); dropping it"
+                );
+                return None;
+            }
+        }
+        let extra = |key: &str| {
+            result
+                .additional_properties
+                .get(key)
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        };
+        if output.contains_key("image_url") {
+            if let Some(file_id) = extra(SCREENSHOT_FILE_ID_KEY) {
+                output.insert("file_id".into(), file_id.clone());
+            }
+        } else if let Some(url) = extra(SCREENSHOT_IMAGE_URL_KEY) {
+            output.insert("image_url".into(), url.clone());
+        }
+        if let Some(detail) = extra(SCREENSHOT_DETAIL_KEY) {
+            output.insert("detail".into(), detail.clone());
+        }
+        let mut item = Map::new();
+        item.insert("type".into(), json!("computer_call_output"));
+        item.insert("call_id".into(), json!(result.call_id));
+        item.insert("output".into(), Value::Object(output));
+        if let Some(id) = &result.id {
+            item.insert("id".into(), json!(id));
+        }
+        if let Some(status) = &result.status {
+            item.insert("status".into(), json!(status));
+        }
+        if let Some(checks) = &result.acknowledged_safety_checks {
+            item.insert("acknowledged_safety_checks".into(), json!(checks));
+        }
+        Some(Value::Object(item))
+    }
+
+    /// A call answered by a completed result no longer awaits the
+    /// application (upstream `_mark_completed_computer_calls`).
+    pub(super) fn mark_completed_calls(messages: &mut [Message]) {
+        let completed: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::ComputerToolResult(r)
+                    if matches!(r.status.as_deref(), None | Some("completed")) =>
+                {
+                    Some(r.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut remaining = completed;
+        for content in messages.iter_mut().flat_map(|m| m.contents.iter_mut()) {
+            if let Content::ComputerToolCall(call) = content {
+                if let Some(i) = remaining.iter().position(|id| *id == call.call_id) {
+                    call.user_input_request = false;
+                    remaining.remove(i);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "experimental-computer-use"))]
+mod computer_tests {
+    use super::*;
+    use agent_framework_core::types::{ComputerSafetyCheck, ComputerToolResultContent, UriContent};
+
+    #[test]
+    fn screenshot_detail_and_secondary_references_round_trip() {
+        for output in [
+            json!({"type": "computer_screenshot", "image_url": "https://x/s.png",
+                   "file_id": "file_1", "detail": "high"}),
+            json!({"type": "computer_screenshot", "file_id": "file_2",
+                   "image_url": "https://x/t.png", "detail": "low"}),
+        ] {
+            let response = response_with(vec![
+                computer_call("cu_1"),
+                json!({"type": "computer_call_output", "call_id": "call_1", "output": output}),
+            ]);
+            let msgs = response.messages.clone();
+            let input = messages_to_input(&msgs);
+            let replayed = input
+                .iter()
+                .find(|i| i["type"] == "computer_call_output")
+                .expect("the result is replayed");
+            assert_eq!(replayed["output"], output, "{replayed}");
+        }
+    }
+
+    fn response_with(items: Vec<Value>) -> ChatResponse {
+        parse_response(&json!({"id": "resp_1", "output": items}), None)
+    }
+
+    fn computer_call(id: &str) -> Value {
+        json!({
+            "type": "computer_call", "id": id, "call_id": "call_1", "status": "completed",
+            "actions": [{"type": "click", "x": 1, "y": 2, "button": "left"}],
+            "pending_safety_checks": [{"id": "sc_1", "code": "irrelevant_domain", "message": "check"}]
+        })
+    }
+
+    fn contents(response: &ChatResponse) -> Vec<Content> {
+        response
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_computer_tool_is_declared() {
+        assert_eq!(
+            tool_to_responses_spec(&agent_framework_core::tools::hosted_computer()),
+            json!({"type": "computer"})
+        );
+    }
+
+    #[test]
+    fn computer_calls_parse_and_stay_pending_until_answered() {
+        let response = response_with(vec![computer_call("cu_1")]);
+        let all = contents(&response);
+        let [Content::ComputerToolCall(call)] = all.as_slice() else {
+            panic!("one computer call: {all:?}");
+        };
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(call.actions[0]["type"], "click");
+        assert!(call.user_input_request);
+        assert_eq!(
+            call.pending_safety_checks,
+            Some(vec![ComputerSafetyCheck {
+                id: "sc_1".into(),
+                code: Some("irrelevant_domain".into()),
+                message: Some("check".into()),
+            }])
+        );
+
+        // A completed output for the call clears it.
+        let answered = response_with(vec![
+            computer_call("cu_1"),
+            json!({"type": "computer_call_output", "call_id": "call_1", "status": "completed",
+                   "output": {"type": "computer_screenshot", "image_url": "https://x/s.png"}}),
+        ]);
+        let all = contents(&answered);
+        assert!(matches!(&all[0], Content::ComputerToolCall(c) if !c.user_input_request));
+        assert!(matches!(&all[1], Content::ComputerToolResult(r)
+            if matches!(r.screenshot.as_deref(), Some(Content::Uri(u)) if u.uri == "https://x/s.png")));
+
+        // Malformed items are skipped.
+        assert!(contents(&response_with(vec![
+            json!({"type": "computer_call", "id": "x"})
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn preview_single_action_calls_replay_in_their_form() {
+        let response = response_with(vec![json!({
+            "type": "computer_call", "id": "cu_2", "call_id": "call_2",
+            "action": {"type": "screenshot"}
+        })]);
+        let msgs = response.messages.clone();
+        let input = messages_to_input(&msgs);
+        assert_eq!(input[0]["type"], "computer_call");
+        assert_eq!(input[0]["action"]["type"], "screenshot");
+        assert!(input[0].get("actions").is_none());
+    }
+
+    #[test]
+    fn results_become_computer_call_outputs() {
+        let call = contents(&response_with(vec![computer_call("cu_1")]));
+        let result = ComputerToolResultContent::new("call_1")
+            .unwrap()
+            .with_screenshot(Content::Uri(UriContent {
+                uri: "https://x/after.png".into(),
+                media_type: "image/png".into(),
+            }))
+            .unwrap()
+            .with_acknowledged_safety_checks(vec![ComputerSafetyCheck {
+                id: "sc_1".into(),
+                ..Default::default()
+            }]);
+        let messages = vec![
+            Message::with_contents(Role::assistant(), call),
+            Message::with_contents(Role::tool(), vec![Content::ComputerToolResult(result)]),
+        ];
+        let input = messages_to_input(&messages);
+        assert_eq!(input[0]["type"], "computer_call");
+        assert_eq!(input[0]["actions"][0]["type"], "click");
+        assert_eq!(
+            input[1],
+            json!({"type": "computer_call_output", "call_id": "call_1",
+                   "output": {"type": "computer_screenshot", "image_url": "https://x/after.png"},
+                   "acknowledged_safety_checks": [{"id": "sc_1"}]})
+        );
+        // Continuing a stored response sends only the output.
+        let continued = messages_to_continuation_input(&messages);
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0]["type"], "computer_call_output");
+    }
+
+    #[test]
+    fn a_streamed_computer_call_arrives_with_its_done_item() {
+        let EventOutcome::Update(update) = parse_responses_event(
+            &json!({"type": "response.output_item.done", "output_index": 0, "item": computer_call("cu_9")}),
+            &mut HashMap::new(),
+            None,
+        ) else {
+            panic!("an update");
+        };
+        assert!(matches!(&update.contents[0], Content::ComputerToolCall(c) if c.id == "cu_9"));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2412,6 +3161,7 @@ mod tests {
             call_ids: HashMap::new(),
             done: false,
             store: None,
+            background: None,
         };
         let mut updates = Vec::new();
         // Drain the single chunk manually (mirrors the real unfold body).
@@ -2550,6 +3300,7 @@ mod tests {
             call_ids: HashMap::new(),
             done: false,
             store: None,
+            background: None,
         };
         let bytes = state.byte_stream.next().await.unwrap().unwrap();
         let decoded = state.utf8.push(&bytes);

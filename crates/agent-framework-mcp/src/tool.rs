@@ -226,6 +226,53 @@ impl Tool for McpToolExecutor {
             .call_tool_value(&self.remote_name, arguments)
             .await
     }
+
+    /// The model-visible result, plus the full `tools/call` result for the
+    /// host under
+    /// [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`](agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY)
+    /// (upstream's MCP Host payload), omitted when it encodes to more than
+    /// [`MAX_HOST_PAYLOAD_SIZE_BYTES`].
+    async fn invoke_with_properties(
+        &self,
+        arguments: Value,
+        _ctx: &agent_framework_core::middleware::FunctionInvocationContext,
+    ) -> Result<(Value, serde_json::Map<String, Value>)> {
+        let raw = self
+            .client
+            .call_tool_raw(&self.remote_name, arguments)
+            .await?;
+        let result = crate::protocol::CallToolResult::from_value(&raw);
+        if result.is_error {
+            return Err(agent_framework_core::error::Error::tool(
+                result.error_message(),
+            ));
+        }
+        let mut properties = serde_json::Map::new();
+        if raw.to_string().len() <= MAX_HOST_PAYLOAD_SIZE_BYTES {
+            properties.insert(
+                agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY.into(),
+                raw,
+            );
+        } else {
+            tracing::warn!(
+                "Omitting MCP Host payload because its encoded size exceeds {MAX_HOST_PAYLOAD_SIZE_BYTES} bytes."
+            );
+        }
+        Ok((result.to_value(), properties))
+    }
+}
+
+/// The largest MCP Host payload kept on a tool result (upstream's default
+/// `max_host_payload_size_bytes`, 1 MiB).
+pub const MAX_HOST_PAYLOAD_SIZE_BYTES: usize = 1024 * 1024;
+
+/// What a tool executor is built from: the normalized local name, the
+/// server's descriptor (whose `name` is the remote name), and the client to
+/// call through.
+pub(crate) struct ExecutorParts<'a> {
+    pub(crate) local_name: String,
+    pub(crate) descriptor: &'a ToolDescriptor,
+    pub(crate) client: Arc<McpClient>,
 }
 
 /// Build one [`ToolDefinition`] per (filtered) tool descriptor, wired to call
@@ -240,6 +287,26 @@ fn build_tool_definitions(
     tools: &[ToolDescriptor],
     allowed_tools: Option<&HashSet<String>>,
     approval_mode: &McpApprovalMode,
+) -> Vec<ToolDefinition> {
+    build_tool_definitions_with(client, tools, allowed_tools, approval_mode, &|parts| {
+        Arc::new(McpToolExecutor {
+            local_name: parts.local_name,
+            description: parts.descriptor.description.clone().unwrap_or_default(),
+            parameters: parts.descriptor.input_schema.clone(),
+            remote_name: parts.descriptor.name.clone(),
+            client: parts.client,
+        })
+    })
+}
+
+/// [`build_tool_definitions`] with the executor built by `make` (the
+/// filtering, Tasks skip, collision dedup and approval policy are shared).
+pub(crate) fn build_tool_definitions_with(
+    client: Arc<McpClient>,
+    tools: &[ToolDescriptor],
+    allowed_tools: Option<&HashSet<String>>,
+    approval_mode: &McpApprovalMode,
+    make: &dyn Fn(ExecutorParts<'_>) -> Arc<dyn Tool>,
 ) -> Vec<ToolDefinition> {
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut definitions = Vec::new();
@@ -272,11 +339,9 @@ fn build_tool_definitions(
             );
             continue;
         }
-        let executor: Arc<dyn Tool> = Arc::new(McpToolExecutor {
+        let executor = make(ExecutorParts {
             local_name: local_name.clone(),
-            description: descriptor.description.clone().unwrap_or_default(),
-            parameters: descriptor.input_schema.clone(),
-            remote_name: descriptor.name.clone(),
+            descriptor,
             client: client.clone(),
         });
         let mut definition = ToolDefinition::from_tool(executor);
@@ -348,6 +413,7 @@ pub struct McpStdioTool {
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     request_timeout: Option<Duration>,
@@ -371,6 +437,7 @@ impl McpStdioTool {
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             request_timeout: None,
@@ -461,6 +528,14 @@ impl McpStdioTool {
         self
     }
 
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
+        self
+    }
+
     /// Register the handler for server-initiated `sampling/createMessage`
     /// requests, applied when the underlying session is created. See
     /// [`McpClient::sampling_handler`].
@@ -534,7 +609,8 @@ impl McpStdioTool {
                 if let Some(timeout) = self.request_timeout {
                     transport = transport.with_request_timeout(timeout);
                 }
-                let mut client = McpClient::new(Arc::new(transport));
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
@@ -627,6 +703,28 @@ impl McpStdioTool {
             client.close().await?;
         }
         Ok(())
+    }
+}
+
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpStdioTool {
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
     }
 }
 
@@ -680,11 +778,13 @@ pub struct McpStreamableHttpTool {
     description: Option<String>,
     url: String,
     headers: Vec<(String, String)>,
+    header_provider: Option<crate::transport::HeaderProvider>,
     timeout: Option<Duration>,
     allowed_tools: Option<HashSet<String>>,
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     session: OnceCell<Arc<McpClient>>,
@@ -698,11 +798,13 @@ impl McpStreamableHttpTool {
             description: None,
             url: url.into(),
             headers: Vec::new(),
+            header_provider: None,
             timeout: None,
             allowed_tools: None,
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             session: OnceCell::new(),
@@ -727,6 +829,14 @@ impl McpStreamableHttpTool {
         self
     }
 
+    /// Headers computed for every request (e.g. a bearer token fetched from
+    /// a credential each time, so a long-lived tool never sends an expired
+    /// one). They replace same-named [`Self::headers`].
+    pub fn header_provider(mut self, provider: crate::transport::HeaderProvider) -> Self {
+        self.header_provider = Some(provider);
+        self
+    }
+
     /// Set a human-readable description for this tool source.
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
@@ -746,6 +856,14 @@ impl McpStreamableHttpTool {
     /// Set the approval policy applied to produced [`ToolDefinition`]s.
     pub fn approval_mode(mut self, mode: McpApprovalMode) -> Self {
         self.approval_mode = mode;
+        self
+    }
+
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
         self
     }
 
@@ -796,9 +914,13 @@ impl McpStreamableHttpTool {
         self.session
             .get_or_try_init(|| async {
                 let header_map = McpStreamableHttpTransport::header_map(&self.headers)?;
-                let transport =
+                let mut transport =
                     McpStreamableHttpTransport::new(self.url.clone(), header_map, self.timeout)?;
-                let mut client = McpClient::new(Arc::new(transport));
+                if let Some(provider) = &self.header_provider {
+                    transport = transport.with_header_provider(provider.clone());
+                }
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
@@ -891,6 +1013,47 @@ impl McpStreamableHttpTool {
             client.close().await?;
         }
         Ok(())
+    }
+}
+
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpStreamableHttpTool {
+    /// The Agent Skills this server serves (SEP-2640; feature `skills`): see
+    /// [`crate::skills::load_skills`]. Connects first.
+    #[cfg(feature = "skills")]
+    pub async fn skills(&self) -> Result<Vec<agent_framework_core::skills::Skill>> {
+        let client = self.connected_client().await?;
+        crate::skills::load_skills(&client).await
+    }
+
+    /// [`Self::skills`] unpacking `archive` entries with `options` (see
+    /// [`crate::skills::load_skills_with`]).
+    #[cfg(feature = "skills")]
+    pub async fn skills_with(
+        &self,
+        options: &crate::skills::ArchiveOptions,
+    ) -> Result<Vec<agent_framework_core::skills::Skill>> {
+        let client = self.connected_client().await?;
+        crate::skills::load_skills_with(&client, options).await
+    }
+
+    #[cfg_attr(not(any(feature = "fides", feature = "skills")), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
     }
 }
 
@@ -948,6 +1111,7 @@ pub struct McpWebsocketTool {
     approval_mode: McpApprovalMode,
     sampling_handler: Option<SamplingHandler>,
     roots: Option<Vec<Root>>,
+    protocol_mode: crate::McpProtocolMode,
     load_tools: bool,
     load_prompts: bool,
     request_timeout: Option<Duration>,
@@ -967,6 +1131,7 @@ impl McpWebsocketTool {
             approval_mode: McpApprovalMode::default(),
             sampling_handler: None,
             roots: None,
+            protocol_mode: crate::McpProtocolMode::default(),
             load_tools: true,
             load_prompts: true,
             request_timeout: None,
@@ -1006,6 +1171,14 @@ impl McpWebsocketTool {
     /// Set the approval policy applied to produced [`ToolDefinition`]s.
     pub fn approval_mode(mut self, mode: McpApprovalMode) -> Self {
         self.approval_mode = mode;
+        self
+    }
+
+    /// How to agree on a protocol era with the server (default
+    /// [`McpProtocolMode::Auto`](crate::McpProtocolMode::Auto)). See
+    /// [`McpClient::protocol_mode`].
+    pub fn protocol_mode(mut self, mode: crate::McpProtocolMode) -> Self {
+        self.protocol_mode = mode;
         self
     }
 
@@ -1071,7 +1244,8 @@ impl McpWebsocketTool {
                 if let Some(timeout) = self.request_timeout {
                     transport = transport.with_request_timeout(timeout);
                 }
-                let mut client = McpClient::new(Arc::new(transport));
+                let mut client =
+                    McpClient::new(Arc::new(transport)).protocol_mode(self.protocol_mode);
                 if let Some(handler) = &self.sampling_handler {
                     client = client.sampling_handler(handler.clone());
                 }
@@ -1167,6 +1341,28 @@ impl McpWebsocketTool {
     }
 }
 
+/// Crate-internal access for wrappers (the `fides` proxy).
+impl McpWebsocketTool {
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) async fn connected_client(&self) -> Result<Arc<McpClient>> {
+        self.connect().await?;
+        Ok(self
+            .session
+            .get()
+            .expect("connect() initializes the session or returns an error")
+            .clone())
+    }
+
+    #[cfg_attr(not(feature = "fides"), allow(dead_code))]
+    pub(crate) fn listing_policy(&self) -> (Option<&HashSet<String>>, &McpApprovalMode, bool) {
+        (
+            self.allowed_tools.as_ref(),
+            &self.approval_mode,
+            self.load_tools,
+        )
+    }
+}
+
 /// Resolved per agent run: lazily connects on first call (reusing
 /// [`Self::connect`]) and serves tools from [`McpClient::list_tools_cached`],
 /// which is invalidated automatically by a
@@ -1212,6 +1408,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             output_schema: None,
             execution: None,
+            annotations: None,
         }
     }
 

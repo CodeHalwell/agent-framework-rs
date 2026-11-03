@@ -134,14 +134,21 @@
 mod client;
 mod protocol;
 mod sampling;
+#[cfg(feature = "fides")]
+#[cfg_attr(docsrs, doc(cfg(feature = "fides")))]
+pub mod security;
+#[cfg(feature = "skills")]
+#[cfg_attr(docsrs, doc(cfg(feature = "skills")))]
+pub mod skills;
 mod tool;
 mod transport;
 
-pub use client::McpClient;
+pub use client::{McpClient, McpProtocolMode};
 pub use protocol::{
     CallToolResult, ContentBlock, GetPromptResult, Implementation, InitializeResult,
-    ListPromptsResult, ListToolsResult, PromptArgument, PromptDescriptor, PromptMessage, RpcError,
-    ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS, PROTOCOL_VERSION,
+    ListPromptsResult, ListToolsResult, PromptArgument, PromptDescriptor, PromptMessage,
+    ReadResourceResult, ResourceContents, RpcError, ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS,
+    PROTOCOL_VERSION,
 };
 pub use sampling::{
     chat_client_sampling_handler, BoxedServerRequestHandler, CreateMessageParams,
@@ -149,5 +156,6 @@ pub use sampling::{
 };
 pub use tool::{McpApprovalMode, McpStdioTool, McpStreamableHttpTool, McpWebsocketTool};
 pub use transport::{
-    McpStdioTransport, McpStreamableHttpTransport, McpTransport, McpWebsocketTransport, StdioEnv,
+    HeaderProvider, McpStdioTransport, McpStreamableHttpTransport, McpTransport,
+    McpWebsocketTransport, StdioEnv,
 };

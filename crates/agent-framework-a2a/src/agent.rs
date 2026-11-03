@@ -595,6 +595,8 @@ fn content_type_name(content: &Content) -> &'static str {
         Content::FunctionApprovalRequest(_) => "function_approval_request",
         Content::FunctionApprovalResponse(_) => "function_approval_response",
         Content::OauthConsentRequest(_) => "oauth_consent_request",
+        Content::ComputerToolCall(_) => "computer_tool_call",
+        Content::ComputerToolResult(_) => "computer_tool_result",
         Content::Unknown => "unknown",
     }
 }

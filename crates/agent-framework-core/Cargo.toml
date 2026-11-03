@@ -38,6 +38,10 @@ tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry-application-insights = { workspace = true, optional = true }
 reqwest013 = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+# The agent-hooks `jcs-sha256` identity provider: RFC 8785 numbers
+# (ECMAScript formatting) and SHA-256.
+ryu-js = { version = "1", default-features = false, optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # `test-util` adds tokio's mock clock (`start_paused`, `pause`/`advance`) used
@@ -62,7 +66,13 @@ experimental-file-history = []
 experimental-progressive-tools = []
 # AGENT_HOOKS: the `agent_hooks` module (AGENT-HOOKS-0.1 interception
 # contract and the enforcement bundle over the agent, chat and function seams).
-experimental-agent-hooks = []
+experimental-agent-hooks = ["dep:ryu-js", "dep:sha2"]
+# COMPUTER_USE: constructors and validation for computer-use content
+# (`ComputerToolCallContent` / `ComputerToolResultContent`).
+experimental-computer-use = []
+# FIDES information-flow control (`security` module): SHA-256 binds policy
+# approvals to the exact invocation.
+experimental-fides = ["dep:sha2"]
 # HARNESS: the `harness` module (agent loop, todo list, standing tool
 # approvals, agent mode, file store and file memory).
 experimental-harness = ["dep:regex"]

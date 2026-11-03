@@ -429,6 +429,12 @@ pub fn tools_to_gemini(tools: &[ToolDefinition]) -> Vec<Value> {
                     "Gemini: hosted image-generation tools are not supported by the generateContent API; skipping"
                 );
             }
+            ToolKind::HostedComputer => {
+                tracing::warn!(
+                    tool = %t.name,
+                    "Gemini: the hosted computer-use tool is not supported by the generateContent API; skipping"
+                );
+            }
         }
     }
     let mut out = Vec::new();

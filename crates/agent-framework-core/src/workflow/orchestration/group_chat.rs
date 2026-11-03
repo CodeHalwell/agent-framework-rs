@@ -470,6 +470,9 @@ pub struct GroupChatBuilder {
     name: Option<String>,
     output_from: Vec<String>,
     intermediate_output_from: Vec<String>,
+    /// Checkpoint storage for the built workflow (see
+    /// [`WorkflowBuilder::with_checkpointing`]).
+    checkpoint_storage: Option<Arc<dyn crate::workflow::CheckpointStorage>>,
 }
 
 impl Default for GroupChatBuilder {
@@ -483,11 +486,24 @@ impl Default for GroupChatBuilder {
             name: None,
             output_from: Vec::new(),
             intermediate_output_from: Vec::new(),
+            checkpoint_storage: None,
         }
     }
 }
 
 impl GroupChatBuilder {
+    /// Enable checkpointing of the built workflow to `storage` at each
+    /// superstep boundary, as upstream's `checkpoint_storage` /
+    /// `with_checkpointing` (required for a hosted workflow to pause and
+    /// resume).
+    pub fn with_checkpointing(
+        mut self,
+        storage: Arc<dyn crate::workflow::CheckpointStorage>,
+    ) -> Self {
+        self.checkpoint_storage = Some(storage);
+        self
+    }
+
     /// Create an empty builder (round-robin manager by default).
     pub fn new() -> Self {
         Self::default()
@@ -633,6 +649,7 @@ impl GroupChatBuilder {
 
     /// Validate and build the group chat workflow.
     pub fn build(self) -> Result<Workflow> {
+        let checkpoint_storage = self.checkpoint_storage.clone();
         if self.participants.is_empty() {
             return Err(Error::Workflow(
                 "group chat needs at least one participant".into(),
@@ -710,6 +727,9 @@ impl GroupChatBuilder {
         }
         if let Some(name) = self.name {
             builder = builder.name(name);
+        }
+        if let Some(storage) = checkpoint_storage {
+            builder = builder.with_checkpointing(storage);
         }
         builder.build()
     }

@@ -226,6 +226,26 @@ pub struct ChatOptions {
     pub top_p: Option<f32>,
     pub user: Option<String>,
     pub additional_properties: HashMap<String, serde_json::Value>,
+    /// Ask the service to run the request as a background (long-running)
+    /// operation.
+    ///
+    /// Mirrors upstream's `background` option (Python `OpenAIChatOptions`)
+    /// and .NET `ChatOptions.AllowBackgroundResponses`. A client that
+    /// supports it returns as soon as the service has accepted the request,
+    /// with a [`ChatResponse::continuation_token`](crate::types::ChatResponse::continuation_token)
+    /// while the operation is still queued or running; pass that token back
+    /// through [`Self::continuation_token`] to poll (non-streaming) or resume
+    /// the stream. Clients that do not support background operations ignore
+    /// it.
+    pub background: Option<bool>,
+    /// Resume or poll a background operation started earlier.
+    ///
+    /// Mirrors upstream `continuation_token` (Python) / .NET
+    /// `ChatOptions.ContinuationToken`. Treat the token as opaque and pass it
+    /// back to the same client that issued it. A request that carries one
+    /// continues the existing operation instead of starting a new one, so the
+    /// request's messages are not sent.
+    pub continuation_token: Option<crate::types::ContinuationToken>,
     /// The [`AgentSession`](crate::session::AgentSession) of the agent run
     /// this request belongs to, if any.
     ///
@@ -290,6 +310,20 @@ impl ChatOptions {
         self
     }
 
+    /// Builder: ask for a background (long-running) operation. See
+    /// [`Self::background`].
+    pub fn with_background(mut self, background: bool) -> Self {
+        self.background = Some(background);
+        self
+    }
+
+    /// Builder: poll or resume the background operation identified by
+    /// `token`. See [`Self::continuation_token`].
+    pub fn with_continuation_token(mut self, token: crate::types::ContinuationToken) -> Self {
+        self.continuation_token = Some(token);
+        self
+    }
+
     /// Builder: set the structured-output response format.
     pub fn with_response_format(mut self, format: ResponseFormat) -> Self {
         self.response_format = Some(format);
@@ -335,6 +369,8 @@ impl ChatOptions {
         take!(tool_choice);
         take!(top_p);
         take!(user);
+        take!(background);
+        take!(continuation_token);
         take!(session);
         take!(service_call_observer);
 

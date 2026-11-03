@@ -164,6 +164,13 @@ pub struct FunctionInvokingChatClient<C: ChatClient> {
     /// function-middleware pipeline, driven here instead of by a
     /// `use_function_invocation` decorator).
     function_middleware: MiddlewarePipeline<FunctionInvocationContext>,
+    /// The live tool list of each session whose background operation is
+    /// pending, by session id: a continuation resumes the operation with the
+    /// tools it was actually submitted with (including any a tool or
+    /// middleware added or removed mid-run), whose executors cannot be
+    /// parked in the session's JSON state. Process-local; any other request
+    /// on the session drops the entry.
+    parked_tools: Arc<std::sync::Mutex<HashMap<String, Vec<ToolDefinition>>>>,
 }
 
 impl<C: ChatClient> FunctionInvokingChatClient<C> {
@@ -173,6 +180,7 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
             config: FunctionInvocationConfig::default(),
             function_middleware: MiddlewarePipeline::default(),
             observability: crate::observability::ObservabilityConfig::from_env(),
+            parked_tools: Arc::default(),
         }
     }
 
@@ -245,7 +253,9 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
         mut options: ChatOptions,
         session: Option<&crate::session::AgentSession>,
     ) -> Result<ChatResponse> {
-        let Some(session) = session else {
+        // A request that resumes a background operation sends no messages,
+        // so queued ones stay queued for the next request that does.
+        let Some(session) = session.filter(|_| options.continuation_token.is_none()) else {
             return self.inner.get_response(messages, options).await;
         };
         let mut conversation = messages;
@@ -269,7 +279,12 @@ impl<C: ChatClient> FunctionInvokingChatClient<C> {
                         Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
                     )
                 });
-            if follow_up || crate::session::pending_messages(session).is_empty() {
+            // A background operation still running is resumed by the
+            // caller, not by another request here.
+            if follow_up
+                || response.continuation_token.is_some()
+                || crate::session::pending_messages(session).is_empty()
+            {
                 if !earlier.is_empty() {
                     accumulate_usage(&mut usage, response.usage_details.as_ref());
                     earlier.append(&mut response.messages);
@@ -335,6 +350,11 @@ async fn inject_streaming<C: ChatClient + 'static>(
             .collect()
     }
 
+    // A request that resumes a background operation sends no messages, so
+    // queued ones stay queued for the next request that does.
+    if options.continuation_token.is_some() {
+        return inner.get_streaming_response(messages, options).await;
+    }
     // The first call starts here, so its errors surface from this function
     // as they do without injection.
     let mut conversation = messages;
@@ -393,7 +413,10 @@ async fn inject_streaming<C: ChatClient + 'static>(
                             Content::FunctionCall(_) | Content::FunctionApprovalRequest(_)
                         )
                     });
-                if follow_up || crate::session::pending_messages(&st.session).is_empty() {
+                if follow_up
+                    || response.continuation_token.is_some()
+                    || crate::session::pending_messages(&st.session).is_empty()
+                {
                     st.done = true;
                     continue;
                 }
@@ -560,6 +583,12 @@ struct InvocationBudget {
     /// `Instant` cannot.
     started_millis: u64,
     executed: usize,
+    /// Model iterations used so far, against
+    /// [`FunctionInvocationConfig::max_iterations`]. Carried across
+    /// background continuations (not approval replies), so a loop polled
+    /// through continuation after continuation still reaches the
+    /// tools-disabled failsafe.
+    iterations: usize,
     max_calls: Option<usize>,
     max_duration: Option<Duration>,
 }
@@ -578,10 +607,12 @@ impl InvocationBudget {
         config: &FunctionInvocationConfig,
         session: Option<&AgentSession>,
         resuming_approval: bool,
+        continuing: bool,
     ) -> Self {
         let mut budget = Self {
             started_millis: epoch_millis(),
             executed: 0,
+            iterations: 0,
             max_calls: config.max_function_calls,
             // `FunctionInvocationConfig::validate` — which every run calls
             // before reaching here — rejects everything `try_from_secs_f64`
@@ -610,6 +641,11 @@ impl InvocationBudget {
             if let Some(executed) = parked.get("executed").and_then(Value::as_u64) {
                 budget.executed = executed as usize;
             }
+            if continuing {
+                if let Some(iterations) = parked.get("iterations").and_then(Value::as_u64) {
+                    budget.iterations = iterations as usize;
+                }
+            }
         }
         budget
     }
@@ -622,6 +658,7 @@ impl InvocationBudget {
                 serde_json::json!({
                     "started_millis": self.started_millis,
                     "executed": self.executed,
+                    "iterations": self.iterations,
                 }),
             );
         }
@@ -754,6 +791,7 @@ async fn execute_tool_call(
                     call_id: call.call_id.clone(),
                     result: None,
                     exception: Some(format!("tool '{}' not found", call.name)),
+                    additional_properties: Default::default(),
                 },
             })
         }
@@ -775,6 +813,7 @@ async fn execute_tool_call(
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
+                            additional_properties: Default::default(),
                         },
                     });
                 }
@@ -798,7 +837,9 @@ async fn execute_tool_call(
                     #[cfg(feature = "otel-metrics")]
                     let started = std::time::Instant::now();
                     let outcome = async {
-                        let result = exec.invoke_in_context(ctx.arguments.clone(), &ctx).await;
+                        let result = exec
+                            .invoke_with_properties(ctx.arguments.clone(), &ctx)
+                            .await;
                         if let Err(e) = &result {
                             crate::observability::record_error(
                                 &tracing::Span::current(),
@@ -820,10 +861,12 @@ async fn execute_tool_call(
                             .map(crate::observability::error_type)
                             .as_deref(),
                     );
-                    if let Ok(value) = &outcome {
+                    if let Ok((value, _)) = &outcome {
                         crate::observability::record_tool_result(&span, value, &obs_config);
                     }
-                    ctx.result = Some(outcome?);
+                    let (value, properties) = outcome?;
+                    ctx.result = Some(value);
+                    ctx.result_properties = properties;
                     Ok(ctx)
                 }) as crate::tools::BoxFuture<Result<FunctionInvocationContext>>
             });
@@ -845,6 +888,7 @@ async fn execute_tool_call(
                         call_id: call.call_id.clone(),
                         result: Some(ctx.result.unwrap_or(Value::Null)),
                         exception: None,
+                        additional_properties: ctx.result_properties,
                     },
                 }),
                 // The one error the loop does not absorb: middleware that
@@ -864,6 +908,7 @@ async fn execute_tool_call(
                             call_id: call.call_id.clone(),
                             result: None,
                             exception: Some(msg),
+                            additional_properties: Default::default(),
                         },
                     })
                 }
@@ -1221,6 +1266,7 @@ fn replace_approval_contents_with_results(
                             call_id: call_id.clone(),
                             result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                             exception: None,
+                            additional_properties: Default::default(),
                         });
                         answered = true;
                     }
@@ -1241,6 +1287,26 @@ fn replace_approval_contents_with_results(
         if set_role_tool {
             msg.role = Role::tool();
         }
+    }
+}
+
+impl<C: ChatClient> FunctionInvokingChatClient<C> {
+    /// Park `tools` for `session`'s pending background operation.
+    fn park_tools(&self, session: Option<&AgentSession>, tools: Vec<ToolDefinition>) {
+        if let Some(session) = session {
+            self.parked_tools
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(session.session_id().to_string(), tools);
+        }
+    }
+
+    /// Take (and drop) the tools parked for `session`.
+    fn take_parked_tools(&self, session: &AgentSession) -> Option<Vec<ToolDefinition>> {
+        self.parked_tools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session.session_id())
     }
 }
 
@@ -1267,6 +1333,16 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // invoked tools via `FunctionInvocationContext::session`.
             let session = options.session.take();
             let observer = options.service_call_observer.take();
+            // A continuation resumes with the tools its operation was
+            // submitted with; any other request drops a stale entry.
+            if let Some(s) = session.as_ref() {
+                let parked = self.take_parked_tools(s);
+                if options.continuation_token.is_some() {
+                    if let Some(tools) = parked {
+                        options.tools = tools;
+                    }
+                }
+            }
 
             // Default tool choice to auto when tools are present and unset.
             if !options.tools.is_empty() && options.tool_choice.is_none() {
@@ -1304,12 +1380,19 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             // carrying approval responses is resuming the paused run whose
             // budget is parked on this session.
             let deferred = ready_deferred_siblings(session.as_ref(), &conversation);
-            let resuming_approval =
-                !collect_approval_responses(&conversation).is_empty() || deferred.is_some();
+            // A continuation token resumes a background operation this loop
+            // handed back while it was still running, and with it the budget
+            // parked at that point: polling through continuations must not
+            // start each leg with a full budget.
+            let continuing = options.continuation_token.is_some();
+            let resuming_approval = !collect_approval_responses(&conversation).is_empty()
+                || deferred.is_some()
+                || continuing;
             let mut budget = InvocationBudget::resume_or_start(
                 &self.config,
                 session.as_ref(),
                 resuming_approval,
+                continuing,
             );
             // Usage summed over every model call this loop makes, applied to
             // whichever response is returned so the caller sees the cost of the
@@ -1388,7 +1471,19 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 }
             }
 
-            for _ in 0..self.config.max_iterations {
+            loop {
+                // A model operation is charged one iteration when it is
+                // submitted. Retrieving a background operation with its
+                // continuation token is not a new one, so polls are free:
+                // otherwise a slow provider could spend the limit on polls
+                // alone, and the failsafe could not disable tools on an
+                // operation that was already submitted with them.
+                if options.continuation_token.is_none() {
+                    if budget.iterations >= self.config.max_iterations {
+                        break;
+                    }
+                    budget.iterations += 1;
+                }
                 options.tools = live_tools.snapshot();
                 let tools = executable_tools(&options);
                 // Checked before the approval replay below, not only after
@@ -1428,6 +1523,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                                 call_id: resp.function_call.call_id.clone(),
                                 result: Some(Value::String(REJECTION_MESSAGE.to_string())),
                                 exception: None,
+                                additional_properties: Default::default(),
                             }));
                             continue;
                         }
@@ -1531,6 +1627,27 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     // a single call.
                     .inspect_err(|_| InvocationBudget::clear(session.as_ref()))?;
                 accumulate_usage(&mut aggregated_usage, response.usage_details.as_ref());
+
+                // A background operation that is still running has nothing
+                // for the loop to act on yet: hand it back, token and all, so
+                // the caller can poll it.
+                if response.continuation_token.is_some() {
+                    // Parked like an approval pause, so the continuation
+                    // resumes this run's call count and clock.
+                    budget.park(session.as_ref());
+                    self.park_tools(session.as_ref(), live_tools.snapshot());
+                    let mut pending = response;
+                    let mut msgs = std::mem::take(&mut carried);
+                    msgs.append(&mut pending.messages);
+                    pending.messages = msgs;
+                    pending.usage_details = aggregated_usage;
+                    return Ok(pending);
+                }
+                // Once the operation has finished, the next request of this
+                // loop submits tool results; it must not retrieve the same
+                // finished operation again (upstream #5394). `background`
+                // stays, so later requests also run in the background.
+                options.continuation_token = None;
 
                 // A call whose result is already present in the same response
                 // was executed by the provider (e.g. Anthropic server-side
@@ -1862,7 +1979,17 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     result_contents.push(Content::FunctionResult(content));
                 }
 
-                if has_declaration_only {
+                // A pending computer call is answered by the application, not
+                // by a tool here (upstream `_tools.py`, COMPUTER_USE): run the
+                // batch's local calls, then return so the caller can act.
+                let has_pending_computer_call = response
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.contents.iter())
+                    .any(
+                        |c| matches!(c, Content::ComputerToolCall(call) if call.user_input_request),
+                    );
+                if has_declaration_only || has_pending_computer_call {
                     InvocationBudget::clear(session.as_ref());
                     let mut resp = response;
                     // `carried` already holds this response's messages
@@ -1916,6 +2043,13 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
             let mut final_resp = self
                 .inner_get_response(conversation, options, session.as_ref(), observer.as_ref())
                 .await?;
+            // A background operation still running after the tools-disabled
+            // call is handed back for polling; its continuation must resume
+            // this run's (spent) budget rather than start a fresh one.
+            if final_resp.continuation_token.is_some() {
+                budget.park(session.as_ref());
+                self.park_tools(session.as_ref(), live_tools.snapshot());
+            }
             accumulate_usage(&mut aggregated_usage, final_resp.usage_details.as_ref());
             let mut msgs = std::mem::take(&mut carried);
             msgs.append(&mut final_resp.messages);
@@ -1953,6 +2087,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         // `message_id` so that consumers re-aggregating via
         // `ChatResponse::from_updates` keep the messages separate rather than
         // merging the tool-call and final assistant messages by role.
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let response = self.get_response(messages, options).await?;
         // Response-level metadata must survive the replay so re-aggregation
         // (and the agent's thread adoption) sees it: ids on every update,
@@ -1964,6 +2099,17 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         let response_id = response.response_id.clone();
         let finish_reason = response.finish_reason.clone();
         let usage_details = response.usage_details.clone();
+        let continuation_token = response.continuation_token.clone();
+        // A background request's final update carries the operation state,
+        // so aggregating a pending stream with its completed continuation
+        // ends the operation (clears the token) instead of keeping it.
+        let operation_state = background.then(|| {
+            if continuation_token.is_some() {
+                crate::types::OperationState::InProgress
+            } else {
+                crate::types::OperationState::Terminal
+            }
+        });
         let last = response.messages.len().saturating_sub(1);
         // Keep the provider message ids only when they're all present and
         // distinct; otherwise use positional ids for every message. A service
@@ -2004,13 +2150,22 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     conversation_id: conversation_id.clone(),
                     response_id: response_id.clone(),
                     finish_reason: is_last.then(|| finish_reason.clone()).flatten(),
+                    // The resume handle belongs to the operation, so it rides
+                    // the final update like the finish reason.
+                    continuation_token: is_last.then(|| continuation_token.clone()).flatten(),
+                    operation_state: is_last.then_some(operation_state).flatten(),
                     ..Default::default()
                 })
             })
             .collect();
         // A messageless response (unusual, but possible) still carries its
         // terminal metadata in one trailing update.
-        if updates.is_empty() && (usage_details.is_some() || finish_reason.is_some()) {
+        if updates.is_empty()
+            && (usage_details.is_some()
+                || finish_reason.is_some()
+                || continuation_token.is_some()
+                || operation_state.is_some())
+        {
             let contents = usage_details
                 .map(|u| vec![Content::Usage(UsageContent { details: u })])
                 .unwrap_or_default();
@@ -2020,6 +2175,8 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 conversation_id,
                 response_id,
                 finish_reason,
+                continuation_token,
+                operation_state,
                 ..Default::default()
             }));
         }
@@ -2474,6 +2631,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("first".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
         approved.insert(
@@ -2482,6 +2640,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("second".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
 
@@ -2522,6 +2681,7 @@ mod approval_replacement_tests {
                 call_id: "c1".into(),
                 result: Some(Value::String("legacy".into())),
                 exception: None,
+                additional_properties: Default::default(),
             },
         );
         let mut messages = vec![Message::with_contents(
@@ -2590,6 +2750,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
             Message::with_contents(Role::assistant(), vec![Content::FunctionCall(call("c1"))]),
@@ -2703,6 +2864,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
         ];
@@ -2735,6 +2897,7 @@ mod approval_replacement_tests {
                     call_id: "c1".into(),
                     result: Some(Value::String("sunny".into())),
                     exception: None,
+                    additional_properties: Default::default(),
                 })],
             ),
             approval_request("c1"),

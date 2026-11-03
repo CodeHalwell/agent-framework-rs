@@ -21,6 +21,8 @@ mistral = ["dep:agent-framework-mistral"]
 foundry-local = ["dep:agent-framework-foundry-local"]
 bedrock = ["dep:agent-framework-bedrock"]
 github-copilot = ["dep:agent-framework-github-copilot"]
+# The Claude Code CLI as an agent (Claude Agent SDK protocol).
+claude = ["dep:agent-framework-claude"]
 azure = ["dep:agent-framework-azure"]
 # Azure Content Understanding attachment analysis (`ContentUnderstandingContextProvider`).
 azure-content-understanding = ["azure", "agent-framework-azure/content-understanding"]
@@ -32,6 +34,13 @@ agui-client = ["hosting", "agent-framework-hosting/agui-client"]
 redis = ["dep:agent-framework-redis"]
 mem0 = ["dep:agent-framework-mem0"]
 foundry = ["dep:agent-framework-foundry"]
+# Host agents and workflows as Azure AI Foundry hosted agents.
+foundry-hosting = ["dep:agent-framework-foundry-hosting"]
+# OpenTelemetry parenting and exporter setup for Foundry hosted agents.
+foundry-hosting-otel = ["foundry-hosting", "agent-framework-foundry-hosting/otel"]
+# Agent Skills served by a Foundry toolbox / any MCP server (SEP-2640).
+foundry-hosting-skills = ["foundry-hosting", "agent-framework-foundry-hosting/skills"]
+mcp-skills = ["mcp", "agent-framework-mcp/skills"]
 azure-ai-search = ["dep:agent-framework-azure-ai-search"]
 cosmos = ["dep:agent-framework-cosmos"]
 # The Qdrant vector store. Experimental upstream (VECTOR_STORES), so it
@@ -39,6 +48,12 @@ cosmos = ["dep:agent-framework-cosmos"]
 qdrant = ["dep:agent-framework-qdrant", "experimental-vector-stores"]
 # The PostgreSQL + pgvector vector store (experimental, like `qdrant`).
 postgres = ["dep:agent-framework-postgres", "experimental-vector-stores"]
+# The SQL Server vector store (experimental).
+sql-server = ["dep:agent-framework-sql-server", "experimental-vector-stores"]
+# The MongoDB Atlas vector store (experimental).
+mongodb = ["dep:agent-framework-mongodb", "experimental-vector-stores"]
+# The Azure DocumentDB (MongoDB vCore) vector store (experimental).
+azure-documentdb = ["dep:agent-framework-azure-documentdb", "experimental-vector-stores"]
 copilotstudio = ["dep:agent-framework-copilotstudio"]
 purview = ["dep:agent-framework-purview"]
 tools = ["dep:agent-framework-tools"]
@@ -63,10 +78,21 @@ experimental-vector-stores = [
     "agent-framework-redis?/experimental-vector-stores",
     "agent-framework-qdrant?/experimental-vector-stores",
     "agent-framework-postgres?/experimental-vector-stores",
+    "agent-framework-azure-documentdb?/experimental-vector-stores",
+    "agent-framework-mongodb?/experimental-vector-stores",
+    "agent-framework-sql-server?/experimental-vector-stores",
 ]
 experimental-file-history = ["agent-framework-core/experimental-file-history"]
 experimental-progressive-tools = ["agent-framework-core/experimental-progressive-tools"]
 experimental-agent-hooks = ["agent-framework-core/experimental-agent-hooks"]
+# COMPUTER_USE: computer-use content and the OpenAI / Foundry mappings.
+experimental-computer-use = [
+    "agent-framework-core/experimental-computer-use",
+    "agent-framework-openai?/experimental-computer-use",
+    "agent-framework-foundry-hosting?/experimental-computer-use",
+]
+# FIDES: `agent_framework_core::security` (information-flow control).
+experimental-fides = ["agent-framework-core/experimental-fides", "agent-framework-mcp?/fides"]
 # File-based skills: SKILL.md discovery (`SkillsProvider::from_paths`).
 file-skills = ["agent-framework-core/file-skills"]
 experimental-harness = ["agent-framework-core/experimental-harness"]
@@ -77,6 +103,7 @@ experimental-evals = [
 experimental-session-store = [
     "agent-framework-core/experimental-session-store",
     "agent-framework-azure?/session-store",
+    "agent-framework-foundry-hosting?/session-store",
 ]
 experimental-declarative-agents = [
     "dep:agent-framework-declarative",
@@ -87,12 +114,17 @@ experimental = [
     "experimental-file-history",
     "experimental-progressive-tools",
     "experimental-agent-hooks",
+    "experimental-fides",
+    "experimental-computer-use",
     "experimental-harness",
     "experimental-evals",
     "experimental-session-store",
     "experimental-declarative-agents",
     "qdrant",
     "postgres",
+    "sql-server",
+    "mongodb",
+    "azure-documentdb",
 ]
 full = [
     "file-skills",
@@ -104,6 +136,7 @@ full = [
     "foundry-local",
     "bedrock",
     "github-copilot",
+    "claude",
     "azure",
     "mcp",
     "a2a",
@@ -112,6 +145,7 @@ full = [
     "redis",
     "mem0",
     "foundry",
+    "foundry-hosting",
     "azure-ai-search",
     "cosmos",
     "copilotstudio",
@@ -129,6 +163,7 @@ agent-framework-mistral = { workspace = true, optional = true }
 agent-framework-foundry-local = { workspace = true, optional = true }
 agent-framework-bedrock = { workspace = true, optional = true }
 agent-framework-github-copilot = { workspace = true, optional = true }
+agent-framework-claude = { workspace = true, optional = true }
 agent-framework-azure = { workspace = true, optional = true }
 agent-framework-mcp = { workspace = true, optional = true }
 agent-framework-a2a = { workspace = true, optional = true }
@@ -137,10 +172,14 @@ agent-framework-hosting = { workspace = true, optional = true }
 agent-framework-redis = { workspace = true, optional = true }
 agent-framework-mem0 = { workspace = true, optional = true }
 agent-framework-foundry = { workspace = true, optional = true }
+agent-framework-foundry-hosting = { workspace = true, optional = true }
 agent-framework-azure-ai-search = { workspace = true, optional = true }
 agent-framework-cosmos = { workspace = true, optional = true }
 agent-framework-qdrant = { workspace = true, optional = true }
 agent-framework-postgres = { workspace = true, optional = true }
+agent-framework-azure-documentdb = { workspace = true, optional = true }
+agent-framework-mongodb = { workspace = true, optional = true }
+agent-framework-sql-server = { workspace = true, optional = true }
 agent-framework-copilotstudio = { workspace = true, optional = true }
 agent-framework-purview = { workspace = true, optional = true }
 agent-framework-tools = { workspace = true, optional = true }

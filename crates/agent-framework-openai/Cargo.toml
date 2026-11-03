@@ -27,5 +27,10 @@ bytes = { workspace = true }
 tokio-stream = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# COMPUTER_USE (experimental upstream): map `computer_call` /
+# `computer_call_output` items to and from computer-use content.
+experimental-computer-use = ["agent-framework-core/experimental-computer-use"]
+
 [dev-dependencies]
 tokio = { workspace = true }

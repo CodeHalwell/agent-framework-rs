@@ -12,6 +12,8 @@ use futures::StreamExt;
 use serde_json::{Map, Value};
 
 use super::codecs;
+use super::composition::{ApprovalRedactor, ApprovalResolver, Composition};
+use super::identity::IdentityProvider;
 use super::protocol::{
     EnforcementMode, InterceptionBlocked, InterceptionContextBuilder, InterceptionEmitter,
     InterceptionPoint, Interceptor, RecordSink, ShutdownReason, DEFAULT_TIMEOUT,
@@ -38,10 +40,26 @@ tokio::task_local! {
 /// Mirrors .NET's `AgentHooksOptions`. At least one interceptor is required.
 #[derive(Clone, Default)]
 pub struct AgentHooksOptions {
-    interceptors: Vec<(Option<String>, Arc<dyn Interceptor>)>,
+    interceptors: Vec<OptionBinding>,
     mode: EnforcementMode,
     timeout: Option<Option<Duration>>,
     record_sink: Option<RecordSink>,
+    composition: Composition,
+    identity: IdentityProvider,
+    resolver: Option<Arc<dyn ApprovalResolver>>,
+    resolver_timeout: Option<Option<Duration>>,
+    redactor: Option<ApprovalRedactor>,
+    declaration: Option<String>,
+}
+
+/// One interceptor in [`AgentHooksOptions`]: its name and, for a
+/// declaration binding, the points it runs at and its own timeout.
+#[derive(Clone)]
+struct OptionBinding {
+    name: Option<String>,
+    interceptor: Arc<dyn Interceptor>,
+    at: Option<Vec<InterceptionPoint>>,
+    timeout: Option<Option<Duration>>,
 }
 
 impl std::fmt::Debug for AgentHooksOptions {
@@ -51,6 +69,10 @@ impl std::fmt::Debug for AgentHooksOptions {
             .field("mode", &self.mode)
             .field("timeout", &self.timeout)
             .field("record_sink", &self.record_sink.is_some())
+            .field("composition", &self.composition)
+            .field("identity", &self.identity)
+            .field("resolver", &self.resolver.is_some())
+            .field("redactor", &self.redactor.is_some())
             .finish()
     }
 }
@@ -63,7 +85,12 @@ impl AgentHooksOptions {
 
     /// Register an interceptor. Interceptors run in registration order.
     pub fn interceptor(mut self, interceptor: Arc<dyn Interceptor>) -> Self {
-        self.interceptors.push((None, interceptor));
+        self.interceptors.push(OptionBinding {
+            name: None,
+            interceptor,
+            at: None,
+            timeout: None,
+        });
         self
     }
 
@@ -74,7 +101,12 @@ impl AgentHooksOptions {
         name: impl Into<String>,
         interceptor: Arc<dyn Interceptor>,
     ) -> Self {
-        self.interceptors.push((Some(name.into()), interceptor));
+        self.interceptors.push(OptionBinding {
+            name: Some(name.into()),
+            interceptor,
+            at: None,
+            timeout: None,
+        });
         self
     }
 
@@ -93,6 +125,64 @@ impl AgentHooksOptions {
     /// A callback receiving every interception record.
     pub fn record_sink(mut self, sink: RecordSink) -> Self {
         self.record_sink = Some(sink);
+        self
+    }
+
+    /// The composition profile (default `sequential/first_deny`,
+    /// `on_approval: stop`).
+    pub fn composition(mut self, composition: Composition) -> Self {
+        self.composition = composition;
+        self
+    }
+
+    /// The identity provider (default `jcs-sha256`).
+    pub fn identity_provider(mut self, provider: IdentityProvider) -> Self {
+        self.identity = provider;
+        self
+    }
+
+    /// The approval resolver consulted for liftable denies. Without one, a
+    /// liftable deny stands.
+    pub fn approval_resolver(mut self, resolver: Arc<dyn ApprovalResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Register an interceptor that runs only at `at`, with its own timeout
+    /// (`None` unbounded): a declaration binding.
+    pub fn bound_interceptor(
+        mut self,
+        name: impl Into<String>,
+        interceptor: Arc<dyn Interceptor>,
+        at: impl IntoIterator<Item = InterceptionPoint>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        self.interceptors.push(OptionBinding {
+            name: Some(name.into()),
+            interceptor,
+            at: Some(at.into_iter().collect()),
+            timeout: Some(timeout),
+        });
+        self
+    }
+
+    /// The approval resolver's own timeout (`None` disables it); unset, it
+    /// is the interceptor timeout.
+    pub fn approval_resolver_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.resolver_timeout = Some(timeout);
+        self
+    }
+
+    /// Record the host declaration contract version these options were
+    /// loaded from on every interception record.
+    pub fn declaration_version(mut self, version: impl Into<String>) -> Self {
+        self.declaration = Some(version.into());
+        self
+    }
+
+    /// Minimize the context handed to the approval resolver.
+    pub fn approval_redactor(mut self, redactor: ApprovalRedactor) -> Self {
+        self.redactor = Some(redactor);
         self
     }
 }
@@ -126,6 +216,32 @@ struct RunState {
     /// puts in the invocation's metadata; the inner seam records there
     /// whether (and with which arguments) the call was dispatched.
     tool_calls: Mutex<HashMap<String, ToolTrack>>,
+    /// Set once `agent_shutdown` has been (or must no longer be) emitted.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Closes a per-run session whose run future is dropped before it finishes
+/// (a cancelled run): `agent_shutdown` with reason `cancelled` is emitted on
+/// a spawned task, since there is no async drop. Best effort: without a
+/// Tokio runtime at drop time the trail stays open.
+struct CancelGuard(Arc<RunState>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        let state = &self.0;
+        if state.session_scoped || state.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let state = state.clone();
+            handle.spawn(async move {
+                state
+                    .emitter
+                    .emit_unchecked(state.builder.agent_shutdown(ShutdownReason::Cancelled))
+                    .await;
+            });
+        }
+    }
 }
 
 /// What the inner tool seam observed for one invocation.
@@ -354,12 +470,34 @@ impl AgentHooksAgent {
                 let options = &config.options;
                 let mut emitter = InterceptionEmitter::new()
                     .with_mode(options.mode)
-                    .with_timeout(options.timeout.unwrap_or(Some(DEFAULT_TIMEOUT)));
+                    .with_timeout(options.timeout.unwrap_or(Some(DEFAULT_TIMEOUT)))
+                    .with_composition(options.composition)
+                    .with_identity_provider(options.identity.clone());
+                if let Some(resolver) = &options.resolver {
+                    emitter = emitter.with_approval_resolver(resolver.clone());
+                }
+                if let Some(redactor) = &options.redactor {
+                    emitter = emitter.with_approval_redactor(redactor.clone());
+                }
                 if let Some(sink) = &options.record_sink {
                     emitter = emitter.with_record_sink(sink.clone());
                 }
-                for (name, interceptor) in &options.interceptors {
-                    emitter = emitter.register(interceptor.clone(), name.clone());
+                if let Some(timeout) = options.resolver_timeout {
+                    emitter = emitter.with_approval_resolver_timeout(timeout);
+                }
+                if let Some(version) = &options.declaration {
+                    emitter = emitter.with_declaration(version.clone());
+                }
+                for b in &options.interceptors {
+                    emitter = match &b.at {
+                        None => emitter.register(b.interceptor.clone(), b.name.clone()),
+                        Some(at) => emitter.register_at(
+                            b.interceptor.clone(),
+                            b.name.clone(),
+                            at.iter().copied(),
+                            b.timeout,
+                        ),
+                    };
                 }
                 let mut builder = InterceptionContextBuilder::new(
                     self.inner.id(),
@@ -379,6 +517,7 @@ impl AgentHooksAgent {
             config: config.clone(),
             halted: Mutex::new(None),
             tool_calls: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -434,7 +573,7 @@ impl AgentHooksAgent {
             Some(halt) => Err(halt),
             None => result,
         };
-        if !state.session_scoped {
+        if !state.session_scoped && !state.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let reason = if result.is_ok() {
                 ShutdownReason::Completed
             } else {
@@ -468,6 +607,7 @@ impl SupportsAgentRun for AgentHooksAgent {
         options: AgentRunOptions,
     ) -> Result<AgentResponse> {
         let state = self.new_run_state();
+        let _cancel = CancelGuard(state.clone());
         RUN_STATE
             .scope(state.clone(), async {
                 let result = async {
@@ -490,6 +630,7 @@ impl SupportsAgentRun for AgentHooksAgent {
     ) -> Result<AgentRunStream> {
         let options = options.unwrap_or_default();
         let state = self.new_run_state();
+        let _cancel = CancelGuard(state.clone());
         RUN_STATE
             .scope(state.clone(), async {
                 let result = async {
@@ -1016,6 +1157,7 @@ mod tests {
             config,
             halted: Mutex::new(None),
             tool_calls: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

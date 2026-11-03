@@ -43,23 +43,48 @@ on one of them still needs checking against the Rust form.
 Open work, recorded so it is not mistaken for a decision. The order comes
 from the roadmap, not from this file.
 
-- **Agent hooks, remainder** (`experimental-agent-hooks` ships the
-  enforcement bundle): the approval seam (liftable denies are enforced as
-  plain denies), the `sequential/run_all` and parallel composition profiles,
-  the `jcs-sha256` and custom identity providers (records are
-  identity-unbound), an `agent_shutdown` on cancellation, and §5.4
-  result-label flow (labels reach the combined verdict and the record but
-  are not persisted with the produced data or resurfaced as
-  `source_labels`; upstream's framework layer does not do this either).
-- **Security (FIDES)**: marked experimental upstream; when ported it goes
-  behind an `experimental-*` feature (see `docs/feature-stages.md`).
+- **Agent hooks, remainder** (`experimental-agent-hooks`): §5.4 result
+  labels are unioned from permitting verdicts onto the combined verdict and
+  its record, as the agent-hooks SDK (0.1.0-beta.3) does; neither upstream
+  nor the SDK persists them with produced data or resurfaces them as
+  `extensions.*.source_labels`, so there is nothing further to port.
+  FIDES's `source_labels` is a separate, ported feature (`security`).
+- **Evaluation, remainder**:
   Evaluation is ported (`experimental-evals`, with `FoundryEvals` behind
   `agent-framework-foundry`'s `evals` feature); upstream's
   `evaluate_foundry_target` is not.
-- **Foundry hosting** (`foundry_hosting`, `Microsoft.Agents.AI.Foundry.Hosting`).
-- **Durable Task hosting** (`durabletask`), blocked on the sidecar protocol.
-- **Claude Agent SDK agent** (`claude`), a subprocess shim with no Rust SDK
-  to build on.
+- **Foundry hosting, remainder** (`agent-framework-foundry-hosting`): the
+  agentserver's resilient task runtime, which runs on the Foundry Tasks
+  service and can resume a workflow from its checkpoint (interrupted
+  background responses are failed at startup instead, and provider
+  background polling does not resume after a restart); pending
+  container-file citations are not carried across a restart either, and a
+  process crash between a turn's session save and its response record
+  leaves a durable session store holding the crashed turn while the
+  startup sweep fails its response. Span
+  enrichment stamps agent identity at span start (the Rust SDK has no
+  on-end mutation). A toolbox skill refresh rebuilds the `SkillsProvider`,
+  so previously loaded skills are re-injected only once loaded again. Tested in-process only.
+- **Background responses, divergences**: the agent does not wrap the
+  provider token with the saved input and earlier updates (.NET's
+  `ChatClientAgentContinuationToken`), so after an interrupted stream the
+  resumed run records only the reply received after the cut. Requiring a
+  session for background runs and rejecting a token sent with new messages
+  follow .NET and Go (Python enforces neither). OpenAI tokens add
+  `sequence_number`/`starting_after` and `function_calls` (Python's carries
+  only `response_id` and replays the whole stream); no client cancel call
+  exists upstream, so none is offered.
+- **Computer use, remainder** (`experimental-computer-use`): Anthropic and
+  Gemini skip the computer tool with a warning; upstream has no computer-use
+  support for either provider. The workflow has no request-cancellation API,
+  so a pending computer call is cancelled from the reply instead
+  (`{"call_id", "cancelled": true}` or `{"cancelled": true}`).
+- **Durable Task hosting** (`agent-framework-durabletask`, now published
+  from its own repository). Blocked: it sits on the `durabletask` SDK, a
+  deterministic-replay orchestration engine with durable entities and a
+  gRPC sidecar protocol (about 18,000 lines on top of the package's own
+  20,000). There is no Rust Durable Task SDK to build on, and no sidecar or
+  scheduler emulator to verify a port against.
 - **Azure**: the Cosmos DB memory provider (blocked on the Agent Memory
   Toolkit). The Application Insights exporter is ported
   (`agent-framework-core`'s `azure-monitor` feature); the
@@ -70,16 +95,18 @@ from the roadmap, not from this file.
 - **Depth gaps the parity ledger surfaced** (see
   [`docs/parity/STATUS.md`](docs/parity/STATUS.md) for every declaration):
   skills beyond inline and file-based skills with scripts (class-based and
-  MCP skills, source pipelines); compaction's in-place annotation model (groups here are computed per pass rather than stamped on messages, and summaries are not linked back to the messages they replace);
-  workflow graph reflection of request ports and typed protocol descriptors; context
+  MCP skills, source pipelines); compaction's in-place annotation model (groups here are computed per pass rather than stamped on messages, and summaries are not linked back to the messages they replace); context
   providers seeing the agent object (they see its
   identity, `SessionContext::agent`, and the session in `before_run`, and
   the session after the run, but not the agent itself).
-- **Vector stores**: MongoDB, DuckDB, SQL Server and Azure DocumentDB
-  (blocked on the MongoDB wire protocol). The Redis vector store is ported
-  (`agent-framework-redis`'s `experimental-vector-stores` feature); its
-  live tests run only against a Redis with Search and JSON
-  (`AF_REDIS_SEARCH_TEST_URL`), which this repository's CI does not start.
+- **Live verification of the database vector stores**: DuckDB is tested
+  in-process; the SQL Server (`agent-framework-sql-server`), MongoDB Atlas
+  (`agent-framework-mongodb`) and Azure DocumentDB
+  (`agent-framework-azure-documentdb`) stores are tested offline (statement
+  and pipeline building) with live tests gated on `AF_SQL_SERVER_TEST_URL`,
+  `AF_MONGODB_TEST_URL` and `AF_DOCUMENTDB_TEST_URL`, which CI does not
+  start. The Redis vector store's live tests likewise need a Redis with
+  Search and JSON (`AF_REDIS_SEARCH_TEST_URL`).
 - **Adopting `azure_data_cosmos`** (1.0.0 stable since 2026-10) behind an
   optional feature, as `entra-sdk` does for credentials. Roughly 1,540 of
   `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
@@ -89,10 +116,13 @@ from the roadmap, not from this file.
   `VectorDistance` queries `vector_store.rs` issues. See
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
-- **MCP 2.x protocol negotiation** (upstream #9236): the `2026-07-28`
-  protocol era upstream's `auto` mode negotiates. This client requests
-  `2025-06-18` and accepts servers that answer with `2025-11-25` or older;
-  the new era's wire changes are not ported.
+- **MCP 2.x, remainder**: the `2026-07-28` era is negotiated
+  (`McpProtocolMode`, `server/discover`, per-request `_meta`, the
+  `MCP-Protocol-Version` header). Not ported from that era:
+  `subscriptions/listen` streams (list-changed notifications still arrive
+  only the legacy way), the `input_required` result type (refused with an
+  error), result caching hints (`ttlMs`, `cacheScope`) and the Tasks
+  extension.
 - **Workflow pause/restore bookkeeping** (upstream #9291, #9289):
   preserving concurrent steps across a pause, and restored sub-workflow
   sibling requests. Both land on upstream's `WorkflowExecutor`; this

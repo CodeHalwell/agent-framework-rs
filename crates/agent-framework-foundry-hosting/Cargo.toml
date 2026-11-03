@@ -1,0 +1,76 @@
+[package]
+name = "agent-framework-foundry-hosting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+description = "Host agents and workflows as Azure AI Foundry hosted agents (Responses and Invocations protocols, Foundry state storage)"
+
+[dependencies]
+agent-framework-core = { workspace = true }
+agent-framework-hosting = { workspace = true }
+agent-framework-azure = { workspace = true }
+agent-framework-mcp = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+axum = "0.8"
+sha2 = "0.10"
+regex = { workspace = true, optional = true }
+# The `otel` feature: caller trace-context propagation and exporter setup.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["trace"] }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[features]
+# `InvocationsHostServer` and the agent-session stores, over core's
+# `AgentSessionStore` (experimental upstream: SESSION_STORE).
+session-store = ["agent-framework-core/experimental-session-store"]
+# `FoundryToolbox::skills_provider`: Agent Skills a toolbox serves over MCP.
+skills = ["agent-framework-mcp/skills"]
+# COMPUTER_USE (experimental upstream): computer calls and results as
+# `computer_call` / `computer_call_output` items, in and out.
+experimental-computer-use = ["agent-framework-core/experimental-computer-use"]
+# `invocations_ws`: the agentserver's `/invocations_ws` WebSocket route.
+websocket = ["axum/ws"]
+# `voice`: upstream's experimental Voice Live Bridge typed event relay
+# (`VoiceAgentServerHost`) on `/voice_conversation_engine` and
+# `/invocations_ws`. Implies `websocket`.
+voice = ["websocket", "dep:regex"]
+# OpenTelemetry: request spans join the caller's W3C trace (`traceparent`),
+# and `configure_observability` exports to Application Insights or OTLP from
+# the host configuration (upstream agentserver tracing).
+otel = [
+    "agent-framework-core/azure-monitor",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["trace", "testing"] }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

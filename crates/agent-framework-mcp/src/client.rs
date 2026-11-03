@@ -10,7 +10,7 @@ use agent_framework_core::error::{Error, Result};
 use crate::protocol::{
     CallToolResult, GetPromptResult, Implementation, InitializeResult, ListPromptsResult,
     ListToolsResult, PromptDescriptor, ToolDescriptor, COMPATIBLE_PROTOCOL_VERSIONS,
-    PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use crate::sampling::{dispatch_server_request, Root, SamplingHandler, ServerRequestHandlers};
 use crate::transport::McpTransport;
@@ -43,6 +43,11 @@ const MAX_LIST_PAGES: usize = 10_000;
 pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     initialize_result: RwLock<Option<InitializeResult>>,
+    /// How to agree on a protocol era; see [`McpProtocolMode`].
+    mode: StdRwLock<McpProtocolMode>,
+    /// `Some` once a modern-era connection is established: the client
+    /// identity sent in every request's `_meta`.
+    modern: RwLock<Option<Implementation>>,
     handlers: Arc<StdRwLock<ServerRequestHandlers>>,
     /// Cache for [`Self::list_tools_cached`], invalidated on a
     /// `notifications/tools/list_changed` notification from the server.
@@ -119,6 +124,8 @@ impl McpClient {
         Self {
             transport,
             initialize_result: RwLock::new(None),
+            mode: StdRwLock::new(McpProtocolMode::default()),
+            modern: RwLock::new(None),
             handlers,
             tools_cache,
             prompts_cache,
@@ -168,14 +175,88 @@ impl McpClient {
         Value::Object(capabilities)
     }
 
-    /// Perform the MCP `initialize` request followed by the
-    /// `notifications/initialized` notification.
-    ///
-    /// Idempotent: once a handshake has succeeded, later calls return the
-    /// cached result without re-sending anything. The client always *sends*
-    /// [`PROTOCOL_VERSION`], but accepts whatever `protocolVersion` the
-    /// server responds with — including an older one — logging a warning if
-    /// it isn't one this client specifically recognizes.
+    /// Choose how the protocol era is agreed (default
+    /// [`McpProtocolMode::Auto`]). Set before [`Self::initialize`].
+    pub fn protocol_mode(self, mode: McpProtocolMode) -> Self {
+        *self.mode.write().unwrap() = mode;
+        self
+    }
+
+    /// Whether the connection uses the modern, handshake-free era.
+    pub async fn is_modern(&self) -> bool {
+        self.modern.read().await.is_some()
+    }
+
+    /// The `_meta` every modern-era request carries.
+    fn modern_meta(&self, client: &Implementation) -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": client,
+            "io.modelcontextprotocol/clientCapabilities": self.client_capabilities(),
+        })
+    }
+
+    /// Send a request, adding the modern era's `_meta` when connected that
+    /// way, and refusing a result the client cannot act on.
+    async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        let params = match self.modern.read().await.clone() {
+            Some(client) => with_meta(params, self.modern_meta(&client)),
+            None => params,
+        };
+        let result = self.transport.call(method, params).await?;
+        if let Some(kind) = result.get("resultType").and_then(Value::as_str) {
+            if kind != "complete" {
+                return Err(Error::service(format!(
+                    "MCP {method} returned resultType '{kind}', which this client does not support"
+                )));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Connect in the modern era with `server/discover`. Returns `Ok(None)`
+    /// when the server is reachable but offers no modern version this
+    /// client speaks (so a legacy handshake should follow).
+    async fn discover(&self, client: &Implementation) -> Result<Option<InitializeResult>> {
+        self.transport
+            .set_protocol_version(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let raw = self
+            .transport
+            .call(
+                "server/discover",
+                json!({ "_meta": self.modern_meta(client) }),
+            )
+            .await?;
+        let supported: Vec<String> = raw
+            .get("supportedVersions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if !supported.iter().any(|v| v == MODERN_PROTOCOL_VERSION) {
+            return Ok(None);
+        }
+        let server_info = raw
+            .pointer("/_meta/io.modelcontextprotocol~1serverInfo")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(Implementation {
+                name: String::new(),
+                version: String::new(),
+            });
+        Ok(Some(InitializeResult {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_string(),
+            capabilities: raw.get("capabilities").cloned().unwrap_or(Value::Null),
+            server_info,
+            instructions: raw
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }))
+    }
+
+    /// Connect: in the modern era via `server/discover`, or with the legacy
+    /// `initialize` handshake, as [`McpProtocolMode`] directs. In `Auto`
+    /// mode a server that answers `server/discover` with anything but a
+    /// recognized modern result is treated as legacy, as the specification's
+    /// dual-era rules prescribe.
     pub async fn initialize(
         &self,
         client_name: &str,
@@ -184,7 +265,51 @@ impl McpClient {
         if let Some(existing) = self.initialize_result.read().await.clone() {
             return Ok(existing);
         }
+        let client = Implementation {
+            name: client_name.to_string(),
+            version: client_version.to_string(),
+        };
+        let mode = *self.mode.read().unwrap();
+        if mode != McpProtocolMode::Legacy {
+            match self.discover(&client).await {
+                Ok(Some(result)) => {
+                    *self.modern.write().await = Some(client);
+                    *self.initialize_result.write().await = Some(result.clone());
+                    return Ok(result);
+                }
+                Ok(None) if mode == McpProtocolMode::Modern => {
+                    self.transport.set_protocol_version(None);
+                    return Err(Error::service(format!(
+                        "MCP server does not support protocol version {MODERN_PROTOCOL_VERSION}"
+                    )));
+                }
+                Err(e) if mode == McpProtocolMode::Modern => {
+                    self.transport.set_protocol_version(None);
+                    return Err(e);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "MCP server/discover failed; using the legacy handshake");
+                }
+            }
+            self.transport.set_protocol_version(None);
+        }
+        self.legacy_initialize(client_name, client_version).await
+    }
 
+    /// Perform the MCP `initialize` request followed by the
+    /// `notifications/initialized` notification.
+    ///
+    /// Idempotent: once a handshake has succeeded, later calls return the
+    /// cached result without re-sending anything. The client always *sends*
+    /// [`PROTOCOL_VERSION`], but accepts whatever `protocolVersion` the
+    /// server responds with — including an older one — logging a warning if
+    /// it isn't one this client specifically recognizes.
+    async fn legacy_initialize(
+        &self,
+        client_name: &str,
+        client_version: &str,
+    ) -> Result<InitializeResult> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": self.client_capabilities(),
@@ -208,6 +333,8 @@ impl McpClient {
         self.transport
             .notify("notifications/initialized", json!({}))
             .await?;
+        self.transport
+            .set_protocol_version(Some(result.protocol_version.clone()));
 
         *self.initialize_result.write().await = Some(result.clone());
         Ok(result)
@@ -216,7 +343,7 @@ impl McpClient {
     /// `ping` — verify the server is still responsive.
     pub async fn ping(&self) -> Result<()> {
         self.require_initialized().await?;
-        self.transport.call("ping", json!({})).await?;
+        self.rpc("ping", json!({})).await?;
         Ok(())
     }
 
@@ -231,7 +358,7 @@ impl McpClient {
                 Some(c) => json!({ "cursor": c }),
                 None => json!({}),
             };
-            let raw = self.transport.call("tools/list", params).await?;
+            let raw = self.rpc("tools/list", params).await?;
             let page: ListToolsResult = serde_json::from_value(raw)
                 .map_err(|e| Error::service(format!("invalid MCP tools/list response: {e}")))?;
             tools.extend(page.tools);
@@ -293,6 +420,13 @@ impl McpClient {
     /// `tools/call` — invoke a tool and return the raw result, including
     /// `is_error`, without converting an error result into an `Err`.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult> {
+        let raw = self.call_tool_raw(name, arguments).await?;
+        Ok(CallToolResult::from_value(&raw))
+    }
+
+    /// `tools/call`, returning the result exactly as the server sent it
+    /// (content blocks with their `_meta`, `structuredContent`, `_meta`).
+    pub async fn call_tool_raw(&self, name: &str, arguments: Value) -> Result<Value> {
         self.require_initialized().await?;
         let arguments = if arguments.is_null() {
             json!({})
@@ -300,8 +434,7 @@ impl McpClient {
             arguments
         };
         let params = json!({ "name": name, "arguments": arguments });
-        let raw = self.transport.call("tools/call", params).await?;
-        Ok(CallToolResult::from_value(&raw))
+        self.rpc("tools/call", params).await
     }
 
     /// `tools/call`, mapped to a single JSON value suitable for handing back
@@ -336,7 +469,7 @@ impl McpClient {
                 Some(c) => json!({ "cursor": c }),
                 None => json!({}),
             };
-            let raw = self.transport.call("prompts/list", params).await?;
+            let raw = self.rpc("prompts/list", params).await?;
             let page: ListPromptsResult = serde_json::from_value(raw)
                 .map_err(|e| Error::service(format!("invalid MCP prompts/list response: {e}")))?;
             prompts.extend(page.prompts);
@@ -402,9 +535,17 @@ impl McpClient {
             arguments
         };
         let params = json!({ "name": name, "arguments": arguments });
-        let raw = self.transport.call("prompts/get", params).await?;
+        let raw = self.rpc("prompts/get", params).await?;
         serde_json::from_value(raw)
             .map_err(|e| Error::service(format!("invalid MCP prompts/get response: {e}")))
+    }
+
+    /// Read the resource at `uri` (`resources/read`).
+    pub async fn read_resource(&self, uri: &str) -> Result<crate::protocol::ReadResourceResult> {
+        self.require_initialized().await?;
+        let raw = self.rpc("resources/read", json!({ "uri": uri })).await?;
+        serde_json::from_value(raw)
+            .map_err(|e| Error::service(format!("invalid MCP resources/read response: {e}")))
     }
 
     /// Whether the server declared the `prompts` capability during
@@ -458,6 +599,40 @@ impl McpClient {
             ))
         }
     }
+}
+
+/// How an [`McpClient`] agrees on a protocol era with its server (upstream
+/// #9236's `auto` / `legacy` connection modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpProtocolMode {
+    /// Probe with `server/discover` and use the modern era
+    /// (`2026-07-28`) when the server offers it, falling back to the
+    /// `initialize` handshake otherwise. The default, as upstream.
+    #[default]
+    Auto,
+    /// Always use the `initialize` handshake.
+    Legacy,
+    /// Require the modern era; fail if the server does not offer it.
+    Modern,
+}
+
+/// `params` with `meta` merged into its `_meta` (existing keys win, so a
+/// caller's own metadata is kept).
+fn with_meta(params: Value, meta: Value) -> Value {
+    let mut params = match params {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        other => return other,
+    };
+    let entry = params
+        .entry("_meta".to_string())
+        .or_insert_with(|| json!({}));
+    if let (Some(existing), Value::Object(meta)) = (entry.as_object_mut(), meta) {
+        for (k, v) in meta {
+            existing.entry(k).or_insert(v);
+        }
+    }
+    Value::Object(params)
 }
 
 #[cfg(test)]
@@ -544,12 +719,14 @@ mod tests {
             self.sent.lock().unwrap().push((method.to_string(), params));
             let response = {
                 let mut guard = self.responses.lock().unwrap();
-                let queue = guard
-                    .get_mut(method)
-                    .unwrap_or_else(|| panic!("no canned responses queued for method '{method}'"));
-                queue
-                    .pop_front()
-                    .ok_or_else(|| Error::service(format!("no more canned responses for {method}")))
+                // An unscripted method answers as a server that does not
+                // implement it (a legacy server probed with server/discover).
+                match guard.get_mut(method) {
+                    Some(queue) => queue.pop_front().ok_or_else(|| {
+                        Error::service(format!("no more canned responses for {method}"))
+                    }),
+                    None => Err(Error::service("MCP error -32601: Method not found")),
+                }
             };
             // Simulate a server notification landing while this very call is
             // still in flight (as a real transport's reader loop dispatches
@@ -707,6 +884,109 @@ mod tests {
         let info = client.server_info().await.unwrap();
         assert_eq!(info.name, "mock-server");
         assert_eq!(client.protocol_version().await.unwrap(), "2025-06-18");
+    }
+
+    // -- Protocol eras (upstream #9236) ----------------------------------
+
+    fn discover_result(versions: &[&str]) -> Value {
+        json!({
+            "resultType": "complete",
+            "supportedVersions": versions,
+            "capabilities": { "tools": {} },
+            "instructions": "Use the tools.",
+            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "modern", "version": "2" } },
+        })
+    }
+
+    #[tokio::test]
+    async fn auto_mode_speaks_the_modern_era_when_offered() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push(
+            "server/discover",
+            discover_result(&["2026-07-28", "2025-11-25"]),
+        );
+        mock.push(
+            "tools/list",
+            json!({ "resultType": "complete", "tools": [] }),
+        );
+        let client = McpClient::new(mock.clone()).roots(vec![]);
+        let result = client.initialize("c", "1").await.unwrap();
+        assert_eq!(result.protocol_version, "2026-07-28");
+        assert_eq!(result.server_info.name, "modern");
+        assert_eq!(result.instructions.as_deref(), Some("Use the tools."));
+        assert!(client.is_modern().await);
+        client.list_tools().await.unwrap();
+        let sent = mock.sent.lock().unwrap().clone();
+        assert!(sent.iter().all(|(m, _)| m != "initialize"), "no handshake");
+        let meta = &mock.last_params("tools/list").unwrap()["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        assert_eq!(meta["io.modelcontextprotocol/clientInfo"]["name"], "c");
+        assert!(meta["io.modelcontextprotocol/clientCapabilities"]
+            .get("roots")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_to_the_handshake() {
+        // A legacy server does not implement server/discover.
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        mock.push("ping", json!({}));
+        let client = McpClient::new(mock.clone());
+        client.initialize("c", "1").await.unwrap();
+        assert!(!client.is_modern().await);
+        client.ping().await.unwrap();
+        assert!(mock.last_params("ping").unwrap().get("_meta").is_none());
+
+        // A server offering only legacy versions is handshaken too.
+        let mock = Arc::new(MockTransport::new());
+        mock.push("server/discover", discover_result(&["2025-11-25"]));
+        mock.push("initialize", init_result());
+        let client = McpClient::new(mock);
+        assert_eq!(
+            client.initialize("c", "1").await.unwrap().protocol_version,
+            "2025-06-18"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_modes_skip_or_require_the_modern_era() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("initialize", init_result());
+        let client = McpClient::new(mock.clone()).protocol_mode(McpProtocolMode::Legacy);
+        client.initialize("c", "1").await.unwrap();
+        let sent = mock.sent.lock().unwrap().clone();
+        assert_eq!(sent[0].0, "initialize", "no probe in legacy mode");
+
+        let mock = Arc::new(MockTransport::new());
+        let client = McpClient::new(mock).protocol_mode(McpProtocolMode::Modern);
+        assert!(client.initialize("c", "1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_result_needing_input_is_refused() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push("server/discover", discover_result(&["2026-07-28"]));
+        mock.push("tools/call", json!({ "resultType": "input_required" }));
+        let client = McpClient::new(mock);
+        client.initialize("c", "1").await.unwrap();
+        assert!(client.call_tool("t", json!({})).await.is_err());
+    }
+
+    #[test]
+    fn meta_merges_without_overwriting_caller_keys() {
+        let merged = with_meta(
+            json!({ "name": "t", "_meta": { "a": 1, "b": 1 } }),
+            json!({ "b": 2, "c": 3 }),
+        );
+        assert_eq!(merged["_meta"], json!({ "a": 1, "b": 1, "c": 3 }));
+        assert_eq!(
+            with_meta(Value::Null, json!({ "x": 1 })),
+            json!({ "_meta": { "x": 1 } })
+        );
     }
 
     // -- Capability declaration ------------------------------------------

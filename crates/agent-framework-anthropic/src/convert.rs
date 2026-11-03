@@ -794,6 +794,12 @@ pub fn tools_to_anthropic(tools: &[ToolDefinition]) -> (Vec<Value>, Vec<Value>) 
                     "Anthropic: hosted image-generation tools are not supported by the Anthropic Messages API; skipping"
                 );
             }
+            ToolKind::HostedComputer => {
+                tracing::warn!(
+                    tool = %t.name,
+                    "Anthropic: the hosted computer-use tool is not mapped by this client; skipping"
+                );
+            }
         }
     }
     (tool_list, mcp_servers)

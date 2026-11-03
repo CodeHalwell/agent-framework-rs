@@ -22,29 +22,29 @@ the order does not matter:
 1. **Tier 0** — `agent-framework-core`
 2. **Tier 1** — `agent-framework-a2a`, `agent-framework-bedrock`,
    `agent-framework-copilotstudio`,
-   `agent-framework-declarative`, `agent-framework-gemini`,
+   `agent-framework-claude`, `agent-framework-declarative`, `agent-framework-duckdb`, `agent-framework-mongodb`, `agent-framework-sql-server`, `agent-framework-gemini`,
    `agent-framework-hosting`, `agent-framework-mcp`, `agent-framework-mem0`,
    `agent-framework-openai`, `agent-framework-purview`,
    `agent-framework-postgres`, `agent-framework-qdrant`, `agent-framework-redis`, `agent-framework-tools`
 3. **Tier 2** — `agent-framework-azure`, `agent-framework-foundry-local`,
    `agent-framework-github-copilot`, `agent-framework-mistral`,
-   `agent-framework-ollama` (need `openai`)
+   `agent-framework-ollama` (need `openai`), `agent-framework-azure-documentdb` (needs `mongodb`)
 4. **Tier 3** — `agent-framework-anthropic` (needs `azure` + `bedrock`),
    `agent-framework-azure-ai-search`, `agent-framework-cosmos`,
-   `agent-framework-foundry` (need `azure`)
+   `agent-framework-foundry`, `agent-framework-foundry-hosting` (need `azure`)
 5. **Tier 4** — `agent-framework` (the umbrella crate)
 
 ```bash
 # One tier at a time; crates.io indexing is fast but not instant, so give
 # each tier a moment before publishing the next.
 cargo publish -p agent-framework-core
-for c in a2a bedrock copilotstudio declarative gemini hosting mcp mem0 openai postgres purview qdrant redis tools; do
+for c in a2a bedrock claude copilotstudio declarative duckdb gemini hosting mcp mem0 mongodb openai postgres purview qdrant redis sql-server tools; do
   cargo publish -p agent-framework-$c
 done
-for c in azure foundry-local github-copilot mistral ollama; do
+for c in azure azure-documentdb foundry-local github-copilot mistral ollama; do
   cargo publish -p agent-framework-$c
 done
-for c in anthropic azure-ai-search cosmos foundry; do
+for c in anthropic azure-ai-search cosmos foundry foundry-hosting; do
   cargo publish -p agent-framework-$c
 done
 cargo publish -p agent-framework

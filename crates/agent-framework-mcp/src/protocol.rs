@@ -21,6 +21,10 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const COMPATIBLE_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// The modern (handshake-free) protocol revision: version, client identity
+/// and capabilities travel in every request's `_meta` (upstream #9236).
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
 /// A monotonically increasing JSON-RPC request id generator, starting at 1.
 #[derive(Debug, Default)]
 pub struct IdGenerator(AtomicI64);
@@ -189,6 +193,11 @@ pub struct ToolDescriptor {
     /// [`Self::requires_tasks`] reads it.
     #[serde(default)]
     pub execution: Option<Value>,
+    /// The tool's `annotations` (`ToolAnnotations` hints such as
+    /// `openWorldHint`), kept raw. Hints, not policy: with the `fides`
+    /// feature, [`crate::security`] maps them restriction-only.
+    #[serde(default)]
+    pub annotations: Option<Value>,
 }
 
 impl ToolDescriptor {
@@ -395,6 +404,8 @@ pub struct CallToolResult {
     pub content: Vec<ContentBlock>,
     pub is_error: bool,
     pub structured_content: Option<Value>,
+    /// The result's `_meta` (e.g. an IFC-aware server's `ifc` label).
+    pub meta: Option<Value>,
 }
 
 impl CallToolResult {
@@ -407,10 +418,12 @@ impl CallToolResult {
             .unwrap_or_default();
         let is_error = v.get("isError").and_then(Value::as_bool).unwrap_or(false);
         let structured_content = v.get("structuredContent").cloned();
+        let meta = v.get("_meta").filter(|m| !m.is_null()).cloned();
         Self {
             content,
             is_error,
             structured_content,
+            meta,
         }
     }
 
@@ -531,6 +544,31 @@ impl PromptMessage {
     pub fn content_block(&self) -> ContentBlock {
         ContentBlock::from_value(&self.content)
     }
+}
+
+/// One item of a `resources/read` result: text or base64 `blob` contents.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceContents {
+    /// The resource's URI.
+    pub uri: String,
+    /// Its MIME type, if declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Text contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Base64 binary contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// The result of a `resources/read` request.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ReadResourceResult {
+    /// The resource's contents (a resource may have several parts).
+    #[serde(default)]
+    pub contents: Vec<ResourceContents>,
 }
 
 /// The result of a `prompts/get` request.
