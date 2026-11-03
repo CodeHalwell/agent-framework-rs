@@ -2841,12 +2841,15 @@ impl agent_framework_foundry_hosting::ResponseStore for ConversationReadFails {
     ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
     {
         use std::sync::atomic::Ordering::SeqCst;
-        if self.armed.load(SeqCst)
+        // `fetch_update` is deprecated in favour of `try_update`, which the
+        // workspace's MSRV (1.88) lacks; allowed as in core's `tools.rs`.
+        #[allow(deprecated)]
+        let refused = self.armed.load(SeqCst)
             && self
                 .allowed
                 .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_err()
-        {
+                .is_err();
+        if refused {
             return Err(agent_framework_core::error::Error::Other(
                 "read failed".into(),
             ));
