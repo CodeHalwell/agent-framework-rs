@@ -192,6 +192,9 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   cannot be stored, or that is cancelled before persistence, leaves the
   conversation's and the response's sessions as inherited, so continuing it
   no longer picks up the failed or cancelled turn's output.
+- FIDES for MCP (review fix): `SecureMcpToolProxy` tools keep the raw
+  `tools/call` result for the host (as plain MCP tools do), so Foundry
+  container-file citations work through the secure proxy too.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

@@ -265,6 +265,44 @@ struct SecureMcpExecutor {
 }
 
 impl SecureMcpExecutor {
+    /// Call the remote tool: the labeled result, and the host payload.
+    async fn call(&self, arguments: Value) -> Result<(Value, Map<String, Value>)> {
+        let raw = self
+            .client
+            .call_tool_raw(&self.remote_name, arguments)
+            .await?;
+        let result = crate::protocol::CallToolResult::from_value(&raw);
+        let server = label_from_mcp_meta(result.meta.as_ref());
+        if result.is_error {
+            return Err(Error::tool(mcp_error_text(
+                &self.local_name,
+                result.error_message(),
+                &self.local_label(),
+                server.as_ref(),
+                self.trust_server_ifc,
+            )));
+        }
+        let mut properties = Map::new();
+        if raw.to_string().len() <= crate::tool::MAX_HOST_PAYLOAD_SIZE_BYTES {
+            properties.insert(
+                agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY.into(),
+                raw,
+            );
+        } else {
+            tracing::warn!(
+                "Omitting MCP Host payload because its encoded size exceeds {} bytes.",
+                crate::tool::MAX_HOST_PAYLOAD_SIZE_BYTES
+            );
+        }
+        let value = stamp_mcp_result(
+            result.to_value(),
+            &self.local_label(),
+            server,
+            self.trust_server_ifc,
+        );
+        Ok((value, properties))
+    }
+
     /// The current local output policy (read at call time, as upstream).
     fn local_label(&self) -> ContentLabel {
         let declared = self.registry.get(&self.local_name).unwrap_or_default();
@@ -289,23 +327,20 @@ impl Tool for SecureMcpExecutor {
         self.parameters.clone()
     }
     async fn invoke(&self, arguments: Value) -> Result<Value> {
-        let result = self.client.call_tool(&self.remote_name, arguments).await?;
-        let server = label_from_mcp_meta(result.meta.as_ref());
-        if result.is_error {
-            return Err(Error::tool(mcp_error_text(
-                &self.local_name,
-                result.error_message(),
-                &self.local_label(),
-                server.as_ref(),
-                self.trust_server_ifc,
-            )));
-        }
-        Ok(stamp_mcp_result(
-            result.to_value(),
-            &self.local_label(),
-            server,
-            self.trust_server_ifc,
-        ))
+        self.call(arguments).await.map(|(value, _)| value)
+    }
+
+    /// As [`McpToolExecutor`](crate::tool), the raw `tools/call` result is
+    /// kept for the host (container-file citations and the like) under
+    /// [`MCP_TOOL_RESULT_HOST_PAYLOAD_KEY`](agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY),
+    /// beside the security-labeled, model-visible result; it never reaches
+    /// the model.
+    async fn invoke_with_properties(
+        &self,
+        arguments: Value,
+        _ctx: &agent_framework_core::middleware::FunctionInvocationContext,
+    ) -> Result<(Value, Map<String, Value>)> {
+        self.call(arguments).await
     }
 }
 

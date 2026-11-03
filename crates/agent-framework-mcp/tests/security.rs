@@ -325,3 +325,21 @@ async fn server_labeled_error_details_are_withheld() {
         assert!(err.contains("bad input"), "{err}");
     }
 }
+
+#[tokio::test]
+async fn the_secure_executor_keeps_the_host_payload() {
+    let registry = ToolSecurityRegistry::new();
+    let defs = secure_tool_definitions(server(), &registry, McpSecurityPolicy::new())
+        .await
+        .unwrap();
+    let executor = definition(&defs, "read_db").executor.clone().unwrap();
+    let ctx = FunctionInvocationContext::new("read_db", json!({}));
+    let (_, properties) = executor
+        .invoke_with_properties(json!({}), &ctx)
+        .await
+        .unwrap();
+    let payload = &properties[agent_framework_core::types::MCP_TOOL_RESULT_HOST_PAYLOAD_KEY];
+    // The raw `tools/call` result, `_meta` included, for the host.
+    assert_eq!(payload["_meta"]["ifc"]["confidentiality"], "private");
+    assert_eq!(payload["content"][0]["text"], "{\"rows\": 1}");
+}
