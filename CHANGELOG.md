@@ -200,6 +200,11 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   under the response's cancel/delete lock, so a response is continuable as
   soon as it reads as finished; a failed record write, transcript update or
   late cancel puts the sessions back to the inherited ones.
+- Foundry hosting (`session-store`, review fix): `FoundryAgentSessionStore`
+  keys each session by the JSON array `[agent id, session id, {partitions}]`,
+  so each agent's sessions are its own (as `AgentSessionStore` requires) and a
+  partitioned key can no longer collide with a look-alike unpartitioned id.
+  (The crate is new in this release, so no earlier keys exist.)
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

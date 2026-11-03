@@ -230,7 +230,12 @@ async fn invocation_sessions_round_trip_through_foundry_storage() {
         assert_eq!(reply["response"], expected);
     }
     let db = state.lock().unwrap();
-    assert!(db.stores["invocation_sessions"].contains_key("s1"));
+    // Keyed by the host's agent identity, the session id and its partitions.
+    assert!(
+        db.stores["invocation_sessions"].contains_key(r#"["foundry-invocations/echo","s1",{}]"#),
+        "{:?}",
+        db.stores["invocation_sessions"].keys().collect::<Vec<_>>()
+    );
     assert!(db
         .log
         .iter()
@@ -471,4 +476,91 @@ async fn hosted_conversation_turns_save_their_sessions() {
         let (status, reply) = json(&router, request).await;
         assert_eq!(status, StatusCode::OK, "{history:?}: {reply}");
     }
+}
+
+/// An agent of its own (a distinct id) for the session-store tests.
+#[cfg(feature = "session-store")]
+fn named_agent(name: &str) -> Arc<dyn agent_framework_core::agent::SupportsAgentRun> {
+    use agent_framework_core::prelude::Agent;
+    Arc::new(Agent::builder(Echo::default()).name(name).build())
+}
+
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn partitioned_and_look_alike_session_keys_stay_apart() {
+    use agent_framework_core::session_store::{AgentSessionStore, AgentSessionStoreKey};
+    use agent_framework_foundry_hosting::FoundryAgentSessionStore;
+    let (storage, _) = double().await;
+    let agent = named_agent("one");
+    let store =
+        FoundryAgentSessionStore::new(storage, FoundryRequestContext::default(), None, None);
+    let partitioned = AgentSessionStoreKey::new("s")
+        .unwrap()
+        .with_partition("tenant", "a")
+        .unwrap();
+    // An unpartitioned id spelled like the partitioned key's old framing.
+    let look_alike = AgentSessionStoreKey::new(r#"s#{"tenant":"a"}"#).unwrap();
+    let session = agent.create_session();
+    session.state.insert("owner", json!("partitioned"));
+    store
+        .save_session(agent.as_ref(), &partitioned, &session)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_session(agent.as_ref(), &look_alike)
+            .await
+            .unwrap()
+            .is_none(),
+        "the look-alike key does not read the partitioned session"
+    );
+    store
+        .delete_session(agent.as_ref(), &look_alike)
+        .await
+        .unwrap();
+    let kept = store
+        .get_session(agent.as_ref(), &partitioned)
+        .await
+        .unwrap()
+        .expect("deleting the look-alike key keeps the partitioned session");
+    assert_eq!(kept.state.get("owner"), Some(json!("partitioned")));
+}
+
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn sessions_are_scoped_to_their_agent() {
+    use agent_framework_core::session_store::{AgentSessionStore, AgentSessionStoreKey};
+    use agent_framework_foundry_hosting::FoundryAgentSessionStore;
+    let (storage, _) = double().await;
+    let (one, two) = (named_agent("one"), named_agent("two"));
+    assert_ne!(one.id(), two.id());
+    let store =
+        FoundryAgentSessionStore::new(storage, FoundryRequestContext::default(), None, None);
+    let key = AgentSessionStoreKey::new("shared").unwrap();
+    let session = one.create_session();
+    session.state.insert("owner", json!("one"));
+    store
+        .save_session(one.as_ref(), &key, &session)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_session(two.as_ref(), &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "another agent does not read it"
+    );
+    // Another agent's write and delete under the same key leave it alone.
+    store
+        .save_session(two.as_ref(), &key, &two.create_session())
+        .await
+        .unwrap();
+    store.delete_session(two.as_ref(), &key).await.unwrap();
+    let kept = store
+        .get_session(one.as_ref(), &key)
+        .await
+        .unwrap()
+        .expect("the owner's session survives");
+    assert_eq!(kept.state.get("owner"), Some(json!("one")));
 }

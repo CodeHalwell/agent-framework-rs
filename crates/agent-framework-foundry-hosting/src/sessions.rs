@@ -19,13 +19,18 @@ use crate::scope::{store_name, FoundryRequestContext, FoundryRequestScope};
 use crate::storage::{FoundryStorage, StorageError};
 use crate::stores::{object, open, store_scope};
 
-/// The item key of a session: its id, plus its partitions when it has any.
-fn session_item_key(key: &AgentSessionStoreKey) -> String {
-    if key.partitions().is_empty() {
-        return key.session_id().to_string();
-    }
-    let partitions = serde_json::to_string(key.partitions()).unwrap_or_default();
-    format!("{}#{partitions}", key.session_id())
+/// The item key of `agent`'s session under `key`: the JSON array
+/// `[agent id, session id, {partitions}]`. Each part is a JSON string (or
+/// object of strings), so no id or partition can spell another key, and
+/// each agent's sessions are its own (the `AgentSessionStore` contract).
+///
+/// The Rust host's own format: upstream's `FoundryAgentSessionStore` keys a
+/// session by its bare id (it has no agent or partitions), and the Rust host
+/// already names its sessions differently (`response-…`), so the two never
+/// shared records.
+fn session_item_key(agent: &dyn SupportsAgentRun, key: &AgentSessionStoreKey) -> String {
+    serde_json::to_string(&(agent.id(), key.session_id(), key.partitions()))
+        .expect("strings serialize")
 }
 
 /// Agent sessions in a Foundry state store, with optimistic concurrency: a
@@ -78,11 +83,11 @@ impl FoundryAgentSessionStore {
 impl AgentSessionStore for FoundryAgentSessionStore {
     async fn save_session(
         &self,
-        _agent: &dyn SupportsAgentRun,
+        agent: &dyn SupportsAgentRun,
         key: &AgentSessionStoreKey,
         session: &AgentSession,
     ) -> Result<()> {
-        let item = session_item_key(key);
+        let item = session_item_key(agent, key);
         let value = object(serialize_session(session), "session")?;
         let store = open(&self.storage, &self.name, &self.context).await?;
         let known = self.etags.lock().unwrap().get(&item).cloned();
@@ -113,7 +118,7 @@ impl AgentSessionStore for FoundryAgentSessionStore {
         agent: &dyn SupportsAgentRun,
         key: &AgentSessionStoreKey,
     ) -> Result<Option<AgentSession>> {
-        let item = session_item_key(key);
+        let item = session_item_key(agent, key);
         let store = open(&self.storage, &self.name, &self.context).await?;
         let Some(found) = store.get_item(&item).await? else {
             self.etags.lock().unwrap().insert(item, None);
@@ -130,10 +135,10 @@ impl AgentSessionStore for FoundryAgentSessionStore {
 
     async fn delete_session(
         &self,
-        _agent: &dyn SupportsAgentRun,
+        agent: &dyn SupportsAgentRun,
         key: &AgentSessionStoreKey,
     ) -> Result<()> {
-        let item = session_item_key(key);
+        let item = session_item_key(agent, key);
         let store = open(&self.storage, &self.name, &self.context).await?;
         match store.delete_item(&item, None).await {
             Ok(()) | Err(StorageError::NotFound(_)) => {}
