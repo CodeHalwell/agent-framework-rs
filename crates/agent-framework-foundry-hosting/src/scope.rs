@@ -2,7 +2,7 @@
 //! headers, and the trusted scope hosted state is keyed by.
 
 use agent_framework_core::error::{Error, Result};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
 
 use crate::config::FoundryHostConfig;
@@ -23,6 +23,13 @@ pub mod headers {
     pub const INVOCATION_ID: &str = "x-agent-invocation-id";
     /// Classifies an error response (`user`, `platform`, `upstream`).
     pub const ERROR_SOURCE: &str = "x-platform-error-source";
+    /// Diagnostic detail on a `platform` error response.
+    pub const ERROR_DETAIL: &str = "x-platform-error-detail";
+    /// The platform's original-subject assertions (upstream's draft
+    /// header); see [`FoundryOriginalSubject`](super::FoundryOriginalSubject).
+    pub const ORIGINAL_SUBJECT: &str = "x-ms-original-subject";
+    /// Foundry baggage for a model endpoint.
+    pub const FOUNDRY_BAGGAGE: &str = "x-ms-foundry-baggage";
 }
 
 /// What the platform said about one request (upstream
@@ -37,6 +44,9 @@ pub struct FoundryRequestContext {
     pub user_id: Option<String>,
     /// `x-agent-foundry-call-id`.
     pub call_id: Option<String>,
+    /// `x-ms-original-subject`: invocation-local attribution assertions
+    /// (experimental upstream); `None` when the header is absent.
+    pub original_subject: Option<FoundryOriginalSubject>,
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -51,7 +61,24 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 impl FoundryRequestContext {
     /// Read the context from request headers; `session_id` is the caller's
     /// (a query parameter or body field) when the protocol has one.
-    pub fn from_headers(headers: &HeaderMap, session_id: Option<String>) -> Self {
+    ///
+    /// Fails when `x-ms-original-subject` is present but malformed (see
+    /// [`FoundryOriginalSubject::from_headers`]); the hosts then reject the
+    /// request before any handler runs.
+    pub fn from_headers(
+        headers: &HeaderMap,
+        session_id: Option<String>,
+    ) -> std::result::Result<Self, InvalidOriginalSubject> {
+        let original_subject = FoundryOriginalSubject::from_headers(headers)?;
+        Ok(Self {
+            original_subject,
+            ..Self::identity_from_headers(headers, session_id)
+        })
+    }
+
+    /// The context without the original subject, for routes where upstream
+    /// does not read the header.
+    pub(crate) fn identity_from_headers(headers: &HeaderMap, session_id: Option<String>) -> Self {
         Self {
             request_id: header(headers, headers::REQUEST_ID)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -60,8 +87,319 @@ impl FoundryRequestContext {
                 .or_else(|| header(headers, headers::SESSION_ID)),
             user_id: header(headers, headers::USER_ID),
             call_id: header(headers, headers::FOUNDRY_CALL_ID),
+            original_subject: None,
         }
     }
+
+    /// Per-call headers for a model endpoint whose owner has enabled the
+    /// draft original-subject contract (experimental upstream:
+    /// `FoundryAgentRequestContext.model_attribution_headers`).
+    ///
+    /// `headers` (existing per-call headers, including any Foundry baggage)
+    /// are copied, not mutated. Inbound `x-ms-original-subject*` headers and
+    /// `x-agent-foundry-call-id` are dropped, as is any reserved
+    /// `foundry.original_subject` baggage member. With a subject, its whole
+    /// quoted dictionary is emitted once, percent-encoded, as the first
+    /// `x-ms-foundry-baggage` member, and the call id is added when known;
+    /// without one, only the unrelated baggage is kept.
+    ///
+    /// Use the result per call, never as a client default, and never send
+    /// it to external endpoints, storage or tools. Fails on a partial, empty
+    /// or non-visible-ASCII tuple, a quoted tuple over 256 characters, or
+    /// merged baggage over 1024 characters.
+    pub fn model_attribution_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<HeaderMap, InvalidOriginalSubject> {
+        let mut result = HeaderMap::new();
+        let mut baggage: Vec<String> = Vec::new();
+        let subject_prefix = format!("{}-", headers::ORIGINAL_SUBJECT);
+        let reserved_prefix = format!("{ORIGINAL_SUBJECT_BAGGAGE}.");
+        for (name, value) in headers {
+            let lowered = name.as_str();
+            if lowered == headers::FOUNDRY_BAGGAGE {
+                let Ok(value) = value.to_str() else {
+                    continue;
+                };
+                for member in value.split(',') {
+                    let member = member.trim();
+                    let raw_key = member
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .split('=')
+                        .next()
+                        .unwrap_or_default()
+                        .trim();
+                    let key = percent_decode(raw_key).to_lowercase();
+                    if member.is_empty()
+                        || key == ORIGINAL_SUBJECT_BAGGAGE
+                        || key.starts_with(&reserved_prefix)
+                    {
+                        continue;
+                    }
+                    baggage.push(member.to_string());
+                }
+            } else if lowered != headers::ORIGINAL_SUBJECT
+                && !lowered.starts_with(&subject_prefix)
+                && lowered != headers::FOUNDRY_CALL_ID
+            {
+                result.append(name.clone(), value.clone());
+            }
+        }
+        let baggage_name = HeaderName::from_static(headers::FOUNDRY_BAGGAGE);
+        let Some(subject) = &self.original_subject else {
+            if let Some(value) = (!baggage.is_empty())
+                .then(|| HeaderValue::from_str(&baggage.join(",")).ok())
+                .flatten()
+            {
+                result.insert(baggage_name, value);
+            }
+            return Ok(result);
+        };
+        let mut members = Vec::with_capacity(3);
+        for (name, value) in [
+            ("oid", &subject.oid),
+            ("tid", &subject.tid),
+            ("idtype", &subject.idtype),
+        ] {
+            let value = value
+                .as_deref()
+                .filter(|v| !v.is_empty() && v.chars().all(|c| ('!'..='~').contains(&c)))
+                .ok_or(InvalidOriginalSubject(
+                    "Original-subject attribution requires a complete, HTTP-safe tuple.",
+                ))?;
+            let escaped = value.replace('\\', r"\\").replace('"', r#"\""#);
+            members.push(format!(r#"{name}="{escaped}""#));
+        }
+        let value = members.join(", ");
+        if value.len() > MAX_ORIGINAL_SUBJECT_LENGTH {
+            return Err(InvalidOriginalSubject(
+                "Original-subject attribution requires a quoted tuple of at most 256 characters.",
+            ));
+        }
+        // Reserve attribution space before unrelated members can expand.
+        baggage.insert(
+            0,
+            format!("{ORIGINAL_SUBJECT_BAGGAGE}={}", percent_encode(&value)),
+        );
+        let merged = baggage.join(",");
+        let too_long = InvalidOriginalSubject(
+            "Original-subject attribution requires merged baggage of at most 1024 characters.",
+        );
+        if merged.chars().count() > MAX_FOUNDRY_BAGGAGE_LENGTH {
+            return Err(too_long);
+        }
+        result.insert(
+            baggage_name,
+            HeaderValue::from_str(&merged).map_err(|_| too_long)?,
+        );
+        if let Some(call_id) = self
+            .call_id
+            .as_deref()
+            .and_then(|c| HeaderValue::from_str(c).ok())
+        {
+            result.insert(HeaderName::from_static(headers::FOUNDRY_CALL_ID), call_id);
+        }
+        Ok(result)
+    }
+}
+
+/// The baggage member that carries the original subject.
+const ORIGINAL_SUBJECT_BAGGAGE: &str = "foundry.original_subject";
+const MAX_ORIGINAL_SUBJECT_LENGTH: usize = 256;
+const MAX_FOUNDRY_BAGGAGE_LENGTH: usize = 1024;
+
+/// A malformed `x-ms-original-subject` header, or a subject that cannot be
+/// sent as model attribution (upstream raises `ValueError` with the same
+/// messages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidOriginalSubject(&'static str);
+
+impl InvalidOriginalSubject {
+    /// The reason, worded as upstream.
+    pub fn message(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for InvalidOriginalSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidOriginalSubject {}
+
+const NOT_UNIQUE_MEMBERS: InvalidOriginalSubject = InvalidOriginalSubject(
+    "Original-subject attribution requires unique oid/tid/idtype string members.",
+);
+
+/// Invocation-local original-subject assertions from the platform's
+/// `x-ms-original-subject` header, separate from model authentication
+/// (experimental upstream: `FoundryOriginalSubject`).
+///
+/// These values are not proof of identity: the receiving model service
+/// must establish provenance and invocation binding before using them.
+/// Omitted keys stay `None` and empty strings stay empty; nothing is
+/// normalized or inferred. `Debug` does not print the values.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct FoundryOriginalSubject {
+    /// The original subject's object id (not the agent's or the session
+    /// owner's).
+    pub oid: Option<String>,
+    /// The original subject's tenant id.
+    pub tid: Option<String>,
+    /// The original subject's classification, preserved as sent.
+    pub idtype: Option<String>,
+}
+
+impl std::fmt::Debug for FoundryOriginalSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FoundryOriginalSubject")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FoundryOriginalSubject {
+    /// Parse the header's draft RFC 9651 dictionary profile: only `oid`,
+    /// `tid` and `idtype` string members, each at most once, in any order,
+    /// without parameters. `Ok(None)` when the header is absent; an error
+    /// for a repeated header field, an empty dictionary, an unknown or
+    /// duplicate member, a parameter, or any other malformed syntax.
+    pub fn from_headers(
+        headers: &HeaderMap,
+    ) -> std::result::Result<Option<Self>, InvalidOriginalSubject> {
+        let mut fields = headers.get_all(headers::ORIGINAL_SUBJECT).iter();
+        let Some(field) = fields.next() else {
+            return Ok(None);
+        };
+        if fields.next().is_some() {
+            return Err(InvalidOriginalSubject(
+                "Original-subject attribution requires a single header field.",
+            ));
+        }
+        let mut remaining = trim_ows(field.as_bytes());
+        let mut subject = Self::default();
+        let mut any = false;
+        while !remaining.is_empty() {
+            let (key, value, rest) = parse_member(remaining).ok_or(NOT_UNIQUE_MEMBERS)?;
+            let slot = match key {
+                "oid" => &mut subject.oid,
+                "tid" => &mut subject.tid,
+                _ => &mut subject.idtype,
+            };
+            if slot.is_some() {
+                return Err(NOT_UNIQUE_MEMBERS);
+            }
+            *slot = Some(value);
+            any = true;
+            remaining = trim_ows_start(rest);
+            if remaining.is_empty() {
+                break;
+            }
+            match remaining.split_first() {
+                Some((b',', after)) if !trim_ows(after).is_empty() => {
+                    remaining = trim_ows_start(after);
+                }
+                _ => {
+                    return Err(InvalidOriginalSubject(
+                        "Original-subject attribution requires comma-separated dictionary members.",
+                    ))
+                }
+            }
+        }
+        if !any {
+            return Err(InvalidOriginalSubject(
+                "Original-subject attribution requires a nonempty dictionary.",
+            ));
+        }
+        Ok(Some(subject))
+    }
+}
+
+fn trim_ows_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn trim_ows(bytes: &[u8]) -> &[u8] {
+    let bytes = trim_ows_start(bytes);
+    let end = bytes
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t'))
+        .map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
+/// One `key="value"` member at the start of `input`, as upstream's
+/// `(oid|tid|idtype)="((?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\["\\])*)"`
+/// matches it: the key, the unescaped value, and what follows.
+fn parse_member(input: &[u8]) -> Option<(&'static str, String, &[u8])> {
+    let (key, rest) = ["oid", "tid", "idtype"]
+        .into_iter()
+        .find_map(|k| Some((k, input.strip_prefix(k.as_bytes())?)))?;
+    let mut rest = rest.strip_prefix(b"=\"")?;
+    let mut value = String::new();
+    loop {
+        match rest.split_first()? {
+            (b'"', after) => return Some((key, value, after)),
+            (b'\\', after) => {
+                let (&escaped, after) = after.split_first()?;
+                if !matches!(escaped, b'"' | b'\\') {
+                    return None;
+                }
+                value.push(escaped as char);
+                rest = after;
+            }
+            (&c, after) if (0x20..=0x7e).contains(&c) => {
+                value.push(c as char);
+                rest = after;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Percent-encode all but RFC 3986 unreserved characters (Python's
+/// `quote(value, safe='')`).
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Decode `%XX` escapes, leaving malformed ones as they are (Python's
+/// `unquote`).
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(byte) = value
+                .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The trusted identity hosted state is partitioned by: the platform

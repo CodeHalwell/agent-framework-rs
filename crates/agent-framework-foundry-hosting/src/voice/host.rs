@@ -195,7 +195,33 @@ async fn upgrade(
     let session_id = Some(server.config.session_id.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let context = FoundryRequestContext::from_headers(&request_headers, Some(session_id.clone()));
+    let ws = ws
+        .max_message_size(TRANSPORT_FRAME_LIMIT)
+        .max_frame_size(TRANSPORT_FRAME_LIMIT);
+    let context =
+        match FoundryRequestContext::from_headers(&request_headers, Some(session_id.clone())) {
+            Ok(context) => context,
+            Err(_) => {
+                tracing::warn!(
+                    target: "azure.ai.agentserver",
+                    "Voice WebSocket rejected: invalid original-subject platform header."
+                );
+                let failed_session = session_id.clone();
+                let response = ws
+                    .on_failed_upgrade(move |_error| {
+                        close_event(
+                            &tracing::Span::none(),
+                            &failed_session,
+                            CLOSE_INTERNAL_ERROR,
+                            Some("accept_failed"),
+                            SessionTermination::AcceptError.as_str(),
+                            started,
+                        );
+                    })
+                    .on_upgrade(move |socket| reject_invalid_subject(socket, session_id, started));
+                return with_server_version(response);
+            }
+        };
     // The span goes to whichever runs: axum keeps the failure callback
     // alive for the whole connection, so it must not hold its own clone.
     let span = Arc::new(std::sync::Mutex::new(Some(telemetry::connection_span(
@@ -204,9 +230,7 @@ async fn upgrade(
     ))));
     let failed_span = span.clone();
     let failed_session = session_id.clone();
-    let mut response = ws
-        .max_message_size(TRANSPORT_FRAME_LIMIT)
-        .max_frame_size(TRANSPORT_FRAME_LIMIT)
+    let response = ws
         .on_failed_upgrade(move |_error| {
             tracing::error!(target: "azure.ai.agentserver", "Voice WebSocket accept failed");
             let span = take_span(&failed_span);
@@ -223,12 +247,42 @@ async fn upgrade(
             let span = take_span(&span);
             connection(server, socket, context, span, started)
         });
+    with_server_version(response)
+}
+
+fn with_server_version(mut response: Response) -> Response {
     if let Ok(version) = HeaderValue::from_str(&crate::host::server_version()) {
         response
             .headers_mut()
             .insert(HeaderName::from_static(headers::SERVER_VERSION), version);
     }
     response
+}
+
+/// A malformed original-subject header: accept, so the peer receives 1011
+/// rather than a handshake rejection, and close without a session or any
+/// callback (upstream `_ws_endpoint`).
+async fn reject_invalid_subject(mut socket: WebSocket, session_id: String, started: Instant) {
+    let close = async {
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_INTERNAL_ERROR,
+                reason: "Internal server error".into(),
+            })))
+            .await?;
+        socket.close().await
+    };
+    if !matches!(tokio::time::timeout(CLOSE_TIMEOUT, close).await, Ok(Ok(()))) {
+        tracing::debug!(target: "azure.ai.agentserver", "Voice WebSocket close failed");
+    }
+    close_event(
+        &tracing::Span::none(),
+        &session_id,
+        CLOSE_INTERNAL_ERROR,
+        Some("invalid_original_subject"),
+        SessionTermination::InternalError.as_str(),
+        started,
+    );
 }
 
 /// The transport's own frame limit. Frames up to it are read whole, so the

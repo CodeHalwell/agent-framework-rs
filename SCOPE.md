@@ -61,9 +61,7 @@ from the roadmap, not from this file.
   container-file citations are not carried across a restart either. Span
   enrichment stamps agent identity at span start (the Rust SDK has no
   on-end mutation). A toolbox skill refresh rebuilds the `SkillsProvider`,
-  so previously loaded skills are re-injected only once loaded again. Voice
-  invocations (feature `voice`) do not check the `x-agent-original-subject`
-  header. Tested in-process only.
+  so previously loaded skills are re-injected only once loaded again. Tested in-process only.
 - **Background responses, divergences**: the agent does not wrap the
   provider token with the saved input and earlier updates (.NET's
   `ChatClientAgentContinuationToken`), so after an interrupted stream the

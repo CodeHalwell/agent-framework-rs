@@ -175,6 +175,17 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
 - Foundry hosting (`voice`, review fix): once the client is gone and the
   outbound channel is drained, the connection loop stops polling it instead
   of spinning while a callback is still running.
+- Foundry hosting: the platform's `x-ms-original-subject` header
+  (experimental upstream) is parsed into
+  `FoundryRequestContext::original_subject` (`FoundryOriginalSubject`:
+  `oid`/`tid`/`idtype`, values hidden from `Debug`), and
+  `FoundryRequestContext::model_attribution_headers` builds the per-call
+  `x-ms-foundry-baggage` for a model endpoint. A malformed header is rejected
+  before any handler runs, as upstream: Invocations invoke/get/cancel answer
+  400 (`x-platform-error-detail: invalid_original_subject`), `POST /responses`
+  answers a platform-classified 400, and `/invocations_ws` and both voice
+  routes close with 1011. **Breaking:** `FoundryRequestContext::from_headers`
+  returns `Result<_, InvalidOriginalSubject>`.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

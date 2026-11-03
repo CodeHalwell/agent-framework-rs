@@ -125,7 +125,9 @@ pub use responses::{
     BackgroundSource, HistorySource, HostedResponseRequest, InMemoryResponseStore, OptionsHook,
     ResponseStore, ResponsesHostServer, StoredResponse, WorkflowPause,
 };
-pub use scope::{FoundryRequestContext, FoundryRequestScope};
+pub use scope::{
+    FoundryOriginalSubject, FoundryRequestContext, FoundryRequestScope, InvalidOriginalSubject,
+};
 #[cfg(feature = "session-store")]
 pub use sessions::{
     FoundryAgentSessionStore, FoundrySessionStoreProvider, InMemorySessionStoreProvider,

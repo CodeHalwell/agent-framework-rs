@@ -44,7 +44,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::FoundryHostConfig;
 use crate::host::{error_response, with_host_routes, HostOptions};
 use crate::responses::AgentFactory;
-use crate::scope::{headers, FoundryRequestContext, FoundryRequestScope};
+use crate::scope::{headers, FoundryOriginalSubject, FoundryRequestContext, FoundryRequestScope};
 use crate::sessions::{InMemorySessionStoreProvider, SessionStoreProvider};
 
 /// Options an invocation may not set: the agent owns them.
@@ -314,12 +314,43 @@ impl Inner {
     }
 }
 
-async fn unknown_invocation(Path(id): Path<String>) -> Response {
+async fn unknown_invocation(Path(id): Path<String>, headers: HeaderMap) -> Response {
+    // As upstream's get and cancel, which read the platform context first.
+    if FoundryOriginalSubject::from_headers(&headers).is_err() {
+        let mut response = invalid_original_subject_response();
+        if let Ok(v) = HeaderValue::from_str(&id) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(headers::INVOCATION_ID), v);
+        }
+        return response;
+    }
     error_response(
         StatusCode::NOT_FOUND,
         "not_found",
         format!("Invocation '{id}' was not found."),
     )
+}
+
+/// Reject a malformed original-subject header without echoing it
+/// (upstream `_invalid_original_subject_response`).
+fn invalid_original_subject_response() -> Response {
+    tracing::warn!("Request rejected: invalid original-subject platform header.");
+    let mut response = error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "Invalid original-subject platform header.",
+    );
+    let h = response.headers_mut();
+    h.insert(
+        HeaderName::from_static(headers::ERROR_SOURCE),
+        HeaderValue::from_static("platform"),
+    );
+    h.insert(
+        HeaderName::from_static(headers::ERROR_DETAIL),
+        HeaderValue::from_static("invalid_original_subject"),
+    );
+    response
 }
 
 /// An id usable in headers and keys: `[A-Za-z0-9-_.:]{1,256}`, else a new
@@ -495,7 +526,16 @@ async fn invoke(
         (!server.config.session_id.is_empty()).then(|| server.config.session_id.clone())
     });
     let session_id = sanitize_id(requested.as_deref());
-    let context = FoundryRequestContext::from_headers(&headers, Some(session_id.clone()));
+    let context = match FoundryRequestContext::from_headers(&headers, Some(session_id.clone())) {
+        Ok(context) => context,
+        Err(_) => {
+            return with_ids(
+                invalid_original_subject_response(),
+                &invocation_id,
+                &session_id,
+            )
+        }
+    };
     let (scope, partition) = match resolve_session(&server.config, &context, &routed) {
         Ok(resolved) => resolved,
         Err(e) => {

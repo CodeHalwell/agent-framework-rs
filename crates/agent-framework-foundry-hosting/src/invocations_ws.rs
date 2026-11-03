@@ -5,8 +5,9 @@
 //! accepts the upgrade, then runs the handler with a [`WsSession`]: the
 //! client's data frames ([`WsSession::recv`], `None` once the client
 //! closes), a sender ([`WsSession::send`]), and the request's
-//! [`FoundryRequestContext`] (call id, user id and session id from the
-//! platform headers). When the handler returns the host closes the
+//! [`FoundryRequestContext`] (call id, user id, session id and original
+//! subject from the platform headers; a malformed `x-ms-original-subject`
+//! closes the accepted connection with 1011 before the handler runs). When the handler returns the host closes the
 //! connection with `1000` (normal), or `1011` ("Internal server error") when
 //! it fails or panics, and logs a close event (target
 //! `azure.ai.agentserver`) with the session id, close code and duration. Protocol pings and pongs are handled by the host: with a
@@ -160,8 +161,36 @@ async fn upgrade(
     let session_id = Some(server.config.session_id.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let context = FoundryRequestContext::from_headers(&headers, Some(session_id));
-    ws.on_upgrade(move |socket| connection(server, socket, context))
+    // The platform binds one invocation to the connection: the subject
+    // comes from the upgrade headers, never from message payloads.
+    match FoundryRequestContext::from_headers(&headers, Some(session_id.clone())) {
+        Ok(context) => ws.on_upgrade(move |socket| connection(server, socket, context)),
+        Err(_) => {
+            let started = Instant::now();
+            ws.on_upgrade(move |socket| reject_invalid_subject(socket, session_id, started))
+        }
+    }
+}
+
+/// Accept, then close with 1011 without running the handler (upstream:
+/// a malformed original-subject header).
+async fn reject_invalid_subject(mut socket: WebSocket, session_id: String, started: Instant) {
+    tracing::warn!("WebSocket rejected: invalid original-subject platform header.");
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: CLOSE_INTERNAL_ERROR,
+            reason: "Internal server error".into(),
+        })))
+        .await;
+    let _ = socket.close().await;
+    tracing::info!(
+        target: "azure.ai.agentserver",
+        session_id = %session_id,
+        close_code = CLOSE_INTERNAL_ERROR,
+        duration_ms = started.elapsed().as_millis() as u64,
+        error_code = "invalid_original_subject",
+        "invocations_ws connection closed"
+    );
 }
 
 async fn connection(server: Arc<InvocationsWs>, socket: WebSocket, context: FoundryRequestContext) {

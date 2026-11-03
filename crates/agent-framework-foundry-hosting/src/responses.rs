@@ -49,7 +49,7 @@ use agent_framework_hosting::responses::openai_error;
 use agent_framework_hosting::{responses_to_run, ResponsesRequest};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -63,7 +63,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::FoundryHostConfig;
 use crate::host::{with_host_routes, HostOptions};
 use crate::output::{OutputError, OutputTracker};
-use crate::scope::{ids, FoundryRequestContext};
+use crate::scope::{headers, ids, FoundryRequestContext, InvalidOriginalSubject};
 use crate::stores::{
     FunctionApprovalStore, FunctionApprovalStoreProvider, InMemoryFunctionApprovalStore,
 };
@@ -886,6 +886,30 @@ fn bad_request(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// A malformed platform header (upstream: a `ValueError` building the
+/// request context, answered as a platform-classified invalid request).
+fn invalid_platform_context(error: InvalidOriginalSubject) -> Response {
+    tracing::warn!(error = %error, "Invalid platform request context");
+    let mut response = (
+        StatusCode::BAD_REQUEST,
+        Json(openai_error(
+            error.message(),
+            "invalid_request_error",
+            Some("invalid_request_error"),
+        )),
+    )
+        .into_response();
+    let h = response.headers_mut();
+    h.insert(
+        HeaderName::from_static(headers::ERROR_SOURCE),
+        HeaderValue::from_static("platform"),
+    );
+    if let Ok(detail) = HeaderValue::from_str(&format!("ValueError: {error}")) {
+        h.insert(HeaderName::from_static(headers::ERROR_DETAIL), detail);
+    }
+    response
+}
+
 fn not_found(id: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -1041,6 +1065,10 @@ async fn create(
     if conversation.is_some() && create.previous_response_id.is_some() {
         return bad_request("previous_response_id and conversation cannot both be set.");
     }
+    let context = match FoundryRequestContext::from_headers(&headers, None) {
+        Ok(context) => context,
+        Err(e) => return invalid_platform_context(e),
+    };
     let server = &inner.server;
     let conversation_turn = match &conversation {
         Some(id) => Some(Arc::new(inner.conversation_lock(id).lock_owned().await)),
@@ -1100,7 +1128,6 @@ async fn create(
         _ => None,
     };
     let response_id = ids::response_id(create.previous_response_id.as_deref());
-    let context = FoundryRequestContext::from_headers(&headers, None);
     // A workflow resume's input is its replies, consumed above.
     let messages = if resume.is_some() {
         Vec::new()
@@ -2736,7 +2763,7 @@ async fn delete_response(
     };
     // Its session snapshot goes with it (the conversation keeps its own).
     if exists || was_running {
-        let context = FoundryRequestContext::from_headers(&headers, None);
+        let context = FoundryRequestContext::identity_from_headers(&headers, None);
         if let Err(e) = delete_response_session(&inner.server, &context, &id).await {
             tracing::error!(error = %e, "failed to delete a response's session");
             return server_error("The response's session could not be deleted.".to_string());
