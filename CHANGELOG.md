@@ -186,6 +186,12 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   answers a platform-classified 400, and `/invocations_ws` and both voice
   routes close with 1011. **Breaking:** `FoundryRequestContext::from_headers`
   returns `Result<_, InvalidOriginalSubject>`.
+- Foundry hosting (review fix): with `HistorySource::Agent`/`Service`, a
+  turn's completed agent sessions are written only together with its stored
+  response, under the response's cancel/delete lock. A turn whose response
+  cannot be stored, or that is cancelled before persistence, leaves the
+  conversation's and the response's sessions as inherited, so continuing it
+  no longer picks up the failed or cancelled turn's output.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so

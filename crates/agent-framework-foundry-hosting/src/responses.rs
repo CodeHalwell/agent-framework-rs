@@ -954,6 +954,9 @@ struct Prepared {
     session_state: Option<Value>,
     /// This turn's session state after the run, for persistence.
     session_out: Arc<Mutex<Option<Value>>>,
+    /// This turn's completed host sessions (`HistorySource::Agent` /
+    /// `Service`), written by [`persist`] only with the turn's other writes.
+    staged_sessions: Arc<Mutex<Option<StagedSessions>>>,
     /// Held from before the turn can be cancelled or deleted until its
     /// persistence ends.
     terminal: Arc<TerminalHandle>,
@@ -1152,6 +1155,7 @@ async fn create(
         _conversation_turn: conversation_turn,
         session_state,
         session_out: Arc::default(),
+        staged_sessions: Arc::default(),
         terminal: Arc::new(inner.terminal(&response_id)),
         agent: None,
         sessions: None,
@@ -1534,12 +1538,31 @@ async fn persist(
         .store
         .put(&prepared.request.response_id, stored)
         .await?;
+    // A cancel or delete that arrived during the response write keeps the
+    // conversation and every session as they were.
+    if terminal.stopping() {
+        return Ok(false);
+    }
+    // The turn's completed sessions (a part of persistence: a session that
+    // cannot be saved fails the turn). Written here, under the response's
+    // terminal lock, so a deleted response's snapshot is never recreated.
+    let staged = prepared.staged_sessions.lock().unwrap().take();
+    let session_keys: Vec<String> = match &staged {
+        Some(_) => std::iter::once(response_session_key(&prepared.request.response_id))
+            .chain(
+                prepared
+                    .request
+                    .conversation_id
+                    .as_deref()
+                    .map(conversation_session_key),
+            )
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(staged) = &staged {
+        staged.save(&session_keys).await?;
+    }
     if let (Some(conversation), false) = (&prepared.request.conversation_id, status == "failed") {
-        // A cancel or delete that arrived during the response write keeps
-        // the conversation as it was.
-        if terminal.stopping() {
-            return Ok(false);
-        }
         // Transcript and state move together. The previous pair is read
         // first (under the conversation's turn lock) so a failed update can
         // put it back rather than leave a new transcript with an old state.
@@ -1560,6 +1583,9 @@ async fn persist(
                 .await
             {
                 tracing::error!(error = %restore, "failed to restore a conversation after a failed update");
+            }
+            if let Some(staged) = &staged {
+                staged.restore(&session_keys).await;
             }
             return Err(e);
         }
@@ -1772,6 +1798,8 @@ async fn execute(
             None => Arc::new(server.host_sessions(&request.context)?),
         })
     };
+    // The session the turn inherited, to put back if its writes fail part-way.
+    let mut inherited = None;
     let (mut session, local_history) = match &sessions {
         // The transcript is replayed; only the state bag carries over.
         None => match &prepared.session_state {
@@ -1784,6 +1812,7 @@ async fn execute(
         Some(sessions) => {
             let (mut session, prior) =
                 load_session(server, sessions, request, agent.as_ref()).await?;
+            inherited = Some((session.to_dict(), prior.clone()));
             let history = attach_local_history(&mut session, prior);
             (session, history)
         }
@@ -1845,38 +1874,80 @@ async fn execute(
         }
         *prepared.session_out.lock().unwrap() = Some(state);
     }
-    if !host_history && prepared.store {
-        // Part of persistence: a session that cannot be saved fails the
-        // turn rather than leaving its continuation unresumable. Under the
-        // response's terminal lock, so a cancel or delete either waits for
-        // these writes or has stopped them: a deleted response's snapshot
-        // is never recreated, and a cancelled one keeps its inherited one.
-        let terminal = prepared.terminal.clone();
-        let state = terminal.state.lock().await;
-        let stopped = state.finalized || terminal.stopping();
-        if let (Some(sessions), false) = (&sessions, stopped) {
-            sessions
-                .save(
-                    agent.as_ref(),
-                    &response_session_key(&request.response_id),
-                    &session,
-                    local_history.as_ref(),
-                )
-                .await?;
-            if let Some(conversation) = &request.conversation_id {
-                sessions
-                    .save(
-                        agent.as_ref(),
-                        &conversation_session_key(conversation),
-                        &session,
-                        local_history.as_ref(),
-                    )
-                    .await?;
-            }
-        }
-        drop(state);
+    if let (false, true, Some(sessions)) = (host_history, prepared.store, sessions) {
+        // Staged, not written: [`persist`] writes them with the response,
+        // under its terminal lock, so a turn whose response is not stored
+        // (a failed write, a cancel or delete first) leaves every session as
+        // it inherited it.
+        *prepared.staged_sessions.lock().unwrap() = Some(StagedSessions {
+            sessions,
+            agent: agent.clone(),
+            session,
+            history: local_history,
+            inherited,
+        });
     }
     Ok((response, None))
+}
+
+/// A turn's completed host sessions, waiting for [`persist`].
+struct StagedSessions {
+    sessions: Arc<HostSessions>,
+    agent: Arc<dyn SupportsAgentRun>,
+    session: agent_framework_core::session::AgentSession,
+    history: Option<agent_framework_core::history::InMemoryHistoryProvider>,
+    /// The inherited session's state and history, restored if the turn's
+    /// writes fail part-way.
+    inherited: Option<(Value, Option<Vec<Message>>)>,
+}
+
+impl StagedSessions {
+    /// Save the turn's session under `keys`, in order. A failure restores
+    /// the keys already written to the inherited session (best effort).
+    async fn save(&self, keys: &[String]) -> Result<()> {
+        for (i, key) in keys.iter().enumerate() {
+            if let Err(e) = self
+                .sessions
+                .save(
+                    self.agent.as_ref(),
+                    key,
+                    &self.session,
+                    self.history.as_ref(),
+                )
+                .await
+            {
+                self.restore(&keys[..i]).await;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Put `keys` back to the inherited session (best effort, logged).
+    async fn restore(&self, keys: &[String]) {
+        let Some((state, prior)) = &self.inherited else {
+            return;
+        };
+        let session = match agent_framework_core::session::AgentSession::from_dict(state) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to rebuild an inherited session");
+                return;
+            }
+        };
+        let history = prior
+            .clone()
+            .map(agent_framework_core::history::InMemoryHistoryProvider::with_messages);
+        for key in keys {
+            if let Err(e) = self
+                .sessions
+                .save(self.agent.as_ref(), key, &session, history.as_ref())
+                .await
+            {
+                tracing::error!(error = %e, "failed to restore an inherited session");
+            }
+        }
+    }
 }
 
 /// Run a turn as a provider background response (upstream

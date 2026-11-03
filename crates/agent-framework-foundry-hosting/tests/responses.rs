@@ -2483,3 +2483,165 @@ async fn an_agent_executor_computer_pause_round_trips() {
         "{second}"
     );
 }
+
+/// Refuses to store a completed response while `failing` is set.
+#[derive(Default)]
+struct FlakyStore {
+    inner: agent_framework_foundry_hosting::InMemoryResponseStore,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl agent_framework_foundry_hosting::ResponseStore for FlakyStore {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<agent_framework_foundry_hosting::StoredResponse>>
+    {
+        self.inner.get(id).await
+    }
+    async fn put(
+        &self,
+        id: &str,
+        response: agent_framework_foundry_hosting::StoredResponse,
+    ) -> agent_framework_core::error::Result<()> {
+        if response.response["status"] == "completed"
+            && self.failing.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(agent_framework_core::error::Error::Other(
+                "store down".into(),
+            ));
+        }
+        self.inner.put(id, response).await
+    }
+    async fn delete(&self, id: &str) -> agent_framework_core::error::Result<bool> {
+        self.inner.delete(id).await
+    }
+    async fn conversation(
+        &self,
+        id: &str,
+    ) -> agent_framework_core::error::Result<Option<Vec<agent_framework_core::types::Message>>>
+    {
+        self.inner.conversation(id).await
+    }
+    async fn set_conversation(
+        &self,
+        id: &str,
+        transcript: Vec<agent_framework_core::types::Message>,
+    ) -> agent_framework_core::error::Result<()> {
+        self.inner.set_conversation(id, transcript).await
+    }
+}
+
+fn turn_text(r: &serde_json::Value) -> String {
+    r["output"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_turn_that_fails_to_persist_leaves_the_sessions_as_inherited() {
+    use agent_framework_foundry_hosting::HistorySource;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let store = Arc::new(FlakyStore::default());
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .with_response_store(store.clone())
+            .into_router();
+        let in_conversation = |input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "conversation": "conv_p"}),
+            )
+        };
+        let (_, first) = json(&router, in_conversation("a")).await;
+        assert_eq!(turn_text(&first), "turn 1", "{history:?}");
+        // The run completes, but its response cannot be stored.
+        store
+            .failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed = failed_turn(&router, json!({"input": "b", "conversation": "conv_p"})).await;
+        store
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Neither the conversation nor the failed response picks it up.
+        let (_, next) = json(&router, in_conversation("c")).await;
+        assert_eq!(turn_text(&next), "turn 2", "{history:?}: the conversation");
+        let (status, from_failed) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "d", "previous_response_id": failed["id"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{from_failed}");
+        assert_eq!(
+            turn_text(&from_failed),
+            "turn 2",
+            "{history:?}: the failed response"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_before_persistence_leaves_the_sessions_as_inherited() {
+    use agent_framework_foundry_hosting::HistorySource;
+    use std::sync::atomic::Ordering::SeqCst;
+    for history in [HistorySource::Agent, HistorySource::Service] {
+        let store = Arc::new(GatedStore::default());
+        store.tripped.store(true, SeqCst);
+        let router = ResponsesHostServer::agent(Arc::new(HangingCounter))
+            .with_history_source(history)
+            .with_response_store(store.clone())
+            .into_router();
+        let in_conversation = |input: &str| {
+            post(
+                "/responses",
+                json!({"input": input, "conversation": "conv_q"}),
+            )
+        };
+        let (_, first) = json(&router, in_conversation("a")).await;
+        assert_eq!(turn_text(&first), "turn 1", "{history:?}");
+        // The next turn's run finishes; its persistence is held when the
+        // cancel lands.
+        store.tripped.store(false, SeqCst);
+        let (_, queued) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "b", "background": true, "conversation": "conv_q"}),
+            ),
+        )
+        .await;
+        let id = queued["id"].as_str().unwrap().to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.notified())
+            .await
+            .expect("the turn reaches its persistence");
+        let (status, cancelled) = during_persist(
+            &router,
+            &store,
+            post(&format!("/responses/{id}/cancel"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{cancelled}");
+        assert_eq!(cancelled["status"], "cancelled");
+        let (_, next) = json(&router, in_conversation("c")).await;
+        assert_eq!(turn_text(&next), "turn 2", "{history:?}: the conversation");
+        let (status, from_cancelled) = json(
+            &router,
+            post(
+                "/responses",
+                json!({"input": "d", "previous_response_id": id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{from_cancelled}");
+        assert_eq!(
+            turn_text(&from_cancelled),
+            "turn 2",
+            "{history:?}: the cancelled response"
+        );
+    }
+}
