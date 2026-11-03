@@ -218,7 +218,14 @@ fn persistable_response(messages: &[Message], continuation_pending: bool) -> Vec
 /// final update as a [`Content::Usage`] item (aggregation folds it back into
 /// [`AgentResponse::usage_details`], never into message contents) — the
 /// same contract as the tool-loop replay in `FunctionInvokingChatClient`.
-pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentResponseUpdate>> {
+/// `background` says whether the run was a background one (it asked for
+/// background responses or resumed one with a continuation token): its final
+/// update then carries the operation state, so aggregating an earlier pending
+/// stream with this one ends (or keeps) the operation correctly.
+pub(crate) fn response_to_updates(
+    response: AgentResponse,
+    background: bool,
+) -> Vec<Result<AgentResponseUpdate>> {
     let AgentResponse {
         messages,
         response_id,
@@ -229,6 +236,13 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         ..
     } = response;
     let last = messages.len().saturating_sub(1);
+    let operation_state = background.then(|| {
+        if continuation_token.is_some() {
+            crate::types::OperationState::InProgress
+        } else {
+            crate::types::OperationState::Terminal
+        }
+    });
     // Keep provider message ids only when all present and distinct; otherwise
     // positional ids for every message. A service (e.g. Assistants) can reuse
     // one run id across the tool-call and final assistant messages, and
@@ -279,6 +293,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
                 // response a policy check produces, which is the one a caller
                 // most needs to be able to resume.
                 continuation_token: (i == last).then(|| continuation_token.clone()).flatten(),
+                operation_state: (i == last).then_some(operation_state).flatten(),
                 ..Default::default()
             })
         })
@@ -289,7 +304,8 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
         && (usage_details.is_some()
             || response_id.is_some()
             || finish_reason.is_some()
-            || continuation_token.is_some())
+            || continuation_token.is_some()
+            || operation_state.is_some())
     {
         let contents = usage_details
             .map(|u| {
@@ -305,6 +321,7 @@ pub(crate) fn response_to_updates(response: AgentResponse) -> Vec<Result<AgentRe
             conversation_id,
             finish_reason,
             continuation_token,
+            operation_state,
             ..Default::default()
         }));
     }
@@ -409,10 +426,12 @@ pub trait SupportsAgentRun: Send + Sync {
         options: Option<AgentRunOptions>,
     ) -> Result<AgentRunStream> {
         let mut owned = session;
+        let options = options.unwrap_or_default();
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let response = self
-            .run_with_options(messages, owned.as_mut(), options.unwrap_or_default())
+            .run_with_options(messages, owned.as_mut(), options)
             .await?;
-        Ok(futures::stream::iter(response_to_updates(response)).boxed())
+        Ok(futures::stream::iter(response_to_updates(response, background)).boxed())
     }
 
     /// A stable identifier for this agent.
@@ -627,6 +646,7 @@ impl Agent {
             .prepare_request(&input, &mut session, &run_options)
             .await?;
         let service_history = options.conversation_id.is_some();
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let per_call = self.per_call_history(&session, service_history, &input, &mut options);
 
         // When agent middleware is configured, route the run through the same
@@ -655,7 +675,7 @@ impl Agent {
             // Distinct message ids keep boundaries when re-aggregated; the
             // response's conversation/response ids and usage ride along so
             // service-managed continuity survives the middleware replay.
-            return Ok(futures::stream::iter(response_to_updates(response)).boxed());
+            return Ok(futures::stream::iter(response_to_updates(response, background)).boxed());
         }
 
         let (final_messages, options) = self
@@ -2017,7 +2037,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let updates: Vec<_> = super::response_to_updates(response)
+        let updates: Vec<_> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.expect("update"))
             .collect();
@@ -2054,7 +2074,7 @@ mod tests {
             continuation_token: Some(token.clone()),
             ..Default::default()
         };
-        let updates: Vec<AgentResponseUpdate> = super::response_to_updates(response)
+        let updates: Vec<AgentResponseUpdate> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.unwrap())
             .collect();
@@ -2079,7 +2099,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let updates: Vec<_> = super::response_to_updates(response)
+        let updates: Vec<_> = super::response_to_updates(response, false)
             .into_iter()
             .map(|u| u.expect("update"))
             .collect();

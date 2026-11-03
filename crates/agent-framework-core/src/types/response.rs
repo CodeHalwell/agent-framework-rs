@@ -776,7 +776,7 @@ impl AgentResponse {
     /// distinct id, ids on every update, and usage and finish reason on the
     /// last.
     pub fn to_updates(&self) -> Vec<AgentResponseUpdate> {
-        crate::agent::response_to_updates(self.clone())
+        crate::agent::response_to_updates(self.clone(), false)
             .into_iter()
             .filter_map(|u| u.ok())
             .collect()

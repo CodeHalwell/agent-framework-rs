@@ -772,3 +772,48 @@ mod progressive {
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the added tool ran");
     }
 }
+
+#[tokio::test]
+async fn a_streamed_tool_loop_continuation_ends_the_operation() {
+    // With tools configured the stream is the tool loop's replay. An initial
+    // pending stream aggregated with its completed continuation must not
+    // still report the operation as pending.
+    let script = Script::replies(vec![
+        pending("op-15", Some("thinking")),
+        ChatResponse::from_text("finished"),
+    ]);
+    let agent = Agent::builder(script.clone()).tool(lookup()).build();
+    let session = agent.create_session();
+    let first: Vec<_> = agent
+        .run_stream(
+            vec![Message::user("go")],
+            Some(session.clone()),
+            Some(AgentRunOptions::new().with_background(true)),
+        )
+        .await
+        .unwrap()
+        .map(|u| u.unwrap())
+        .collect()
+        .await;
+    let rest: Vec<_> = agent
+        .run_stream(
+            Vec::<Message>::new(),
+            Some(session),
+            Some(
+                AgentRunOptions::new()
+                    .with_background(true)
+                    .with_continuation_token(token("op-15")),
+            ),
+        )
+        .await
+        .unwrap()
+        .map(|u| u.unwrap())
+        .collect()
+        .await;
+    let all: Vec<_> = first.into_iter().chain(rest).collect();
+    let response = AgentResponse::from_updates(all);
+    assert!(
+        response.continuation_token.is_none(),
+        "the completed continuation ends the operation"
+    );
+}

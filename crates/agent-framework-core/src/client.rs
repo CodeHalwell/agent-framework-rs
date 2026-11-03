@@ -2087,6 +2087,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         // `message_id` so that consumers re-aggregating via
         // `ChatResponse::from_updates` keep the messages separate rather than
         // merging the tool-call and final assistant messages by role.
+        let background = options.background == Some(true) || options.continuation_token.is_some();
         let response = self.get_response(messages, options).await?;
         // Response-level metadata must survive the replay so re-aggregation
         // (and the agent's thread adoption) sees it: ids on every update,
@@ -2099,6 +2100,16 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         let finish_reason = response.finish_reason.clone();
         let usage_details = response.usage_details.clone();
         let continuation_token = response.continuation_token.clone();
+        // A background request's final update carries the operation state,
+        // so aggregating a pending stream with its completed continuation
+        // ends the operation (clears the token) instead of keeping it.
+        let operation_state = background.then(|| {
+            if continuation_token.is_some() {
+                crate::types::OperationState::InProgress
+            } else {
+                crate::types::OperationState::Terminal
+            }
+        });
         let last = response.messages.len().saturating_sub(1);
         // Keep the provider message ids only when they're all present and
         // distinct; otherwise use positional ids for every message. A service
@@ -2142,6 +2153,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                     // The resume handle belongs to the operation, so it rides
                     // the final update like the finish reason.
                     continuation_token: is_last.then(|| continuation_token.clone()).flatten(),
+                    operation_state: is_last.then_some(operation_state).flatten(),
                     ..Default::default()
                 })
             })
@@ -2149,7 +2161,10 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
         // A messageless response (unusual, but possible) still carries its
         // terminal metadata in one trailing update.
         if updates.is_empty()
-            && (usage_details.is_some() || finish_reason.is_some() || continuation_token.is_some())
+            && (usage_details.is_some()
+                || finish_reason.is_some()
+                || continuation_token.is_some()
+                || operation_state.is_some())
         {
             let contents = usage_details
                 .map(|u| vec![Content::Usage(UsageContent { details: u })])
@@ -2161,6 +2176,7 @@ impl<C: ChatClient + 'static> ChatClient for FunctionInvokingChatClient<C> {
                 response_id,
                 finish_reason,
                 continuation_token,
+                operation_state,
                 ..Default::default()
             }));
         }

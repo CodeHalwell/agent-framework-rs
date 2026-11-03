@@ -209,6 +209,10 @@ Closing items from `SCOPE.md`'s "Not yet ported" list:
   persistence fails or is cancelled restores the inherited session's full
   stored snapshot, local history included, so earlier turns of the
   conversation are no longer erased.
+- Core (review fix): when a background request's response is replayed as a
+  stream (the tool loop's or agent middleware's replay), the final update
+  carries the operation state, so aggregating a pending stream with its
+  completed continuation ends the operation instead of keeping the token.
 - Claude agent (review fix): control handlers the CLI started (tool calls,
   approval and hook callbacks) are aborted when the run is dropped or
   cancelled, and a `control_cancel_request` aborts the matching handler, so
