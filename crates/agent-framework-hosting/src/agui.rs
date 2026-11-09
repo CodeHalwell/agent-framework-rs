@@ -1166,7 +1166,24 @@ impl AgUiFraming {
                 }
                 Content::FunctionCall(fc) => {
                     let tool_call_id = coalesce_call_id(fc, self.started_tools.last());
-                    if !fc.name.is_empty() {
+                    // A call starts once. A name arriving again for a call
+                    // that is *still open* is a replay — the function loop
+                    // replays a declaration-only call's pause, and some
+                    // providers repeat the name on every argument fragment —
+                    // and a second `TOOL_CALL_START` duplicates the call in
+                    // the client's thread (upstream #9770, fixing #9638).
+                    //
+                    // An id whose occurrence already ENDED is not a replay:
+                    // a provider may legally reuse a call id for a later,
+                    // distinct call, which starts afresh. Tracking per
+                    // occurrence rather than per id (`started_tools` /
+                    // `ended_tools`) is what lets both hold at once.
+                    let call_is_open = self
+                        .started_tools
+                        .iter()
+                        .zip(&self.ended_tools)
+                        .any(|(t, ended)| *t == tool_call_id && !ended);
+                    if !fc.name.is_empty() && !call_is_open {
                         let mut start = json!({
                             "type": event_type::TOOL_CALL_START,
                             "toolCallId": tool_call_id,
@@ -1579,6 +1596,46 @@ mod tests {
             "f",
             Some(FunctionArguments::Raw("{}".into())),
         ))
+    }
+
+    /// A still-open call whose name arrives again is a replay — the function
+    /// loop replays a declaration-only pause, and some providers repeat the
+    /// name on every argument fragment. Starting it twice duplicated the call
+    /// in the client's thread (upstream #9770, fixing #9638).
+    #[test]
+    fn a_replayed_open_call_starts_once() {
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        framing.push_contents(&[call("c1"), call("c1")], &mut out);
+        framing.finalize(&mut out);
+        let count = |ty: &str| out.iter().filter(|e| e["type"] == ty).count();
+        assert_eq!(count("TOOL_CALL_START"), 1, "{out:?}");
+        // The sweep still closes the one open call exactly once.
+        assert_eq!(count("TOOL_CALL_END"), 1, "{out:?}");
+    }
+
+    /// Two declaration-only calls in one response: upstream's last-id cursor
+    /// sat on the second, so a replay re-started both.
+    #[test]
+    fn two_declaration_only_calls_each_start_once() {
+        let mut framing = AgUiFraming::new();
+        let mut out = Vec::new();
+        framing.push_contents(&[call("c1"), call("c2")], &mut out);
+        // The function loop replays both pauses.
+        framing.push_contents(&[call("c1"), call("c2")], &mut out);
+        framing.finalize(&mut out);
+        let starts: Vec<&serde_json::Value> = out
+            .iter()
+            .filter(|e| e["type"] == "TOOL_CALL_START")
+            .collect();
+        assert_eq!(starts.len(), 2, "{out:?}");
+        assert_eq!(starts[0]["toolCallId"], "c1");
+        assert_eq!(starts[1]["toolCallId"], "c2");
+        assert_eq!(
+            out.iter().filter(|e| e["type"] == "TOOL_CALL_END").count(),
+            2,
+            "{out:?}"
+        );
     }
 
     #[test]
