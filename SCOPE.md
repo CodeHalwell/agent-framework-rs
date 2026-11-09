@@ -22,6 +22,7 @@ Reopening an item means changing this file in the same PR that ports it.
 | **Telegram hosting** (`hosting-telegram`) | Alpha helpers converting one chat platform's update JSON to and from run values. Outside a framework port's remit. |
 | **Sandboxed code execution** (`hyperlight`, `monty`, .NET `LocalCodeAct`) | Each wraps a specific sandbox runtime (Hyperlight micro-VMs, the Monty Python interpreter, a local process). There is no Rust binding to the first two worth pinning to, and they change upstream frequently. |
 | **TypeSafe AI** (`typesafe`) | An alpha chat-client adapter for one vendor's structured-decision models, which return scores rather than chat text. Niche, and outside the general provider set. |
+| **The session-based GitHub Copilot agent** (`GitHubCopilotAgent`) | Upstream has two Copilot surfaces. This port implements the chat client — `agent-framework-github-copilot`'s `GitHubCopilotChatClient`, which speaks Copilot's OpenAI-compatible `/chat/completions` endpoint. The other is an agent built on Copilot's **session** protocol (session events, `ASSISTANT_USAGE` accounting, URL-session approvals, file hooks, provider-specific function middleware), a second client protocol rather than a deeper version of the first. Fixes to it (#10088, #9773, #10090, #10149, #10121) have nowhere to land here. |
 | **Lab** (`lab`) | Upstream's own incubator for unstable ideas, not a supported surface. |
 | **Azure AI Search agentic / Knowledge Base mode** | The connector implements semantic and vector retrieval (including scoped filters). The agentic mode is where upstream moves fastest on this connector and is a documented boundary, not a defect. |
 | **Python-runtime specifics** | asyncio task lifetimes, SDK stream disposal, `ResponseStream` latency work, postponed-annotation detection, `py.typed`, pickle allowlists (checkpoints here are JSON), pydantic settings coercion. None has an analogue in this architecture. |
@@ -37,6 +38,7 @@ on one of them still needs checking against the Rust form.
 | `run(stream=...)` / `get_response(stream=...)` | Method pairs: `run` / `run_stream`, `get_response` / `get_streaming_response`. One function returning either a value or a stream on a runtime flag is not idiomatic Rust. |
 | Ollama's native API | `agent-framework-ollama` speaks Ollama's OpenAI-compatible endpoint and reuses `agent_framework_openai::convert`, so fixes to native fields (`images`, `keep_alive`, native tool-result shapes) do not apply. |
 | Anthropic `response_format` handling | Folded into the system prompt (the Messages API has no native field), so upstream's schema-mutation fixes cannot arise. |
+| An injected SDK client *or* environment connection settings, through one constructor | Separate entry points: `new(...)` takes the connection (client, credential, endpoint, deployment, model) explicitly, and `from_env()` reads the environment. Upstream's recurring "prefer the injected client over connection settings" fixes resolve a precedence between the two inside a single constructor; there is none to resolve here. |
 
 ## Not yet ported
 
@@ -116,6 +118,20 @@ from the roadmap, not from this file.
   `VectorDistance` queries `vector_store.rs` issues. See
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
+- **MCP hardening from the 2026-11 window**: catalog-discovery hardening
+  (#10042, breaking) and concurrent calls with request-owned headers
+  (#10147). The second is a real concurrency defect upstream — headers
+  shared across in-flight calls — and `agent-framework-mcp` has not been
+  checked against it. Scoping a *workflow's* MCP client to one invocation
+  (#9722) belongs with them; the declarative half of that change is out of
+  scope above. Validating arguments on the hosted-agent MCP tool surface
+  (#10036) is open too: typed tool arguments are validated, that surface is
+  not.
+- **Harness fixes from the 2026-11 window**: keep finished background tasks
+  until cleared or released (#9387); quarantine an unreadable memory state
+  file instead of failing every turn (#9547); keep sessions pending when a
+  consolidation pass did not cover them (#9294); kill the shell process
+  group on a stateless shell timeout (#9483).
 - **MCP 2.x, remainder**: the `2026-07-28` era is negotiated
   (`McpProtocolMode`, `server/discover`, per-request `_meta`, the
   `MCP-Protocol-Version` header). Not ported from that era:

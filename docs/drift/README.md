@@ -7,14 +7,20 @@ was already satisfied, and what does not apply here. Every item recorded as
 landed was verified (full workspace build, `cargo test`, clippy
 `--all-targets` and rustfmt, all green) before commit.
 
-**Current upstream baseline: `ca65085e` (2026-11-01).**
+**Current upstream baseline: `924a6e50` (2026-11-06).**
 
 > Upstream rewrote its main into a single linear history after the
 > 2026-10-19 pass, so `9d308951` (and every earlier baseline SHA) no longer
-> resolves there. Baselines from `02005995` on are on the linear main, and
-> the 2026-10-26 and 2026-11-02 passes both confirmed a plain
-> `<baseline>..origin/main` range works again. See the window notes in those
-> passes.
+> resolves there. Baselines from `02005995` on are on the linear main.
+>
+> **Diff along the upstream lineage, not the fork's `main`.** The clone at
+> `/home/user/agent-framework` is a fork whose `main` is a chain of daily
+> `Merge commit '<sha>'` commits, so it reaches the pre-rewrite September
+> history as well; a plain `<baseline>..origin/main` therefore reports ~150
+> extra commits that three earlier passes already closed. Use
+> `<baseline>..<upstream-tip>`, where the tip is `origin/main`'s second
+> parent, and check that every commit in the range is dated inside the
+> window. The 2026-11-09 pass has the full explanation.
 
 Deliberate exclusions live in [`SCOPE.md`](../../SCOPE.md); cite it rather
 than re-arguing a boundary in a new pass. The July re-baseline's catalogue
@@ -31,6 +37,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-11-09-924a6e50`](2026-11-09-924a6e50.md) | Post-`ca65085e` drift + Azure-ecosystem review (checked against `924a6e50`, 2026-11-06) |
 | [`2026-11-02-ca65085e-round-5`](2026-11-02-ca65085e-round-5.md) | Parity push: harness, evaluation, Qdrant, Postgres, Valkey, cloud streaming (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-4`](2026-11-02-ca65085e-round-4.md) | Clearing the queue: Redis scope leak, AG-UI error echo, User-Agent, transport errors and more (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-3`](2026-11-02-ca65085e-round-3.md) | Anthropic server-tool replay + `pause_turn` continuation (same upstream baseline, `ca65085e`) |
