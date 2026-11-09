@@ -88,6 +88,19 @@
 //! channel in its own right — under evaluation). Only `usage` content is
 //! skipped, because it carries token counts rather than user data.
 //!
+//! ### Binary content is classified under a *text* activity
+//!
+//! An attachment's bytes are sent as Purview binary content, but the
+//! **activity** reported alongside them is still `UploadText` (see the
+//! fidelity note below) — never `UploadFile` or `DownloadFile`. The
+//! middleware cannot tell a file attachment from inline binary content, so
+//! it does not claim to: sending bytes does not change the activity.
+//!
+//! This matters for policy authoring. A DLP policy scoped only to
+//! `UploadFile` or `DownloadFile` does **not** evaluate anything that comes
+//! through this integration, binary content included; it has to cover the
+//! text activities. Upstream documents the same boundary (#10103).
+//!
 //! ## A curious fidelity note: both directions check `UploadText`
 //!
 //! Python's `Activity` enum has both `UPLOAD_TEXT` and `DOWNLOAD_TEXT`
