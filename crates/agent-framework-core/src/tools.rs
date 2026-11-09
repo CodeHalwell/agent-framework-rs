@@ -481,7 +481,7 @@ impl FunctionTool {
         Self {
             name: name.into(),
             description: description.into(),
-            parameters,
+            parameters: canonicalize_schema(parameters),
             approval_mode: ApprovalMode::NeverRequire,
             func: Arc::new(move |args| Box::pin(func(args))),
             max_invocations: None,
@@ -752,6 +752,45 @@ impl Tool for FunctionTool {
     }
 }
 
+/// Sort every object's keys in a JSON Schema, recursively, leaving array
+/// order alone.
+///
+/// Providers cache a prompt by its exact bytes, so a tool whose parameters
+/// schema serializes differently from one process to the next loses the cache
+/// (upstream #8960). Object key order is insignificant to JSON Schema but not
+/// to that comparison, while array order *is* significant — `required`,
+/// `enum`, `prefixItems` and the `allOf` / `anyOf` / `oneOf` branches all mean
+/// something in the order given — so arrays are recursed into, not reordered.
+///
+/// Why this is needed when `serde_json::Map` is often already sorted: it is a
+/// `BTreeMap` only while nothing in the build enables `serde_json`'s
+/// `preserve_order` feature, and features unify across a whole build graph.
+/// `bson` — reached through `agent-framework-mongodb`'s `mongodb` dependency —
+/// turns it on, so in a workspace build the map is an insertion-ordered
+/// `IndexMap` instead. Either way the order is stable for one binary, so a
+/// cache is not lost *between runs*; what it is not is stable across
+/// dependency sets, which is what canonicalizing here fixes. It also pins the
+/// order of a hand-written schema, where the caller's literal decided it.
+fn canonicalize_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            // Collected and sorted explicitly rather than relying on the map
+            // type: under `preserve_order` insertion order is what survives,
+            // so the sort has to be the thing that establishes the order.
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_schema(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonicalize_schema).collect()),
+        other => other,
+    }
+}
+
 /// Whether `schema` declares an integer and no *other* numeric type.
 ///
 /// A declaration that also permits `number` permits fractions, so nothing is
@@ -930,7 +969,9 @@ fn typed_parameters_schema<Args: schemars::JsonSchema>() -> Value {
         map.remove("$schema");
         map.remove("title");
     }
-    value
+    // Canonical key order, so the schema a provider caches the prompt by does
+    // not depend on the build's dependency set. See `canonicalize_schema`.
+    canonicalize_schema(value)
 }
 
 /// Configuration for the automatic function-invocation loop.
@@ -1050,6 +1091,86 @@ impl FunctionInvocationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: canonical schema key order (upstream #8960)
+
+    #[test]
+    fn a_schema_has_its_object_keys_sorted_recursively() {
+        let tool = FunctionTool::new(
+            "t",
+            "d",
+            serde_json::json!({
+                "type": "object",
+                "required": ["zebra", "apple"],
+                "properties": {
+                    "zebra": { "type": "string", "description": "z" },
+                    "apple": { "minimum": 1, "type": "integer" },
+                },
+            }),
+            |_: Value| async move { Ok(serde_json::json!(null)) },
+        );
+        let schema = tool.parameters_schema();
+        let keys: Vec<&String> = schema.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["properties", "required", "type"]);
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().collect::<Vec<_>>(),
+            vec!["apple", "zebra"]
+        );
+        // Nested objects too.
+        assert_eq!(
+            properties["apple"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["minimum", "type"]
+        );
+        // An array's order is significant and must survive untouched.
+        assert_eq!(schema["required"], serde_json::json!(["zebra", "apple"]));
+    }
+
+    #[test]
+    fn canonicalizing_recurses_into_arrays_without_reordering_them() {
+        let canonical = canonicalize_schema(serde_json::json!({
+            "anyOf": [
+                { "type": "string", "const": "b" },
+                { "type": "integer", "const": "a" },
+            ],
+        }));
+        let branches = canonical["anyOf"].as_array().unwrap();
+        // Branch order preserved...
+        assert_eq!(branches[0]["type"], serde_json::json!("string"));
+        assert_eq!(branches[1]["type"], serde_json::json!("integer"));
+        // ...and each branch's own keys sorted.
+        assert_eq!(
+            branches[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["const", "type"]
+        );
+    }
+
+    /// A derived schema is canonical too, so the bytes a provider caches the
+    /// prompt by do not depend on the struct's field declaration order.
+    #[test]
+    fn a_derived_schema_is_canonical() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Unsorted {
+            zebra: String,
+            apple: String,
+        }
+        let schema = typed_parameters_schema::<Unsorted>();
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["apple", "zebra"]
+        );
+    }
+
+    // endregion
 
     // region: whole-number floats for integer parameters (upstream #9852)
 
