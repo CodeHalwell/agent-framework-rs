@@ -63,8 +63,21 @@ fn strip_port(host_header: &str) -> &str {
     if let Some(rest) = host_header.strip_prefix('[') {
         // "[::1]" or "[::1]:8080" — keep through the closing bracket. `rest`
         // starts one byte into `host_header`, so shift the found index by 1.
-        if let Some(end) = rest.find(']') {
-            return &host_header[..=end + 1];
+        let Some(end) = rest.find(']') else {
+            return host_header;
+        };
+        let host = &host_header[..=end + 1];
+        let suffix = &host_header[end + 2..];
+        // Anything after the closing bracket other than nothing or a numeric
+        // ":port" is a malformed authority, e.g. "[::1]evil.example" or
+        // "[::1]:notaport". Returning just the bracketed host would drop that
+        // trailing garbage and hand the allowlist a host that passes, so give
+        // back the raw value to fail the comparison instead (upstream #9712).
+        let port_only = suffix
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+        if suffix.is_empty() || port_only {
+            return host;
         }
         return host_header;
     }
@@ -463,6 +476,13 @@ mod tests {
         assert_eq!(strip_port("127.0.0.1:3000"), "127.0.0.1");
         assert_eq!(strip_port("[::1]"), "[::1]");
         assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        // A malformed bracketed authority must not be reduced to the
+        // bracketed host, which would smuggle it past the allowlist
+        // (upstream #9712).
+        assert_eq!(strip_port("[::1]evil.example"), "[::1]evil.example");
+        assert_eq!(strip_port("[::1]:notaport"), "[::1]:notaport");
+        assert_eq!(strip_port("[::1]:"), "[::1]:");
+        assert_eq!(strip_port("[::1"), "[::1");
         assert_eq!(strip_port("::1"), "::1");
     }
 
