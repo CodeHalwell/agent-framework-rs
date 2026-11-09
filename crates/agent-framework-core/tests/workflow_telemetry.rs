@@ -39,10 +39,18 @@ impl<S: tracing::Subscriber> Layer<S> for Names {
 }
 
 async fn run(options: WorkflowTelemetryOptions) -> Vec<String> {
+    run_named(options, None).await
+}
+
+async fn run_named(options: WorkflowTelemetryOptions, name: Option<&str>) -> Vec<String> {
     let names = Names::default();
     let subscriber = tracing_subscriber::registry().with(names.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
-    let workflow = WorkflowBuilder::new()
+    let mut builder = WorkflowBuilder::new();
+    if let Some(name) = name {
+        builder = builder.name(name);
+    }
+    let workflow = builder
         .add_executor(Arc::new(FunctionExecutor::new(
             "a",
             |msg, ctx| async move { ctx.send_message(msg).await },
@@ -66,7 +74,7 @@ async fn a_run_emits_the_workflow_spans() {
     let names = run(WorkflowTelemetryOptions::default()).await;
     for expected in [
         "workflow.build",
-        "workflow.run",
+        "invoke_workflow",
         "executor.process a",
         "executor.process b",
         "message.send",
@@ -91,4 +99,17 @@ async fn each_span_kind_can_be_turned_off() {
     })
     .await;
     assert!(names.is_empty(), "{names:?}");
+}
+
+/// A named workflow suffixes its run span, per the OTel GenAI conventions
+/// upstream aligned on in #9900 / #9899 (`invoke_workflow {name}`).
+#[tokio::test(flavor = "current_thread")]
+async fn a_named_workflow_suffixes_the_run_span() {
+    let names = run_named(WorkflowTelemetryOptions::default(), Some("triage")).await;
+    assert!(
+        names.iter().any(|n| n == "invoke_workflow triage"),
+        "{names:?}"
+    );
+    // The bare name is the unnamed form; a named run must not also emit it.
+    assert!(!names.iter().any(|n| n == "invoke_workflow"), "{names:?}");
 }

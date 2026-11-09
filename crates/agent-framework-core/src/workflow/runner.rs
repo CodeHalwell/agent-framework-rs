@@ -193,7 +193,7 @@ pub struct WorkflowBuilder {
 
 /// Which workflow spans are emitted (upstream `WorkflowTelemetryOptions`).
 ///
-/// A run emits `workflow.build`, `workflow.run`, `executor.process {id}`,
+/// A run emits `workflow.build`, `invoke_workflow [name]`, `executor.process {id}`,
 /// `message.send` and `edge_group.process {type}` spans through `tracing`,
 /// inert until a subscriber (such as the `otel-export` pipeline) is
 /// installed. Each kind can be turned off; message payloads are recorded only
@@ -202,7 +202,7 @@ pub struct WorkflowBuilder {
 pub struct WorkflowTelemetryOptions {
     /// Skip the `workflow.build` span.
     pub disable_workflow_build: bool,
-    /// Skip the `workflow.run` span.
+    /// Skip the `invoke_workflow` run span.
     pub disable_workflow_run: bool,
     /// Skip the `executor.process` spans.
     pub disable_executor_process: bool,
@@ -1031,15 +1031,43 @@ impl WorkflowRun {
         let span = if telemetry.disable_workflow_run {
             tracing::Span::none()
         } else {
-            tracing::info_span!(
-                "workflow.run",
-                otel.name = "workflow.run",
+            // OpenTelemetry GenAI semantic conventions (upstream #9900 for
+            // Python, #9899 for .NET, both breaking): the run span is
+            // `invoke_workflow`, suffixed with the workflow's name when it has
+            // one, and it carries `gen_ai.operation.name`. The name attribute
+            // moved from `workflow.name` to `gen_ai.workflow.name`.
+            //
+            // Upstream also had to exclude builder-generated names
+            // (`WorkflowBuilder-<uuid>`) from the span name and attribute,
+            // because its builder invents one when the caller gives none.
+            // This port leaves [`Workflow::name`] as `None` in that case, so
+            // an absent name simply omits both — there is no generated name to
+            // filter out.
+            let op = crate::observability::op::INVOKE_WORKFLOW;
+            let workflow_name = self.shared.name.as_deref().filter(|n| !n.is_empty());
+            // The span name has to be set when the span opens: a subscriber
+            // reads a span's fields on creation, so a name recorded afterwards
+            // is missed entirely.
+            let otel_name = match workflow_name {
+                Some(name) => format!("{op} {name}"),
+                None => op.to_string(),
+            };
+            let span = tracing::info_span!(
+                "invoke_workflow",
+                otel.name = otel_name.as_str(),
+                gen_ai.operation.name = op,
                 workflow.id = %self.shared.id,
-                workflow.name = self.shared.name.as_deref().unwrap_or_default(),
+                // Left unrecorded (and so unemitted) when the workflow has no
+                // name, as upstream omits the attribute.
+                gen_ai.workflow.name = tracing::field::Empty,
                 workflow.description = self.shared.description.as_deref().unwrap_or_default(),
                 error.type = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
-            )
+            );
+            if let Some(name) = workflow_name {
+                span.record("gen_ai.workflow.name", name);
+            }
+            span
         };
         let result = self.run_loop().instrument(span.clone()).await;
         if result.is_err() {

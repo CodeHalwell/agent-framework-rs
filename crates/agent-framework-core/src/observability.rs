@@ -184,6 +184,11 @@ pub mod op {
     pub const INVOKE_AGENT: &str = "invoke_agent";
     pub const EXECUTE_TOOL: &str = "execute_tool";
     pub const EMBEDDINGS: &str = "embeddings";
+    /// A workflow run. Both the operation name and the `invoke_workflow`
+    /// span's base name, suffixed with the workflow's name when it has one
+    /// (upstream #9899/#9900 aligned both languages on this; the span used to
+    /// be called `workflow.run`).
+    pub const INVOKE_WORKFLOW: &str = "invoke_workflow";
 }
 
 /// The `error.type` value for a framework [`Error`]: its variant discriminant.
