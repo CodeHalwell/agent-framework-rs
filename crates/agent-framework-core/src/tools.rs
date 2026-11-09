@@ -738,12 +738,89 @@ impl Tool for FunctionTool {
                 self.invocation_count.fetch_add(1, Ordering::SeqCst);
             }
         }
+        // JSON carries `3` and `3.0` identically, so narrow a whole-number
+        // float back to an integer wherever the schema asks for one before
+        // the arguments reach `serde` or a hand-written closure (#9852).
+        let mut arguments = arguments;
+        narrow_integer_arguments(&mut arguments, &self.parameters);
         let result = (self.func)(arguments).await;
         if result.is_err() {
             self.invocation_exception_count
                 .fetch_add(1, Ordering::SeqCst);
         }
         result
+    }
+}
+
+/// Whether `schema` declares an integer and no *other* numeric type.
+///
+/// A declaration that also permits `number` permits fractions, so nothing is
+/// narrowed to fit a type the schema never exclusively asked for. The
+/// nullable form (`{"type": ["integer", "null"]}`) still narrows.
+fn schema_narrows_to_integer(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(ty)) => ty == "integer",
+        Some(Value::Array(types)) => {
+            let mut integer = false;
+            for ty in types {
+                match ty.as_str() {
+                    Some("integer") => integer = true,
+                    // `number` alongside `integer` permits a fraction.
+                    Some("number") => return false,
+                    _ => {}
+                }
+            }
+            integer
+        }
+        _ => false,
+    }
+}
+
+/// Coerce whole-number floats to integers, in place, where the parameters
+/// schema asks for an integer.
+///
+/// JSON has one number type, so a model that means `3` may send `3.0` for a
+/// parameter declared `"type": "integer"`. `serde` then refuses to
+/// deserialize it into a Rust integer and the whole call fails with an
+/// argument error the model cannot fix by rephrasing; a hand-written tool
+/// that indexes with the value fails the same way. JSON Schema's `integer`
+/// means "a number with no fractional part", so `3.0` is valid and the tool
+/// should receive `3` (upstream #9852, fixing #9843).
+///
+/// Like upstream's, this is one pass over the top-level properties: members
+/// of a nested object are left exactly as sent.
+fn narrow_integer_arguments(arguments: &mut Value, parameters: &Value) {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(args) = arguments.as_object_mut() else {
+        return;
+    };
+    for (name, schema) in properties {
+        let Some(value) = args.get_mut(name) else {
+            continue;
+        };
+        // Only a value actually stored as a float is a candidate: an integer
+        // already on the wire needs nothing, and `as_f64` would accept it.
+        if !value.is_f64() {
+            continue;
+        }
+        let Some(number) = value.as_f64() else {
+            continue;
+        };
+        if number.fract() != 0.0 || !schema_narrows_to_integer(schema) {
+            continue;
+        }
+        // A float outside the integer range cannot be narrowed without
+        // changing the value, so it is left for `serde` to reject.
+        let narrowed = if number >= 0.0 && number <= u64::MAX as f64 {
+            serde_json::Number::from(number as u64)
+        } else if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+            serde_json::Number::from(number as i64)
+        } else {
+            continue;
+        };
+        *value = Value::Number(narrowed);
     }
 }
 
@@ -973,6 +1050,102 @@ impl FunctionInvocationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // region: whole-number floats for integer parameters (upstream #9852)
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct CountArgs {
+        count: u32,
+        #[serde(default)]
+        offset: Option<i64>,
+    }
+
+    /// A model that means `3` may send `3.0`; JSON Schema's `integer` accepts
+    /// it, so the typed tool must too rather than failing the call.
+    #[tokio::test]
+    async fn a_whole_number_float_satisfies_an_integer_parameter() {
+        let tool = FunctionTool::typed("count", "counts", |args: CountArgs| async move {
+            Ok(serde_json::json!({ "count": args.count, "offset": args.offset }))
+        });
+        let out = tool
+            .invoke(serde_json::json!({ "count": 3.0, "offset": -2.0 }))
+            .await
+            .expect("a whole-number float must satisfy an integer parameter");
+        assert_eq!(out, serde_json::json!({ "count": 3, "offset": -2 }));
+    }
+
+    #[tokio::test]
+    async fn a_fractional_value_is_still_rejected_for_an_integer_parameter() {
+        let tool = FunctionTool::typed("count", "counts", |args: CountArgs| async move {
+            Ok(serde_json::json!(args.count))
+        });
+        assert!(tool
+            .invoke(serde_json::json!({ "count": 3.5 }))
+            .await
+            .is_err());
+    }
+
+    /// The narrowing is schema-driven, so a hand-written schema gets it too —
+    /// the closure there parses the raw JSON itself.
+    #[tokio::test]
+    async fn a_hand_written_integer_schema_also_narrows() {
+        let tool = FunctionTool::new(
+            "page",
+            "pages",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "page": { "type": "integer" } },
+                "required": ["page"],
+            }),
+            |args: Value| async move {
+                let page: u64 = serde_json::from_value(args["page"].clone())
+                    .map_err(|e| Error::tool(e.to_string()))?;
+                Ok(serde_json::json!(page))
+            },
+        );
+        let out = tool
+            .invoke(serde_json::json!({ "page": 7.0 }))
+            .await
+            .unwrap();
+        assert_eq!(out, serde_json::json!(7));
+    }
+
+    #[test]
+    fn a_schema_allowing_number_keeps_the_float() {
+        // `number` alongside `integer` permits a fraction, so the value's own
+        // type is the answer and nothing is narrowed.
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": { "size": { "type": ["integer", "number"] } },
+        });
+        let mut arguments = serde_json::json!({ "size": 4.0 });
+        narrow_integer_arguments(&mut arguments, &parameters);
+        assert!(arguments["size"].is_f64(), "{arguments}");
+    }
+
+    #[test]
+    fn a_nullable_integer_schema_narrows() {
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": ["integer", "null"] } },
+        });
+        let mut arguments = serde_json::json!({ "n": 5.0 });
+        narrow_integer_arguments(&mut arguments, &parameters);
+        assert_eq!(arguments["n"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn a_string_parameter_is_untouched() {
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": { "s": { "type": "string" } },
+        });
+        let mut arguments = serde_json::json!({ "s": "3.0" });
+        narrow_integer_arguments(&mut arguments, &parameters);
+        assert_eq!(arguments["s"], serde_json::json!("3.0"));
+    }
+
+    // endregion
 
     // region: typed() schema derivation
 
