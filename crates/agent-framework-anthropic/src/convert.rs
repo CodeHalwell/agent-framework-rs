@@ -1089,21 +1089,32 @@ fn tool_use_id(block: &Value) -> String {
 ///   upstream unconditionally appends `cit` after the `match` regardless of
 ///   which arm (or the fallback `case _`) ran (~667-669).
 ///
-/// `title` note: upstream's `page_location` and `content_block_location`
-/// cases read `citation.document_title`, but `char_location` reads
-/// `citation.title` (~622) -- and per the `anthropic` Python SDK's
-/// `BetaCitationCharLocation` model, `char_location` citations have *no*
-/// `title` field, only `document_title` (identical to its two siblings).
-/// This looks like an upstream copy/paste bug (`char_location`'s branch
-/// resembles `web_search_result_location`/`search_result_location`, which
-/// legitimately use `.title`) rather than intentional behavior, since the
-/// real API never sends a `title` key on a `char_location` citation. It is
-/// mirrored here literally (`char_location` reads wire key `"title"`, which
-/// in practice is always absent) rather than "corrected" to `document_title`,
-/// per this task's mandate to match upstream's exact behavior; flagged in
-/// the implementation report.
+/// `title` note: this port previously mirrored upstream's `char_location`
+/// branch reading `citation.title`, flagging it as a likely copy/paste bug --
+/// per the `anthropic` SDK's `BetaCitationCharLocation` model a
+/// `char_location` citation has no `title` field at all, only
+/// `document_title`, so the key read was always absent and every
+/// `char_location` citation lost its title. Upstream has since fixed it the
+/// same way (#9898), so `char_location` now reads `document_title` like its
+/// two siblings.
 pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
     let citations = block.get("citations").and_then(Value::as_array)?;
+    parse_citation_list(citations)
+}
+
+/// The single `citation` object carried by a streamed `citations_delta`.
+///
+/// Streaming delivers each citation as its own delta on the open text block
+/// rather than as the finished block's `citations` array, so without this the
+/// whole annotation set was dropped from every streamed response (upstream
+/// #9898).
+pub(crate) fn parse_citations_delta(delta: &Value) -> Option<Vec<Annotation>> {
+    let citation = delta.get("citation")?;
+    parse_citation_list(std::slice::from_ref(citation))
+}
+
+/// Shared body of [`parse_citations`] and [`parse_citations_delta`].
+fn parse_citation_list(citations: &[Value]) -> Option<Vec<Annotation>> {
     if citations.is_empty() {
         return None;
     }
@@ -1132,9 +1143,9 @@ pub(crate) fn parse_citations(block: &Value) -> Option<Vec<Annotation>> {
         };
         match citation.get("type").and_then(Value::as_str) {
             Some("char_location") => {
-                // See doc comment: upstream reads `citation.title` here, not
-                // `citation.document_title` (likely a bug), mirrored as-is.
-                cit.title = str_field("title");
+                // `document_title`, not `title`: a `char_location` citation
+                // carries no `title` key (upstream #9898).
+                cit.title = str_field("document_title");
                 cit.snippet = str_field("cited_text");
                 cit.file_id = truthy_str("file_id");
                 cit.annotated_regions = Some(vec![TextSpanRegion {
@@ -1210,16 +1221,92 @@ pub(crate) fn map_stop_reason(reason: &str) -> FinishReason {
     }
 }
 
+/// Last-seen Anthropic input/cache token components for one stream.
+///
+/// Anthropic usually reports `cache_creation_input_tokens` /
+/// `cache_read_input_tokens` only on `message_start`, while each
+/// `message_delta` repeats `input_tokens` on its own. Because
+/// `input_token_count` is *inclusive* of both cache components (see
+/// [`inclusive_input_tokens`]), a later snapshot that omits them computes a
+/// smaller input total than the one already emitted, and
+/// [`StreamUsageAccumulator`]'s high-water mark then clamps the increment to
+/// zero — swallowing any genuine growth in `input_tokens`. Carrying the
+/// last-seen components forward keeps every snapshot's total inclusive.
+///
+/// Mirrors upstream's `raw_usage_carry` (#9859).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RawUsageCarry {
+    input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+}
+
+/// Read the three input-side token components from a `usage` object, applying
+/// (and updating) `carry` when one is threaded through a stream.
+fn usage_components(
+    usage: &Value,
+    carry: Option<&mut RawUsageCarry>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut input = usage.get("input_tokens").and_then(Value::as_u64);
+    let mut creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let mut read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    if let Some(carry) = carry {
+        match input {
+            Some(value) => carry.input_tokens = Some(value),
+            None => input = carry.input_tokens,
+        }
+        match creation {
+            Some(value) => carry.cache_creation_input_tokens = Some(value),
+            None => creation = carry.cache_creation_input_tokens,
+        }
+        match read {
+            Some(value) => carry.cache_read_input_tokens = Some(value),
+            None => read = carry.cache_read_input_tokens,
+        }
+    }
+    (input, creation, read)
+}
+
+/// The inclusive input-token total.
+///
+/// Anthropic's `input_tokens` counts only the tokens *after* the last cache
+/// breakpoint, so the total input adds both cache components back in. That
+/// matches every other connector in this workspace and the GenAI semantic
+/// conventions, where the cache-read count is a subset of the input total
+/// rather than a figure alongside it (upstream #9859, fixing #9808).
+///
+/// `None` only when all three components are absent, so a `usage` object
+/// carrying no input side at all still reports nothing rather than zero.
+fn inclusive_input_tokens(
+    input: Option<u64>,
+    creation: Option<u64>,
+    read: Option<u64>,
+) -> Option<u64> {
+    if input.is_none() && creation.is_none() && read.is_none() {
+        return None;
+    }
+    Some(input.unwrap_or(0) + creation.unwrap_or(0) + read.unwrap_or(0))
+}
+
 /// Parse an Anthropic `usage` object (input/output tokens plus prompt-cache
 /// counts) into [`UsageDetails`].
 pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
+    parse_usage_with_carry(usage, None)
+}
+
+/// [`parse_usage`], optionally applying a stream's [`RawUsageCarry`].
+pub(crate) fn parse_usage_with_carry(
+    usage: &Value,
+    carry: Option<&mut RawUsageCarry>,
+) -> UsageDetails {
+    let (input, creation, read) = usage_components(usage, carry);
     let mut details = UsageDetails {
-        input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
+        input_token_count: inclusive_input_tokens(input, creation, read),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
-        cache_creation_input_token_count: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64),
-        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cache_creation_input_token_count: creation,
+        cache_read_input_token_count: read,
         ..Default::default()
     };
     if let (Some(i), Some(o)) = (details.input_token_count, details.output_token_count) {
@@ -1235,22 +1322,22 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 /// additive [`UsageContent`] (as `ChatResponse::absorb_update` does when
 /// aggregating a stream) would double-count output tokens, so this
 /// deliberately omits `output_tokens` here.
-pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
-    let details = UsageDetails {
-        input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
-        cache_creation_input_token_count: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64),
-        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
-        ..Default::default()
-    };
-    if details.input_token_count.is_none()
-        && details.cache_creation_input_token_count.is_none()
-        && details.cache_read_input_token_count.is_none()
-    {
-        return None;
-    }
-    Some(UsageContent { details })
+/// `carry` applies a stream's [`RawUsageCarry`]; pass `None` for a one-off
+/// snapshot.
+pub(crate) fn parse_message_start_usage(
+    usage: &Value,
+    carry: Option<&mut RawUsageCarry>,
+) -> Option<UsageContent> {
+    let (input, creation, read) = usage_components(usage, carry);
+    let input_token_count = inclusive_input_tokens(input, creation, read)?;
+    Some(UsageContent {
+        details: UsageDetails {
+            input_token_count: Some(input_token_count),
+            cache_creation_input_token_count: creation,
+            cache_read_input_token_count: read,
+            ..Default::default()
+        },
+    })
 }
 
 /// Per-stream accumulator that turns Anthropic's *cumulative* usage snapshots
@@ -1276,9 +1363,29 @@ pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
 #[derive(Debug, Default)]
 pub(crate) struct StreamUsageAccumulator {
     emitted: UsageDetails,
+    /// Last-seen input/cache components for this stream — see
+    /// [`RawUsageCarry`].
+    carry: RawUsageCarry,
 }
 
 impl StreamUsageAccumulator {
+    /// Parse a cumulative `message_delta.usage` snapshot against this stream's
+    /// carry and return the increment over what has already been emitted.
+    pub(crate) fn increment_from_delta(&mut self, usage: &Value) -> UsageDetails {
+        let cumulative = parse_usage_with_carry(usage, Some(&mut self.carry));
+        self.increment(&cumulative)
+    }
+
+    /// The same for `message_start.usage`, which deliberately omits
+    /// `output_tokens` (see [`parse_message_start_usage`]). `None` when the
+    /// snapshot carries no input side at all.
+    pub(crate) fn increment_from_message_start(&mut self, usage: &Value) -> Option<UsageContent> {
+        let content = parse_message_start_usage(usage, Some(&mut self.carry))?;
+        Some(UsageContent {
+            details: self.increment(&content.details),
+        })
+    }
+
     /// Convert a cumulative snapshot into the increment since the last one,
     /// recording the snapshot as the new high-water mark.
     pub(crate) fn increment(&mut self, cumulative: &UsageDetails) -> UsageDetails {
@@ -1393,13 +1500,17 @@ mod tests {
         let mut acc = StreamUsageAccumulator::default();
 
         // `message_start`: the first cumulative snapshot (input + cache only).
-        let start = parse_message_start_usage(&json!({
+        let start = parse_message_start_usage(
+            &json!({
             "input_tokens": 10,
-            "cache_read_input_tokens": 4,
-        }))
+                "cache_read_input_tokens": 4,
+            }),
+            None,
+        )
         .unwrap();
         let first = acc.increment(&start.details);
-        assert_eq!(first.input_token_count, Some(10));
+        // Inclusive of the cache component: 10 post-breakpoint + 4 cache-read.
+        assert_eq!(first.input_token_count, Some(14));
         assert_eq!(first.cache_read_input_token_count, Some(4));
 
         // `message_delta`: the *running total*, which repeats input_tokens.
@@ -1416,7 +1527,7 @@ mod tests {
         // Summing the emitted increments reconstructs the true cumulative usage.
         let mut aggregated = first;
         aggregated.add_assign(&delta);
-        assert_eq!(aggregated.input_token_count, Some(10));
+        assert_eq!(aggregated.input_token_count, Some(14));
         assert_eq!(aggregated.output_token_count, Some(25));
         assert_eq!(aggregated.cache_read_input_token_count, Some(4));
     }
@@ -1487,6 +1598,81 @@ mod tests {
         // A provider reporting a lower total must clamp to 0, not underflow.
         let inc = acc.increment(&parse_usage(&json!({ "output_tokens": 20 })));
         assert_eq!(inc.output_token_count, Some(0));
+    }
+
+    // region: cache tokens fold into the input total (upstream #9859/#9808)
+
+    #[test]
+    fn input_token_count_includes_both_cache_components() {
+        // Anthropic's `input_tokens` counts only what follows the last cache
+        // breakpoint, so the inclusive total is 10 + 4 + 6.
+        let details = parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "cache_creation_input_tokens": 4,
+            "cache_read_input_tokens": 6,
+        }));
+        assert_eq!(details.input_token_count, Some(20));
+        assert_eq!(details.cache_creation_input_token_count, Some(4));
+        assert_eq!(details.cache_read_input_token_count, Some(6));
+        // `total_token_count` is derived from the inclusive input.
+        assert_eq!(details.total_token_count, Some(23));
+    }
+
+    #[test]
+    fn a_usage_object_with_no_input_side_reports_no_input_count() {
+        let details = parse_usage(&json!({ "output_tokens": 3 }));
+        assert_eq!(details.input_token_count, None);
+        assert_eq!(details.total_token_count, None);
+    }
+
+    #[test]
+    fn cache_components_are_carried_across_a_stream_that_omits_them() {
+        // `message_start` reports the cache components; `message_delta`
+        // repeats a *grown* `input_tokens` without them. Without the carry the
+        // delta's total (30) would fall below the already-emitted 33 and the
+        // high-water mark would clamp the increment to 0, losing the 5 extra
+        // input tokens the provider did report.
+        let mut acc = StreamUsageAccumulator::default();
+        let first = acc
+            .increment_from_message_start(&json!({
+                "input_tokens": 25,
+                "cache_read_input_tokens": 8,
+            }))
+            .unwrap();
+        assert_eq!(first.details.input_token_count, Some(33));
+
+        let delta = acc.increment_from_delta(&json!({
+            "input_tokens": 30,
+            "output_tokens": 15,
+        }));
+        assert_eq!(delta.input_token_count, Some(5));
+        assert_eq!(delta.output_token_count, Some(15));
+
+        let mut aggregated = first.details;
+        aggregated.add_assign(&delta);
+        assert_eq!(aggregated.input_token_count, Some(38));
+        assert_eq!(aggregated.cache_read_input_token_count, Some(8));
+    }
+
+    #[test]
+    fn a_repeated_cumulative_snapshot_still_adds_nothing_with_the_carry() {
+        let mut acc = StreamUsageAccumulator::default();
+        let first = acc
+            .increment_from_message_start(&json!({
+                "input_tokens": 25,
+                "cache_read_input_tokens": 8,
+            }))
+            .unwrap();
+        // The delta repeats the same input total, omitting the cache field.
+        let delta = acc.increment_from_delta(&json!({
+            "input_tokens": 25,
+            "output_tokens": 15,
+        }));
+        assert_eq!(delta.input_token_count, Some(0));
+        let mut aggregated = first.details;
+        aggregated.add_assign(&delta);
+        assert_eq!(aggregated.input_token_count, Some(33));
     }
 
     use agent_framework_core::tools::ApprovalMode;
@@ -2007,7 +2193,7 @@ mod tests {
     #[test]
     fn message_start_usage_omits_output_tokens() {
         let usage = json!({ "input_tokens": 25, "output_tokens": 1 });
-        let content = parse_message_start_usage(&usage).unwrap();
+        let content = parse_message_start_usage(&usage, None).unwrap();
         assert_eq!(content.details.input_token_count, Some(25));
         assert_eq!(content.details.output_token_count, None);
     }
@@ -2718,11 +2904,10 @@ mod tests {
         let annotations = parse_citations(&block).unwrap();
         assert_eq!(annotations.len(), 1);
         let cit = &annotations[0];
-        // Mirrors upstream's `char_location` branch, which reads
-        // `citation.title` rather than `citation.document_title` -- absent
-        // on the real wire payload, so `title` ends up `None` here too. See
-        // `parse_citations`'s doc comment for the upstream-bug analysis.
-        assert_eq!(cit.title, None);
+        // `document_title`, like `page_location` and
+        // `content_block_location`: a `char_location` citation carries no
+        // `title` key, so reading one lost every title (upstream #9898).
+        assert_eq!(cit.title.as_deref(), Some("Example Document"));
         assert_eq!(cit.snippet.as_deref(), Some("The grass is green."));
         assert_eq!(
             cit.annotated_regions,
@@ -2731,6 +2916,35 @@ mod tests {
                 end_index: Some(20)
             }])
         );
+    }
+
+    #[test]
+    fn parse_citations_delta_reads_the_single_citation() {
+        // Streaming delivers one citation per delta, under `citation`,
+        // instead of a finished block's `citations` array (#9898).
+        let delta = json!({
+            "type": "citations_delta",
+            "citation": {
+                "type": "char_location",
+                "cited_text": "The grass is green.",
+                "document_index": 0,
+                "document_title": "Example Document",
+                "start_char_index": 0,
+                "end_char_index": 20,
+            }
+        });
+        let annotations = parse_citations_delta(&delta).unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].title.as_deref(), Some("Example Document"));
+        assert_eq!(
+            annotations[0].snippet.as_deref(),
+            Some("The grass is green.")
+        );
+    }
+
+    #[test]
+    fn parse_citations_delta_without_a_citation_is_none() {
+        assert!(parse_citations_delta(&json!({ "type": "citations_delta" })).is_none());
     }
 
     #[test]

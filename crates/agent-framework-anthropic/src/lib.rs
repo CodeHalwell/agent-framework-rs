@@ -751,12 +751,12 @@ fn parse_stream_event(
                 .map(String::from);
             let mut contents = Vec::new();
             if let Some(usage) = message.get("usage") {
-                if let Some(usage_content) = convert::parse_message_start_usage(usage) {
-                    // Seed the accumulator: `message_start`'s counts are the
-                    // first cumulative snapshot, so the increment equals it.
-                    contents.push(Content::Usage(UsageContent {
-                        details: usage_acc.increment(&usage_content.details),
-                    }));
+                // Seed the accumulator: `message_start`'s counts are the first
+                // cumulative snapshot, so the increment equals it. Its
+                // `cache_*` components also seed this stream's carry, since
+                // later deltas usually omit them (#9859).
+                if let Some(usage_content) = usage_acc.increment_from_message_start(usage) {
+                    contents.push(Content::Usage(usage_content));
                 }
             }
             Some(ChatResponseUpdate {
@@ -869,6 +869,16 @@ fn parse_stream_event(
                         .map(str::to_string),
                     ..Default::default()
                 }),
+                // Citations stream one at a time on the open text block.
+                // Carried as an empty-text fragment so `coalesce_text` folds
+                // the annotation onto the text it cites, the same merge that
+                // already lands a `signature_delta` on its thinking block.
+                // Without this every streamed citation was dropped (#9898).
+                "citations_delta" => Content::Text(TextContent {
+                    text: String::new(),
+                    annotations: convert::parse_citations_delta(delta),
+                    ..Default::default()
+                }),
                 "input_json_delta" => {
                     let partial = delta
                         .get("partial_json")
@@ -905,9 +915,11 @@ fn parse_stream_event(
             let mut contents = Vec::new();
             if let Some(usage) = value.get("usage") {
                 // `message_delta.usage` is the running total for the message,
-                // not a per-delta increment: emit only what it adds.
+                // not a per-delta increment: emit only what it adds. The
+                // stream's carry supplies any `cache_*` component this
+                // snapshot omits, so the input total stays inclusive (#9859).
                 contents.push(Content::Usage(UsageContent {
-                    details: usage_acc.increment(&convert::parse_usage(usage)),
+                    details: usage_acc.increment_from_delta(usage),
                 }));
             }
             let finish_reason = value
@@ -1298,8 +1310,49 @@ mod tests {
         let updates = collect_updates(text).await;
         let resp = ChatResponse::from_updates(updates);
         let usage = resp.usage_details.unwrap();
-        assert_eq!(usage.input_token_count, Some(25));
+        // 25 post-breakpoint + 8 cache-read, counted once (#9859).
+        assert_eq!(usage.input_token_count, Some(33));
         assert_eq!(usage.output_token_count, Some(15));
+        assert_eq!(usage.cache_read_input_token_count, Some(8));
+    }
+
+    /// A stream whose `message_delta` omits the `cache_*` fields that only
+    /// `message_start` carried must still report an inclusive input total
+    /// (upstream #9859's `raw_usage_carry`).
+    #[tokio::test]
+    async fn stream_carries_cache_tokens_when_a_delta_omits_them() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "message_start",
+            &serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4",
+                    "usage": {
+                        "input_tokens": 25,
+                        "cache_creation_input_tokens": 4,
+                        "cache_read_input_tokens": 8,
+                        "output_tokens": 1
+                    }
+                }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "input_tokens": 25, "output_tokens": 15 }
+            }),
+        ));
+
+        let updates = collect_updates(text).await;
+        let resp = ChatResponse::from_updates(updates);
+        let usage = resp.usage_details.unwrap();
+        assert_eq!(usage.input_token_count, Some(37));
+        assert_eq!(usage.output_token_count, Some(15));
+        assert_eq!(usage.cache_creation_input_token_count, Some(4));
         assert_eq!(usage.cache_read_input_token_count, Some(8));
     }
 
@@ -1429,18 +1482,30 @@ mod tests {
         assert_eq!(args, serde_json::json!({ "q": "rust" }));
     }
 
+    /// A streamed `citations_delta` carries one citation on the open text
+    /// block. Upstream had no case for it, so streamed responses lost every
+    /// citation; #9898 surfaces it as a textless annotation fragment that
+    /// merges onto the text it cites.
     #[tokio::test]
-    async fn stream_citations_delta_is_ignored_like_upstream() {
-        // Upstream's `_process_stream_event`/`_parse_message_contents` has no
-        // case for the `citations_delta` delta type (it only appears inside
-        // `content_block_delta`), so it falls through to a debug-logged
-        // no-op; citations are only ever populated from a full `text` block's
-        // `citations` array (non-streaming, or a hypothetical fully-formed
-        // streamed block). This asserts the streaming path tolerates the
-        // event (no panic, no spurious update) rather than mirroring
-        // citation *population* during streaming, which upstream doesn't do
-        // either.
-        let text = sse_frame(
+    async fn stream_citations_delta_annotates_the_cited_text() {
+        let mut text = String::new();
+        text.push_str(&sse_frame(
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" }
+            }),
+        ));
+        text.push_str(&sse_frame(
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "example" }
+            }),
+        ));
+        text.push_str(&sse_frame(
             "content_block_delta",
             &serde_json::json!({
                 "type": "content_block_delta",
@@ -1457,12 +1522,27 @@ mod tests {
                     }
                 }
             }),
-        );
+        ));
         let updates = collect_updates(text).await;
-        assert!(
-            updates.is_empty(),
-            "citations_delta should not produce an update, matching upstream"
-        );
+        let resp = ChatResponse::from_updates(updates);
+        let annotations = resp
+            .messages
+            .iter()
+            .flat_map(|m| m.contents.iter())
+            .filter_map(|c| match c {
+                Content::Text(t) => t.annotations.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(annotations.len(), 1, "{annotations:?}");
+        let cit = annotations[0];
+        // `char_location` reads `document_title` (#9898), not `title`.
+        assert_eq!(cit.title.as_deref(), Some("Doc"));
+        assert_eq!(cit.snippet.as_deref(), Some("example"));
+        // The annotation merged onto the text it cites rather than standing
+        // alone as an empty fragment.
+        assert_eq!(resp.text(), "example");
     }
 
     #[tokio::test]
