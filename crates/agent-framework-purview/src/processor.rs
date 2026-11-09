@@ -65,6 +65,64 @@ pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<S
     author_name_fallback.or_else(|| provided.filter(|p| is_valid_guid(p)).map(str::to_string))
 }
 
+/// The user id this one message carries, or `None`.
+///
+/// `additional_properties["user_id"]` first, then a GUID-shaped
+/// `author_name` — both read from the *same* message, mirroring upstream's
+/// `TryGetUserIdFromMessage` (#10099).
+fn message_user_id(message: &Message) -> Option<String> {
+    if let Some(user_id) = message
+        .additional_properties
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        if is_valid_guid(user_id) {
+            return Some(user_id.to_string());
+        }
+    }
+    message
+        .author_name
+        .as_deref()
+        .filter(|name| is_valid_guid(name))
+        .map(str::to_string)
+}
+
+/// Attribute each message to a user, in order.
+///
+/// A batch is not one user's text. A group chat, a handoff, or a replayed
+/// transcript carries several people's messages, and a single id for the
+/// whole batch evaluates all of them against whichever user happened to be
+/// found first — so one participant's policy decides another's content.
+/// Upstream fixed the same thing in #10099.
+///
+/// * An `authenticated` id (the credential's own user, or one the caller
+///   passed) governs every message outright; a message cannot claim to be
+///   somebody else.
+/// * Otherwise each message with an explicit id of its own uses it, and
+///   becomes the id inherited by the messages after it — assistant and tool
+///   messages are generated and normally carry none, so they are attributed
+///   to the user whose turn produced them, without overriding a later
+///   explicit identity.
+/// * Leading messages that precede any explicit id (a system prompt, say)
+///   inherit the first explicit id in the batch, so they are evaluated rather
+///   than skipped.
+fn attribute_user_ids(messages: &[Message], authenticated: Option<&str>) -> Vec<Option<String>> {
+    if let Some(authenticated) = authenticated.filter(|id| is_valid_guid(id)) {
+        return vec![Some(authenticated.to_string()); messages.len()];
+    }
+    // Seed with the first explicit id so leading un-attributed messages are
+    // covered rather than dropped.
+    let mut inherited = messages.iter().find_map(message_user_id);
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some(own) = message_user_id(message) {
+            inherited = Some(own);
+        }
+        out.push(inherited.clone());
+    }
+    out
+}
+
 /// Render an arbitrary content item as text a classifier can read.
 ///
 /// The whole item is serialized rather than named fields picked out of it:
@@ -375,10 +433,17 @@ impl ContentProcessor {
             ));
         };
 
-        for message in messages {
+        // Each message is evaluated as the user it belongs to, not as whoever
+        // the batch resolved to first (#10099).
+        let attributed = attribute_user_ids(messages, provided_user_id);
+        for (message, message_user_id) in messages.iter().zip(attributed) {
+            // `resolve_user_id` already established that *some* id exists for
+            // this batch, so this only skips a message no user can be found
+            // for at all, which there is no policy to evaluate it against.
+            let message_user_id = message_user_id.as_deref().unwrap_or(user_id.as_str());
             for request in build_requests(
                 message,
-                &user_id,
+                message_user_id,
                 tenant_id,
                 &settings.app_name,
                 &app_location,
@@ -423,6 +488,108 @@ mod tests {
     fn is_valid_guid_rejects_garbage() {
         assert!(!is_valid_guid("not-a-guid"));
         assert!(!is_valid_guid(""));
+    }
+
+    // -- attribute_user_ids (upstream #10099) ---------------------------------
+
+    const ALICE: &str = "11111111-1111-1111-1111-111111111111";
+    const BOB: &str = "22222222-2222-2222-2222-222222222222";
+
+    #[test]
+    fn each_message_is_attributed_to_its_own_user() {
+        let messages = vec![
+            msg_with_user_id("from alice", ALICE),
+            msg_with_user_id("from bob", BOB),
+        ];
+        assert_eq!(
+            attribute_user_ids(&messages, None),
+            vec![Some(ALICE.to_string()), Some(BOB.to_string())]
+        );
+    }
+
+    /// Generated assistant and tool messages carry no user id; they belong to
+    /// the turn that produced them, not to whoever the batch resolved first.
+    #[test]
+    fn generated_messages_inherit_the_latest_explicit_user() {
+        let messages = vec![
+            msg_with_user_id("alice asks", ALICE),
+            Message::new(Role::assistant(), "answer for alice"),
+            msg_with_user_id("bob asks", BOB),
+            Message::new(Role::assistant(), "answer for bob"),
+        ];
+        assert_eq!(
+            attribute_user_ids(&messages, None),
+            vec![
+                Some(ALICE.to_string()),
+                Some(ALICE.to_string()),
+                Some(BOB.to_string()),
+                Some(BOB.to_string()),
+            ]
+        );
+    }
+
+    /// A leading system prompt precedes every explicit id, so it inherits the
+    /// first one in the batch rather than going unevaluated.
+    #[test]
+    fn leading_messages_inherit_the_first_explicit_user() {
+        let messages = vec![
+            Message::new(Role::system(), "be helpful"),
+            msg_with_user_id("alice asks", ALICE),
+        ];
+        assert_eq!(
+            attribute_user_ids(&messages, None),
+            vec![Some(ALICE.to_string()), Some(ALICE.to_string())]
+        );
+    }
+
+    #[test]
+    fn an_authenticated_user_governs_every_message() {
+        // A message cannot claim to be somebody else when the credential
+        // already names the acting user.
+        let messages = vec![
+            msg_with_user_id("claims bob", BOB),
+            Message::new(Role::user(), "no id"),
+        ];
+        assert_eq!(
+            attribute_user_ids(&messages, Some(ALICE)),
+            vec![Some(ALICE.to_string()), Some(ALICE.to_string())]
+        );
+    }
+
+    #[test]
+    fn a_non_guid_authenticated_id_is_ignored() {
+        let messages = vec![msg_with_user_id("alice", ALICE)];
+        assert_eq!(
+            attribute_user_ids(&messages, Some("not-a-guid")),
+            vec![Some(ALICE.to_string())]
+        );
+    }
+
+    #[test]
+    fn a_guid_shaped_author_name_attributes_its_own_message() {
+        let messages = vec![msg_with_author("hi", BOB)];
+        assert_eq!(
+            attribute_user_ids(&messages, None),
+            vec![Some(BOB.to_string())]
+        );
+    }
+
+    #[test]
+    fn a_batch_with_no_resolvable_user_attributes_nothing() {
+        let messages = vec![Message::new(Role::user(), "no id")];
+        assert_eq!(attribute_user_ids(&messages, None), vec![None]);
+    }
+
+    /// `message_user_id` reads both sources from the *same* message, so an
+    /// explicit `user_id` wins over that message's own `author_name` but not
+    /// over another message's.
+    #[test]
+    fn an_explicit_user_id_wins_within_its_own_message() {
+        let mut message = msg_with_author("hi", BOB);
+        message
+            .additional_properties
+            .insert("user_id".to_string(), serde_json::json!(ALICE));
+        assert_eq!(message_user_id(&message).as_deref(), Some(ALICE));
     }
 
     // -- resolve_user_id ------------------------------------------------------
