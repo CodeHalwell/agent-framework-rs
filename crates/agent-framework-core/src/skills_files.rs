@@ -595,4 +595,45 @@ mod tests {
         );
         assert!(parse_skill_md("---\nname: Bad\ndescription: d\n---\n").is_err());
     }
+
+    /// The name comparison behind the case-variant skip, tested directly so
+    /// the rule is covered on every platform — the `file_skills` integration
+    /// tests need two files whose names differ only by case, which a
+    /// case-insensitive filesystem cannot even hold.
+    #[test]
+    fn case_variant_script_names_are_detected() {
+        let at = |name: &str| (name.to_string(), PathBuf::from(name));
+
+        // The ambiguous pair, in either discovery order.
+        let pair = first_case_variant_pair(&[at("scripts/Run.py"), at("scripts/run.py")]);
+        assert_eq!(
+            pair,
+            Some(("scripts/Run.py".to_string(), "scripts/run.py".to_string()))
+        );
+        let reversed = first_case_variant_pair(&[at("scripts/run.py"), at("scripts/Run.py")]);
+        assert_eq!(
+            reversed,
+            Some(("scripts/run.py".to_string(), "scripts/Run.py".to_string()))
+        );
+
+        // A collision anywhere in the relative path counts, since the whole
+        // path is the name the model runs the script by.
+        assert!(first_case_variant_pair(&[at("Scripts/go.py"), at("scripts/go.py")]).is_some());
+
+        // Distinct names, including ones that only share a prefix.
+        assert_eq!(
+            first_case_variant_pair(&[at("scripts/run.py"), at("scripts/runner.py")]),
+            None
+        );
+        assert_eq!(first_case_variant_pair(&[at("only.py")]), None);
+        assert_eq!(first_case_variant_pair(&[]), None);
+
+        // Non-ASCII case differences are *not* collisions: `Skill::script`
+        // compares with `eq_ignore_ascii_case`, so these stay distinct names
+        // and must not take a loadable skill out of service.
+        assert_eq!(
+            first_case_variant_pair(&[at("scripts/É.py"), at("scripts/é.py")]),
+            None
+        );
+    }
 }
