@@ -407,12 +407,24 @@ fn translate(message: &Value) -> Result<Step> {
             let usage = message.get("usage").unwrap_or(&Value::Null);
             let count = |k: &str| usage.get(k).and_then(Value::as_u64);
             let (input, output) = (count("input_tokens"), count("output_tokens"));
+            let cache_creation = count("cache_creation_input_tokens");
+            let cache_read = count("cache_read_input_tokens");
+            // Anthropic's `input_tokens` counts only the tokens after the last
+            // cache breakpoint; the cache counts are reported separately and
+            // are not included in it. The framework's `input_token_count` is
+            // the *total* input, as every other provider reports it, so the
+            // cache components are added back here while also staying
+            // available as their own counts (upstream #10003).
+            let input_total = match (input, cache_creation, cache_read) {
+                (None, None, None) => None,
+                (i, c, r) => Some(i.unwrap_or(0) + c.unwrap_or(0) + r.unwrap_or(0)),
+            };
             let details = UsageDetails {
-                input_token_count: input,
+                input_token_count: input_total,
                 output_token_count: output,
-                total_token_count: input.zip(output).map(|(i, o)| i + o),
-                cache_creation_input_token_count: count("cache_creation_input_tokens"),
-                cache_read_input_token_count: count("cache_read_input_tokens"),
+                total_token_count: input_total.zip(output).map(|(i, o)| i + o),
+                cache_creation_input_token_count: cache_creation,
+                cache_read_input_token_count: cache_read,
                 ..Default::default()
             };
             let mut update = AgentResponseUpdate {

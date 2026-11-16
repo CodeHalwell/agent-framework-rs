@@ -523,3 +523,58 @@ async fn a_streamed_run_the_service_allows_is_delivered_unchanged() {
     );
     assert_eq!(handle.join().expect("server thread").len(), 2);
 }
+
+#[tokio::test]
+async fn each_message_is_evaluated_under_its_own_user_and_the_response_follows_the_last_speaker() {
+    // Purview evaluates policy *for a user*, and the user id travels in the
+    // request path. A batch carrying two participants must therefore produce
+    // one request per participant under that participant's own id — not both
+    // under the first speaker's, which would check one user's content against
+    // another user's policy (upstream #10193, .NET #10099).
+    let first = "11111111-1111-1111-1111-111111111111";
+    let second = "22222222-2222-2222-2222-222222222222";
+
+    let (base_url, handle) = serve_sequence(vec![
+        // Prompt check: one call per message, both allowed.
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "1"}))),
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "2"}))),
+        // Response check: allowed.
+        Box::new(|stream| write_json_response(stream, &serde_json::json!({"id": "3"}))),
+    ]);
+
+    let with_user = |text: &str, user_id: &str| {
+        let mut m = Message::user(text);
+        m.additional_properties
+            .insert("user_id".to_string(), serde_json::json!(user_id));
+        m
+    };
+
+    let middleware = PurviewAgentMiddleware::new(
+        StaticTokenProvider::new("test-token"),
+        settings_pointed_at(&base_url),
+    );
+    let pipeline = MiddlewarePipeline::new(vec![Arc::new(middleware)]);
+    let called = Arc::new(AtomicBool::new(false));
+    let ctx = AgentContext::new(
+        vec![
+            with_user("first user's question", first),
+            with_user("second user's question", second),
+        ],
+        false,
+    );
+
+    pipeline
+        .execute(ctx, terminal_returning(called.clone(), "Here you go."))
+        .await
+        .unwrap();
+    assert!(called.load(Ordering::SeqCst));
+
+    let requests = handle.join().expect("server thread panicked");
+    assert_eq!(requests.len(), 3);
+    let path_for =
+        |user_id: &str| format!("/users/{user_id}/dataSecurityAndGovernance/processContent");
+    assert_eq!(requests[0].path, path_for(first));
+    assert_eq!(requests[1].path, path_for(second));
+    // The response is attributed to whoever spoke last.
+    assert_eq!(requests[2].path, path_for(second));
+}

@@ -7,6 +7,64 @@ may break APIs).
 
 ## [Unreleased]
 
+Upstream drift from the window ending at `e2f52bc5` (2026-11-15) — a
+fortnight and 198 upstream commits — recorded in
+[`docs/drift/2026-11-16-e2f52bc5.md`](docs/drift/2026-11-16-e2f52bc5.md),
+together with a re-check of the official Azure SDK for Rust crates in
+[`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
+
+### Fixed
+
+- **Cached prompt tokens are now counted in `input_token_count`** on
+  `agent-framework-anthropic`, `agent-framework-bedrock` and
+  `agent-framework-claude` (upstream #9859, #10003). Anthropic's
+  `input_tokens` and Bedrock's `inputTokens` cover only the *uncached* part
+  of a prompt, so with prompt caching active the reported input was short by
+  exactly the cached tokens — most of the prompt, in the case caching is for.
+  The cache components are folded into the total while still being reported
+  as their own counts, and Bedrock now parses `cacheReadInputTokens` /
+  `cacheWriteInputTokens` at all (both were always `None` before). On
+  Anthropic's streaming path the accumulator carries the last-seen cache
+  components forward, because `message_delta` repeats `input_tokens` while
+  omitting the `cache_*` fields that appeared only on `message_start`.
+- **A file skill whose script names differ only by case is skipped** rather
+  than loaded ambiguously (upstream #10158). `Skill::script` resolves names
+  case-insensitively, so a package holding both `scripts/Run.py` and
+  `scripts/run.py` kept only one of them and ran it for *either* spelling —
+  the model asking for one file and a different file executing. Resources
+  are unaffected: this port looks them up by exact name, so case-variant
+  resources stay distinct and both load.
+- **Purview evaluates each message under its own user id** (upstream
+  #10193, .NET #10099). `ContentProcessor::evaluate` resolved one id for the
+  whole batch, so a conversation with more than one participant had every
+  message checked against the first participant's policy and attributed to
+  them in the audit trail. Each message is now attributed to its own
+  identity, a message without one inherits the latest explicit identity
+  before it, and a caller-provided id remains an override for the whole
+  batch. `processor::resolve_user_id` keeps its signature but now reports
+  the **last** message's id — the one a following response-phase evaluation
+  should use — rather than the first.
+- **A blocked Gemini prompt reports `content_filter` when streaming**
+  (upstream #10213). `parse_stream_chunk` did not read
+  `promptFeedback.blockReason` at all, so a refused prompt ended a streaming
+  run with no finish reason. Both parsers also now catch the shape where a
+  blocked continuation hop keeps the earlier candidate with its
+  `finishReason` cleared, which the non-streaming path missed too.
+
+### Changed
+
+- **Breaking (telemetry): the workflow run span follows the OpenTelemetry
+  GenAI conventions** (upstream #9900, .NET #9899, flagged breaking in
+  both). The span is now `invoke_workflow {name}` — plain `invoke_workflow`
+  for an unnamed workflow — instead of `workflow.run`; it carries
+  `gen_ai.operation.name = invoke_workflow`; and the workflow name is
+  reported as `gen_ai.workflow.name`, omitted entirely rather than sent as
+  an empty string when there is none. `workflow.id`, `workflow.description`
+  and the `workflow.build` span are unchanged, as upstream leaves them. A
+  dashboard or alert matching `workflow.run` or `workflow.name` needs
+  updating. New constants: `observability::op::INVOKE_WORKFLOW` and
+  `observability::attr::WORKFLOW_NAME`.
+
 ## [0.15.0] — 2026-11-02
 
 Upstream drift from the window ending at `ca65085e` (2026-11-01), recorded

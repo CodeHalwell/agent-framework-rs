@@ -1298,7 +1298,9 @@ mod tests {
         let updates = collect_updates(text).await;
         let resp = ChatResponse::from_updates(updates);
         let usage = resp.usage_details.unwrap();
-        assert_eq!(usage.input_token_count, Some(25));
+        // 25 uncached + 8 cache-read: the total input is inclusive of the
+        // cache components (upstream #9859).
+        assert_eq!(usage.input_token_count, Some(33));
         assert_eq!(usage.output_token_count, Some(15));
         assert_eq!(usage.cache_read_input_token_count, Some(8));
     }

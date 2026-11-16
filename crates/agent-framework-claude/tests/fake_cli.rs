@@ -66,7 +66,8 @@ def result(**extra):
     msg = {"type": "result", "subtype": "success", "duration_ms": 5, "duration_api_ms": 3,
            "is_error": False, "num_turns": 1, "session_id": "sess-1", "stop_reason": "end_turn",
            "total_cost_usd": 0.25,
-           "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 2}}
+           "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 2,
+                     "cache_creation_input_tokens": 5}}
     msg.update(extra)
     out(msg)
 
@@ -255,7 +256,10 @@ async fn a_run_streams_text_and_reports_usage_and_the_session() {
             usage.total_token_count,
             usage.cache_read_input_token_count
         ),
-        (Some(10), Some(4), Some(14), Some(2))
+        // The total input includes both cache components: 10 uncached + 5
+        // cache-creation + 2 cache-read = 17, and the total is then
+        // 17 + 4 = 21 (upstream #10003).
+        (Some(17), Some(4), Some(21), Some(2))
     );
     assert_eq!(response.finish_reason.as_ref().unwrap().0, "stop");
     assert_eq!(response.conversation_id.as_deref(), Some("sess-1"));

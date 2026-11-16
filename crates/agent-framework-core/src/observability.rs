@@ -166,6 +166,10 @@ pub mod attr {
     pub const AGENT_ID: &str = "gen_ai.agent.id";
     pub const INPUT_MESSAGES: &str = "gen_ai.input.messages";
     pub const OUTPUT_MESSAGES: &str = "gen_ai.output.messages";
+    /// A workflow's name, under the GenAI namespace since upstream #9900
+    /// (.NET #9899); `workflow.id` and `workflow.description` stay outside it,
+    /// as they do upstream.
+    pub const WORKFLOW_NAME: &str = "gen_ai.workflow.name";
     /// The human-readable span name override consumed by OTel bridges.
     pub const OTEL_NAME: &str = "otel.name";
     /// `tracing-opentelemetry` special field: sets the OTel span status code
@@ -184,6 +188,9 @@ pub mod op {
     pub const INVOKE_AGENT: &str = "invoke_agent";
     pub const EXECUTE_TOOL: &str = "execute_tool";
     pub const EMBEDDINGS: &str = "embeddings";
+    /// A workflow run. Also the run span's name, as `invoke_agent` is for an
+    /// agent run (upstream #9900, .NET #9899).
+    pub const INVOKE_WORKFLOW: &str = "invoke_workflow";
 }
 
 /// The `error.type` value for a framework [`Error`]: its variant discriminant.

@@ -1,9 +1,32 @@
 # Official Azure SDK for Rust crates, and what this port could use
 
 A review of what Microsoft actually ships for Rust, measured against what
-this port hand-rolls against Azure services. Checked **2026-11-02**, with
-versions read from the crates.io API rather than from announcement posts,
-which lag.
+this port hand-rolls against Azure services. Re-checked **2026-11-16**
+(first written 2026-11-02), with versions read from the crates.io API rather
+than from announcement posts, which lag.
+
+Since the 2026-11-02 check, **every stable line is unchanged**, so the pins
+in `Cargo.toml` are still current. Two things did move, both on the
+prerelease lines, and one of them clears a recorded blocker:
+
+- **`azure_core_opentelemetry` 1.1.0-beta.2 is on `opentelemetry` 0.32** —
+  the version this workspace already uses. The version mismatch `SCOPE.md`
+  records as blocking the bridge for the Azure SDK's own client spans is
+  resolved in that beta (1.0.0 stable is still on 0.31). Adopting it today
+  means taking a prerelease Azure dependency, which is not this port's
+  policy, so the item stays open — but it now waits on a **1.1.0 stable
+  release**, not on upstream deciding to move. That is what the next pass
+  should check for.
+- The remaining betas advanced without changing the picture: `azure_core`
+  1.2.0-beta.2, `azure_identity` and `azure_data_cosmos` 1.1.0-beta.2,
+  `azure_storage_blob` 1.2.0-beta.1.
+
+One standing open question is also now **answered**: `azure_data_cosmos`
+1.0.0's `ContainerClient` exposes `query_items`, which sends arbitrary
+Cosmos SQL with parameters. `VectorDistance(...)` is a server-side SQL
+function, not a client feature, so the crate covers the queries
+`vector_store.rs` issues. Azure AI Search is still the same `0.0.1`
+placeholder last published 2025-03-07.
 
 The short version: of the eight Azure-facing crates in this workspace, only
 **Cosmos DB** has an official Rust client worth adopting. Azure AI Search,
@@ -91,11 +114,11 @@ as a purely additive optional feature while the hand-rolled one stays the
 default. The same shape — a `cosmos-sdk` feature — gets the official client's
 retry and auth behaviour without a breaking change or a forced dependency.
 
-Worth checking before committing to it: `azure_data_cosmos` 1.0.0's query
-surface has to cover the `VectorDistance` queries `vector_store.rs` issues,
-which are a relatively recent Cosmos feature. If it does not expose them,
-scope the feature to `auth` + plain document CRUD and keep issuing vector
-queries directly.
+**Checked 2026-11-16:** the query surface is not a constraint.
+`ContainerClient::query_items` takes arbitrary Cosmos SQL with parameters,
+and `VectorDistance(...)` is evaluated server-side, so the vector queries
+`vector_store.rs` issues need no dedicated client support. The feature can
+cover auth, CRUD *and* the vector queries.
 
 ### 2. App Insights: `azure_core_opentelemetry` 1.0.0 closes a recorded gap
 
@@ -113,16 +136,23 @@ is what Azure's agent views key off, and the bridge is what carries
 `APPLICATIONINSIGHTS_CONNECTION_STRING`), which exports traces and metrics
 to Application Insights through the community
 `opentelemetry-application-insights` exporter (0.45, the release on
-`opentelemetry` 0.32). The `azure_core_opentelemetry` bridge for the Azure
-SDK's own client spans still waits on its move to `opentelemetry` 0.32.
+`opentelemetry` 0.32).
 
-### 3. Blob session store: `azure_storage_blob` is at 1.1.0, not 1.1
+**Checked 2026-11-16:** the `azure_core_opentelemetry` bridge for the Azure
+SDK's own client spans has made its move — **1.1.0-beta.2 depends on
+`opentelemetry` 0.32 and `opentelemetry_sdk` 0.32.1**, matching this
+workspace. 1.0.0 stable remains on 0.31, so taking the bridge now means
+taking a prerelease; the item is unblocked on substance and waits only on
+1.1.0 going stable.
 
-`SCOPE.md` already names `azure_storage_blob` 1.1 for the
-`AzureBlobAgentSessionStore` analogue, and notes it shares the `azure_core`
-1.x line that `entra-sdk` already pulls. That is still true and the version
-is now **1.1.0 stable**, so the item is unblocked on the dependency side —
-it needs only the `session_store` implementation.
+### 3. Blob session store: done
+
+`SCOPE.md` named `azure_storage_blob` 1.1 for the
+`AzureBlobAgentSessionStore` analogue. That store is now ported —
+`agent-framework-azure`'s `session-store` feature — so this item is closed.
+The dependency line is still right: `azure_storage_blob` 1.1.0 stable
+(1.2.0-beta.1 in flight) shares the `azure_core` 1.x line `entra-sdk`
+already pulls.
 
 ## Not worth doing
 

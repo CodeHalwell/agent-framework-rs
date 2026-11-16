@@ -27,42 +27,69 @@ fn is_valid_guid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok()
 }
 
-/// Resolve the acting user id for a batch of messages, mirroring
-/// `ScopedContentProcessor._map_messages`'s resolution order (minus the
-/// bearer-token-JWT fallback this port doesn't perform — see the crate
-/// docs):
+/// A message's *own* identity: its `additional_properties["user_id"]` when
+/// that is a valid GUID, else its `author_name` when that is. `None` when the
+/// message identifies nobody — a system, assistant or tool message, say.
 ///
-/// 1. The first message whose `additional_properties["user_id"]` is a valid
-///    GUID wins outright.
-/// 2. Otherwise, the first message whose `author_name` is a valid GUID is
-///    remembered as a fallback candidate (scanning continues, in case a
-///    later message has an explicit `user_id`).
-/// 3. If neither produced a value, `provided` is used if it is itself a
-///    valid GUID.
-/// 4. Otherwise `None` — callers must treat this as "cannot evaluate; do not
-///    block" (see [`ContentProcessor::evaluate`]), matching Python's
-///    fail-open behavior when no resolvable user id exists.
-pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<String> {
-    let mut author_name_fallback: Option<String> = None;
-    for message in messages {
-        if let Some(user_id) = message
-            .additional_properties
-            .get("user_id")
-            .and_then(serde_json::Value::as_str)
-        {
-            if is_valid_guid(user_id) {
-                return Some(user_id.to_string());
-            }
-        }
-        if author_name_fallback.is_none() {
-            if let Some(name) = &message.author_name {
-                if is_valid_guid(name) {
-                    author_name_fallback = Some(name.clone());
-                }
-            }
-        }
+/// Mirrors upstream's `_get_message_user_id` (#10193, .NET #10099).
+fn message_user_id(message: &Message) -> Option<&str> {
+    let property = message
+        .additional_properties
+        .get("user_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| is_valid_guid(id));
+    property.or_else(|| message.author_name.as_deref().filter(|n| is_valid_guid(n)))
+}
+
+/// Attribute every message in `messages` to the user id its content is
+/// evaluated under, one per message and in order.
+///
+/// Purview evaluates policy *for a user*, so a batch carrying more than one
+/// identity cannot be evaluated under a single id: doing so checks one
+/// participant's content against another participant's policy. Each message
+/// therefore gets its own attribution, mirroring upstream's `_map_messages`
+/// (#10193, .NET #10099):
+///
+/// 1. A valid-GUID `provided` id is an **override**: the caller (or, upstream,
+///    a credential that authenticates a user) has named the acting user, so
+///    every message is evaluated under it. This is how a response-phase
+///    evaluation reuses the id resolved during the prompt phase.
+/// 2. Otherwise each message is attributed to [`message_user_id`] when it has
+///    one, and to the latest explicit identity before it when it does not —
+///    so an assistant or tool message is evaluated under the user it is
+///    answering, without overriding a later participant's own identity.
+///    Leading messages with no identity of their own (a system or generated
+///    message) inherit the *first* explicit identity in the batch.
+/// 3. `None` when the batch carries no identity at all and none was provided.
+///    Callers must fail closed on that: nothing was evaluated, so nothing may
+///    be reported as cleared (see [`ContentProcessor::evaluate`]).
+///
+/// This port performs no bearer-token-JWT introspection, so upstream's
+/// token-derived override arrives here only as `provided` — see the crate
+/// docs.
+fn attributed_user_ids(messages: &[Message], provided: Option<&str>) -> Option<Vec<String>> {
+    if let Some(override_id) = provided.filter(|p| is_valid_guid(p)) {
+        return Some(vec![override_id.to_string(); messages.len()]);
     }
-    author_name_fallback.or_else(|| provided.filter(|p| is_valid_guid(p)).map(str::to_string))
+    // Leading messages without an identity of their own inherit the first
+    // explicit one in the batch.
+    let mut inherited = messages.iter().find_map(message_user_id)?;
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        inherited = message_user_id(message).unwrap_or(inherited);
+        out.push(inherited.to_string());
+    }
+    Some(out)
+}
+
+/// Resolve the acting user id for a batch of messages: the id of its **last**
+/// message under [`attributed_user_ids`], which is what a response-phase
+/// evaluation should be attributed to.
+///
+/// `None` when no id could be resolved; callers must treat that as "cannot
+/// evaluate" and fail closed (see [`ContentProcessor::evaluate`]).
+pub fn resolve_user_id(messages: &[Message], provided: Option<&str>) -> Option<String> {
+    attributed_user_ids(messages, provided)?.pop()
 }
 
 /// Render an arbitrary content item as text a classifier can read.
@@ -311,16 +338,18 @@ impl ContentProcessor {
         Self { client }
     }
 
-    /// Evaluate `messages` for policy violations, resolving the user id per
-    /// [`resolve_user_id`] (`provided_user_id` lets a response-phase
-    /// evaluation reuse the id resolved during the prompt phase, matching
-    /// Python's `process_messages(..., user_id=resolved_user_id)`).
+    /// Evaluate `messages` for policy violations, attributing each message to
+    /// its own user id per [`attributed_user_ids`] (`provided_user_id` is an
+    /// override that lets a response-phase evaluation reuse the id resolved
+    /// during the prompt phase, matching Python's
+    /// `process_messages(..., user_id=resolved_user_id)`).
     ///
-    /// Returns `(should_block, resolved_user_id)`. One `processContent` call
-    /// is made per message, in order, stopping at (and including) the first
-    /// one that returns a block verdict — mirrors
-    /// `ScopedContentProcessor.process_messages`'s `for req in
-    /// pc_requests: ...; if should_block: break`.
+    /// Returns `(should_block, resolved_user_id)`, where the resolved id is
+    /// the **last** message's — the one a following response-phase call should
+    /// be evaluated under. One `processContent` call is made per message, in
+    /// order, stopping at (and including) the first one that returns a block
+    /// verdict — mirrors `ScopedContentProcessor.process_messages`'s `for req
+    /// in pc_requests: ...; if should_block: break`.
     ///
     /// Fails (rather than silently allowing) when `tenant_id` or
     /// `purview_app_location` aren't set on `settings`, mirroring Python's
@@ -358,7 +387,7 @@ impl ContentProcessor {
             })?
             .to_policy_location();
 
-        let Some(user_id) = resolve_user_id(messages, provided_user_id) else {
+        let Some(user_ids) = attributed_user_ids(messages, provided_user_id) else {
             // Fail **closed**: Purview evaluates policy for a specific user,
             // so with no user there is no policy and nothing was evaluated.
             // Returning "not blocked" here reported an unevaluated message as
@@ -375,21 +404,34 @@ impl ContentProcessor {
             ));
         };
 
-        for message in messages {
+        // Each message is evaluated under *its own* user id, so a batch
+        // carrying several participants checks each one's content against
+        // that participant's policy rather than the first speaker's
+        // (#10193). The id reported back is the last message's, which is what
+        // the response phase is attributed to.
+        // The last message's id, or — for the degenerate empty batch, which
+        // has no last message — the override itself, so a caller still gets
+        // back the id it passed in.
+        let resolved = user_ids.last().cloned().or_else(|| {
+            provided_user_id
+                .filter(|p| is_valid_guid(p))
+                .map(str::to_string)
+        });
+        for (message, user_id) in messages.iter().zip(&user_ids) {
             for request in build_requests(
                 message,
-                &user_id,
+                user_id,
                 tenant_id,
                 &settings.app_name,
                 &app_location,
             ) {
                 let response = self.client.process_content(&request).await?;
                 if response.should_block() {
-                    return Ok((true, Some(user_id)));
+                    return Ok((true, resolved));
                 }
             }
         }
-        Ok((false, Some(user_id)))
+        Ok((false, resolved))
     }
 }
 
@@ -481,6 +523,102 @@ mod tests {
     fn resolve_user_id_ignores_non_guid_user_id_property() {
         let messages = vec![msg_with_user_id("hi", "not-a-guid")];
         assert!(resolve_user_id(&messages, None).is_none());
+    }
+
+    // -- attributed_user_ids: per-message attribution (#10193) ---------------
+
+    #[test]
+    fn each_message_is_attributed_to_its_own_user_id() {
+        // Two participants in one batch: evaluating both under the first
+        // speaker's id would check one user's content against the other's
+        // policy.
+        let first = "11111111-1111-1111-1111-111111111111";
+        let second = "22222222-2222-2222-2222-222222222222";
+        let messages = vec![
+            msg_with_user_id("from first", first),
+            msg_with_user_id("from second", second),
+        ];
+        assert_eq!(
+            attributed_user_ids(&messages, None).unwrap(),
+            vec![first.to_string(), second.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_message_without_an_identity_inherits_the_latest_explicit_one() {
+        // An assistant reply is evaluated under the user it is answering, and
+        // a later participant's own identity still takes over from there.
+        let first = "11111111-1111-1111-1111-111111111111";
+        let second = "22222222-2222-2222-2222-222222222222";
+        let messages = vec![
+            msg_with_user_id("ask", first),
+            Message::assistant("answer"),
+            msg_with_user_id("ask again", second),
+            Message::assistant("answer again"),
+        ];
+        assert_eq!(
+            attributed_user_ids(&messages, None).unwrap(),
+            vec![
+                first.to_string(),
+                first.to_string(),
+                second.to_string(),
+                second.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn leading_messages_without_an_identity_inherit_the_first_explicit_one() {
+        let guid = "11111111-1111-1111-1111-111111111111";
+        let messages = vec![Message::system("be brief"), msg_with_user_id("hi", guid)];
+        assert_eq!(
+            attributed_user_ids(&messages, None).unwrap(),
+            vec![guid.to_string(), guid.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_provided_user_id_overrides_every_message_identity() {
+        // The caller (upstream: a credential that authenticates a user) has
+        // named the acting user, so the whole batch is evaluated under it.
+        let provided = "33333333-3333-3333-3333-333333333333";
+        let other = "11111111-1111-1111-1111-111111111111";
+        let messages = vec![msg_with_user_id("hi", other), Message::assistant("there")];
+        assert_eq!(
+            attributed_user_ids(&messages, Some(provided)).unwrap(),
+            vec![provided.to_string(), provided.to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_user_id_reports_the_last_messages_id() {
+        // The response phase is attributed to whoever spoke last, not to the
+        // batch's first speaker.
+        let first = "11111111-1111-1111-1111-111111111111";
+        let second = "22222222-2222-2222-2222-222222222222";
+        let messages = vec![
+            msg_with_user_id("first", first),
+            msg_with_user_id("second", second),
+        ];
+        assert_eq!(resolve_user_id(&messages, None).as_deref(), Some(second));
+    }
+
+    #[test]
+    fn a_message_user_id_property_beats_its_own_author_name() {
+        let author = "11111111-1111-1111-1111-111111111111";
+        let property = "22222222-2222-2222-2222-222222222222";
+        let mut m = msg_with_user_id("hi", property);
+        m.author_name = Some(author.to_string());
+        assert_eq!(
+            attributed_user_ids(&[m], None).unwrap(),
+            vec![property.to_string()]
+        );
+    }
+
+    #[test]
+    fn attribution_is_none_when_no_message_identifies_anyone() {
+        let messages = vec![Message::user("hi"), Message::assistant("there")];
+        assert!(attributed_user_ids(&messages, None).is_none());
     }
 
     // -- evaluate: configuration validation (async, no network) ------------

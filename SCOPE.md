@@ -89,7 +89,9 @@ from the roadmap, not from this file.
   Toolkit). The Application Insights exporter is ported
   (`agent-framework-core`'s `azure-monitor` feature); the
   `azure_core_opentelemetry` bridge for the Azure SDK's own client spans
-  waits on that crate moving to `opentelemetry` 0.32 (see
+  waits on that crate's 1.1.0 going stable: 1.1.0-beta.2 is already on
+  `opentelemetry` 0.32, the version this workspace uses, while 1.0.0 stable
+  is still on 0.31 (see
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md)). The Blob session
   store is ported (`agent-framework-azure`'s `session-store` feature).
 - **Depth gaps the parity ledger surfaced** (see
@@ -112,8 +114,10 @@ from the roadmap, not from this file.
   `agent-framework-cosmos`'s 5,222 lines are the REST plumbing and
   resource-token signing the official client now does. Not a defect — the
   hand-rolled client works — but it is maintenance this port would stop
-  carrying. Needs a check that the crate's query surface covers the
-  `VectorDistance` queries `vector_store.rs` issues. See
+  carrying. The query surface is no longer an open
+  question: `ContainerClient::query_items` sends arbitrary Cosmos SQL, and
+  `VectorDistance(...)` is evaluated server-side, so a `cosmos-sdk` feature
+  can cover auth, CRUD and the vector queries together. See
   [`docs/azure-rust-sdk.md`](docs/azure-rust-sdk.md).
 
 - **MCP 2.x, remainder**: the `2026-07-28` era is negotiated

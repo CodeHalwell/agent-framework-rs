@@ -1210,16 +1210,46 @@ pub(crate) fn map_stop_reason(reason: &str) -> FinishReason {
     }
 }
 
+/// Sum the components that make up a request's *total* input tokens.
+///
+/// Anthropic's `input_tokens` counts only the tokens after the last cache
+/// breakpoint: `cache_creation_input_tokens` and `cache_read_input_tokens`
+/// are reported separately and are **not** included in it. The framework's
+/// [`UsageDetails::input_token_count`] — and the `gen_ai.usage.input_tokens`
+/// metric derived from it — is the total input, as every other provider
+/// reports it, so the cache components are added back here while also staying
+/// available as their own counts (upstream #9859).
+///
+/// Returns `None` only when the snapshot carries no input component at all,
+/// so an absent count stays absent rather than becoming a spurious `0`.
+fn total_input_tokens(
+    input: Option<u64>,
+    cache_creation: Option<u64>,
+    cache_read: Option<u64>,
+) -> Option<u64> {
+    match (input, cache_creation, cache_read) {
+        (None, None, None) => None,
+        (i, c, r) => Some(i.unwrap_or(0) + c.unwrap_or(0) + r.unwrap_or(0)),
+    }
+}
+
 /// Parse an Anthropic `usage` object (input/output tokens plus prompt-cache
-/// counts) into [`UsageDetails`].
+/// counts) into [`UsageDetails`]. `input_token_count` is inclusive of the
+/// cache counts — see [`total_input_tokens`].
 pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
     let mut details = UsageDetails {
-        input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
+        input_token_count: total_input_tokens(
+            usage.get("input_tokens").and_then(Value::as_u64),
+            cache_creation,
+            cache_read,
+        ),
         output_token_count: usage.get("output_tokens").and_then(Value::as_u64),
-        cache_creation_input_token_count: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64),
-        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cache_creation_input_token_count: cache_creation,
+        cache_read_input_token_count: cache_read,
         ..Default::default()
     };
     if let (Some(i), Some(o)) = (details.input_token_count, details.output_token_count) {
@@ -1236,12 +1266,18 @@ pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
 /// aggregating a stream) would double-count output tokens, so this
 /// deliberately omits `output_tokens` here.
 pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
     let details = UsageDetails {
-        input_token_count: usage.get("input_tokens").and_then(Value::as_u64),
-        cache_creation_input_token_count: usage
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64),
-        cache_read_input_token_count: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        input_token_count: total_input_tokens(
+            usage.get("input_tokens").and_then(Value::as_u64),
+            cache_creation,
+            cache_read,
+        ),
+        cache_creation_input_token_count: cache_creation,
+        cache_read_input_token_count: cache_read,
         ..Default::default()
     };
     if details.input_token_count.is_none()
@@ -1276,6 +1312,10 @@ pub(crate) fn parse_message_start_usage(usage: &Value) -> Option<UsageContent> {
 #[derive(Debug, Default)]
 pub(crate) struct StreamUsageAccumulator {
     emitted: UsageDetails,
+    /// Last-seen `cache_creation_input_tokens`, if any snapshot reported one.
+    carried_cache_creation: Option<u64>,
+    /// Last-seen `cache_read_input_tokens`, if any snapshot reported one.
+    carried_cache_read: Option<u64>,
 }
 
 impl StreamUsageAccumulator {
@@ -1295,11 +1335,35 @@ impl StreamUsageAccumulator {
             Some(increment)
         }
 
+        // Anthropic reports `cache_*` only on `message_start` for most streams,
+        // while every `message_delta` repeats `input_tokens`. `parse_usage`
+        // folds the cache counts a snapshot carries into its
+        // `input_token_count`, so a snapshot that omits them describes a
+        // *smaller* total input than the stream has already seen — and the
+        // high-water mark below would then emit a 0 increment and under-count
+        // the run's input by the cached tokens. Carry the last-seen components
+        // forward and add them back, keeping the cumulative total inclusive
+        // for the whole stream (upstream #9859's `raw_usage_carry`).
+        let mut carried_input = cumulative.input_token_count;
+        match cumulative.cache_creation_input_token_count {
+            Some(v) => self.carried_cache_creation = Some(v),
+            None => {
+                if let Some(v) = self.carried_cache_creation {
+                    carried_input = Some(carried_input.unwrap_or(0) + v);
+                }
+            }
+        }
+        match cumulative.cache_read_input_token_count {
+            Some(v) => self.carried_cache_read = Some(v),
+            None => {
+                if let Some(v) = self.carried_cache_read {
+                    carried_input = Some(carried_input.unwrap_or(0) + v);
+                }
+            }
+        }
+
         let mut out = UsageDetails {
-            input_token_count: delta(
-                &mut self.emitted.input_token_count,
-                cumulative.input_token_count,
-            ),
+            input_token_count: delta(&mut self.emitted.input_token_count, carried_input),
             output_token_count: delta(
                 &mut self.emitted.output_token_count,
                 cumulative.output_token_count,
@@ -1399,7 +1463,8 @@ mod tests {
         }))
         .unwrap();
         let first = acc.increment(&start.details);
-        assert_eq!(first.input_token_count, Some(10));
+        // Inclusive of the cache read: 10 uncached + 4 cache-read (#9859).
+        assert_eq!(first.input_token_count, Some(14));
         assert_eq!(first.cache_read_input_token_count, Some(4));
 
         // `message_delta`: the *running total*, which repeats input_tokens.
@@ -1416,7 +1481,7 @@ mod tests {
         // Summing the emitted increments reconstructs the true cumulative usage.
         let mut aggregated = first;
         aggregated.add_assign(&delta);
-        assert_eq!(aggregated.input_token_count, Some(10));
+        assert_eq!(aggregated.input_token_count, Some(14));
         assert_eq!(aggregated.output_token_count, Some(25));
         assert_eq!(aggregated.cache_read_input_token_count, Some(4));
     }
@@ -1963,6 +2028,91 @@ mod tests {
         let usage = resp.usage_details.unwrap();
         assert_eq!(usage.cache_creation_input_token_count, Some(50));
         assert_eq!(usage.cache_read_input_token_count, Some(20));
+        // `input_tokens` counts only the tokens after the last cache
+        // breakpoint, so the total input adds both cache components back
+        // (upstream #9859).
+        assert_eq!(usage.input_token_count, Some(170));
+        assert_eq!(usage.total_token_count, Some(180));
+    }
+
+    #[test]
+    fn parse_usage_input_count_includes_both_cache_components() {
+        let usage = parse_usage(&json!({
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cache_creation_input_tokens": 11,
+            "cache_read_input_tokens": 13,
+        }));
+        assert_eq!(usage.input_token_count, Some(31));
+        assert_eq!(usage.total_token_count, Some(34));
+    }
+
+    #[test]
+    fn parse_usage_reports_cache_only_input_when_input_tokens_is_absent() {
+        // A snapshot can carry cache counts with no `input_tokens` at all;
+        // the total input is then the cache components alone, not `None`.
+        let usage = parse_usage(&json!({ "cache_read_input_tokens": 9 }));
+        assert_eq!(usage.input_token_count, Some(9));
+    }
+
+    #[test]
+    fn parse_usage_leaves_input_absent_when_no_component_is_reported() {
+        let usage = parse_usage(&json!({ "output_tokens": 5 }));
+        assert_eq!(usage.input_token_count, None);
+        assert_eq!(usage.total_token_count, None);
+    }
+
+    #[test]
+    fn message_start_usage_input_count_includes_cache_components() {
+        let content = parse_message_start_usage(&json!({
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 6,
+            "cache_read_input_tokens": 4,
+        }))
+        .unwrap();
+        assert_eq!(content.details.input_token_count, Some(20));
+    }
+
+    #[test]
+    fn stream_usage_carries_cache_components_a_later_delta_omits() {
+        // `message_start` reports the cache counts; the `message_delta` repeats
+        // a *grown* `input_tokens` but omits `cache_*`, as Anthropic's streams
+        // do. Without carrying them forward the aggregate would stop at the
+        // message_start total and lose the extra uncached tokens (#9859).
+        let mut acc = StreamUsageAccumulator::default();
+        let start = parse_message_start_usage(&json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 4,
+        }))
+        .unwrap();
+        let mut aggregated = acc.increment(&start.details);
+        assert_eq!(aggregated.input_token_count, Some(14));
+
+        let delta = acc.increment(&parse_usage(&json!({
+            "input_tokens": 12,
+            "output_tokens": 5,
+        })));
+        aggregated.add_assign(&delta);
+        // 12 uncached + the carried 4 cache-read = 16.
+        assert_eq!(aggregated.input_token_count, Some(16));
+    }
+
+    #[test]
+    fn stream_usage_carry_does_not_double_count_a_repeated_cache_count() {
+        // The common case: every snapshot repeats the same cache count. The
+        // carry must not add it on top of a snapshot that already includes it.
+        let mut acc = StreamUsageAccumulator::default();
+        let mut aggregated = acc.increment(&parse_usage(&json!({
+            "input_tokens": 10,
+            "cache_read_input_tokens": 4,
+        })));
+        let delta = acc.increment(&parse_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 25,
+            "cache_read_input_tokens": 4,
+        })));
+        aggregated.add_assign(&delta);
+        assert_eq!(aggregated.input_token_count, Some(14));
     }
 
     #[test]

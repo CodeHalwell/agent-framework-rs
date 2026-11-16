@@ -193,7 +193,7 @@ pub struct WorkflowBuilder {
 
 /// Which workflow spans are emitted (upstream `WorkflowTelemetryOptions`).
 ///
-/// A run emits `workflow.build`, `workflow.run`, `executor.process {id}`,
+/// A run emits `workflow.build`, `invoke_workflow {name}`, `executor.process {id}`,
 /// `message.send` and `edge_group.process {type}` spans through `tracing`,
 /// inert until a subscriber (such as the `otel-export` pipeline) is
 /// installed. Each kind can be turned off; message payloads are recorded only
@@ -202,7 +202,7 @@ pub struct WorkflowBuilder {
 pub struct WorkflowTelemetryOptions {
     /// Skip the `workflow.build` span.
     pub disable_workflow_build: bool,
-    /// Skip the `workflow.run` span.
+    /// Skip the `invoke_workflow` span.
     pub disable_workflow_run: bool,
     /// Skip the `executor.process` spans.
     pub disable_executor_process: bool,
@@ -1031,15 +1031,33 @@ impl WorkflowRun {
         let span = if telemetry.disable_workflow_run {
             tracing::Span::none()
         } else {
-            tracing::info_span!(
-                "workflow.run",
-                otel.name = "workflow.run",
+            // The run span follows the OTel GenAI conventions, as the agent
+            // and chat spans already do: it is named `invoke_workflow {name}`
+            // (plain `invoke_workflow` for an unnamed workflow), carries
+            // `gen_ai.operation.name`, and reports the name as
+            // `gen_ai.workflow.name`. `workflow.id` and
+            // `workflow.description` stay outside the GenAI namespace, as
+            // they do upstream (#9900, .NET #9899).
+            let span = tracing::info_span!(
+                "invoke_workflow",
+                otel.name = crate::observability::op::INVOKE_WORKFLOW,
+                gen_ai.operation.name = crate::observability::op::INVOKE_WORKFLOW,
                 workflow.id = %self.shared.id,
-                workflow.name = self.shared.name.as_deref().unwrap_or_default(),
+                gen_ai.workflow.name = tracing::field::Empty,
                 workflow.description = self.shared.description.as_deref().unwrap_or_default(),
                 error.type = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
-            )
+            );
+            // An unnamed workflow reports neither a name attribute nor a
+            // name in the span name, rather than an empty string.
+            if let Some(name) = self.shared.name.as_deref() {
+                span.record(crate::observability::attr::WORKFLOW_NAME, name);
+                span.record(
+                    crate::observability::attr::OTEL_NAME,
+                    format!("{} {name}", crate::observability::op::INVOKE_WORKFLOW).as_str(),
+                );
+            }
+            span
         };
         let result = self.run_loop().instrument(span.clone()).await;
         if result.is_err() {
