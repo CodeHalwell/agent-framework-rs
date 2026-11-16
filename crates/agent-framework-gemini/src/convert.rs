@@ -486,14 +486,23 @@ pub fn parse_response(
             .unwrap_or_default();
         let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
         response.finish_reason = finalize_finish_reason(raw_finish_reason, &contents);
+        if response.finish_reason.is_none() {
+            // The candidate reported no reason of its own. When the payload
+            // also carries a blocked prompt, that is the reason: a blocked
+            // continuation hop keeps the earlier candidate with its
+            // `finishReason` cleared (#10213).
+            if let Some(block_reason) = prompt_was_blocked(value) {
+                tracing::debug!(
+                    block_reason,
+                    "Gemini: prompt blocked, candidate reports no finish reason"
+                );
+                response.finish_reason = Some(FinishReason::new(FinishReason::CONTENT_FILTER));
+            }
+        }
         let mut message = Message::with_contents(Role::assistant(), contents);
         message.message_id = response.response_id.clone();
         response.messages.push(message);
-    } else if let Some(block_reason) = value
-        .get("promptFeedback")
-        .and_then(|pf| pf.get("blockReason"))
-        .and_then(Value::as_str)
-    {
+    } else if let Some(block_reason) = prompt_was_blocked(value) {
         // The prompt itself was blocked: Gemini returns a 200 with no
         // `candidates` at all, only `promptFeedback.blockReason`. Surface
         // this as a content-filter finish reason on an empty assistant
@@ -636,6 +645,21 @@ fn finalize_finish_reason(raw: Option<&str>, contents: &[Content]) -> Option<Fin
     }
 }
 
+/// `true` when the payload reports that Gemini blocked the *prompt* itself
+/// (`promptFeedback.blockReason`).
+///
+/// A blocked prompt is a `200 OK`, not an error. It usually arrives with no
+/// `candidates` at all, but when a later automatic-continuation hop is
+/// blocked the API keeps the earlier candidate and clears its
+/// `finishReason` — so the block has to be read off `promptFeedback`
+/// whether or not a candidate is present (upstream #10213).
+fn prompt_was_blocked(value: &Value) -> Option<&str> {
+    value
+        .get("promptFeedback")
+        .and_then(|pf| pf.get("blockReason"))
+        .and_then(Value::as_str)
+}
+
 /// Map one raw Gemini `finishReason` name onto the shared [`FinishReason`].
 ///
 /// The mapped names mirror upstream Python's `_FINISH_REASON_MAP`
@@ -712,6 +736,18 @@ pub(crate) fn parse_stream_chunk(
         }
         let raw_finish_reason = candidate.get("finishReason").and_then(Value::as_str);
         finish_reason = finalize_finish_reason(raw_finish_reason, &contents);
+    }
+
+    // A blocked prompt is a 200 on the streaming path too, and it may arrive
+    // either as a chunk with no candidates or — when a continuation hop is
+    // blocked — as one whose candidate has no `finishReason`. Either way the
+    // run ended in the content filter, and a caller keying off
+    // `finish_reason` saw nothing at all before (#10213).
+    if finish_reason.is_none() {
+        if let Some(block_reason) = prompt_was_blocked(value) {
+            tracing::debug!(block_reason, "Gemini: prompt blocked mid-stream");
+            finish_reason = Some(FinishReason::new(FinishReason::CONTENT_FILTER));
+        }
     }
 
     let response_id = value
@@ -1568,6 +1604,85 @@ mod tests {
         assert!(matches!(msg.contents[0], Content::TextReasoning(_)));
         assert_eq!(msg.contents[0].as_text(), Some("thinking..."));
         assert!(matches!(msg.contents[1], Content::Text(_)));
+    }
+
+    #[test]
+    fn parse_response_blocked_prompt_with_a_kept_candidate_sets_content_filter() {
+        // When a later automatic-continuation hop is blocked, the API keeps
+        // the earlier candidate and clears its `finishReason`. The block then
+        // has to be read off `promptFeedback`, or the response reports no
+        // finish reason at all (#10213).
+        let value = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "partial" }] },
+            }],
+            "promptFeedback": { "blockReason": "SAFETY" },
+        });
+        let resp = parse_response(&value, None);
+        assert_eq!(
+            resp.finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+        // The text the hop did produce is still delivered.
+        assert_eq!(resp.text(), "partial");
+    }
+
+    #[test]
+    fn parse_response_candidate_finish_reason_wins_over_prompt_feedback() {
+        // A candidate that reported its own reason keeps it: `promptFeedback`
+        // is only consulted when there is no reason to report.
+        let value = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "done" }] },
+                "finishReason": "MAX_TOKENS",
+            }],
+            "promptFeedback": { "blockReason": "SAFETY" },
+        });
+        assert_eq!(
+            parse_response(&value, None).finish_reason,
+            Some(FinishReason::new(FinishReason::LENGTH))
+        );
+    }
+
+    #[test]
+    fn parse_stream_chunk_blocked_prompt_sets_content_filter() {
+        // The streaming path reported no finish reason at all for a blocked
+        // prompt before (#10213).
+        let chunk = json!({ "promptFeedback": { "blockReason": "SAFETY" } });
+        let update = parse_stream_chunk(&chunk, None).expect("a blocked prompt must surface");
+        assert_eq!(
+            update.finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+    }
+
+    #[test]
+    fn parse_stream_chunk_blocked_prompt_with_a_kept_candidate_sets_content_filter() {
+        let chunk = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "partial" }] },
+            }],
+            "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" },
+        });
+        let update = parse_stream_chunk(&chunk, None).unwrap();
+        assert_eq!(
+            update.finish_reason,
+            Some(FinishReason::new(FinishReason::CONTENT_FILTER))
+        );
+    }
+
+    #[test]
+    fn parse_stream_chunk_without_a_block_reason_reports_no_finish_reason() {
+        // A guard: an ordinary text delta must not pick up a finish reason.
+        let chunk = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "hi" }] },
+            }],
+        });
+        assert_eq!(
+            parse_stream_chunk(&chunk, None).unwrap().finish_reason,
+            None
+        );
     }
 
     #[test]

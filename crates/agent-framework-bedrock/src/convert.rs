@@ -672,13 +672,30 @@ pub(crate) fn map_stop_reason(reason: &str) -> FinishReason {
     }
 }
 
-/// Parse a Converse `usage` object (`{"inputTokens","outputTokens","totalTokens"}`)
-/// into [`UsageDetails`].
+/// Parse a Converse `usage` object
+/// (`{"inputTokens","outputTokens","totalTokens"}`, plus the
+/// `cacheReadInputTokens` / `cacheWriteInputTokens` Bedrock adds when prompt
+/// caching is active) into [`UsageDetails`].
+///
+/// `inputTokens` counts only the uncached part of the prompt, so the cache
+/// components are added back into [`UsageDetails::input_token_count`] — the
+/// total input, as every other provider reports it and as
+/// `gen_ai.usage.input_tokens` is defined — while also staying available as
+/// their own counts (upstream #10003). `totalTokens` is passed through as
+/// Bedrock reports it.
 pub(crate) fn parse_usage(usage: &Value) -> UsageDetails {
+    let input = usage.get("inputTokens").and_then(Value::as_u64);
+    let cache_read = usage.get("cacheReadInputTokens").and_then(Value::as_u64);
+    let cache_write = usage.get("cacheWriteInputTokens").and_then(Value::as_u64);
     UsageDetails {
-        input_token_count: usage.get("inputTokens").and_then(Value::as_u64),
+        input_token_count: match (input, cache_read, cache_write) {
+            (None, None, None) => None,
+            (i, r, w) => Some(i.unwrap_or(0) + r.unwrap_or(0) + w.unwrap_or(0)),
+        },
         output_token_count: usage.get("outputTokens").and_then(Value::as_u64),
         total_token_count: usage.get("totalTokens").and_then(Value::as_u64),
+        cache_read_input_token_count: cache_read,
+        cache_creation_input_token_count: cache_write,
         ..Default::default()
     }
 }
@@ -1077,6 +1094,41 @@ mod tests {
         assert_eq!(usage.input_token_count, Some(10));
         assert_eq!(usage.output_token_count, Some(5));
         assert_eq!(usage.total_token_count, Some(15));
+    }
+
+    #[test]
+    fn parse_usage_input_count_includes_the_cache_components() {
+        // `inputTokens` covers only the uncached part of the prompt when
+        // prompt caching is active, so the total input adds the cache read
+        // and write counts back: 10 + 8 + 3 = 21 (upstream #10003).
+        let usage = parse_usage(&json!({
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "totalTokens": 26,
+            "cacheReadInputTokens": 8,
+            "cacheWriteInputTokens": 3,
+        }));
+        assert_eq!(usage.input_token_count, Some(21));
+        assert_eq!(usage.cache_read_input_token_count, Some(8));
+        assert_eq!(usage.cache_creation_input_token_count, Some(3));
+        // `totalTokens` is passed through as Bedrock reports it.
+        assert_eq!(usage.total_token_count, Some(26));
+    }
+
+    #[test]
+    fn parse_usage_without_caching_is_unchanged() {
+        let usage = parse_usage(&json!({
+            "inputTokens": 10, "outputTokens": 5, "totalTokens": 15,
+        }));
+        assert_eq!(usage.input_token_count, Some(10));
+        assert_eq!(usage.cache_read_input_token_count, None);
+        assert_eq!(usage.cache_creation_input_token_count, None);
+    }
+
+    #[test]
+    fn parse_usage_leaves_input_absent_when_no_input_component_is_reported() {
+        let usage = parse_usage(&json!({ "outputTokens": 5 }));
+        assert_eq!(usage.input_token_count, None);
     }
 
     #[test]

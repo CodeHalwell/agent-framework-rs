@@ -44,7 +44,8 @@
 //!   anywhere, including inside `metadata` (upstream keeps the first and
 //!   warns there).
 
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value as Yaml;
@@ -462,7 +463,29 @@ impl FileSkillsSource {
             skill.compatibility = fm.compatibility.clone();
             skill.allowed_tools = fm.allowed_tools.clone();
             skill.metadata = fm.metadata.clone().unwrap_or_default();
-            for (name, path) in self.script_files(&dir, &fm.name) {
+            // A skill's scripts are resolved case-insensitively
+            // ([`Skill::script`]), so two script files whose names differ only
+            // by case are ambiguous: `with_script` keeps just one of them, and
+            // a `run_skill_script` call naming either would run that one —
+            // silently the wrong file. Skip the whole skill instead of running
+            // code the model did not ask for (upstream #10158, which rejects
+            // such names in the file-skill constructor and skips the affected
+            // skill in its file source).
+            //
+            // Resources need no such check: they are looked up by exact name,
+            // so case-variant resource files stay distinct and addressable.
+            let scripts = self.script_files(&dir, &fm.name);
+            if let Some((first, second)) = first_case_variant_pair(&scripts) {
+                tracing::warn!(
+                    skill = %fm.name,
+                    dir = %dir.display(),
+                    script = %first,
+                    other = %second,
+                    "skipping a skill whose script names differ only by case"
+                );
+                continue;
+            }
+            for (name, path) in scripts {
                 let full_path = std::path::absolute(&path).unwrap_or(path);
                 skill = skill.with_script(SkillScript::file(name, full_path));
             }
@@ -501,6 +524,25 @@ impl FileSkillsSource {
         }
         skills
     }
+}
+
+/// The first pair of script names that differ only by ASCII case, if any.
+///
+/// ASCII case, not Unicode, because that is the comparison
+/// [`Skill::script`] resolves a name with (`eq_ignore_ascii_case`); a check
+/// on a different notion of equality would either miss a real ambiguity or
+/// reject names the lookup keeps apart.
+fn first_case_variant_pair(scripts: &[(String, PathBuf)]) -> Option<(String, String)> {
+    let mut seen: HashMap<String, &str> = HashMap::with_capacity(scripts.len());
+    for (name, _) in scripts {
+        match seen.entry(name.to_ascii_lowercase()) {
+            Entry::Occupied(e) => return Some(((*e.get()).to_string(), name.clone())),
+            Entry::Vacant(e) => {
+                e.insert(name);
+            }
+        }
+    }
+    None
 }
 
 impl SkillsProvider {

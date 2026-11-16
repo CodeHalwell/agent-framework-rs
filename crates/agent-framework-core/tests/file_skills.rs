@@ -227,3 +227,51 @@ async fn inline_scripts_run_in_process() {
     plain.before_run(&mut ctx).await.unwrap();
     assert!(ctx.tools.iter().all(|t| t.name != "run_skill_script"));
 }
+
+#[tokio::test]
+async fn a_skill_whose_script_names_differ_only_by_case_is_skipped() {
+    // `Skill::script` resolves a script name case-insensitively, so two script
+    // files differing only by case are ambiguous: only one of them would be
+    // kept, and a `run_skill_script` call naming either would run that one —
+    // silently the wrong file. The whole skill is skipped instead, and a
+    // skill alongside it still loads (upstream #10158).
+    let root =
+        std::env::temp_dir().join(format!("af-skill-case-{}", uuid::Uuid::new_v4().simple()));
+    write(
+        &root.join("ambiguous/SKILL.md"),
+        "---\nname: ambiguous\ndescription: Two scripts, one name.\n---\nRun it.\n",
+    );
+    write(&root.join("ambiguous/scripts/Run.py"), "print('upper')");
+    write(&root.join("ambiguous/scripts/run.py"), "print('lower')");
+    write(
+        &root.join("fine/SKILL.md"),
+        "---\nname: fine\ndescription: One script.\n---\nRun it.\n",
+    );
+    write(&root.join("fine/scripts/go.py"), "print('ok')");
+
+    let skills = FileSkillsSource::new([&root]).load();
+    let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["fine"], "the ambiguous skill must not load");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn case_variant_resource_names_both_load() {
+    // Resources are looked up by exact name, so unlike scripts a case-variant
+    // pair is unambiguous: both stay addressable and the skill loads.
+    let root = std::env::temp_dir().join(format!("af-res-case-{}", uuid::Uuid::new_v4().simple()));
+    write(
+        &root.join("docs/SKILL.md"),
+        "---\nname: docs\ndescription: Two readmes.\n---\nRead them.\n",
+    );
+    write(&root.join("docs/README.md"), "upper");
+    write(&root.join("docs/readme.md"), "lower");
+
+    let skills = FileSkillsSource::new([&root]).load();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].resources.get("README.md").unwrap(), "upper");
+    assert_eq!(skills[0].resources.get("readme.md").unwrap(), "lower");
+
+    std::fs::remove_dir_all(&root).ok();
+}
