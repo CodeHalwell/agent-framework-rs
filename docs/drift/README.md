@@ -7,7 +7,7 @@ was already satisfied, and what does not apply here. Every item recorded as
 landed was verified (full workspace build, `cargo test`, clippy
 `--all-targets` and rustfmt, all green) before commit.
 
-**Current upstream baseline: `e2f52bc5` (2026-11-15).**
+**Current upstream baseline: `f8ade3e9` (2026-11-17).**
 
 > Upstream rewrote its main into a single linear history after the
 > 2026-10-19 pass, so `9d308951` (and every earlier baseline SHA) no longer
@@ -31,6 +31,7 @@ unchanged baseline takes the same SHA plus a short suffix.
 
 | File | Pass |
 |---|---|
+| [`2026-11-23-f8ade3e9`](2026-11-23-f8ade3e9.md) | Post-`e2f52bc5` drift (2 days, 6 commits, no Python change) + a package-level cross-check of all 44 upstream packages, which found `hosting-mcp` unported since September + Azure-ecosystem review (checked against `f8ade3e9`, 2026-11-17) |
 | [`2026-11-16-e2f52bc5`](2026-11-16-e2f52bc5.md) | Post-`ca65085e` drift (a fortnight, 198 commits) + Azure-ecosystem review (checked against `e2f52bc5`, 2026-11-15) |
 | [`2026-11-02-ca65085e-round-5`](2026-11-02-ca65085e-round-5.md) | Parity push: harness, evaluation, Qdrant, Postgres, Valkey, cloud streaming (same upstream baseline, `ca65085e`) |
 | [`2026-11-02-ca65085e-round-4`](2026-11-02-ca65085e-round-4.md) | Clearing the queue: Redis scope leak, AG-UI error echo, User-Agent, transport errors and more (same upstream baseline, `ca65085e`) |

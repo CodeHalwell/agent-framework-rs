@@ -37,6 +37,7 @@ on one of them still needs checking against the Rust form.
 | `run(stream=...)` / `get_response(stream=...)` | Method pairs: `run` / `run_stream`, `get_response` / `get_streaming_response`. One function returning either a value or a stream on a runtime flag is not idiomatic Rust. |
 | Ollama's native API | `agent-framework-ollama` speaks Ollama's OpenAI-compatible endpoint and reuses `agent_framework_openai::convert`, so fixes to native fields (`images`, `keep_alive`, native tool-result shapes) do not apply. |
 | Anthropic `response_format` handling | Folded into the system prompt (the Messages API has no native field), so upstream's schema-mutation fixes cannot arise. |
+| An injected SDK client must take precedence over connection settings (#9982 MongoDB, #9983 Postgres, #9985 Oracle, #9984 Claude, #9987 Azure OpenAI, #9991 Foundry embeddings, #9993 Qdrant, #9996 Cosmos, #9999 DocumentDB, #9969 Gemini, #9967 Bedrock, #9977 Redis) | Disjoint constructors. A store or client is built *either* from resolved settings (`from_env`, or an explicit endpoint/key) *or* from a client the caller already has (`from_client`) — never from both at once. Upstream's bug is that one constructor accepts both and silently preferred the settings; here there is no code path in which an injected client and a connection setting both apply and one has to win, so the series cannot arise. Settled deliberately in the 2026-11-23 pass rather than per-PR. |
 
 ## Not yet ported
 
@@ -79,6 +80,51 @@ from the roadmap, not from this file.
   support for either provider. The workflow has no request-cancellation API,
   so a pending computer call is cancelled from the reply instead
   (`{"call_id", "cancelled": true}` or `{"cancelled": true}`).
+- **Exposing agents and workflows as MCP tools** (`hosting-mcp`, upstream
+  from 2026-09-17): the inverse of what `agent-framework-mcp` does. That
+  crate is an MCP **client** (README calls it that) — it consumes remote
+  servers. Upstream's `hosting-mcp` converts the other way, and deliberately
+  owns no server lifecycle and picks no web framework: it is
+  `mcp_to_run(...)` (native MCP tool arguments to run arguments),
+  `mcp_from_run(...)` (an `AgentResponse` or `Message` to MCP
+  `ContentBlock`s), `AgentMCPTool(...)` and `WorkflowMCPTool(...)`
+  (generating the native `Tool` definition from an agent, or from a
+  workflow's start-executor input type, and keeping listing, parsing,
+  execution, result conversion and optional session persistence aligned).
+  None of that exists here, so an agent built with this port cannot be
+  served to an MCP client. The serving direction *has* been written once:
+  `agent-framework-claude`'s private `ToolServer` (`src/mcp.rs` —
+  `list`/`handle`/`call`) answers MCP JSON-RPC for the Claude CLI's `sdk`
+  server contract, and `examples/mcp/mcp_http_transport.rs` hand-rolls about
+  60 lines of axum as a test fixture. Neither is reusable, and the protocol
+  types a port would need are already public (`ContentBlock` and
+  `CallToolResult` in `agent-framework-mcp/src/protocol.rs`), so this is a
+  modest crate rather than new protocol work. Recorded as open in the
+  2026-11-23 pass, which is the first to notice it: the package landed
+  upstream in September and roughly nine passes since read the name
+  `hosting-mcp` as covered by `agent-framework-mcp`, which is the opposite
+  direction.
+- **NVIDIA NIM embeddings** (`nvidia`, upstream #8920): an embeddings-only
+  client for NVIDIA's hosted NIM endpoint
+  (`https://integrate.api.nvidia.com/v1`), which exposes an OpenAI-compatible
+  surface. Upstream builds it on its own OpenAI embedding client: it defaults
+  the base URL, batches inputs, and sends the two options outside the OpenAI
+  schema (`input_type`, `truncate`) as `extra_body`. Here that is a thin crate
+  over `agent-framework-openai`'s embedding client. Recorded as open, not
+  excluded: the 2026-11-02 pass deferred it as "a scope decision, not drift"
+  and the decision was never taken, so the port has neither the crate nor a
+  reason not to have it.
+- **Oracle vector store** (`oracle`, upstream #8676, #9233): an alpha
+  connector for native `VECTOR` columns in Oracle AI Database 26ai, on
+  `python-oracledb` 3.x in async Thin mode. There is no comparable Rust
+  driver: `oracle` 0.6.3 and `sibyl` 0.7.1 are both OCI bindings that need
+  Oracle Instant Client (a C library) at build and run time, and of the three Oracle crates on
+  crates.io only `oracle-rs` 0.1.7 is pure Rust, and it is still 0.1.x. CI also has no Oracle AI
+  Database 26ai to verify a port against, the same constraint the other
+  database vector stores' live tests record above. Listed here because the
+  2026-10-12 pass cited this as a recorded `SCOPE.md` boundary when no such
+  entry existed; this is that correction, and it records the state (unported,
+  driver-blocked) rather than ruling the connector out.
 - **Durable Task hosting** (`agent-framework-durabletask`, now published
   from its own repository). Blocked: it sits on the `durabletask` SDK, a
   deterministic-replay orchestration engine with durable entities and a
